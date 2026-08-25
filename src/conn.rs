@@ -6,6 +6,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[allow(unused_imports)]
+use crate::proto::SizeHint;
 
 pub trait Conn: Send {
     fn send(&mut self, req: Request) -> Result<()>;
@@ -70,9 +72,28 @@ impl Conn for LocalConn {
 pub struct RemoteConn {
     child: Child,
     w: FrameWriter<ChildStdin>,
-    r: FrameReader<ChildStdout>,
+    /// Responses are parsed on a reader thread so the network keeps flowing
+    /// while the caller processes the previous one.
+    rx: std::sync::mpsc::Receiver<std::io::Result<Response>>,
     label: String,
     dead: bool,
+}
+
+const READ_AHEAD: usize = 4;
+
+fn spawn_reader(stdout: ChildStdout) -> std::sync::mpsc::Receiver<std::io::Result<Response>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(READ_AHEAD);
+    std::thread::spawn(move || {
+        let mut r = FrameReader::new(stdout);
+        loop {
+            let msg = r.read_msg::<Response>();
+            let failed = msg.is_err();
+            if tx.send(msg).is_err() || failed {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 impl RemoteConn {
@@ -99,7 +120,11 @@ impl Conn for RemoteConn {
         self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))
     }
     fn recv(&mut self) -> Result<Response> {
-        self.r.read_msg().map_err(|e| self.io_err(e.into()))
+        match self.rx.recv() {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(self.io_err(e.into())),
+            Err(_) => Err(self.io_err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "reader stopped").into())),
+        }
     }
     fn is_dead(&self) -> bool {
         self.dead
@@ -133,6 +158,29 @@ impl Drop for RemoteConn {
     }
 }
 
+/// At most this many ssh sessions are being established at any moment.
+const MAX_CONCURRENT_CONNECTS: usize = 6;
+static CONNECTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static CONNECTS_CV: std::sync::Condvar = std::sync::Condvar::new();
+
+struct ConnectSlot;
+fn connect_slot() -> ConnectSlot {
+    let mut n = CONNECTS.lock().unwrap();
+    while *n >= MAX_CONCURRENT_CONNECTS {
+        n = CONNECTS_CV.wait(n).unwrap();
+    }
+    *n += 1;
+    ConnectSlot
+}
+impl Drop for ConnectSlot {
+    fn drop(&mut self) {
+        *CONNECTS.lock().unwrap() -= 1;
+        CONNECTS_CV.notify_one();
+    }
+}
+
+pub const CIPHERS: &str = "Ciphers=aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com";
+
 #[derive(Clone, Debug)]
 pub struct RemoteSpec {
     pub user: Option<String>,
@@ -153,8 +201,11 @@ impl RemoteSpec {
         let mut cmd = Command::new(&self.rsh[0]);
         cmd.args(&self.rsh[1..]);
         if self.rsh[0].ends_with("ssh") {
-            // Data connections must not share one TCP stream / cipher process.
-            cmd.args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+            // Data connections must not share one TCP stream / cipher process,
+            // and AES-GCM is much faster than OpenSSH's default chacha20 on
+            // CPUs with AES-NI. The list still includes the defaults so
+            // negotiation never fails.
+            cmd.args(["-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", CIPHERS]);
             if let Some(u) = &self.user {
                 cmd.args(["-l", u]);
             }
@@ -174,7 +225,32 @@ impl RemoteSpec {
         }
     }
 
+    /// Connect, retrying a few times: sshd's MaxStartups (default 10) drops
+    /// connections at random when many are being set up at once, so we also
+    /// limit how many connects are in flight.
     pub fn connect(&self, compress: bool) -> Result<RemoteConn> {
+        let mut delay = std::time::Duration::from_millis(200);
+        let mut last = None;
+        for attempt in 0..6 {
+            let _slot = connect_slot();
+            match self.connect_once(compress) {
+                Ok(c) => return Ok(c),
+                // Don't retry what won't change: missing binary (127) or a version mismatch.
+                Err(e) if attempt == 5 || e.to_string().contains("version mismatch") || e.to_string().contains("exit status: 127") => return Err(e),
+                Err(e) => {
+                    if crate::transfer::debug() {
+                        eprintln!("pcp: connect to {} failed (attempt {}): {e:#}", self.label(), attempt + 1);
+                    }
+                    last = Some(e);
+                    std::thread::sleep(delay);
+                    delay *= 2;
+                }
+            }
+        }
+        Err(last.unwrap())
+    }
+
+    fn connect_once(&self, compress: bool) -> Result<RemoteConn> {
         let mut cmd = self.ssh_command();
         cmd.arg(self.server_command());
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
@@ -184,11 +260,11 @@ impl RemoteSpec {
         let mut conn = RemoteConn {
             child,
             w: FrameWriter::new(stdin, compress),
-            r: FrameReader::new(stdout),
+            rx: spawn_reader(stdout),
             label: self.label(),
             dead: false,
         };
-        conn.send(Request::Hello { version: VERSION, compress })?;
+        conn.send(Request::Hello { version: VERSION, compress, debug: crate::transfer::debug() })?;
         match conn.recv() {
             Ok(Response::HelloOk { version }) if version == VERSION => Ok(conn),
             Ok(Response::HelloOk { version }) => {

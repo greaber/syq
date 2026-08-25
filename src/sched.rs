@@ -164,12 +164,35 @@ impl Sched {
         Some(h)
     }
 
+    /// Pop further queued files no larger than `max_size` (largest-first order
+    /// means once the top is small, everything left is). Each is marked as
+    /// being probed, like `Item::File`.
+    pub fn take_small(&self, max_size: u64, max_n: usize, max_bytes: u64) -> Vec<usize> {
+        let mut g = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        let mut bytes = 0u64;
+        while out.len() < max_n {
+            match g.files.peek() {
+                Some(&(size, _)) if size <= max_size && bytes + size <= max_bytes => {
+                    let (size, Reverse(idx)) = g.files.pop().unwrap();
+                    bytes += size;
+                    g.probing += 1;
+                    out.push(idx);
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
     /// After probing a file: register its ranges. Returns the handle for the
     /// first range (already marked in flight) or None if nothing to transfer.
     pub fn ranges_ready(&self, idx: usize, ranges: Vec<(u64, u64)>) -> Option<RangeHandle> {
         let mut g = self.inner.lock().unwrap();
         g.probing -= 1;
-        g.outstanding.insert(idx, ranges.len() as u32);
+        if !ranges.is_empty() {
+            g.outstanding.insert(idx, ranges.len() as u32);
+        }
         let mut it = ranges.into_iter();
         let first = it.next().map(|(off, end)| {
             let h = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));

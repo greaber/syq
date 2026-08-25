@@ -13,6 +13,8 @@ use xxhash_rust::xxh3::xxh3_64;
 
 const WINDOW: usize = 4;
 const MAX_ATTEMPTS: u32 = 3;
+const FAST_BATCH_FILES: usize = 64;
+const FAST_BATCH_BYTES: u64 = 16 << 20;
 
 pub struct Opts {
     pub block: u64,
@@ -53,6 +55,10 @@ fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
             Err(e)
         }
     }
+}
+
+pub fn debug() -> bool {
+    std::env::var_os("PCP_DEBUG").is_some()
 }
 
 fn read_umask() -> u32 {
@@ -99,8 +105,63 @@ pub fn run(args: Args) -> Result<i32> {
         umask: read_umask(),
     });
 
-    let mut src_ctl = connect_ctl(&src_ep, &args)?;
-    let mut dst_ctl = connect_ctl(&dst_ep, &args)?;
+    let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
+    let progress = Progress::new(args.connections, show_progress, args.progress, args.width, args.progress_json);
+    let sched = Arc::new(Sched::new(block, min_split));
+
+    // Workers connect on their own threads, in parallel with the control
+    // connections below, so all ssh sessions come up at once.
+    let mut workers: Vec<std::thread::JoinHandle<Result<()>>> = Vec::new();
+    let spawn_workers = |workers: &mut Vec<std::thread::JoinHandle<Result<()>>>| {
+        for id in 0..args.connections {
+            let (src_ep, dst_ep, sched, progress, opts) =
+                (src_ep.clone(), dst_ep.clone(), sched.clone(), progress.clone(), opts.clone());
+            let compress = args.compress;
+            workers.push(std::thread::spawn(move || -> Result<()> {
+                let t0 = std::time::Instant::now();
+                let mut w = Worker {
+                    id,
+                    src: src_ep.connect(compress)?,
+                    dst: dst_ep.connect(compress)?,
+                    sched,
+                    progress,
+                    opts,
+                    t: [0.0; 4],
+                };
+                if debug() {
+                    eprintln!("pcp: worker {id} connected in {:.2}s", t0.elapsed().as_secs_f64());
+                }
+                w.run()
+            }));
+        }
+    };
+    // With --bootstrap the control connection must go first (it installs the
+    // remote binary); otherwise everything connects at once.
+    if !opts.dry_run && !args.bootstrap {
+        spawn_workers(&mut workers);
+    }
+
+    let t0 = std::time::Instant::now();
+    let (mut src_ctl, mut dst_ctl) = {
+        let (a, b) = (src_ep.clone(), args.clone());
+        let t = std::thread::spawn(move || connect_ctl(&a, &b));
+        let dst_ctl = connect_ctl(&dst_ep, &args);
+        let src_ctl = t.join().map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
+        match (src_ctl, dst_ctl) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) | (_, Err(e)) => {
+                sched.abort();
+                progress.stop();
+                return Err(e);
+            }
+        }
+    };
+    if debug() {
+        eprintln!("pcp: control connections up in {:.2}s", t0.elapsed().as_secs_f64());
+    }
+    if !opts.dry_run && args.bootstrap {
+        spawn_workers(&mut workers);
+    }
 
     let dst_root = dst.path.as_bytes().to_vec();
     let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root)?;
@@ -122,31 +183,7 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
-    let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(args.connections, show_progress, args.progress, args.width, args.progress_json);
     let ticker = progress.spawn_ticker();
-    let sched = Arc::new(Sched::new(block, min_split));
-
-    // Workers connect on their own threads so ssh sessions come up in parallel.
-    let mut workers = Vec::new();
-    if !opts.dry_run {
-        for id in 0..args.connections {
-            let (src_ep, dst_ep, sched, progress, opts) =
-                (src_ep.clone(), dst_ep.clone(), sched.clone(), progress.clone(), opts.clone());
-            let compress = args.compress;
-            workers.push(std::thread::spawn(move || -> Result<()> {
-                let mut w = Worker {
-                    id,
-                    src: src_ep.connect(compress)?,
-                    dst: dst_ep.connect(compress)?,
-                    sched,
-                    progress,
-                    opts,
-                };
-                w.run()
-            }));
-        }
-    }
 
     let mut st = Planner {
         dst: &mut *dst_ctl,
@@ -514,17 +551,48 @@ struct Worker {
     sched: Arc<Sched>,
     progress: Arc<Progress>,
     opts: Arc<Opts>,
+    /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
+    t: [f64; 4],
 }
 
 impl Worker {
     fn run(&mut self) -> Result<()> {
         loop {
-            match self.sched.next() {
-                Item::Exit => return Ok(()),
+            let t0 = std::time::Instant::now();
+            let item = self.sched.next();
+            self.t[3] += t0.elapsed().as_secs_f64();
+            match item {
+                Item::Exit => {
+                    if debug() {
+                        eprintln!(
+                            "pcp: worker {} blocked: src recv {:.2}s, dst send {:.2}s, dst ack {:.2}s, idle {:.2}s",
+                            self.id, self.t[0], self.t[1], self.t[2], self.t[3]
+                        );
+                    }
+                    return Ok(());
+                }
                 Item::File(idx) => {
-                    let res = if self.opts.verify_only { self.verify_file(idx) } else { self.handle_file(idx) };
-                    if let Err(e) = res {
-                        self.file_error(idx, e)?;
+                    if self.fast_eligible(idx) {
+                        let mut batch = vec![idx];
+                        batch.extend(self.sched.take_small(self.opts.block, FAST_BATCH_FILES, FAST_BATCH_BYTES));
+                        let (fast, slow): (Vec<usize>, Vec<usize>) = batch.into_iter().partition(|&i| self.fast_eligible(i));
+                        if let Err(e) = self.fast_batch(&fast) {
+                            // Transport-level failure: every file in the batch is affected.
+                            for &i in &fast {
+                                self.sched.ranges_ready(i, vec![]);
+                            }
+                            self.file_error(fast[0], e)?;
+                        }
+                        for i in slow {
+                            if let Err(e) = self.handle_file(i) {
+                                self.file_error(i, e)?;
+                            }
+                        }
+                    } else {
+                        let res = if self.opts.verify_only { self.verify_file(idx) } else { self.handle_file(idx) };
+                        if let Err(e) = res {
+                            self.file_error(idx, e)?;
+                        }
                     }
                 }
                 Item::Range(h) => {
@@ -542,6 +610,129 @@ impl Worker {
             }
             self.progress.set_worker(self.id, None);
         }
+    }
+
+    /// Small new files (no existing destination file) are sent without a
+    /// per-file round trip: one pipelined burst of reads, one of
+    /// prepare+write+finalize, one stat — a few RTTs for the whole batch.
+    fn fast_eligible(&self, idx: usize) -> bool {
+        let jobs = self.sched.jobs.lock().unwrap();
+        let j = &jobs[idx];
+        !self.opts.verify_only && !self.opts.inplace && j.entry.size <= self.opts.block && j.dst_entry.is_none()
+    }
+
+    fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
+        let jobs: Vec<FileJob> = {
+            let all = self.sched.jobs.lock().unwrap();
+            batch.iter().map(|&i| all[i].clone()).collect()
+        };
+        if let Some(j) = jobs.last() {
+            self.progress.set_worker(self.id, Some(WorkerStatus { path: format!("{} (+{} small files)", j.rel, jobs.len() - 1), done: j.done.clone(), total: j.entry.size }));
+        }
+        // Reads.
+        for j in &jobs {
+            if j.entry.size > 0 {
+                self.src.send(Request::ReadRange { path: j.src.clone(), off: 0, len: j.entry.size as u32 })?;
+            }
+        }
+        let mut data: Vec<Result<Vec<u8>>> = Vec::with_capacity(jobs.len());
+        for j in &jobs {
+            if j.entry.size == 0 {
+                data.push(Ok(Vec::new()));
+                continue;
+            }
+            data.push(match ok(self.src.recv()?, "read") {
+                Ok(Response::Block { hash, data, .. }) => {
+                    if xxh3_64(&data) != hash {
+                        Err(anyhow::anyhow!("block hash mismatch on read"))
+                    } else {
+                        Ok(data)
+                    }
+                }
+                Ok(other) => Err(anyhow::anyhow!("unexpected response {other:?}")),
+                Err(e) => Err(e),
+            });
+        }
+        // Writes: prepare, write, finalize for every file, then collect acks.
+        let mut expect: Vec<usize> = Vec::with_capacity(jobs.len());
+        let flags = self.opts.flags | flags::MODE;
+        for (j, d) in jobs.iter().zip(data.iter_mut()) {
+            let Ok(bytes) = d else {
+                expect.push(0);
+                continue;
+            };
+            let bytes = std::mem::take(bytes);
+            let hash = xxh3_64(&bytes);
+            let mut meta = j.entry.meta();
+            if !self.opts.perms {
+                meta.mode = j.entry.mode & 0o777 & !self.opts.umask;
+            }
+            self.dst.send(Request::Prepare { path: j.dst.clone(), size: j.entry.size, inplace: false, from_final: false })?;
+            let mut n = 2;
+            if !bytes.is_empty() {
+                self.dst.send(Request::WriteRange { path: j.dst.clone(), inplace: false, off: 0, hash, data: bytes })?;
+                n = 3;
+            }
+            self.dst.send(Request::Finalize { path: j.dst.clone(), inplace: false, meta, flags })?;
+            expect.push(n);
+        }
+        let mut results: Vec<Result<()>> = Vec::with_capacity(jobs.len());
+        for (d, &n) in data.iter_mut().zip(expect.iter()) {
+            let mut res: Result<()> = match d {
+                Ok(_) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!("{e:#}")),
+            };
+            for _ in 0..n {
+                if let Err(e) = ok(self.dst.recv()?, "write") {
+                    if res.is_ok() {
+                        res = Err(e);
+                    }
+                }
+            }
+            results.push(res);
+        }
+        // Did any source change while we were at it?
+        let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
+        let now = match ok(self.src.call(Request::StatMany(paths))?, "stat")? {
+            Response::Stats(v) => v,
+            other => bail!("unexpected response {other:?}"),
+        };
+        for ((idx, j), (res, now)) in batch.iter().zip(jobs.iter()).zip(results.into_iter().zip(now.into_iter())) {
+            self.sched.ranges_ready(*idx, vec![]);
+            if let Err(e) = res {
+                self.progress.error(&format!("pcp: {}: {e:#}", j.rel));
+                self.sched.fail_file(*idx);
+                continue;
+            }
+            let changed = match &now {
+                Some(e) => e.kind != Kind::File || e.size != j.entry.size || e.mtime != j.entry.mtime || e.mtime_nsec != j.entry.mtime_nsec,
+                None => true,
+            };
+            if changed {
+                if let (Some(e), true) = (now, j.attempts + 1 < MAX_ATTEMPTS) {
+                    self.progress.eprintln(&format!("pcp: {}: changed during transfer, retrying", j.rel));
+                    let mut all = self.sched.jobs.lock().unwrap();
+                    let job = &mut all[*idx];
+                    self.progress.bytes_total.fetch_add(e.size, Relaxed);
+                    job.entry = Entry { path: job.entry.path.clone(), ..e };
+                    job.attempts += 1;
+                    job.dst_entry = Some(job.entry.clone());
+                    drop(all);
+                    self.sched.requeue(*idx);
+                } else {
+                    self.progress.error(&format!("pcp: {}: source changed during transfer (or vanished)", j.rel));
+                    self.sched.fail_file(*idx);
+                }
+                continue;
+            }
+            self.progress.add_bytes(j.entry.size);
+            j.done.store(j.entry.size, Relaxed);
+            self.progress.files_done.fetch_add(1, Relaxed);
+            if self.opts.verbose > 0 {
+                self.progress.println(&j.rel);
+            }
+        }
+        Ok(())
     }
 
     fn file_error(&mut self, idx: usize, e: anyhow::Error) -> Result<()> {
@@ -731,19 +922,25 @@ impl Worker {
             if reads_out == 0 {
                 break;
             }
+            let t0 = std::time::Instant::now();
             let (off, hash, data) = match ok(self.src.recv()?, "read")? {
                 Response::Block { off, hash, data } => (off, hash, data),
                 other => bail!("unexpected response {other:?}"),
             };
+            self.t[0] += t0.elapsed().as_secs_f64();
             reads_out -= 1;
             if xxh3_64(&data) != hash {
                 bail!("block hash mismatch on read @{off}");
             }
             let n = data.len() as u64;
+            let t0 = std::time::Instant::now();
             self.dst.send(Request::WriteRange { path: job.dst.clone(), inplace, off, hash, data })?;
+            self.t[1] += t0.elapsed().as_secs_f64();
             writes_out += 1;
             if writes_out >= WINDOW {
+                let t0 = std::time::Instant::now();
                 ok(self.dst.recv()?, "write")?;
+                self.t[2] += t0.elapsed().as_secs_f64();
                 writes_out -= 1;
             }
             self.progress.add_bytes(n);

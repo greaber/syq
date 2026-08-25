@@ -88,7 +88,7 @@ pub enum Op {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Request {
-    Hello { version: u32, compress: bool },
+    Hello { version: u32, compress: bool, debug: bool },
     Scan { root: PathBytes, follow_root: bool },
     StatMany(Vec<PathBytes>),
     Apply(Vec<Op>),
@@ -132,6 +132,34 @@ pub enum Response {
     Err(String),
 }
 
+/// Rough serialized size, so big blocks are encoded without reallocation.
+pub trait SizeHint {
+    fn size_hint(&self) -> usize;
+}
+
+impl SizeHint for Request {
+    fn size_hint(&self) -> usize {
+        match self {
+            Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
+            Request::StatMany(v) => v.iter().map(|p| p.len() + 8).sum::<usize>() + 16,
+            Request::Apply(v) => v.len() * 128 + 16,
+            _ => 256,
+        }
+    }
+}
+
+impl SizeHint for Response {
+    fn size_hint(&self) -> usize {
+        match self {
+            Response::Block { data, .. } => data.len() + 64,
+            Response::ScanBatch(v) => v.len() * 160 + 16,
+            Response::Stats(v) => v.len() * 96 + 16,
+            Response::Hashes(v) => v.len() * 9 + 16,
+            _ => 256,
+        }
+    }
+}
+
 pub struct FrameWriter<W: Write> {
     w: BufWriter<W>,
     pub compress: bool,
@@ -142,8 +170,8 @@ impl<W: Write> FrameWriter<W> {
         FrameWriter { w: BufWriter::with_capacity(1 << 20, w), compress }
     }
 
-    pub fn write_msg<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
-        let payload = postcard::to_allocvec(msg)
+    pub fn write_msg<T: Serialize + SizeHint>(&mut self, msg: &T) -> io::Result<()> {
+        let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut flag = 0u8;
         let mut body = payload;

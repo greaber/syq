@@ -6,13 +6,14 @@ use anyhow::{bail, Result};
 use std::io::{self, ErrorKind};
 
 pub fn run() -> Result<()> {
-    let stdin = io::stdin().lock();
     let stdout = io::stdout().lock();
-    let mut r = FrameReader::new(stdin);
+    let mut r = FrameReader::new(io::stdin());
     let mut w = FrameWriter::new(stdout, false);
 
+    let debug;
     match r.read_msg::<Request>()? {
-        Request::Hello { version, compress } => {
+        Request::Hello { version, compress, debug: d } => {
+            debug = d;
             if version != VERSION {
                 w.write_msg(&Response::Err(format!(
                     "protocol version mismatch (remote {VERSION}, client {version})"
@@ -25,13 +26,40 @@ pub fn run() -> Result<()> {
         _ => bail!("expected Hello"),
     }
 
+    // Requests are parsed on a reader thread so incoming data keeps flowing
+    // while a block is being hashed and written.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<Request>>(4);
+    std::thread::spawn(move || loop {
+        let msg = r.read_msg::<Request>();
+        let failed = msg.is_err();
+        if tx.send(msg).is_err() || failed {
+            break;
+        }
+    });
+
     let mut ops = FsOps::new();
+    let mut t = [0f64; 3];
+    let (mut blocks, mut bytes) = (0u64, 0u64);
     loop {
-        let req: Request = match r.read_msg() {
-            Ok(req) => req,
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
+        let t0 = std::time::Instant::now();
+        let req: Request = match rx.recv() {
+            Ok(Ok(req)) => req,
+            Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => break,
         };
+        t[0] += t0.elapsed().as_secs_f64();
+        match &req {
+            Request::WriteRange { data, .. } => {
+                blocks += 1;
+                bytes += data.len() as u64;
+            }
+            Request::ReadRange { len, .. } => {
+                blocks += 1;
+                bytes += *len as u64;
+            }
+            _ => {}
+        }
         match req {
             Request::Shutdown => break,
             Request::Scan { root, follow_root } => {
@@ -61,10 +89,20 @@ pub fn run() -> Result<()> {
                 }
             }
             other => {
+                let t0 = std::time::Instant::now();
                 let resp = ops.handle(&other);
+                t[1] += t0.elapsed().as_secs_f64();
+                let t0 = std::time::Instant::now();
                 w.write_msg(&resp)?;
+                t[2] += t0.elapsed().as_secs_f64();
             }
         }
+    }
+    if debug {
+        eprintln!(
+            "pcp server: {blocks} blocks, {} MiB; waiting for input {:.2}s, handling {:.2}s, writing responses {:.2}s",
+            bytes >> 20, t[0], t[1], t[2]
+        );
     }
     Ok(())
 }

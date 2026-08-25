@@ -11,7 +11,20 @@ mod transfer;
 
 use clap::Parser;
 
+/// Keep multi-megabyte block buffers in the heap instead of mmap/munmap-ing
+/// each one: page faults and TLB shootdowns across many threads otherwise
+/// dominate at high throughput.
+fn tune_allocator() {
+    unsafe {
+        // glibc caps this at 32 MiB; larger values are rejected.
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 30);
+        libc::mallopt(libc::M_TOP_PAD, 64 << 20);
+    }
+}
+
 fn main() {
+    tune_allocator();
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("--server") {
         if let Err(e) = server::run() {

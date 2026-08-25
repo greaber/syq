@@ -210,6 +210,27 @@ ordering question for them.
 - **Not** a single spinning disk: parallel reads of one file there mean seeks.
   Use `-j 1` or a large `--min-split`.
 
+## Performance notes
+
+- pcp asks ssh for `aes128-gcm@openssh.com` first (falling back to the usual
+  ciphers). On x86 with AES-NI that is noticeably faster per stream than
+  OpenSSH's default chacha20-poly1305.
+- Each connection costs one ssh handshake (~0.3 s on a LAN, several seconds
+  across continents), and sshd's `MaxStartups` (default 10) randomly rejects
+  sessions if too many are being set up at once, so pcp limits in-flight
+  connects and retries. For short transfers over long links, `-j 4` may beat
+  `-j 16`.
+- Direct remote→remote with a *forwarded* agent authenticates every session
+  through your machine; over a slow link that dominates setup time. Keys on the
+  source host avoid it.
+- Measured on two 160-core hosts on a 20 Gbit LAN: a single ssh stream tops out
+  around 450–550 MB/s; `pcp -j8` into tmpfs reached ~1.2–1.3 GiB/s (the raw
+  multi-stream ssh ceiling), while writes to the destination's ext4 NVMe capped
+  everything, rsync included, at ~600 MB/s. Check the disk before blaming the
+  network.
+- `PCP_DEBUG=1` prints connect times and where each worker and each remote
+  server spent its time (blocked on reads, pipe writes, acks; waiting, handling).
+
 ## Exit codes
 
 | Code | Meaning |
