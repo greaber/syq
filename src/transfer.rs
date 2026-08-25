@@ -1,0 +1,831 @@
+//! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
+
+use crate::cli::{parse_rsh, parse_size, Args, Location};
+use crate::conn::{ok, Conn, Endpoint, RemoteSpec};
+use crate::fsops::join;
+use crate::progress::{commas, human, Progress, WorkerStatus};
+use crate::proto::*;
+use crate::sched::{FileJob, Item, RangeHandle, Sched};
+use anyhow::{bail, Result};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
+use xxhash_rust::xxh3::xxh3_64;
+
+const WINDOW: usize = 4;
+const MAX_ATTEMPTS: u32 = 3;
+
+pub struct Opts {
+    pub block: u64,
+    pub flags: u8,
+    pub recursive: bool,
+    pub links: bool,
+    pub perms: bool,
+    pub devices: bool,
+    pub checksum: bool,
+    pub verify_only: bool,
+    pub inplace: bool,
+    pub dry_run: bool,
+    pub verbose: u8,
+    pub umask: u32,
+}
+
+fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
+    Ok(match &loc.host {
+        None => Endpoint::Local,
+        Some(h) => Endpoint::Remote(RemoteSpec {
+            user: loc.user.clone(),
+            host: h.clone(),
+            rsh: parse_rsh(&args.rsh)?,
+            pcp_path: args.pcp_path.clone(),
+        }),
+    })
+}
+
+fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
+    match ep.connect(args.compress) {
+        Ok(c) => Ok(c),
+        Err(e) => {
+            if let (Endpoint::Remote(spec), true) = (ep, args.bootstrap) {
+                eprintln!("pcp: {e:#}");
+                spec.bootstrap()?;
+                return ep.connect(args.compress);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn read_umask() -> u32 {
+    unsafe {
+        let m = libc::umask(0o022);
+        libc::umask(m);
+        m as u32
+    }
+}
+
+pub fn run(args: Args) -> Result<i32> {
+    let block = parse_size(&args.block_size)?.clamp(64 * 1024, 1 << 30);
+    let min_split = parse_size(&args.min_split)?;
+    let locs: Vec<Location> = args.paths.iter().map(|p| Location::parse(p)).collect::<Result<_>>()?;
+    let (dst, srcs) = locs.split_last().unwrap();
+    for s in srcs {
+        if !s.same_host(&srcs[0]) {
+            bail!("all sources must be on the same host");
+        }
+    }
+    let src_ep = endpoint(&srcs[0], &args)?;
+    let dst_ep = endpoint(dst, &args)?;
+    if src_ep.is_remote() && dst_ep.is_remote() && !args.quiet {
+        eprintln!("pcp: remote-to-remote transfer: relaying data through this machine");
+    }
+
+    let opts = Arc::new(Opts {
+        block,
+        flags: args.meta_flags(),
+        recursive: args.recursive,
+        links: args.links,
+        perms: args.perms,
+        devices: args.devices,
+        checksum: args.checksum,
+        verify_only: args.verify_only,
+        inplace: args.inplace,
+        dry_run: args.dry_run,
+        verbose: args.verbose,
+        umask: read_umask(),
+    });
+
+    let mut src_ctl = connect_ctl(&src_ep, &args)?;
+    let mut dst_ctl = connect_ctl(&dst_ep, &args)?;
+
+    let dst_root = dst.path.as_bytes().to_vec();
+    let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root)?;
+    let dst_is_dir = match &dst_root_entry {
+        Some(e) if e.kind == Kind::Dir => true,
+        Some(_) if srcs.len() > 1 => bail!("destination must be a directory when copying multiple sources"),
+        Some(_) => false,
+        None => srcs.len() > 1 || dst.copies_contents(),
+    };
+
+    if dst_root_entry.is_none() && dst_is_dir && !args.dry_run {
+        match ok(dst_ctl.call(Request::Apply(vec![Op::Mkdir { path: dst_root.clone(), mode: 0o755 }]))?, "mkdir")? {
+            Response::Applied(errs) => {
+                if let Some(e) = errs.into_iter().flatten().next() {
+                    bail!("{e}");
+                }
+            }
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+
+    let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
+    let progress = Progress::new(args.connections, show_progress, args.progress_json, args.quiet);
+    let ticker = progress.spawn_ticker();
+    let sched = Arc::new(Sched::new(block, min_split));
+
+    // Workers connect on their own threads so ssh sessions come up in parallel.
+    let mut workers = Vec::new();
+    if !opts.dry_run {
+        for id in 0..args.connections {
+            let (src_ep, dst_ep, sched, progress, opts) =
+                (src_ep.clone(), dst_ep.clone(), sched.clone(), progress.clone(), opts.clone());
+            let compress = args.compress;
+            workers.push(std::thread::spawn(move || -> Result<()> {
+                let mut w = Worker {
+                    id,
+                    src: src_ep.connect(compress)?,
+                    dst: dst_ep.connect(compress)?,
+                    sched,
+                    progress,
+                    opts,
+                };
+                w.run()
+            }));
+        }
+    }
+
+    let mut st = Planner {
+        dst: &mut *dst_ctl,
+        sched: &sched,
+        progress: &progress,
+        opts: &opts,
+        deferred: Vec::new(),
+        dirs_created: 0,
+        links_created: 0,
+        specials_created: 0,
+    };
+
+    let mut scan_err = None;
+    for src in srcs {
+        let src_root = src.path.as_bytes().to_vec();
+        let follow = src.copies_contents();
+        // A bare directory source goes to dest/basename even when dest doesn't
+        // exist yet; a non-directory source only does so when dest is a directory
+        // (decided once the root entry is seen).
+        let sub = if follow { String::new() } else { src.basename() };
+        if let Err(e) = st.scan_source(&mut *src_ctl, &src_root, follow, &sub, &dst_root, dst_is_dir) {
+            scan_err = Some(e);
+            break;
+        }
+    }
+    progress.scan_done.store(true, Relaxed);
+    sched.scan_done();
+    if let Some(e) = &scan_err {
+        progress.error(&format!("pcp: {e:#}"));
+        sched.abort();
+    }
+
+    for w in workers {
+        match w.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                progress.error(&format!("pcp: worker: {e:#}"));
+                sched.abort();
+            }
+            Err(_) => progress.error("pcp: worker thread panicked"),
+        }
+    }
+
+    let aborted = sched.is_aborted();
+    if !aborted && !opts.dry_run && !opts.verify_only {
+        st.apply_deferred()?;
+    }
+    drop(st);
+
+    progress.stop();
+    if let Some(t) = ticker {
+        let _ = t.join();
+    }
+    progress.clear();
+
+    let errors = progress.errors.load(Relaxed);
+    let elapsed = progress.start.elapsed().as_secs_f64();
+    let done = progress.bytes_done.load(Relaxed);
+    if !args.quiet {
+        if opts.verify_only {
+            println!(
+                "pcp: verified {} files, {} differ/missing, {} in {}",
+                commas(progress.files_done.load(Relaxed) + errors),
+                errors,
+                human(done),
+                crate::progress::hms(elapsed)
+            );
+        } else {
+            let verb = if opts.dry_run { "would transfer" } else { "transferred" };
+            println!(
+                "pcp: {} {} files ({}), {} unchanged ({} files), {} dirs{}{}",
+                verb,
+                commas(progress.files_done.load(Relaxed)),
+                human(if opts.dry_run { progress.bytes_total.load(Relaxed) } else { done }),
+                human(progress.bytes_skipped.load(Relaxed)),
+                commas(progress.files_skipped.load(Relaxed)),
+                commas(st_dirs(&progress)),
+                if opts.dry_run {
+                    String::new()
+                } else {
+                    format!(", {} at {}/s", crate::progress::hms(elapsed), human((done as f64 / elapsed.max(0.001)) as u64))
+                },
+                if errors > 0 { format!(", {errors} errors") } else { String::new() }
+            );
+        }
+        if args.stats {
+            println!(
+                "  scanned entries: {}\n  files to transfer: {}\n  files unchanged: {}\n  bytes transferred: {}\n  bytes unchanged: {}\n  elapsed: {:.2}s",
+                commas(progress.scanned.load(Relaxed)),
+                commas(progress.files_total.load(Relaxed)),
+                commas(progress.files_skipped.load(Relaxed)),
+                commas(done),
+                commas(progress.bytes_skipped.load(Relaxed)),
+                elapsed
+            );
+        }
+    }
+    Ok(if aborted {
+        1
+    } else if errors > 0 {
+        23
+    } else {
+        0
+    })
+}
+
+fn st_dirs(p: &Progress) -> u64 {
+    p.scanned.load(Relaxed).saturating_sub(p.files_total.load(Relaxed) + p.files_skipped.load(Relaxed))
+}
+
+fn stat_one(conn: &mut dyn Conn, path: &[u8]) -> Result<Option<Entry>> {
+    match ok(conn.call(Request::StatMany(vec![path.to_vec()]))?, "stat")? {
+        Response::Stats(mut v) => Ok(v.pop().flatten()),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn display(p: &[u8]) -> String {
+    String::from_utf8_lossy(p).into_owned()
+}
+
+struct Planner<'a> {
+    dst: &'a mut dyn Conn,
+    sched: &'a Sched,
+    progress: &'a Progress,
+    opts: &'a Opts,
+    /// (dst path, meta, flags, depth) for directories, applied deepest-first at the end.
+    deferred: Vec<(PathBytes, Meta, u8, usize)>,
+    dirs_created: u64,
+    links_created: u64,
+    specials_created: u64,
+}
+
+impl Planner<'_> {
+    fn scan_source(&mut self, src: &mut dyn Conn, src_root: &[u8], follow: bool, sub: &str, dst_root: &[u8], dst_is_dir: bool) -> Result<()> {
+        let mut first = true;
+        let mut sub = sub.to_string();
+        let progress = self.progress;
+        let recursive = self.opts.recursive;
+        src.scan(
+            src_root,
+            follow,
+            &mut |batch: Vec<Entry>| {
+                if first {
+                    first = false;
+                    if let Some(root) = batch.first() {
+                        if root.kind != Kind::Dir && !dst_is_dir {
+                            sub = String::new();
+                        }
+                        if root.kind == Kind::Dir && !recursive {
+                            progress.eprintln(&format!("skipping directory {}", display(src_root)));
+                            return Ok(());
+                        }
+                    }
+                }
+                progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                self.handle_batch(batch, src_root, &sub, dst_root)
+            },
+            &mut |w| progress.error(&format!("pcp: {w}")),
+        )
+    }
+
+    fn handle_batch(&mut self, batch: Vec<Entry>, src_root: &[u8], sub: &str, dst_root: &[u8]) -> Result<()> {
+        let opts = self.opts;
+        let sub_b = sub.as_bytes();
+        let mut mkdirs: Vec<Op> = Vec::new();
+        let mut dir_entries: Vec<(PathBytes, &Entry)> = Vec::new();
+        let mut others: Vec<(PathBytes, PathBytes, &Entry)> = Vec::new();
+        for e in &batch {
+            if e.kind == Kind::Dir && !opts.recursive {
+                continue;
+            }
+            let dst_rel = join(sub_b, &e.path);
+            let dst_path = join(dst_root, &dst_rel);
+            if e.kind == Kind::Dir {
+                mkdirs.push(Op::Mkdir { path: dst_path.clone(), mode: e.mode });
+                dir_entries.push((dst_path, e));
+            } else {
+                others.push((join(src_root, &e.path), dst_path, e));
+            }
+        }
+
+        if !dir_entries.is_empty() && !opts.dry_run && !opts.verify_only {
+            let stats = self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
+            let new_dirs: Vec<Op> = mkdirs
+                .into_iter()
+                .zip(stats.iter())
+                .filter(|(_, s)| !matches!(s, Some(e) if e.kind == Kind::Dir))
+                .map(|(op, _)| op)
+                .collect();
+            if !new_dirs.is_empty() {
+                let n = new_dirs.len();
+                let names: Vec<PathBytes> = new_dirs
+                    .iter()
+                    .map(|op| match op {
+                        Op::Mkdir { path, .. } => path.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                let errs = self.apply(true, new_dirs)?;
+                let mut failed = 0;
+                for (name, err) in names.iter().zip(errs) {
+                    if let Some(err) = err {
+                        failed += 1;
+                        self.progress.error(&format!("pcp: {err}"));
+                    } else if opts.verbose > 0 {
+                        self.progress.println(&format!("{}/", display(name)));
+                    }
+                }
+                self.dirs_created += (n - failed) as u64;
+            }
+            let mut flags = opts.flags;
+            if !opts.perms {
+                flags &= !flags::MODE;
+            }
+            for (p, e) in &dir_entries {
+                let depth = p.iter().filter(|&&c| c == b'/').count();
+                self.deferred.push((p.clone(), e.meta(), flags, depth));
+            }
+        } else if opts.dry_run && opts.verbose > 0 {
+            for (p, _) in &dir_entries {
+                self.progress.println(&format!("{}/", display(p)));
+            }
+        }
+
+        if others.is_empty() {
+            return Ok(());
+        }
+        let stats = self.stat_many(true, others.iter().map(|(_, d, _)| d.clone()).collect())?;
+        let mut ops: Vec<Op> = Vec::new();
+        let mut op_names: Vec<String> = Vec::new();
+        for ((src_path, dst_path, e), dst_entry) in others.into_iter().zip(stats) {
+            let rel = {
+                let r = join(sub_b, &e.path);
+                if r.is_empty() { display(src_root.rsplit(|&c| c == b'/').next().unwrap_or(src_root)) } else { display(&r) }
+            };
+            match e.kind {
+                Kind::File => {
+                    let same = dst_entry.as_ref().is_some_and(|d| {
+                        d.kind == Kind::File
+                            && d.size == e.size
+                            && (opts.flags & flags::TIMES != 0 && d.mtime == e.mtime)
+                    });
+                    if opts.verify_only {
+                        if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
+                            self.enqueue(src_path, dst_path, rel, e.clone(), dst_entry);
+                        } else {
+                            self.progress.error(&format!("MISSING {rel}"));
+                        }
+                    } else if same && !opts.checksum {
+                        self.progress.files_skipped.fetch_add(1, Relaxed);
+                        self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                    } else if opts.dry_run {
+                        self.progress.files_total.fetch_add(1, Relaxed);
+                        self.progress.bytes_total.fetch_add(e.size, Relaxed);
+                        self.progress.files_done.fetch_add(1, Relaxed);
+                        if opts.verbose > 0 {
+                            self.progress.println(&rel);
+                        }
+                    } else {
+                        self.enqueue(src_path, dst_path, rel, e.clone(), dst_entry);
+                    }
+                }
+                Kind::Symlink => {
+                    if !opts.links {
+                        if opts.verbose > 0 {
+                            self.progress.eprintln(&format!("skipping non-regular file \"{rel}\""));
+                        }
+                        continue;
+                    }
+                    let target = e.link.clone().unwrap_or_default();
+                    let same = dst_entry.as_ref().is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
+                    if same || opts.verify_only {
+                        continue;
+                    }
+                    if opts.dry_run {
+                        if opts.verbose > 0 {
+                            self.progress.println(&format!("{rel} -> {}", display(&target)));
+                        }
+                        continue;
+                    }
+                    op_names.push(format!("{rel} -> {}", display(&target)));
+                    ops.push(Op::Symlink { path: dst_path.clone(), target });
+                    ops.push(Op::SetMeta { path: dst_path, meta: e.meta(), flags: opts.flags & !flags::MODE });
+                    self.links_created += 1;
+                }
+                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
+                    if !opts.devices {
+                        if opts.verbose > 0 {
+                            self.progress.eprintln(&format!("skipping non-regular file \"{rel}\""));
+                        }
+                        continue;
+                    }
+                    let same = dst_entry.as_ref().is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
+                    if same || opts.verify_only || opts.dry_run {
+                        if opts.dry_run && !same && opts.verbose > 0 {
+                            self.progress.println(&rel);
+                        }
+                        continue;
+                    }
+                    op_names.push(rel);
+                    ops.push(Op::Mknod { path: dst_path.clone(), mode: e.mode, rdev: e.rdev });
+                    ops.push(Op::SetMeta { path: dst_path, meta: e.meta(), flags: opts.flags });
+                    self.specials_created += 1;
+                }
+                Kind::Dir | Kind::Other => {}
+            }
+        }
+        if !ops.is_empty() {
+            let errs = self.apply(true, ops)?;
+            // Two ops per item: creation then metadata.
+            for (i, name) in op_names.iter().enumerate() {
+                let e1 = errs.get(2 * i).cloned().flatten();
+                let e2 = errs.get(2 * i + 1).cloned().flatten();
+                if let Some(e) = e1.or(e2) {
+                    self.progress.error(&format!("pcp: {e}"));
+                } else if opts.verbose > 0 {
+                    self.progress.println(name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue(&mut self, src: PathBytes, dst: PathBytes, rel: String, entry: Entry, dst_entry: Option<Entry>) {
+        self.progress.files_total.fetch_add(1, Relaxed);
+        self.progress.bytes_total.fetch_add(entry.size, Relaxed);
+        self.sched.push_file(FileJob { src, dst, rel, entry, dst_entry, attempts: 0, done: Arc::new(AtomicU64::new(0)) });
+    }
+
+    fn stat_many(&mut self, _on_dst: bool, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
+        match ok(self.dst.call(Request::StatMany(paths))?, "stat")? {
+            Response::Stats(v) => Ok(v),
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+
+    fn apply(&mut self, _on_dst: bool, ops: Vec<Op>) -> Result<Vec<Option<String>>> {
+        match ok(self.dst.call(Request::Apply(ops))?, "apply")? {
+            Response::Applied(v) => Ok(v),
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+
+    fn apply_deferred(&mut self) -> Result<()> {
+        let mut d = std::mem::take(&mut self.deferred);
+        d.sort_by(|a, b| b.3.cmp(&a.3));
+        for chunk in d.chunks(1000) {
+            let ops: Vec<Op> = chunk
+                .iter()
+                .map(|(p, m, f, _)| Op::SetMeta { path: p.clone(), meta: *m, flags: *f })
+                .collect();
+            for err in self.apply(true, ops)?.into_iter().flatten() {
+                self.progress.error(&format!("pcp: {err}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct Worker {
+    id: usize,
+    src: Box<dyn Conn>,
+    dst: Box<dyn Conn>,
+    sched: Arc<Sched>,
+    progress: Arc<Progress>,
+    opts: Arc<Opts>,
+}
+
+impl Worker {
+    fn run(&mut self) -> Result<()> {
+        loop {
+            match self.sched.next() {
+                Item::Exit => return Ok(()),
+                Item::File(idx) => {
+                    let res = if self.opts.verify_only { self.verify_file(idx) } else { self.handle_file(idx) };
+                    if let Err(e) = res {
+                        self.file_error(idx, e)?;
+                    }
+                }
+                Item::Range(h) => {
+                    let idx = h.lock().unwrap().idx;
+                    let res = self.transfer_range(&h);
+                    if let Err(e) = res {
+                        self.file_error(idx, e)?;
+                    }
+                    if self.sched.range_done(&h) {
+                        if let Err(e) = self.finish_file(idx) {
+                            self.file_error(idx, e)?;
+                        }
+                    }
+                }
+            }
+            self.progress.set_worker(self.id, None);
+        }
+    }
+
+    fn file_error(&mut self, idx: usize, e: anyhow::Error) -> Result<()> {
+        if self.src.is_dead() || self.dst.is_dead() {
+            return Err(e);
+        }
+        if !self.sched.is_failed(idx) {
+            let rel = self.sched.jobs.lock().unwrap()[idx].rel.clone();
+            self.progress.error(&format!("pcp: {rel}: {e:#}"));
+            self.sched.fail_file(idx);
+        }
+        Ok(())
+    }
+
+    fn job(&self, idx: usize) -> FileJob {
+        self.sched.jobs.lock().unwrap()[idx].clone()
+    }
+
+    fn handle_file(&mut self, idx: usize) -> Result<()> {
+        let job = self.job(idx);
+        let size = job.entry.size;
+        let opts = self.opts.clone();
+        self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: size }));
+
+        let planned: Result<Vec<(u64, u64)>> = (|| {
+            let (partial_size, final_entry) = match ok(self.dst.call(Request::Probe { path: job.dst.clone() })?, "probe")? {
+                Response::Probed { partial_size, final_entry } => (partial_size, final_entry),
+                other => bail!("unexpected response {other:?}"),
+            };
+            if let Some(f) = &final_entry {
+                if f.kind == Kind::Dir {
+                    bail!("destination is a directory");
+                }
+            }
+            let final_is_file = final_entry.as_ref().is_some_and(|f| f.kind == Kind::File);
+            let full = || if size > 0 { vec![(0, size)] } else { vec![] };
+
+            if opts.inplace {
+                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: true, from_final: false })?, "prepare")?;
+                if final_is_file && size > 0 {
+                    return self.diff_blocks(&job, Which::Final);
+                }
+                return Ok(full());
+            }
+            if partial_size.is_some() {
+                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: false })?, "prepare")?;
+                if size == 0 {
+                    return Ok(vec![]);
+                }
+                return self.diff_blocks(&job, Which::Partial);
+            }
+            if final_is_file && (size > 0 && final_entry.as_ref().unwrap().size > 0 || size == 0) {
+                let ranges = if size > 0 { self.diff_blocks(&job, Which::Final)? } else { vec![] };
+                if ranges.is_empty() && final_entry.as_ref().unwrap().size == size {
+                    // Content identical: just fix up metadata.
+                    let flags = self.final_flags(&job);
+                    let errs = match ok(self.dst.call(Request::Apply(vec![Op::SetMeta { path: job.dst.clone(), meta: job.entry.meta(), flags }]))?, "setmeta")? {
+                        Response::Applied(v) => v,
+                        other => bail!("unexpected response {other:?}"),
+                    };
+                    if let Some(e) = errs.into_iter().flatten().next() {
+                        bail!("{e}");
+                    }
+                    return Ok(vec![]);
+                }
+                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: true })?, "prepare")?;
+                return Ok(ranges);
+            }
+            ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: false })?, "prepare")?;
+            Ok(full())
+        })();
+
+        let ranges = match planned {
+            Ok(r) => r,
+            Err(e) => {
+                self.sched.ranges_ready(idx, vec![]);
+                return Err(e);
+            }
+        };
+        let to_send: u64 = ranges.iter().map(|(o, e)| e - o).sum();
+        job.done.store(size - to_send, Relaxed);
+        self.progress.bytes_skipped.fetch_add(size - to_send, Relaxed);
+        self.progress.bytes_total.fetch_sub(size - to_send, Relaxed);
+        let metadata_only = ranges.is_empty() && to_send == 0 && !opts.inplace
+            && matches!(self.sched.jobs.lock().unwrap()[idx].dst_entry, Some(Entry { kind: Kind::File, .. }))
+            && !self.probe_left_partial(&job)?;
+
+        match self.sched.ranges_ready(idx, ranges) {
+            Some(h) => {
+                let res = self.transfer_range(&h);
+                if let Err(e) = res {
+                    self.file_error(idx, e)?;
+                }
+                if self.sched.range_done(&h) {
+                    self.finish_file(idx)?;
+                }
+            }
+            None => {
+                if metadata_only {
+                    self.progress.files_total.fetch_sub(1, Relaxed);
+                    self.progress.files_skipped.fetch_add(1, Relaxed);
+                } else {
+                    self.finish_file(idx)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a partial file exists for this job on the destination.
+    fn probe_left_partial(&mut self, job: &FileJob) -> Result<bool> {
+        match ok(self.dst.call(Request::Probe { path: job.dst.clone() })?, "probe")? {
+            Response::Probed { partial_size, .. } => Ok(partial_size.is_some()),
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+
+    fn final_flags(&self, job: &FileJob) -> u8 {
+        let mut flags = self.opts.flags;
+        if !self.opts.perms && matches!(job.dst_entry, Some(Entry { kind: Kind::File, .. })) {
+            flags &= !flags::MODE;
+        }
+        flags
+    }
+
+    /// Hash blocks on both sides (in parallel) and return the ranges that differ.
+    fn diff_blocks(&mut self, job: &FileJob, which: Which) -> Result<Vec<(u64, u64)>> {
+        let block = self.opts.block;
+        let size = job.entry.size;
+        self.src.send(Request::HashBlocks { path: job.src.clone(), which: Which::Final, block, len: size })?;
+        self.dst.send(Request::HashBlocks { path: job.dst.clone(), which, block, len: size })?;
+        let sh = match ok(self.src.recv()?, "hash source")? {
+            Response::Hashes(h) => h,
+            other => bail!("unexpected response {other:?}"),
+        };
+        let dh = match ok(self.dst.recv()?, "hash destination")? {
+            Response::Hashes(h) => h,
+            other => bail!("unexpected response {other:?}"),
+        };
+        let n = size.div_ceil(block) as usize;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for i in 0..n {
+            let same = sh.get(i).is_some() && sh.get(i) == dh.get(i);
+            if same {
+                continue;
+            }
+            let off = i as u64 * block;
+            let end = (off + block).min(size);
+            match ranges.last_mut() {
+                Some(last) if last.1 == off => last.1 = end,
+                _ => ranges.push((off, end)),
+            }
+        }
+        Ok(ranges)
+    }
+
+    fn transfer_range(&mut self, h: &RangeHandle) -> Result<()> {
+        let (idx, start, end0) = {
+            let g = h.lock().unwrap();
+            (g.idx, g.pos, g.end)
+        };
+        let job = self.job(idx);
+        if self.sched.is_failed(idx) {
+            return Ok(());
+        }
+        let _ = (start, end0);
+        self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: job.entry.size }));
+        let block = self.opts.block;
+        let inplace = self.opts.inplace;
+        let mut reads_out = 0usize;
+        let mut writes_out = 0usize;
+        loop {
+            while reads_out < WINDOW {
+                let (off, n) = {
+                    let mut g = h.lock().unwrap();
+                    if g.pos >= g.end {
+                        break;
+                    }
+                    let n = (g.end - g.pos).min(block);
+                    let off = g.pos;
+                    g.pos += n;
+                    (off, n)
+                };
+                self.src.send(Request::ReadRange { path: job.src.clone(), off, len: n as u32 })?;
+                reads_out += 1;
+            }
+            if reads_out == 0 {
+                break;
+            }
+            let (off, hash, data) = match ok(self.src.recv()?, "read")? {
+                Response::Block { off, hash, data } => (off, hash, data),
+                other => bail!("unexpected response {other:?}"),
+            };
+            reads_out -= 1;
+            if xxh3_64(&data) != hash {
+                bail!("block hash mismatch on read @{off}");
+            }
+            let n = data.len() as u64;
+            self.dst.send(Request::WriteRange { path: job.dst.clone(), inplace, off, hash, data })?;
+            writes_out += 1;
+            if writes_out >= WINDOW {
+                ok(self.dst.recv()?, "write")?;
+                writes_out -= 1;
+            }
+            self.progress.add_bytes(n);
+            job.done.fetch_add(n, Relaxed);
+        }
+        while writes_out > 0 {
+            ok(self.dst.recv()?, "write")?;
+            writes_out -= 1;
+        }
+        Ok(())
+    }
+
+    fn finish_file(&mut self, idx: usize) -> Result<()> {
+        if self.sched.is_failed(idx) {
+            return Ok(());
+        }
+        let job = self.job(idx);
+        let flags = self.final_flags(&job);
+        let mut meta = job.entry.meta();
+        if !self.opts.perms {
+            meta.mode = job.entry.mode & 0o777 & !self.opts.umask;
+        }
+        ok(
+            self.dst.call(Request::Finalize { path: job.dst.clone(), inplace: self.opts.inplace, meta, flags: flags | if self.opts.perms { 0 } else { flags::MODE } })?,
+            "finalize",
+        )?;
+        // Did the source change under us?
+        let now = stat_one(&mut *self.src, &job.src)?;
+        let changed = match &now {
+            Some(e) => e.kind != Kind::File || e.size != job.entry.size || e.mtime != job.entry.mtime || e.mtime_nsec != job.entry.mtime_nsec,
+            None => true,
+        };
+        if changed {
+            if job.attempts + 1 < MAX_ATTEMPTS {
+                if let Some(e) = now {
+                    self.progress.eprintln(&format!("pcp: {}: changed during transfer, retrying", job.rel));
+                    let mut jobs = self.sched.jobs.lock().unwrap();
+                    let j = &mut jobs[idx];
+                    self.progress.bytes_total.fetch_add(e.size, Relaxed);
+                    j.entry = Entry { path: j.entry.path.clone(), ..e };
+                    j.attempts += 1;
+                    j.dst_entry = Some(j.entry.clone());
+                    j.done.store(0, Relaxed);
+                    drop(jobs);
+                    self.sched.requeue(idx);
+                    return Ok(());
+                }
+            }
+            bail!("source changed during transfer (or vanished)");
+        }
+        self.progress.files_done.fetch_add(1, Relaxed);
+        if self.opts.verbose > 0 {
+            self.progress.println(&job.rel);
+        }
+        Ok(())
+    }
+
+    fn verify_file(&mut self, idx: usize) -> Result<()> {
+        let job = self.job(idx);
+        self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: job.entry.size }));
+        let r = (|| -> Result<bool> {
+            self.src.send(Request::FileHash { path: job.src.clone() })?;
+            self.dst.send(Request::FileHash { path: job.dst.clone() })?;
+            let a = ok(self.src.recv()?, "hash source")?;
+            let b = ok(self.dst.recv()?, "hash destination")?;
+            match (a, b) {
+                (Response::FileHash { size: s1, hash: h1 }, Response::FileHash { size: s2, hash: h2 }) => Ok(s1 == s2 && h1 == h2),
+                (a, b) => bail!("unexpected responses {a:?} {b:?}"),
+            }
+        })();
+        self.sched.ranges_ready(idx, vec![]);
+        self.progress.add_bytes(job.entry.size);
+        job.done.store(job.entry.size, Relaxed);
+        match r {
+            Ok(true) => {
+                self.progress.files_done.fetch_add(1, Relaxed);
+                if self.opts.verbose > 0 {
+                    self.progress.println(&format!("ok      {}", job.rel));
+                }
+            }
+            Ok(false) => {
+                self.progress.error(&format!("DIFFERS {}", job.rel));
+                self.sched.fail_file(idx);
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+}
+
