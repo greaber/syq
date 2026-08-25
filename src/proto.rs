@@ -6,7 +6,7 @@
 //! independently whether to compress, readers always accept both.
 
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub const VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
@@ -189,10 +189,5 @@ impl<R: Read> FrameReader<R> {
             body
         };
         postcard::from_bytes(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    /// True if the underlying stream is at EOF (peer closed).
-    pub fn at_eof(&mut self) -> bool {
-        matches!(self.r.fill_buf(), Ok(b) if b.is_empty())
     }
 }

@@ -16,7 +16,7 @@ pub struct WorkerStatus {
 pub struct Progress {
     pub enabled: bool,
     pub json: bool,
-    pub quiet: bool,
+    pub width: Option<usize>,
     pub bytes_total: AtomicU64,
     pub bytes_done: AtomicU64,
     pub bytes_skipped: AtomicU64,
@@ -39,11 +39,11 @@ struct TermState {
 }
 
 impl Progress {
-    pub fn new(n_workers: usize, enabled: bool, json: bool, quiet: bool) -> Arc<Self> {
+    pub fn new(n_workers: usize, enabled: bool, force: bool, width: Option<usize>, json: bool) -> Arc<Self> {
         Arc::new(Progress {
-            enabled: enabled && std::io::stderr().is_terminal(),
+            enabled: enabled && (force || std::io::stderr().is_terminal()),
             json,
-            quiet,
+            width,
             bytes_total: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
             bytes_skipped: AtomicU64::new(0),
@@ -141,7 +141,7 @@ impl Progress {
             return;
         }
         self.erase(&mut t);
-        let width = term_width();
+        let width = self.width.unwrap_or_else(term_width);
         let mut lines = Vec::new();
         let pct = if total > 0 { done * 100 / total } else { 0 };
         let mut head = format!(
@@ -160,12 +160,21 @@ impl Progress {
             head.push_str(&format!("  scanning: {} entries", self.scanned.load(Relaxed)));
         }
         lines.push(head);
+        // One line per file in flight; several workers may share a file.
+        let mut seen: Vec<(String, u64, u64, usize)> = Vec::new();
         for w in self.workers.lock().unwrap().iter().flatten() {
-            let done = w.done.load(Relaxed).min(w.total);
-            let pct = if w.total > 0 { done * 100 / w.total } else { 100 };
+            match seen.iter_mut().find(|s| s.0 == w.path) {
+                Some(s) => s.3 += 1,
+                None => seen.push((w.path.clone(), w.done.load(Relaxed), w.total, 1)),
+            }
+        }
+        for (path, done, total, n) in seen {
+            let done = done.min(total);
+            let pct = if total > 0 { done * 100 / total } else { 100 };
             let prefix = format!("  {pct:>3}% ");
-            let room = width.saturating_sub(prefix.len() + 1);
-            lines.push(format!("{prefix}{}", truncate(&w.path, room)));
+            let suffix = if n > 1 { format!("  ×{n}") } else { String::new() };
+            let room = width.saturating_sub(prefix.len() + suffix.len() + 1);
+            lines.push(format!("{prefix}{}{suffix}", truncate(&path, room)));
         }
         let mut err = std::io::stderr().lock();
         for l in &lines {
@@ -199,7 +208,7 @@ impl Progress {
     }
 }
 
-fn term_width() -> usize {
+pub fn term_width() -> usize {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::ioctl(2, libc::TIOCGWINSZ, &mut ws) };
     if r == 0 && ws.ws_col > 0 {

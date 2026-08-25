@@ -1,6 +1,6 @@
 # pcp — parallel copy with an rsync-shaped interface
 
-**Status:** design only, nothing implemented yet.
+**Status:** implemented through milestone 5's direct remote→remote mode; see README.md for usage. Remaining from the plan: `--bwlimit`, `--exclude` globs, `--delete`.
 
 ## Goal
 

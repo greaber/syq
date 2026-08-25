@@ -75,8 +75,13 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
-    if src_ep.is_remote() && dst_ep.is_remote() && !args.quiet {
-        eprintln!("pcp: remote-to-remote transfer: relaying data through this machine");
+    if src_ep.is_remote() && dst_ep.is_remote() {
+        if !args.relay {
+            return crate::direct::run(&args, srcs, dst);
+        }
+        if !args.quiet {
+            eprintln!("pcp: remote-to-remote transfer: relaying data through this machine");
+        }
     }
 
     let opts = Arc::new(Opts {
@@ -118,7 +123,7 @@ pub fn run(args: Args) -> Result<i32> {
     }
 
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(args.connections, show_progress, args.progress_json, args.quiet);
+    let progress = Progress::new(args.connections, show_progress, args.progress, args.width, args.progress_json);
     let ticker = progress.spawn_ticker();
     let sched = Arc::new(Sched::new(block, min_split));
 

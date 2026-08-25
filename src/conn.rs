@@ -244,10 +244,4 @@ impl Endpoint {
         }
     }
 
-    pub fn label(&self) -> String {
-        match self {
-            Endpoint::Local => "local".into(),
-            Endpoint::Remote(s) => s.label(),
-        }
-    }
 }

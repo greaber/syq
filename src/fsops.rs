@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -487,9 +487,4 @@ fn apply_owner(flags: u8, meta: &Meta, chown: impl Fn(Option<u32>, Option<u32>) 
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied && uid.is_none() => Ok(()),
         Err(e) => Err(e.into()),
     }
-}
-
-/// Convenience for the client: seek-free size check helper.
-pub fn file_len(f: &mut File) -> io::Result<u64> {
-    f.seek(SeekFrom::End(0))
 }
