@@ -256,6 +256,16 @@ NFS, where every unlink is a round trip, `-j32` removed 20,000 files in 2.5 s
 versus 9.7 s for `rm -rf`; on a local SSD `rm -rf` is already fast and pcp is
 no faster.
 
+## Same-machine copies (copy_file_range)
+
+When source and destination are on the same machine, pcp copies each file with
+`copy_file_range(2)` instead of streaming bytes through userspace: the kernel
+does a reflink or a straight in-kernel copy, and on NFS 4.2 the *server* copies
+the file internally (no client round trip). Measured: a single 8 GB file
+/raid→/raid at 24.8 GB/s vs 2.5 GB/s for `cp`; NFS→NFS at 3.3 GB/s vs 0.4.
+Hashing is skipped on this path (there's no wire to corrupt it); `-c` and any
+existing partial fall back to the streaming path, which keeps hash-based resume.
+
 ## NFS
 
 Local↔NFS copies are a local→local pcp run (`pcp -a -j16 /raid/x /mnt/nfs/x`)

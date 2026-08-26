@@ -323,6 +323,71 @@ impl FsOps {
         Ok(())
     }
 
+    /// Copy a whole file in the kernel via copy_file_range. Falls back with a
+    /// distinct "EXDEV" error when the kernel can't offload (different mounts
+    /// without server-side copy, or an unsupported filesystem) so the caller
+    /// can use the normal streaming path.
+    #[cfg(target_os = "linux")]
+    pub fn copy_local(&mut self, src: &[u8], dst: &[u8], inplace: bool, size: u64, mode: u32) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let sp = resolve(src);
+        let s = File::open(&sp).with_context(|| format!("open {}", sp.display()))?;
+        let dp = resolve(dst);
+        self.uncache(&dp);
+        let target = if inplace { dp.clone() } else { partial_path(&dp) };
+        self.uncache(&target);
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                fs::create_dir_all(parent).ok();
+            }
+        }
+        let d = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode & 0o7777)
+            .open(&target)
+            .with_context(|| format!("create {}", target.display()))?;
+        let mut off: i64 = 0;
+        let mut remaining = size;
+        while remaining > 0 {
+            let n = unsafe {
+                libc::copy_file_range(
+                    s.as_raw_fd(),
+                    &mut off as *mut i64 as *mut _,
+                    d.as_raw_fd(),
+                    &mut off as *mut i64 as *mut _,
+                    remaining as usize,
+                    0,
+                )
+            };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                let raw = e.raw_os_error().unwrap_or(0);
+                // First-block failure with a "can't offload" errno: signal fallback.
+                if remaining == size && matches!(raw, libc::EXDEV | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) {
+                    drop(d);
+                    let _ = fs::remove_file(&target);
+                    bail!("EXDEV");
+                }
+                if raw == libc::EINTR {
+                    continue;
+                }
+                return Err(e).with_context(|| format!("copy_file_range {} -> {}", sp.display(), target.display()));
+            }
+            if n == 0 {
+                break; // source shorter than expected; finalize what we have
+            }
+            remaining -= n as u64;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn copy_local(&mut self, _src: &[u8], _dst: &[u8], _inplace: bool, _size: u64, _mode: u32) -> Result<()> {
+        bail!("EXDEV")
+    }
+
     pub fn hash_blocks(&mut self, path: &[u8], which: Which, block: u64, len: u64) -> Result<Vec<u64>> {
         let p = resolve(path);
         let p = if which == Which::Partial { partial_path(&p) } else { p };
@@ -423,6 +488,9 @@ impl FsOps {
             Request::Probe { path } => self.probe(path),
             Request::Prepare { path, size, inplace, from_final, mode } => {
                 self.prepare(path, *size, *inplace, *from_final, *mode).map(|_| Response::Ok)
+            }
+            Request::CopyLocal { src, dst, inplace, size, mode } => {
+                self.copy_local(src, dst, *inplace, *size, *mode).map(|_| Response::Ok)
             }
             Request::HashBlocks { path, which, block, len } => {
                 self.hash_blocks(path, *which, *block, *len).map(Response::Hashes)

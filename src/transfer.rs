@@ -28,6 +28,7 @@ pub struct Opts {
     pub verify_only: bool,
     pub inplace: bool,
     pub atomic: bool,
+    pub same_host: bool,
     pub dry_run: bool,
     pub verbose: u8,
     pub umask: u32,
@@ -99,8 +100,10 @@ pub fn run(args: Args) -> Result<i32> {
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
     if args.connections_default && !src_ep.is_remote() && !dst_ep.is_remote() {
-        // Local threads are cheap and network filesystems want the concurrency.
-        args.connections = LOCAL_DEFAULT_CONNECTIONS;
+        // Local threads are cheap and network filesystems want the concurrency,
+        // but don't oversubscribe a small machine (a laptop shouldn't spawn 32).
+        let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        args.connections = ncpu.clamp(4, LOCAL_DEFAULT_CONNECTIONS);
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
@@ -122,6 +125,7 @@ pub fn run(args: Args) -> Result<i32> {
         verify_only: args.verify_only,
         inplace: args.inplace,
         atomic: args.atomic,
+        same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         dry_run: args.dry_run,
         verbose: args.verbose,
         umask: read_umask(),
@@ -798,6 +802,18 @@ impl Worker {
         self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: size }));
 
         let mut inplace = self.opts.inplace;
+        // Same-machine copy: let the kernel move the bytes (reflink / NFS
+        // server-side copy) instead of streaming them through userspace.
+        if self.opts.same_host && !self.opts.checksum && job.entry.size > 0 {
+            match self.try_copy_local(idx, &job) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {} // not offloadable — fall through to streaming
+                Err(e) => {
+                    self.sched.ranges_ready(idx, vec![]);
+                    return Err(e);
+                }
+            }
+        }
         let planned: Result<Vec<(u64, u64)>> = (|| {
             let (partial_size, final_entry) = match ok(self.dst.call(Request::Probe { path: job.dst.clone() })?, "probe")? {
                 Response::Probed { partial_size, final_entry } => (partial_size, final_entry),
@@ -902,6 +918,44 @@ impl Worker {
     /// finalize agree.
     fn set_inplace(&self, idx: usize, v: bool) {
         self.sched.jobs.lock().unwrap()[idx].inplace = v;
+    }
+
+    /// Attempt an in-kernel same-host copy. Ok(true) = done; Ok(false) =
+    /// kernel can't offload, caller should stream; Err = real failure.
+    fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
+        // If a partial exists, prefer the streaming path so its hash-based
+        // resume reuses the bytes already on disk; copy_file_range would
+        // discard them and recopy the whole file.
+        let partial = match ok(self.dst.call(Request::Probe { path: job.dst.clone() })?, "probe")? {
+            Response::Probed { partial_size, .. } => partial_size.is_some(),
+            _ => false,
+        };
+        if partial {
+            return Ok(false);
+        }
+        let inplace = self.opts.inplace || job.dst_entry.is_none();
+        self.set_inplace(idx, inplace);
+        let mode = self.create_mode(job);
+        let resp = self.dst.call(Request::CopyLocal {
+            src: job.src.clone(),
+            dst: job.dst.clone(),
+            inplace,
+            size: job.entry.size,
+            mode,
+        })?;
+        match resp {
+            Response::Ok => {
+                self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: job.entry.size }));
+                self.progress.add_bytes(job.entry.size);
+                job.done.store(job.entry.size, Relaxed);
+                self.sched.ranges_ready(idx, vec![]);
+                self.finish_file(idx)?;
+                Ok(true)
+            }
+            Response::Err(e) if e.contains("EXDEV") => Ok(false),
+            Response::Err(e) => bail!("{e}"),
+            other => bail!("unexpected response {other:?}"),
+        }
     }
 
     /// Mode a new destination file is created with (what finalize will want).
