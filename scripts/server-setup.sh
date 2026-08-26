@@ -2,9 +2,10 @@
 # server-setup.sh — one idempotent script for everything pcp/RoCE needs on a
 # Japanese GPU host. Run as root; rerun any time (it only changes what differs).
 #
+#   sudo ./server-setup.sh plan      # print exactly what `apply` would change here
 #   sudo ./server-setup.sh apply     # do everything below
 #   sudo ./server-setup.sh status    # show what is / isn't in place (no changes)
-#   sudo ./server-setup.sh undo      # remove everything this script added
+#   sudo ./server-setup.sh undo      # best-effort removal of everything this script added
 #
 # What `apply` does (each step is skipped when already done):
 #   1. TCP tuning for long-RTT transfers: 64 MB socket buffers, BBR, fq.
@@ -16,8 +17,9 @@
 #   4. RoCE: bring the ConnectX ports up; if any have link, give each an
 #      address 192.168.<100+N>.<host octet>/24 with MTU 9000 via
 #      /etc/netplan/60-roce.yaml and allow all traffic on those interfaces.
-#      Ports without a cable are left alone, so this is a no-op on hosts that
-#      aren't wired yet (rerun once they are).
+#      Addresses are set live with `ip`; the yaml is only generated (never
+#      `netplan apply`, which would re-touch bond0). Ports without a cable are
+#      left alone, so this is a no-op on hosts that aren't wired yet.
 #
 # Everything this script writes carries a "pcp-setup" marker so `undo` can
 # find it. Nothing here touches bond0, NFS mounts, or existing ufw rules.
@@ -32,14 +34,21 @@ PCP_PORTS=47600:47699
 ROCE_SUBNET_BASE=100
 MARK=pcp-setup
 
-SYSCTL_FILE=/etc/sysctl.d/90-pcp-net.conf
-MODULES_FILE=/etc/modules-load.d/pcp-bbr.conf
-SSHD_FILE=/etc/ssh/sshd_config.d/60-pcp.conf
-NETPLAN_FILE=/etc/netplan/60-roce.yaml
+ETC=${PCP_SETUP_ETC:-/etc}           # overridable for testing only
+SYSCTL_FILE=$ETC/sysctl.d/90-pcp-net.conf
+OLD_SYSCTL_FILE=$ETC/sysctl.d/99-net.conf
+MODULES_FILE=$ETC/modules-load.d/pcp-bbr.conf
+SSHD_FILE=$ETC/ssh/sshd_config.d/60-pcp.conf
+NETPLAN_FILE=$ETC/netplan/60-roce.yaml
 
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "  $*"; }
 need_root() { [ "$(id -u)" = 0 ] || die "run as root: sudo $0 $*"; }
+DRY=0
+# Every command that changes the system goes through run(); `plan` just prints them.
+run() { if [ "$DRY" = 1 ]; then echo "    would run: $*"; else "$@"; fi; }
+# Same for file writes: write_file PATH <<EOF ... EOF
+write_file() { if [ "$DRY" = 1 ]; then echo "    would write: $1"; sed 's/^/      | /'; else cat > "$1"; fi; }
 
 # ---- 1. sysctl -----------------------------------------------------------------
 sysctl_wanted() {
@@ -61,14 +70,16 @@ sysctl_status() {
 }
 sysctl_apply() {
   # Absorb the hand-made file from the first round (same settings, broken comment).
-  if [ -f /etc/sysctl.d/99-net.conf ] && grep -q "tcp_congestion_control" /etc/sysctl.d/99-net.conf; then
-    rm -f /etc/sysctl.d/99-net.conf; say "sysctl: removed hand-made /etc/sysctl.d/99-net.conf (superseded)"
+  if [ -f $OLD_SYSCTL_FILE ] && grep -q "tcp_congestion_control" $OLD_SYSCTL_FILE; then
+    run rm -f $OLD_SYSCTL_FILE; say "sysctl: hand-made $OLD_SYSCTL_FILE removed (same settings now live in $SYSCTL_FILE)"
+  fi
+  if [ ! -f $MODULES_FILE ]; then
+    echo tcp_bbr | write_file $MODULES_FILE; say "sysctl: tcp_bbr added to modules-load (BBR survives reboot)"
   fi
   if ! sysctl_status >/dev/null 2>&1 || ! diff -q <(sysctl_wanted) $SYSCTL_FILE >/dev/null 2>&1; then
-    echo tcp_bbr > $MODULES_FILE
-    modprobe tcp_bbr
-    sysctl_wanted > $SYSCTL_FILE
-    sysctl -q --system >/dev/null
+    run modprobe tcp_bbr
+    sysctl_wanted | write_file $SYSCTL_FILE
+    run sysctl -q --system >/dev/null
     say "sysctl: applied"
   else
     say "sysctl: already in place"
@@ -89,10 +100,10 @@ sshd_status() {
   [ "$v" = "100:30:200" ]
 }
 sshd_apply() {
-  if sshd_status >/dev/null 2>&1; then say "sshd: already in place"; return; fi
-  printf '# %s\nMaxStartups 100:30:200\n' "$MARK" > $SSHD_FILE
-  sshd -t && systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-  say "sshd: applied (MaxStartups 100:30:200)"
+  if [ -f $SSHD_FILE ] && sshd_status >/dev/null 2>&1; then say "sshd: already in place"; return; fi
+  printf '# %s\nMaxStartups 100:30:200\n' "$MARK" | write_file $SSHD_FILE
+  if [ "$DRY" = 0 ]; then sshd -t && { systemctl reload ssh 2>/dev/null || systemctl reload sshd; }; else echo "    would run: sshd -t && systemctl reload ssh"; fi
+  say "sshd: applied (MaxStartups 100:30:200 via $SSHD_FILE; an existing line in sshd_config is harmless — the Include comes first)"
 }
 sshd_undo() {
   rm -f $SSHD_FILE
@@ -102,8 +113,15 @@ sshd_undo() {
 
 # ---- 3. ufw --------------------------------------------------------------------
 ufw_sources() { echo "$CLUSTER_LAN"; printf '%s\n' "${CLUSTER_PUBLIC[@]}" "${CLIENTS[@]}"; }
-ufw_active() { command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; }
-ufw_has() { ufw status | grep -qE "^$PCP_PORTS/tcp +ALLOW IN +$1( |$)"; }
+UFW_STATUS=""
+ufw_active() {
+  command -v ufw >/dev/null || return 1
+  [ -n "$UFW_STATUS" ] || UFW_STATUS=$(ufw status verbose 2>/dev/null || true)
+  grep -q "Status: active" <<<"$UFW_STATUS"
+}
+# `ufw status verbose` always prints the direction ("ALLOW IN"); plain status doesn't.
+ufw_has() { grep -qE "^$PCP_PORTS/tcp +ALLOW IN +$1( |$)" <<<"$UFW_STATUS"; }
+ufw_has_iface() { grep -qE "^Anywhere on $1 +ALLOW IN" <<<"$UFW_STATUS"; }
 ufw_status() {
   if ! ufw_active; then say "ufw: inactive (nothing to do)"; return 0; fi
   local ok=0 missing=""
@@ -115,7 +133,7 @@ ufw_apply() {
   if ! ufw_active; then say "ufw: inactive, skipping"; return; fi
   for s in $(ufw_sources); do
     if ufw_has "$s"; then continue; fi
-    ufw allow from "$s" to any port "$PCP_PORTS" proto tcp comment "$MARK pcp data" >/dev/null
+    run ufw allow from "$s" to any port "$PCP_PORTS" proto tcp comment "$MARK pcp data" >/dev/null
     say "ufw: allowed $PCP_PORTS/tcp from $s"
   done
   say "ufw: done"
@@ -124,9 +142,8 @@ ufw_undo() {
   ufw_active || return 0
   # Delete every pcp port-range rule, marked or hand-made (highest number first
   # so the numbering stays valid while deleting).
-  ufw status numbered | grep -E "$PCP_PORTS/tcp|$MARK" | sed -E 's/^\[ *([0-9]+)\].*/\1/' | sort -rn | while read -r n; do
-    yes | ufw delete "$n" >/dev/null
-  done
+  local nums; nums=$( (ufw status numbered || true) | grep -E "$PCP_PORTS/tcp|$MARK" | sed -E 's/^\[ *([0-9]+)\].*/\1/' | sort -rn)
+  for n in $nums; do yes | ufw delete "$n" >/dev/null; done
   say "ufw: removed all pcp port rules"
 }
 
@@ -158,8 +175,8 @@ roce_status() {
 roce_apply() {
   local ports; ports=$(roce_ports)
   [ -n "$ports" ] || { say "roce: no ConnectX ports, skipping"; return; }
-  for n in $ports; do ip link set "$n" up 2>/dev/null || true; done
-  sleep 5
+  for n in $ports; do run ip link set "$n" up 2>/dev/null || true; done
+  [ "$DRY" = 1 ] || sleep 5
   local linked=()
   for n in $ports; do link_up "$n" && linked+=("$n"); done
   if [ ${#linked[@]} = 0 ]; then
@@ -174,34 +191,48 @@ roce_apply() {
     fi
     i=$((i+1))
   done
+  # Persist via netplan (generate only — `netplan apply` would re-touch bond0,
+  # the interface this session probably runs over) and configure live with ip.
   if [ -f $NETPLAN_FILE ] && diff -q <(printf "$yaml") $NETPLAN_FILE >/dev/null; then
     say "roce: netplan already in place (${#linked[@]} ports)"
   else
-    printf "$yaml" > $NETPLAN_FILE; chmod 600 $NETPLAN_FILE
-    netplan generate && netplan apply
-    say "roce: configured ${linked[*]} (192.168.<100+N>.$h/24, MTU 9000)"
+    printf "$yaml" | write_file $NETPLAN_FILE
+    run chmod 600 $NETPLAN_FILE
+    run netplan generate
+    say "roce: wrote $NETPLAN_FILE for ${linked[*]} (192.168.<100+N>.$h/24, MTU 9000)"
   fi
+  i=0
+  for n in $ports; do
+    if printf '%s\n' "${linked[@]}" | grep -qx "$n"; then
+      local addr="192.168.$((ROCE_SUBNET_BASE + i)).$h/24"
+      ip -4 -o addr show "$n" | grep -q " $addr " || run ip addr add "$addr" dev "$n"
+      [ "$(cat /sys/class/net/$n/mtu)" = 9000 ] || run ip link set "$n" mtu 9000
+    fi
+    i=$((i+1))
+  done
+  say "roce: live addresses set on ${linked[*]}"
   if ufw_active; then
     for n in "${linked[@]}"; do
-      ufw status | grep -qE "^Anywhere on $n +ALLOW IN" || ufw allow in on "$n" comment "$MARK roce" >/dev/null
-      ufw status | grep -qE "^Anywhere +ALLOW OUT +Anywhere on $n" || ufw allow out on "$n" comment "$MARK roce" >/dev/null
+      ufw_has_iface "$n" || run ufw allow in on "$n" comment "$MARK roce" >/dev/null
+      grep -qE "^Anywhere +ALLOW OUT +Anywhere on $n" <<<"$UFW_STATUS" || run ufw allow out on "$n" comment "$MARK roce" >/dev/null
     done
     say "roce: ufw allows all traffic on ${linked[*]}"
   fi
-  for n in "${linked[@]}"; do d=$(ibdev_of "$n"); [ -n "$d" ] && cma_roce_mode -d "$d" -p 1 -m 2 >/dev/null 2>&1 || true; done
+  for n in "${linked[@]}"; do d=$(ibdev_of "$n"); [ -n "$d" ] && run cma_roce_mode -d "$d" -p 1 -m 2 >/dev/null 2>&1 || true; done
   say "roce: test with  ib_write_bw -d $(ibdev_of "${linked[0]}") -F --report_gbits   (server)  /  ... <ip>  (client)"
 }
 roce_undo() {
-  if [ -f $NETPLAN_FILE ]; then rm -f $NETPLAN_FILE; netplan generate && netplan apply; say "roce: netplan removed"; fi
+  if [ -f $NETPLAN_FILE ]; then rm -f $NETPLAN_FILE; netplan generate; say "roce: netplan file removed"; fi
   for n in $(roce_ports); do ip addr flush dev "$n" 2>/dev/null || true; done
   say "roce: addresses flushed (ports left admin-up; harmless)"
 }
 
 # ---- driver ---------------------------------------------------------------------
 case "${1:-}" in
+  plan)   need_root plan; DRY=1; echo "== plan on $(hostname) (nothing will be changed)"; sysctl_apply; sshd_apply; ufw_apply; roce_apply; echo "== end of plan" ;;
   apply)  need_root apply; echo "== apply on $(hostname)"; sysctl_apply; sshd_apply; ufw_apply; roce_apply; echo "== done" ;;
   status) echo "== status on $(hostname)"; [ "$(id -u)" = 0 ] || say "(run as root for sshd/ufw details)"; sysctl_status || true; sshd_status || true; ufw_status || true; roce_status
-          grep -qE "^MaxStartups" /etc/ssh/sshd_config 2>/dev/null && say "note: hand-made MaxStartups line in /etc/ssh/sshd_config (harmless; this script's file takes precedence)" ;;
+          grep -qE "^MaxStartups" $ETC/ssh/sshd_config 2>/dev/null && say "note: hand-made MaxStartups line in $ETC/ssh/sshd_config (harmless; this script's file takes precedence)" ;;
   undo)   need_root undo; echo "== undo on $(hostname)"; roce_undo; ufw_undo; sshd_undo; sysctl_undo; echo "== done" ;;
   *) sed -n '2,26p' "$0"; exit 1 ;;
 esac
