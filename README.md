@@ -228,7 +228,11 @@ connections, so `--tcp` is always safe to pass.
 
 The remote advertises every address it has (the one your ssh session arrived
 on first, then private LAN, then CGNAT/Tailscale, then public); the client
-tries them all and prefers the best that answers. With ufw:
+tries them all and prefers the best that answers. When several NICs of
+comparable speed are reachable (e.g. an 8-rail RoCE fabric), pcp spreads its
+data connections across all of them (multipath) — it keeps only paths within
+2x of the fastest, so it never drags a fast transfer down by mixing in a slow
+link. Single-homed hosts and laptops use the one best path, unchanged. With ufw:
 
 ```sh
 sudo ufw allow from REMOVED/24 to any port 47600:47699 proto tcp   # LAN peers
