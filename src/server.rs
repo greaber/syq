@@ -88,7 +88,7 @@ fn serve<R: Read + Send + 'static, W: Write>(r: R, w: W, over_ssh: bool, expect_
                     Err(e) => w.write_msg(&Response::Err(format!("{e:#}")))?,
                 }
             }
-            Request::Scan { root, follow_root } => {
+            Request::Scan { root, follow_root, all } => {
                 let root = fsops::resolve(&root);
                 // Warnings are collected and sent between batches so a single
                 // writer borrow suffices.
@@ -97,6 +97,7 @@ fn serve<R: Read + Send + 'static, W: Write>(r: R, w: W, over_ssh: bool, expect_
                 let res = crate::scan::scan(
                     &root,
                     follow_root,
+                    all,
                     &mut |batch| {
                         let mut w = wref.borrow_mut();
                         for m in warns.borrow_mut().drain(..) {

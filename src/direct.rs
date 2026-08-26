@@ -100,6 +100,13 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     };
     remote.push(dst_str);
 
+    if args.detach {
+        // Detached: log JSON progress instead of a live display.
+        remote.retain(|a| a != "--progress" && !a.starts_with("--width="));
+        remote.insert(0, "--no-progress".into());
+        remote.insert(0, "--progress-json".into());
+        remote.insert(0, "-v".into());
+    }
     let dbg = if crate::transfer::debug() { "PCP_DEBUG=1 " } else { "" };
     let remote_cmd = match &args.pcp_path {
         Some(p) => format!("{dbg}{} {}", shell_words::quote(p), shell_words::join(&remote)),
@@ -107,6 +114,20 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             "{dbg}sh -c 'command -v pcp >/dev/null 2>&1 && exec pcp \"$@\"; exec \"$HOME/.local/bin/pcp\" \"$@\"' pcp {}",
             shell_words::join(&remote)
         ),
+    };
+
+    let remote_cmd = if args.detach {
+        // Survive the loss of this ssh session: new session, no controlling
+        // terminal, everything to a log file. The transfer itself still needs
+        // the forwarded agent only for its initial connections, so hostA must
+        // be able to reach hostB with its own credentials for a long run.
+        let name = srcs[0].path.trim_end_matches('/').rsplit('/').next().unwrap_or("pcp").to_string();
+        format!(
+            "mkdir -p \"$HOME/.pcp\" && log=\"$HOME/.pcp/{name}-$(date +%Y%m%d-%H%M%S).log\" && (setsid nohup sh -c {} > \"$log\" 2>&1 < /dev/null &) && echo \"$log\"",
+            shell_words::quote(&remote_cmd)
+        )
+    } else {
+        remote_cmd
     };
 
     let mut cmd = Command::new(&rsh[0]);
@@ -122,6 +143,17 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         cmd.args(["-l", u]);
     }
     cmd.arg(&src_host).arg(&remote_cmd);
+    if args.detach {
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        let out = cmd.output().with_context(|| format!("spawn {:?}", rsh[0]))?;
+        let log = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || log.is_empty() {
+            bail!("could not start detached transfer on {src_host}");
+        }
+        println!("pcp: started on {src_host}, log {log}");
+        println!("pcp: follow with:  pcp --follow {src_host}:{log}");
+        return Ok(0);
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
     if !args.quiet {
         eprintln!("pcp: remote-to-remote: running on {src_host} (use --relay to route data through this machine)");
@@ -134,4 +166,60 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         }
         None => bail!("remote pcp on {src_host} killed by signal"),
     }
+}
+
+/// `pcp --follow HOST:LOG`: tail a detached transfer's log, rendering the JSON
+/// progress lines as a status line and passing everything else through.
+pub fn follow(args: &Args) -> Result<i32> {
+    let target = args.paths.first().ok_or_else(|| anyhow::anyhow!("usage: pcp --follow HOST:LOGFILE"))?;
+    let loc = Location::parse(target)?;
+    let (Some(host), log) = (&loc.host, &loc.path) else { bail!("usage: pcp --follow HOST:LOGFILE") };
+    let rsh = parse_rsh(&args.rsh)?;
+    let mut cmd = Command::new(&rsh[0]);
+    cmd.args(&rsh[1..]);
+    if let Some(u) = &loc.user {
+        cmd.args(["-l", u]);
+    }
+    cmd.arg(host).arg(format!("tail -n +1 -f {}", shell_words::quote(log)));
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let mut child = cmd.spawn()?;
+    let out = child.stdout.take().unwrap();
+    use std::io::BufRead;
+    let tty = std::io::stderr().is_terminal();
+    let mut last_status = String::new();
+    for line in std::io::BufReader::new(out).lines() {
+        let line = line?;
+        if line.starts_with('{') {
+            let get = |k: &str| -> f64 {
+                line.split(&format!("\"{k}\":")).nth(1).and_then(|r| r.split([',', '}']).next()).and_then(|v| v.trim().parse().ok()).unwrap_or(0.0)
+            };
+            let (done, total, fd, ft, rate, el) = (get("bytes_done"), get("bytes_total"), get("files_done"), get("files_total"), get("rate"), get("elapsed"));
+            let pct = if total > 0.0 { done / total * 100.0 } else { 0.0 };
+            last_status = format!(
+                "{} / {}  {pct:>3.0}%  {}/s  files {}/{}  elapsed {}",
+                crate::progress::human(done as u64),
+                crate::progress::human(total as u64),
+                crate::progress::human(rate as u64),
+                fd as u64,
+                ft as u64,
+                crate::progress::hms(el)
+            );
+            if tty {
+                eprint!("\r\x1b[K{last_status}");
+            }
+        } else {
+            if tty && !last_status.is_empty() {
+                eprint!("\r\x1b[K");
+            }
+            println!("{line}");
+            if line.starts_with("pcp: transferred") || line.starts_with("pcp: would transfer") {
+                let _ = child.kill();
+                return Ok(0);
+            }
+        }
+    }
+    if tty {
+        eprintln!();
+    }
+    Ok(0)
 }

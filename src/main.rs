@@ -50,7 +50,13 @@ fn main() {
     }
     let mut args = cli::Args::parse();
     args.normalize();
-    let result = if args.rm { rm::run(args) } else { transfer::run(args) };
+    let result = if args.follow {
+        direct::follow(&args)
+    } else if args.rm {
+        rm::run(args)
+    } else {
+        transfer::run(args)
+    };
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {

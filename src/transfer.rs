@@ -356,6 +356,7 @@ impl Planner<'_> {
         src.scan(
             src_root,
             follow,
+            false,
             &mut |batch: Vec<Entry>| {
                 if first {
                     first = false;
