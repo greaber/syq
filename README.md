@@ -79,6 +79,7 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `--tcp` | Data over TCP sockets (AES-256-GCM) after ssh auth; falls back to ssh if unreachable |
 | `--tcp-plain` | Like `--tcp` without encryption (trusted networks only) |
 | `--tcp-ports LO-HI` | Port range the remote listens on for `--tcp` (default 47600-47699) |
+| `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
 | `-h` | Accepted for compatibility; sizes are always human-readable. Use `--help` for help |
 
@@ -236,6 +237,28 @@ sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specif
 
 Remote→remote (`pcp --tcp hostA:src hostB:dst`) works the same way: the
 orchestrator on hostA connects to hostB's listener.
+
+## Parallel removal (`--rm`)
+
+`pcp --rm [-j N] [-n] [-v] PATH...` removes trees the way pcp copies them:
+a parallel scan, files unlinked in batches across N workers, directories
+removed deepest-first with each level in parallel. Symlinks are removed, not
+followed. Remote paths (`host:path`) work. It refuses `/`, `.` and `~`. On
+NFS, where every unlink is a round trip, `-j32` removed 20,000 files in 2.5 s
+versus 9.7 s for `rm -rf`; on a local SSD `rm -rf` is already fast and pcp is
+no faster.
+
+## NFS
+
+Local↔NFS copies are a local→local pcp run (`pcp -a -j16 /raid/x /mnt/nfs/x`)
+and benefit from the same parallelism: measured on a 20 Gbit NFSv4.2 mount,
+reads of one 4 GB file 858 MiB/s with `-j8` vs ~400 MB/s for `cp`; 20,000
+small files written in 28 s vs 72 s for `cp -r`. Writes of a *single* file
+were capped at ~250 MB/s regardless of `-j`, while eight files written in
+parallel reached ~650 MB/s: the per-file limit comes from the NFS client's one
+TCP connection and per-inode write serialization. Mounting with
+`nconnect=8` (NFS 4.1+; needs an unmount/mount, not a remount) is the usual
+fix for that.
 
 ## Performance notes
 

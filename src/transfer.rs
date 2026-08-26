@@ -31,7 +31,7 @@ pub struct Opts {
     pub umask: u32,
 }
 
-fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
+pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     Ok(match &loc.host {
         None => Endpoint::Local,
         Some(h) => Endpoint::Remote(RemoteSpec {
@@ -44,7 +44,7 @@ fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     })
 }
 
-fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
+pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
     match ep.connect(args.compress) {
         Ok(c) => Ok(c),
         Err(e) => {
@@ -84,6 +84,9 @@ pub fn run(args: Args) -> Result<i32> {
     let block = parse_size(&args.block_size)?.clamp(64 * 1024, 1 << 30);
     let min_split = parse_size(&args.min_split)?;
     let locs: Vec<Location> = args.paths.iter().map(|p| Location::parse(p)).collect::<Result<_>>()?;
+    if locs.len() < 2 {
+        bail!("need at least one source and a destination");
+    }
     let (dst, srcs) = locs.split_last().unwrap();
     for s in srcs {
         if !s.same_host(&srcs[0]) {

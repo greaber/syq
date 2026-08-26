@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64, Xxh3};
 
 pub const PARTIAL_SUFFIX: &str = ".pcp-partial";
-const FD_CACHE_MAX: usize = 64;
+const FD_CACHE_MAX: usize = 16;
 
 pub fn resolve(p: &[u8]) -> PathBuf {
     if p.is_empty() {
@@ -228,6 +228,10 @@ impl FsOps {
             Op::SetMeta { path, meta, flags } => {
                 let p = resolve(path);
                 set_meta_path(&p, meta, *flags).with_context(|| format!("set metadata {}", p.display()))
+            }
+            Op::Rmdir { path } => {
+                let p = resolve(path);
+                fs::remove_dir(&p).with_context(|| format!("rmdir {}", p.display()))
             }
             Op::Remove { path } => {
                 let p = resolve(path);
