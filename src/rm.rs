@@ -105,7 +105,11 @@ pub fn run(args: Args) -> Result<i32> {
             bail!("refusing to remove {:?}", l.path);
         }
     }
+    let mut args = args;
     let ep = endpoint(&locs[0], &args)?;
+    if args.connections_default && !ep.is_remote() {
+        args.connections = crate::transfer::LOCAL_DEFAULT_CONNECTIONS;
+    }
     let mut ctl = connect_ctl(&ep, &args)?;
 
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;

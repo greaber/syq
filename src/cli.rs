@@ -55,9 +55,13 @@ pub struct Args {
     #[arg(short = 'h', long)]
     pub human_readable: bool,
 
-    /// Number of parallel data connections
-    #[arg(short = 'j', long, default_value = "8", value_name = "N")]
+    /// Number of parallel connections/workers (default: 8 over ssh, 32 when everything is local)
+    #[arg(short = 'j', long, value_name = "N")]
+    pub connections_opt: Option<usize>,
+    #[arg(skip)]
     pub connections: usize,
+    #[arg(skip)]
+    pub connections_default: bool,
     /// Transfer/hash block size (e.g. 4M)
     #[arg(long, default_value = "4M", value_name = "SIZE")]
     pub block_size: String,
@@ -90,7 +94,8 @@ pub struct Args {
     /// Only compare source and destination contents; transfer nothing
     #[arg(long)]
     pub verify_only: bool,
-    /// Write directly into destination files instead of partial + rename
+    /// Write directly into existing destination files too (new files are always written in
+    /// place; existing ones go through a partial file and an atomic rename unless this is set)
     #[arg(long)]
     pub inplace: bool,
 
@@ -150,9 +155,8 @@ impl Args {
             self.progress = true;
             self.partial = true;
         }
-        if self.connections == 0 {
-            self.connections = 1;
-        }
+        self.connections_default = self.connections_opt.is_none();
+        self.connections = self.connections_opt.unwrap_or(8).max(1);
     }
 
     pub fn meta_flags(&self) -> u8 {

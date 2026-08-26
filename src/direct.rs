@@ -50,8 +50,10 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if !short.is_empty() {
         remote.push(format!("-{short}"));
     }
-    remote.push("-j".into());
-    remote.push(args.connections.to_string());
+    if let Some(j) = args.connections_opt {
+        remote.push("-j".into());
+        remote.push(j.to_string());
+    }
     remote.push(format!("--block-size={}", args.block_size));
     remote.push(format!("--min-split={}", args.min_split));
     if args.stats {

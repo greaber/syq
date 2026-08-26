@@ -16,6 +16,8 @@ pub struct FileJob {
     pub attempts: u32,
     /// Bytes of this file in place on the destination (transferred or matched).
     pub done: Arc<AtomicU64>,
+    /// Written directly to the final path (no partial + rename).
+    pub inplace: bool,
 }
 
 pub struct RangeState {

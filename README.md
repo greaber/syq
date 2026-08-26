@@ -238,6 +238,13 @@ sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specif
 Remote→remote (`pcp --tcp hostA:src hostB:dst`) works the same way: the
 orchestrator on hostA connects to hostB's listener.
 
+## Defaults chosen for network filesystems
+
+New files are written in place (created with their final mode, no separate
+chmod, no rename); existing files are replaced through a partial file and an
+atomic rename unless `--inplace`. When both ends are local, 32 workers are
+used. On NFS these choices are the difference between ~300 and ~850 files/s.
+
 ## Parallel removal (`--rm`)
 
 `pcp --rm [-j N] [-n] [-v] PATH...` removes trees the way pcp copies them:
