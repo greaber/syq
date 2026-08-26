@@ -5,6 +5,7 @@
 #   sudo ./server-setup.sh plan      # print exactly what `apply` would change here
 #   sudo ./server-setup.sh apply     # do everything below
 #   sudo ./server-setup.sh status    # show what is / isn't in place (no changes)
+#   sudo ./server-setup.sh install-pcp # install the pcp binary system-wide (/usr/local/bin)
 #   sudo ./server-setup.sh roce-clean# remove only the RoCE bits this script added (keep the rest)
 #
 # There is intentionally no blanket "undo": these settings (BBR, buffers,
@@ -249,12 +250,32 @@ roce_clean() {
   say "roce: removed $removed of our 192.168.10x addresses (provider addresses left intact)"
 }
 
+# ---- install pcp system-wide ------------------------------------------------
+PCP_SRC=/mnt/nfs/grant/pcp.bin        # staged static binary on NFS
+PCP_DST=/usr/local/bin/pcp
+install_pcp() {
+  [ -f "$PCP_SRC" ] || die "$PCP_SRC not found (stage the binary on NFS first)"
+  local want; want=$(cat /mnt/nfs/grant/pcp.version 2>/dev/null || echo "?")
+  local have; have=$("$PCP_DST" --version 2>/dev/null | awk '{print $2}')
+  if [ "$have" = "$want" ] && [ -n "$have" ]; then
+    say "pcp: /usr/local/bin/pcp already at $have"
+  else
+    run install -m 0755 "$PCP_SRC" "$PCP_DST"
+    say "pcp: installed $("$PCP_DST" --version 2>/dev/null) to $PCP_DST (was ${have:-absent})"
+  fi
+  # Point out per-user copies that would shadow the system one on PATH.
+  for h in /home/*; do
+    [ -e "$h/.local/bin/pcp" ] && say "pcp: NOTE $h/.local/bin/pcp exists and may shadow $PCP_DST on that user's PATH"
+  done
+}
+
 # ---- driver ---------------------------------------------------------------------
 case "${1:-}" in
   plan)   need_root plan; DRY=1; echo "== plan on $(hostname) (nothing will be changed)"; sysctl_apply; sshd_apply; ufw_apply; roce_apply; echo "== end of plan" ;;
   apply)  need_root apply; echo "== apply on $(hostname)"; sysctl_apply; sshd_apply; ufw_apply; roce_apply; echo "== done" ;;
   status) echo "== status on $(hostname)"; [ "$(id -u)" = 0 ] || say "(run as root for sshd/ufw details)"; sysctl_status || true; sshd_status || true; ufw_status || true; roce_status
           ;;
+  install-pcp) need_root install-pcp; echo "== install-pcp on $(hostname)"; install_pcp; echo "== done" ;;
   roce-clean) need_root roce-clean; echo "== roce-clean on $(hostname)"; roce_clean; echo "== done" ;;
   *) sed -n '2,26p' "$0"; exit 1 ;;
 esac
