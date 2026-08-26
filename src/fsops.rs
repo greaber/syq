@@ -281,14 +281,17 @@ impl FsOps {
         Ok(Response::Probed { partial_size, final_entry })
     }
 
-    pub fn prepare(&mut self, path: &[u8], size: u64, inplace: bool, from_final: bool) -> Result<()> {
+    pub fn prepare(&mut self, path: &[u8], size: u64, inplace: bool, from_final: bool, mode: u32) -> Result<()> {
         let p = resolve(path);
         if inplace {
             self.uncache(&p);
+            // A stale partial from an interrupted run would otherwise be orphaned.
+            let _ = fs::remove_file(partial_path(&p));
             let f = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(false)
+                .mode(mode & 0o7777)
                 .open(&p)
                 .with_context(|| format!("open {}", p.display()))?;
             f.set_len(size)?;
@@ -307,7 +310,7 @@ impl FsOps {
         let f = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode & 0o7777)
             .open(&pp)
             .with_context(|| format!("create {}", pp.display()))?;
         if from_final {
@@ -418,8 +421,8 @@ impl FsOps {
             Request::StatMany(paths) => Ok(Response::Stats(self.stat_many(paths))),
             Request::Apply(ops) => Ok(Response::Applied(self.apply(ops))),
             Request::Probe { path } => self.probe(path),
-            Request::Prepare { path, size, inplace, from_final } => {
-                self.prepare(path, *size, *inplace, *from_final).map(|_| Response::Ok)
+            Request::Prepare { path, size, inplace, from_final, mode } => {
+                self.prepare(path, *size, *inplace, *from_final, *mode).map(|_| Response::Ok)
             }
             Request::HashBlocks { path, which, block, len } => {
                 self.hash_blocks(path, *which, *block, *len).map(Response::Hashes)
@@ -470,7 +473,12 @@ fn timespec(sec: i64, nsec: u32) -> libc::timespec {
 fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     if flags & flags::MODE != 0 {
-        f.set_permissions(fs::Permissions::from_mode(meta.mode & 0o7777))?;
+        // On network filesystems every setattr is a round trip; skip it when
+        // the file was created with the right mode already.
+        let cur = f.metadata().map(|m| m.mode() & 0o7777).unwrap_or(u32::MAX);
+        if cur != meta.mode & 0o7777 {
+            f.set_permissions(fs::Permissions::from_mode(meta.mode & 0o7777))?;
+        }
     }
     apply_owner(flags, meta, |uid, gid| {
         std::os::unix::fs::fchown(f, uid, gid)

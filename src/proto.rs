@@ -101,7 +101,8 @@ pub enum Request {
     /// What exists at `path` on the receiving side: the final file and/or a partial.
     Probe { path: PathBytes },
     /// Create/adjust the write target for `path` with the given final size.
-    Prepare { path: PathBytes, size: u64, inplace: bool, from_final: bool },
+    /// `mode`: create new files with this mode so no separate chmod is needed.
+    Prepare { path: PathBytes, size: u64, inplace: bool, from_final: bool, mode: u32 },
     HashBlocks { path: PathBytes, which: Which, block: u64, len: u64 },
     ReadRange { path: PathBytes, off: u64, len: u32 },
     WriteRange {

@@ -13,6 +13,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 const WINDOW: usize = 4;
 const MAX_ATTEMPTS: u32 = 3;
+pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 const FAST_BATCH_FILES: usize = 64;
 const FAST_BATCH_BYTES: u64 = 16 << 20;
 
@@ -81,6 +82,7 @@ fn read_umask() -> u32 {
 }
 
 pub fn run(args: Args) -> Result<i32> {
+    let mut args = args;
     let block = parse_size(&args.block_size)?.clamp(64 * 1024, 1 << 30);
     let min_split = parse_size(&args.min_split)?;
     let locs: Vec<Location> = args.paths.iter().map(|p| Location::parse(p)).collect::<Result<_>>()?;
@@ -95,6 +97,10 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
+    if args.connections_default && !src_ep.is_remote() && !dst_ep.is_remote() {
+        // Local threads are cheap and network filesystems want the concurrency.
+        args.connections = LOCAL_DEFAULT_CONNECTIONS;
+    }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
             return crate::direct::run(&args, srcs, dst);
@@ -542,7 +548,7 @@ impl Planner<'_> {
     fn enqueue(&mut self, src: PathBytes, dst: PathBytes, rel: String, entry: Entry, dst_entry: Option<Entry>) {
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
-        self.sched.push_file(FileJob { src, dst, rel, entry, dst_entry, attempts: 0, done: Arc::new(AtomicU64::new(0)) });
+        self.sched.push_file(FileJob { src, dst, rel, entry, dst_entry, attempts: 0, done: Arc::new(AtomicU64::new(0)), inplace: false });
     }
 
     fn stat_many(&mut self, _on_dst: bool, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
@@ -698,13 +704,13 @@ impl Worker {
             if !self.opts.perms {
                 meta.mode = j.entry.mode & 0o777 & !self.opts.umask;
             }
-            self.dst.send(Request::Prepare { path: j.dst.clone(), size: j.entry.size, inplace: false, from_final: false })?;
+            self.dst.send(Request::Prepare { path: j.dst.clone(), size: j.entry.size, inplace: true, from_final: false, mode: self.create_mode(j) })?;
             let mut n = 2;
             if !bytes.is_empty() {
-                self.dst.send(Request::WriteRange { path: j.dst.clone(), inplace: false, off: 0, hash, data: bytes })?;
+                self.dst.send(Request::WriteRange { path: j.dst.clone(), inplace: true, off: 0, hash, data: bytes })?;
                 n = 3;
             }
-            self.dst.send(Request::Finalize { path: j.dst.clone(), inplace: false, meta, flags })?;
+            self.dst.send(Request::Finalize { path: j.dst.clone(), inplace: true, meta, flags })?;
             expect.push(n);
         }
         let mut results: Vec<Result<()>> = Vec::with_capacity(jobs.len());
@@ -786,8 +792,10 @@ impl Worker {
         let job = self.job(idx);
         let size = job.entry.size;
         let opts = self.opts.clone();
+        let _ = &opts;
         self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: size }));
 
+        let mut inplace = self.opts.inplace;
         let planned: Result<Vec<(u64, u64)>> = (|| {
             let (partial_size, final_entry) = match ok(self.dst.call(Request::Probe { path: job.dst.clone() })?, "probe")? {
                 Response::Probed { partial_size, final_entry } => (partial_size, final_entry),
@@ -800,16 +808,23 @@ impl Worker {
             }
             let final_is_file = final_entry.as_ref().is_some_and(|f| f.kind == Kind::File);
             let full = || if size > 0 { vec![(0, size)] } else { vec![] };
+            // Nothing there yet (and no partial to resume from): write in place.
+            // No reader can depend on atomic replacement of a file that doesn't
+            // exist, and it saves a rename per file — expensive on network filesystems.
+            if final_entry.is_none() && partial_size.is_none() {
+                inplace = true;
+            }
+            self.set_inplace(idx, inplace);
 
-            if opts.inplace {
-                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: true, from_final: false })?, "prepare")?;
+            if inplace {
+                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: true, from_final: false, mode: self.create_mode(&job) })?, "prepare")?;
                 if final_is_file && size > 0 {
                     return self.diff_blocks(&job, Which::Final);
                 }
                 return Ok(full());
             }
             if partial_size.is_some() {
-                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: false })?, "prepare")?;
+                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: false, mode: self.create_mode(&job) })?, "prepare")?;
                 if size == 0 {
                     return Ok(vec![]);
                 }
@@ -829,10 +844,10 @@ impl Worker {
                     }
                     return Ok(vec![]);
                 }
-                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: true })?, "prepare")?;
+                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: true, mode: self.create_mode(&job) })?, "prepare")?;
                 return Ok(ranges);
             }
-            ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: false })?, "prepare")?;
+            ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: false, mode: self.create_mode(&job) })?, "prepare")?;
             Ok(full())
         })();
 
@@ -847,7 +862,7 @@ impl Worker {
         job.done.store(size - to_send, Relaxed);
         self.progress.bytes_skipped.fetch_add(size - to_send, Relaxed);
         self.progress.bytes_total.fetch_sub(size - to_send, Relaxed);
-        let metadata_only = ranges.is_empty() && to_send == 0 && !opts.inplace
+        let metadata_only = ranges.is_empty() && to_send == 0 && !inplace
             && matches!(self.sched.jobs.lock().unwrap()[idx].dst_entry, Some(Entry { kind: Kind::File, .. }))
             && !self.probe_left_partial(&job)?;
 
@@ -878,6 +893,21 @@ impl Worker {
         match ok(self.dst.call(Request::Probe { path: job.dst.clone() })?, "probe")? {
             Response::Probed { partial_size, .. } => Ok(partial_size.is_some()),
             other => bail!("unexpected response {other:?}"),
+        }
+    }
+
+    /// Record the in-place decision on the job so every range worker and the
+    /// finalize agree.
+    fn set_inplace(&self, idx: usize, v: bool) {
+        self.sched.jobs.lock().unwrap()[idx].inplace = v;
+    }
+
+    /// Mode a new destination file is created with (what finalize will want).
+    fn create_mode(&self, job: &FileJob) -> u32 {
+        if self.opts.perms {
+            job.entry.mode & 0o7777
+        } else {
+            job.entry.mode & 0o777 & !self.opts.umask
         }
     }
 
@@ -932,7 +962,7 @@ impl Worker {
         let _ = (start, end0);
         self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: job.entry.size }));
         let block = self.opts.block;
-        let inplace = self.opts.inplace;
+        let inplace = job.inplace;
         let mut reads_out = 0usize;
         let mut writes_out = 0usize;
         loop {
@@ -995,7 +1025,7 @@ impl Worker {
             meta.mode = job.entry.mode & 0o777 & !self.opts.umask;
         }
         ok(
-            self.dst.call(Request::Finalize { path: job.dst.clone(), inplace: self.opts.inplace, meta, flags: flags | if self.opts.perms { 0 } else { flags::MODE } })?,
+            self.dst.call(Request::Finalize { path: job.dst.clone(), inplace: job.inplace, meta, flags: flags | if self.opts.perms { 0 } else { flags::MODE } })?,
             "finalize",
         )?;
         // Did the source change under us?
