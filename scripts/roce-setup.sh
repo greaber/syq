@@ -64,21 +64,25 @@ cmd_probe() {
   cmd_status
   echo
   echo "Transceivers / link (ethtool):"
+  local cabled=0
   for n in $(roce_ports); do
-    link=$(ethtool "$n" 2>/dev/null | awk -F: '/Link detected/{gsub(/ /,"",$2);print $2}')
-    if ethtool -m "$n" >/dev/null 2>&1; then
-      mod=$(ethtool -m "$n" 2>/dev/null | awk -F: '/Identifier|Vendor name|Vendor PN/{gsub(/^ +/,"",$2); printf "%s; ", $2}')
-      mod="module present: ${mod%; }"
-    else
-      mod="NO TRANSCEIVER DETECTED (or EEPROM unreadable)"
-    fi
-    printf "  %-16s link=%-4s %s\n" "$n" "${link:-?}" "$mod"
+    link=$(ethtool "$n" 2>/dev/null | awk -F': ' '/Link detected/{print $2}')
+    mod=$(ethtool -m "$n" 2>&1 | awk -F: '/Identifier|Vendor name|Vendor PN/{gsub(/^ +/,"",$2); printf "%s; ", $2}')
+    case "$link" in
+      *"No cable"*) desc="NIC reports no cable/module in the cage" ;;
+      yes)          desc="LINK UP  ${mod:+(module: ${mod%; })}"; cabled=$((cabled+1)) ;;
+      *)            desc="${mod:+module: ${mod%; } — }no link (peer/switch port down?)"; [ -n "$mod" ] && cabled=$((cabled+1)) ;;
+    esac
+    printf "  %-16s link=%-16s %s\n" "$n" "${link:-?}" "$desc"
   done
   echo
-  echo "Interpretation:"
-  echo "  PHYS=LinkUp + link=yes  -> cabled and switch port is up: run 'configure --apply'."
-  echo "  PHYS=Polling + module   -> cable/transceiver present but no peer: switch port down or unpatched."
-  echo "  PHYS=Disabled, no module-> nothing plugged into this port."
+  if [ $cabled = 0 ]; then
+    echo "RESULT: no port has a cable or transceiver. Nothing to configure on this host;"
+    echo "        ask the provider whether these ports are meant to be connected to a fabric."
+  else
+    echo "RESULT: $cabled port(s) have something plugged in. If they show LINK UP, run 'configure --apply';"
+    echo "        if a module is present but there's no link, the switch side is down or unpatched."
+  fi
 }
 
 cmd_configure() {
