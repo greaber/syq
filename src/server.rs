@@ -204,24 +204,38 @@ fn tcp_listen(key: Option<Vec<u8>>, token: Vec<u8>, lo: u16, hi: u16, debug: boo
     };
     let port = listener.local_addr()?.port();
     let next_id = Arc::new(AtomicU32::new(1));
+    // Bound in-flight data connections (a peer shouldn't be able to spawn
+    // unbounded threads), and remember which client connection ids we've seen
+    // so a captured record stream can't be replayed while the listener is up.
+    let live = Arc::new(AtomicU32::new(0));
+    let seen: Arc<std::sync::Mutex<std::collections::HashSet<u32>>> = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    const MAX_LIVE: u32 = 256;
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let id = next_id.fetch_add(1, Relaxed);
-            let (key, token) = (key.clone(), token.clone());
+            if live.load(Relaxed) >= MAX_LIVE {
+                if debug {
+                    eprintln!("pcp server (tcp): refusing connection, {MAX_LIVE} already live");
+                }
+                continue; // drop; stream closes
+            }
+            live.fetch_add(1, Relaxed);
+            let (key, token, live, seen) = (key.clone(), token.clone(), live.clone(), seen.clone());
             std::thread::spawn(move || {
-                if let Err(e) = serve_tcp(stream, id, key, token, debug, compress) {
+                if let Err(e) = serve_tcp(stream, id, key, token, debug, compress, &seen) {
                     if debug {
                         eprintln!("pcp server (tcp {id}): {e:#}");
                     }
                 }
+                live.fetch_sub(1, Relaxed);
             });
         }
     });
     Ok(port)
 }
 
-fn serve_tcp(stream: TcpStream, id: u32, key: Option<Vec<u8>>, token: Vec<u8>, _debug: bool, _compress: bool) -> Result<()> {
+fn serve_tcp(stream: TcpStream, id: u32, key: Option<Vec<u8>>, token: Vec<u8>, _debug: bool, _compress: bool, seen: &std::sync::Mutex<std::collections::HashSet<u32>>) -> Result<()> {
     stream.set_nodelay(true)?;
     // Scanners and stray connections must not hold a thread forever.
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -231,14 +245,20 @@ fn serve_tcp(stream: TcpStream, id: u32, key: Option<Vec<u8>>, token: Vec<u8>, _
     (&stream).read_exact(&mut idbuf)?;
     let conn_id = u32::from_be_bytes(idbuf);
     let _ = id;
+    // Each client connection id is single-use: a replayed record stream carries
+    // the original id (it must, to decrypt) and is rejected here.
+    if !seen.lock().unwrap().insert(conn_id) {
+        bail!("duplicate connection id {conn_id} (possible replay)");
+    }
     let (rc, wc) = match &key {
         Some(k) => (Some(Cipher::new(k, conn_id, 1)), Some(Cipher::new(k, conn_id, 2))),
         None => (None, None),
     };
     let reader = RecordReader::new(stream.try_clone()?, rc);
     let writer = RecordWriter::new(stream.try_clone()?, wc);
-    // Only the Hello is subject to the timeout; the serve loop reads on a thread
-    // so it can't be told apart, hence clear it once we have the stream set up.
+    // The record reader delivers whole frames; clear the handshake timeout only
+    // after the first complete record (which carries the Hello), not after a
+    // partial read.
     let res = serve(TimeoutOnce { inner: reader, stream: stream.try_clone()?, cleared: false }, writer, false, Some(token));
     res
 }
