@@ -103,6 +103,15 @@ pub struct Args {
     /// Install this pcp binary on the remote host (~/.local/bin/pcp) if missing
     #[arg(long)]
     pub bootstrap: bool,
+    /// Use TCP data connections (AES-256-GCM) after authenticating over ssh; falls back to ssh
+    #[arg(long)]
+    pub tcp: bool,
+    /// Like --tcp but unencrypted (trusted networks only)
+    #[arg(long)]
+    pub tcp_plain: bool,
+    /// Port range the remote listens on for --tcp
+    #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
+    pub tcp_ports: String,
     /// Remote-to-remote: relay data through this machine instead of running on the source host
     #[arg(long)]
     pub relay: bool,

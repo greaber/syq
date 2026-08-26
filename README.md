@@ -76,6 +76,9 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
 | `--pcp-path PATH` | Location of `pcp` on the remote host |
 | `--bootstrap` | Copy this binary to the remote's `~/.local/bin/pcp` if starting it fails |
+| `--tcp` | Data over TCP sockets (AES-256-GCM) after ssh auth; falls back to ssh if unreachable |
+| `--tcp-plain` | Like `--tcp` without encryption (trusted networks only) |
+| `--tcp-ports LO-HI` | Port range the remote listens on for `--tcp` (default 47600-47699) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
 | `-h` | Accepted for compatibility; sizes are always human-readable. Use `--help` for help |
 
@@ -209,6 +212,30 @@ ordering question for them.
 - **NVMe / RAID** on either side.
 - **Not** a single spinning disk: parallel reads of one file there mean seeks.
   Use `-j 1` or a large `--min-split`.
+
+## TCP data connections (`--tcp`)
+
+ssh caps every stream at a few hundred MB/s of cipher CPU, and its 2 MB
+per-channel flow-control window caps a stream at roughly `2 MB / RTT` on long
+links (≈7 MB/s at 265 ms). `--tcp` keeps ssh for authentication and control
+only: the remote opens a listener on a port from `--tcp-ports` (default
+47600-47699), and the data connections are plain TCP sockets carrying
+AES-256-GCM records keyed by a secret exchanged over the ssh session
+(`--tcp-plain` skips the encryption on trusted networks). If the port can't be
+reached — a firewall, typically — pcp says so once and falls back to ssh data
+connections, so `--tcp` is always safe to pass.
+
+The remote advertises every address it has (the one your ssh session arrived
+on first, then private LAN, then CGNAT/Tailscale, then public); the client
+tries them all and prefers the best that answers. With ufw:
+
+```sh
+sudo ufw allow from 10.2.201.0/24 to any port 47600:47699 proto tcp   # LAN peers
+sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specific client
+```
+
+Remote→remote (`pcp --tcp hostA:src hostB:dst`) works the same way: the
+orchestrator on hostA connects to hostB's listener.
 
 ## Performance notes
 

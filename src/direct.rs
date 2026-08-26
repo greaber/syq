@@ -16,6 +16,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             host: src_host.clone(),
             rsh: rsh.clone(),
             pcp_path: args.pcp_path.clone(),
+            tcp: Default::default(),
         };
         if spec.connect(false).is_err() {
             spec.bootstrap()?;
@@ -65,6 +66,13 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.bootstrap {
         remote.push("--bootstrap".into());
     }
+    if args.tcp {
+        remote.push("--tcp".into());
+    }
+    if args.tcp_plain {
+        remote.push("--tcp-plain".into());
+    }
+    remote.push(format!("--tcp-ports={}", args.tcp_ports));
     if args.progress_json {
         remote.push("--progress-json".into());
     }
@@ -92,10 +100,11 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     };
     remote.push(dst_str);
 
+    let dbg = if crate::transfer::debug() { "PCP_DEBUG=1 " } else { "" };
     let remote_cmd = match &args.pcp_path {
-        Some(p) => format!("{} {}", shell_words::quote(p), shell_words::join(&remote)),
+        Some(p) => format!("{dbg}{} {}", shell_words::quote(p), shell_words::join(&remote)),
         None => format!(
-            "sh -c 'command -v pcp >/dev/null 2>&1 && exec pcp \"$@\"; exec \"$HOME/.local/bin/pcp\" \"$@\"' pcp {}",
+            "{dbg}sh -c 'command -v pcp >/dev/null 2>&1 && exec pcp \"$@\"; exec \"$HOME/.local/bin/pcp\" \"$@\"' pcp {}",
             shell_words::join(&remote)
         ),
     };

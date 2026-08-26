@@ -4,8 +4,10 @@ use crate::fsops::{self, FsOps};
 use crate::proto::*;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
-use std::io::Write;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use crate::crypto::{Cipher, RecordReader, RecordWriter};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::process::{Child, Command, Stdio};
 #[allow(unused_imports)]
 use crate::proto::SizeHint;
 
@@ -70,8 +72,8 @@ impl Conn for LocalConn {
 }
 
 pub struct RemoteConn {
-    child: Child,
-    w: FrameWriter<ChildStdin>,
+    child: Option<Child>,
+    w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
     rx: std::sync::mpsc::Receiver<std::io::Result<Response>>,
@@ -81,10 +83,10 @@ pub struct RemoteConn {
 
 const READ_AHEAD: usize = 4;
 
-fn spawn_reader(stdout: ChildStdout) -> std::sync::mpsc::Receiver<std::io::Result<Response>> {
+fn spawn_reader(input: Box<dyn Read + Send>) -> std::sync::mpsc::Receiver<std::io::Result<Response>> {
     let (tx, rx) = std::sync::mpsc::sync_channel(READ_AHEAD);
     std::thread::spawn(move || {
-        let mut r = FrameReader::new(stdout);
+        let mut r = FrameReader::new(input);
         loop {
             let msg = r.read_msg::<Response>();
             let failed = msg.is_err();
@@ -100,11 +102,13 @@ impl RemoteConn {
     fn io_err(&mut self, e: anyhow::Error) -> anyhow::Error {
         self.dead = true;
         // If the child has exited (or does so shortly), that's the more useful error.
-        for _ in 0..20 {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                return anyhow!("{}: remote pcp exited ({status})", self.label);
+        if let Some(child) = &mut self.child {
+            for _ in 0..20 {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return anyhow!("{}: remote pcp exited ({status})", self.label);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let msg = if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof) {
             "connection closed by remote".to_string()
@@ -154,7 +158,9 @@ impl Drop for RemoteConn {
         if !self.dead {
             let _ = self.w.write_msg(&Request::Shutdown);
         }
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.wait();
+        }
     }
 }
 
@@ -187,10 +193,12 @@ pub struct RemoteSpec {
     pub host: String,
     pub rsh: Vec<String>,
     pub pcp_path: Option<String>,
+    /// Shared across clones so workers see the TCP setup done on the control connection.
+    pub tcp: std::sync::Arc<std::sync::Mutex<Option<TcpInfo>>>,
 }
 
 impl RemoteSpec {
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match &self.user {
             Some(u) => format!("{u}@{}", self.host),
             None => self.host.clone(),
@@ -257,14 +265,143 @@ impl RemoteSpec {
         let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", self.rsh[0]))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let mut conn = RemoteConn {
-            child,
-            w: FrameWriter::new(stdin, compress),
-            rx: spawn_reader(stdout),
+        let conn = RemoteConn {
+            child: Some(child),
+            w: FrameWriter::new(Box::new(stdin), compress),
+            rx: spawn_reader(Box::new(stdout)),
             label: self.label(),
             dead: false,
         };
-        conn.send(Request::Hello { version: VERSION, compress, debug: crate::transfer::debug() })?;
+        hello(conn, compress, Vec::new())
+    }
+
+    /// Ask the remote (over the control connection) to accept TCP data
+    /// connections; records how to reach it for later `connect` calls.
+    pub fn setup_tcp(&self, ctl: &mut dyn Conn, plain: bool, ports: (u16, u16)) -> Result<()> {
+        let key = if plain { None } else { Some(crate::crypto::random_bytes(crate::crypto::KEY_LEN)) };
+        let token = crate::crypto::random_bytes(16);
+        let resp = ctl.call(Request::TcpListen { key: key.clone(), token: token.clone(), port_lo: ports.0, port_hi: ports.1 })?;
+        let (port, mut addrs) = match ok(resp, "tcp listen")? {
+            Response::TcpListening { port, addrs } => (port, addrs),
+            other => bail!("unexpected response {other:?}"),
+        };
+        if let Some(h) = self.resolved_hostname() {
+            if !addrs.contains(&h) {
+                addrs.push(h);
+            }
+        }
+        *self.tcp.lock().unwrap() = Some(TcpInfo { addrs, port, key, token, failed: false });
+        Ok(())
+    }
+
+    /// The real host name behind an ssh config alias.
+    fn resolved_hostname(&self) -> Option<String> {
+        if !self.rsh[0].ends_with("ssh") {
+            return Some(self.host.clone());
+        }
+        let out = Command::new(&self.rsh[0]).args(&self.rsh[1..]).arg("-G").arg(&self.host).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .find_map(|l| l.strip_prefix("hostname "))
+            .map(|h| h.trim().to_string())
+            .or_else(|| Some(self.host.clone()))
+    }
+
+    /// Try every advertised address at once (firewalls that drop packets make
+    /// sequential attempts slow), then use the best one that connected:
+    /// addresses are listed in priority order, and once one succeeds we give
+    /// higher-priority ones a short grace period to succeed too.
+    fn connect_tcp(&self, info: &TcpInfo, compress: bool) -> Result<RemoteConn> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let n = info.addrs.len();
+        for (prio, addr) in info.addrs.clone().into_iter().enumerate() {
+            let (tx, port) = (tx.clone(), info.port);
+            std::thread::spawn(move || {
+                let r = (addr.as_str(), port)
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut i| i.next())
+                    .ok_or_else(|| anyhow!("cannot resolve {addr}"))
+                    .and_then(|sa| TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(4)).map_err(|e| anyhow!("{addr}:{port}: {e}")));
+                let _ = tx.send((prio, r));
+            });
+        }
+        drop(tx);
+        let mut last = anyhow!("no address advertised");
+        let mut best: Option<(usize, TcpStream)> = None;
+        let mut got = 0;
+        let mut deadline: Option<std::time::Instant> = None;
+        while got < n {
+            let msg = match deadline {
+                Some(d) => match rx.recv_timeout(d.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(m) => m,
+                    Err(_) => break,
+                },
+                None => match rx.recv() {
+                    Ok(m) => m,
+                    Err(_) => break,
+                },
+            };
+            got += 1;
+            match msg {
+                (prio, Ok(stream)) => {
+                    if best.as_ref().map_or(true, |(p, _)| prio < *p) {
+                        best = Some((prio, stream));
+                    }
+                    if prio == 0 {
+                        break;
+                    }
+                    deadline.get_or_insert(std::time::Instant::now() + std::time::Duration::from_millis(400));
+                }
+                (_, Err(e)) => last = e,
+            }
+        }
+        match best {
+            Some((_, stream)) => {
+                {
+                    let addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+                    if crate::transfer::debug() {
+                        eprintln!("pcp: {}: data connection via tcp {addr}", self.label());
+                    }
+                    stream.set_nodelay(true)?;
+                    let conn_id = TCP_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    (&stream).write_all(&conn_id.to_be_bytes())?;
+                    let (wc, rc) = match &info.key {
+                        Some(k) => (Some(Cipher::new(k, conn_id, 1)), Some(Cipher::new(k, conn_id, 2))),
+                        None => (None, None),
+                    };
+                    let writer = RecordWriter::new(stream.try_clone()?, wc);
+                    let reader = RecordReader::new(stream, rc);
+                    let conn = RemoteConn {
+                        child: None,
+                        w: FrameWriter::new(Box::new(writer), compress),
+                        rx: spawn_reader(Box::new(reader)),
+                        label: format!("{} (tcp {addr})", self.label()),
+                        dead: false,
+                    };
+                    hello(conn, compress, info.token.clone())
+                }
+            }
+            None => Err(last),
+        }
+    }
+}
+
+static TCP_CONN_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+#[derive(Clone, Debug)]
+pub struct TcpInfo {
+    pub addrs: Vec<String>,
+    pub port: u16,
+    pub key: Option<Vec<u8>>,
+    pub token: Vec<u8>,
+    /// Set once a connect attempt failed; later connections use ssh.
+    pub failed: bool,
+}
+
+fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteConn> {
+    {
+        conn.send(Request::Hello { version: VERSION, compress, debug: crate::transfer::debug(), token })?;
         match conn.recv() {
             Ok(Response::HelloOk { version }) if version == VERSION => Ok(conn),
             Ok(Response::HelloOk { version }) => {
@@ -278,7 +415,9 @@ impl RemoteSpec {
             ),
         }
     }
+}
 
+impl RemoteSpec {
     /// Copy this binary to `~/.local/bin/pcp` on the remote host.
     pub fn bootstrap(&self) -> Result<()> {
         let exe = std::env::current_exe().context("locate own executable")?;
@@ -316,7 +455,24 @@ impl Endpoint {
     pub fn connect(&self, compress: bool) -> Result<Box<dyn Conn>> {
         match self {
             Endpoint::Local => Ok(Box::new(LocalConn::new())),
-            Endpoint::Remote(spec) => Ok(Box::new(spec.connect(compress)?)),
+            Endpoint::Remote(spec) => {
+                let info = spec.tcp.lock().unwrap().clone();
+                if let Some(info) = info.filter(|i| !i.failed) {
+                    match spec.connect_tcp(&info, compress) {
+                        Ok(c) => return Ok(Box::new(c)),
+                        Err(e) => {
+                            let mut g = spec.tcp.lock().unwrap();
+                            if let Some(i) = g.as_mut() {
+                                if !i.failed {
+                                    i.failed = true;
+                                    eprintln!("pcp: {}: TCP data connection failed ({e:#}); falling back to ssh (is port {} open?)", spec.label(), info.port);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Box::new(spec.connect(compress)?))
+            }
         }
     }
 

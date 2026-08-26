@@ -1,5 +1,6 @@
 mod cli;
 mod conn;
+mod crypto;
 mod direct;
 mod fsops;
 mod progress;

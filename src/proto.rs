@@ -88,7 +88,10 @@ pub enum Op {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Request {
-    Hello { version: u32, compress: bool, debug: bool },
+    Hello { version: u32, compress: bool, debug: bool, token: Vec<u8> },
+    /// Ask the server to accept data connections over TCP (see crypto.rs).
+    /// `key` is None for plaintext; `token` authenticates plaintext connections.
+    TcpListen { key: Option<Vec<u8>>, token: Vec<u8>, port_lo: u16, port_hi: u16 },
     Scan { root: PathBytes, follow_root: bool },
     StatMany(Vec<PathBytes>),
     Apply(Vec<Op>),
@@ -114,6 +117,9 @@ pub enum Request {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Response {
     HelloOk { version: u32 },
+    /// `addrs`: the address the client reached this server on (if known), then
+    /// the server's other local addresses.
+    TcpListening { port: u16, addrs: Vec<String> },
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
     ScanDone,
