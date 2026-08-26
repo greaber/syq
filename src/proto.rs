@@ -125,9 +125,9 @@ pub enum Request {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Response {
     HelloOk { version: u32 },
-    /// `addrs`: the address the client reached this server on (if known), then
-    /// the server's other local addresses.
-    TcpListening { port: u16, addrs: Vec<String> },
+    /// Each advertised data address with its interface link speed in Mbps
+    /// (0 = unknown). The address the client's ssh session arrived on is first.
+    TcpListening { port: u16, addrs: Vec<(String, u32)> },
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
     ScanDone,

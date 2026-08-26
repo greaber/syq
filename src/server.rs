@@ -138,33 +138,57 @@ fn serve<R: Read + Send + 'static, W: Write>(r: R, w: W, over_ssh: bool, expect_
     Ok(())
 }
 
-/// Addresses a client might reach us on: the one this ssh session came in
-/// on first, then every other local IPv4 address (private ones before public).
-fn local_addrs() -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(c) = std::env::var("SSH_CONNECTION") {
-        if let Some(a) = c.split_whitespace().nth(2) {
-            out.push(a.to_string());
+fn is_virtual_iface(name: &str) -> bool {
+    name == "lo"
+        || ["docker", "veth", "br-", "virbr", "vmnet", "cni", "flannel", "cali", "kube", "ib"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        || std::path::Path::new(&format!("/sys/class/net/{name}/bridge")).exists()
+}
+
+fn iface_speed(name: &str) -> u32 {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/speed"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v as u32)
+        .unwrap_or(0)
+}
+
+/// (ip, speed_mbps) for each real NIC the client might reach us on. The ssh
+/// session's own server-IP is first; virtual interfaces (docker/bridges/etc.)
+/// are skipped so multipath never fans out onto a dead bridge.
+fn local_addrs() -> Vec<(String, u32)> {
+    let ssh_ip = std::env::var("SSH_CONNECTION").ok().and_then(|c| c.split_whitespace().nth(2).map(str::to_string));
+    let out = std::process::Command::new("ip").args(["-o", "-4", "addr", "show"]).output();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let mut addrs: Vec<(String, u32, u8)> = Vec::new(); // (ip, speed, priority-bucket)
+    for line in text.lines() {
+        // "3: bond0    inet 10.2.201.45/24 brd ... scope global bond0"
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let (Some(iface), Some(ipcidr)) = (f.get(1), f.iter().skip_while(|w| **w != "inet").nth(1)) else { continue };
+        if is_virtual_iface(iface) {
+            continue;
         }
-    }
-    let mut rest: Vec<String> = std::process::Command::new("hostname")
-        .arg("-I")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default();
-    rest.retain(|a| a.contains('.') && !a.starts_with("127.") && !out.contains(a));
-    // Private LANs first, then CGNAT (Tailscale and the like), then public.
-    rest.sort_by_key(|a| {
-        if a.starts_with("100.") && a.split('.').nth(1).and_then(|o| o.parse::<u8>().ok()).is_some_and(|o| (64..128).contains(&o)) {
-            1
-        } else if a.starts_with("10.") || a.starts_with("192.168.") || a.starts_with("172.") {
+        let ip = ipcidr.split('/').next().unwrap_or("").to_string();
+        if ip.is_empty() || ip.starts_with("127.") {
+            continue;
+        }
+        let bucket = if ssh_ip.as_deref() == Some(&ip) {
             0
+        } else if ip.starts_with("10.") || ip.starts_with("192.168.") || ip.starts_with("172.") {
+            1
+        } else if ip.starts_with("100.") {
+            3 // CGNAT / Tailscale
         } else {
-            2
-        }
-    });
-    out.extend(rest);
-    out
+            2 // public
+        };
+        addrs.push((ip, iface_speed(iface), bucket));
+    }
+    // ssh-arrival ip first, then by bucket, then by speed (fastest first).
+    addrs.sort_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)));
+    addrs.dedup_by(|a, b| a.0 == b.0);
+    addrs.into_iter().map(|(ip, sp, _)| (ip, sp)).collect()
 }
 
 fn tcp_listen(key: Option<Vec<u8>>, token: Vec<u8>, lo: u16, hi: u16, debug: bool, compress: bool) -> Result<u16> {
