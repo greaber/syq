@@ -39,6 +39,9 @@ pub struct Entry {
     pub uid: u32,
     pub gid: u32,
     pub rdev: u64,
+    /// Device and inode, for detecting src==dst (same file / hardlink / alias).
+    pub dev: u64,
+    pub ino: u64,
     pub link: Option<PathBytes>,
 }
 

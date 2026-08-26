@@ -6,7 +6,10 @@
 #   sudo ./server-setup.sh apply     # do everything below
 #   sudo ./server-setup.sh status    # show what is / isn't in place (no changes)
 #   sudo ./server-setup.sh roce-clean# remove only the RoCE bits this script added (keep the rest)
-#   sudo ./server-setup.sh undo      # best-effort removal of everything this script added
+#
+# There is intentionally no blanket "undo": these settings (BBR, buffers,
+# MaxStartups, ufw rules) are shared with hand-made config and safe to leave.
+# To reverse a specific change, edit the file it names below.
 #
 # What `apply` does (each step is skipped when already done):
 #   1. TCP tuning for long-RTT transfers: 64 MB socket buffers, BBR, fq.
@@ -23,8 +26,8 @@
 #      `netplan apply`, which would re-touch bond0). Ports without a cable are
 #      left alone, so this is a no-op on hosts that aren't wired yet.
 #
-# Everything this script writes carries a "pcp-setup" marker so `undo` can
-# find it. Nothing here touches bond0, NFS mounts, or existing ufw rules.
+# Everything this script writes carries a "pcp-setup" marker. Nothing here
+# touches bond0, NFS mounts, or the provider's RoCE fabric.
 
 set -euo pipefail
 
@@ -88,13 +91,6 @@ sysctl_apply() {
     say "sysctl: already in place"
   fi
 }
-sysctl_undo() {
-  rm -f $SYSCTL_FILE $MODULES_FILE
-  sysctl -q -w net.ipv4.tcp_congestion_control=cubic net.core.default_qdisc=fq_codel \
-    net.core.rmem_max=212992 net.core.wmem_max=212992 \
-    net.ipv4.tcp_rmem="4096 131072 6291456" net.ipv4.tcp_wmem="4096 16384 4194304" >/dev/null
-  say "sysctl: removed (kernel defaults restored)"
-}
 
 # ---- 2. sshd -------------------------------------------------------------------
 SSHD_WANT="MaxStartups 100:30:200"
@@ -120,12 +116,6 @@ sshd_apply() {
     say "sshd: appended '$SSHD_WANT' to $SSHD_CONFIG"
   fi
   if [ "$DRY" = 0 ]; then sshd -t && { systemctl reload ssh 2>/dev/null || systemctl reload sshd; }; else echo "    would run: sshd -t && systemctl reload ssh"; fi
-}
-sshd_undo() {
-  rm -f $OLD_SSHD_FILE
-  sed -i -E "s/^$SSHD_WANT$/#MaxStartups 10:30:100/" $SSHD_CONFIG
-  systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-  say "sshd: MaxStartups line commented out again"
 }
 
 # ---- 3. ufw --------------------------------------------------------------------
@@ -154,14 +144,6 @@ ufw_apply() {
     say "ufw: allowed $PCP_PORTS/tcp from $s"
   done
   say "ufw: done"
-}
-ufw_undo() {
-  ufw_active || return 0
-  # Delete every pcp port-range rule, marked or hand-made (highest number first
-  # so the numbering stays valid while deleting).
-  local nums; nums=$( (ufw status numbered || true) | grep -E "$PCP_PORTS/tcp|$MARK" | sed -E 's/^\[ *([0-9]+)\].*/\1/' | sort -rn)
-  for n in $nums; do yes | ufw delete "$n" >/dev/null; done
-  say "ufw: removed all pcp port rules"
 }
 
 # ---- 4. RoCE -------------------------------------------------------------------
@@ -266,11 +248,6 @@ roce_clean() {
   done
   say "roce: removed $removed of our 192.168.10x addresses (provider addresses left intact)"
 }
-roce_undo() {
-  if [ -f $NETPLAN_FILE ]; then rm -f $NETPLAN_FILE; netplan generate; say "roce: netplan file removed"; fi
-  for n in $(roce_ports); do ip addr flush dev "$n" 2>/dev/null || true; done
-  say "roce: addresses flushed (ports left admin-up; harmless)"
-}
 
 # ---- driver ---------------------------------------------------------------------
 case "${1:-}" in
@@ -279,6 +256,5 @@ case "${1:-}" in
   status) echo "== status on $(hostname)"; [ "$(id -u)" = 0 ] || say "(run as root for sshd/ufw details)"; sysctl_status || true; sshd_status || true; ufw_status || true; roce_status
           ;;
   roce-clean) need_root roce-clean; echo "== roce-clean on $(hostname)"; roce_clean; echo "== done" ;;
-  undo)   need_root undo; echo "== undo on $(hostname)"; roce_undo; ufw_undo; sshd_undo; sysctl_undo; echo "== done" ;;
   *) sed -n '2,26p' "$0"; exit 1 ;;
 esac

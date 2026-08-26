@@ -97,6 +97,19 @@ pub fn run(args: Args) -> Result<i32> {
             bail!("all sources must be on the same host");
         }
     }
+    // Reject up front when two sources would land on the same destination name
+    // (e.g. a/same and b/same into dest/) — before any bytes are written.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for s in srcs {
+            if !s.copies_contents() {
+                let base = s.basename();
+                if !base.is_empty() && !seen.insert(base.clone()) {
+                    bail!("two sources named {base:?} map to the same destination; rename one or copy them separately");
+                }
+            }
+        }
+    }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
     if args.connections_default && !src_ep.is_remote() && !dst_ep.is_remote() {
@@ -232,6 +245,8 @@ pub fn run(args: Args) -> Result<i32> {
         sched: &sched,
         progress: &progress,
         opts: &opts,
+        dst_seen: std::collections::HashSet::new(),
+        collision: false,
         deferred: Vec::new(),
         dirs_created: 0,
         links_created: 0,
@@ -251,10 +266,14 @@ pub fn run(args: Args) -> Result<i32> {
             break;
         }
     }
+    let collision = st.collision;
     progress.scan_done.store(true, Relaxed);
     sched.scan_done();
     if let Some(e) = &scan_err {
         progress.error(&format!("pcp: {e:#}"));
+        sched.abort();
+    }
+    if collision {
         sched.abort();
     }
 
@@ -352,6 +371,9 @@ struct Planner<'a> {
     sched: &'a Sched,
     progress: &'a Progress,
     opts: &'a Opts,
+    /// Leaf destination paths already claimed, to reject two sources writing one file.
+    dst_seen: std::collections::HashSet<PathBytes>,
+    collision: bool,
     /// (dst path, meta, flags, depth) for directories, applied deepest-first at the end.
     deferred: Vec<(PathBytes, Meta, u8, usize)>,
     dirs_created: u64,
@@ -465,6 +487,15 @@ impl Planner<'_> {
             };
             match e.kind {
                 Kind::File => {
+                    // Never copy a file onto itself (same path, hardlink, or a
+                    // symlinked alias) — with --inplace that would truncate the
+                    // source. Only possible when both ends are the same machine.
+                    if opts.same_host
+                        && dst_entry.as_ref().is_some_and(|d| d.dev == e.dev && d.ino == e.ino)
+                    {
+                        self.progress.eprintln(&format!("skipping {rel}: source and destination are the same file"));
+                        continue;
+                    }
                     let same = dst_entry.as_ref().is_some_and(|d| {
                         d.kind == Kind::File
                             && d.size == e.size
@@ -472,7 +503,7 @@ impl Planner<'_> {
                     });
                     if opts.verify_only {
                         if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
-                            self.enqueue(src_path, dst_path, rel, e.clone(), dst_entry);
+                            self.enqueue(src_path.clone(), dst_path.clone(), rel.clone(), e.clone(), dst_entry.clone());
                         } else {
                             self.progress.error(&format!("MISSING {rel}"));
                         }
@@ -486,7 +517,7 @@ impl Planner<'_> {
                         if opts.verbose > 0 {
                             self.progress.println(&rel);
                         }
-                    } else {
+                    } else if self.claim_dst(&dst_path, &rel) {
                         self.enqueue(src_path, dst_path, rel, e.clone(), dst_entry);
                     }
                 }
@@ -508,6 +539,9 @@ impl Planner<'_> {
                         }
                         continue;
                     }
+                    if !self.claim_dst(&dst_path, &rel) {
+                        continue;
+                    }
                     op_names.push(format!("{rel} -> {}", display(&target)));
                     ops.push(Op::Symlink { path: dst_path.clone(), target });
                     ops.push(Op::SetMeta { path: dst_path, meta: e.meta(), flags: opts.flags & !flags::MODE });
@@ -525,6 +559,9 @@ impl Planner<'_> {
                         if opts.dry_run && !same && opts.verbose > 0 {
                             self.progress.println(&rel);
                         }
+                        continue;
+                    }
+                    if !self.claim_dst(&dst_path, &rel) {
                         continue;
                     }
                     op_names.push(rel);
@@ -549,6 +586,20 @@ impl Planner<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Record a leaf (file/symlink/special) destination; return false if this
+    /// exact destination was already claimed by another source (a collision).
+    fn claim_dst(&mut self, dst: &PathBytes, rel: &str) -> bool {
+        if !self.dst_seen.insert(dst.clone()) {
+            self.progress.error(&format!(
+                "pcp: {rel}: two sources map to the same destination {} — refusing to write it twice",
+                display(dst)
+            ));
+            self.collision = true;
+            return false;
+        }
+        true
     }
 
     fn enqueue(&mut self, src: PathBytes, dst: PathBytes, rel: String, entry: Entry, dst_entry: Option<Entry>) {

@@ -4,7 +4,8 @@
 
 use crate::cli::{Args, Location};
 use crate::conn::{ok, Conn, Endpoint};
-use crate::fsops::join;
+use crate::fsops::{join, resolve};
+use std::fs;
 use crate::progress::{commas, Progress};
 use crate::proto::*;
 use crate::transfer::{connect_ctl, endpoint};
@@ -94,18 +95,57 @@ fn worker(pool: Arc<Pool>, rx: Arc<Mutex<mpsc::Receiver<Vec<Op>>>>, ep: Endpoint
     }
 }
 
+/// Reject dangerous removal targets: traversal (`..`), the filesystem root,
+/// home, cwd, and any ancestor of cwd/home. `..` components are rejected for
+/// every target (local or remote) so `child/..` can't escape; local targets are
+/// additionally canonicalized to catch symlink and alias tricks.
+fn check_rm_safety(locs: &[Location], args: &Args) -> Result<()> {
+    use std::path::{Component, Path, PathBuf};
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().ok();
+    for l in locs {
+        let raw = l.path.trim_end_matches('/');
+        // Any `..` (or bare `.`) component is refused, on any host.
+        for c in Path::new(&l.path).components() {
+            match c {
+                Component::ParentDir => bail!("refusing to remove {:?}: contains a '..' path component", l.path),
+                Component::CurDir if raw == "." => bail!("refusing to remove the current directory {:?}", l.path),
+                _ => {}
+            }
+        }
+        if raw.is_empty() || raw == "/" || raw == "~" || raw == "~/" {
+            bail!("refusing to remove {:?}", l.path);
+        }
+        if l.is_remote() {
+            continue; // can't canonicalize a remote path here; the checks above still apply
+        }
+        // Local: resolve symlinks/./.. and refuse root, home, cwd, and ancestors.
+        let resolved = fs::canonicalize(resolve(l.path.as_bytes())).unwrap_or_else(|_| resolve(l.path.as_bytes()));
+        if resolved.parent().is_none() {
+            bail!("refusing to remove the filesystem root {:?}", resolved);
+        }
+        for special in [home.as_ref(), cwd.as_ref()].into_iter().flatten() {
+            if &resolved == special {
+                bail!("refusing to remove {:?} (it is your {})", resolved, if Some(&resolved) == home.as_ref() { "home directory" } else { "current directory" });
+            }
+            if special.starts_with(&resolved) {
+                bail!("refusing to remove {:?}: it is an ancestor of {:?}", resolved, special);
+            }
+        }
+    }
+    let _ = args;
+    Ok(())
+}
+
 pub fn run(args: Args) -> Result<i32> {
     let locs: Vec<Location> = args.paths.iter().map(|p| Location::parse(p)).collect::<Result<_>>()?;
     for l in &locs {
         if !l.same_host(&locs[0]) {
             bail!("all paths must be on the same host");
         }
-        let p = l.path.trim_end_matches('/');
-        if p.is_empty() || p == "." || p == "~" || p == "/" {
-            bail!("refusing to remove {:?}", l.path);
-        }
     }
     let mut args = args;
+    check_rm_safety(&locs, &args)?;
     let ep = endpoint(&locs[0], &args)?;
     if args.connections_default && !ep.is_remote() {
         args.connections = crate::transfer::LOCAL_DEFAULT_CONNECTIONS;

@@ -244,6 +244,10 @@ impl Location {
     }
 
 
+    pub fn is_remote(&self) -> bool {
+        self.host.is_some()
+    }
+
     /// rsync trailing-slash semantics: "copy the contents" rather than the dir.
     pub fn copies_contents(&self) -> bool {
         let p = self.path.as_str();
