@@ -521,16 +521,21 @@ fn mkdir(p: &Path, mode: u32) -> Result<()> {
 }
 
 fn preallocate(f: &File, size: u64) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
     if size == 0 {
         f.set_len(0)?;
         return Ok(());
     }
-    let r = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) };
-    if r != 0 {
-        // Unsupported filesystem (tmpfs, some NFS): fall back to a sparse file.
-        f.set_len(size)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let r = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) };
+        if r == 0 {
+            return Ok(());
+        }
+        // Unsupported filesystem (tmpfs, some NFS): fall through to sparse.
     }
+    // Portable fallback (also macOS): a sparse file of the right size.
+    f.set_len(size)?;
     Ok(())
 }
 
