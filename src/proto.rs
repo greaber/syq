@@ -94,7 +94,8 @@ pub enum Request {
     /// Ask the server to accept data connections over TCP (see crypto.rs).
     /// `key` is None for plaintext; `token` authenticates plaintext connections.
     TcpListen { key: Option<Vec<u8>>, token: Vec<u8>, port_lo: u16, port_hi: u16 },
-    Scan { root: PathBytes, follow_root: bool },
+    /// `all`: include pcp's own partial files (used by --rm).
+    Scan { root: PathBytes, follow_root: bool, all: bool },
     StatMany(Vec<PathBytes>),
     Apply(Vec<Op>),
     /// What exists at `path` on the receiving side: the final file and/or a partial.

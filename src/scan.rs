@@ -14,6 +14,7 @@ pub const BATCH: usize = 1000;
 pub fn scan(
     root: &Path,
     follow_root: bool,
+    all: bool,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     warn: &mut dyn FnMut(String),
 ) -> Result<()> {
@@ -33,9 +34,9 @@ pub fn scan(
     let walk = WalkDirGeneric::<((), Option<Entry>)>::new(root)
         .follow_links(false)
         .skip_hidden(false)
-        .process_read_dir(|_depth, _path, _state, children| {
+        .process_read_dir(move |_depth, _path, _state, children| {
             for child in children.iter_mut().flatten() {
-                if is_partial_name(&child.file_name) {
+                if !all && is_partial_name(&child.file_name) {
                     child.read_children_path = None;
                     child.client_state = None;
                     continue;
@@ -59,7 +60,7 @@ pub fn scan(
             warn(format!("scan: {}: {e}", de.path().display()));
         }
         let Some(mut entry) = de.client_state.take() else {
-            if !is_partial_name(&de.file_name) {
+            if all || !is_partial_name(&de.file_name) {
                 warn(format!("scan: cannot stat {}", de.path().display()));
             }
             continue;

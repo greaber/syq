@@ -112,6 +112,13 @@ pub struct Args {
     /// Port range the remote listens on for --tcp
     #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
     pub tcp_ports: String,
+    /// Remote-to-remote: start the transfer detached on the source host (survives losing this
+    /// ssh session) and return; progress goes to a log you can watch with --follow
+    #[arg(long)]
+    pub detach: bool,
+    /// Follow a detached transfer: pcp --follow HOST:LOGFILE
+    #[arg(long)]
+    pub follow: bool,
     /// Remote-to-remote: relay data through this machine instead of running on the source host
     #[arg(long)]
     pub relay: bool,

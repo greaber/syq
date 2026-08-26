@@ -27,6 +27,7 @@ pub trait Conn: Send {
         &mut self,
         root: &[u8],
         follow_root: bool,
+        all: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()>;
@@ -64,10 +65,11 @@ impl Conn for LocalConn {
         &mut self,
         root: &[u8],
         follow_root: bool,
+        all: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
-        crate::scan::scan(&fsops::resolve(root), follow_root, sink, warn)
+        crate::scan::scan(&fsops::resolve(root), follow_root, all, sink, warn)
     }
 }
 
@@ -137,10 +139,11 @@ impl Conn for RemoteConn {
         &mut self,
         root: &[u8],
         follow_root: bool,
+        all: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
-        self.send(Request::Scan { root: root.to_vec(), follow_root })?;
+        self.send(Request::Scan { root: root.to_vec(), follow_root, all })?;
         loop {
             match self.recv()? {
                 Response::ScanBatch(b) => sink(b)?,
