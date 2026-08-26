@@ -39,6 +39,7 @@ fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             host: h.clone(),
             rsh: parse_rsh(&args.rsh)?,
             pcp_path: args.pcp_path.clone(),
+            tcp: Default::default(),
         }),
     })
 }
@@ -55,6 +56,16 @@ fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
             Err(e)
         }
     }
+}
+
+fn parse_ports(s: &str) -> Result<(u16, u16)> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let lo: u16 = a.trim().parse().map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
+    let hi: u16 = b.trim().parse().map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
+    if hi < lo {
+        bail!("bad port range {s:?}");
+    }
+    Ok((lo, hi))
 }
 
 pub fn debug() -> bool {
@@ -135,9 +146,11 @@ pub fn run(args: Args) -> Result<i32> {
             }));
         }
     };
-    // With --bootstrap the control connection must go first (it installs the
-    // remote binary); otherwise everything connects at once.
-    if !opts.dry_run && !args.bootstrap {
+    // With --bootstrap or --tcp the control connection must go first (it
+    // installs the remote binary / sets up the TCP listener); otherwise
+    // everything connects at once.
+    let use_tcp = args.tcp || args.tcp_plain;
+    if !opts.dry_run && !args.bootstrap && !use_tcp {
         spawn_workers(&mut workers);
     }
 
@@ -159,7 +172,21 @@ pub fn run(args: Args) -> Result<i32> {
     if debug() {
         eprintln!("pcp: control connections up in {:.2}s", t0.elapsed().as_secs_f64());
     }
-    if !opts.dry_run && args.bootstrap {
+    if use_tcp {
+        let ports = parse_ports(&args.tcp_ports)?;
+        for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
+            if let Endpoint::Remote(spec) = ep {
+                if let Err(e) = spec.setup_tcp(&mut **ctl, args.tcp_plain, ports) {
+                    eprintln!("pcp: {}: cannot set up TCP data connections ({e:#}); using ssh", spec.label());
+                    continue;
+                }
+                if debug() {
+                    eprintln!("pcp: {}: tcp data port {:?}", spec.label(), spec.tcp.lock().unwrap().as_ref().map(|i| (i.addrs.clone(), i.port)));
+                }
+            }
+        }
+    }
+    if !opts.dry_run && (args.bootstrap || use_tcp) {
         spawn_workers(&mut workers);
     }
 

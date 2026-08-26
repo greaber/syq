@@ -403,7 +403,7 @@ impl FsOps {
                 self.finalize(path, *inplace, meta, *flags).map(|_| Response::Ok)
             }
             Request::FileHash { path } => self.file_hash(path),
-            Request::Hello { .. } | Request::Scan { .. } | Request::Shutdown => {
+            Request::Hello { .. } | Request::Scan { .. } | Request::Shutdown | Request::TcpListen { .. } => {
                 Err(anyhow!("unexpected request"))
             }
         };
