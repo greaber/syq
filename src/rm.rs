@@ -22,6 +22,7 @@ struct Pool {
     cv: Condvar,
     progress: Arc<Progress>,
     verbose: bool,
+    aborted: std::sync::atomic::AtomicBool,
 }
 
 impl Pool {
@@ -41,9 +42,16 @@ impl Pool {
             self.cv.notify_all();
         }
     }
+    fn abort(&self) {
+        self.aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cv.notify_all();
+    }
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(std::sync::atomic::Ordering::SeqCst)
+    }
     fn wait_idle(&self) {
         let mut p = self.pending.lock().unwrap();
-        while *p > 0 {
+        while *p > 0 && !self.is_aborted() {
             p = self.cv.wait(p).unwrap();
         }
     }
@@ -86,6 +94,7 @@ fn worker(pool: Arc<Pool>, rx: Arc<Mutex<mpsc::Receiver<Vec<Op>>>>, ep: Endpoint
                 pool.progress.error(&format!("pcp: {e:#}"));
                 pool.done();
                 if conn.is_dead() {
+                    pool.abort(); // wake wait_idle so the run doesn't hang on queued ops
                     return Err(e);
                 }
                 continue;
@@ -171,6 +180,7 @@ pub fn run(args: Args) -> Result<i32> {
         cv: Condvar::new(),
         progress: progress.clone(),
         verbose: args.verbose > 0,
+        aborted: std::sync::atomic::AtomicBool::new(false),
     });
     let mut workers = Vec::new();
     if !args.dry_run {
@@ -251,7 +261,7 @@ pub fn run(args: Args) -> Result<i32> {
     if let Some(e) = scan_err {
         progress.error(&format!("pcp: {e:#}"));
     }
-    let errors = progress.errors.load(Relaxed);
+    let errors = progress.errors.load(Relaxed) + if pool.is_aborted() { 1 } else { 0 };
     if !args.quiet {
         println!(
             "pcp: {} {} entries in {}{}",

@@ -138,7 +138,10 @@ transfer stays parallel without pre-deciding chunk counts.
 
 On the receiving side each file is written into `.name.pcp-partial` in its
 directory (preallocated with `fallocate`, written with `pwrite` from several
-processes), then fsynced, given its metadata, and `rename`d over the target.
+processes), given its metadata, and `rename`d over the target. By default pcp
+does not `fsync` each file (the rename still orders correctly, and per-file
+fsync is costly on NFS); pass `--fsync` to force each file durable before the
+rename for crash safety.
 The final name is never occupied by an incomplete file. `--inplace` skips the
 partial for when there is no room for a second copy.
 
@@ -168,7 +171,9 @@ uploads and downloads) that trade was made deliberately.
 
 Always:
 
-- Every block carries an xxh3 hash checked on receipt; a mismatch is re-sent.
+- Every block carries an xxh3 hash checked on receipt (read side and write
+  side); a mismatch aborts that file with an error (exit 23) rather than
+  silently continuing — it indicates transport corruption, which is rare.
 - After a file completes, the source is re-stat'ed. If its size or mtime
   changed during the transfer the file is redone (up to three attempts), then
   reported as an error.

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 const COMPRESS_MIN: usize = 512;
 
@@ -120,7 +120,7 @@ pub enum Request {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
-    Finalize { path: PathBytes, inplace: bool, meta: Meta, flags: u8 },
+    Finalize { path: PathBytes, inplace: bool, meta: Meta, flags: u8, fsync: bool },
     FileHash { path: PathBytes },
     Shutdown,
 }
@@ -229,7 +229,16 @@ impl<R: Read> FrameReader<R> {
         let mut body = vec![0u8; len - 1];
         self.r.read_exact(&mut body)?;
         let payload = if flag[0] & 1 != 0 {
-            zstd::decode_all(&body[..])?
+            {
+                use std::io::Read as _;
+                let mut dec = zstd::stream::read::Decoder::new(&body[..])?;
+                let mut out = Vec::new();
+                dec.by_ref().take(MAX_FRAME as u64 + 1).read_to_end(&mut out)?;
+                if out.len() > MAX_FRAME {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "decompressed frame exceeds limit"));
+                }
+                out
+            }
         } else {
             body
         };

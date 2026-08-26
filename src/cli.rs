@@ -102,6 +102,9 @@ pub struct Args {
     /// semantics; costs a rename per file, which is slow on NFS)
     #[arg(long)]
     pub atomic: bool,
+    /// fsync each file before renaming it into place (durable across a crash; slower on NFS)
+    #[arg(long)]
+    pub fsync: bool,
 
     /// Remote shell command (default: ssh)
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]

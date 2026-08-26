@@ -28,6 +28,7 @@ pub struct Opts {
     pub verify_only: bool,
     pub inplace: bool,
     pub atomic: bool,
+    pub fsync: bool,
     pub same_host: bool,
     pub dry_run: bool,
     pub verbose: u8,
@@ -85,7 +86,8 @@ fn read_umask() -> u32 {
 
 pub fn run(args: Args) -> Result<i32> {
     let mut args = args;
-    let block = parse_size(&args.block_size)?.clamp(64 * 1024, 1 << 30);
+    // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
+    let block = parse_size(&args.block_size)?.clamp(64 * 1024, 64 << 20);
     let min_split = parse_size(&args.min_split)?;
     let locs: Vec<Location> = args.paths.iter().map(|p| Location::parse(p)).collect::<Result<_>>()?;
     if locs.len() < 2 {
@@ -138,6 +140,7 @@ pub fn run(args: Args) -> Result<i32> {
         verify_only: args.verify_only,
         inplace: args.inplace,
         atomic: args.atomic,
+        fsync: args.fsync,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         dry_run: args.dry_run,
         verbose: args.verbose,
@@ -436,7 +439,9 @@ impl Planner<'_> {
             let new_dirs: Vec<Op> = mkdirs
                 .into_iter()
                 .zip(stats.iter())
-                .filter(|(_, s)| !matches!(s, Some(e) if e.kind == Kind::Dir))
+                // Keep the op for new dirs, and for existing dirs we can't yet
+                // write into (0o700 not set) so apply() opens them up.
+                .filter(|(_, s)| !matches!(s, Some(e) if e.kind == Kind::Dir && e.mode & 0o700 == 0o700))
                 .map(|(op, _)| op)
                 .collect();
             if !new_dirs.is_empty() {
@@ -480,6 +485,7 @@ impl Planner<'_> {
         let stats = self.stat_many(true, others.iter().map(|(_, d, _)| d.clone()).collect())?;
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<String> = Vec::new();
+        let mut meta_fixes: Vec<Op> = Vec::new();
         for ((src_path, dst_path, e), dst_entry) in others.into_iter().zip(stats) {
             let rel = {
                 let r = join(sub_b, &e.path);
@@ -508,6 +514,24 @@ impl Planner<'_> {
                             self.progress.error(&format!("MISSING {rel}"));
                         }
                     } else if same && !opts.checksum {
+                        // Content is up to date, but still reconcile metadata
+                        // (mode/owner/group) the way rsync does — a skipped file
+                        // shouldn't keep stale permissions.
+                        if let Some(d) = &dst_entry {
+                            let mut ff = 0u8;
+                            if opts.flags & flags::MODE != 0 && d.mode & 0o7777 != e.mode & 0o7777 {
+                                ff |= flags::MODE;
+                            }
+                            if opts.flags & flags::OWNER != 0 && d.uid != e.uid {
+                                ff |= flags::OWNER;
+                            }
+                            if opts.flags & flags::GROUP != 0 && d.gid != e.gid {
+                                ff |= flags::GROUP;
+                            }
+                            if ff != 0 {
+                                meta_fixes.push(Op::SetMeta { path: dst_path.clone(), meta: e.meta(), flags: ff });
+                            }
+                        }
                         self.progress.files_skipped.fetch_add(1, Relaxed);
                         self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
                     } else if opts.dry_run {
@@ -570,6 +594,11 @@ impl Planner<'_> {
                     self.specials_created += 1;
                 }
                 Kind::Dir | Kind::Other => {}
+            }
+        }
+        if !meta_fixes.is_empty() {
+            for err in self.apply(true, meta_fixes)?.into_iter().flatten() {
+                self.progress.error(&format!("pcp: {err}"));
             }
         }
         if !ops.is_empty() {
@@ -651,6 +680,16 @@ struct Worker {
 
 impl Worker {
     fn run(&mut self) -> Result<()> {
+        let r = self.run_inner();
+        if r.is_err() {
+            // A dead connection here would otherwise leave peers blocked in
+            // sched.next(); wake them so the whole transfer unwinds.
+            self.sched.abort();
+        }
+        r
+    }
+
+    fn run_inner(&mut self) -> Result<()> {
         loop {
             let t0 = std::time::Instant::now();
             let item = self.sched.next();
@@ -692,10 +731,13 @@ impl Worker {
                 Item::Range(h) => {
                     let idx = h.lock().unwrap().idx;
                     let res = self.transfer_range(&h);
+                    // Remove the handle from the scheduler's in-flight set FIRST,
+                    // so a propagating error can't strand it and deadlock peers.
+                    let done = self.sched.range_done(&h);
                     if let Err(e) = res {
                         self.file_error(idx, e)?;
                     }
-                    if self.sched.range_done(&h) {
+                    if done {
                         if let Err(e) = self.finish_file(idx) {
                             self.file_error(idx, e)?;
                         }
@@ -749,7 +791,7 @@ impl Worker {
         }
         // Writes: prepare, write, finalize for every file, then collect acks.
         let mut expect: Vec<usize> = Vec::with_capacity(jobs.len());
-        let flags = self.opts.flags | flags::MODE;
+        let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
         for (j, d) in jobs.iter().zip(data.iter_mut()) {
             let Ok(bytes) = d else {
                 expect.push(0);
@@ -758,16 +800,14 @@ impl Worker {
             let bytes = std::mem::take(bytes);
             let hash = xxh3_64(&bytes);
             let mut meta = j.entry.meta();
-            if !self.opts.perms {
-                meta.mode = j.entry.mode & 0o777 & !self.opts.umask;
-            }
+            meta.mode = self.create_mode(j);
             self.dst.send(Request::Prepare { path: j.dst.clone(), size: j.entry.size, inplace: true, from_final: false, mode: self.create_mode(j) })?;
             let mut n = 2;
             if !bytes.is_empty() {
                 self.dst.send(Request::WriteRange { path: j.dst.clone(), inplace: true, off: 0, hash, data: bytes })?;
                 n = 3;
             }
-            self.dst.send(Request::Finalize { path: j.dst.clone(), inplace: true, meta, flags })?;
+            self.dst.send(Request::Finalize { path: j.dst.clone(), inplace: true, meta, flags, fsync: self.opts.fsync })?;
             expect.push(n);
         }
         let mut results: Vec<Result<()>> = Vec::with_capacity(jobs.len());
@@ -902,9 +942,11 @@ impl Worker {
             if final_is_file && (size > 0 && final_entry.as_ref().unwrap().size > 0 || size == 0) {
                 let ranges = if size > 0 { self.diff_blocks(&job, Which::Final)? } else { vec![] };
                 if ranges.is_empty() && final_entry.as_ref().unwrap().size == size {
-                    // Content identical: just fix up metadata.
-                    let flags = self.final_flags(&job);
-                    let errs = match ok(self.dst.call(Request::Apply(vec![Op::SetMeta { path: job.dst.clone(), meta: job.entry.meta(), flags }]))?, "setmeta")? {
+                    // Content identical: just fix up metadata (mode per rsync rules).
+                    let mut meta = job.entry.meta();
+                    meta.mode = self.create_mode(&job);
+                    let flags = self.opts.flags | flags::MODE;
+                    let errs = match ok(self.dst.call(Request::Apply(vec![Op::SetMeta { path: job.dst.clone(), meta, flags }]))?, "setmeta")? {
                         Response::Applied(v) => v,
                         other => bail!("unexpected response {other:?}"),
                     };
@@ -1010,20 +1052,17 @@ impl Worker {
     }
 
     /// Mode a new destination file is created with (what finalize will want).
+    /// The mode the finished file should have (rsync semantics):
+    /// with -p the source mode; without -p an existing file keeps its own mode
+    /// and a new file gets the source mode minus the umask.
     fn create_mode(&self, job: &FileJob) -> u32 {
         if self.opts.perms {
             job.entry.mode & 0o7777
+        } else if let Some(d) = job.dst_entry.as_ref().filter(|d| d.kind == Kind::File) {
+            d.mode & 0o7777
         } else {
             job.entry.mode & 0o777 & !self.opts.umask
         }
-    }
-
-    fn final_flags(&self, job: &FileJob) -> u8 {
-        let mut flags = self.opts.flags;
-        if !self.opts.perms && matches!(job.dst_entry, Some(Entry { kind: Kind::File, .. })) {
-            flags &= !flags::MODE;
-        }
-        flags
     }
 
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
@@ -1126,13 +1165,11 @@ impl Worker {
             return Ok(());
         }
         let job = self.job(idx);
-        let flags = self.final_flags(&job);
         let mut meta = job.entry.meta();
-        if !self.opts.perms {
-            meta.mode = job.entry.mode & 0o777 & !self.opts.umask;
-        }
+        meta.mode = self.create_mode(&job);
+        let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
         ok(
-            self.dst.call(Request::Finalize { path: job.dst.clone(), inplace: job.inplace, meta, flags: flags | if self.opts.perms { 0 } else { flags::MODE } })?,
+            self.dst.call(Request::Finalize { path: job.dst.clone(), inplace: job.inplace, meta, flags, fsync: self.opts.fsync })?,
             "finalize",
         )?;
         // Did the source change under us?

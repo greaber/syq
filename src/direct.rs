@@ -68,6 +68,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.atomic {
         remote.push("--atomic".into());
     }
+    if args.fsync {
+        remote.push("--fsync".into());
+    }
     if args.bootstrap {
         remote.push("--bootstrap".into());
     }
@@ -126,7 +129,11 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         // terminal, everything to a log file. The transfer itself still needs
         // the forwarded agent only for its initial connections, so hostA must
         // be able to reach hostB with its own credentials for a long run.
-        let name = srcs[0].path.trim_end_matches('/').rsplit('/').next().unwrap_or("pcp").to_string();
+        // The basename is interpolated into a remote shell command; allow only
+        // safe characters so a crafted filename can't inject commands.
+        let raw = srcs[0].path.trim_end_matches('/').rsplit('/').next().unwrap_or("pcp");
+        let name: String = raw.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' }).collect();
+        let name = if name.trim_matches('.').is_empty() { "pcp".to_string() } else { name };
         format!(
             "mkdir -p \"$HOME/.pcp\" && log=\"$HOME/.pcp/{name}-$(date +%Y%m%d-%H%M%S).log\" && (setsid nohup sh -c {} > \"$log\" 2>&1 < /dev/null &) && echo \"$log\"",
             shell_words::quote(&remote_cmd)
