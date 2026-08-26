@@ -5,6 +5,7 @@
 #   sudo ./server-setup.sh plan      # print exactly what `apply` would change here
 #   sudo ./server-setup.sh apply     # do everything below
 #   sudo ./server-setup.sh status    # show what is / isn't in place (no changes)
+#   sudo ./server-setup.sh roce-clean# remove only the RoCE bits this script added (keep the rest)
 #   sudo ./server-setup.sh undo      # best-effort removal of everything this script added
 #
 # What `apply` does (each step is skipped when already done):
@@ -188,9 +189,25 @@ roce_status() {
   done
   say "roce: $up/$total ports have link; netplan=$([ -f $NETPLAN_FILE ] && echo present || echo absent)"
 }
+# A fabric is "pre-configured" if the provider already addressed these ports
+# (rail*/roce* interface names, existing IPs, or netplan-generated rail networks).
+# In that case we must not touch them — our flat 192.168/24 would clobber it.
+roce_preconfigured() {
+  ls /run/systemd/network/*rail*.network >/dev/null 2>&1 && return 0
+  for n in $(roce_ports); do
+    case "$n" in rail*|roce*) return 0;; esac
+    [ -n "$(ip -4 -o addr show "$n" | awk '{print $4}')" ] && return 0
+  done
+  return 1
+}
 roce_apply() {
   local ports; ports=$(roce_ports)
   [ -n "$ports" ] || { say "roce: no ConnectX ports, skipping"; return; }
+  if roce_preconfigured; then
+    say "roce: fabric already configured by the provider (rails/addresses present) — leaving it untouched"
+    [ -f $NETPLAN_FILE ] && say "roce: NOTE stale $NETPLAN_FILE from a previous run is present; run '$0 roce-clean' to remove it safely"
+    return
+  fi
   for n in $ports; do run ip link set "$n" up 2>/dev/null || true; done
   [ "$DRY" = 1 ] || sleep 5
   local linked=()
@@ -237,6 +254,18 @@ roce_apply() {
   for n in "${linked[@]}"; do d=$(ibdev_of "$n"); [ -n "$d" ] && run cma_roce_mode -d "$d" -p 1 -m 2 >/dev/null 2>&1 || true; done
   say "roce: test with  ib_write_bw -d $(ibdev_of "${linked[0]}") -F --report_gbits   (server)  /  ... <ip>  (client)"
 }
+# Remove only what THIS script added to RoCE (our netplan file + our 192.168.10x
+# addresses), never the provider's fabric addresses.
+roce_clean() {
+  if [ -f $NETPLAN_FILE ]; then run rm -f $NETPLAN_FILE; run netplan generate; say "roce: removed our $NETPLAN_FILE"; else say "roce: no $NETPLAN_FILE to remove"; fi
+  local removed=0
+  for n in $(roce_ports); do
+    for a in $(ip -4 -o addr show "$n" | awk '{print $4}'); do
+      case "$a" in 192.168.10[0-9].*) run ip addr del "$a" dev "$n"; removed=$((removed+1));; esac
+    done
+  done
+  say "roce: removed $removed of our 192.168.10x addresses (provider addresses left intact)"
+}
 roce_undo() {
   if [ -f $NETPLAN_FILE ]; then rm -f $NETPLAN_FILE; netplan generate; say "roce: netplan file removed"; fi
   for n in $(roce_ports); do ip addr flush dev "$n" 2>/dev/null || true; done
@@ -249,6 +278,7 @@ case "${1:-}" in
   apply)  need_root apply; echo "== apply on $(hostname)"; sysctl_apply; sshd_apply; ufw_apply; roce_apply; echo "== done" ;;
   status) echo "== status on $(hostname)"; [ "$(id -u)" = 0 ] || say "(run as root for sshd/ufw details)"; sysctl_status || true; sshd_status || true; ufw_status || true; roce_status
           ;;
+  roce-clean) need_root roce-clean; echo "== roce-clean on $(hostname)"; roce_clean; echo "== done" ;;
   undo)   need_root undo; echo "== undo on $(hostname)"; roce_undo; ufw_undo; sshd_undo; sysctl_undo; echo "== done" ;;
   *) sed -n '2,26p' "$0"; exit 1 ;;
 esac
