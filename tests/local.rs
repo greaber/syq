@@ -445,3 +445,84 @@ fn updates_changed_file_and_skips_symlink_only_when_same() {
     assert_eq!(fs::read_link(t.path("dst/l")).unwrap(), PathBuf::from("other"));
     assert_same_tree(&t.path("src"), &t.path("dst"));
 }
+
+// ---- Regression tests for the security review ----
+
+#[test]
+fn inplace_self_copy_preserves_source() {
+    let t = Tmp::new();
+    write(&t.path("f"), b"hello world data");
+    // Copying a file onto itself must never truncate it.
+    let out = pcp(&["-a", "--inplace", &t.s("f"), &t.s("f")]);
+    assert!(out.status.success());
+    assert_eq!(read(&t.path("f")), b"hello world data");
+}
+
+#[test]
+fn inplace_hardlink_alias_preserves_source() {
+    let t = Tmp::new();
+    write(&t.path("a"), b"aaaa");
+    fs::hard_link(t.path("a"), t.path("b")).unwrap();
+    let out = pcp(&["-a", "--inplace", &t.s("a"), &t.s("b")]);
+    assert!(out.status.success());
+    assert_eq!(read(&t.path("a")), b"aaaa");
+    assert_eq!(read(&t.path("b")), b"aaaa");
+}
+
+#[test]
+fn inplace_replaces_symlink_dest_not_its_target() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"SRCDATA");
+    write(&t.path("external"), b"EXTERNAL");
+    std::os::unix::fs::symlink("external", t.path("link")).unwrap();
+    run_ok(&["-a", "--inplace", &t.s("src"), &t.s("link")]);
+    // The symlink target must be untouched; the dest is now a regular file.
+    assert_eq!(read(&t.path("external")), b"EXTERNAL");
+    assert!(fs::symlink_metadata(t.path("link")).unwrap().file_type().is_file());
+    assert_eq!(read(&t.path("link")), b"SRCDATA");
+}
+
+#[test]
+fn rm_rejects_parent_traversal() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("parent/child")).unwrap();
+    write(&t.path("parent/sibling"), b"x");
+    write(&t.path("parent/child/y"), b"y");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args(["--rm", ".."])
+        .arg("--no-progress")
+        .current_dir(t.path("parent/child"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    // The sibling outside child must survive.
+    assert!(t.path("parent/sibling").exists());
+}
+
+#[test]
+fn rm_rejects_dangerous_roots() {
+    for target in ["/", ".", "~", "/tmp/.."] {
+        let out = pcp(&["--rm", target]);
+        assert!(!out.status.success(), "should reject --rm {target}");
+    }
+}
+
+#[test]
+fn rm_normal_target_works() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("killme/sub")).unwrap();
+    write(&t.path("killme/sub/f"), b"f");
+    run_ok(&["--rm", &t.s("killme")]);
+    assert!(!t.path("killme").exists());
+}
+
+#[test]
+fn duplicate_destination_rejected() {
+    let t = Tmp::new();
+    write(&t.path("a/same"), b"A");
+    write(&t.path("b/same"), b"B");
+    fs::create_dir_all(t.path("dest")).unwrap();
+    let out = pcp(&["-a", &t.s("a/same"), &t.s("b/same"), &t.s("dest/")]);
+    assert!(!out.status.success(), "two sources named 'same' must be rejected");
+    assert!(!t.path("dest/same").exists());
+}

@@ -103,6 +103,8 @@ pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry 
         uid: md.uid(),
         gid: md.gid(),
         rdev: md.rdev(),
+        dev: md.dev(),
+        ino: md.ino(),
         link,
     }
 }
@@ -287,6 +289,16 @@ impl FsOps {
             self.uncache(&p);
             // A stale partial from an interrupted run would otherwise be orphaned.
             let _ = fs::remove_file(partial_path(&p));
+            // Don't follow a symlink (or write onto a dir/special): replace it
+            // with a regular file, like rsync does.
+            if let Ok(md) = fs::symlink_metadata(&p) {
+                if !md.is_file() {
+                    if md.is_dir() {
+                        bail!("destination {} is a directory", p.display());
+                    }
+                    fs::remove_file(&p).with_context(|| format!("replace {}", p.display()))?;
+                }
+            }
             let f = OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -333,8 +345,26 @@ impl FsOps {
         let sp = resolve(src);
         let s = File::open(&sp).with_context(|| format!("open {}", sp.display()))?;
         let dp = resolve(dst);
+        // Never truncate the source: if the destination resolves to the same
+        // file (same path, a hardlink, or a symlink pointing back), refuse.
+        if let (Ok(sm), Ok(dm)) = (s.metadata(), fs::metadata(&dp)) {
+            if sm.dev() == dm.dev() && sm.ino() == dm.ino() {
+                bail!("source and destination are the same file: {}", dp.display());
+            }
+        }
         self.uncache(&dp);
         let target = if inplace { dp.clone() } else { partial_path(&dp) };
+        // Symlink/special destination written in place: replace it, don't follow it.
+        if inplace {
+            if let Ok(md) = fs::symlink_metadata(&target) {
+                if !md.is_file() {
+                    if md.is_dir() {
+                        bail!("destination {} is a directory", target.display());
+                    }
+                    fs::remove_file(&target).ok();
+                }
+            }
+        }
         self.uncache(&target);
         if let Some(parent) = target.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
