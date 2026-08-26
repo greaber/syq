@@ -16,6 +16,7 @@ use clap::Parser;
 /// Keep multi-megabyte block buffers in the heap instead of mmap/munmap-ing
 /// each one: page faults and TLB shootdowns across many threads otherwise
 /// dominate at high throughput.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn tune_allocator() {
     unsafe {
         // glibc caps this at 32 MiB; larger values are rejected.
@@ -24,6 +25,9 @@ fn tune_allocator() {
         libc::mallopt(libc::M_TOP_PAD, 64 << 20);
     }
 }
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_allocator() {}
 
 /// Many workers each keep a few files open; the default soft limit (1024) is
 /// too small for -j32, so use whatever the hard limit allows.

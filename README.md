@@ -26,6 +26,12 @@ started as `pcp --server` over the remote shell. Options:
   `~/.local/bin/pcp` on the remote host and retry. The default remote command
   falls back to `~/.local/bin/pcp` automatically. The remote must be the same
   architecture as the local binary.
+- **macOS (Apple Silicon / Intel):** build natively on the Mac with
+  `cargo build --release` (needs the Xcode command-line tools, `xcode-select
+  --install`, for the bundled zstd C library). The tool is otherwise pure Rust
+  and uses only POSIX calls; Linux-only optimizations (`fallocate`,
+  glibc `mallopt`) are compiled out automatically. copy_file_range's local
+  fast path is Linux-only; on macOS same-machine copies use the normal path.
 - For portability across distributions (e.g. to `--bootstrap` onto hosts with
   an older glibc), build a static binary:
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
