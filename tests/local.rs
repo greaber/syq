@@ -590,3 +590,63 @@ fn archive_into_readonly_dest_dir() {
     run_ok(&["-a", &t.s("src/"), &t.s("d/src/")]);
     assert_eq!(read(&t.path("d/src/sub/g")), b"more");
 }
+
+// ---- Review round 3 ----
+
+#[test]
+fn partial_symlink_is_not_followed() {
+    let t = Tmp::new();
+    write(&t.path("src"), &vec![7u8; 5 * 1024 * 1024]);
+    write(&t.path("external"), b"EXTERNAL-DO-NOT-TOUCH");
+    // A malicious/stale partial symlink pointing outside must not be followed.
+    std::os::unix::fs::symlink("external", t.path(".out.pcp-partial")).unwrap();
+    run_ok(&["-a", &t.s("src"), &t.s("out")]);
+    assert_eq!(read(&t.path("external")), b"EXTERNAL-DO-NOT-TOUCH");
+    assert!(fs::symlink_metadata(t.path("out")).unwrap().file_type().is_file());
+    assert_eq!(read(&t.path("out")).len(), 5 * 1024 * 1024);
+}
+
+#[test]
+fn rm_rejects_dot_final_component() {
+    let t = Tmp::new();
+    write(&t.path("p/f"), b"x");
+    let out = pcp(&["--rm", &format!("{}/.", t.s("p"))]);
+    assert!(!out.status.success());
+    assert!(t.path("p/f").exists(), "contents must survive rm p/.");
+}
+
+#[test]
+fn dir_vs_file_destination_collision_rejected() {
+    let t = Tmp::new();
+    write(&t.path("A/x"), b"aaa");        // A/x is a file
+    write(&t.path("B/x/y"), b"yyy");      // B/x is a directory
+    fs::create_dir_all(t.path("dest")).unwrap();
+    let out = pcp(&["-a", &format!("{}/", t.s("A")), &format!("{}/", t.s("B")), &format!("{}/", t.s("dest"))]);
+    assert!(!out.status.success(), "conflicting file-vs-dir destination must be rejected");
+}
+
+#[test]
+fn verify_only_detects_symlink_difference() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("s")).unwrap();
+    fs::create_dir_all(t.path("d")).unwrap();
+    std::os::unix::fs::symlink("target-a", t.path("s/l")).unwrap();
+    std::os::unix::fs::symlink("target-b", t.path("d/l")).unwrap();
+    let out = pcp(&["-a", "--verify-only", &format!("{}/", t.s("s")), &format!("{}/", t.s("d"))]);
+    assert_eq!(out.status.code(), Some(23));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("DIFFERS"));
+}
+
+#[test]
+fn small_files_atomic_no_partials() {
+    let t = Tmp::new();
+    for i in 0..200 {
+        write(&t.path(&format!("sm/f{i}")), format!("data-{i}").as_bytes());
+    }
+    run_ok(&["-a", &format!("{}/", t.s("sm")), &format!("{}/", t.s("smd"))]);
+    let partials = fs::read_dir(t.path("smd")).unwrap().filter(|e| {
+        e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pcp-partial")
+    }).count();
+    assert_eq!(partials, 0);
+    assert_eq!(read(&t.path("smd/f7")), b"data-7");
+}
