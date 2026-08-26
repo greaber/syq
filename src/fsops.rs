@@ -163,18 +163,25 @@ impl FsOps {
         self.fds.remove(p)
     }
 
+    /// Batches are statted on several threads: on network filesystems each
+    /// lstat is a round trip and the planner would otherwise starve the workers.
     pub fn stat_many(&mut self, paths: &[PathBytes]) -> Vec<Option<Entry>> {
-        paths
-            .iter()
-            .map(|p| lstat_entry(Vec::new(), &resolve(p)).ok())
-            .collect()
+        parallel_map(paths, |p| lstat_entry(Vec::new(), &resolve(p)).ok())
     }
 
+    /// Ops within a batch are independent (the planner orders batches so that
+    /// parents come first), so they run in parallel too.
     pub fn apply(&mut self, ops: &[Op]) -> Vec<Option<String>> {
-        ops.iter().map(|op| self.apply_one(op).err().as_ref().map(errstr)).collect()
+        parallel_map(ops, |op| apply_one(op).err().as_ref().map(errstr))
     }
 
-    fn apply_one(&mut self, op: &Op) -> Result<()> {
+    fn _unused_apply_one(&mut self, op: &Op) -> Result<()> {
+        apply_one(op)
+    }
+}
+
+fn apply_one(op: &Op) -> Result<()> {
+    {
         match op {
             Op::Mkdir { path, mode } => {
                 let p = resolve(path);
@@ -244,7 +251,26 @@ impl FsOps {
             }
         }
     }
+}
 
+const PAR_THREADS: usize = 32;
+const PAR_MIN: usize = 32;
+
+fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() < PAR_MIN {
+        return items.iter().map(&f).collect();
+    }
+    let chunk = items.len().div_ceil(PAR_THREADS).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<R>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().expect("stat thread")).collect()
+    })
+}
+
+impl FsOps {
     pub fn probe(&mut self, path: &[u8]) -> Result<Response> {
         let p = resolve(path);
         let partial_size = fs::symlink_metadata(partial_path(&p))
@@ -355,7 +381,6 @@ impl FsOps {
                 .open(&src)
                 .with_context(|| format!("open {}", src.display()))?,
         };
-        f.sync_all().ok();
         set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", src.display()))?;
         drop(f);
         if !inplace {
