@@ -94,10 +94,14 @@ pub struct Args {
     /// Only compare source and destination contents; transfer nothing
     #[arg(long)]
     pub verify_only: bool,
-    /// Write directly into existing destination files too (new files are always written in
-    /// place; existing ones go through a partial file and an atomic rename unless this is set)
-    #[arg(long)]
+    /// Write directly into existing destination files too (by default new files are written in
+    /// place and existing ones go through a partial file and an atomic rename)
+    #[arg(long, conflicts_with = "atomic")]
     pub inplace: bool,
+    /// Always write through a partial file and an atomic rename, even for new files (rsync
+    /// semantics; costs a rename per file, which is slow on NFS)
+    #[arg(long)]
+    pub atomic: bool,
 
     /// Remote shell command (default: ssh)
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]

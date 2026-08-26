@@ -242,7 +242,8 @@ orchestrator on hostA connects to hostB's listener.
 
 New files are written in place (created with their final mode, no separate
 chmod, no rename); existing files are replaced through a partial file and an
-atomic rename unless `--inplace`. When both ends are local, 64 workers are
+atomic rename unless `--inplace`. `--atomic` forces the partial+rename path
+for every file (rsync semantics) when readers might open files mid-transfer. When both ends are local, 64 workers are
 used. On NFS these choices are the difference between ~300 and ~850 files/s.
 
 ## Parallel removal (`--rm`)
