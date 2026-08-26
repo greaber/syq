@@ -892,7 +892,7 @@ impl Worker {
         let _ = &opts;
         self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: size }));
 
-        let mut inplace = self.opts.inplace;
+        let inplace = self.opts.inplace;
         // Same-machine copy: let the kernel move the bytes (reflink / NFS
         // server-side copy) instead of streaming them through userspace.
         if self.opts.same_host && !self.opts.checksum && job.entry.size > 0 {
@@ -917,12 +917,12 @@ impl Worker {
             }
             let final_is_file = final_entry.as_ref().is_some_and(|f| f.kind == Kind::File);
             let full = || if size > 0 { vec![(0, size)] } else { vec![] };
-            // Nothing there yet (and no partial to resume from): write in place.
-            // No reader can depend on atomic replacement of a file that doesn't
-            // exist, and it saves a rename per file — expensive on network filesystems.
-            if final_entry.is_none() && partial_size.is_none() && !self.opts.atomic {
-                inplace = true;
-            }
+            // Larger files go through a partial file + atomic rename even when
+            // new (unless --inplace): an interrupted in-place file sits under its
+            // final name and could later be mistaken for complete by the quick
+            // check. Small new files use the in-place fast-batch path instead,
+            // which completes atomically in one burst (that's where the NFS win
+            // is); this handle_file path is for the larger ones.
             self.set_inplace(idx, inplace);
 
             if inplace {
@@ -1026,7 +1026,10 @@ impl Worker {
         if partial {
             return Ok(false);
         }
-        let inplace = self.opts.inplace || job.dst_entry.is_none();
+        // Write to a partial and let finish_file rename it, so an interrupted
+        // copy_file_range never leaves a final-named file the quick check could
+        // mistake for complete. Only --inplace writes the final path directly.
+        let inplace = self.opts.inplace;
         self.set_inplace(idx, inplace);
         let mode = self.create_mode(job);
         let resp = self.dst.call(Request::CopyLocal {
