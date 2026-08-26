@@ -4,6 +4,7 @@ mod crypto;
 mod direct;
 mod fsops;
 mod progress;
+mod rm;
 mod proto;
 mod scan;
 mod sched;
@@ -24,8 +25,21 @@ fn tune_allocator() {
     }
 }
 
+/// Many workers each keep a few files open; the default soft limit (1024) is
+/// too small for -j32, so use whatever the hard limit allows.
+fn raise_nofile() {
+    unsafe {
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < rl.rlim_max {
+            rl.rlim_cur = rl.rlim_max.min(1 << 20);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        }
+    }
+}
+
 fn main() {
     tune_allocator();
+    raise_nofile();
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("--server") {
         if let Err(e) = server::run() {
@@ -36,7 +50,8 @@ fn main() {
     }
     let mut args = cli::Args::parse();
     args.normalize();
-    match transfer::run(args) {
+    let result = if args.rm { rm::run(args) } else { transfer::run(args) };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("pcp: {e:#}");

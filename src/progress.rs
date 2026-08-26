@@ -17,6 +17,8 @@ pub struct Progress {
     pub enabled: bool,
     pub json: bool,
     pub width: Option<usize>,
+    /// Removal mode: header counts entries instead of bytes.
+    pub rm: bool,
     pub bytes_total: AtomicU64,
     pub bytes_done: AtomicU64,
     pub bytes_skipped: AtomicU64,
@@ -44,6 +46,7 @@ impl Progress {
             enabled: enabled && (force || std::io::stderr().is_terminal()),
             json,
             width,
+            rm: false,
             bytes_total: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
             bytes_skipped: AtomicU64::new(0),
@@ -144,12 +147,16 @@ impl Progress {
         let width = self.width.unwrap_or_else(term_width);
         let mut lines = Vec::new();
         let pct = if total > 0 { done * 100 / total } else { 0 };
-        let mut head = format!(
-            "{} / {}  {pct:>3}%  {}/s  files {fdone}/{ftotal}",
-            human(done),
-            human(total),
-            human(rate as u64)
-        );
+        let mut head = if self.rm {
+            format!("removed {} / {} entries", commas(fdone), commas(ftotal))
+        } else {
+            format!(
+                "{} / {}  {pct:>3}%  {}/s  files {fdone}/{ftotal}",
+                human(done),
+                human(total),
+                human(rate as u64)
+            )
+        };
         if let Some(e) = eta {
             head.push_str(&format!("  ETA {}", hms(e)));
         }

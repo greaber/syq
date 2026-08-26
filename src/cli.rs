@@ -119,8 +119,12 @@ pub struct Args {
     #[arg(long, hide = true)]
     pub width: Option<usize>,
 
-    /// Source(s) and destination
-    #[arg(required = true, num_args = 2.., value_name = "PATH")]
+    /// Remove the given paths recursively and in parallel (like rm -rf); honours -j, -n, -v, -q, -e
+    #[arg(long)]
+    pub rm: bool,
+
+    /// Source(s) and destination (or, with --rm, the paths to remove)
+    #[arg(required = true, num_args = 1.., value_name = "PATH")]
     pub paths: Vec<String>,
 }
 

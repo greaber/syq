@@ -84,6 +84,8 @@ pub enum Op {
     Mknod { path: PathBytes, mode: u32, rdev: u64 },
     SetMeta { path: PathBytes, meta: Meta, flags: u8 },
     Remove { path: PathBytes },
+    /// Remove an empty directory.
+    Rmdir { path: PathBytes },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
