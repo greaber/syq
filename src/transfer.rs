@@ -248,7 +248,7 @@ pub fn run(args: Args) -> Result<i32> {
         sched: &sched,
         progress: &progress,
         opts: &opts,
-        dst_seen: std::collections::HashSet::new(),
+        dst_seen: std::collections::HashMap::new(),
         collision: false,
         deferred: Vec::new(),
         dirs_created: 0,
@@ -375,7 +375,8 @@ struct Planner<'a> {
     progress: &'a Progress,
     opts: &'a Opts,
     /// Leaf destination paths already claimed, to reject two sources writing one file.
-    dst_seen: std::collections::HashSet<PathBytes>,
+    /// dest path -> is_dir. Two dirs merge; a dir vs a leaf, or two leaves, conflict.
+    dst_seen: std::collections::HashMap<PathBytes, bool>,
     collision: bool,
     /// (dst path, meta, flags, depth) for directories, applied deepest-first at the end.
     deferred: Vec<(PathBytes, Meta, u8, usize)>,
@@ -427,6 +428,10 @@ impl Planner<'_> {
             let dst_rel = join(sub_b, &e.path);
             let dst_path = join(dst_root, &dst_rel);
             if e.kind == Kind::Dir {
+                let rel = display(&join(sub_b, &e.path));
+                if !self.claim_dst(&dst_path, &rel, true) {
+                    continue;
+                }
                 mkdirs.push(Op::Mkdir { path: dst_path.clone(), mode: e.mode });
                 dir_entries.push((dst_path, e));
             } else {
@@ -541,7 +546,7 @@ impl Planner<'_> {
                         if opts.verbose > 0 {
                             self.progress.println(&rel);
                         }
-                    } else if self.claim_dst(&dst_path, &rel) {
+                    } else if self.claim_dst(&dst_path, &rel, false) {
                         self.enqueue(src_path, dst_path, rel, e.clone(), dst_entry);
                     }
                 }
@@ -554,7 +559,13 @@ impl Planner<'_> {
                     }
                     let target = e.link.clone().unwrap_or_default();
                     let same = dst_entry.as_ref().is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
-                    if same || opts.verify_only {
+                    if opts.verify_only {
+                        if !same {
+                            self.progress.error(&format!("DIFFERS {rel} (symlink)"));
+                        }
+                        continue;
+                    }
+                    if same {
                         continue;
                     }
                     if opts.dry_run {
@@ -563,7 +574,7 @@ impl Planner<'_> {
                         }
                         continue;
                     }
-                    if !self.claim_dst(&dst_path, &rel) {
+                    if !self.claim_dst(&dst_path, &rel, false) {
                         continue;
                     }
                     op_names.push(format!("{rel} -> {}", display(&target)));
@@ -585,7 +596,7 @@ impl Planner<'_> {
                         }
                         continue;
                     }
-                    if !self.claim_dst(&dst_path, &rel) {
+                    if !self.claim_dst(&dst_path, &rel, false) {
                         continue;
                     }
                     op_names.push(rel);
@@ -619,16 +630,22 @@ impl Planner<'_> {
 
     /// Record a leaf (file/symlink/special) destination; return false if this
     /// exact destination was already claimed by another source (a collision).
-    fn claim_dst(&mut self, dst: &PathBytes, rel: &str) -> bool {
-        if !self.dst_seen.insert(dst.clone()) {
-            self.progress.error(&format!(
-                "pcp: {rel}: two sources map to the same destination {} — refusing to write it twice",
-                display(dst)
-            ));
-            self.collision = true;
-            return false;
+    fn claim_dst(&mut self, dst: &PathBytes, rel: &str, is_dir: bool) -> bool {
+        match self.dst_seen.get(dst) {
+            Some(&prev_dir) if prev_dir && is_dir => true,
+            Some(_) => {
+                self.progress.error(&format!(
+                    "pcp: {rel}: two sources map to the same destination {} with conflicting types — refusing to clobber it",
+                    display(dst)
+                ));
+                self.collision = true;
+                false
+            }
+            None => {
+                self.dst_seen.insert(dst.clone(), is_dir);
+                true
+            }
         }
-        true
     }
 
     fn enqueue(&mut self, src: PathBytes, dst: PathBytes, rel: String, entry: Entry, dst_entry: Option<Entry>) {
@@ -789,40 +806,32 @@ impl Worker {
                 Err(e) => Err(e),
             });
         }
-        // Writes: prepare, write, finalize for every file, then collect acks.
-        let mut expect: Vec<usize> = Vec::with_capacity(jobs.len());
+        // One atomic PutSmall per file (pipelined): write partial, verify, set
+        // metadata, rename — nothing appears under the final name on failure.
         let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
+        let mut sent: Vec<bool> = Vec::with_capacity(jobs.len());
         for (j, d) in jobs.iter().zip(data.iter_mut()) {
             let Ok(bytes) = d else {
-                expect.push(0);
+                sent.push(false);
                 continue;
             };
             let bytes = std::mem::take(bytes);
             let hash = xxh3_64(&bytes);
             let mut meta = j.entry.meta();
             meta.mode = self.create_mode(j);
-            self.dst.send(Request::Prepare { path: j.dst.clone(), size: j.entry.size, inplace: true, from_final: false, mode: self.create_mode(j) })?;
-            let mut n = 2;
-            if !bytes.is_empty() {
-                self.dst.send(Request::WriteRange { path: j.dst.clone(), inplace: true, off: 0, hash, data: bytes })?;
-                n = 3;
-            }
-            self.dst.send(Request::Finalize { path: j.dst.clone(), inplace: true, meta, flags, fsync: self.opts.fsync })?;
-            expect.push(n);
+            self.dst.send(Request::PutSmall { path: j.dst.clone(), data: bytes, hash, meta, flags, fsync: self.opts.fsync })?;
+            sent.push(true);
         }
         let mut results: Vec<Result<()>> = Vec::with_capacity(jobs.len());
-        for (d, &n) in data.iter_mut().zip(expect.iter()) {
-            let mut res: Result<()> = match d {
-                Ok(_) => Ok(()),
-                Err(e) => Err(anyhow::anyhow!("{e:#}")),
-            };
-            for _ in 0..n {
-                if let Err(e) = ok(self.dst.recv()?, "write") {
-                    if res.is_ok() {
-                        res = Err(e);
-                    }
+        for (d, &was_sent) in data.iter_mut().zip(sent.iter()) {
+            let res: Result<()> = if !was_sent {
+                match d {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(anyhow::anyhow!("{e:#}")),
                 }
-            }
+            } else {
+                ok(self.dst.recv()?, "put").map(|_| ())
+            };
             results.push(res);
         }
         // Did any source change while we were at it?
@@ -1190,7 +1199,8 @@ impl Worker {
                     self.progress.bytes_total.fetch_add(e.size, Relaxed);
                     j.entry = Entry { path: j.entry.path.clone(), ..e };
                     j.attempts += 1;
-                    j.dst_entry = Some(j.entry.clone());
+                    // Keep the original dst_entry: it drives mode preservation
+                    // without -p, and re-reading the source must not change it.
                     j.done.store(0, Relaxed);
                     drop(jobs);
                     self.sched.requeue(idx);

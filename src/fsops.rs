@@ -318,9 +318,13 @@ impl FsOps {
                 .write(true)
                 .create(true)
                 .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW)
                 .mode(mode & 0o7777)
                 .open(&p)
                 .with_context(|| format!("open {}", p.display()))?;
+            if !f.metadata()?.file_type().is_file() {
+                bail!("destination {} is not a regular file", p.display());
+            }
             f.set_len(size)?;
             return Ok(());
         }
@@ -328,7 +332,7 @@ impl FsOps {
         self.uncache(&pp);
         if let Ok(md) = fs::symlink_metadata(&pp) {
             if md.is_file() {
-                let f = OpenOptions::new().write(true).open(&pp)?;
+                let f = OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(&pp)?;
                 f.set_len(size)?;
                 return Ok(());
             }
@@ -341,12 +345,11 @@ impl FsOps {
             .open(&pp)
             .with_context(|| format!("create {}", pp.display()))?;
         if from_final {
-            if let Ok(mut src) = File::open(&p) {
-                let mut dst = &f;
-                // Seed the partial with the existing file for block-diff, but never
-                // keep more than `size` bytes (a longer destination must shrink).
-                io::copy(&mut (&mut src).take(size), &mut dst).with_context(|| format!("seed partial from {}", p.display()))?;
-            }
+            // Seed the partial with the existing file for block-diff, but never
+            // keep more than `size` bytes (a longer destination must shrink).
+            let mut src = File::open(&p).with_context(|| format!("open {} to seed repair", p.display()))?;
+            let mut dst = &f;
+            io::copy(&mut (&mut src).take(size), &mut dst).with_context(|| format!("seed partial from {}", p.display()))?;
         }
         preallocate(&f, size)?;
         f.set_len(size)?; // exact length: fallocate never shrinks an already-longer file
@@ -372,30 +375,13 @@ impl FsOps {
         }
         self.uncache(&dp);
         let target = if inplace { dp.clone() } else { partial_path(&dp) };
-        // Symlink/special destination written in place: replace it, don't follow it.
-        if inplace {
-            if let Ok(md) = fs::symlink_metadata(&target) {
-                if !md.is_file() {
-                    if md.is_dir() {
-                        bail!("destination {} is a directory", target.display());
-                    }
-                    fs::remove_file(&target).ok();
-                }
-            }
-        }
         self.uncache(&target);
         if let Some(parent) = target.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 fs::create_dir_all(parent).ok();
             }
         }
-        let d = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode & 0o7777)
-            .open(&target)
-            .with_context(|| format!("create {}", target.display()))?;
+        let d = open_regular_write(&target, mode)?;
         let mut off: i64 = 0;
         let mut remaining = size;
         while remaining > 0 {
@@ -434,6 +420,44 @@ impl FsOps {
     #[cfg(not(target_os = "linux"))]
     pub fn copy_local(&mut self, _src: &[u8], _dst: &[u8], _inplace: bool, _size: u64, _mode: u32) -> Result<()> {
         bail!("EXDEV")
+    }
+
+    /// Atomic whole-file put: verify, write a partial, set metadata, rename.
+    /// If any step fails, no file appears under the final name.
+    pub fn put_small(&mut self, path: &[u8], data: &[u8], hash: u64, meta: &Meta, flags: u8, fsync: bool) -> Result<()> {
+        if xxh3_64(data) != hash {
+            bail!("block hash mismatch on receive");
+        }
+        let p = resolve(path);
+        let pp = partial_path(&p);
+        self.uncache(&pp);
+        if let Some(parent) = pp.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                fs::create_dir_all(parent).ok();
+            }
+        }
+        {
+            let f = open_regular_write(&pp, meta.mode)?;
+            f.write_all_at(data, 0).with_context(|| format!("write {}", pp.display()))?;
+            set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", pp.display()))?;
+            if fsync {
+                f.sync_all().with_context(|| format!("fsync {}", pp.display()))?;
+            }
+        }
+        if let Ok(md) = fs::symlink_metadata(&p) {
+            if md.is_dir() {
+                let _ = fs::remove_file(&pp);
+                bail!("destination {} is a directory", p.display());
+            }
+        }
+        fs::rename(&pp, &p).with_context(|| format!("rename {} -> {}", pp.display(), p.display()))?;
+        if fsync {
+            let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+            if let Ok(df) = File::open(dir) {
+                let _ = df.sync_all();
+            }
+        }
+        Ok(())
     }
 
     pub fn hash_blocks(&mut self, path: &[u8], which: Which, block: u64, len: u64) -> Result<Vec<u64>> {
@@ -497,10 +521,10 @@ impl FsOps {
                 .open(&src)
                 .with_context(|| format!("open {}", src.display()))?,
         };
+        set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", src.display()))?;
         if fsync {
             f.sync_all().with_context(|| format!("fsync {}", src.display()))?;
         }
-        set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", src.display()))?;
         drop(f);
         if !inplace {
             if let Ok(md) = fs::symlink_metadata(&p) {
@@ -509,6 +533,13 @@ impl FsOps {
                 }
             }
             fs::rename(&src, &p).with_context(|| format!("rename {} -> {}", src.display(), p.display()))?;
+        }
+        if fsync {
+            // Make the rename (or in-place write) itself durable.
+            let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+            if let Ok(df) = File::open(dir) {
+                let _ = df.sync_all();
+            }
         }
         Ok(())
     }
@@ -543,6 +574,9 @@ impl FsOps {
             Request::CopyLocal { src, dst, inplace, size, mode } => {
                 self.copy_local(src, dst, *inplace, *size, *mode).map(|_| Response::Ok)
             }
+            Request::PutSmall { path, data, hash, meta, flags, fsync } => {
+                self.put_small(path, data, *hash, meta, *flags, *fsync).map(|_| Response::Ok)
+            }
             Request::HashBlocks { path, which, block, len } => {
                 self.hash_blocks(path, *which, *block, *len).map(Response::Hashes)
             }
@@ -563,6 +597,34 @@ impl FsOps {
             Err(e) => Response::Err(errstr(&e)),
         }
     }
+}
+
+/// Open `target` for writing as a regular file, replacing any existing
+/// symlink/dir/special and refusing to follow a symlink (O_NOFOLLOW), then
+/// verify the opened fd is a regular file. Used for every write target so a
+/// malicious or stale `.pcp-partial` symlink can't redirect the write.
+fn open_regular_write(target: &Path, mode: u32) -> Result<File> {
+    if let Ok(md) = fs::symlink_metadata(target) {
+        if !md.is_file() {
+            if md.is_dir() {
+                bail!("destination {} is a directory", target.display());
+            }
+            fs::remove_file(target).with_context(|| format!("replace {}", target.display()))?;
+        }
+    }
+    let f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode & 0o7777)
+        .open(target)
+        .with_context(|| format!("create {}", target.display()))?;
+    let md = f.metadata()?;
+    if !md.file_type().is_file() {
+        bail!("{} is not a regular file", target.display());
+    }
+    Ok(f)
 }
 
 fn mkdir(p: &Path, mode: u32) -> Result<()> {
@@ -623,10 +685,11 @@ fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
 fn set_meta_path(p: &Path, meta: &Meta, flags: u8) -> Result<()> {
     let md = fs::symlink_metadata(p)?;
     let is_link = md.file_type().is_symlink();
+    // Owner first: chown clears setuid/setgid, so mode is applied afterwards.
+    apply_owner(flags, meta, |uid, gid| std::os::unix::fs::lchown(p, uid, gid))?;
     if flags & flags::MODE != 0 && !is_link {
         fs::set_permissions(p, fs::Permissions::from_mode(meta.mode & 0o7777))?;
     }
-    apply_owner(flags, meta, |uid, gid| std::os::unix::fs::lchown(p, uid, gid))?;
     if flags & flags::TIMES != 0 {
         let ts = [timespec(0, libc::UTIME_OMIT as u32), timespec(meta.mtime, meta.mtime_nsec)];
         let c = cstr(p)?;

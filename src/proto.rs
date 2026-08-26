@@ -121,6 +121,18 @@ pub enum Request {
         data: Vec<u8>,
     },
     Finalize { path: PathBytes, inplace: bool, meta: Meta, flags: u8, fsync: bool },
+    /// Whole small file in one atomic step: write a partial, verify, set
+    /// metadata, and rename over the target. Nothing appears under the final
+    /// name unless the whole transaction succeeds.
+    PutSmall {
+        path: PathBytes,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        hash: u64,
+        meta: Meta,
+        flags: u8,
+        fsync: bool,
+    },
     FileHash { path: PathBytes },
     Shutdown,
 }

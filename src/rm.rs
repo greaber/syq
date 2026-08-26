@@ -4,8 +4,7 @@
 
 use crate::cli::{Args, Location};
 use crate::conn::{ok, Conn, Endpoint};
-use crate::fsops::{join, resolve};
-use std::fs;
+use crate::fsops::join;
 use crate::progress::{commas, Progress};
 use crate::proto::*;
 use crate::transfer::{connect_ctl, endpoint};
@@ -108,41 +107,24 @@ fn worker(pool: Arc<Pool>, rx: Arc<Mutex<mpsc::Receiver<Vec<Op>>>>, ep: Endpoint
 /// home, cwd, and any ancestor of cwd/home. `..` components are rejected for
 /// every target (local or remote) so `child/..` can't escape; local targets are
 /// additionally canonicalized to catch symlink and alias tricks.
-fn check_rm_safety(locs: &[Location], args: &Args) -> Result<()> {
-    use std::path::{Component, Path, PathBuf};
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let cwd = std::env::current_dir().ok();
+/// Match `rm -rf` refusals: a target whose lexical final component is `.` or
+/// `..` is rejected (so `path/.`, `child/..`, `/tmp/..` all fail), as is the
+/// filesystem root and an empty/`~` target. This is a lexical rule on the given
+/// path — deliberately not stricter than rm (no home/cwd/ancestor guessing).
+fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
     for l in locs {
         let raw = l.path.trim_end_matches('/');
-        // Any `..` (or bare `.`) component is refused, on any host.
-        for c in Path::new(&l.path).components() {
-            match c {
-                Component::ParentDir => bail!("refusing to remove {:?}: contains a '..' path component", l.path),
-                Component::CurDir if raw == "." => bail!("refusing to remove the current directory {:?}", l.path),
-                _ => {}
-            }
+        let last = raw.rsplit('/').next().unwrap_or("");
+        if raw.is_empty() || l.path == "/" {
+            bail!("refusing to remove the filesystem root {:?}", l.path);
         }
-        if raw.is_empty() || raw == "/" || raw == "~" || raw == "~/" {
+        if raw == "~" {
             bail!("refusing to remove {:?}", l.path);
         }
-        if l.is_remote() {
-            continue; // can't canonicalize a remote path here; the checks above still apply
-        }
-        // Local: resolve symlinks/./.. and refuse root, home, cwd, and ancestors.
-        let resolved = fs::canonicalize(resolve(l.path.as_bytes())).unwrap_or_else(|_| resolve(l.path.as_bytes()));
-        if resolved.parent().is_none() {
-            bail!("refusing to remove the filesystem root {:?}", resolved);
-        }
-        for special in [home.as_ref(), cwd.as_ref()].into_iter().flatten() {
-            if &resolved == special {
-                bail!("refusing to remove {:?} (it is your {})", resolved, if Some(&resolved) == home.as_ref() { "home directory" } else { "current directory" });
-            }
-            if special.starts_with(&resolved) {
-                bail!("refusing to remove {:?}: it is an ancestor of {:?}", resolved, special);
-            }
+        if last == "." || last == ".." {
+            bail!("\"{}\" may not be removed: its final path component is {:?}", l.path, last);
         }
     }
-    let _ = args;
     Ok(())
 }
 
@@ -186,7 +168,13 @@ pub fn run(args: Args) -> Result<i32> {
     if !args.dry_run {
         for _ in 0..args.connections {
             let (pool, rx, ep, compress) = (pool.clone(), rx.clone(), ep.clone(), args.compress);
-            workers.push(std::thread::spawn(move || worker(pool, rx, ep, compress)));
+            workers.push(std::thread::spawn(move || {
+                let r = worker(pool.clone(), rx, ep, compress);
+                if r.is_err() {
+                    pool.abort(); // wake wait_idle even if connect() failed before any op
+                }
+                r
+            }));
         }
     }
 

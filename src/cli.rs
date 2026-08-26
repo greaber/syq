@@ -102,7 +102,8 @@ pub struct Args {
     /// semantics; costs a rename per file, which is slow on NFS)
     #[arg(long)]
     pub atomic: bool,
-    /// fsync each file before renaming it into place (durable across a crash; slower on NFS)
+    /// fsync each file and its parent directory around the rename, so a completed file
+    /// survives a crash (slower, especially on NFS)
     #[arg(long)]
     pub fsync: bool,
 
@@ -247,6 +248,7 @@ impl Location {
     }
 
 
+    #[allow(dead_code)]
     pub fn is_remote(&self) -> bool {
         self.host.is_some()
     }

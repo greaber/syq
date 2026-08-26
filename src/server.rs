@@ -257,9 +257,15 @@ fn serve_tcp(stream: TcpStream, id: u32, key: Option<Vec<u8>>, token: Vec<u8>, _
     let reader = RecordReader::new(stream.try_clone()?, rc);
     let writer = RecordWriter::new(stream.try_clone()?, wc);
     // The record reader delivers whole frames; clear the handshake timeout only
-    // after the first complete record (which carries the Hello), not after a
-    // partial read.
+    // after the first complete record (which carries the Hello), not a partial read.
     let res = serve(TimeoutOnce { inner: reader, stream: stream.try_clone()?, cleared: false }, writer, false, Some(token));
+    // If the connection never authenticated (bad token / error before completing
+    // the Hello), free its id so an unauthenticated peer can't reserve ids and
+    // force the client to fall back to ssh. A successful session keeps its id,
+    // which is what blocks replay.
+    if res.is_err() {
+        seen.lock().unwrap().remove(&conn_id);
+    }
     res
 }
 
