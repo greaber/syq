@@ -27,6 +27,7 @@ pub struct Opts {
     pub checksum: bool,
     pub verify_only: bool,
     pub inplace: bool,
+    pub atomic: bool,
     pub dry_run: bool,
     pub verbose: u8,
     pub umask: u32,
@@ -120,6 +121,7 @@ pub fn run(args: Args) -> Result<i32> {
         checksum: args.checksum,
         verify_only: args.verify_only,
         inplace: args.inplace,
+        atomic: args.atomic,
         dry_run: args.dry_run,
         verbose: args.verbose,
         umask: read_umask(),
@@ -655,7 +657,7 @@ impl Worker {
     fn fast_eligible(&self, idx: usize) -> bool {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
-        !self.opts.verify_only && !self.opts.inplace && j.entry.size <= self.opts.block && j.dst_entry.is_none()
+        !self.opts.verify_only && !self.opts.inplace && !self.opts.atomic && j.entry.size <= self.opts.block && j.dst_entry.is_none()
     }
 
     fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
@@ -811,7 +813,7 @@ impl Worker {
             // Nothing there yet (and no partial to resume from): write in place.
             // No reader can depend on atomic replacement of a file that doesn't
             // exist, and it saves a rename per file — expensive on network filesystems.
-            if final_entry.is_none() && partial_size.is_none() {
+            if final_entry.is_none() && partial_size.is_none() && !self.opts.atomic {
                 inplace = true;
             }
             self.set_inplace(idx, inplace);
