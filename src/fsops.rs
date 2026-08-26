@@ -174,7 +174,22 @@ impl FsOps {
     /// Ops within a batch are independent (the planner orders batches so that
     /// parents come first), so they run in parallel too.
     pub fn apply(&mut self, ops: &[Op]) -> Vec<Option<String>> {
-        parallel_map(ops, |op| apply_one(op).err().as_ref().map(errstr))
+        // SetMeta depends on the object existing, so create everything first,
+        // then apply metadata — otherwise a parallel SetMeta can beat its
+        // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
+        let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. });
+        let create_idx: Vec<usize> = (0..ops.len()).filter(|&i| !is_meta(&ops[i])).collect();
+        let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
+        let mut out: Vec<Option<String>> = vec![None; ops.len()];
+        let cres = parallel_map(&create_idx, |&i| apply_one(&ops[i]).err().as_ref().map(errstr));
+        for (i, r) in create_idx.iter().zip(cres) {
+            out[*i] = r;
+        }
+        let mres = parallel_map(&meta_idx, |&i| apply_one(&ops[i]).err().as_ref().map(errstr));
+        for (i, r) in meta_idx.iter().zip(mres) {
+            out[*i] = r;
+        }
+        out
     }
 
     fn _unused_apply_one(&mut self, op: &Op) -> Result<()> {
@@ -328,10 +343,13 @@ impl FsOps {
         if from_final {
             if let Ok(mut src) = File::open(&p) {
                 let mut dst = &f;
-                let _ = io::copy(&mut src, &mut dst);
+                // Seed the partial with the existing file for block-diff, but never
+                // keep more than `size` bytes (a longer destination must shrink).
+                io::copy(&mut (&mut src).take(size), &mut dst).with_context(|| format!("seed partial from {}", p.display()))?;
             }
         }
         preallocate(&f, size)?;
+        f.set_len(size)?; // exact length: fallocate never shrinks an already-longer file
         Ok(())
     }
 
@@ -469,7 +487,7 @@ impl FsOps {
         f.write_all_at(data, off).with_context(|| format!("write {} @{off}", p.display()))
     }
 
-    pub fn finalize(&mut self, path: &[u8], inplace: bool, meta: &Meta, flags: u8) -> Result<()> {
+    pub fn finalize(&mut self, path: &[u8], inplace: bool, meta: &Meta, flags: u8, fsync: bool) -> Result<()> {
         let p = resolve(path);
         let src = if inplace { p.clone() } else { partial_path(&p) };
         let f = match self.uncache(&src) {
@@ -479,6 +497,9 @@ impl FsOps {
                 .open(&src)
                 .with_context(|| format!("open {}", src.display()))?,
         };
+        if fsync {
+            f.sync_all().with_context(|| format!("fsync {}", src.display()))?;
+        }
         set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", src.display()))?;
         drop(f);
         if !inplace {
@@ -529,8 +550,8 @@ impl FsOps {
             Request::WriteRange { path, inplace, off, hash, data } => {
                 self.write_range(path, *inplace, *off, *hash, data).map(|_| Response::Ok)
             }
-            Request::Finalize { path, inplace, meta, flags } => {
-                self.finalize(path, *inplace, meta, *flags).map(|_| Response::Ok)
+            Request::Finalize { path, inplace, meta, flags, fsync } => {
+                self.finalize(path, *inplace, meta, *flags, *fsync).map(|_| Response::Ok)
             }
             Request::FileHash { path } => self.file_hash(path),
             Request::Hello { .. } | Request::Scan { .. } | Request::Shutdown | Request::TcpListen { .. } => {
@@ -575,17 +596,20 @@ fn timespec(sec: i64, nsec: u32) -> libc::timespec {
 
 fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
     use std::os::unix::io::AsRawFd;
-    if flags & flags::MODE != 0 {
-        // On network filesystems every setattr is a round trip; skip it when
-        // the file was created with the right mode already.
-        let cur = f.metadata().map(|m| m.mode() & 0o7777).unwrap_or(u32::MAX);
-        if cur != meta.mode & 0o7777 {
-            f.set_permissions(fs::Permissions::from_mode(meta.mode & 0o7777))?;
-        }
-    }
+    // Owner first: chown clears setuid/setgid, so mode must be set afterwards.
     apply_owner(flags, meta, |uid, gid| {
         std::os::unix::fs::fchown(f, uid, gid)
     })?;
+    if flags & flags::MODE != 0 {
+        // On network filesystems every setattr is a round trip; skip it when
+        // the mode is already right (but always run it after a chown that could
+        // have cleared setuid/setgid bits we need to restore).
+        let cur = f.metadata().map(|m| m.mode() & 0o7777).unwrap_or(u32::MAX);
+        let want = meta.mode & 0o7777;
+        if cur != want || (flags & (flags::OWNER | flags::GROUP) != 0 && want & 0o6000 != 0) {
+            f.set_permissions(fs::Permissions::from_mode(want))?;
+        }
+    }
     if flags & flags::TIMES != 0 {
         let ts = [timespec(0, libc::UTIME_OMIT as u32), timespec(meta.mtime, meta.mtime_nsec)];
         let r = unsafe { libc::futimens(f.as_raw_fd(), ts.as_ptr()) };

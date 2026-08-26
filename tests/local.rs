@@ -526,3 +526,67 @@ fn duplicate_destination_rejected() {
     assert!(!out.status.success(), "two sources named 'same' must be rejected");
     assert!(!t.path("dest/same").exists());
 }
+
+#[test]
+fn checksum_repair_shrinks_longer_destination() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"abc");
+    write(&t.path("dst"), b"ABCDEFG");
+    set_mtime(&t.path("dst"), 1_000_000_000);
+    set_mtime(&t.path("src"), 1_000_000_000);
+    run_ok(&["-ac", &t.s("src"), &t.s("dst")]);
+    assert_eq!(read(&t.path("dst")), b"abc");
+}
+
+#[test]
+fn skip_reconciles_mode() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::copy(t.path("src"), t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o644)).unwrap();
+    set_mtime(&t.path("src"), 1_000_000_000);
+    set_mtime(&t.path("dst"), 1_000_000_000);
+    // content is skipped, but -a must still fix the mode
+    run_ok(&["-a", &t.s("src"), &t.s("dst")]);
+    let m = fs::symlink_metadata(t.path("dst")).unwrap().mode() & 0o777;
+    assert_eq!(m, 0o600, "mode should be reconciled on skip");
+}
+
+#[test]
+fn no_perms_preserves_existing_dest_mode() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"x");
+    fs::copy(t.path("src"), t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o666)).unwrap();
+    write(&t.path("src"), b"y"); // change content so it transfers
+    set_mtime(&t.path("dst"), 1_000_000_000);
+    set_mtime(&t.path("src"), 1_000_000_500); // newer -> not skipped
+    run_ok(&["-t", &t.s("src"), &t.s("dst")]); // no -p
+    let m = fs::symlink_metadata(t.path("dst")).unwrap().mode() & 0o777;
+    assert_eq!(m, 0o666, "existing dest mode must be preserved without -p");
+    assert_eq!(read(&t.path("dst")), b"y");
+}
+
+#[test]
+fn many_symlinks_no_setmeta_race() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("ln")).unwrap();
+    for i in 0..100 {
+        std::os::unix::fs::symlink(format!("/target{i}"), t.path(&format!("ln/l{i}"))).unwrap();
+    }
+    run_ok(&["-a", &t.s("ln"), &t.s("dst")]);
+    let n = fs::read_dir(t.path("dst/ln")).unwrap().count();
+    assert_eq!(n, 100);
+}
+
+#[test]
+fn archive_into_readonly_dest_dir() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f"), b"hi");
+    run_ok(&["-a", &t.s("src"), &t.s("d")]);
+    fs::set_permissions(t.path("d/src"), fs::Permissions::from_mode(0o555)).unwrap();
+    write(&t.path("src/sub/g"), b"more");
+    run_ok(&["-a", &t.s("src/"), &t.s("d/src/")]);
+    assert_eq!(read(&t.path("d/src/sub/g")), b"more");
+}
