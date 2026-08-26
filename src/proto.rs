@@ -103,6 +103,10 @@ pub enum Request {
     /// Create/adjust the write target for `path` with the given final size.
     /// `mode`: create new files with this mode so no separate chmod is needed.
     Prepare { path: PathBytes, size: u64, inplace: bool, from_final: bool, mode: u32 },
+    /// In-kernel copy of a same-machine file (copy_file_range: reflink / NFS
+    /// server-side copy when possible). Err("EXDEV") tells the caller to fall
+    /// back to the normal read/write path.
+    CopyLocal { src: PathBytes, dst: PathBytes, inplace: bool, size: u64, mode: u32 },
     HashBlocks { path: PathBytes, which: Which, block: u64, len: u64 },
     ReadRange { path: PathBytes, off: u64, len: u32 },
     WriteRange {
