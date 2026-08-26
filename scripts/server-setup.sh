@@ -11,7 +11,8 @@
 #   1. TCP tuning for long-RTT transfers: 64 MB socket buffers, BBR, fq.
 #      -> /etc/sysctl.d/90-pcp-net.conf, /etc/modules-load.d/pcp-bbr.conf
 #   2. sshd MaxStartups 100:30:200 so many parallel ssh sessions aren't dropped.
-#      -> /etc/ssh/sshd_config.d/60-pcp.conf (+ sshd reload)
+#      -> the MaxStartups line in /etc/ssh/sshd_config itself (uncommented /
+#         replaced in place, added if absent) + sshd reload
 #   3. ufw: allow pcp's TCP data ports (47600-47699) from the cluster LAN, from
 #      each cluster host's public IP, and from the listed client machines.
 #   4. RoCE: bring the ConnectX ports up; if any have link, give each an
@@ -38,7 +39,8 @@ ETC=${PCP_SETUP_ETC:-/etc}           # overridable for testing only
 SYSCTL_FILE=$ETC/sysctl.d/90-pcp-net.conf
 OLD_SYSCTL_FILE=$ETC/sysctl.d/99-net.conf
 MODULES_FILE=$ETC/modules-load.d/pcp-bbr.conf
-SSHD_FILE=$ETC/ssh/sshd_config.d/60-pcp.conf
+SSHD_CONFIG=$ETC/ssh/sshd_config
+OLD_SSHD_FILE=$ETC/ssh/sshd_config.d/60-pcp.conf   # from an earlier version of this script
 NETPLAN_FILE=$ETC/netplan/60-roce.yaml
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -94,21 +96,35 @@ sysctl_undo() {
 }
 
 # ---- 2. sshd -------------------------------------------------------------------
+SSHD_WANT="MaxStartups 100:30:200"
 sshd_status() {
-  local v; v=$(sshd -T 2>/dev/null | awk '/^maxstartups/{print $2}')
-  say "sshd: MaxStartups=$v file=$([ -f $SSHD_FILE ] && echo present || echo absent)"
-  [ "$v" = "100:30:200" ]
+  local live; live=$(sshd -T 2>/dev/null | awk '/^maxstartups/{print $2}')
+  local n; n=$(grep -cE "^MaxStartups" $SSHD_CONFIG 2>/dev/null || true)
+  say "sshd: live MaxStartups=${live:-?}; $SSHD_CONFIG has $n MaxStartups line(s)"
+  [ "$live" = "100:30:200" ] && [ "$n" = 1 ] && grep -qE "^$SSHD_WANT$" $SSHD_CONFIG
 }
 sshd_apply() {
-  if [ -f $SSHD_FILE ] && sshd_status >/dev/null 2>&1; then say "sshd: already in place"; return; fi
-  printf '# %s\nMaxStartups 100:30:200\n' "$MARK" | write_file $SSHD_FILE
+  if [ -f $OLD_SSHD_FILE ]; then run rm -f $OLD_SSHD_FILE; say "sshd: removed old drop-in $OLD_SSHD_FILE"; fi
+  if sshd_status >/dev/null 2>&1 && [ ! -f $OLD_SSHD_FILE ]; then say "sshd: already in place"; return; fi
+  if grep -qE "^MaxStartups" $SSHD_CONFIG; then
+    # Normalize the first active line in place; drop any further active ones.
+    run sed -i -E "0,/^MaxStartups.*/s//$SSHD_WANT/; /^MaxStartups/{x;s/^/x/;/^x{2,}/{x;d};x}" $SSHD_CONFIG
+    say "sshd: normalized existing MaxStartups line in $SSHD_CONFIG"
+  elif grep -qE "^#MaxStartups" $SSHD_CONFIG; then
+    # Keep the stock commented default and add the real line right after it.
+    run sed -i -E "0,/^#MaxStartups.*/s//&\n$SSHD_WANT/" $SSHD_CONFIG
+    say "sshd: added '$SSHD_WANT' after the commented default in $SSHD_CONFIG"
+  else
+    run sh -c "printf '\n%s\n' '$SSHD_WANT' >> $SSHD_CONFIG"
+    say "sshd: appended '$SSHD_WANT' to $SSHD_CONFIG"
+  fi
   if [ "$DRY" = 0 ]; then sshd -t && { systemctl reload ssh 2>/dev/null || systemctl reload sshd; }; else echo "    would run: sshd -t && systemctl reload ssh"; fi
-  say "sshd: applied (MaxStartups 100:30:200 via $SSHD_FILE; an existing line in sshd_config is harmless — the Include comes first)"
 }
 sshd_undo() {
-  rm -f $SSHD_FILE
+  rm -f $OLD_SSHD_FILE
+  sed -i -E "s/^$SSHD_WANT$/#MaxStartups 10:30:100/" $SSHD_CONFIG
   systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-  say "sshd: removed"
+  say "sshd: MaxStartups line commented out again"
 }
 
 # ---- 3. ufw --------------------------------------------------------------------
@@ -232,7 +248,7 @@ case "${1:-}" in
   plan)   need_root plan; DRY=1; echo "== plan on $(hostname) (nothing will be changed)"; sysctl_apply; sshd_apply; ufw_apply; roce_apply; echo "== end of plan" ;;
   apply)  need_root apply; echo "== apply on $(hostname)"; sysctl_apply; sshd_apply; ufw_apply; roce_apply; echo "== done" ;;
   status) echo "== status on $(hostname)"; [ "$(id -u)" = 0 ] || say "(run as root for sshd/ufw details)"; sysctl_status || true; sshd_status || true; ufw_status || true; roce_status
-          grep -qE "^MaxStartups" $ETC/ssh/sshd_config 2>/dev/null && say "note: hand-made MaxStartups line in $ETC/ssh/sshd_config (harmless; this script's file takes precedence)" ;;
+          ;;
   undo)   need_root undo; echo "== undo on $(hostname)"; roce_undo; ufw_undo; sshd_undo; sysctl_undo; echo "== done" ;;
   *) sed -n '2,26p' "$0"; exit 1 ;;
 esac
