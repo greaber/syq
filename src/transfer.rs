@@ -13,7 +13,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 const WINDOW: usize = 4;
 const MAX_ATTEMPTS: u32 = 3;
-pub const LOCAL_DEFAULT_CONNECTIONS: usize = 64;
+pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 const FAST_BATCH_FILES: usize = 64;
 const FAST_BATCH_BYTES: u64 = 16 << 20;
 

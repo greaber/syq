@@ -55,7 +55,7 @@ pub struct Args {
     #[arg(short = 'h', long)]
     pub human_readable: bool,
 
-    /// Number of parallel connections/workers (default: 8 over ssh, 64 when everything is local)
+    /// Number of parallel connections/workers (default: 8 over ssh, 32 when everything is local)
     #[arg(short = 'j', long, value_name = "N")]
     pub connections_opt: Option<usize>,
     #[arg(skip)]
