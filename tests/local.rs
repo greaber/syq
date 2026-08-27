@@ -3246,3 +3246,35 @@ fn files_from_symlink_conflict_is_order_independent() {
     assert_eq!(read(&t.path("dst2/link/secret")), b"s");
     assert!(t.path("dst2/link").symlink_metadata().unwrap().is_dir());
 }
+
+#[test]
+fn three_claimants_are_validated_as_a_group() {
+    let t = Tmp::new();
+    write(&t.path("dst/x"), b"dest content");
+    fs::create_dir_all(t.path("a")).unwrap();
+    fs::hard_link(t.path("dst/x"), t.path("a/x")).unwrap();
+    write(&t.path("b/x"), b"from b");
+    write(&t.path("c/x"), b"from c");
+    // a/x is the destination file; b/x and c/x are two different contents.
+    let out = pcp(&["-r", &t.s("a/"), &t.s("b/"), &t.s("c/"), &t.s("dst")]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("2 sources map to the same destination"));
+    assert_eq!(read(&t.path("dst/x")), b"dest content");
+    // With only one other content it is fine, in any position.
+    run_ok(&["-r", &t.s("b/"), &t.s("a/"), &t.s("dst")]);
+    assert_eq!(read(&t.path("dst/x")), b"from b");
+}
+
+#[test]
+fn conflicting_sources_leave_no_destination_behind() {
+    let t = Tmp::new();
+    write(&t.path("a/x"), b"1");
+    write(&t.path("b/x"), b"2");
+    let out = pcp(&["-r", &t.s("a/"), &t.s("b/"), &t.s("dst/")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!t.path("dst").exists(), "destination must not be created");
+    // And a clean multi-source copy into a missing destination still works.
+    write(&t.path("c/y"), b"3");
+    run_ok(&["-r", &t.s("a/"), &t.s("c/"), &t.s("dst2/")]);
+    assert_eq!(listing(&t.path("dst2")), ["x", "y"]);
+}

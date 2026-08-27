@@ -161,7 +161,8 @@ Identical to rsync:
 - Several sources require (or create) a directory destination. With several
   sources pcp scans them all before writing anything, so two sources mapping
   onto one destination path with different contents is refused before the
-  destination is touched (the transfer starts once the scans finish).
+  destination is touched — not even a missing destination directory is
+  created (the transfer starts once the scans finish).
 - A destination that is a symlink to a directory is that directory (the link
   is kept, with or without a trailing slash); a symlink to anything else is
   replaced like a file.

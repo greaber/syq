@@ -611,27 +611,16 @@ pub fn run(args: Args) -> Result<i32> {
     )?;
 
     // Create a missing directory destination — never in the read-only modes,
-    // and never under --existing.
-    if dst_root_entry.is_none()
+    // and never under --existing. With several sources this waits until
+    // their scans have been checked against each other, so a conflicting
+    // command leaves nothing behind.
+    let create_root = dst_root_entry.is_none()
         && dst_is_dir
         && !args.dry_run
         && !args.verify_only
-        && !args.existing
-    {
-        match ok(
-            dst_ctl.call(Request::Apply(vec![Op::Mkdir {
-                path: dst_root.clone(),
-                mode: 0o755,
-            }]))?,
-            "mkdir",
-        )? {
-            Response::Applied(errs) => {
-                if let Some(e) = errs.into_iter().flatten().next() {
-                    bail!("{e}");
-                }
-            }
-            other => bail!("unexpected response {other:?}"),
-        }
+        && !args.existing;
+    if create_root && srcs.len() == 1 {
+        mkdir_root(&mut *dst_ctl, &dst_root)?;
     }
 
     let checkpoint_completed = checkpoint_state
@@ -667,6 +656,11 @@ pub fn run(args: Args) -> Result<i32> {
         max_delete_hit: false,
         buffer: if srcs.len() > 1 {
             Some(Vec::new())
+        } else {
+            None
+        },
+        create_root: if create_root && srcs.len() > 1 {
+            Some(dst_root.clone())
         } else {
             None
         },
@@ -920,6 +914,24 @@ fn stat_many(
     }
 }
 
+fn mkdir_root(conn: &mut dyn Conn, dst_root: &[u8]) -> Result<()> {
+    match ok(
+        conn.call(Request::Apply(vec![Op::Mkdir {
+            path: dst_root.to_vec(),
+            mode: 0o755,
+        }]))?,
+        "mkdir",
+    )? {
+        Response::Applied(errs) => {
+            if let Some(e) = errs.into_iter().flatten().next() {
+                bail!("{e}");
+            }
+            Ok(())
+        }
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
 fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Entry>> {
     Ok(stat_many(conn, vec![path.to_vec()], follow)?
         .pop()
@@ -1037,6 +1049,9 @@ struct Planner<'a> {
     /// Several sources: mapped batches waiting for all scans to finish
     /// (see `Mapped`). None with a single source, where batches stream.
     buffer: Option<Vec<Mapped>>,
+    /// Several sources into a destination that doesn't exist yet: create it
+    /// only once the scans have been validated against each other.
+    create_root: Option<PathBytes>,
     /// --files-from: listed directories are created even without -r (which
     /// then only decides whether their contents are walked).
     keep_dirs: bool,
@@ -1447,28 +1462,37 @@ impl Planner<'_> {
         let Some(mut buffered) = self.buffer.take() else {
             return Ok(());
         };
-        // (destination, first claimant's identity, this claimant's identity, name)
-        type Contested = (PathBytes, (u64, u64), (u64, u64), String);
-        let contested: Vec<Contested> = buffered
+        // Every claimant of each contested destination, as a group: the first
+        // (from dst_seen) plus all the contested ones. The group is fine only
+        // if at most one *distinct* file among them is not the destination
+        // file itself — otherwise two different contents want one path.
+        let mut groups: std::collections::BTreeMap<PathBytes, (String, Vec<(u64, u64)>)> =
+            std::collections::BTreeMap::new();
+        for p in buffered
             .iter()
             .flat_map(|m| m.others.iter().filter(|p| p.contested))
-            .map(|p| {
+        {
+            let g = groups.entry(p.dst.clone()).or_insert_with(|| {
                 let first = match self.dst_seen.get(&p.dst) {
-                    Some(Claim::File { dev, ino }) => (*dev, *ino),
-                    _ => (0, 0),
+                    Some(Claim::File { dev, ino }) => vec![(*dev, *ino)],
+                    _ => Vec::new(),
                 };
-                (p.dst.clone(), first, (p.e.dev, p.e.ino), p.rel.clone())
-            })
-            .collect();
-        if !contested.is_empty() {
-            let stats = self.stat_many(true, contested.iter().map(|c| c.0.clone()).collect())?;
-            for ((dst, first, second, rel), st) in contested.into_iter().zip(stats) {
-                let is_dst = |(dev, ino): (u64, u64)| {
-                    self.opts.same_host && st.as_ref().is_some_and(|d| d.dev == dev && d.ino == ino)
-                };
-                if !is_dst(first) && !is_dst(second) {
+                (p.rel.clone(), first)
+            });
+            g.1.push((p.e.dev, p.e.ino));
+        }
+        if !groups.is_empty() {
+            let stats = self.stat_many(true, groups.keys().cloned().collect())?;
+            for ((dst, (rel, ids)), st) in groups.into_iter().zip(stats) {
+                let dst_id = st.filter(|_| self.opts.same_host).map(|d| (d.dev, d.ino));
+                let mut distinct: Vec<(u64, u64)> =
+                    ids.into_iter().filter(|id| Some(*id) != dst_id).collect();
+                distinct.sort_unstable();
+                distinct.dedup();
+                if distinct.len() > 1 {
                     self.progress.error(&format!(
-                        "pcp: {rel}: two sources map to the same destination {} — refusing to clobber it",
+                        "pcp: {rel}: {} sources map to the same destination {} — refusing to clobber it",
+                        distinct.len(),
                         display(&dst)
                     ));
                     self.collision = true;
@@ -1477,6 +1501,9 @@ impl Planner<'_> {
         }
         if self.collision {
             return Ok(());
+        }
+        if let Some(root) = self.create_root.take() {
+            mkdir_root(self.dst, &root)?;
         }
         // Validated: from here on they are ordinary entries (the one that is
         // the destination file skips itself; the other is written).
