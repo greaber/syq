@@ -65,11 +65,11 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.inplace {
         remote.push("--inplace".into());
     }
-    if args.atomic {
-        remote.push("--atomic".into());
-    }
     if args.fsync {
         remote.push("--fsync".into());
+    }
+    if let Some(path) = &args.checkpoint {
+        remote.push(format!("--checkpoint={path}"));
     }
     if args.no_bootstrap {
         remote.push("--no-bootstrap".into());
@@ -107,9 +107,27 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     for s in srcs {
         remote.push(s.path.clone());
     }
-    let dst_str = match &dst.user {
-        Some(u) => format!("{u}@{}:{}", dst.host.as_ref().unwrap(), dst.path),
-        None => format!("{}:{}", dst.host.as_ref().unwrap(), dst.path),
+    // Same host (and user) on both ends: on that host this is a plain local
+    // copy — no ssh back to itself, copy_file_range applies, and the
+    // copy-into-itself check sees both paths on one machine.
+    let dst_str = if srcs[0].same_host(dst) {
+        // A relative remote path is relative to the home; anchor it so the
+        // orchestrator's local parse can't take it for something else.
+        if dst.path.starts_with('/')
+            || dst.path == "~"
+            || dst.path.starts_with("~/")
+            || dst.path.starts_with("./")
+            || dst.path.starts_with("../")
+        {
+            dst.path.clone()
+        } else {
+            format!("./{}", dst.path)
+        }
+    } else {
+        match &dst.user {
+            Some(u) => format!("{u}@{}:{}", dst.host.as_ref().unwrap(), dst.path),
+            None => format!("{}:{}", dst.host.as_ref().unwrap(), dst.path),
+        }
     };
     remote.push(dst_str);
 

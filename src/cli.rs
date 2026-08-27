@@ -107,17 +107,21 @@ pub struct Args {
     /// Update files in place instead of writing a partial and renaming. Use this to modify a
     /// large existing file without copying it first (saves time and disk space when only part
     /// of it changes)
-    #[arg(long, conflicts_with = "atomic")]
-    pub inplace: bool,
-    /// Always write through a partial file and an atomic rename, even for small new files.
-    /// Use this when another process may read the destination while pcp writes it, so a file
-    /// only ever appears complete (rsync semantics; costs a rename per file, slow on NFS)
     #[arg(long)]
-    pub atomic: bool,
+    pub inplace: bool,
     /// fsync each file and its parent directory around the rename, so a completed file
-    /// survives a crash (slower, especially on NFS)
+    /// survives a crash; also syncs an explicitly requested checkpoint (slower, especially on NFS)
     #[arg(long)]
     pub fsync: bool,
+
+    /// Save completed-file state here; reuse the same file to accelerate a retry. The file is
+    /// retained after interruption or failure and removed after a clean copy.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["checksum", "verify_only", "rm"]
+    )]
+    pub checkpoint: Option<String>,
 
     /// Remote shell command (default: ssh)
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
@@ -134,9 +138,6 @@ pub struct Args {
     /// Send all data over the ssh connection instead of separate TCP data connections
     #[arg(long)]
     pub no_tcp: bool,
-    /// Disable the resume marker/journal (no destination marker, no completion journal)
-    #[arg(long)]
-    pub no_resume: bool,
     /// Port range the remote listens on for TCP data connections
     #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
     pub tcp_ports: String,
@@ -277,6 +278,7 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         "--block-size",
         "--min-split",
         "--bwlimit",
+        "--checkpoint",
         "--tcp-ports",
         "--pcp-path",
         "--width",
