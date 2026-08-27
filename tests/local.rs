@@ -678,6 +678,51 @@ fn large_file_parallel_chunks() {
 }
 
 #[test]
+fn bwlimit_is_aggregate_across_workers() {
+    let t = Tmp::new();
+    for i in 0..4 {
+        write(
+            &t.path(&format!("src/{i}.bin")),
+            &prng(512 * 1024, i as u64 + 100),
+        );
+    }
+
+    // Four independent files keep four workers active. At 1 MiB/s, their
+    // aggregate 2 MiB must take about two seconds (minus the initial burst). A
+    // mistakenly per-worker limiter would finish in well under one second.
+    let start = std::time::Instant::now();
+    run_ok(&[
+        "-a",
+        "--no-resume",
+        "-j",
+        "4",
+        "--bwlimit",
+        "1M",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1600),
+        "aggregate 2 MiB copy completed too quickly: {elapsed:?}"
+    );
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+}
+
+#[test]
+fn bwlimit_rejects_invalid_rates() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"x");
+    let out = pcp(&["-a", "--bwlimit", "fast", &t.s("src/"), &t.s("dst/")]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("bad --bwlimit"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn dry_run_creates_nothing() {
     let t = Tmp::new();
     make_tree(&t.path("src"));

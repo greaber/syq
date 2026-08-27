@@ -71,6 +71,11 @@ pub struct Args {
     /// Don't split in-flight files with less than this much left (e.g. 32M)
     #[arg(long, default_value = "32M", value_name = "SIZE")]
     pub min_split: String,
+    /// Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables)
+    #[arg(long, value_name = "RATE")]
+    pub bwlimit: Option<String>,
+    #[arg(skip)]
+    pub bwlimit_bytes: u64,
 
     /// Show progress (default when stderr is a terminal)
     #[arg(long, overrides_with = "no_progress")]
@@ -185,6 +190,12 @@ impl Args {
         reject_unsupported_rsync_flags(&argv)?;
         let m = Args::command().get_matches();
         let mut args = Args::from_arg_matches(&m)?;
+        args.bwlimit_bytes = args
+            .bwlimit
+            .as_deref()
+            .map(crate::bwlimit::parse_rate)
+            .transpose()?
+            .unwrap_or(0);
         let mut items: Vec<(usize, bool, String)> = Vec::new();
         if let Some(idx) = m.indices_of("ignore") {
             for (i, v) in idx.zip(&args.ignore) {
@@ -263,6 +274,7 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         "--connections",
         "--block-size",
         "--min-split",
+        "--bwlimit",
         "--tcp-ports",
         "--pcp-path",
         "--width",
@@ -317,7 +329,6 @@ fn message_for_long(base: &str) -> Option<&'static str> {
         "delete" => DELETE_MSG,
         _ if base.starts_with("delete-") => DELETE_MSG,
         "update" => "pcp does not implement -u/--update (skip files newer on the receiver).",
-        "bwlimit" => "pcp does not implement --bwlimit.",
         "one-file-system" => "pcp does not implement -x/--one-file-system.",
         "sparse" => "pcp does not implement -S/--sparse.",
         "hard-links" => "pcp does not preserve hard links (-H/--hard-links).",

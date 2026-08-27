@@ -63,6 +63,7 @@ pcp -a /mnt/nfs/tree /local/tree              # local → local (parallel scan a
 pcp -a hostA:big/ hostB:big/                  # remote → remote: runs on hostA, data goes A → B directly
 pcp -a --relay hostA:big/ hostB:big/          # ...or relay through this machine if A can't reach B
 pcp -avz -j 16 bigdir server:dest             # 16 parallel connections
+pcp -a --bwlimit 50M src server:dst            # cap all connections at 50 MiB/s total
 pcp -a -e 'ssh -p 2222 -i ~/.ssh/other' src host:dst
 pcp -a --dry-run -v src host:dst              # show what would be copied
 pcp -ac src host:dst                          # skip the quick check; compare blocks, repair differences
@@ -81,6 +82,7 @@ pcp -a src newhost:dst                        # the matching remote helper is au
 | `-z`, `--compress` | zstd-compress data in transit (inside pcp's protocol, not `ssh -C`) |
 | `-n`, `--dry-run` | Scan and report; change nothing |
 | `-j N`, `--connections N` | Parallel data connections (default 8 over ssh, 32 when fully local) |
+| `--bwlimit RATE` | Limit aggregate file-data throughput (bare rate is KiB/s; `0` disables) |
 | `--block-size SIZE` | Transfer and hash block size (default 4M) |
 | `--min-split SIZE` | Don't split an in-flight file with less than this left (default 32M) |
 | `--progress` / `--no-progress` | Progress meter (default on when stderr is a terminal) |
@@ -108,6 +110,13 @@ pcp -a src newhost:dst                        # the matching remote helper is au
 | `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
+
+`--bwlimit` is one approximate limit shared by every `-j` worker, not a
+per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
+`M`, `G`, and `MiB` use powers of 1024, a final `+1` or `-1` adjusts the scaled
+value by one byte, and `0` means unlimited. PCP counts uncompressed file bytes;
+protocol overhead is not counted, and `-z` may make the actual network rate
+lower. Scanning, hashing, and metadata operations are not limited.
 
 ### Remote-to-remote
 
@@ -169,8 +178,8 @@ does not `fsync` each file (the rename still orders correctly, and per-file
 fsync is costly on NFS); pass `--fsync` to force each file durable before the
 rename for crash safety.
 Large files and existing-file updates go through this partial + rename, so their
-final name is never occupied by an incomplete file. **Small new files (up to the
-block size) are the exception**: they are written straight to their final path
+final name is never occupied by an incomplete file. **Small new files (up to one
+transfer block) are the exception**: they are written straight to their final path
 for speed (no rename), so a concurrent reader can observe one partially written,
 and an aborted run leaves an incomplete final-named file until you rerun (a
 rerun re-transfers it, since without preallocation it is detectably short — it
@@ -265,7 +274,7 @@ ordering question for them.
 
 - rsync filter rules (`--exclude`/`--include`/`--filter`); use `-i` (gitignore
   syntax) instead.
-- `--delete`, `--link-dest`, `-u`/`--update`, `--files-from`, `--bwlimit`.
+- `--delete`, `--link-dest`, `-u`/`--update`, `--files-from`.
 - Hardlinks (`-H`), ACLs and xattrs (`-A`/`-X`).
 - rsync daemon mode / `rsync://`. pcp speaks its own protocol; it cannot talk
   to an rsync server.
@@ -375,8 +384,11 @@ When source and destination are on the same machine, pcp copies each file with
 does a reflink or a straight in-kernel copy, and on NFS 4.2 the *server* copies
 the file internally (no client round trip). Measured: a single 8 GB file
 /raid→/raid at 24.8 GB/s vs 2.5 GB/s for `cp`; NFS→NFS at 3.3 GB/s vs 0.4.
-Hashing is skipped on this path (there's no wire to corrupt it); `-c` and any
-existing partial fall back to the streaming path, which keeps hash-based resume.
+Hashing is skipped on this path (there's no wire to corrupt it); `-c`, any
+existing partial, and `--bwlimit` disable this shortcut. Existing partials and
+larger bwlimited files use the hash-resumable streaming path. Small new
+bwlimited files that fit in one paced transfer block retain the `PutSmall`
+exception described above.
 
 ## NFS
 
