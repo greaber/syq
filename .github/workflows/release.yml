@@ -1,71 +1,225 @@
-# Build stripped release binaries for Linux and macOS on x86-64 and ARM64,
-# and attach raw, gzip-compressed, and SHA-256 assets to a GitHub Release.
-#
-# Trigger: push a tag like v0.1.0  (git tag v0.1.0 && git push origin v0.1.0)
-# or run manually from the Actions tab (workflow_dispatch).
+# Build all supported targets, assemble one complete signed release, attest its
+# contents, publish it draft-first, then update the project-owned Homebrew tap.
 name: release
+
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
-  contents: write   # needed to create the Release and upload assets
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
+  verify-tag:
+    name: verify signed release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Require a verified annotated tag for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/verify-release-tag.sh \
+            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master
+
   build:
+    name: build (${{ matrix.name }})
+    needs: verify-tag
     strategy:
+      fail-fast: true
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            name: pcp-linux-x86_64            # static, runs on any glibc-or-not Linux
+            name: syq-linux-x86_64
             flags: "-C target-feature=+crt-static"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            name: pcp-linux-aarch64           # static, native GitHub ARM64 runner
+            name: syq-linux-aarch64
             flags: "-C target-feature=+crt-static"
-          - os: macos-14                       # Apple Silicon runner
+          - os: macos-14
             target: aarch64-apple-darwin
-            name: pcp-macos-arm64
-          - os: macos-15-intel                 # Intel runner
+            name: syq-macos-arm64
+            flags: ""
+          - os: macos-15-intel
             target: x86_64-apple-darwin
-            name: pcp-macos-x86_64
+            name: syq-macos-x86_64
+            flags: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Check out the verified tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          targets: ${{ matrix.target }}
-      - name: Check tag matches package version
-        if: startsWith(github.ref, 'refs/tags/')
+          persist-credentials: false
+      - name: Validate release inputs
+        env:
+          SYQ_RELEASE_PUBLIC_KEY: ${{ vars.SYQ_RELEASE_PUBLIC_KEY }}
+        shell: bash
         run: |
+          set -euo pipefail
+          test -n "$SYQ_RELEASE_PUBLIC_KEY" || {
+            echo 'Set the SYQ_RELEASE_PUBLIC_KEY repository variable before releasing.' >&2
+            exit 1
+          }
+          test "$(printf '%s' "$SYQ_RELEASE_PUBLIC_KEY" | openssl base64 -d -A | wc -c | tr -d ' ')" -eq 32 || {
+            echo 'SYQ_RELEASE_PUBLIC_KEY must be one base64-encoded 32-byte Ed25519 key.' >&2
+            exit 1
+          }
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           test "$GITHUB_REF_NAME" = "v$version"
-      - name: Build
+          rustup target add '${{ matrix.target }}'
+          test "$(rustc --version | awk '{print $2}')" = "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+      - name: Build locked release binary
         env:
           RUSTFLAGS: ${{ matrix.flags }}
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Stage binary
+          SYQ_RELEASE_PUBLIC_KEY: ${{ vars.SYQ_RELEASE_PUBLIC_KEY }}
+        run: cargo build --locked --release --bin syq --target '${{ matrix.target }}'
+      - name: Stage raw and compressed binaries
+        shell: bash
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/pcp dist/${{ matrix.name }}
-          gzip -9 -n -c dist/${{ matrix.name }} > dist/${{ matrix.name }}.gz
-          shasum -a 256 dist/${{ matrix.name }}.gz | awk '{print $1}' > dist/${{ matrix.name }}.gz.sha256
-      - uses: actions/upload-artifact@v4
+          set -euo pipefail
+          mkdir dist
+          cp 'target/${{ matrix.target }}/release/syq' 'dist/${{ matrix.name }}'
+          chmod 755 'dist/${{ matrix.name }}'
+          gzip -9 -n -c 'dist/${{ matrix.name }}' > 'dist/${{ matrix.name }}.gz'
+          test -s 'dist/${{ matrix.name }}'
+          test -s 'dist/${{ matrix.name }}.gz'
+      - name: Upload build output
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.name }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 1
 
   release:
+    name: verify, attest, and publish
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
-      - uses: actions/download-artifact@v4
-        with: { path: dist, merge-multiple: true }
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - name: Check out release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          files: dist/*
-          fail_on_unmatched_files: true
+          persist-credentials: false
+      - name: Download every target
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Build and validate release metadata
+        run: scripts/package-release.sh "$GITHUB_REF_NAME" dist
+      - name: Sign release manifest and verify the configured key
+        env:
+          SYQ_RELEASE_PUBLIC_KEY: ${{ vars.SYQ_RELEASE_PUBLIC_KEY }}
+          SYQ_RELEASE_SIGNING_KEY_PEM_B64: ${{ secrets.SYQ_RELEASE_SIGNING_KEY_PEM_B64 }}
+        run: |
+          scripts/sign-release-manifest.sh \
+            dist/syq-release-manifest.json dist/syq-release-manifest.json.sig
+      - name: Verify final release inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$RUNNER_TEMP/expected-assets"
+          for asset in syq-linux-x86_64 syq-linux-aarch64 syq-macos-arm64 syq-macos-x86_64; do
+            printf '%s\n' "$asset" "$asset.sha256" "$asset.gz" "$asset.gz.sha256"
+          done > "$expected"
+          printf '%s\n' install.sh syq-release-manifest.json syq-release-manifest.json.sig syq.rb >> "$expected"
+          sort -o "$expected" "$expected"
+          find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$RUNNER_TEMP/actual-assets"
+          diff -u "$expected" "$RUNNER_TEMP/actual-assets"
+          ruby -c dist/syq.rb
+          scripts/test-installer.sh
+      - name: Refuse a divergent published release
+        id: release_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" --json isDraft > "$RUNNER_TEMP/release-state" 2>/dev/null; then
+            echo 'published=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          draft=$(jq -r .isDraft "$RUNNER_TEMP/release-state")
+          test "$draft" = false || {
+            echo "Draft $GITHUB_REF_NAME already exists; inspect and remove it before retrying." >&2
+            exit 1
+          }
+          scripts/verify-release-assets.sh "$GITHUB_REF_NAME" dist
+          echo 'published=true' >> "$GITHUB_OUTPUT"
+      - name: Attest all release files
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/*
+      - name: Create, verify, and publish a new immutable release
+        if: steps.release_state.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "syq ${GITHUB_REF_NAME#v}" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/*
+          scripts/verify-release-assets.sh "$GITHUB_REF_NAME" dist
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+      - name: Carry the verified published formula to the tap job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: homebrew-formula
+          path: dist/syq.rb
+          if-no-files-found: error
+          retention-days: 1
+
+  homebrew:
+    name: update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out project-owned tap
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: greaber/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+      - name: Download generated formula
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: homebrew-formula
+          path: formula
+      - name: Commit formula update
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tap/Formula
+          cp formula/syq.rb tap/Formula/syq.rb
+          cd tap
+          git diff --check
+          git add Formula/syq.rb
+          git diff --cached --quiet && {
+            echo 'The tap already contains this exact formula version.'
+            exit 0
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "syq ${GITHUB_REF_NAME#v}"
+          git push

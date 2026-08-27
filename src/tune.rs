@@ -1,6 +1,6 @@
 //! Automatic tuning of the number of parallel workers / connections.
 //!
-//! When `-j` is not given, pcp does not guess: it starts with a few workers
+//! When `-j` is not given, syq does not guess: it starts with a few workers
 //! and measures. Progress (bytes, plus a small credit per completed file so
 //! small-file transfers count too) is sampled every few seconds; a worker
 //! count has been *measured* once the rate has stopped changing — two
@@ -443,7 +443,7 @@ pub fn run(
             sampler.reset();
             if crate::transfer::debug() {
                 eprintln!(
-                    "pcp: tune: {before} -> {n} workers (measured {:.1} MB/s at {before}, state {:?})",
+                    "syq: tune: {before} -> {n} workers (measured {:.1} MB/s at {before}, state {:?})",
                     score / 1e6,
                     policy.state
                 );
