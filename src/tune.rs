@@ -232,9 +232,14 @@ impl Policy {
             State::Ramp { up: true, coarse } => {
                 let factor = if coarse { COARSE_STEP } else { STEP };
                 let p = self.prev.min(self.n);
-                if ratio > Self::gain_needed(factor) && self.n < self.max {
+                if ratio > Self::gain_needed(factor) {
                     self.base = Some(score);
-                    self.set(step_up_by(self.n, factor));
+                    if self.n < self.max {
+                        self.set(step_up_by(self.n, factor));
+                    } else {
+                        // It paid all the way up to the cap: stay there.
+                        self.hold(false);
+                    }
                 } else if coarse && step_up(p) < self.n {
                     // The doubling from `p` didn't pay as a whole, but the
                     // best count may lie between p and 2p: go back to p and
@@ -489,6 +494,20 @@ mod tests {
             p.history
         );
         assert!((25..=42).contains(&p.settled()), "history {:?}", p.history);
+    }
+
+    #[test]
+    fn a_gain_at_the_cap_holds_at_the_cap() {
+        // Linear all the way past MAX (e.g. a fast NAS): 32 -> 64 doubles
+        // throughput, and 64 is the cap, so it must stay at 64.
+        let p = simulate(START_LOCAL, 200, 30, |_| 1.0);
+        assert_eq!(&p.history[..2], &[32, 64], "history {:?}", p.history);
+        assert_eq!(p.settled(), MAX, "history {:?}", p.history);
+        assert!(
+            p.history[1..].iter().all(|&n| n >= 48),
+            "history {:?}",
+            p.history
+        );
     }
 
     #[test]

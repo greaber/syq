@@ -298,8 +298,9 @@ ordering question for them.
 
 ## How many connections (`-j`)
 
-Without `-j`, pcp tunes the number of workers while the transfer runs
-instead of guessing. It starts with 8 over the network (32 when both ends are
+Without `-j`, pcp tunes the number of workers while a copy runs instead of
+guessing (`--rm` keeps a fixed 8, or 32 locally: removal is metadata-bound
+and short). It starts with 8 over the network (32 when both ends are
 local: threads are free, connections are not) and measures: progress (bytes,
 plus a small credit per completed file so small-file trees count) is sampled
 every 2.5 s, and a count has been *measured* only once two consecutive
@@ -443,8 +444,9 @@ fix for that.
   ciphers). On x86 with AES-NI that is noticeably faster per stream than
   OpenSSH's default chacha20-poly1305.
 - Each connection costs one ssh handshake (~0.3 s on a LAN, several seconds
-  across continents). The control connection always goes first (everything
-  waits on it); data connections are opened up to 32 at a time, and if the
+  across continents). The control connections always come up first
+  (everything waits on them; only then do data connections start), up to 32
+  at a time, and if the
   server sheds one — sshd's `MaxStartups` (default 10) randomly rejects
   sessions beyond 10 being set up at once — pcp halves that number for the
   rest of the run and retries. On a server set up for pcp (`MaxStartups
