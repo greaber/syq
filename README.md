@@ -315,6 +315,9 @@ the transfer (see below); hardlinks aren't implemented.
 
 ## Not implemented (on purpose, for now)
 
+`RSYNC-COMPAT.md` tracks rsync compatibility in full: what matches, what
+differs and why, what's missing, and the open issues. The short version:
+
 - rsync filter rules (`--exclude`/`--include`/`--filter`); use `-i` (gitignore
   syntax) instead.
 - `--link-dest`, `--backup`.
@@ -466,8 +469,8 @@ have is removed. The rules are simpler than rsync's, deliberately:
 - **Anything the source has is safe.** A file skipped by `-u`, `--existing`,
   `--ignore-existing`, `--max-size` or `--min-size` — or a symlink or special
   file skipped for lack of `-l`/`-D` — still exists in the source, so its
-  destination copy is left alone (rsync would delete a `--max-size`
-  casualty). Such files are reported under `files excluded` in `--stats`.
+  destination copy is left alone, as in rsync. Such files are reported under
+  `files excluded` in `--stats`.
 - **After, not before.** Deletions run once every file has been transferred
   and only if the whole source scan succeeded: an unreadable source directory
   would otherwise look like one whose contents vanished (`source scan reported
