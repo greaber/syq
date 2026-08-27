@@ -142,8 +142,16 @@ processes), given its metadata, and `rename`d over the target. By default pcp
 does not `fsync` each file (the rename still orders correctly, and per-file
 fsync is costly on NFS); pass `--fsync` to force each file durable before the
 rename for crash safety.
-The final name is never occupied by an incomplete file. `--inplace` skips the
-partial for when there is no room for a second copy.
+Large files and existing-file updates go through this partial + rename, so their
+final name is never occupied by an incomplete file. **Small new files (up to the
+block size) are the exception**: they are written straight to their final path
+for speed (no rename), so a concurrent reader can observe one partially written,
+and an aborted run leaves an incomplete final-named file until you rerun (a
+rerun re-transfers it, since without preallocation it is detectably short — it
+is never *silently* skipped as complete). Pass `--atomic` when a consumer may
+read the destination while pcp is writing, to make every file appear atomically.
+`--inplace` writes every file in place (e.g. to update a large file without room
+for a second copy).
 
 Local → local runs the same machinery in-process with N threads, which helps
 on NFS and NVMe.

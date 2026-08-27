@@ -1,15 +1,15 @@
 //! Connections to endpoints: local (in-process) or remote (over an ssh child).
 
+use crate::crypto::{Cipher, RecordReader, RecordWriter};
 use crate::fsops::{self, FsOps};
+#[allow(unused_imports)]
+use crate::proto::SizeHint;
 use crate::proto::*;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
-use crate::crypto::{Cipher, RecordReader, RecordWriter};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
-#[allow(unused_imports)]
-use crate::proto::SizeHint;
 
 pub trait Conn: Send {
     fn send(&mut self, req: Request) -> Result<()>;
@@ -48,7 +48,10 @@ pub struct LocalConn {
 
 impl LocalConn {
     pub fn new() -> Self {
-        LocalConn { ops: FsOps::new(), pending: VecDeque::new() }
+        LocalConn {
+            ops: FsOps::new(),
+            pending: VecDeque::new(),
+        }
     }
 }
 
@@ -59,7 +62,9 @@ impl Conn for LocalConn {
         Ok(())
     }
     fn recv(&mut self) -> Result<Response> {
-        self.pending.pop_front().ok_or_else(|| anyhow!("no pending response"))
+        self.pending
+            .pop_front()
+            .ok_or_else(|| anyhow!("no pending response"))
     }
     fn scan(
         &mut self,
@@ -85,7 +90,9 @@ pub struct RemoteConn {
 
 const READ_AHEAD: usize = 4;
 
-fn spawn_reader(input: Box<dyn Read + Send>) -> std::sync::mpsc::Receiver<std::io::Result<Response>> {
+fn spawn_reader(
+    input: Box<dyn Read + Send>,
+) -> std::sync::mpsc::Receiver<std::io::Result<Response>> {
     let (tx, rx) = std::sync::mpsc::sync_channel(READ_AHEAD);
     std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
@@ -112,7 +119,10 @@ impl RemoteConn {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        let msg = if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof) {
+        let msg = if e
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)
+        {
             "connection closed by remote".to_string()
         } else {
             format!("{e:#}")
@@ -129,7 +139,9 @@ impl Conn for RemoteConn {
         match self.rx.recv() {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => Err(self.io_err(e.into())),
-            Err(_) => Err(self.io_err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "reader stopped").into())),
+            Err(_) => Err(self.io_err(
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "reader stopped").into(),
+            )),
         }
     }
     fn is_dead(&self) -> bool {
@@ -143,7 +155,11 @@ impl Conn for RemoteConn {
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
-        self.send(Request::Scan { root: root.to_vec(), follow_root, all })?;
+        self.send(Request::Scan {
+            root: root.to_vec(),
+            follow_root,
+            all,
+        })?;
         loop {
             match self.recv()? {
                 Response::ScanBatch(b) => sink(b)?,
@@ -219,7 +235,16 @@ impl RemoteSpec {
             // and AES-GCM is much faster than OpenSSH's default chacha20 on
             // CPUs with AES-NI. The list still includes the defaults so
             // negotiation never fails.
-            cmd.args(["-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "StrictHostKeyChecking=accept-new", "-o", CIPHERS]);
+            cmd.args([
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                CIPHERS,
+            ]);
             if let Some(u) = &self.user {
                 cmd.args(["-l", u]);
             }
@@ -250,10 +275,20 @@ impl RemoteSpec {
             match self.connect_once(compress) {
                 Ok(c) => return Ok(c),
                 // Don't retry what won't change: missing binary (127) or a version mismatch.
-                Err(e) if attempt == 5 || e.to_string().contains("version mismatch") || e.to_string().contains("exit status: 127") => return Err(e),
+                Err(e)
+                    if attempt == 5
+                        || e.to_string().contains("version mismatch")
+                        || e.to_string().contains("exit status: 127") =>
+                {
+                    return Err(e)
+                }
                 Err(e) => {
                     if crate::transfer::debug() {
-                        eprintln!("pcp: connect to {} failed (attempt {}): {e:#}", self.label(), attempt + 1);
+                        eprintln!(
+                            "pcp: connect to {} failed (attempt {}): {e:#}",
+                            self.label(),
+                            attempt + 1
+                        );
                     }
                     last = Some(e);
                     std::thread::sleep(delay);
@@ -267,8 +302,12 @@ impl RemoteSpec {
     fn connect_once(&self, compress: bool) -> Result<RemoteConn> {
         let mut cmd = self.ssh_command();
         cmd.arg(self.server_command());
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
-        let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", self.rsh[0]))?;
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawn {:?}", self.rsh[0]))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let conn = RemoteConn {
@@ -284,9 +323,18 @@ impl RemoteSpec {
     /// Ask the remote (over the control connection) to accept TCP data
     /// connections; records how to reach it for later `connect` calls.
     pub fn setup_tcp(&self, ctl: &mut dyn Conn, plain: bool, ports: (u16, u16)) -> Result<()> {
-        let key = if plain { None } else { Some(crate::crypto::random_bytes(crate::crypto::KEY_LEN)) };
+        let key = if plain {
+            None
+        } else {
+            Some(crate::crypto::random_bytes(crate::crypto::KEY_LEN))
+        };
         let token = crate::crypto::random_bytes(16);
-        let resp = ctl.call(Request::TcpListen { key: key.clone(), token: token.clone(), port_lo: ports.0, port_hi: ports.1 })?;
+        let resp = ctl.call(Request::TcpListen {
+            key: key.clone(),
+            token: token.clone(),
+            port_lo: ports.0,
+            port_hi: ports.1,
+        })?;
         let (port, mut advertised) = match ok(resp, "tcp listen")? {
             Response::TcpListening { port, addrs } => (port, addrs),
             other => bail!("unexpected response {other:?}"),
@@ -306,12 +354,21 @@ impl RemoteSpec {
         // Tailscale, say) would drag the transfer down, so we don't.
         let fastest = reachable.iter().map(|(_, s)| *s).max().unwrap_or(0);
         let addrs: Vec<String> = if fastest > 0 {
-            reachable.iter().filter(|(_, s)| *s * 2 >= fastest).map(|(a, _)| a.clone()).collect()
+            reachable
+                .iter()
+                .filter(|(_, s)| *s * 2 >= fastest)
+                .map(|(a, _)| a.clone())
+                .collect()
         } else {
             vec![reachable[0].0.clone()]
         };
         if crate::transfer::debug() {
-            eprintln!("pcp: {}: data paths {:?} (advertised {:?})", self.label(), addrs, advertised);
+            eprintln!(
+                "pcp: {}: data paths {:?} (advertised {:?})",
+                self.label(),
+                addrs,
+                advertised
+            );
         }
         *self.tcp.lock().unwrap() = Some(TcpInfo {
             addrs,
@@ -324,14 +381,17 @@ impl RemoteSpec {
         Ok(())
     }
 
-    
-
     /// The real host name behind an ssh config alias.
     fn resolved_hostname(&self) -> Option<String> {
         if !self.rsh[0].ends_with("ssh") {
             return Some(self.host.clone());
         }
-        let out = Command::new(&self.rsh[0]).args(&self.rsh[1..]).arg("-G").arg(&self.host).output().ok()?;
+        let out = Command::new(&self.rsh[0])
+            .args(&self.rsh[1..])
+            .arg("-G")
+            .arg(&self.host)
+            .output()
+            .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         text.lines()
             .find_map(|l| l.strip_prefix("hostname "))
@@ -349,7 +409,11 @@ impl RemoteSpec {
         let mut last = anyhow!("no data address");
         for k in 0..n {
             let addr = &info.addrs[(start + k) % n];
-            let sa = match (addr.as_str(), info.port).to_socket_addrs().ok().and_then(|mut i| i.next()) {
+            let sa = match (addr.as_str(), info.port)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut i| i.next())
+            {
                 Some(sa) => sa,
                 None => {
                     last = anyhow!("cannot resolve {addr}");
@@ -363,7 +427,10 @@ impl RemoteSpec {
                     continue;
                 }
             };
-            let addr_s = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+            let addr_s = stream
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
             if crate::transfer::debug() {
                 eprintln!("pcp: {}: data connection via tcp {addr_s}", self.label());
             }
@@ -371,7 +438,10 @@ impl RemoteSpec {
             let conn_id = TCP_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (&stream).write_all(&conn_id.to_be_bytes())?;
             let (wc, rc) = match &info.key {
-                Some(k) => (Some(Cipher::new(k, conn_id, 1)), Some(Cipher::new(k, conn_id, 2))),
+                Some(k) => (
+                    Some(Cipher::new(k, conn_id, 1)),
+                    Some(Cipher::new(k, conn_id, 2)),
+                ),
                 None => (None, None),
             };
             let writer = RecordWriter::new(stream.try_clone()?, wc);
@@ -400,13 +470,19 @@ fn probe_reachable(advertised: &[(String, u32)], port: u16) -> Vec<(String, u32)
                 .to_socket_addrs()
                 .ok()
                 .and_then(|mut it| it.next())
-                .map(|sa| TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1000)).is_ok())
+                .map(|sa| {
+                    TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1000)).is_ok()
+                })
                 .unwrap_or(false);
             let _ = tx.send((i, addr, speed, ok));
         });
     }
     drop(tx);
-    let mut hits: Vec<(usize, String, u32)> = rx.iter().filter(|(_, _, _, ok)| *ok).map(|(i, a, s, _)| (i, a, s)).collect();
+    let mut hits: Vec<(usize, String, u32)> = rx
+        .iter()
+        .filter(|(_, _, _, ok)| *ok)
+        .map(|(i, a, s, _)| (i, a, s))
+        .collect();
     hits.sort_by_key(|(i, _, _)| *i);
     hits.into_iter().map(|(_, a, s)| (a, s)).collect()
 }
@@ -428,13 +504,22 @@ pub struct TcpInfo {
 
 impl std::fmt::Debug for TcpInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TcpInfo").field("addrs", &self.addrs).field("port", &self.port).field("failed", &self.failed).finish()
+        f.debug_struct("TcpInfo")
+            .field("addrs", &self.addrs)
+            .field("port", &self.port)
+            .field("failed", &self.failed)
+            .finish()
     }
 }
 
 fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteConn> {
     {
-        conn.send(Request::Hello { version: VERSION, compress, debug: crate::transfer::debug(), token })?;
+        conn.send(Request::Hello {
+            version: VERSION,
+            compress,
+            debug: crate::transfer::debug(),
+            token,
+        })?;
         match conn.recv() {
             Ok(Response::HelloOk { version }) if version == VERSION => Ok(conn),
             Ok(Response::HelloOk { version }) => {
@@ -455,12 +540,18 @@ impl RemoteSpec {
     pub fn bootstrap(&self) -> Result<()> {
         let exe = std::env::current_exe().context("locate own executable")?;
         let bin = std::fs::read(&exe).with_context(|| format!("read {}", exe.display()))?;
-        eprintln!("pcp: installing pcp on {} (~/.local/bin/pcp, {} bytes)", self.label(), bin.len());
+        eprintln!(
+            "pcp: installing pcp on {} (~/.local/bin/pcp, {} bytes)",
+            self.label(),
+            bin.len()
+        );
         let mut cmd = self.ssh_command();
         cmd.arg(
             "sh -c 'd=\"$HOME/.local/bin\"; mkdir -p \"$d\" && cat > \"$d/pcp.tmp\" && chmod 755 \"$d/pcp.tmp\" && mv \"$d/pcp.tmp\" \"$d/pcp\" && \"$d/pcp\" --version'",
         );
-        cmd.stdin(Stdio::piped()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
         let mut child = cmd.spawn()?;
         {
             let mut stdin = child.stdin.take().unwrap();
@@ -512,5 +603,4 @@ impl Endpoint {
             }
         }
     }
-
 }

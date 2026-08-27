@@ -82,36 +82,91 @@ pub enum Which {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Op {
-    Mkdir { path: PathBytes, mode: u32 },
-    Symlink { path: PathBytes, target: PathBytes },
-    Mknod { path: PathBytes, mode: u32, rdev: u64 },
-    SetMeta { path: PathBytes, meta: Meta, flags: u8 },
-    Remove { path: PathBytes },
+    Mkdir {
+        path: PathBytes,
+        mode: u32,
+    },
+    Symlink {
+        path: PathBytes,
+        target: PathBytes,
+    },
+    Mknod {
+        path: PathBytes,
+        mode: u32,
+        rdev: u64,
+    },
+    SetMeta {
+        path: PathBytes,
+        meta: Meta,
+        flags: u8,
+    },
+    Remove {
+        path: PathBytes,
+    },
     /// Remove an empty directory.
-    Rmdir { path: PathBytes },
+    Rmdir {
+        path: PathBytes,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Request {
-    Hello { version: u32, compress: bool, debug: bool, token: Vec<u8> },
+    Hello {
+        version: u32,
+        compress: bool,
+        debug: bool,
+        token: Vec<u8>,
+    },
     /// Ask the server to accept data connections over TCP (see crypto.rs).
     /// `key` is None for plaintext; `token` authenticates plaintext connections.
-    TcpListen { key: Option<Vec<u8>>, token: Vec<u8>, port_lo: u16, port_hi: u16 },
+    TcpListen {
+        key: Option<Vec<u8>>,
+        token: Vec<u8>,
+        port_lo: u16,
+        port_hi: u16,
+    },
     /// `all`: include pcp's own partial files (used by --rm).
-    Scan { root: PathBytes, follow_root: bool, all: bool },
+    Scan {
+        root: PathBytes,
+        follow_root: bool,
+        all: bool,
+    },
     StatMany(Vec<PathBytes>),
     Apply(Vec<Op>),
     /// What exists at `path` on the receiving side: the final file and/or a partial.
-    Probe { path: PathBytes },
+    Probe {
+        path: PathBytes,
+    },
     /// Create/adjust the write target for `path` with the given final size.
     /// `mode`: create new files with this mode so no separate chmod is needed.
-    Prepare { path: PathBytes, size: u64, inplace: bool, from_final: bool, mode: u32 },
+    Prepare {
+        path: PathBytes,
+        size: u64,
+        inplace: bool,
+        from_final: bool,
+        mode: u32,
+    },
     /// In-kernel copy of a same-machine file (copy_file_range: reflink / NFS
     /// server-side copy when possible). Err("EXDEV") tells the caller to fall
     /// back to the normal read/write path.
-    CopyLocal { src: PathBytes, dst: PathBytes, inplace: bool, size: u64, mode: u32 },
-    HashBlocks { path: PathBytes, which: Which, block: u64, len: u64 },
-    ReadRange { path: PathBytes, off: u64, len: u32 },
+    CopyLocal {
+        src: PathBytes,
+        dst: PathBytes,
+        inplace: bool,
+        size: u64,
+        mode: u32,
+    },
+    HashBlocks {
+        path: PathBytes,
+        which: Which,
+        block: u64,
+        len: u64,
+    },
+    ReadRange {
+        path: PathBytes,
+        off: u64,
+        len: u32,
+    },
     WriteRange {
         path: PathBytes,
         inplace: bool,
@@ -120,10 +175,16 @@ pub enum Request {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
-    Finalize { path: PathBytes, inplace: bool, meta: Meta, flags: u8, fsync: bool },
-    /// Whole small file in one atomic step: write a partial, verify, set
-    /// metadata, and rename over the target. Nothing appears under the final
-    /// name unless the whole transaction succeeds.
+    Finalize {
+        path: PathBytes,
+        inplace: bool,
+        meta: Meta,
+        flags: u8,
+        fsync: bool,
+    },
+    /// Whole small file in one request: verify, then write it straight to its
+    /// final path (no preallocation, no rename). An interrupted write leaves a
+    /// short file the next run re-transfers; see put_small for the rationale.
     PutSmall {
         path: PathBytes,
         #[serde(with = "serde_bytes")]
@@ -133,22 +194,32 @@ pub enum Request {
         flags: u8,
         fsync: bool,
     },
-    FileHash { path: PathBytes },
+    FileHash {
+        path: PathBytes,
+    },
     Shutdown,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Response {
-    HelloOk { version: u32 },
+    HelloOk {
+        version: u32,
+    },
     /// Each advertised data address with its interface link speed in Mbps
     /// (0 = unknown). The address the client's ssh session arrived on is first.
-    TcpListening { port: u16, addrs: Vec<(String, u32)> },
+    TcpListening {
+        port: u16,
+        addrs: Vec<(String, u32)>,
+    },
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
     ScanDone,
     Stats(Vec<Option<Entry>>),
     Applied(Vec<Option<String>>),
-    Probed { partial_size: Option<u64>, final_entry: Option<Entry> },
+    Probed {
+        partial_size: Option<u64>,
+        final_entry: Option<Entry>,
+    },
     Hashes(Vec<u64>),
     Block {
         off: u64,
@@ -156,7 +227,10 @@ pub enum Response {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
-    FileHash { size: u64, hash: u128 },
+    FileHash {
+        size: u64,
+        hash: u128,
+    },
     Ok,
     Err(String),
 }
@@ -170,6 +244,7 @@ impl SizeHint for Request {
     fn size_hint(&self) -> usize {
         match self {
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
+            Request::PutSmall { data, path, .. } => data.len() + path.len() + 96,
             Request::StatMany(v) => v.iter().map(|p| p.len() + 8).sum::<usize>() + 16,
             Request::Apply(v) => v.len() * 128 + 16,
             _ => 256,
@@ -196,7 +271,10 @@ pub struct FrameWriter<W: Write> {
 
 impl<W: Write> FrameWriter<W> {
     pub fn new(w: W, compress: bool) -> Self {
-        FrameWriter { w: BufWriter::with_capacity(1 << 20, w), compress }
+        FrameWriter {
+            w: BufWriter::with_capacity(1 << 20, w),
+            compress,
+        }
     }
 
     pub fn write_msg<T: Serialize + SizeHint>(&mut self, msg: &T) -> io::Result<()> {
@@ -226,7 +304,9 @@ pub struct FrameReader<R: Read> {
 
 impl<R: Read> FrameReader<R> {
     pub fn new(r: R) -> Self {
-        FrameReader { r: BufReader::with_capacity(1 << 20, r) }
+        FrameReader {
+            r: BufReader::with_capacity(1 << 20, r),
+        }
     }
 
     pub fn read_msg<T: for<'de> Deserialize<'de>>(&mut self) -> io::Result<T> {
@@ -234,7 +314,10 @@ impl<R: Read> FrameReader<R> {
         self.r.read_exact(&mut hdr)?;
         let len = u32::from_le_bytes(hdr) as usize;
         if len == 0 || len > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad frame length {len}")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad frame length {len}"),
+            ));
         }
         let mut flag = [0u8; 1];
         self.r.read_exact(&mut flag)?;
@@ -245,9 +328,14 @@ impl<R: Read> FrameReader<R> {
                 use std::io::Read as _;
                 let mut dec = zstd::stream::read::Decoder::new(&body[..])?;
                 let mut out = Vec::new();
-                dec.by_ref().take(MAX_FRAME as u64 + 1).read_to_end(&mut out)?;
+                dec.by_ref()
+                    .take(MAX_FRAME as u64 + 1)
+                    .read_to_end(&mut out)?;
                 if out.len() > MAX_FRAME {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "decompressed frame exceeds limit"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decompressed frame exceeds limit",
+                    ));
                 }
                 out
             }

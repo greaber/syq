@@ -4,8 +4,8 @@ mod crypto;
 mod direct;
 mod fsops;
 mod progress;
-mod rm;
 mod proto;
+mod rm;
 mod scan;
 mod sched;
 mod server;
@@ -33,7 +33,10 @@ fn tune_allocator() {}
 /// too small for -j32, so use whatever the hard limit allows.
 fn raise_nofile() {
     unsafe {
-        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < rl.rlim_max {
             rl.rlim_cur = rl.rlim_max.min(1 << 20);
             libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
