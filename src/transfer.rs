@@ -1774,7 +1774,10 @@ impl Worker {
             && job.entry.size > 0
         {
             match self.try_copy_local(idx, &job) {
-                Ok(true) => return Ok(()),
+                Ok(true) => {
+                    self.sched.ranges_ready(idx, vec![]);
+                    return Ok(());
+                }
                 Ok(false) => {} // not offloadable — fall through to streaming
                 Err(e) => {
                     self.sched.ranges_ready(idx, vec![]);
@@ -1962,6 +1965,7 @@ impl Worker {
 
     /// Attempt an in-kernel same-host copy. Ok(true) = done; Ok(false) =
     /// kernel can't offload, caller should stream; Err = real failure.
+    /// The caller owns scheduler probing bookkeeping for every terminal result.
     fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
         // If a partial exists, prefer the streaming path so its hash-based
         // resume reuses the bytes already on disk; copy_file_range would
@@ -2003,7 +2007,6 @@ impl Worker {
                 );
                 self.progress.add_bytes(job.entry.size);
                 job.done.store(job.entry.size, Relaxed);
-                self.sched.ranges_ready(idx, vec![]);
                 self.finish_file(idx)?;
                 Ok(true)
             }
