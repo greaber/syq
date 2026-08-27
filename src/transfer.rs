@@ -297,8 +297,10 @@ pub fn run(args: Args) -> Result<i32> {
                 if let Err(e) = spec.setup_tcp(&mut **ctl, args.tcp_plain, ports) {
                     if !args.quiet || debug() {
                         eprintln!(
-                            "pcp: {}: cannot set up TCP data connections ({e:#}); using ssh (slower per stream; --tcp-ports / firewall?)",
-                            spec.label()
+                            "pcp: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}); a Tailscale address or an open port is faster",
+                            spec.label(),
+                            ports.0,
+                            ports.1
                         );
                     }
                     continue;
