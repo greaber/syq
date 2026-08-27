@@ -8,10 +8,11 @@ reached — splitting large files into ranges
 that idle workers steal from each other, so a single huge file at the end of
 a transfer still uses every connection. Throughput is typically several times
 that of a single ssh stream. It also has a progress meter that separates
-transferred bytes from unchanged ones, resumes interrupted transfers from
-partial files without retransmitting their finished blocks, offers an explicit
-checkpoint for exceptionally large or failure-prone jobs, and can verify that
-a copy is complete.
+transferred bytes from unchanged ones and automatically resumes interrupted
+transfers from partial files without retransmitting their finished blocks. An
+optional checkpoint can avoid repeated destination lookups for exceptionally
+large or failure-prone jobs; it is not required for normal resumption. PCP can
+also verify that a copy is complete.
 
 ## Install
 
@@ -70,7 +71,7 @@ pcp -a --dry-run -v src host:dst              # show what would be copied
 pcp -ac src host:dst                          # skip the quick check; compare blocks, repair differences
 pcp -a --verify-only src host:dst             # compare only; transfer nothing
 pcp -a src newhost:dst                        # the matching remote helper is automatic
-pcp -a --checkpoint ./copy.state src host:dst # retain completed-file state if this run fails
+pcp -a --checkpoint ./copy.state src host:dst # keep completed-file state for later runs
 ```
 
 ### Options
@@ -96,8 +97,8 @@ pcp -a --checkpoint ./copy.state src host:dst # retain completed-file state if t
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
 | `--verify-only` | Hash every file on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
-| `--fsync` | fsync each file and its parent dir around the rename (survives a crash; slower) |
-| `--checkpoint FILE` | Save completed-file state for an accelerated retry; retained on failure, removed on success |
+| `--fsync` | fsync each file, rename, and explicit checkpoint state (crash-durable; slower) |
+| `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
 | `--pcp-path PATH` | Use this exact remote `pcp` instead of the managed helper |
 | `--no-bootstrap` | Require `pcp` on the remote `PATH`; do not install a managed helper |
@@ -204,8 +205,8 @@ on NFS and NVMe.
 ### Resume and checkpoints
 
 With the default staged write path, Ctrl-C is safe: kill it and rerun the same
-command. `--inplace` deliberately gives up that guarantee. Resume works at two
-levels.
+command. `--inplace` deliberately gives up that guarantee. No checkpoint is
+needed for this normal resumption. Resume works at two levels.
 
 **Within a file.** There is no per-file state file — the partial *is* the state:
 
@@ -223,12 +224,12 @@ databases, logs). It does **not** catch a byte inserted near the start of a
 file, which rsync's rolling checksum would — for pcp's intended use (fresh
 uploads and downloads) that trade was made deliberately.
 
-**Across the whole job.** Ordinary copies keep no transfer history. Every
-invocation scans the current source and destination, so deleting or changing a
-destination file affects the next run just as it does with rsync.
+**Across the whole job.** Ordinary copies keep no transfer history, but their
+source and destination scans still skip files already complete. Deleting or
+changing a destination file affects the next run just as it does with rsync.
 
-For a tree so large or failure-prone that repeatedly reaching the unfinished
-frontier is itself expensive, opt in explicitly:
+Only when repeated destination metadata lookups are themselves too expensive
+should you opt in to a checkpoint:
 
 ```sh
 pcp -a --checkpoint ./copy.state huge-tree/ host:huge-tree/
@@ -244,13 +245,15 @@ Everything else follows the normal quick check, partial hashing, and transfer
 path. Unfinished individual files are never checkpoint-complete; their actual
 `.pcp-partial` contents remain the resume state.
 
-The checkpoint is flushed about once a second, retained after interruption or
-failure, and removed after a clean copy. Losing its last buffered records only
-causes repeated work. If the destination root disappeared, PCP resets the
-checkpoint. `-n` may read an existing checkpoint to preview a retry but never
-creates or changes one. `-c` and `--verify-only` conflict with `--checkpoint`
-because they explicitly require destination inspection. One checkpoint file
-may be used by only one running copy at a time.
+The checkpoint is flushed about once a second and persists after both failed
+and successful runs until you remove or stop passing it. Losing its last
+buffered records only causes repeated work; `--fsync` makes each flush and the
+initial header durable. If an existing checkpoint has completed records but an
+expected destination root is missing, PCP fails and asks you to remove the
+checkpoint to restart. The checkpoint must be outside local source and
+destination trees. `-n` reads and validates existing state but never creates or
+changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`.
+One checkpoint file may be used by only one running copy at a time.
 
 A checkpoint is an explicit trust decision: PCP does not inspect a destination
 file covered by a matching record. If another process deleted, replaced, or
@@ -258,9 +261,12 @@ modified that destination after it was recorded, a checkpointed retry will not
 notice. Do not use a checkpoint when the destination may be independently
 modified; omit the option and PCP remains history-independent.
 
-Like rsync, ordinary PCP runs do not coordinate with each other. Concurrent
-copies into one tree produce the union of their files, and one whole-file
-rename wins for any path both write.
+Concurrent ordinary copies can populate different paths in one tree. For a
+path both are actively staging, PCP's processes coordinate through an advisory
+lock on the sidecar: one copy reports that file as an error instead of letting
+both writers mix bytes in one inode. If the staging periods do not overlap,
+each publication is still an atomic whole-file rename and the later one wins.
+`--inplace` deliberately gives up both staging and this isolation.
 
 ### Verification and consistency
 

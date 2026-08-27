@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -167,6 +168,16 @@ fn is_root() -> bool {
 pub struct FsOps {
     fds: HashMap<PathBuf, File>,
     fd_order: Vec<PathBuf>,
+    /// Exclusive advisory locks on deterministic partials claimed by this
+    /// connection. The lock stays held until the file is finalized or the
+    /// connection closes, so another pcp process cannot write the same inode.
+    partial_leases: HashMap<PathBuf, PartialLease>,
+}
+
+struct PartialLease {
+    file: File,
+    /// Size before this transfer claimed the partial; None means we created it.
+    basis_size: Option<u64>,
 }
 
 impl Default for FsOps {
@@ -180,6 +191,7 @@ impl FsOps {
         FsOps {
             fds: HashMap::new(),
             fd_order: Vec::new(),
+            partial_leases: HashMap::new(),
         }
     }
 
@@ -247,17 +259,10 @@ fn apply_one(op: &Op) -> Result<()> {
         match op {
             Op::Mkdir { path, mode } => {
                 let p = resolve(path);
-                // A symlink to a directory counts as the directory (rsync
-                // semantics for a destination given as a symlink); anything
-                // else in the way is replaced.
-                let md = fs::symlink_metadata(&p).map(|md| {
-                    if md.file_type().is_symlink() {
-                        fs::metadata(&p).unwrap_or(md)
-                    } else {
-                        md
-                    }
-                });
-                match md {
+                // The orchestrator resolves an explicitly supplied root
+                // symlink. Symlinks found inside the destination tree are
+                // payload conflicts and must be replaced, never traversed.
+                match fs::symlink_metadata(&p) {
                     Ok(md) if md.is_dir() => {
                         // Make sure we can write into it while transferring.
                         if md.mode() & 0o700 != 0o700 {
@@ -275,7 +280,23 @@ fn apply_one(op: &Op) -> Result<()> {
                                 fs::create_dir_all(parent)?;
                             }
                         }
-                        mkdir(&p, *mode)
+                        match mkdir(&p, *mode) {
+                            Ok(()) => Ok(()),
+                            Err(error) => match fs::symlink_metadata(&p) {
+                                // Another pcp may have created this same
+                                // destination directory after our first stat.
+                                Ok(md) if md.is_dir() => {
+                                    if md.mode() & 0o700 != 0o700 {
+                                        fs::set_permissions(
+                                            &p,
+                                            fs::Permissions::from_mode(md.mode() | 0o700),
+                                        )?;
+                                    }
+                                    Ok(())
+                                }
+                                _ => Err(error),
+                            },
+                        }
                     }
                 }
                 .with_context(|| format!("mkdir {}", p.display()))
@@ -358,11 +379,133 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 impl FsOps {
     pub fn probe_partial(&mut self, path: &[u8]) -> Result<Response> {
         let p = resolve(path);
-        let partial_size = fs::symlink_metadata(partial_path(&p))
-            .ok()
-            .filter(|m| m.is_file())
-            .map(|m| m.len());
+        let pp = partial_path(&p);
+        // Preserve the cheap, read-only missing-sidecar probe. We only need to
+        // claim an inode that already exists; Prepare/CopyLocal will atomically
+        // create and claim one if this transfer later decides to write.
+        let partial_size = match fs::symlink_metadata(&pp) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => {
+                self.acquire_partial(&pp)?
+            }
+            Ok(_) => None,
+            Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
+        };
         Ok(Response::PartialSize(partial_size))
+    }
+
+    /// Claim a deterministic partial for this transfer. flock is advisory,
+    /// but all pcp writers participate; unlike a process-local mutex it also
+    /// coordinates separate local invocations and remote worker processes.
+    fn acquire_partial(&mut self, pp: &Path) -> Result<Option<u64>> {
+        if let Some(lease) = self.partial_leases.get(pp) {
+            return Ok(lease.basis_size);
+        }
+        self.uncache(pp);
+        loop {
+            // The optional directory guard serializes replacement of an
+            // unsafe sidecar (symlink, hardlink, or special file). Missing and
+            // ordinary private-file claims remain per-path and parallel.
+            let (file, basis_size, claim_guard) = match fs::symlink_metadata(pp) {
+                Ok(md) if md.is_file() && md.nlink() == 1 => {
+                    match OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(pp)
+                    {
+                        Ok(file) => {
+                            let fd_meta = file.metadata()?;
+                            let path_meta = fs::symlink_metadata(pp)?;
+                            if !fd_meta.file_type().is_file()
+                                || fd_meta.nlink() != 1
+                                || fd_meta.dev() != path_meta.dev()
+                                || fd_meta.ino() != path_meta.ino()
+                            {
+                                continue;
+                            }
+                            (file, Some(fd_meta.len()), None)
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(error).with_context(|| format!("open {}", pp.display()))
+                        }
+                    }
+                }
+                Ok(_) => {
+                    let parent = pp
+                        .parent()
+                        .filter(|path| !path.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    let guard =
+                        File::open(parent).with_context(|| format!("open {}", parent.display()))?;
+                    if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+                    {
+                        bail!(
+                            "destination partial {} is being replaced by another pcp process: {}",
+                            pp.display(),
+                            io::Error::last_os_error()
+                        );
+                    }
+                    match fs::symlink_metadata(pp) {
+                        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => continue,
+                        Ok(_) => fs::remove_file(pp)
+                            .with_context(|| format!("replace {}", pp.display()))?,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| format!("stat {}", pp.display()))
+                        }
+                    }
+                    let file = match OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(pp)
+                    {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                        Err(error) => {
+                            return Err(error).with_context(|| format!("create {}", pp.display()))
+                        }
+                    };
+                    (file, None, Some(guard))
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    match OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(pp)
+                    {
+                        Ok(file) => (file, None, None),
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("create {}", pp.display()))
+                        }
+                    }
+                }
+                Err(e) => return Err(e).with_context(|| format!("stat {}", pp.display())),
+            };
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = io::Error::last_os_error();
+                bail!(
+                    "destination partial {} is in use by another pcp process: {error}",
+                    pp.display()
+                );
+            }
+            self.partial_leases
+                .insert(pp.to_path_buf(), PartialLease { file, basis_size });
+            drop(claim_guard);
+            #[cfg(debug_assertions)]
+            if let Some(ms) = std::env::var_os("PCP_TEST_HOLD_PARTIAL_MS") {
+                if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
+            return Ok(basis_size);
+        }
     }
 
     pub fn prepare(
@@ -403,39 +546,26 @@ impl FsOps {
             return Ok(());
         }
         let pp = partial_path(&p);
-        self.uncache(&pp);
-        if let Ok(md) = fs::symlink_metadata(&pp) {
-            // Resume only a private regular partial. A partial with more than one
-            // link (hardlinked to some other file by a backup/dedup tool) must be
-            // discarded, or writing to it would corrupt that other file.
-            if md.is_file() && md.nlink() == 1 {
-                let f = OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&pp)?;
-                if f.metadata()?.nlink() == 1 {
-                    f.set_len(size)?;
-                    return Ok(());
-                }
-            }
-            fs::remove_file(&pp).ok();
-        }
-        let f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode & 0o7777)
-            .open(&pp)
-            .with_context(|| format!("create {}", pp.display()))?;
+        self.acquire_partial(&pp)?;
+        let lease = self
+            .partial_leases
+            .get(&pp)
+            .with_context(|| format!("partial {} was not claimed", pp.display()))?;
+        let f = &lease.file;
         if from_final {
+            f.set_len(0)?;
             // Seed the partial with the existing file for block-diff, but never
             // keep more than `size` bytes (a longer destination must shrink).
             let mut src =
                 File::open(&p).with_context(|| format!("open {} to seed repair", p.display()))?;
-            let mut dst = &f;
+            let mut dst = f;
             io::copy(&mut (&mut src).take(size), &mut dst)
                 .with_context(|| format!("seed partial from {}", p.display()))?;
+        } else if lease.basis_size.is_some() {
+            f.set_len(size)?;
+            return Ok(());
         }
-        preallocate(&f, size)?;
+        preallocate(f, size)?;
         f.set_len(size)?; // exact length: fallocate never shrinks an already-longer file
         Ok(())
     }
@@ -453,7 +583,6 @@ impl FsOps {
         size: u64,
         mode: u32,
     ) -> Result<()> {
-        use std::os::unix::io::AsRawFd;
         let sp = resolve(src);
         let s = File::open(&sp).with_context(|| format!("open {}", sp.display()))?;
         let dp = resolve(dst);
@@ -476,7 +605,16 @@ impl FsOps {
                 fs::create_dir_all(parent).ok();
             }
         }
-        let d = open_regular_write(&target, mode)?;
+        if !inplace {
+            self.acquire_partial(&target)?;
+        }
+        let d = if inplace {
+            open_regular_write(&target, mode)?
+        } else {
+            let d = self.partial_leases[&target].file.try_clone()?;
+            d.set_len(0)?;
+            d
+        };
         let mut off: i64 = 0;
         let mut remaining = size;
         while remaining > 0 {
@@ -500,8 +638,14 @@ impl FsOps {
                         libc::EXDEV | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL
                     )
                 {
-                    drop(d);
-                    let _ = fs::remove_file(&target);
+                    if inplace {
+                        drop(d);
+                        let _ = fs::remove_file(&target);
+                    } else {
+                        // Keep the claimed inode and its lock for the normal
+                        // streaming fallback.
+                        d.set_len(0)?;
+                    }
                     bail!("EXDEV");
                 }
                 if raw == libc::EINTR {
@@ -556,38 +700,10 @@ impl FsOps {
             }
         }
 
-        // Reuse only a private regular sidecar. Open without truncating, verify
-        // the fd, and only then clear it so a hardlink cannot be damaged.
-        let mut partial = None;
-        if let Ok(md) = fs::symlink_metadata(&pp) {
-            if md.is_file() && md.nlink() == 1 {
-                if let Ok(file) = OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&pp)
-                {
-                    if file
-                        .metadata()
-                        .is_ok_and(|m| m.file_type().is_file() && m.nlink() == 1)
-                    {
-                        file.set_len(0)?;
-                        partial = Some(file);
-                    }
-                }
-            }
-            if partial.is_none() {
-                fs::remove_file(&pp).with_context(|| format!("replace {}", pp.display()))?;
-            }
-        }
-        let f = match partial {
-            Some(file) => file,
-            None => OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(meta.mode & 0o7777)
-                .open(&pp)
-                .with_context(|| format!("create {}", pp.display()))?,
-        };
+        self.acquire_partial(&pp)?;
+        let lease = self.partial_leases.remove(&pp).unwrap();
+        let f = lease.file;
+        f.set_len(0)?;
         f.write_all_at(data, 0)
             .with_context(|| format!("write {}", pp.display()))?;
         set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", pp.display()))?;
@@ -595,7 +711,6 @@ impl FsOps {
             f.sync_all()
                 .with_context(|| format!("fsync {}", pp.display()))?;
         }
-        drop(f);
         #[cfg(debug_assertions)]
         if let Some(pat) = std::env::var_os("PCP_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
             // Test hook (debug builds only): model interruption after the
@@ -606,15 +721,9 @@ impl FsOps {
         }
         fs::rename(&pp, &p)
             .with_context(|| format!("rename {} to {}", pp.display(), p.display()))?;
+        drop(f);
         if fsync {
-            let dir = p
-                .parent()
-                .filter(|d| !d.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let df =
-                File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
-            df.sync_all()
-                .with_context(|| format!("fsync directory {}", dir.display()))?;
+            fsync_parent(&p)?;
         }
         Ok(())
     }
@@ -698,34 +807,33 @@ impl FsOps {
     ) -> Result<()> {
         let p = resolve(path);
         let src = if inplace { p.clone() } else { partial_path(&p) };
-        let f = match self.uncache(&src) {
-            Some(f) => f,
-            None => OpenOptions::new()
+        let lease = self.partial_leases.remove(&src).map(|lease| lease.file);
+        let cached = self.uncache(&src);
+        // Prefer the lease descriptor so its lock remains held through rename.
+        let f = lease.or(cached).map(Ok).unwrap_or_else(|| {
+            OpenOptions::new()
                 .write(true)
                 .open(&src)
-                .with_context(|| format!("open {}", src.display()))?,
-        };
+                .with_context(|| format!("open {}", src.display()))
+        })?;
         set_meta_file(&f, meta, flags)
             .with_context(|| format!("set metadata {}", src.display()))?;
         if fsync {
             f.sync_all()
                 .with_context(|| format!("fsync {}", src.display()))?;
         }
-        drop(f);
         if !inplace {
-            fs::rename(&src, &p)
-                .with_context(|| format!("rename {} -> {}", src.display(), p.display()))?;
+            if fs::symlink_metadata(&p).is_ok_and(|metadata| metadata.is_dir()) {
+                bail!("destination {} is a directory", p.display());
+            }
+            fs::rename(&src, &p).with_context(|| {
+                format!("publish {} as destination {}", src.display(), p.display())
+            })?;
         }
+        drop(f);
         if fsync {
             // Make the rename (or in-place write) itself durable.
-            let dir = p
-                .parent()
-                .filter(|d| !d.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let df =
-                File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
-            df.sync_all()
-                .with_context(|| format!("fsync directory {}", dir.display()))?;
+            fsync_parent(&p)?;
         }
         Ok(())
     }
@@ -879,6 +987,16 @@ fn preallocate(f: &File, size: u64) -> Result<()> {
     // Portable fallback (also macOS): a sparse file of the right size.
     f.set_len(size)?;
     Ok(())
+}
+
+fn fsync_parent(path: &Path) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file = File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
+    file.sync_all()
+        .with_context(|| format!("fsync directory {}", dir.display()))
 }
 
 fn timespec(sec: i64, nsec: u32) -> libc::timespec {

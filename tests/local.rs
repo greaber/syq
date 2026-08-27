@@ -992,7 +992,7 @@ fn file_over_nonempty_destination_directory_reports_error_without_panicking() {
     write(&t.path("src/foo"), b"source");
     write(&t.path("dest/foo/keep"), b"keep");
 
-    let out = pcp(&["-j", "1", "--no-resume", &t.s("src/foo"), &t.s("dest")]);
+    let out = pcp(&["-j", "1", &t.s("src/foo"), &t.s("dest")]);
 
     assert_eq!(out.status.code(), Some(23));
     let err = String::from_utf8_lossy(&out.stderr);
@@ -1416,6 +1416,31 @@ fn ignore_conflicts_with_rm() {
     assert!(t.path("tree/hello.txt").is_file());
 }
 
+#[test]
+fn checkpoint_conflicts_are_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    for conflicting in ["-c", "--verify-only"] {
+        let out = pcp(&[
+            "-a",
+            conflicting,
+            "--checkpoint",
+            &t.s("state"),
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
+        assert!(!out.status.success(), "{conflicting}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("cannot be used with"), "{conflicting}: {err}");
+    }
+    let out = pcp(&["--rm", "--checkpoint", &t.s("state"), &t.s("src")]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot be used with"), "{err}");
+    assert!(t.path("src/f").is_file());
+    assert!(!t.path("state").exists());
+}
+
 // Ordinary copies keep no historical completion state: the current destination
 // determines what a later invocation repairs.
 #[test]
@@ -1493,9 +1518,92 @@ fn checkpoint_is_explicit_retained_and_source_sensitive() {
         0o600
     );
     assert!(
-        !t.path("copy.checkpoint").exists(),
-        "a clean retry removes its checkpoint"
+        t.path("copy.checkpoint").is_file(),
+        "an explicit checkpoint persists after a clean retry"
     );
+}
+
+// A completed checkpoint deliberately trusts destination history, but an
+// ordinary source fingerprint change invalidates the corresponding record.
+#[test]
+fn completed_checkpoint_trusts_destination_and_tracks_source() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"original");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let checkpoint = t.s("copy.checkpoint");
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(t.path("copy.checkpoint").is_file());
+
+    write(&t.path("dst/f"), b"damaged independently");
+    let stdout = run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(transferred(&stdout), 0);
+    assert_eq!(
+        read(&t.path("dst/f")),
+        b"damaged independently",
+        "a matching record intentionally bypasses destination inspection"
+    );
+
+    write(&t.path("src/f"), b"updated source");
+    set_mtime(&t.path("src/f"), 1_600_000_001);
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(read(&t.path("dst/f")), b"updated source");
+    assert!(t.path("copy.checkpoint").is_file());
+}
+
+#[test]
+fn checkpoint_inside_local_source_is_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    let out = pcp(&[
+        "-a",
+        "--checkpoint",
+        &t.s("src/state"),
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("must not be inside local source"), "{err}");
+    assert!(!t.path("src/state").exists());
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn checkpoint_inside_local_destination_is_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src/state"), b"payload");
+    let out = pcp(&[
+        "-a",
+        "--checkpoint",
+        &t.s("dst/state"),
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("must not be inside local destination"),
+        "{err}"
+    );
+    assert!(!t.path("dst").exists());
 }
 
 // A checkpoint-complete file is still a claimed destination: a second source that
@@ -1657,7 +1765,7 @@ fn checkpoint_records_quick_check_only_after_meta_repair() {
         0o600,
         "the failed repair must not have been checkpointed as complete"
     );
-    assert!(!t.path("copy.checkpoint").exists());
+    assert!(t.path("copy.checkpoint").is_file());
 }
 
 // The read-only modes create nothing, not even the destination directory.
@@ -1689,6 +1797,32 @@ fn readonly_modes_create_nothing() {
         !t.path("dry-run.checkpoint").exists(),
         "--dry-run must not create a checkpoint"
     );
+}
+
+#[test]
+fn dry_run_validates_checkpoint_identity_with_missing_destination() {
+    let t = Tmp::new();
+    write(&t.path("first/f"), b"first");
+    write(&t.path("second/f"), b"second");
+    let checkpoint = t.s("copy.checkpoint");
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("first/"),
+        &t.s("first-dst/"),
+    ]);
+    let out = pcp(&[
+        "-an",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("second/"),
+        &t.s("missing/"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("describes a different copy"), "{err}");
+    assert!(!t.path("missing").exists());
 }
 
 // Different spellings of the same local path are one job.
@@ -1728,11 +1862,11 @@ fn checkpoint_identity_is_spelling_independent() {
     );
 }
 
-// A destination removed between attempts makes an explicit checkpoint describe
-// nothing, so the retry resets it and starts over.
+// Existing completion records are never reset automatically. A missing
+// destination is suspicious and requires the user to remove the checkpoint.
 #[cfg(debug_assertions)]
 #[test]
-fn removed_destination_restarts() {
+fn existing_checkpoint_with_missing_destination_fails() {
     let t = Tmp::new();
     write(&t.path("src/a"), b"aaaa");
     write(&t.path("src/fail/secret"), b"secret");
@@ -1751,22 +1885,52 @@ fn removed_destination_restarts() {
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
     assert!(t.path("copy.checkpoint").is_file());
-    run_ok(&["--rm", &t.s("dest")]);
+    fs::remove_dir_all(t.path("dest")).unwrap();
     assert!(!t.path("dest").exists());
-    run_ok(&[
+    let out = pcp(&[
         "-a",
         "--checkpoint",
         &checkpoint,
         &t.s("src/"),
         &t.s("dest/"),
     ]);
-    assert_eq!(
-        read(&t.path("dest/a")),
-        b"aaaa",
-        "the reset checkpoint must not skip it"
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("destination") && err.contains("missing"),
+        "{err}"
     );
-    assert_eq!(read(&t.path("dest/fail/secret")), b"secret");
-    assert!(!t.path("copy.checkpoint").exists());
+    assert!(!t.path("dest").exists());
+    assert!(t.path("copy.checkpoint").is_file());
+}
+
+#[test]
+fn existing_checkpoint_with_missing_mapped_source_target_fails() {
+    let t = Tmp::new();
+    write(&t.path("bigdir/f"), b"data");
+    let checkpoint = t.s("copy.checkpoint");
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("bigdir"),
+        &t.s("backups"),
+    ]);
+    fs::remove_dir_all(t.path("backups/bigdir")).unwrap();
+    let out = pcp(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("bigdir"),
+        &t.s("backups"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("destination target") && err.contains("missing"),
+        "{err}"
+    );
+    assert!(!t.path("backups/bigdir").exists());
 }
 
 #[test]
@@ -1814,6 +1978,80 @@ fn concurrent_copies_union() {
     assert_eq!(read(&t.path("dest/a7")), b"a");
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn concurrent_writers_never_share_a_partial_inode() {
+    let t = Tmp::new();
+    let first_contents = vec![b'a'; 8 * 1024 * 1024];
+    let second_contents = vec![b'b'; 8 * 1024 * 1024];
+    write(&t.path("first"), &first_contents);
+    write(&t.path("second"), &second_contents);
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args(["-a", "--no-progress", &t.s("first"), &t.s("out")])
+        .env("PCP_TEST_HOLD_PARTIAL_MS", "1000")
+        .spawn()
+        .unwrap();
+    let partial = t.path(".out.pcp-partial");
+    for _ in 0..200 {
+        if partial.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(partial.exists(), "first copy never created its sidecar");
+
+    let second = pcp(&["-a", &t.s("second"), &t.s("out")]);
+    assert_eq!(second.status.code(), Some(23));
+    let err = String::from_utf8_lossy(&second.stderr);
+    assert!(err.contains("in use by another pcp process"), "{err}");
+    assert!(first.wait().unwrap().success());
+    assert_eq!(read(&t.path("out")), first_contents);
+    assert!(!partial.exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn changed_source_retry_uses_published_file_as_block_basis() {
+    let t = Tmp::new();
+    let original = vec![b'a'; 8 * 1024 * 1024];
+    let mut changed = original.clone();
+    changed[0] = b'b';
+    write(&t.path("src"), &original);
+    set_mtime(&t.path("src"), 1_600_000_000);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("PCP_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if t.path("dst").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(t.path("dst").exists(), "first attempt never finalized");
+    write(&t.path("src"), &changed);
+    set_mtime(&t.path("src"), 1_600_000_001);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(&t.path("dst")), changed);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("bytes transferred: 12,582,912"),
+        "retry should send one changed 4 MiB block, not the full file: {stdout}"
+    );
+}
+
 // A destination given as a symlink to a directory is that directory, whether
 // or not it's spelled with a trailing slash: the link survives, the payload
 // lands in its target.
@@ -1844,6 +2082,44 @@ fn symlink_destination_is_followed() {
         .file_type()
         .is_symlink());
     assert_eq!(read(&t.path("real/src/f")), b"hi");
+}
+
+#[test]
+fn in_tree_destination_symlink_is_replaced_not_followed() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f"), b"payload");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::create_dir_all(t.path("elsewhere")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", t.path("dst/sub")).unwrap();
+
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+
+    assert!(fs::symlink_metadata(t.path("dst/sub")).unwrap().is_dir());
+    assert_eq!(read(&t.path("dst/sub/f")), b"payload");
+    assert!(!t.path("elsewhere/f").exists());
+}
+
+#[test]
+fn destination_root_symlink_preserves_target_metadata_for_both_spellings() {
+    for spelling in ["link", "link/"] {
+        let t = Tmp::new();
+        write(&t.path("src/f"), b"payload");
+        fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o555)).unwrap();
+        set_mtime(&t.path("src"), 1_600_000_000);
+        fs::create_dir_all(t.path("real")).unwrap();
+        std::os::unix::fs::symlink("real", t.path("link")).unwrap();
+
+        run_ok(&["-a", &t.s("src/"), &t.s(spelling)]);
+
+        let metadata = fs::metadata(t.path("real")).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o555, "{spelling}");
+        assert_eq!(metadata.mtime(), 1_600_000_000, "{spelling}");
+        assert_eq!(read(&t.path("real/f")), b"payload", "{spelling}");
+        assert!(fs::symlink_metadata(t.path("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 }
 
 // The copy-into-itself guard resolves paths the way the kernel does: `..`

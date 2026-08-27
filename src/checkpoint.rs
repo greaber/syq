@@ -2,9 +2,8 @@
 //!
 //! No checkpoint is created unless the user supplies `--checkpoint FILE`.
 //! The file is append-only JSONL and records regular files that were confirmed
-//! complete. It is retained after interruption or failure and removed after a
-//! clean copy. Destination partial files remain the authoritative state for an
-//! unfinished individual file.
+//! complete. It persists until the user removes it. Destination partial files
+//! remain the authoritative state for an unfinished individual file.
 
 use crate::proto::{flags, Entry, PathBytes};
 use anyhow::{bail, Context, Result};
@@ -14,7 +13,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -232,12 +231,7 @@ impl Checkpoint {
         Ok(out)
     }
 
-    pub fn open(
-        path: &Path,
-        job_identity: &str,
-        fsync: bool,
-        reset: bool,
-    ) -> Result<(Self, Loaded)> {
+    pub fn open(path: &Path, job_identity: &str, fsync: bool) -> Result<(Self, Loaded)> {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -254,7 +248,7 @@ impl Checkpoint {
             );
         }
         // Validate and load only after locking the same file we will append to.
-        let mut loaded = Self::load_file(&mut file, path)?;
+        let loaded = Self::load_file(&mut file, path)?;
         if let Some(existing) = &loaded.existing_identity {
             if existing != job_identity {
                 bail!(
@@ -262,11 +256,6 @@ impl Checkpoint {
                     path.display()
                 );
             }
-        }
-        if reset {
-            file.set_len(0)
-                .with_context(|| format!("reset checkpoint {}", path.display()))?;
-            loaded = Loaded::empty();
         }
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         let len = file.metadata()?.len();
@@ -366,37 +355,6 @@ impl Checkpoint {
         self.failed.lock().unwrap().take()
     }
 
-    pub fn remove(&self) -> Result<()> {
-        // The user controls this path. Refuse to unlink it if another process
-        // replaced the directory entry while this checkpoint was open.
-        let open = self.writer.lock().unwrap().file.metadata()?;
-        let current = match fs::symlink_metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                return Err(e).with_context(|| format!("stat checkpoint {}", self.path.display()))
-            }
-        };
-        if open.dev() != current.dev() || open.ino() != current.ino() {
-            bail!(
-                "checkpoint {} was replaced while the copy was running; refusing to remove it",
-                self.path.display()
-            );
-        }
-        match fs::remove_file(&self.path) {
-            Ok(()) => {
-                if self.fsync {
-                    if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                        File::open(parent)?.sync_all()?;
-                    }
-                }
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("remove checkpoint {}", self.path.display())),
-        }
-    }
-
     fn append(&self, record: &Record) -> Result<()> {
         let mut writer = self.writer.lock().unwrap();
         serde_json::to_writer(&mut writer.buf, record)?;
@@ -471,7 +429,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.jsonl");
         let _ = fs::remove_file(&path);
-        let (checkpoint, _) = Checkpoint::open(&path, "identity", false, false).unwrap();
+        let (checkpoint, _) = Checkpoint::open(&path, "identity", false).unwrap();
         checkpoint.record_complete(b"a/b", &entry(10, 20, 0o644), "transferred");
         checkpoint.close().unwrap();
         let loaded = Checkpoint::load(&path).unwrap();
@@ -483,7 +441,8 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        checkpoint.remove().unwrap();
+        drop(checkpoint);
+        fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
     }
 
@@ -496,14 +455,16 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.jsonl");
         let _ = fs::remove_file(&path);
-        Checkpoint::open(&path, "A", false, false)
+        Checkpoint::open(&path, "A", false)
             .unwrap()
             .0
             .close()
             .unwrap();
-        assert!(Checkpoint::open(&path, "B", false, false).is_err());
-        let cleanup = Checkpoint::open(&path, "A", false, false).unwrap().0;
-        cleanup.remove().unwrap();
+        assert!(Checkpoint::open(&path, "B", false).is_err());
+        let cleanup = Checkpoint::open(&path, "A", false).unwrap().0;
+        cleanup.close().unwrap();
+        drop(cleanup);
+        fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
     }
 
@@ -514,10 +475,11 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.jsonl");
         let _ = fs::remove_file(&path);
-        let (first, _) = Checkpoint::open(&path, "A", false, false).unwrap();
-        assert!(Checkpoint::open(&path, "A", false, false).is_err());
+        let (first, _) = Checkpoint::open(&path, "A", false).unwrap();
+        assert!(Checkpoint::open(&path, "A", false).is_err());
         first.close().unwrap();
-        first.remove().unwrap();
+        drop(first);
+        fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
     }
 }
