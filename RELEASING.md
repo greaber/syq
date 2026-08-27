@@ -22,26 +22,64 @@ releases setting so published assets and tags cannot be changed afterward.
    commits, not annotated tag-object signatures; the release workflow checks
    the latter explicitly through GitHub's tag verification API.
 4. Give a fine-grained token write access only to the contents of
-   `greaber/homebrew-tap`. Store it as the `HOMEBREW_TAP_TOKEN` secret in the
-   `release` environment. It does not need access to the syq repository.
+   `greaber/homebrew-tap`. It does not need access to the syq repository. This
+   token and the release signing key enter the encrypted inventory described
+   below; do not paste either value into GitHub directly.
 
-Create the Ed25519 release key offline on an encrypted machine and retain a
-protected backup:
+## Encrypted release inventory
+
+The committed `.env.release` file is the canonical release-credential
+inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64` and
+`HOMEBREW_TAP_TOKEN`, plus the corresponding public
+`SYQ_RELEASE_PUBLIC_KEY`. Its decryption authority lives only in the
+gitignored `.env.keys`. Forks receive the ciphertext but neither the
+decryption key nor official publishing authority.
+
+Install the pinned maintainer tool, then initialize the inventory on an
+encrypted developer machine. The initializer prompts without echoing for the
+fine-grained Homebrew token and generates the Ed25519 signing key locally:
 
 ```sh
-umask 077
-openssl genpkey -algorithm ED25519 -out syq-release-signing.pem
-public_key=$(openssl pkey -in syq-release-signing.pem -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')
-gh variable set SYQ_RELEASE_PUBLIC_KEY --body "$public_key"
-base64 < syq-release-signing.pem | tr -d '\n' | gh secret set SYQ_RELEASE_SIGNING_KEY_PEM_B64 --env release
+npm install --global @dotenvx/dotenvx@2.21.0
+scripts/init-release-secrets.sh
+git add .env.release
+git commit -m 'Add encrypted release credential inventory'
 ```
 
-`SYQ_RELEASE_PUBLIC_KEY` is a repository variable because every official target
-embeds it. The private-key value is an environment secret available only after
-release approval. CI derives the public key from the private key and refuses to
-publish if they differ. Do not rotate this key casually: installed clients
-trust it, so a planned rotation first needs a release that trusts both old and
-new keys.
+Back up `.env.keys` immediately in protected storage. Do not commit it, upload
+it to GitHub, or use it in CI. Losing every copy prevents future releases from
+using the signing identity embedded in installed clients.
+
+After the repository has been renamed and the protected `release` environment
+exists, preview and then synchronize the allowlisted values:
+
+```sh
+scripts/sync-github-secrets.sh
+scripts/sync-github-secrets.sh --execute
+gh secret list --repo greaber/syq --env release
+gh variable list --repo greaber/syq
+```
+
+The sync sends the individual private key and tap token to environment secrets;
+it sends the public key to the repository variable used by every official
+build. It never sends `.env.keys`, any `DOTENV_PRIVATE_KEY_*` value, or an
+undeclared entry from the encrypted file. It also derives the public key from
+the private key and refuses to update GitHub if they differ.
+
+To rotate the Homebrew token, update the canonical ciphertext and rerun the
+same dry-run/execute sequence:
+
+```sh
+read -r -s -p 'New Homebrew tap token: ' token; printf '\n'
+dotenvx set HOMEBREW_TAP_TOKEN "$token" -f .env.release --no-native
+unset token
+git add .env.release && git commit -m 'Rotate Homebrew tap token'
+scripts/sync-github-secrets.sh
+scripts/sync-github-secrets.sh --execute
+```
+
+Do not rotate the release signing key casually: installed clients trust it, so
+a planned rotation first needs a release that trusts both old and new keys.
 
 ## Rename cutover with active worktrees
 
