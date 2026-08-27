@@ -16,6 +16,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             host: src_host.clone(),
             rsh: rsh.clone(),
             pcp_path: args.pcp_path.clone(),
+            quiet_tcp: !(args.tcp || args.tcp_plain || args.no_tcp),
             tcp: Default::default(),
         };
         if spec.connect(false).is_err() {
@@ -76,6 +77,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     if args.tcp {
         remote.push("--tcp".into());
+    }
+    if args.no_tcp {
+        remote.push("--no-tcp".into());
     }
     if args.tcp_plain {
         remote.push("--tcp-plain".into());

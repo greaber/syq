@@ -116,12 +116,16 @@ pub struct Args {
     /// Install this pcp binary on the remote host (~/.local/bin/pcp) if missing
     #[arg(long)]
     pub bootstrap: bool,
-    /// Use TCP data connections (AES-256-GCM) after authenticating over ssh; falls back to ssh
+    /// TCP data connections (AES-256-GCM) after authenticating over ssh — this is the
+    /// default; the flag is accepted for explicitness. Falls back to ssh if unreachable
     #[arg(long)]
     pub tcp: bool,
-    /// Like --tcp but unencrypted (trusted networks only)
+    /// Use TCP data connections without encryption (trusted networks only)
     #[arg(long)]
     pub tcp_plain: bool,
+    /// Send all data over the ssh connection instead of separate TCP data connections
+    #[arg(long)]
+    pub no_tcp: bool,
     /// Port range the remote listens on for --tcp
     #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
     pub tcp_ports: String,
