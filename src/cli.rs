@@ -94,8 +94,10 @@ pub struct Args {
     /// Only compare source and destination contents; transfer nothing
     #[arg(long)]
     pub verify_only: bool,
-    /// Write directly into existing destination files too (by default new files are written in
-    /// place and existing ones go through a partial file and an atomic rename)
+    /// Update files in place instead of writing a partial and renaming. Use this to modify a
+    /// large existing file without copying it first (saves time and disk space when only part
+    /// of it changes) — not for speed on small files, where the default is just as fast and
+    /// stays crash-atomic
     #[arg(long, conflicts_with = "atomic")]
     pub inplace: bool,
     /// Always write through a partial file and an atomic rename, even for new files (rsync
