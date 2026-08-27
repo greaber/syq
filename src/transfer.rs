@@ -141,16 +141,22 @@ fn endpoint_identity(l: &Location) -> String {
 }
 
 /// Load and, for a real copy, open the explicitly requested checkpoint.
+struct DestinationRoot<'a> {
+    location: &'a Location,
+    path: &'a [u8],
+    existed: bool,
+    is_dir: bool,
+}
+
 fn checkpoint_setup(
     args: &Args,
     srcs: &[Location],
-    dst: &Location,
+    dst: DestinationRoot<'_>,
     src_ctl: &mut dyn Conn,
     dst_ctl: &mut dyn Conn,
-    dst_existed: bool,
     opts: &Opts,
 ) -> Result<Option<CheckpointState>> {
-    use crate::checkpoint::{Checkpoint, Loaded};
+    use crate::checkpoint::Checkpoint;
     let Some(path) = args.checkpoint.as_deref().map(std::path::Path::new) else {
         return Ok(None);
     };
@@ -159,24 +165,18 @@ fn checkpoint_setup(
         let p = canonical_path(src_ctl, &l.path, l.is_remote())?;
         src_roots.push((p.to_string_lossy().into_owned(), l.copies_contents()));
     }
-    let dst_norm = canonical_path(dst_ctl, &dst.path, dst.is_remote())?
+    let dst_norm = canonical_path(dst_ctl, &dst.location.path, dst.location.is_remote())?
         .to_string_lossy()
         .into_owned();
     let identity = crate::checkpoint::job_identity(
         &endpoint_identity(&srcs[0]),
         &src_roots,
-        &endpoint_identity(dst),
+        &endpoint_identity(dst.location),
         &dst_norm,
         &semantic_flags(opts, args),
     );
     let (checkpoint, loaded) = if args.dry_run {
-        let loaded = if dst_existed {
-            Checkpoint::load(path)?
-        } else {
-            // Nothing at the destination can be described by an old
-            // checkpoint, and a dry run must not touch the unused path.
-            Loaded::empty()
-        };
+        let loaded = Checkpoint::load(path)?;
         if let Some(ex) = &loaded.existing_identity {
             if *ex != identity {
                 bail!(
@@ -187,17 +187,51 @@ fn checkpoint_setup(
         }
         (None, loaded)
     } else {
-        // When the destination disappeared, open and validate the checkpoint
-        // before resetting its locked inode. Never unlink an arbitrary path.
-        let (checkpoint, loaded) = Checkpoint::open(path, &identity, opts.fsync, !dst_existed)?;
-        let checkpoint = std::sync::Arc::new(checkpoint);
-        checkpoint.spawn_flusher();
+        let (checkpoint, loaded) = Checkpoint::open(path, &identity, opts.fsync)?;
         (Some(checkpoint), loaded)
     };
+    if !loaded.completed.is_empty() {
+        if !dst.existed {
+            bail!(
+                "checkpoint {} records completed files, but destination {} is missing; remove the checkpoint to restart",
+                path.display(),
+                display(dst.path)
+            );
+        }
+        if dst.is_dir {
+            for source in srcs.iter().filter(|source| !source.copies_contents()) {
+                let basename = source.basename();
+                if basename.is_empty() {
+                    continue;
+                }
+                let prefix = basename.as_bytes();
+                let has_completed_path = loaded.completed.keys().any(|completed| {
+                    completed == prefix
+                        || completed
+                            .strip_prefix(prefix)
+                            .is_some_and(|suffix| suffix.starts_with(b"/"))
+                });
+                if has_completed_path {
+                    let target = join(dst.path, prefix);
+                    if stat_one(dst_ctl, &target, false)?.is_none() {
+                        bail!(
+                            "checkpoint {} records completed files, but destination target {} is missing; remove the checkpoint to restart",
+                            path.display(),
+                            display(&target)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let checkpoint = checkpoint.map(|checkpoint| {
+        let checkpoint = std::sync::Arc::new(checkpoint);
+        checkpoint.spawn_flusher();
+        checkpoint
+    });
     Ok(Some(CheckpointState {
         checkpoint,
         completed: std::sync::Arc::new(loaded.completed),
-        path: path.to_path_buf(),
     }))
 }
 
@@ -205,7 +239,14 @@ fn checkpoint_setup(
 struct CheckpointState {
     checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
     completed: std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>,
-    path: std::path::PathBuf,
+}
+
+impl Drop for CheckpointState {
+    fn drop(&mut self) {
+        if let Some(checkpoint) = &self.checkpoint {
+            let _ = checkpoint.close();
+        }
+    }
 }
 
 /// Shared with workers after checkpoint setup and before planning enqueues work.
@@ -250,6 +291,29 @@ pub fn run(args: Args) -> Result<i32> {
     for s in srcs {
         if !s.same_host(&srcs[0]) {
             bail!("all sources must be on the same host");
+        }
+    }
+    if let Some(checkpoint) = args.checkpoint.as_deref() {
+        let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
+        for source in srcs.iter().filter(|source| !source.is_remote()) {
+            let root = crate::fsops::normalize(&crate::fsops::resolve(source.path.as_bytes()));
+            if checkpoint.starts_with(&root) {
+                bail!(
+                    "checkpoint {} must not be inside local source {}",
+                    checkpoint.display(),
+                    root.display()
+                );
+            }
+        }
+        if !dst.is_remote() {
+            let root = crate::fsops::normalize(&crate::fsops::resolve(dst.path.as_bytes()));
+            if checkpoint.starts_with(&root) {
+                bail!(
+                    "checkpoint {} must not be inside local destination {}",
+                    checkpoint.display(),
+                    root.display()
+                );
+            }
         }
     }
     // Reject up front when two sources would land on the same destination name
@@ -471,8 +535,9 @@ pub fn run(args: Args) -> Result<i32> {
     let dst_root = dst.path.as_bytes().to_vec();
     let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root, false)?;
     // A destination that is a symlink to a directory is that directory (as
-    // for rsync); a symlink to anything else is replaced like any other file.
-    let dst_root_entry = follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?;
+    // for rsync). Use the resolved target path for all planning and metadata,
+    // so ordinary in-tree symlinks can still be replaced instead of followed.
+    let (dst_root, dst_root_entry) = follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?;
     let dst_existed = dst_root_entry.is_some();
     let dst_is_dir = match &dst_root_entry {
         Some(e) if e.kind == Kind::Dir => true,
@@ -525,6 +590,20 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
+    let checkpoint_state = checkpoint_setup(
+        &args,
+        srcs,
+        DestinationRoot {
+            location: dst,
+            path: &dst_root,
+            existed: dst_existed,
+            is_dir: dst_is_dir,
+        },
+        &mut *src_ctl,
+        &mut *dst_ctl,
+        &opts,
+    )?;
+
     // Create a missing directory destination — never in the read-only modes,
     // and never under --existing.
     if dst_root_entry.is_none()
@@ -549,15 +628,6 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
-    let checkpoint_state = checkpoint_setup(
-        &args,
-        srcs,
-        dst,
-        &mut *src_ctl,
-        &mut *dst_ctl,
-        dst_existed,
-        &opts,
-    )?;
     let checkpoint_completed = checkpoint_state
         .as_ref()
         .map(|state| state.completed.clone());
@@ -699,7 +769,7 @@ pub fn run(args: Args) -> Result<i32> {
     let errors = progress.errors.load(Relaxed);
 
     // Settle an explicit checkpoint. A recording failure only makes a retry
-    // recheck more files; a clean copy removes the no-longer-needed state.
+    // recheck more files. The user-selected state persists until they remove it.
     if let Some(state) = &checkpoint_state {
         let failed = state.checkpoint.as_ref().and_then(|checkpoint| {
             checkpoint
@@ -712,16 +782,6 @@ pub fn run(args: Args) -> Result<i32> {
             eprintln!(
                 "pcp: warning: checkpoint recording stopped ({e}); a retry will recheck files completed after that point"
             );
-        }
-        if !opts.dry_run && !aborted && errors == 0 {
-            if let Some(checkpoint) = &state.checkpoint {
-                if let Err(e) = checkpoint.remove() {
-                    eprintln!(
-                        "pcp: warning: completed copy but could not remove checkpoint {}: {e:#}",
-                        state.path.display()
-                    );
-                }
-            }
         }
     }
     let elapsed = progress.start.elapsed().as_secs_f64();
@@ -884,14 +944,14 @@ fn scan_into_planner(
 }
 
 /// If `entry` is a symlink whose (possibly chained) target is a directory,
-/// return that directory's entry; otherwise `entry` unchanged.
+/// return the target path and entry; otherwise return the original pair.
 fn follow_dir_symlink(
     conn: &mut dyn Conn,
     path: &[u8],
     entry: Option<Entry>,
-) -> Result<Option<Entry>> {
+) -> Result<(PathBytes, Option<Entry>)> {
     let Some(first) = entry.as_ref().filter(|e| e.kind == Kind::Symlink) else {
-        return Ok(entry);
+        return Ok((path.to_vec(), entry));
     };
     let mut cur_path = path.to_vec();
     let mut cur = first.clone();
@@ -910,7 +970,7 @@ fn follow_dir_symlink(
             join(&parent, &target)
         };
         match stat_one(conn, &next_path, false)? {
-            Some(e) if e.kind == Kind::Dir => return Ok(Some(e)),
+            Some(e) if e.kind == Kind::Dir => return Ok((next_path, Some(e))),
             Some(e) if e.kind == Kind::Symlink => {
                 cur = e;
                 cur_path = next_path;
@@ -918,7 +978,7 @@ fn follow_dir_symlink(
             _ => break,
         }
     }
-    Ok(entry)
+    Ok((path.to_vec(), entry))
 }
 
 fn display(p: &[u8]) -> String {
@@ -1305,28 +1365,11 @@ impl Planner<'_> {
         // metadata so they can't disagree.
         let need_stats = opts.verify_only || !opts.dry_run || opts.existing;
         if !dirs.is_empty() && (need_stats || opts.verbose > 0) {
-            let mut stats: Vec<Option<Entry>> = if need_stats {
+            let stats: Vec<Option<Entry>> = if need_stats {
                 self.stat_many(true, dirs.iter().map(|(p, _)| p.clone()).collect())?
             } else {
                 vec![None; dirs.len()]
             };
-            // A destination symlink to a directory is that directory (rsync
-            // semantics; Mkdir treats it so too), so resolve those before
-            // deciding what exists and what needs opening up.
-            let links: Vec<usize> = stats
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| matches!(s, Some(e) if e.kind == Kind::Symlink))
-                .map(|(i, _)| i)
-                .collect();
-            if !links.is_empty() {
-                let paths = links.iter().map(|&i| dirs[i].0.clone()).collect();
-                for (i, f) in links.into_iter().zip(stat_many(self.dst, paths, true)?) {
-                    if matches!(f, Some(ref e) if e.kind == Kind::Dir) {
-                        stats[i] = f;
-                    }
-                }
-            }
             let mut planned: Vec<(PathBytes, &Entry, Option<Entry>)> = Vec::new();
             for ((p, e), st) in dirs.into_iter().zip(stats) {
                 let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
@@ -1341,9 +1384,10 @@ impl Planner<'_> {
                     continue;
                 }
                 // --existing creates nothing. A non-directory at the path (a
-                // file, a dangling or non-directory symlink) counts as missing:
-                // we won't replace it, and since entries come parent-first,
-                // everything below is skipped too.
+                // file, a symlink even to a directory — in-tree symlinks are
+                // replaced, never traversed) counts as missing: we won't
+                // replace it and won't write through it, and since entries
+                // come parent-first, everything below is skipped too.
                 if opts.existing && (!is_dir || self.under_missing_dir(&p, dst_root)) {
                     self.missing_dirs.insert(p);
                     continue;
@@ -2237,6 +2281,7 @@ impl Worker {
                         "pcp: {}: changed during transfer, retrying",
                         j.rel
                     ));
+                    let published = self.published_entry(j);
                     let mut all = self.sched.jobs.lock().unwrap();
                     let job = &mut all[*idx];
                     self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -2245,8 +2290,7 @@ impl Worker {
                         ..e
                     };
                     job.attempts += 1;
-                    // Keep the original dst_entry so mode is preserved on retry
-                    // without -p (don't adopt the source's mode).
+                    job.dst_entry = Some(published);
                     drop(all);
                     self.sched.requeue(*idx);
                 } else {
@@ -2306,14 +2350,21 @@ impl Worker {
         let partial_size = if inplace {
             None
         } else {
-            match ok(
+            let probed: Result<Option<u64>> = (|| match ok(
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
                 })?,
                 "probe partial",
             )? {
-                Response::PartialSize(size) => size,
+                Response::PartialSize(size) => Ok(size),
                 other => bail!("unexpected response {other:?}"),
+            })();
+            match probed {
+                Ok(size) => size,
+                Err(error) => {
+                    self.sched.ranges_ready(idx, vec![]);
+                    return Err(error);
+                }
             }
         };
         // Same-machine copy: let the kernel move the bytes (reflink / NFS
@@ -2325,9 +2376,13 @@ impl Worker {
             && self.bwlimit.is_none()
             && job.entry.size > 0
             && partial_size.is_none()
+            && job.attempts == 0
         {
             match self.try_copy_local(idx, &job) {
-                Ok(true) => return Ok(()),
+                Ok(true) => {
+                    self.sched.ranges_ready(idx, vec![]);
+                    return Ok(());
+                }
                 Ok(false) => {} // not offloadable — fall through to streaming
                 Err(e) => {
                     self.sched.ranges_ready(idx, vec![]);
@@ -2462,19 +2517,24 @@ impl Worker {
                 if !needs_finalize {
                     self.progress.files_total.fetch_sub(1, Relaxed);
                     self.progress.files_skipped.fetch_add(1, Relaxed);
-                    // Content matched block for block and the metadata is now
-                    // right: complete, so checkpoint it (after the same source
-                    // re-check a transferred file gets) and spare the next
-                    // run the stat and the hashing.
-                    let unchanged = matches!(
-                        stat_one(&mut *self.src, &job.src, false)?,
-                        Some(ref e) if e.kind == Kind::File
-                            && e.size == job.entry.size
-                            && e.mtime == job.entry.mtime
-                            && e.mtime_nsec == job.entry.mtime_nsec
-                    );
-                    if unchanged {
-                        self.record_done(&job.rel_bytes, &job.entry);
+                    if self
+                        .checkpoint
+                        .get()
+                        .and_then(|shared| shared.checkpoint.as_ref())
+                        .is_some()
+                    {
+                        // Content matched block for block and the metadata is
+                        // now right: recheck the source before checkpointing it.
+                        let unchanged = matches!(
+                            stat_one(&mut *self.src, &job.src, false)?,
+                            Some(ref e) if e.kind == Kind::File
+                                && e.size == job.entry.size
+                                && e.mtime == job.entry.mtime
+                                && e.mtime_nsec == job.entry.mtime_nsec
+                        );
+                        if unchanged {
+                            self.record_done(&job.rel_bytes, &job.entry);
+                        }
                     }
                 } else {
                     self.finish_file(idx)?;
@@ -2492,6 +2552,7 @@ impl Worker {
 
     /// Attempt an in-kernel same-host copy. Ok(true) = done; Ok(false) =
     /// kernel can't offload, caller should stream; Err = real failure.
+    /// The caller owns scheduler probing bookkeeping for every terminal result.
     fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
         // Write to a partial and let finish_file rename it, so an interrupted
         // copy_file_range never leaves a final-named file the quick check could
@@ -2518,7 +2579,6 @@ impl Worker {
                 );
                 self.progress.add_bytes(job.entry.size);
                 job.done.store(job.entry.size, Relaxed);
-                self.sched.ranges_ready(idx, vec![]);
                 self.finish_file(idx)?;
                 Ok(true)
             }
@@ -2540,6 +2600,16 @@ impl Worker {
         } else {
             job.entry.mode & 0o777 & !self.opts.umask
         }
+    }
+
+    /// Metadata for the whole file just atomically published at the
+    /// destination. A retry can use it as a block-diff basis without changing
+    /// the no-`-p` mode chosen for the first attempt.
+    fn published_entry(&self, job: &FileJob) -> Entry {
+        let mut entry = job.entry.clone();
+        entry.path = job.dst.clone();
+        entry.mode = (entry.mode & !0o7777) | self.create_mode(job);
+        entry
     }
 
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
@@ -2709,6 +2779,12 @@ impl Worker {
             })?,
             "finalize",
         )?;
+        #[cfg(debug_assertions)]
+        if let Some(ms) = std::env::var_os("PCP_TEST_HOLD_AFTER_FINALIZE_MS") {
+            if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
         // Did the source change under us?
         let now = stat_one(&mut *self.src, &job.src, false)?;
         let changed = match &now {
@@ -2727,6 +2803,7 @@ impl Worker {
                         "pcp: {}: changed during transfer, retrying",
                         job.rel
                     ));
+                    let published = self.published_entry(&job);
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let j = &mut jobs[idx];
                     self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -2735,8 +2812,7 @@ impl Worker {
                         ..e
                     };
                     j.attempts += 1;
-                    // Keep the original dst_entry: it drives mode preservation
-                    // without -p, and re-reading the source must not change it.
+                    j.dst_entry = Some(published);
                     j.done.store(0, Relaxed);
                     drop(jobs);
                     self.sched.requeue(idx);

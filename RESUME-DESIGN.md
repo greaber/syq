@@ -16,6 +16,10 @@ Ordinary invocations must not leave a persistent history or make their result
 depend on hidden state from earlier PCP commands. The second optimization is
 therefore opt-in through `--checkpoint FILE`.
 
+Normal resumption never requires a checkpoint. Every ordinary rerun performs
+the size/mtime quick check and reuses hashed destination partials. A checkpoint
+only avoids destination lookups for whole files already recorded complete.
+
 ## Atomic publication and per-file resume
 
 Unless `--inplace` was explicit, every regular file is written to the
@@ -24,6 +28,12 @@ metadata, and atomically renamed over the requested pathname. Small files are
 still pipelined as whole-file protocol requests, but the receiver stages and
 renames each one before acknowledging it. PCP does not `fsync` by default;
 `--fsync` separately requests crash durability for the file and directory.
+
+The receiver holds an advisory exclusive lock on an active partial. Two PCP
+processes therefore never write the same staged inode: a simultaneous copy of
+the same destination file fails visibly in one command, while unrelated paths
+remain concurrent. Non-overlapping publications may still replace one another
+as atomic whole files. `--inplace` does not provide this isolation.
 
 If a range transfer is interrupted, the partial itself is the per-file state.
 A normal rerun finds it, hashes it and the current source at fixed
@@ -88,17 +98,23 @@ counted complete without a destination stat. A missing or mismatching record
 uses the ordinary destination quick check, partial probe, block comparison, and
 transfer path.
 
-The checkpoint is retained after interruption or any copy error. After a clean
-copy it is closed and removed: completed jobs do not become hidden history. If
-the destination root no longer exists at startup, an old checkpoint is reset
-because none of its destination claims can still be valid. PCP validates that
-the user-selected path contains this job's checkpoint before resetting it; it
-never silently replaces an unrelated file. A dry run may read state to preview
-the corresponding retry but does not create, append, reset, or remove it.
+The checkpoint persists after interruption, copy errors, and clean completion;
+the user removes it or stops passing it when its historical assertions are no
+longer wanted. It is never reset automatically. If it contains completed
+records but their destination root or mapped per-source target is missing, PCP
+fails and asks the user to remove the checkpoint to restart. A dry run reads
+and validates existing state but does not create or append to it.
+
+A checkpoint on the coordinating machine is rejected if it resolves inside a
+local source root or destination tree. Otherwise the scanner could copy it as
+payload or a destination write could replace the live file. For a direct or
+detached remote-to-remote copy, this rule is applied by the source-host
+coordinator.
 
 `-c` and `--verify-only` conflict with `--checkpoint`: those modes explicitly
 ask to inspect destination contents, while a checkpoint exists to bypass that
-inspection.
+inspection. `--rm` also conflicts because it is a removal operation rather
+than a copy.
 
 ## Explicit trust boundary
 

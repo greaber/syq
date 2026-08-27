@@ -109,13 +109,13 @@ pub struct Args {
     /// of it changes)
     #[arg(long)]
     pub inplace: bool,
-    /// fsync each file and its parent directory around the rename, so a completed file
-    /// survives a crash; also syncs an explicitly requested checkpoint (slower, especially on NFS)
+    /// fsync each file and parent directory around the rename, and sync an explicitly requested
+    /// checkpoint; makes acknowledged state crash-durable (slower, especially on NFS)
     #[arg(long)]
     pub fsync: bool,
 
-    /// Save completed-file state here; reuse the same file to accelerate a retry. The file is
-    /// retained after interruption or failure and removed after a clean copy.
+    /// Avoid completed-file destination lookups on later runs. Normal reruns and partial-file
+    /// resume do not need this. The file persists and must be outside local source/destination trees.
     #[arg(
         long,
         value_name = "FILE",

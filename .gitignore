@@ -2,3 +2,6 @@
 /.claude/*
 !/.claude/settings.json
 /.worktrees/
+
+# Agent working notes / handoff plans (not committed).
+/current-plans
