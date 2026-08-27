@@ -28,6 +28,8 @@ pub struct Progress {
     pub scanned: AtomicU64,
     pub scan_done: AtomicBool,
     pub errors: AtomicU64,
+    /// Workers currently allowed to take work (0 = fixed -j, not shown).
+    pub active_workers: AtomicU64,
     pub start: Instant,
     workers: Mutex<Vec<Option<WorkerStatus>>>,
     term: Mutex<TermState>,
@@ -62,6 +64,7 @@ impl Progress {
             scanned: AtomicU64::new(0),
             scan_done: AtomicBool::new(false),
             errors: AtomicU64::new(0),
+            active_workers: AtomicU64::new(0),
             start: Instant::now(),
             workers: Mutex::new(vec![None; n_workers]),
             term: Mutex::new(TermState {
@@ -74,7 +77,11 @@ impl Progress {
     }
 
     pub fn set_worker(&self, id: usize, s: Option<WorkerStatus>) {
-        self.workers.lock().unwrap()[id] = s;
+        let mut w = self.workers.lock().unwrap();
+        if id >= w.len() {
+            w.resize(id + 1, None);
+        }
+        w[id] = s;
     }
 
     pub fn add_bytes(&self, n: u64) {
@@ -175,6 +182,10 @@ impl Progress {
         };
         if let Some(e) = eta {
             head.push_str(&format!("  ETA {}", hms(e)));
+        }
+        let active = self.active_workers.load(Relaxed);
+        if active > 0 {
+            head.push_str(&format!("  {active} conn"));
         }
         if skipped > 0 {
             head.push_str(&format!("  (unchanged {})", human(skipped)));
@@ -306,4 +317,16 @@ pub fn commas(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+impl crate::tune::Meter for Progress {
+    fn bytes(&self) -> u64 {
+        self.bytes_done.load(Relaxed)
+    }
+    fn files(&self) -> u64 {
+        self.files_done.load(Relaxed)
+    }
+    fn set_active(&self, n: usize) {
+        self.active_workers.store(n as u64, Relaxed);
+    }
 }

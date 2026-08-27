@@ -81,7 +81,7 @@ pcp -a src newhost:dst                        # the matching remote helper is au
 | `-q` | Errors only |
 | `-z`, `--compress` | zstd-compress data in transit (inside pcp's protocol, not `ssh -C`) |
 | `-n`, `--dry-run` | Scan and report; change nothing |
-| `-j N`, `--connections N` | Parallel data connections (default 8 over ssh, 32 when fully local) |
+| `-j N`, `--connections N` | Parallel data connections (default: auto-tuned, see below) |
 | `--bwlimit RATE` | Limit aggregate file-data throughput (bare rate is KiB/s; `0` disables) |
 | `--block-size SIZE` | Transfer and hash block size (default 4M) |
 | `--min-split SIZE` | Don't split an in-flight file with less than this left (default 32M) |
@@ -164,7 +164,7 @@ disturb them.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.
-`-j N` data connections — by default separate TCP sockets carrying AES-256-GCM
+The data connections — by default separate TCP sockets carrying AES-256-GCM
 records (under `--no-tcp`, separate `ssh` processes instead), each its own flow
 and cipher — carry only "read range" / "write range" requests. Files go
 onto a largest-first queue; when a worker runs dry it steals the back half of
@@ -296,6 +296,34 @@ ordering question for them.
 - **Not** a single spinning disk: parallel reads of one file there mean seeks.
   Use `-j 1` or a large `--min-split`.
 
+## How many connections (`-j`)
+
+Without `-j`, pcp tunes the number of workers while the transfer runs
+instead of guessing. It starts with 8 over the network (32 when both ends are
+local: threads are free, connections are not), and every 5 seconds compares
+progress (bytes, plus a small credit per completed file so small-file trees
+count) with the previous window: while a doubling improves it by more than
+15 % it doubles again, up to 64; when a doubling buys nothing it goes back to
+the smaller count that did the same work, then keeps halving as long as that
+costs nothing (down to 2). It never stops watching: every 30 s it
+probes one step down (kept if throughput doesn't drop — this is what saves a
+spinning disk from seek thrash) or one step up (the route or a shared NAS may
+have freed up). Surplus workers are parked, not closed: they keep their
+connections and stop taking work, handing back the rest of their range, so
+un-parking is instant. Transfers shorter than a window or two just run with
+the starting count. The progress line shows the current count (`16 conn`), and `--stats`
+reports the path it took (`connections: auto: settled at 16 (path 8 -> 16 ->
+32 -> 16, peak 32)`).
+
+Measured from a 1 Gbit box in Germany to a host in Japan (265 ms): over TCP
+data connections it settles at 8–16 at line rate; over ssh data connections
+(where each stream is capped by OpenSSH's 2 MB window) it climbs to 32 and
+gets 112 MB/s where a fixed `-j 8` managed 44.
+
+`-j N` fixes the count and disables tuning. Use it when you know better (a
+spinning disk that must not be read in parallel: `-j 1`), or to be polite on
+a shared link.
+
 ## TCP data connections
 
 ssh caps every stream at a few hundred MB/s of cipher CPU, and its 2 MB
@@ -410,8 +438,8 @@ fix for that.
 - Each connection costs one ssh handshake (~0.3 s on a LAN, several seconds
   across continents), and sshd's `MaxStartups` (default 10) randomly rejects
   sessions if too many are being set up at once, so pcp limits in-flight
-  connects and retries. For short transfers over long links, `-j 4` may beat
-  `-j 16`.
+  connects and retries. Auto-tuning starts at 8 and only opens more once
+  they have been shown to pay.
 - Direct remote→remote with a *forwarded* agent authenticates every session
   through your machine; over a slow link that dominates setup time. Keys on the
   source host avoid it.
