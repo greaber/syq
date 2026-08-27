@@ -3191,3 +3191,58 @@ fn max_delete_refuses_everything_past_the_limit() {
     let out = pcp(&["-a", "--max-delete", "5", &t.s("src/"), &t.s("dst")]);
     assert!(!out.status.success());
 }
+
+// ------------------------------------------------------------ review round 7
+
+#[test]
+fn cross_source_collision_is_detected_before_any_change() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("a")).unwrap();
+    std::os::unix::fs::symlink("nowhere", t.path("a/x")).unwrap();
+    write(&t.path("a/other"), b"o");
+    write(&t.path("b/x/inside"), b"i");
+    write(&t.path("dst/x"), b"precious file");
+    let out = pcp(&["-a", &t.s("a/"), &t.s("b/"), &t.s("dst")]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("refusing to clobber"));
+    assert_eq!(
+        read(&t.path("dst/x")),
+        b"precious file",
+        "nothing was written"
+    );
+    assert!(
+        !t.path("dst/other").exists(),
+        "nothing from either source was applied"
+    );
+}
+
+#[test]
+fn files_from_symlink_conflict_is_order_independent() {
+    let t = Tmp::new();
+    write(&t.path("outside/secret"), b"s");
+    fs::create_dir_all(t.path("src")).unwrap();
+    std::os::unix::fs::symlink("../outside", t.path("src/link")).unwrap();
+    for (n, list) in [("1", "link\nlink/secret\n"), ("2", "link/secret\nlink\n")] {
+        write(&t.path(&format!("list{n}")), list.as_bytes());
+        let out = pcp(&[
+            "-a",
+            "--files-from",
+            &t.s(&format!("list{n}")),
+            &t.s("src"),
+            &t.s(&format!("dst{n}")),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(23),
+            "order {n}: {}",
+            stderr_of(&out)
+        );
+        let md = t.path(&format!("dst{n}/link")).symlink_metadata().unwrap();
+        // Either the symlink alone (order 1) or a real directory (order 2) —
+        // never a write through a destination symlink.
+        assert!(md.is_symlink() || md.is_dir());
+        assert!(!t.path("outside/secret2").exists());
+    }
+    assert_eq!(read(&t.path("dst2/link/secret")), b"s");
+    assert!(t.path("dst2/link").symlink_metadata().unwrap().is_dir());
+}

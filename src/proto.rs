@@ -108,6 +108,11 @@ pub enum Op {
     Rmdir {
         path: PathBytes,
     },
+    /// Remove a non-directory; a directory that has appeared there is an
+    /// error, never recursed into (used by --delete for planned leaves).
+    Unlink {
+        path: PathBytes,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

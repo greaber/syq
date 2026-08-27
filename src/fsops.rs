@@ -379,6 +379,20 @@ fn apply_one(op: &Op) -> Result<()> {
                 }
                 Ok(())
             }
+            Op::Unlink { path } => {
+                let p = resolve(path);
+                match fs::symlink_metadata(&p) {
+                    Ok(md) if md.is_dir() => {
+                        bail!("{}: is now a directory; not deleting it", p.display())
+                    }
+                    Ok(_) => {
+                        fs::remove_file(&p).with_context(|| format!("unlink {}", p.display()))?
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("unlink {}", p.display())),
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1119,5 +1133,37 @@ fn apply_owner(
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied && uid.is_none() => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlink_never_recurses_into_a_directory() {
+        let dir = std::env::temp_dir().join(format!("pcp-unlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("d/inside")).unwrap();
+        fs::write(dir.join("f"), b"f").unwrap();
+        let mut ops = FsOps::new();
+        let path = |n: &str| path_bytes(&dir.join(n));
+        let errs = ops.apply(&[
+            Op::Unlink { path: path("d") },
+            Op::Unlink { path: path("f") },
+            Op::Unlink {
+                path: path("missing"),
+            },
+        ]);
+        assert!(errs[0]
+            .as_deref()
+            .is_some_and(|e| e.contains("is now a directory")));
+        assert!(
+            dir.join("d/inside").is_dir(),
+            "the directory and its contents survive"
+        );
+        assert!(errs[1].is_none() && !dir.join("f").exists());
+        assert!(errs[2].is_none(), "a vanished leaf is not an error");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

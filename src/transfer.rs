@@ -665,6 +665,11 @@ pub fn run(args: Args) -> Result<i32> {
         specials_created: 0,
         scan_warned: false,
         max_delete_hit: false,
+        buffer: if srcs.len() > 1 {
+            Some(Vec::new())
+        } else {
+            None
+        },
         keep_dirs: args.files_from.is_some(),
         delete_roots: Vec::new(),
         deletes: Deletes::default(),
@@ -704,6 +709,11 @@ pub fn run(args: Args) -> Result<i32> {
         ) {
             scan_err = Some(e);
             break;
+        }
+    }
+    if scan_err.is_none() && !st.collision {
+        if let Err(e) = st.replay_buffered() {
+            scan_err = Some(e);
         }
     }
     let collision = st.collision;
@@ -1024,6 +1034,9 @@ struct Planner<'a> {
     scan_warned: bool,
     /// --max-delete stopped the deletions (exit 25, as rsync).
     max_delete_hit: bool,
+    /// Several sources: mapped batches waiting for all scans to finish
+    /// (see `Mapped`). None with a single source, where batches stream.
+    buffer: Option<Vec<Mapped>>,
     /// --files-from: listed directories are created even without -r (which
     /// then only decides whether their contents are walked).
     keep_dirs: bool,
@@ -1042,8 +1055,12 @@ struct Planner<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Claim {
     Dir,
-    /// A regular file pcp intends to write.
-    File,
+    /// A regular file pcp intends to write; its identity, so a second
+    /// claimant can be checked against "is one of us the destination file?".
+    File {
+        dev: u64,
+        ino: u64,
+    },
     /// A symlink or special file pcp intends to create.
     Leaf,
     Weak,
@@ -1051,16 +1068,26 @@ enum Claim {
 
 /// Everything the planner decided about one source entry, made once in the
 /// mapping loop so the directory pass and the per-kind arms can't disagree.
-struct Planned<'a> {
+struct Planned {
     src: PathBytes,
     dst: PathBytes,
     dst_rel: PathBytes,
     rel: String,
-    e: &'a Entry,
+    e: Entry,
     /// Another source already claimed `dst` as a regular file. Resolved once
     /// the destination is stat'ed: fine if that file *is* this file (a copy
     /// onto itself), a collision otherwise.
     contested: bool,
+}
+
+/// One scanned batch after the mapping loop: every destination claimed,
+/// nothing touched yet. With several sources these are held until all of
+/// them have been scanned, so a conflict between sources is reported before
+/// the destination is changed at all.
+struct Mapped {
+    dst_root: PathBytes,
+    dirs: Vec<(PathBytes, Entry)>,
+    others: Vec<Planned>,
 }
 
 /// What --delete found on the destination that the source doesn't have.
@@ -1260,12 +1287,24 @@ impl Planner<'_> {
                     emitted.insert(c.path.clone(), Kind::Dir);
                     batch.push(c);
                 }
+                match emitted.get(line) {
+                    None => {
+                        emitted.insert(line.clone(), e.kind);
+                        batch.push(e.clone());
+                    }
+                    Some(k) if *k == e.kind => {}
+                    Some(_) => {
+                        // Listed as a symlink (or file) after a path through it
+                        // already made it a directory: the same conflict as the
+                        // other order, refused the same way.
+                        self.progress.error(&format!(
+                            "pcp: --files-from: {shown}: listed as a non-directory but already used as a directory"
+                        ));
+                        continue;
+                    }
+                }
                 if e.kind == Kind::Dir && recurse && recursed.insert(line.clone()) {
                     subtrees.push(line.clone());
-                }
-                if !emitted.contains_key(line) {
-                    emitted.insert(line.clone(), e.kind);
-                    batch.push(e.clone());
                 }
             }
             self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
@@ -1315,11 +1354,29 @@ impl Planner<'_> {
         sub: &str,
         dst_root: &[u8],
     ) -> Result<()> {
+        let mapped = self.map_batch(batch, src_root, sub, dst_root);
+        match &mut self.buffer {
+            Some(buf) => {
+                buf.push(mapped);
+                Ok(())
+            }
+            None => self.apply_mapped(mapped),
+        }
+    }
+
+    /// The mapping loop: decide and claim everything about each entry.
+    fn map_batch(
+        &mut self,
+        batch: Vec<Entry>,
+        src_root: &[u8],
+        sub: &str,
+        dst_root: &[u8],
+    ) -> Mapped {
         let opts = self.opts;
         let sub_b = sub.as_bytes();
-        let mut dirs: Vec<(PathBytes, &Entry)> = Vec::new();
+        let mut dirs: Vec<(PathBytes, Entry)> = Vec::new();
         let mut others: Vec<Planned> = Vec::new();
-        for e in &batch {
+        for e in batch {
             if e.kind == Kind::Dir && !opts.recursive && !self.keep_dirs {
                 continue;
             }
@@ -1337,7 +1394,10 @@ impl Planner<'_> {
                 ));
             let claim = match e.kind {
                 Kind::Dir => Claim::Dir,
-                Kind::File if !partial_named => Claim::File,
+                Kind::File if !partial_named => Claim::File {
+                    dev: e.dev,
+                    ino: e.ino,
+                },
                 Kind::Symlink if opts.links => Claim::Leaf,
                 Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev if opts.devices => {
                     Claim::Leaf
@@ -1347,6 +1407,7 @@ impl Planner<'_> {
             let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
                 continue;
             };
+            let src = join(src_root, &e.path);
             match claim {
                 Claim::Dir => dirs.push((dst, e)),
                 Claim::Weak if partial_named || e.kind == Kind::Other => {
@@ -1361,8 +1422,8 @@ impl Planner<'_> {
                     }
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                 }
-                Claim::File | Claim::Leaf => others.push(Planned {
-                    src: join(src_root, &e.path),
+                Claim::File { .. } | Claim::Leaf => others.push(Planned {
+                    src,
                     dst,
                     dst_rel,
                     rel,
@@ -1371,6 +1432,75 @@ impl Planner<'_> {
                 }),
             }
         }
+        Mapped {
+            dst_root: dst_root.to_vec(),
+            dirs,
+            others,
+        }
+    }
+
+    /// Several sources: every batch has been mapped and claimed, nothing
+    /// applied. Contested claims (two sources naming one regular file) are
+    /// fine only when one of them *is* the destination file; settle those
+    /// with one stat pass, then apply everything if there was no conflict.
+    fn replay_buffered(&mut self) -> Result<()> {
+        let Some(mut buffered) = self.buffer.take() else {
+            return Ok(());
+        };
+        // (destination, first claimant's identity, this claimant's identity, name)
+        type Contested = (PathBytes, (u64, u64), (u64, u64), String);
+        let contested: Vec<Contested> = buffered
+            .iter()
+            .flat_map(|m| m.others.iter().filter(|p| p.contested))
+            .map(|p| {
+                let first = match self.dst_seen.get(&p.dst) {
+                    Some(Claim::File { dev, ino }) => (*dev, *ino),
+                    _ => (0, 0),
+                };
+                (p.dst.clone(), first, (p.e.dev, p.e.ino), p.rel.clone())
+            })
+            .collect();
+        if !contested.is_empty() {
+            let stats = self.stat_many(true, contested.iter().map(|c| c.0.clone()).collect())?;
+            for ((dst, first, second, rel), st) in contested.into_iter().zip(stats) {
+                let is_dst = |(dev, ino): (u64, u64)| {
+                    self.opts.same_host && st.as_ref().is_some_and(|d| d.dev == dev && d.ino == ino)
+                };
+                if !is_dst(first) && !is_dst(second) {
+                    self.progress.error(&format!(
+                        "pcp: {rel}: two sources map to the same destination {} — refusing to clobber it",
+                        display(&dst)
+                    ));
+                    self.collision = true;
+                }
+            }
+        }
+        if self.collision {
+            return Ok(());
+        }
+        // Validated: from here on they are ordinary entries (the one that is
+        // the destination file skips itself; the other is written).
+        for m in &mut buffered {
+            for p in &mut m.others {
+                p.contested = false;
+            }
+        }
+        for m in buffered {
+            self.apply_mapped(m)?;
+        }
+        Ok(())
+    }
+
+    /// Everything after the mapping loop: stat, create directories, filter,
+    /// enqueue.
+    fn apply_mapped(&mut self, mapped: Mapped) -> Result<()> {
+        let opts = self.opts;
+        let Mapped {
+            dst_root,
+            dirs,
+            mut others,
+        } = mapped;
+        let dst_root = &dst_root[..];
 
         // Directories: one stat pass decides everything about each one, and
         // the same filtered list drives creation, listing and deferred
@@ -1382,7 +1512,7 @@ impl Planner<'_> {
             } else {
                 vec![None; dirs.len()]
             };
-            let mut planned: Vec<(PathBytes, &Entry, Option<Entry>)> = Vec::new();
+            let mut planned: Vec<(PathBytes, Entry, Option<Entry>)> = Vec::new();
             for ((p, e), st) in dirs.into_iter().zip(stats) {
                 let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
                 if opts.verify_only {
@@ -1482,7 +1612,7 @@ impl Planner<'_> {
             for p in others.into_iter() {
                 if p.e.kind == Kind::File {
                     if let Some(c) = completed.get(&p.dst_rel) {
-                        if c.matches(p.e, opts.flags) {
+                        if c.matches(&p.e, opts.flags) {
                             self.progress.files_skipped.fetch_add(1, Relaxed);
                             self.progress.bytes_skipped.fetch_add(p.e.size, Relaxed);
                             continue;
@@ -1616,7 +1746,7 @@ impl Planner<'_> {
                         self.progress.files_skipped.fetch_add(1, Relaxed);
                         self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
                         if let Some(checkpoint) = &self.checkpoint {
-                            checkpoint.record_complete(&dst_rel, e, "quick-check");
+                            checkpoint.record_complete(&dst_rel, &e, "quick-check");
                         }
                     } else if opts.dry_run {
                         self.progress.files_total.fetch_add(1, Relaxed);
@@ -1765,7 +1895,7 @@ impl Planner<'_> {
                 self.dst_seen.insert(dst.clone(), c);
                 Some(false)
             }
-            (Some(Claim::File), Claim::File) => Some(true),
+            (Some(Claim::File { .. }), Claim::File { .. }) => Some(true),
             (Some(_), _) => {
                 self.progress.error(&format!(
                     "pcp: {rel}: two sources map to the same destination {} with conflicting types — refusing to clobber it",
@@ -2006,7 +2136,9 @@ impl Planner<'_> {
                             if rmdir {
                                 Op::Rmdir { path: p.clone() }
                             } else {
-                                Op::Remove { path: p.clone() }
+                                // Never Remove: that recurses into a directory
+                                // that appeared here since the walk.
+                                Op::Unlink { path: p.clone() }
                             }
                         })
                         .collect();
