@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -98,6 +98,186 @@ fn read(p: &Path) -> Vec<u8> {
     let mut v = Vec::new();
     File::open(p).unwrap().read_to_end(&mut v).unwrap();
     v
+}
+
+fn executable(p: &Path, body: &[u8]) {
+    write(p, body);
+    fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A remote shell that executes the supplied command locally with an isolated
+/// HOME.  This exercises pcp's real remote launcher/server protocol without
+/// touching ssh or a real remote machine.
+fn fake_rsh(t: &Tmp) -> PathBuf {
+    let path = t.path("fake-rsh");
+    executable(
+        &path,
+        br#"#!/bin/sh
+shift
+HOME="$FAKE_REMOTE_HOME"
+PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
+export HOME PATH
+printf '%s\n' "$1" >> "$FAKE_RSH_LOG"
+exec /bin/sh -c "$1"
+"#,
+    );
+    path
+}
+
+fn remote_pcp(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pcp"));
+    cmd.args(["-e", rsh.to_str().unwrap(), "--no-tcp", "-j", "1"])
+        .args(args)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RELEASE_ARCHIVE", t.path("release.gz"))
+        .env("FAKE_CURL_LOG", t.path("curl.log"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PCP_STATE_DIR", t.path("state"));
+    cmd.output().expect("run pcp through fake remote shell")
+}
+
+fn assert_output_ok(out: &Output) {
+    assert!(
+        out.status.success(),
+        "pcp failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn cached_remote_helper(t: &Tmp) -> PathBuf {
+    let root = t.path("remote-home/.cache/pcp/helpers");
+    let release = fs::read_dir(&root)
+        .unwrap()
+        .next()
+        .expect("release cache directory")
+        .unwrap()
+        .path();
+    let target = fs::read_dir(release)
+        .unwrap()
+        .next()
+        .expect("target cache directory")
+        .unwrap()
+        .path();
+    target.join("pcp")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_helper_download_is_verified_and_cached() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let archive = File::create(t.path("release.gz")).unwrap();
+    let status = Command::new("gzip")
+        .args(["-9", "-n", "-c", env!("CARGO_BIN_EXE_pcp")])
+        .stdout(Stdio::from(archive))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let sum = Command::new("sha256sum")
+        .arg(t.path("release.gz"))
+        .output()
+        .unwrap();
+    assert!(sum.status.success());
+    let digest = String::from_utf8(sum.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    write(
+        &t.path("release.gz.sha256"),
+        format!("{digest}\n").as_bytes(),
+    );
+
+    executable(
+        &t.path("remote-bin/curl"),
+        br#"#!/bin/sh
+printf 'fetch\n' >> "$FAKE_CURL_LOG"
+out=
+url=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output) out=$2; shift 2 ;;
+        *) url=$1; shift ;;
+    esac
+done
+case "$url" in
+    *.sha256) cp "$FAKE_RELEASE_ARCHIVE.sha256" "$out" ;;
+    *) cp "$FAKE_RELEASE_ARCHIVE" "$out" ;;
+esac
+"#,
+    );
+
+    write(&t.path("src"), b"first");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_pcp(&t, &rsh, &["-a", "--no-resume", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"first");
+    assert!(cached_remote_helper(&t).is_file());
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
+    let probes = fs::read_to_string(t.path("rsh.log"))
+        .unwrap()
+        .matches("pcp-helper-target:")
+        .count();
+    assert_eq!(probes, 1);
+
+    // A cache hit goes straight to the helper: no platform probe or download.
+    write(&t.path("src"), b"second");
+    let out = remote_pcp(&t, &rsh, &["-a", "--no-resume", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"second");
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
+    let probes = fs::read_to_string(t.path("rsh.log"))
+        .unwrap()
+        .matches("pcp-helper-target:")
+        .count();
+    assert_eq!(probes, 1, "cache hit should not probe the platform again");
+}
+
+#[test]
+fn remote_helper_falls_back_to_same_platform_upload() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    executable(
+        &t.path("remote-bin/curl"),
+        br#"#!/bin/sh
+printf 'fetch failed\n' >> "$FAKE_CURL_LOG"
+exit 22
+"#,
+    );
+
+    write(&t.path("src"), b"offline");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_pcp(&t, &rsh, &["-a", "--no-resume", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"offline");
+    assert!(cached_remote_helper(&t).is_file());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
+    assert_eq!(read(&t.path("curl.log")), b"fetch failed\n");
+}
+
+#[test]
+fn no_bootstrap_uses_remote_path_without_managed_cache() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_pcp"), t.path("remote-bin/pcp")).unwrap();
+
+    write(&t.path("src"), b"preinstalled");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_pcp(
+        &t,
+        &rsh,
+        &["-a", "--no-resume", "--no-bootstrap", &t.s("src"), &remote],
+    );
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"preinstalled");
+    assert!(!t.path("remote-home/.cache/pcp/helpers").exists());
 }
 
 fn set_mtime(p: &Path, secs: i64) {

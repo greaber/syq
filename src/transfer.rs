@@ -46,6 +46,8 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             host: h.clone(),
             rsh: parse_rsh(&args.rsh)?,
             pcp_path: args.pcp_path.clone(),
+            auto_helper: args.pcp_path.is_none() && !args.no_bootstrap,
+            helper_install: Default::default(),
             quiet: args.quiet,
             tcp: Default::default(),
         }),
@@ -53,17 +55,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
 }
 
 pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
-    match ep.connect(args.compress) {
-        Ok(c) => Ok(c),
-        Err(e) => {
-            if let (Endpoint::Remote(spec), true) = (ep, args.bootstrap) {
-                eprintln!("pcp: {e:#}");
-                spec.bootstrap()?;
-                return ep.connect(args.compress);
-            }
-            Err(e)
-        }
-    }
+    ep.connect(args.compress)
 }
 
 fn parse_ports(s: &str) -> Result<(u16, u16)> {
@@ -573,7 +565,9 @@ pub fn run(args: Args) -> Result<i32> {
     let use_tcp = !args.no_tcp && (src_ep.is_remote() || dst_ep.is_remote());
     // Whether the user said anything about TCP, which controls how loudly we
     // report a fallback (silent when it's just the default).
-    if !opts.dry_run && !args.bootstrap && !use_tcp {
+    let auto_helper =
+        args.pcp_path.is_none() && !args.no_bootstrap && (src_ep.is_remote() || dst_ep.is_remote());
+    if !opts.dry_run && !auto_helper && !use_tcp {
         spawn_workers(&mut workers);
     }
 
@@ -629,7 +623,7 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
-    if !opts.dry_run && (args.bootstrap || use_tcp) {
+    if !opts.dry_run && (auto_helper || use_tcp) {
         spawn_workers(&mut workers);
     }
 

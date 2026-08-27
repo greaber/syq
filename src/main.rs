@@ -5,6 +5,7 @@ mod direct;
 mod fsops;
 mod progress;
 mod proto;
+mod remote_helper;
 mod resume;
 mod rm;
 mod scan;
@@ -47,6 +48,10 @@ fn main() {
     tune_allocator();
     raise_nofile();
     let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("--remote-helper-id") {
+        println!("{}", remote_helper::release_key());
+        return;
+    }
     if argv.get(1).map(String::as_str) == Some("--server") {
         if let Err(e) = server::run() {
             eprintln!("pcp server: {e:#}");
