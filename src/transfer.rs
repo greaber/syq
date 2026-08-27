@@ -538,9 +538,10 @@ pub fn run(args: Args) -> Result<i32> {
     );
     let sched = Arc::new(Sched::new(block, min_split));
 
-    // Workers connect on their own threads, in parallel with the control
-    // connections below, so all ssh sessions come up at once. The tuner may
-    // spawn more later, so the handles live behind a mutex.
+    // Workers connect on their own threads once the control connections are
+    // up: everything waits on those, so they must never compete with worker
+    // handshakes (at sshd's MaxStartups or a serialized ssh agent). The tuner
+    // may spawn more workers later, so the handles live behind a mutex.
     let gate = Gate::new(args.connections);
     let resume_slot: ResumeSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
@@ -625,11 +626,6 @@ pub fn run(args: Args) -> Result<i32> {
     // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
     // Local<->local needs no data plane at all.
     let use_tcp = !args.no_tcp && (src_ep.is_remote() || dst_ep.is_remote());
-    let auto_helper =
-        args.pcp_path.is_none() && !args.no_bootstrap && (src_ep.is_remote() || dst_ep.is_remote());
-    if !opts.dry_run && !auto_helper && !use_tcp {
-        spawn_workers();
-    }
 
     let t0 = std::time::Instant::now();
     let (mut src_ctl, mut dst_ctl) = {
@@ -683,7 +679,7 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
-    if !opts.dry_run && (auto_helper || use_tcp) {
+    if !opts.dry_run {
         spawn_workers();
     }
 
