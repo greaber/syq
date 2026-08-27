@@ -9,8 +9,9 @@ that idle workers steal from each other, so a single huge file at the end of
 a transfer still uses every connection. Throughput is typically several times
 that of a single ssh stream. It also has a progress meter that separates
 transferred bytes from unchanged ones, resumes interrupted transfers from
-partial files without redoing finished work, and can verify that a copy is
-complete.
+partial files without retransmitting their finished blocks, offers an explicit
+checkpoint for exceptionally large or failure-prone jobs, and can verify that
+a copy is complete.
 
 ## Install
 
@@ -69,6 +70,7 @@ pcp -a --dry-run -v src host:dst              # show what would be copied
 pcp -ac src host:dst                          # skip the quick check; compare blocks, repair differences
 pcp -a --verify-only src host:dst             # compare only; transfer nothing
 pcp -a src newhost:dst                        # the matching remote helper is automatic
+pcp -a --checkpoint ./copy.state src host:dst # retain completed-file state if this run fails
 ```
 
 ### Options
@@ -94,9 +96,8 @@ pcp -a src newhost:dst                        # the matching remote helper is au
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
 | `--verify-only` | Hash every file on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
-| `--atomic` | Force partial + atomic rename for every file, including small new ones |
 | `--fsync` | fsync each file and its parent dir around the rename (survives a crash; slower) |
-| `--no-resume` | Don't drop a destination marker or write a completion journal for this run |
+| `--checkpoint FILE` | Save completed-file state for an accelerated retry; retained on failure, removed on success |
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
 | `--pcp-path PATH` | Use this exact remote `pcp` instead of the managed helper |
 | `--no-bootstrap` | Require `pcp` on the remote `PATH`; do not install a managed helper |
@@ -127,10 +128,15 @@ hosts. HostA must be able to ssh to hostB (with your forwarded agent, or its
 own keys). Progress and `-v` output are streamed back. If hostA can't reach
 hostB, `--relay` keeps the orchestrator here and routes every byte A → you → B
 — always works, at half the bandwidth.
+`pcp hostA:src hostA:dst` (same host and user on both ends) simply runs a
+local copy on hostA.
 
 Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
 launched it: pcp starts it on hostA, returns, and writes progress to a log on
 hostA. Reattach with `pcp --follow hostA:LOG` to stream that progress.
+An explicit `--checkpoint` path belongs to the machine running the
+orchestrator: normally the invoking machine, but hostA for a direct or detached
+remote-to-remote copy (`--relay` keeps it local).
 
 ## Path semantics
 
@@ -143,6 +149,12 @@ Identical to rsync:
 - A single file source goes to `dest/file` if `dest` is an existing directory,
   otherwise `dest` is the new filename.
 - Several sources require (or create) a directory destination.
+- A destination that is a symlink to a directory is that directory (the link
+  is kept, with or without a trailing slash); a symlink to anything else is
+  replaced like a file.
+- pcp's own bookkeeping is never payload (as rsync excludes its
+  `--partial-dir`): a source entry named `.name.pcp-partial` is silently left
+  out. Everything else is copied.
 - `host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
   A colon before the first slash means remote; `./x:y` is local. All sources
   must be on the same host. `host::module` (daemon syntax) is not supported.
@@ -158,7 +170,9 @@ by the local umask and existing files keep their mode. Without `-t`, every
 file is transferred every time (the quick check needs mtimes).
 
 Directory mtimes are set last, deepest first, so writing children doesn't
-disturb them.
+disturb them. A directory pcp must write into but can't (no owner write bit)
+is opened up for the duration and gets its own mode back at the end — or the
+source's mode with `-p`.
 
 ## How it works
 
@@ -177,30 +191,29 @@ processes), given its metadata, and `rename`d over the target. By default pcp
 does not `fsync` each file (the rename still orders correctly, and per-file
 fsync is costly on NFS); pass `--fsync` to force each file durable before the
 rename for crash safety.
-Large files and existing-file updates go through this partial + rename, so their
-final name is never occupied by an incomplete file. **Small new files (up to one
-transfer block) are the exception**: they are written straight to their final path
-for speed (no rename), so a concurrent reader can observe one partially written,
-and an aborted run leaves an incomplete final-named file until you rerun (a
-rerun re-transfers it, since without preallocation it is detectably short — it
-is never *silently* skipped as complete). Pass `--atomic` when a consumer may
-read the destination while pcp is writing, to make every file appear atomically.
-`--inplace` writes every file in place (e.g. to update a large file without room
-for a second copy).
+Small files still use a pipelined whole-file request, but the receiver writes
+each request through its sidecar and renames it before acknowledging success.
+Thus every non-`--inplace` final name appears atomically complete. `--inplace`
+writes every file directly (for example, to update a large file without room
+for a second copy), so readers can observe partially updated contents and an
+interruption leaves the final file unfinished.
 
 Local → local runs the same machinery in-process with N threads, which helps
 on NFS and NVMe.
 
-### Resume
+### Resume and checkpoints
 
-Ctrl-C is always safe: kill it, rerun the same command. Resume works at two
+With the default staged write path, Ctrl-C is safe: kill it and rerun the same
+command. `--inplace` deliberately gives up that guarantee. Resume works at two
 levels.
 
 **Within a file.** There is no per-file state file — the partial *is* the state:
 
 - Files whose size and mtime already match are skipped (the rsync quick check).
-- If a `.name.pcp-partial` exists, both sides hash it and the source in
-  `--block-size` blocks and only the mismatching blocks are sent.
+- If a range-transfer `.name.pcp-partial` exists, both sides hash it and the
+  source in `--block-size` blocks and only the mismatching blocks are sent.
+  Pipelined small files are rewritten wholesale on retry instead of paying an
+  extra partial-file probe.
 - If the destination file exists but differs, its blocks are hashed against
   the source too; if all match only metadata is fixed, otherwise the matching
   blocks are copied locally into a new partial and the rest transferred.
@@ -210,29 +223,44 @@ databases, logs). It does **not** catch a byte inserted near the start of a
 file, which rsync's rolling checksum would — for pcp's intended use (fresh
 uploads and downloads) that trade was made deliberately.
 
-**Across the whole job.** So a rerun of a large tree doesn't have to re-stat
-every destination file, pcp keeps a small completion journal per job (keyed to
-the exact source→destination paths and the metadata-affecting flags) under
-`$XDG_STATE_HOME/pcp` (default `~/.local/state/pcp`; override with
-`PCP_STATE_DIR`). While a transfer runs it also drops a marker file,
-`.pcp-transfer-session.json`, on the *destination* filesystem:
+**Across the whole job.** Ordinary copies keep no transfer history. Every
+invocation scans the current source and destination, so deleting or changing a
+destination file affects the next run just as it does with rsync.
 
-- The marker keeps two transfers from writing the same destination at once. If
-  a second run finds a live marker for a different session it stops and tells
-  you which host and session owns it, rather than interleaving writes.
-- On success the marker is removed and the destination root's own
-  metadata restored; the journal is kept so the next identical run is fast.
-- If a run is interrupted, the marker and journal stay. Rerun the same command
-  and pcp skips the files the journal already recorded as complete (matching
-  source size + mtime) without stat'ing the destination, then finishes the rest.
+For a tree so large or failure-prone that repeatedly reaching the unfinished
+frontier is itself expensive, opt in explicitly:
 
-Because the journal is authoritative, changes made to the destination *outside*
-pcp are not noticed by a plain rerun — a file the journal calls complete is
-skipped even if you deleted it. Pass `-c` (compare every file against the real
-destination) or `--no-resume` (ignore the journal and marker entirely) to force
-reconciliation against what is actually on disk. The journal is an optimization,
-never a correctness crutch: if the marker can't be created (e.g. a read-only
-destination directory) the transfer still runs, just without cross-run resume.
+```sh
+pcp -a --checkpoint ./copy.state huge-tree/ host:huge-tree/
+# after an interruption, run the identical command again
+```
+
+The mode-0600 JSONL checkpoint identifies the canonical source, destination,
+and copy semantics. It records regular files only after PCP established that
+the destination was complete and, for transferred files, rechecked the source.
+On retry, a record whose source fingerprint still matches (size, nanosecond
+mtime, and requested mode/owner/group metadata) skips that destination lookup.
+Everything else follows the normal quick check, partial hashing, and transfer
+path. Unfinished individual files are never checkpoint-complete; their actual
+`.pcp-partial` contents remain the resume state.
+
+The checkpoint is flushed about once a second, retained after interruption or
+failure, and removed after a clean copy. Losing its last buffered records only
+causes repeated work. If the destination root disappeared, PCP resets the
+checkpoint. `-n` may read an existing checkpoint to preview a retry but never
+creates or changes one. `-c` and `--verify-only` conflict with `--checkpoint`
+because they explicitly require destination inspection. One checkpoint file
+may be used by only one running copy at a time.
+
+A checkpoint is an explicit trust decision: PCP does not inspect a destination
+file covered by a matching record. If another process deleted, replaced, or
+modified that destination after it was recorded, a checkpointed retry will not
+notice. Do not use a checkpoint when the destination may be independently
+modified; omit the option and PCP remains history-independent.
+
+Like rsync, ordinary PCP runs do not coordinate with each other. Concurrent
+copies into one tree produce the union of their files, and one whole-file
+rename wins for any path both write.
 
 ### Verification and consistency
 
@@ -244,9 +272,8 @@ Always:
 - After a file completes, the source is re-stat'ed. If its size or mtime
   changed during the transfer the file is redone (up to three attempts), then
   reported as an error.
-- Destination files appear atomically via rename — **except small new files**
-  (up to the block size), which are written straight to their final path for
-  speed; pass `--atomic` to make every file appear atomically.
+- Unless `--inplace` was explicit, destination files appear atomically via
+  rename, including new small files.
 - Non-zero exit if anything failed.
 
 On request:
@@ -263,12 +290,11 @@ different moments, so a file being written while copied may come out mixed —
 the re-stat catches the common case, `--verify-only` afterwards catches the
 rest.
 
-Compared with rsync: the atomic rename guarantee is the same for large and
-existing files (and, unlike `rsync -P`, still holds for partial files), but
-small new files are written in place by default for NFS speed — use `--atomic`
-to match rsync's every-file atomicity; the change-during-transfer check
-is the same idea; deletes and hardlinks aren't implemented, so there is no
-ordering question for them.
+Compared with rsync: ordinary writes use the same temporary-file plus atomic
+rename model; `--inplace` explicitly gives that up. PCP's deterministic partial
+also remains reusable without publishing it under the final name. The
+change-during-transfer check is the same idea; deletes and hardlinks aren't
+implemented, so there is no ordering question for them.
 
 ## Not implemented (on purpose, for now)
 
@@ -366,11 +392,10 @@ orchestrator on hostA connects to hostB's listener.
 
 ## Defaults chosen for network filesystems
 
-New files are written in place (created with their final mode, no separate
-chmod, no rename); existing files are replaced through a partial file and an
-atomic rename unless `--inplace`. `--atomic` forces the partial+rename path
-for every file (rsync semantics) when readers might open files mid-transfer. When both ends are local, 32 workers are
-used. On NFS these choices are the difference between ~300 and ~850 files/s.
+Small files are read and written in pipelined batches, but every non-`--inplace`
+write still finishes with an atomic rename. When both ends are local, 32 workers
+are used. This costs one rename per file on NFS, but avoids exposing incomplete
+final-named files. `--inplace` is the explicit space/safety tradeoff.
 
 ## Ignoring paths (`-i`, `--ignore-from`)
 

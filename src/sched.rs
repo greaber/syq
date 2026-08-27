@@ -18,7 +18,7 @@ pub struct FileJob {
     pub done: Arc<AtomicU64>,
     /// Written directly to the final path (no partial + rename).
     pub inplace: bool,
-    /// Destination-root-relative path, used as the completion-journal key.
+    /// Destination-root-relative path, used as the checkpoint key.
     pub rel_bytes: PathBytes,
 }
 

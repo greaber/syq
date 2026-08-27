@@ -1,4 +1,5 @@
 mod bwlimit;
+mod checkpoint;
 mod cli;
 mod conn;
 mod crypto;
@@ -7,7 +8,6 @@ mod fsops;
 mod progress;
 mod proto;
 mod remote_helper;
-mod resume;
 mod rm;
 mod scan;
 mod sched;

@@ -50,11 +50,9 @@ impl Drop for Tmp {
 }
 
 fn pcp(args: &[&str]) -> Output {
-    let state = std::env::temp_dir().join(format!("pcp-test-state-{}", std::process::id()));
     Command::new(env!("CARGO_BIN_EXE_pcp"))
         .args(args)
         .arg("--no-progress")
-        .env("PCP_STATE_DIR", &state)
         .output()
         .expect("run pcp")
 }
@@ -214,7 +212,7 @@ esac
 
     write(&t.path("src"), b"first");
     let remote = format!("fake:{}", t.s("dst"));
-    let out = remote_pcp(&t, &rsh, &["-a", "--no-resume", &t.s("src"), &remote]);
+    let out = remote_pcp(&t, &rsh, &["-a", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
     assert!(cached_remote_helper(&t).is_file());
@@ -228,7 +226,7 @@ esac
 
     // A cache hit goes straight to the helper: no platform probe or download.
     write(&t.path("src"), b"second");
-    let out = remote_pcp(&t, &rsh, &["-a", "--no-resume", &t.s("src"), &remote]);
+    let out = remote_pcp(&t, &rsh, &["-a", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"second");
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
@@ -253,7 +251,7 @@ exit 22
 
     write(&t.path("src"), b"offline");
     let remote = format!("fake:{}", t.s("dst"));
-    let out = remote_pcp(&t, &rsh, &["-a", "--no-resume", &t.s("src"), &remote]);
+    let out = remote_pcp(&t, &rsh, &["-a", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"offline");
     assert!(cached_remote_helper(&t).is_file());
@@ -270,11 +268,7 @@ fn no_bootstrap_uses_remote_path_without_managed_cache() {
 
     write(&t.path("src"), b"preinstalled");
     let remote = format!("fake:{}", t.s("dst"));
-    let out = remote_pcp(
-        &t,
-        &rsh,
-        &["-a", "--no-resume", "--no-bootstrap", &t.s("src"), &remote],
-    );
+    let out = remote_pcp(&t, &rsh, &["-a", "--no-bootstrap", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"preinstalled");
     assert!(!t.path("remote-home/.cache/pcp/helpers").exists());
@@ -642,7 +636,6 @@ fn large_file_parallel_chunks() {
     set_mtime(&t.path("src/huge.bin"), 1_600_000_000);
     run_ok(&[
         "-a",
-        "--no-resume",
         "-j",
         "8",
         "--block-size",
@@ -664,7 +657,6 @@ fn large_file_parallel_chunks() {
     fs::remove_file(t.path("dst/huge.bin")).unwrap();
     run_ok(&[
         "-a",
-        "--no-resume",
         "-j",
         "8",
         "--block-size",
@@ -693,7 +685,6 @@ fn bwlimit_is_aggregate_across_workers() {
     let start = std::time::Instant::now();
     run_ok(&[
         "-a",
-        "--no-resume",
         "-j",
         "4",
         "--bwlimit",
@@ -1018,6 +1009,9 @@ fn small_files_atomic_no_partials() {
     for i in 0..200 {
         write(&t.path(&format!("sm/f{i}")), format!("data-{i}").as_bytes());
     }
+    // A stale sidecar from an earlier interrupted or differently configured
+    // run is overwritten by the atomic small-file path and renamed away.
+    write(&t.path("smd/.f7.pcp-partial"), b"stale");
     run_ok(&[
         "-a",
         &format!("{}/", t.s("sm")),
@@ -1035,6 +1029,28 @@ fn small_files_atomic_no_partials() {
         .count();
     assert_eq!(partials, 0);
     assert_eq!(read(&t.path("smd/f7")), b"data-7");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn small_file_failure_never_publishes_partial_contents() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"complete contents");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("PCP_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "/f")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(23));
+    assert!(
+        !t.path("dst/f").exists(),
+        "the final name must not appear before the atomic rename"
+    );
+    assert_eq!(read(&t.path("dst/.f.pcp-partial")), b"complete contents");
+
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/f")), b"complete contents");
+    assert!(!t.path("dst/.f.pcp-partial").exists());
 }
 
 // ---- Review round 4 (integrity) ----
@@ -1382,64 +1398,493 @@ fn ignore_conflicts_with_rm() {
     assert!(t.path("tree/hello.txt").is_file());
 }
 
-// Resume: a successful transfer leaves no marker behind, and the retained
-// journal is authoritative — a completed file is skipped on a plain rerun even
-// if the destination was externally deleted, while -c bypasses the journal.
+// Ordinary copies keep no historical completion state: the current destination
+// determines what a later invocation repairs.
 #[test]
-fn resume_marker_lifecycle_and_journal_authority() {
+fn ordinary_rerun_reconciles_destination() {
     let t = Tmp::new();
     write(&t.path("src/f.bin"), b"hello world");
     set_mtime(&t.path("src/f.bin"), 1_600_000_000);
-
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(read(&t.path("dst/f.bin")), b"hello world");
-    assert!(
-        !t.path("dst/.pcp-transfer-session.json").exists(),
-        "marker must be removed after a successful transfer"
-    );
-
-    // The journal, not the destination, decides completeness. Delete the dest
-    // file; a plain rerun trusts the journal and does not recopy it.
     fs::remove_file(t.path("dst/f.bin")).unwrap();
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    assert!(
-        !t.path("dst/f.bin").exists(),
-        "a journal-complete file is skipped without a destination stat"
-    );
-    assert!(!t.path("dst/.pcp-transfer-session.json").exists());
-
-    // -c ignores the journal and reconciles against the real destination.
-    run_ok(&["-a", "-c", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(read(&t.path("dst/f.bin")), b"hello world");
-
-    // --no-resume also ignores the journal (independent of -c).
-    fs::remove_file(t.path("dst/f.bin")).unwrap();
-    run_ok(&["-a", "--no-resume", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/f.bin")), b"hello world");
 }
 
-// A source file that would map onto the reserved marker path is refused rather
-// than clobbering the interlock.
 #[test]
-fn resume_reserved_marker_path_is_protected() {
+fn ordinary_copy_needs_no_writable_history_directory() {
     let t = Tmp::new();
-    write(
-        &t.path("src/.pcp-transfer-session.json"),
-        b"not really a marker",
-    );
-    write(&t.path("src/ok.bin"), b"fine");
-    let out = pcp(&["-a", &t.s("src/"), &t.s("dst/")]);
-    // The clash is reported and exit is non-zero, but other files still land.
+    write(&t.path("src/f"), b"data");
+    // A regular file cannot contain an application state directory. Ordinary
+    // copies must ignore both locations because history is opt-in.
+    write(&t.path("not-a-directory"), b"occupied");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("XDG_STATE_HOME", t.s("not-a-directory"))
+        .env("HOME", t.s("not-a-directory"))
+        .output()
+        .unwrap();
     assert!(
-        !out.status.success(),
-        "reserved-path clash must fail the run"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    assert_eq!(read(&t.path("dst/f")), b"data");
+}
+
+// An explicitly requested checkpoint is retained after a copy error and is
+// authoritative on retry. A source metadata change invalidates its record.
+#[cfg(debug_assertions)]
+#[test]
+fn checkpoint_is_explicit_retained_and_source_sensitive() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    write(&t.path("src/fail/other"), b"other");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let checkpoint = t.s("copy.checkpoint");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args([
+            "-a",
+            "--no-progress",
+            "--checkpoint",
+            &checkpoint,
+            &t.s("src/"),
+            &t.s("dest/"),
+        ])
+        .env("PCP_TEST_FAIL_SETMETA", "fail")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(23));
+    assert!(t.path("copy.checkpoint").is_file());
+
+    // Changing mode under -a makes the source fingerprint differ, so this file
+    // is checked and restored rather than checkpoint-skipped.
+    fs::set_permissions(t.path("src/f"), fs::Permissions::from_mode(0o600)).unwrap();
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    fs::remove_file(t.path("dest/f")).unwrap();
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dest/"),
+    ]);
+    assert_eq!(read(&t.path("dest/f")), b"data");
+    assert_eq!(
+        fs::metadata(t.path("dest/f")).unwrap().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        !t.path("copy.checkpoint").exists(),
+        "a clean retry removes its checkpoint"
+    );
+}
+
+// A checkpoint-complete file is still a claimed destination: a second source that
+// later maps onto the same path is a collision, not a silent overwrite.
+#[cfg(debug_assertions)]
+#[test]
+fn checkpoint_skip_still_detects_collision() {
+    let t = Tmp::new();
+    write(&t.path("A/x"), b"from A");
+    write(&t.path("A/fail/y"), b"failure trigger");
+    fs::create_dir_all(t.path("B")).unwrap();
+    let checkpoint = t.s("copy.checkpoint");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args([
+            "-a",
+            "--no-progress",
+            "--checkpoint",
+            &checkpoint,
+            &t.s("A/"),
+            &t.s("B/"),
+            &t.s("dest/"),
+        ])
+        .env("PCP_TEST_FAIL_SETMETA", "fail")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(23));
+    assert_eq!(read(&t.path("dest/x")), b"from A");
+    write(&t.path("B/x"), b"from B");
+    let out = pcp(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("A/"),
+        &t.s("B/"),
+        &t.s("dest/"),
+    ]);
+    assert!(!out.status.success(), "ambiguous mapping must be reported");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("reserved"),
-        "stderr should explain the reservation: {err}"
+    assert!(err.contains("same destination"), "stderr: {err}");
+    assert_eq!(read(&t.path("dest/x")), b"from A", "must not be clobbered");
+}
+
+// A read-only source root: the copy succeeds, the root ends up 0555, and a
+// rerun into the now read-only destination works too.
+#[test]
+fn readonly_root_copies_and_reruns() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o555)).unwrap();
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o555);
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o555);
+    // No implicit history: deleting a destination file makes the next run
+    // restore it from the read-only source.
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_file(t.path("dst/f")).unwrap();
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/f")), b"data");
+}
+
+// Several content sources map onto the destination root; the last one's
+// metadata wins, as for any other directory.
+#[test]
+fn multiple_content_sources_root_meta() {
+    let t = Tmp::new();
+    write(&t.path("A/a"), b"a");
+    write(&t.path("B/b"), b"b");
+    fs::set_permissions(t.path("A"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(t.path("B"), fs::Permissions::from_mode(0o555)).unwrap();
+    run_ok(&["-a", &t.s("A/"), &t.s("B/"), &t.s("dest/")]);
+    assert_eq!(fs::metadata(t.path("dest")).unwrap().mode() & 0o777, 0o555);
+    assert_eq!(read(&t.path("dest/a")), b"a");
+    assert_eq!(read(&t.path("dest/b")), b"b");
+}
+
+// Directories pcp had to open up (no owner write bit) get their own mode back
+// at the end when nothing else sets it (no -p); with -p the source mode wins.
+#[test]
+fn opened_up_directories_get_their_mode_back() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f"), b"data");
+    fs::set_permissions(t.path("src/sub"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(t.path("dst/sub")).unwrap();
+    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o555)).unwrap();
+    run_ok(&["-r", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/sub/f")), b"data");
+    assert_eq!(
+        fs::metadata(t.path("dst/sub")).unwrap().mode() & 0o777,
+        0o555
     );
-    assert_eq!(read(&t.path("dst/ok.bin")), b"fine");
+    assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o555);
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(
+        fs::metadata(t.path("dst/sub")).unwrap().mode() & 0o777,
+        0o755
+    );
+}
+
+// A directory metadata failure is a copy error (exit 23), not a footnote.
+#[cfg(debug_assertions)]
+#[test]
+fn root_meta_failure_is_visible() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst")])
+        .env("PCP_TEST_FAIL_SETMETA", "dst")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(23), "stderr: {err}");
+    assert!(err.contains("injected"), "stderr: {err}");
+    assert_eq!(read(&t.path("dst/f")), b"data");
+}
+
+// A quick-check-identical file whose metadata repair fails is not checkpointed
+// as complete, so the next run repairs it instead of skipping it.
+#[cfg(debug_assertions)]
+#[test]
+fn checkpoint_records_quick_check_only_after_meta_repair() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    let before = fs::metadata(t.path("dst/f")).unwrap().mode() & 0o777;
+    assert_ne!(before, 0o600);
+    fs::set_permissions(t.path("src/f"), fs::Permissions::from_mode(0o600)).unwrap();
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let checkpoint = t.s("copy.checkpoint");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args([
+            "-a",
+            "--no-progress",
+            "--checkpoint",
+            &checkpoint,
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("PCP_TEST_FAIL_SETMETA", "f")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(23));
+    assert_eq!(
+        fs::metadata(t.path("dst/f")).unwrap().mode() & 0o777,
+        before
+    );
+    assert!(t.path("copy.checkpoint").is_file());
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(
+        fs::metadata(t.path("dst/f")).unwrap().mode() & 0o777,
+        0o600,
+        "the failed repair must not have been checkpointed as complete"
+    );
+    assert!(!t.path("copy.checkpoint").exists());
+}
+
+// The read-only modes create nothing, not even the destination directory.
+#[test]
+fn readonly_modes_create_nothing() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    let checkpoint = t.s("dry-run.checkpoint");
+    let out = pcp(&["-a", "--verify-only", &t.s("src/"), &t.s("dst/")]);
+    assert!(
+        !t.path("dst").exists(),
+        "--verify-only must not create the destination"
+    );
+    assert!(!out.status.success(), "everything is missing");
+    let out = pcp(&[
+        "-a",
+        "-n",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(out.status.success());
+    assert!(
+        !t.path("dst").exists(),
+        "--dry-run must not create the destination"
+    );
+    assert!(
+        !t.path("dry-run.checkpoint").exists(),
+        "--dry-run must not create a checkpoint"
+    );
+}
+
+// Different spellings of the same local path are one job.
+#[cfg(debug_assertions)]
+#[test]
+fn checkpoint_identity_is_spelling_independent() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    write(&t.path("src/fail/y"), b"trigger");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let dotted = format!("{}/./src/", t.s(""));
+    let checkpoint = t.s("copy.checkpoint");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args([
+            "-a",
+            "--no-progress",
+            "--checkpoint",
+            &checkpoint,
+            &dotted,
+            &t.s("dst/"),
+        ])
+        .env("PCP_TEST_FAIL_SETMETA", "fail")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(23));
+    fs::remove_file(t.path("dst/f")).unwrap();
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(
+        !t.path("dst/f").exists(),
+        "same checkpoint identity, so the explicitly trusted file is skipped"
+    );
+}
+
+// A destination removed between attempts makes an explicit checkpoint describe
+// nothing, so the retry resets it and starts over.
+#[cfg(debug_assertions)]
+#[test]
+fn removed_destination_restarts() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"aaaa");
+    write(&t.path("src/fail/secret"), b"secret");
+    let checkpoint = t.s("copy.checkpoint");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args([
+            "-a",
+            "--no-progress",
+            "--checkpoint",
+            &checkpoint,
+            &t.s("src/"),
+            &t.s("dest/"),
+        ])
+        .env("PCP_TEST_FAIL_SETMETA", "fail")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(23));
+    assert!(t.path("copy.checkpoint").is_file());
+    run_ok(&["--rm", &t.s("dest")]);
+    assert!(!t.path("dest").exists());
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dest/"),
+    ]);
+    assert_eq!(
+        read(&t.path("dest/a")),
+        b"aaaa",
+        "the reset checkpoint must not skip it"
+    );
+    assert_eq!(read(&t.path("dest/fail/secret")), b"secret");
+    assert!(!t.path("copy.checkpoint").exists());
+}
+
+#[test]
+fn missing_destination_does_not_replace_an_unrelated_checkpoint_path() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"data");
+    write(&t.path("important"), b"not a checkpoint");
+    let out = pcp(&[
+        "-a",
+        "--checkpoint",
+        &t.s("important"),
+        &t.s("src/"),
+        &t.s("dest/"),
+    ]);
+    assert!(!out.status.success());
+    assert_eq!(read(&t.path("important")), b"not a checkpoint");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a PCP checkpoint"), "stderr: {err}");
+}
+
+// Two ordinary copies into one tree behave like rsync: the union lands, and a
+// later invocation checks current destination state rather than hidden history.
+#[test]
+fn concurrent_copies_union() {
+    let t = Tmp::new();
+    for i in 0..200 {
+        write(&t.path(&format!("A/a{i}")), b"a");
+        write(&t.path(&format!("B/b{i}")), b"b");
+    }
+    let spawn = |src: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pcp"))
+            .args(["-a", "--no-progress", &t.s(src), &t.s("dest/")])
+            .spawn()
+            .unwrap()
+    };
+    let (mut a, mut b) = (spawn("A/"), spawn("B/"));
+    assert!(a.wait().unwrap().success());
+    assert!(b.wait().unwrap().success());
+    for i in 0..200 {
+        assert_eq!(read(&t.path(&format!("dest/a{i}"))), b"a");
+        assert_eq!(read(&t.path(&format!("dest/b{i}"))), b"b");
+    }
+    fs::remove_file(t.path("dest/a7")).unwrap();
+    run_ok(&["-a", &t.s("A/"), &t.s("dest/")]);
+    assert_eq!(read(&t.path("dest/a7")), b"a");
+}
+
+// A destination given as a symlink to a directory is that directory, whether
+// or not it's spelled with a trailing slash: the link survives, the payload
+// lands in its target.
+#[test]
+fn symlink_destination_is_followed() {
+    for spelling in ["link", "link/"] {
+        let t = Tmp::new();
+        write(&t.path("src/f"), b"hi");
+        fs::create_dir_all(t.path("real")).unwrap();
+        std::os::unix::fs::symlink("real", t.path("link")).unwrap();
+        run_ok(&["-a", &t.s("src/"), &t.s(spelling)]);
+        assert!(
+            fs::symlink_metadata(t.path("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{spelling}: the symlink must survive"
+        );
+        assert_eq!(read(&t.path("real/f")), b"hi", "{spelling}");
+    }
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"hi");
+    fs::create_dir_all(t.path("real")).unwrap();
+    std::os::unix::fs::symlink("real", t.path("link")).unwrap();
+    run_ok(&["-a", &t.s("src"), &t.s("link")]);
+    assert!(fs::symlink_metadata(t.path("link"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(read(&t.path("real/src/f")), b"hi");
+}
+
+// The copy-into-itself guard resolves paths the way the kernel does: `..`
+// after a symlink pops the link's target, so a destination that physically
+// lands inside the source is refused even when it lexically looks elsewhere.
+#[test]
+fn self_copy_guard_sees_through_symlinks() {
+    let t = Tmp::new();
+    write(&t.path("src/inner/f"), b"x");
+    std::os::unix::fs::symlink(t.path("src/inner"), t.path("link")).unwrap();
+    // link/../out == src/out: inside the source.
+    let out = pcp(&["-a", &t.s("src/"), &t.s("link/../out/")]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("into itself"), "stderr: {err}");
+    assert!(!t.path("src/out").exists());
+}
+
+// Metadata-only reconciliation is a valid checkpoint completion. The explicit
+// checkpoint then trusts it on retry, just like a transferred completion.
+#[cfg(debug_assertions)]
+#[test]
+fn checkpoint_records_metadata_only_reconcile() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"");
+    write(&t.path("src/fail/y"), b"trigger");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    set_mtime(&t.path("src/f"), 1_600_000_001);
+    let checkpoint = t.s("copy.checkpoint");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .args([
+            "-a",
+            "--no-progress",
+            "--checkpoint",
+            &checkpoint,
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("PCP_TEST_FAIL_SETMETA", "fail")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(23));
+    assert_eq!(
+        fs::metadata(t.path("dst/f")).unwrap().mtime(),
+        1_600_000_001
+    );
+    fs::remove_file(t.path("dst/f")).unwrap();
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(
+        !t.path("dst/f").exists(),
+        "the metadata-only reconcile must have been checkpointed"
+    );
 }
 
 // Unsupported rsync flags get a helpful, specific error (not clap's generic
