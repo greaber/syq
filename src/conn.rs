@@ -196,6 +196,9 @@ pub struct RemoteSpec {
     pub host: String,
     pub rsh: Vec<String>,
     pub pcp_path: Option<String>,
+    /// Suppress the "falling back to ssh" notice when TCP is only the default
+    /// (not explicitly requested), so ordinary transfers stay quiet.
+    pub quiet_tcp: bool,
     /// Shared across clones so workers see the TCP setup done on the control connection.
     pub tcp: std::sync::Arc<std::sync::Mutex<Option<TcpInfo>>>,
 }
@@ -397,7 +400,7 @@ fn probe_reachable(advertised: &[(String, u32)], port: u16) -> Vec<(String, u32)
                 .to_socket_addrs()
                 .ok()
                 .and_then(|mut it| it.next())
-                .map(|sa| TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1500)).is_ok())
+                .map(|sa| TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1000)).is_ok())
                 .unwrap_or(false);
             let _ = tx.send((i, addr, speed, ok));
         });
@@ -495,7 +498,11 @@ impl Endpoint {
                             if let Some(i) = g.as_mut() {
                                 if !i.failed {
                                     i.failed = true;
-                                    eprintln!("pcp: {}: TCP data connection failed ({e:#}); falling back to ssh (is port {} open?)", spec.label(), info.port);
+                                    if !spec.quiet_tcp {
+                                        eprintln!("pcp: {}: TCP data connection failed ({e:#}); falling back to ssh (is port {} open?)", spec.label(), info.port);
+                                    } else if crate::transfer::debug() {
+                                        eprintln!("pcp: {}: TCP data connection failed ({e:#}); using ssh", spec.label());
+                                    }
                                 }
                             }
                         }

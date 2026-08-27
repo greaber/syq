@@ -229,11 +229,12 @@ ordering question for them.
 
 ssh caps every stream at a few hundred MB/s of cipher CPU, and its 2 MB
 per-channel flow-control window caps a stream at roughly `2 MB / RTT` on long
-links (≈7 MB/s at 265 ms). `--tcp` keeps ssh for authentication and control
-only: the remote opens a listener on a port from `--tcp-ports` (default
+links (≈7 MB/s at 265 ms). So by default (unless `--no-tcp`) pcp keeps ssh for
+authentication and control only and moves the data over separate TCP
+connections: the remote opens a listener on a port from `--tcp-ports` (default
 47600-47699), and the data connections are plain TCP sockets carrying
 AES-256-GCM records keyed by a secret exchanged over the ssh session
-(`--tcp-plain` skips the encryption on trusted networks). If the port can't be
+(`--tcp-plain` skips the encryption on trusted networks; `--no-tcp` sends data over the ssh connection instead). If the port can't be
 reached — a firewall, typically — pcp says so once and falls back to ssh data
 connections, so `--tcp` is always safe to pass.
 
