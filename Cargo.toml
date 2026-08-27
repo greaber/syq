@@ -23,7 +23,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc", "use-std"] }
-jwalk = "0.8"
+jwalk = "0.9"
 ignore = "0.4"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = "0.13"
