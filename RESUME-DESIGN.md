@@ -4,165 +4,175 @@
 
 ## Purpose
 
-PCP already resumes without retransmitting most data. On a repeated archive
-copy, files whose size and modification time match are skipped. For an
-incomplete large file, PCP hashes the source and `.pcp-partial` file in blocks
-and sends only the blocks that differ.
+PCP already avoids retransmitting most completed data. A repeated archive copy
+skips files whose size and modification time match, and an incomplete large
+file can be resumed by comparing the source with its `.pcp-partial` file in
+blocks.
 
-That design is data-efficient, but resuming a tree with many small files still
-requires scanning the source and issuing destination metadata requests for the
-whole tree. On NFS, those destination `stat` operations can dominate the time
-before useful work resumes.
+The remaining cost is planning: resuming or rerunning a tree with millions of
+small files still requires destination metadata requests for the entire tree.
+On NFS, those `stat` operations can take longer than the useful transfer.
 
-This design adds:
+This design adds two deliberately separate pieces of state:
 
-1. a persistent destination-side session marker, which prevents an unrelated
-   PCP command from accidentally using the same destination; and
-2. a local append-only journal of files known to have completed, which lets a
-   repeated invocation avoid destination metadata requests for those files.
+1. a **destination marker on the destination filesystem**, visible through
+   every host that mounts that filesystem, which warns other PCP jobs that the
+   destination is owned by an incomplete transfer; and
+2. a **persistent local completion journal**, keyed by the logical copy job,
+   which lets interrupted resumes and later completed reruns avoid destination
+   metadata requests for files PCP previously completed successfully.
 
-The design deliberately targets the common case: a transfer is interrupted
-and the same user reruns the same command from the same coordinating machine.
-It is not intended to be a distributed transaction system.
+The design is not a distributed transaction or lease system. It provides the
+largest ordinary-use benefits with one atomic marker creation and an
+append-only local record.
 
 ## Operating assumptions
 
-Version 1 relies on the following assumptions:
+Version 1 relies on these assumptions:
 
-- The source is not intentionally changed during or between attempts.
-- The destination is not independently changed by another tool or user.
-- A transfer is normally resumed by the same user on the same coordinating
-  machine.
-- The common failures are Ctrl-C, a lost connection, or a crashed PCP process.
-- It is acceptable for an extremely narrow simultaneous-resume race to remain.
+- The source is not intentionally modified while a copy is running.
+- The destination is not independently modified or deleted outside PCP.
+- A transfer is normally resumed from the same coordinating machine and user.
+- Common failures are Ctrl-C, a lost connection, or a crashed PCP process.
+- Two identical resume attempts may rarely overlap; with an unchanged source,
+  they intend to write the same content.
 - Power-loss durability is promised only when the existing `--fsync` option is
   used.
 
-PCP should continue its existing post-transfer source re-stat. The assumptions
-above mean that PCP does not need a remote per-file completion manifest,
-distributed leases, fencing tokens, or full destination verification during a
-normal resume.
+PCP retains its existing post-transfer source re-stat. The journal's source
+fingerprints catch ordinary changes between attempts, but do not claim to
+detect content changed while size and nanosecond mtime were deliberately
+preserved.
 
 ## Explicit non-goals
 
-The first implementation will not attempt to guarantee correct resume when:
+Version 1 does not attempt to guarantee correct fast resume when:
 
-- source files are modified while the copy is running;
+- source files change during a running copy;
 - completed destination files are deleted or modified outside PCP;
-- two resume attempts start at almost exactly the same time;
-- a session is moved automatically to a different coordinating machine;
-- the same filesystem destination is reached through different remote hosts,
-  users, mount namespaces, or aliases that normalize to different endpoint
-  identities; or
+- two matching resume processes start at almost exactly the same time;
+- a session is automatically adopted by a different coordinating machine; or
 - a destination acknowledges a non-`--fsync` write and subsequently loses it
-  in a machine or storage-system power failure.
+  during a machine or storage-system power failure.
 
-Users who need to check for external destination changes can use the existing
-quick comparison, `-c`, or `--verify-only`. Those checks should remain separate
-from the fast ordinary-resume path.
+It also does not add held advisory locks, leases, fencing tokens, PID/boot-ID
+liveness records, a remote per-file manifest, or a distributed coordinator.
 
-## Terminology
+Users who want destination verification must use `-c`, `--verify-only`, or a
+future explicit destination-recheck option. Those modes must bypass
+journal-based destination skipping.
 
-### Session
+## Identities
 
-A **session** is the logical transfer across all of its interrupted attempts.
-It has a randomly generated 128-bit session ID. The session ID is an identity,
-not a secret or authentication credential.
+### Job identity and job key
 
-### Attempt
+A **job identity** describes a repeatable logical copy. It contains:
 
-An **attempt** is one running PCP process participating in a session. Each
-attempt records its coordinator host, boot identity, PID, and process start
-time in the local journal.
+- the source endpoint and normalized source root or roots;
+- trailing-slash "copy contents" semantics for every source;
+- the destination endpoint and normalized destination mapping;
+- content- and metadata-affecting options; and
+- the state format version.
 
-### Remote marker
+Content-affecting options include recursive traversal, symlink handling,
+archive and metadata flags, devices and special files, `--inplace`, and
+`--atomic`. Worker count, progress display, verbosity, TCP selection, and
+compression are operational and do not create a different job.
 
-The **remote marker** is a small persistent JSON document on the destination
-endpoint. Its existence claims the normalized destination for one session.
+The **job key** is a stable cryptographic hash of the encoded job identity. It
+names the local journal, so rerunning the same job can find its state without a
+destination marker or remembered session ID.
 
-The marker is created atomically, but PCP does not hold an advisory lock on it.
+Existing local paths should be canonicalized. For a nonexistent final
+component, canonicalize the nearest existing parent and normalize the
+remaining components lexically. Remote endpoints should perform equivalent
+normalization themselves where possible.
 
-### Local journal
+The job key is for finding local state, not for locating the destination
+marker. A marker's physical location must remain the same when the same NFS
+directory is mounted under different absolute paths on different machines.
 
-The **local journal** is an append-only JSON Lines file on the machine running
-the orchestrator. It contains the session header, attempt records, and
-completion records.
+### Session identity
 
-For a push, that is normally the invoking machine. For direct or detached
-remote-to-remote operation, it is the source machine where the PCP
-orchestrator actually runs.
+A **session** is one destination ownership interval, including any interrupted
+attempts that resume it. It has a random 128-bit session ID. The ID is an
+identity, not a secret.
+
+A new invocation after a previously successful copy starts a new session, but
+reuses the persistent job journal's completion records.
 
 ## State locations
 
-State must not be written into the source directory. The source may be
-read-only, may be a single file, and may itself be copied recursively. Keeping
-PCP state there would also create naming and multi-destination conflicts.
+State is never written into the source tree. Sources may be read-only, may be
+single files, and may be reused for several destinations.
 
-### Local journal location
+### Local journal
 
 Use:
 
 ```text
-$XDG_STATE_HOME/pcp/transfers/<session-id>.jsonl
+$XDG_STATE_HOME/pcp/transfers/<job-key>.jsonl
 ```
 
 with this fallback when `XDG_STATE_HOME` is unset:
 
 ```text
-$HOME/.local/state/pcp/transfers/<session-id>.jsonl
+$HOME/.local/state/pcp/transfers/<job-key>.jsonl
 ```
 
-The directory should be mode `0700` and journal files should be mode `0600`.
-`/tmp` is not suitable because the journal must survive reboot-time or periodic
-temporary-file cleanup.
+The directory is mode `0700` and journal files are mode `0600`. `/tmp` is not
+suitable because the state must survive reboot-time and periodic cleanup.
 
-### Remote marker location
+"Local" means local to the process running the orchestrator. For an ordinary
+push that is the invoking machine; for direct or detached remote-to-remote
+operation it is normally the source machine where PCP moved the orchestrator.
 
-The destination endpoint should keep markers in its per-user PCP state
-directory, keyed by a stable hash of the normalized destination identity:
+The journal remains after successful sessions. It may be compacted, but is not
+deleted merely because the destination marker was removed.
+
+### Destination marker
+
+The marker must live **on the destination filesystem**, not in the destination
+host's home or XDG state directory. This is the cross-machine interlock: if j2,
+j3, j4, and j5 mount the same NFS directory, each host must observe the same
+marker through that mount.
+
+For a directory destination scope, use a reserved destination-relative path:
 
 ```text
-$XDG_STATE_HOME/pcp/destinations/<destination-key>/session.json
+<destination-root>/.pcp-transfer-session.json
 ```
 
-with the analogous `$HOME/.local/state` fallback.
+If the destination directory does not exist yet, PCP may create the empty root
+first, then must create the marker before creating any payload beneath it.
+Racing processes may both create or observe the empty root; exclusive marker
+creation chooses the sole session owner.
 
-Keeping the marker outside the copied tree prevents it from colliding with a
-source file or being included in the transfer. It also avoids requiring write
-access to the source directory.
+For an exact single-file destination, use a reserved sidecar in its parent:
 
-This v1 location coordinates jobs that use the same destination endpoint and
-user. It does not attempt to recognize that two different remote hosts happen
-to mount the same underlying NFS directory.
+```text
+<destination-parent>/.<destination-name>.pcp-transfer-session.json
+```
 
-No global dictionary from destinations to nonces is required. The remote
-marker is found from the destination key and supplies the session ID; that ID
-directly names the local journal.
+The marker name is relative to the destination object rather than hashed from
+its host-local absolute path. Consequently, different mount prefixes still
+reach the same physical marker.
 
-## Normalized transfer identity
+The reserved marker path is internal PCP metadata. PCP must never transfer a
+source entry onto it, include it in destination comparisons, or expose it as a
+user payload path. If a requested mapping collides with the reserved name, PCP
+must stop with a clear error rather than overwrite either object.
 
-The session header and remote marker must contain enough information to reject
-using a journal for a different path mapping. At minimum, record:
+Creating and removing a marker inside a directory changes that directory's
+mtime. When metadata preservation is requested, PCP must reapply the intended
+destination-root metadata after removing the marker; otherwise marker cleanup
+would spoil an otherwise correct archive copy.
 
-- the source endpoint and normalized source root or roots;
-- whether each source uses trailing-slash "copy contents" semantics;
-- the destination endpoint and normalized destination root;
-- the effective content and metadata options;
-- the state format version; and
-- the PCP session ID.
+Creating the marker requires write permission on the destination directory or,
+for an exact file destination, its parent. That is consistent with the ability
+to create or replace the requested destination.
 
-Content-affecting options include recursive traversal, symlink handling,
-archive/metadata flags, devices and special files, `--inplace`, and `--atomic`.
-Operational options such as progress display, verbosity, worker count, TCP
-selection, and compression do not need to be identical for a resume.
-
-Existing paths should be canonicalized by the endpoint. A nonexistent final
-component should be normalized lexically relative to the canonical nearest
-existing parent. The normalized identity is stored in the marker as well as
-hashed into the destination key, so an accidental hash collision or
-normalization bug can be detected before resuming.
-
-## Remote marker format
+## Destination marker format
 
 An illustrative marker is:
 
@@ -170,233 +180,314 @@ An illustrative marker is:
 {
   "format": 1,
   "session_id": "80e00c95b8ff4d108e125bc8d29166fd",
+  "job_identity": "sha256:...",
   "source_identity": "sha256:...",
-  "destination_identity": "sha256:...",
   "options_identity": "sha256:...",
   "created_at": "2026-08-27T15:00:00Z",
   "coordinator_host": "workstation-a"
 }
 ```
 
-The marker is small and rewritten only if the marker format itself must be
-upgraded. Per-file completion is not written remotely.
+The marker contains no per-file state and is not periodically rewritten. Its
+existence means that the destination may be incomplete. Its session ID lets
+the owning coordinator distinguish a resume from an unrelated transfer.
+
+The marker is created with exclusive-create semantics (`O_CREAT|O_EXCL`, Rust
+`create_new`, or the endpoint equivalent). PCP must not implement marker
+ownership as a separate check followed by an ordinary overwrite.
+
+The marker is a persistent claim, not a held advisory lock. A crashed process
+leaves it behind intentionally so another machine cannot treat the incomplete
+destination as fresh.
 
 ## Local journal format
 
-The journal is JSON Lines rather than one JSON array. Rewriting a large JSON
-document for every completed file would be increasingly expensive and would
-make interruption recovery more fragile.
+The local journal is append-only JSON Lines. Rewriting a large JSON array for
+every completion would be expensive and fragile under interruption.
 
 Illustrative records are:
 
 ```json
-{"type":"header","format":1,"session_id":"80e00c95b8ff4d108e125bc8d29166fd","source_identity":"sha256:...","destination_identity":"sha256:...","options_identity":"sha256:..."}
-{"type":"attempt","host":"workstation-a","boot_id":"...","pid":12345,"process_start":987654321,"started_at":"2026-08-27T15:00:00Z"}
+{"type":"header","format":1,"job_identity":"sha256:..."}
+{"type":"session_start","session_id":"80e00c95b8ff4d108e125bc8d29166fd","started_at":"2026-08-27T15:00:00Z"}
 {"type":"complete","path_b64":"YS9maWxlMQ==","kind":"file","size":1234,"mtime_sec":1700000000,"mtime_nsec":123456789,"basis":"transferred"}
 {"type":"complete","path_b64":"Yi9maWxlMg==","kind":"file","size":9876,"mtime_sec":1700000001,"mtime_nsec":987654321,"basis":"quick-check"}
+{"type":"session_complete","session_id":"80e00c95b8ff4d108e125bc8d29166fd","completed_at":"2026-08-27T15:30:00Z"}
 ```
 
-Paths must be encoded without assuming UTF-8; base64 is sufficient for the JSON
-format. The implementation may use a compact binary journal later without
-changing the session semantics.
-
-The latest valid completion record for a path wins. This permits a file to be
-reprocessed and recorded again without editing earlier journal contents.
+Paths are encoded without assuming UTF-8; base64 is sufficient for JSON.
+Completion records persist across sessions. The latest valid completion record
+for a destination-relative path wins.
 
 A malformed or unterminated final line is treated as a crash-truncated tail and
-ignored. A malformed interior record indicates journal corruption and should
-abort fast resume rather than guessing.
+ignored. A malformed interior record means the journal is corrupt; PCP must
+abort fast resume rather than guess.
 
-## Creating a new session
+The implementation may later replace JSONL with a compact binary or indexed
+format without changing these semantics.
 
-For a destination with no marker:
+## Starting a new session
 
-1. Normalize the source, destination, and semantic options.
-2. Generate a random 128-bit session ID.
-3. Create the remote marker with exclusive-create semantics
-   (`O_CREAT|O_EXCL`, Rust `create_new`, or the endpoint equivalent).
-4. If exclusive creation reports that the marker already exists, do not
-   overwrite it. Read the winner and restart the existing-marker decision flow.
-5. Create the local journal named by the session ID and write its header and
-   first attempt record.
-6. If local journal creation fails, remove the remote marker only after
-   rereading it and confirming that it still contains this session ID. Then
-   abort without starting file operations.
-7. Begin the ordinary scan and transfer.
+Before payload operations, PCP determines the effective destination scope and
+the corresponding marker location.
 
-Atomic remote creation is the only required interlock. PCP does not perform a
-separate check-then-write sequence, because two new jobs could otherwise both
-observe an absent marker and proceed.
+When no marker exists and the local journal is absent or its latest session is
+complete:
 
-## Resuming an existing session
+1. Normalize and validate the job identity.
+2. Open or create the job-keyed local journal and validate its header.
+3. Generate a random 128-bit session ID.
+4. Create the destination marker atomically with exclusive-create semantics.
+5. If another process won creation, read its marker and restart the
+   existing-marker decision flow.
+6. Append and flush `session_start` to the local journal.
+7. If the journal update fails, reread the marker, remove it only if its session
+   ID is still ours, and abort before payload operations.
+8. Begin the ordinary source scan and transfer.
 
-When a remote marker exists:
+If an incomplete local session exists but its destination marker is missing,
+PCP should abort by default. The marker may have been removed manually or the
+destination may have been replaced. An explicit reset/recovery operation can
+start a new session while retaining safe completion records; v1 should not
+silently guess.
 
-1. Read and validate the marker format and destination identity.
-2. Use its session ID to locate the local journal.
-3. If no matching local journal exists, abort with a clear diagnostic. Automatic
-   cross-machine adoption is outside the first implementation.
-4. Validate the journal header against the current source, destination, and
-   semantic options. A mismatch aborts rather than silently starting a
-   different mapping in the same session.
-5. Read the most recent attempt record.
-6. If it names this coordinator host and boot, and the recorded PID still has
-   the same process start time, report that the transfer is already running and
-   abort.
-7. Otherwise append a new attempt record and proceed with resume.
+## Resuming an interrupted session
 
-The boot ID and process start time prevent a reused PID from being mistaken for
-the old PCP process. The process information is an ordinary-use liveness check,
-not an atomic lock. Two resume processes that execute the dead-process check at
-the same instant can both proceed; this race is accepted by the v1 assumptions.
+When a destination marker exists:
 
-## Recording completion
+1. Read and validate its format.
+2. Locate the local journal directly from the current job key.
+3. Validate the complete job identity stored in the journal and marker.
+4. If the matching session already has a durable `session_complete`, reread and
+   conditionally remove its stale marker, then restart the new-session flow.
+5. Otherwise, confirm that the journal's latest incomplete `session_start` has
+   the same session ID as the marker.
+6. If all identities match, resume using the existing completion records and
+   `.pcp-partial` files.
+7. If the journal is missing, the session IDs differ, or any identity differs,
+   abort. The marker belongs to another machine/job or local recovery state has
+   been lost.
+
+Version 1 does not inspect PID, boot ID, or process start time. Therefore, two
+identical commands on the same coordinator can both recognize the same session
+and overlap. This narrow race is accepted: with an unchanged source they write
+the same intended content. The destination marker still prevents unrelated
+jobs and other machines without the matching journal from proceeding.
+
+Automatic cross-machine adoption is not part of v1. A machine that sees an
+incomplete destination marker but lacks the matching local journal must stop;
+it must not silently create a fresh transfer over that destination.
+
+## Recording file completion
 
 A regular file becomes journal-complete only after:
 
-1. the destination reports that its write/finalize operation succeeded; and
-2. PCP's existing source re-stat confirms that the source size and modification
-   time did not change during the copy.
+1. the destination acknowledges its write or finalize operation; and
+2. PCP's existing source re-stat confirms that source kind, size, mtime
+   seconds, and mtime nanoseconds did not change during the copy.
 
-The completion record contains the source kind, size, mtime seconds, and mtime
-nanoseconds observed by that successful attempt. No additional source hashing
-is required for the normal journal path.
+The completion record stores that source fingerprint. No extra source hash is
+required on the ordinary fast path.
 
-A file that was found complete through the ordinary destination quick check may
-also be recorded with `basis: "quick-check"`. Doing so lets later attempts
-avoid repeating the same destination metadata request.
+A file found complete through a real destination quick check may also be
+recorded with `basis: "quick-check"`. Later sessions can then avoid repeating
+that destination metadata request.
 
 The first implementation may journal only regular files. Directories,
-symlinks, and special files can continue through the current planner; regular
+symlinks, and special files can continue through the existing planner; regular
 small files provide the primary NFS metadata benefit.
 
-## Using completion records
+## Using persistent completion records
 
-The source still must be scanned on resume so PCP can discover new and
-unfinished files. For every scanned regular file:
+The source must still be scanned on every invocation so PCP can discover new,
+removed, changed, and unfinished source entries. For every scanned regular
+file in a normal copy:
 
-1. Look up its latest journal completion record by destination-relative path.
-2. Compare the current source kind, size, and nanosecond mtime with the record.
-3. If they match, count the file as complete without issuing a destination
-   `stat` and without retransferring it.
-4. If they do not match, ignore the record and send the file through PCP's
-   existing destination probe, quick-check, partial hashing, and transfer flow.
+1. Look up its latest completion record by destination-relative path.
+2. Compare current source kind, size, and nanosecond mtime with the record.
+3. If they match, count the file complete without issuing a destination `stat`.
+4. Otherwise, ignore the record and use PCP's existing destination probe,
+   quick check, partial hashing, and transfer path.
 
-This inexpensive source fingerprint check catches common accidental source
-changes. It does not claim to detect content changed while size and mtime were
-deliberately preserved; changing the source is outside the v1 contract.
+This applies both to an interrupted resume and to a later invocation after a
+successful session. A completed rerun therefore performs a source scan and
+local journal lookups, but avoids most NFS destination metadata requests.
 
-Files with no completion record use the existing PCP behavior. In particular,
-an existing `.pcp-partial` remains the authoritative state for an unfinished
-large file and is compared block-by-block.
+Files without completion records retain existing behavior. An unfinished
+large `.pcp-partial` remains authoritative and is compared block by block.
+
+Journal trust must be bypassed when the user explicitly requests destination
+inspection:
+
+- `-c` must perform its destination block comparison;
+- `--verify-only` must inspect and hash the destination; and
+- a future `--recheck-destination` or `--ignore-journal` option should force
+  the ordinary destination metadata path without deleting the journal.
+
+Without such a mode, externally deleted or modified destination files may be
+skipped because the persistent journal records their earlier success. This is
+an explicit speed-versus-external-change tradeoff, not a verification claim.
+
+`--dry-run` must not create a marker, journal, or destination directory.
+`--verify-only` should read an existing marker and report that the destination
+may be incomplete, but it does not need to claim the destination with a new
+marker because it performs no writes. Neither mode may turn read-only planning
+into persistent state changes.
 
 ## Journal buffering and crash behavior
 
 Completion records may be buffered and flushed in batches by count or time.
 They do not require an `fsync` after every file.
 
-The ordering rule is important: a completion record is never generated before
+The ordering rule is strict: PCP never generates a completion record before
 destination success and source revalidation. Therefore:
 
-- If PCP crashes after the remote file completes but before its journal record
-  is flushed, the next attempt performs an unnecessary destination check or
-  retransmission. This is safe.
-- If the journal record is present, it represents a destination success already
-  acknowledged during this session under the operating assumptions.
-- A truncated last journal line is ignored, producing the same safe false
-  negative.
+- A crash after the destination succeeds but before the journal record is
+  flushed causes a safe false negative: the next attempt performs an
+  unnecessary destination check or retransmission.
+- A present completion record represents a destination success acknowledged
+  under this design's operating assumptions.
+- A truncated final record is ignored and likewise causes only repeated work.
 
-When `--fsync` is selected, destination success retains the stronger durability
-meaning already provided by that option. The local journal itself still need
-not be synchronously updated per file because loss of a completion record only
-causes repeated work.
+When `--fsync` is used, destination success retains the stronger durability
+meaning already provided by that option. Local journal loss can reduce resume
+speed or require recovery, but must never make PCP record a file before the
+destination acknowledged it.
 
-## Completion and cleanup
+## Successful completion and cleanup
 
-Only after the entire transfer, including deferred directory metadata, finishes
+Only after all payload work and deferred child-directory metadata finish
 without errors should PCP:
 
-1. flush the local journal;
-2. reread the remote marker and confirm that its session ID matches;
-3. remove the remote marker; and
-4. remove the local journal, or optionally retain it briefly as a diagnostic
-   completed-session record.
+1. flush pending file-completion records;
+2. reread the destination marker and confirm its session ID still matches;
+3. remove that marker;
+4. reapply the requested destination-root metadata, because marker removal
+   changed the root directory's mtime;
+5. append and flush `session_complete` for the active session; and
+6. retain the job-keyed local journal for later reruns.
 
-If PCP exits because of interruption or any transfer error, both marker and
-journal remain so the command can be resumed.
+This leaves only the interval of one final metadata operation between marker
+removal and durable session completion. Version 1 accepts that narrow cleanup
+window rather than adding a second marker or lease protocol. A crash in that
+window leaves an incomplete local session with no marker and therefore enters
+the explicit recovery path instead of being trusted as complete.
 
-## Missing or abandoned local state
+If PCP exits due to interruption or a transfer error before cleanup begins, the
+marker and journal remain. If conditional marker removal fails, PCP does not
+write `session_complete`. A defensive implementation may also recognize a
+matching completed session whose stale marker remains, conditionally remove
+that marker, and then begin a new session.
 
-If the remote marker exists but its local journal has been lost, PCP cannot use
-the fast journal path and should abort by default. The diagnostic should report
-the session ID, coordinator host, normalized destination, and marker location.
+Marker removal must never delete destination payload or `.pcp-partial` files.
 
-A later explicit recovery command may support either:
+## Missing, stale, or abandoned state
 
-- **adopt:** rebuild local knowledge using PCP's existing destination stats and
-  partial-file hashing, then create a replacement journal for the same session;
-  or
-- **reset:** remove the marker after confirmation and begin a new session.
+If the destination marker exists but the matching local journal does not, PCP
+must abort with a diagnostic containing the session ID, coordinator host,
+destination, and marker path. This is what protects a shared NFS destination
+when a different host encounters another host's interrupted copy.
 
-Neither operation is needed for the initial common-case implementation. Manual
-reset must never delete destination data or `.pcp-partial` files; a new session
-can safely reuse those partials through the existing block comparison.
+A later explicit recovery command may support:
+
+- **adopt:** inspect the destination using existing stats and partial hashing,
+  create a matching local journal, and continue the marked session; or
+- **reset:** conditionally remove the marker after confirmation and start a new
+  session.
+
+Neither is required for the first implementation. Reset never removes payload
+or partial files; the next session can reuse safe partials through existing
+block comparison.
+
+If a persistent completed journal exists but the destination marker is absent,
+normal reruns may trust its matching completion records under the operating
+assumptions. Users who may have changed the destination must select a
+destination-rechecking mode.
+
+## Large in-place files
+
+The journal improves recovery for explicit `--inplace` transfers: an
+interrupted file has no completion record and must re-enter the existing
+probe/block-resume path.
+
+It does **not** make in-place writes equivalent to partial-plus-rename. A
+concurrent reader can still observe mixed content, and an interrupted update
+has already modified the previous destination. Therefore this design does not
+change PCP's default for large files: partial-plus-rename remains the default,
+while `--inplace` stays an explicit space/behavior tradeoff.
+
+## Journal size and compaction
+
+JSONL is intentionally simple for v1, but a record per file is large. A tree of
+millions of files can produce a journal hundreds of megabytes long.
+
+After a clean session, PCP may compact the local journal atomically to:
+
+- one validated header;
+- the latest completion record for each destination-relative path; and
+- the most recent `session_complete` record.
+
+Compaction reduces replay of superseded records but not the one-record-per-file
+floor. If multi-million-file datasets are normal, a compact binary/indexed
+format should follow. Parsing local sequential state is still expected to be
+substantially cheaper than millions of NFS metadata round trips.
 
 ## Failure cases intentionally accepted
 
-### Simultaneous resume race
+### Simultaneous matching resumes
 
-Two processes can read the same dead attempt record before either appends its
-new attempt record. Both may then run. Avoiding this completely requires an
-atomic local lock or compare-and-swap mechanism. The first implementation
-accepts this unlikely race rather than adding lock lifecycle and filesystem
-compatibility complexity.
+Two matching processes can observe the same marker and local session before
+either makes progress. Both may proceed. Eliminating this completely requires
+a local lock or a distributed compare-and-swap/lease mechanism. Version 1
+accepts the race rather than adding lock lifecycle and stale-lock handling.
 
 ### Remote work briefly outliving the coordinator
 
-After the coordinating process dies, a remote server may still be finishing an
-in-flight filesystem operation before it notices the closed connection. An
-immediate resume can briefly overlap that operation. With an unchanged source,
-the old and new attempts write the same intended content. The first design does
-not add a remote lease or fencing system for this narrow window.
+After the coordinator dies, a destination server may still be finishing an
+in-flight operation before noticing the closed connection. An immediate resume
+can briefly overlap that work. With an unchanged source, both attempts write
+the same intended content. Version 1 adds no lease or fencing protocol for this
+narrow window.
 
 ### External destination changes
 
-A journal-complete file is not statted during fast resume. If another tool
-deletes or modifies it, fast resume can leave the destination incomplete or
-stale. Users requiring that guarantee must run with a verification workflow.
-This trade-off is what removes the destination metadata round trips that the
-journal is intended to avoid.
+Normal fast reruns do not stat journal-complete destination files. An external
+deletion or modification can therefore remain unnoticed. `-c`,
+`--verify-only`, and the future forced-recheck mode must bypass this shortcut.
 
 ## Expected benefit
 
-For archive copies, the current implementation already avoids sending bytes for
-completed files. The journal's main benefit is therefore faster planning and
-restart, not lower byte counts.
+For archive copies, PCP already avoids resending bytes for completed files.
+The journal improves planning and restart latency.
 
-For a large small-file tree on NFS, a resume should require:
+For a large small-file tree on shared NFS, a resume or completed rerun should
+require:
 
 - one source scan;
-- local journal lookups for known-complete files;
-- destination probes only for files absent from the journal or whose source
-  fingerprint changed; and
-- the existing block comparison for incomplete partials.
+- local completion-record lookups for known files;
+- destination probes only for unrecorded or source-changed files; and
+- existing block comparison for incomplete partials.
 
-This preserves PCP's current self-validating partial-file resume while removing
-most repeated destination metadata latency in the common interrupted-transfer
-case.
+The destination marker independently ensures that every machine mounting the
+same destination sees that another session may have left it incomplete.
 
 ## Implementation sequence
 
-1. Define normalization and session identity types.
-2. Add destination marker create/read/remove protocol operations.
-3. Implement local state-directory discovery and JSONL journal parsing.
-4. Record attempt identity and ordinary liveness diagnostics.
-5. Append completion records after destination success and source revalidation.
-6. Integrate journal lookups before destination `StatMany` planning.
-7. Remove marker and journal only after completely successful transfers.
-8. Add interruption, truncated-journal, live-PID, identity-mismatch, and
-   simultaneous-new-session tests.
-9. Benchmark cold resume versus journal resume on a representative NFS
-   small-file tree.
-
+1. Define job identity, job key, session ID, and marker-location rules.
+2. Add marker create/read/conditional-remove operations on the destination
+   filesystem.
+3. Implement persistent job-keyed JSONL journal parsing and truncated-tail
+   handling.
+4. Append completion records after destination success and source
+   revalidation.
+5. Integrate journal lookups before destination `StatMany` planning for normal
+   copies.
+6. Explicitly bypass journal skipping for `-c` and `--verify-only`.
+7. Append `session_complete`, remove only the matching marker, and retain the
+   journal after success.
+8. Add optional atomic compaction after clean sessions.
+9. Test shared-NFS visibility through two mount aliases, interrupted resume,
+   completed rerun, marker mismatch, missing journal, truncated journal,
+   reserved-path collision, and simultaneous marker creation.
+10. Benchmark cold planning, interrupted resume, and completed rerun on a
+    representative multi-million-file NFS tree.
