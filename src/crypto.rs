@@ -36,9 +36,10 @@ impl Cipher {
     }
     pub fn seal(&mut self, plain: &[u8]) -> Vec<u8> {
         let n = self.nonce();
+        let nonce = Nonce::try_from(n.as_slice()).expect("nonce length");
         self.aead
             .encrypt(
-                Nonce::from_slice(&n),
+                &nonce,
                 Payload {
                     msg: plain,
                     aad: &[],
@@ -48,9 +49,10 @@ impl Cipher {
     }
     pub fn open(&mut self, cipher: &[u8]) -> io::Result<Vec<u8>> {
         let n = self.nonce();
+        let nonce = Nonce::try_from(n.as_slice()).expect("nonce length");
         self.aead
             .decrypt(
-                Nonce::from_slice(&n),
+                &nonce,
                 Payload {
                     msg: cipher,
                     aad: &[],
@@ -161,6 +163,43 @@ impl<R: Read> Read for RecordReader<R> {
 
 pub fn random_bytes(n: usize) -> Vec<u8> {
     let mut v = vec![0u8; n];
-    getrandom::getrandom(&mut v).expect("getrandom");
+    getrandom::fill(&mut v).expect("getrandom");
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn encrypted_records_round_trip_across_nonce_counters() {
+        let key = [7; KEY_LEN];
+        let plain = vec![0x5a; RECORD_MAX + 19];
+        let mut encoded = Vec::new();
+        {
+            let cipher = Cipher::new(&key, 42, 1);
+            let mut writer = RecordWriter::new(&mut encoded, Some(cipher));
+            writer.write_all(&plain).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let cipher = Cipher::new(&key, 42, 1);
+        let mut reader = RecordReader::new(Cursor::new(encoded), Some(cipher));
+        let mut decoded = vec![0; plain.len()];
+        reader.read_exact(&mut decoded).unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn encrypted_records_reject_tampering() {
+        let key = [9; KEY_LEN];
+        let mut sender = Cipher::new(&key, 17, 0);
+        let mut ciphertext = sender.seal(b"authenticated payload");
+        ciphertext[0] ^= 1;
+
+        let mut receiver = Cipher::new(&key, 17, 0);
+        let error = receiver.open(&ciphertext).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 }
