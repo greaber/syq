@@ -5,3 +5,8 @@
 
 # Agent working notes / handoff plans (not committed).
 /current-plans
+
+.*.pcp-transfer-session.json
+.*.syq-transfer-session.json
+.pcp-transfer-session.json
+.syq-transfer-session.json

@@ -126,7 +126,7 @@ pub enum Request {
         port_lo: u16,
         port_hi: u16,
     },
-    /// `all`: include pcp's own partial files (used by --rm).
+    /// `all`: include syq's own partial files (used by --rm).
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
     Scan {
         root: PathBytes,
