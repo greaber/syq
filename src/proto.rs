@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 const COMPRESS_MIN: usize = 512;
 
@@ -136,8 +136,9 @@ pub enum Request {
     },
     StatMany(Vec<PathBytes>),
     Apply(Vec<Op>),
-    /// What exists at `path` on the receiving side: the final file and/or a partial.
-    Probe {
+    /// Return the size of the deterministic sidecar, if it is a regular file.
+    /// The planner has already statted the final path.
+    ProbePartial {
         path: PathBytes,
     },
     /// Create/adjust the write target for `path` with the given final size.
@@ -185,9 +186,9 @@ pub enum Request {
         flags: u8,
         fsync: bool,
     },
-    /// Whole small file in one request: verify, then write it straight to its
-    /// final path (no preallocation, no rename). An interrupted write leaves a
-    /// short file the next run re-transfers; see put_small for the rationale.
+    /// Whole small file in one request: verify, write a sidecar, then rename it
+    /// atomically over the final path. This preserves small-file pipelining
+    /// without exposing partial final-named files.
     PutSmall {
         path: PathBytes,
         #[serde(with = "serde_bytes")]
@@ -200,17 +201,9 @@ pub enum Request {
     FileHash {
         path: PathBytes,
     },
-    /// Create a marker file with exclusive-create semantics.
-    MarkerCreate {
-        path: PathBytes,
-        data: Vec<u8>,
-    },
-    /// Read a marker file if present.
-    MarkerRead {
-        path: PathBytes,
-    },
-    /// Remove a marker file (idempotent).
-    MarkerRemove {
+    /// Absolute, normalized form of a path on this endpoint (symlinks in the
+    /// existing prefix resolved), for a stable job identity.
+    Canonicalize {
         path: PathBytes,
     },
     Shutdown,
@@ -228,19 +221,12 @@ pub enum Response {
         port: u16,
         addrs: Vec<(String, u32)>,
     },
-    /// The marker already existed; carries its current content.
-    MarkerExists(Vec<u8>),
-    /// A marker's content, or None if absent.
-    Marker(Option<Vec<u8>>),
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
     ScanDone,
     Stats(Vec<Option<Entry>>),
     Applied(Vec<Option<String>>),
-    Probed {
-        partial_size: Option<u64>,
-        final_entry: Option<Entry>,
-    },
+    PartialSize(Option<u64>),
     Hashes(Vec<u64>),
     Block {
         off: u64,
@@ -252,6 +238,7 @@ pub enum Response {
         size: u64,
         hash: u128,
     },
+    Path(PathBytes),
     Ok,
     Err(String),
 }
