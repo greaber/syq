@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -86,6 +86,39 @@ pub fn is_partial_name(name: &OsStr) -> bool {
     b.len() > 1 + PARTIAL_SUFFIX.len()
         && b.starts_with(b".")
         && b.ends_with(PARTIAL_SUFFIX.as_bytes())
+}
+
+/// Absolute, normalized form of a path, resolved the way the kernel resolves
+/// it: component by component, symlinks followed as they are met, so `..`
+/// after a symlink pops the link's *target*. Once a component does not exist
+/// the rest is normalized lexically. Stable across spellings of one place.
+pub fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    let mut out = PathBuf::from("/");
+    let mut exists = true;
+    for c in abs.components() {
+        match c {
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => {
+                out.push(name);
+                if exists {
+                    match fs::canonicalize(&out) {
+                        Ok(real) => out = real,
+                        Err(_) => exists = false,
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry {
@@ -241,7 +274,17 @@ fn apply_one(op: &Op) -> Result<()> {
         match op {
             Op::Mkdir { path, mode } => {
                 let p = resolve(path);
-                match fs::symlink_metadata(&p) {
+                // A symlink to a directory counts as the directory (rsync
+                // semantics for a destination given as a symlink); anything
+                // else in the way is replaced.
+                let md = fs::symlink_metadata(&p).map(|md| {
+                    if md.file_type().is_symlink() {
+                        fs::metadata(&p).unwrap_or(md)
+                    } else {
+                        md
+                    }
+                });
+                match md {
                     Ok(md) if md.is_dir() => {
                         // Make sure we can write into it while transferring.
                         if md.mode() & 0o700 != 0o700 {
@@ -292,6 +335,13 @@ fn apply_one(op: &Op) -> Result<()> {
             }
             Op::SetMeta { path, meta, flags } => {
                 let p = resolve(path);
+                #[cfg(debug_assertions)]
+                if let Some(pat) = std::env::var_os("PCP_TEST_FAIL_SETMETA") {
+                    // Test hook (debug builds only): fail metadata for matching paths.
+                    if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
+                        return Err(anyhow!("set metadata {}: injected failure", p.display()));
+                    }
+                }
                 set_meta_path(&p, meta, *flags)
                     .with_context(|| format!("set metadata {}", p.display()))
             }
@@ -333,17 +383,13 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 }
 
 impl FsOps {
-    pub fn probe(&mut self, path: &[u8]) -> Result<Response> {
+    pub fn probe_partial(&mut self, path: &[u8]) -> Result<Response> {
         let p = resolve(path);
         let partial_size = fs::symlink_metadata(partial_path(&p))
             .ok()
             .filter(|m| m.is_file())
             .map(|m| m.len());
-        let final_entry = lstat_entry(Vec::new(), &p).ok();
-        Ok(Response::Probed {
-            partial_size,
-            final_entry,
-        })
+        Ok(Response::PartialSize(partial_size))
     }
 
     pub fn prepare(
@@ -512,11 +558,9 @@ impl FsOps {
         bail!("EXDEV")
     }
 
-    /// Write a small new file straight to its final path (no partial, no rename,
-    /// no preallocation). Because the size isn't preallocated, an interrupted
-    /// write leaves a *short* file that the next run detects (size mismatch) and
-    /// re-transfers — so there is no "full size, wrong content" state to mistake
-    /// for complete. Saves the rename op, which dominates small-file cost on NFS.
+    /// Write a whole small file through its deterministic sidecar and atomically
+    /// rename it into place. Keeping this as one request preserves pipelining;
+    /// unlike an in-place write, no partial final-named file is ever visible.
     pub fn put_small(
         &mut self,
         path: &[u8],
@@ -531,23 +575,65 @@ impl FsOps {
         }
         let p = resolve(path);
         self.uncache(&p);
+        let pp = partial_path(&p);
+        self.uncache(&pp);
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 fs::create_dir_all(parent).ok();
             }
         }
-        if let Ok(md) = fs::symlink_metadata(&p) {
-            if md.is_dir() {
-                bail!("destination {} is a directory", p.display());
+
+        // Reuse only a private regular sidecar. Open without truncating, verify
+        // the fd, and only then clear it so a hardlink cannot be damaged.
+        let mut partial = None;
+        if let Ok(md) = fs::symlink_metadata(&pp) {
+            if md.is_file() && md.nlink() == 1 {
+                if let Ok(file) = OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&pp)
+                {
+                    if file
+                        .metadata()
+                        .is_ok_and(|m| m.file_type().is_file() && m.nlink() == 1)
+                    {
+                        file.set_len(0)?;
+                        partial = Some(file);
+                    }
+                }
+            }
+            if partial.is_none() {
+                fs::remove_file(&pp).with_context(|| format!("replace {}", pp.display()))?;
             }
         }
-        let f = open_regular_write(&p, meta.mode)?;
+        let f = match partial {
+            Some(file) => file,
+            None => OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(meta.mode & 0o7777)
+                .open(&pp)
+                .with_context(|| format!("create {}", pp.display()))?,
+        };
         f.write_all_at(data, 0)
-            .with_context(|| format!("write {}", p.display()))?;
-        set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", p.display()))?;
+            .with_context(|| format!("write {}", pp.display()))?;
+        set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", pp.display()))?;
         if fsync {
             f.sync_all()
-                .with_context(|| format!("fsync {}", p.display()))?;
+                .with_context(|| format!("fsync {}", pp.display()))?;
+        }
+        drop(f);
+        #[cfg(debug_assertions)]
+        if let Some(pat) = std::env::var_os("PCP_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
+            // Test hook (debug builds only): model interruption after the
+            // sidecar is complete but before it becomes the final name.
+            if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
+                bail!("put small {}: injected failure before rename", p.display());
+            }
+        }
+        fs::rename(&pp, &p)
+            .with_context(|| format!("rename {} to {}", pp.display(), p.display()))?;
+        if fsync {
             let dir = p
                 .parent()
                 .filter(|d| !d.as_os_str().is_empty())
@@ -654,11 +740,6 @@ impl FsOps {
         }
         drop(f);
         if !inplace {
-            if let Ok(md) = fs::symlink_metadata(&p) {
-                if md.is_dir() {
-                    bail!("destination {} is a directory", p.display());
-                }
-            }
             fs::rename(&src, &p)
                 .with_context(|| format!("rename {} -> {}", src.display(), p.display()))?;
         }
@@ -697,43 +778,6 @@ impl FsOps {
         })
     }
 
-    fn marker_create(&mut self, path: &[u8], data: &[u8]) -> Result<Response> {
-        let p = resolve(path);
-        if let Some(parent) = p.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::create_dir_all(parent).ok();
-            }
-        }
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&p)
-        {
-            Ok(mut f) => {
-                f.write_all(data)
-                    .with_context(|| format!("write {}", p.display()))?;
-                Ok(Response::Ok)
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                let existing = fs::read(&p).unwrap_or_default();
-                Ok(Response::MarkerExists(existing))
-            }
-            Err(e) => {
-                Err(anyhow::Error::from(e)).with_context(|| format!("create {}", p.display()))
-            }
-        }
-    }
-
-    fn marker_read(&mut self, path: &[u8]) -> Result<Response> {
-        let p = resolve(path);
-        match fs::read(&p) {
-            Ok(d) => Ok(Response::Marker(Some(d))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Response::Marker(None)),
-            Err(e) => Err(anyhow::Error::from(e)).with_context(|| format!("read {}", p.display())),
-        }
-    }
-
     /// Dispatch a request that has a single response (everything except Scan).
     pub fn handle(&mut self, req: &Request) -> Response {
         let r: Result<Response> = match req {
@@ -741,7 +785,7 @@ impl FsOps {
                 Ok(Response::Stats(self.stat_many(paths, *follow)))
             }
             Request::Apply(ops) => Ok(Response::Applied(self.apply(ops))),
-            Request::Probe { path } => self.probe(path),
+            Request::ProbePartial { path } => self.probe_partial(path),
             Request::Prepare {
                 path,
                 size,
@@ -798,16 +842,8 @@ impl FsOps {
                 .finalize(path, *inplace, meta, *flags, *fsync)
                 .map(|_| Response::Ok),
             Request::FileHash { path } => self.file_hash(path),
-            Request::MarkerCreate { path, data } => self.marker_create(path, data),
-            Request::MarkerRead { path } => self.marker_read(path),
-            Request::MarkerRemove { path } => {
-                let p = resolve(path);
-                match fs::remove_file(&p) {
-                    Ok(()) => Ok(Response::Ok),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Response::Ok),
-                    Err(e) => Err(anyhow::Error::from(e))
-                        .with_context(|| format!("remove {}", p.display())),
-                }
+            Request::Canonicalize { path } => {
+                Ok(Response::Path(path_bytes(&normalize(&resolve(path)))))
             }
             Request::Hello { .. }
             | Request::Scan { .. }

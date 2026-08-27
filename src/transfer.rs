@@ -31,7 +31,6 @@ pub struct Opts {
     pub checksum: bool,
     pub verify_only: bool,
     pub inplace: bool,
-    pub atomic: bool,
     pub fsync: bool,
     pub same_host: bool,
     pub dry_run: bool,
@@ -95,60 +94,31 @@ fn parse_ports(s: &str) -> Result<(u16, u16)> {
     Ok((lo, hi))
 }
 
-/// Absolute, normalized form of a path for containment checks. Locally we
-/// canonicalize the longest existing prefix (resolving symlinks and `..`);
-/// remotely we can only normalize lexically.
-fn norm_path(p: &str, local: bool) -> std::path::PathBuf {
-    use std::path::{Component, PathBuf};
-    let raw = crate::fsops::resolve(p.as_bytes());
-    let abs = if raw.is_absolute() {
-        raw
-    } else if local {
-        std::env::current_dir().unwrap_or_default().join(raw)
-    } else {
-        // A remote relative path is relative to the remote home; keep it as-is
-        // and rely on lexical comparison of like-formed paths.
-        raw
-    };
-    // Lexical normalization (drop `.`, resolve `..`).
-    let mut out = PathBuf::new();
-    for c in abs.components() {
-        match c {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            c => out.push(c.as_os_str()),
-        }
+/// The canonical form of a path (symlinks and `..` resolved the way the kernel
+/// does), normalized by the endpoint that holds it. Used for the job identity —
+/// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job — and for
+/// the copy-into-itself check.
+fn canonical_path(ctl: &mut dyn Conn, path: &str, remote: bool) -> Result<std::path::PathBuf> {
+    if !remote {
+        return Ok(crate::fsops::normalize(&crate::fsops::resolve(
+            path.as_bytes(),
+        )));
     }
-    if local {
-        // Canonicalize the longest existing prefix so symlinked sources compare
-        // by their real location; re-append the not-yet-existing tail.
-        let mut existing = out.clone();
-        let mut tail: Vec<std::ffi::OsString> = Vec::new();
-        while !existing.as_os_str().is_empty() {
-            if let Ok(mut real) = std::fs::canonicalize(&existing) {
-                for name in tail.iter().rev() {
-                    real.push(name);
-                }
-                return real;
-            }
-            match existing.file_name().map(|n| n.to_os_string()) {
-                Some(name) => {
-                    tail.push(name);
-                    existing.pop();
-                }
-                None => break,
-            }
-        }
+    match ok(
+        ctl.call(Request::Canonicalize {
+            path: path.as_bytes().to_vec(),
+        })?,
+        "canonicalize",
+    )? {
+        Response::Path(p) => Ok(crate::fsops::resolve(&p)),
+        other => bail!("unexpected response {other:?}"),
     }
-    out
 }
 
 /// Encode the content/metadata-affecting options into the job identity.
 fn semantic_flags(opts: &Opts, args: &Args) -> String {
     format!(
-        "r={} l={} p={} t={} g={} o={} D={} inplace={} atomic={}",
+        "r={} l={} p={} t={} g={} o={} D={} inplace={}",
         opts.recursive,
         opts.links,
         opts.flags & flags::MODE != 0,
@@ -157,299 +127,93 @@ fn semantic_flags(opts: &Opts, args: &Args) -> String {
         opts.flags & flags::OWNER != 0,
         opts.devices,
         args.inplace,
-        args.atomic,
     )
 }
 
-fn root_meta_from(m: &Meta) -> crate::resume::RootMeta {
-    crate::resume::RootMeta {
-        mode: m.mode,
-        uid: m.uid,
-        gid: m.gid,
-        mtime_sec: m.mtime,
-        mtime_nsec: m.mtime_nsec,
-    }
-}
-fn meta_from_root(r: &crate::resume::RootMeta) -> Meta {
-    Meta {
-        mode: r.mode,
-        uid: r.uid,
-        gid: r.gid,
-        mtime: r.mtime_sec,
-        mtime_nsec: r.mtime_nsec,
+/// The endpoint half of a job identity: `user@host` (the user matters — two
+/// accounts on one host see different destinations), or `local`.
+fn endpoint_identity(l: &Location) -> String {
+    match (&l.user, &l.host) {
+        (_, None) => "local".into(),
+        (Some(u), Some(h)) => format!("{u}@{h}"),
+        (None, Some(h)) => h.clone(),
     }
 }
 
-/// Restore the destination-root metadata after the marker (a file inside it)
-/// was created/removed and bumped its mtime.
-fn restore_root_meta(ctl: &mut dyn Conn, dst_root: &[u8], meta: &Meta, flags: u8) -> Result<()> {
-    if flags == 0 {
-        return Ok(());
-    }
-    ok(
-        ctl.call(Request::Apply(vec![Op::SetMeta {
-            path: dst_root.to_vec(),
-            meta: *meta,
-            flags,
-        }]))?,
-        "restore root meta",
-    )?;
-    Ok(())
-}
-
-/// Decide fresh / resume / cleanup-then-fresh / abort, set up the journal and
-/// marker, and return the resume state (None if resume is disabled for this run).
-#[allow(clippy::too_many_arguments)]
-fn resume_setup(
+/// Load and, for a real copy, open the explicitly requested checkpoint.
+fn checkpoint_setup(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
     src_ctl: &mut dyn Conn,
     dst_ctl: &mut dyn Conn,
-    dst_root: &[u8],
-    dst_is_dir: bool,
+    dst_existed: bool,
     opts: &Opts,
-) -> Result<Option<ResumeState>> {
-    use crate::resume::{
-        job_key, journal_path, new_session_id, Journal, LastSession, Marker, FORMAT,
-    };
-    if args.no_resume || args.dry_run || args.verify_only {
+) -> Result<Option<CheckpointState>> {
+    use crate::checkpoint::{Checkpoint, Loaded};
+    let Some(path) = args.checkpoint.as_deref().map(std::path::Path::new) else {
         return Ok(None);
+    };
+    let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
+    for l in srcs {
+        let p = canonical_path(src_ctl, &l.path, l.is_remote())?;
+        src_roots.push((p.to_string_lossy().into_owned(), l.copies_contents()));
     }
-    let local = |l: &Location| !l.is_remote();
-    let src_ep = srcs[0].host.clone().unwrap_or_else(|| "local".into());
-    let dst_ep = dst.host.clone().unwrap_or_else(|| "local".into());
-    let src_roots: Vec<(String, bool)> = srcs
-        .iter()
-        .map(|l| {
-            (
-                norm_path(&l.path, local(l)).to_string_lossy().into_owned(),
-                l.copies_contents(),
-            )
-        })
-        .collect();
-    let dst_norm = norm_path(&dst.path, local(dst))
+    let dst_norm = canonical_path(dst_ctl, &dst.path, dst.is_remote())?
         .to_string_lossy()
         .into_owned();
-    let identity = crate::resume::job_identity(
-        &src_ep,
+    let identity = crate::checkpoint::job_identity(
+        &endpoint_identity(&srcs[0]),
         &src_roots,
-        &dst_ep,
+        &endpoint_identity(dst),
         &dst_norm,
         &semantic_flags(opts, args),
     );
-    let key = job_key(&identity);
-
-    let loaded = Journal::load(&key)?;
-    if let Some(ex) = &loaded.existing_identity {
-        if *ex != identity {
-            bail!(
-                "the resume journal for this destination describes a different copy; pass --no-resume or remove {}",
-                journal_path(&key).display()
-            );
-        }
-    }
-
-    let marker_path = marker_path_for(dst_root, dst_is_dir);
-    // Root metadata to restore after marker cleanup: only when a single source's
-    // contents map onto the destination root and we preserve its mode/times.
-    let meta_flags = opts.flags & (flags::MODE | flags::OWNER | flags::GROUP | flags::TIMES);
-    let root_meta: Option<Meta> = if srcs.len() == 1 && srcs[0].copies_contents() && meta_flags != 0
-    {
-        stat_one(src_ctl, srcs[0].path.as_bytes(), false)?.map(|e| {
-            let mut m = e.meta();
-            if opts.flags & flags::MODE == 0 {
-                m.mode = e.mode & 0o777 & !opts.umask;
-            }
-            m
-        })
-    } else {
-        None
-    };
-
-    let existing = marker_read(dst_ctl, &marker_path)?;
-
-    // Cleanup helpers.
-    let do_cleanup = |dst_ctl: &mut dyn Conn,
-                      journal: &Journal,
-                      sid: &str,
-                      rm: Option<&crate::resume::RootMeta>,
-                      marker_present: bool|
-     -> Result<()> {
-        if marker_present {
-            marker_remove(dst_ctl, &marker_path)?;
-        }
-        if let Some(rm) = rm {
-            restore_root_meta(dst_ctl, dst_root, &meta_from_root(rm), meta_flags)?;
-        }
-        journal.cleanup_complete(sid)?;
-        Ok(())
-    };
-
-    let start_new = |dst_ctl: &mut dyn Conn,
-                     completed: std::collections::HashMap<PathBytes, crate::resume::Completed>|
-     -> Result<Option<ResumeState>> {
-        let journal = Journal::open(&key, &identity, loaded.existing_identity.as_deref())?;
-        let session_id = new_session_id();
-        let marker = Marker {
-            format: FORMAT,
-            session_id: session_id.clone(),
-            job_identity: identity.clone(),
-            created_at: 0,
-            coordinator_host: crate::resume::hostname(),
+    let (checkpoint, loaded) = if args.dry_run {
+        let loaded = if dst_existed {
+            Checkpoint::load(path)?
+        } else {
+            // Nothing at the destination can be described by an old
+            // checkpoint, and a dry run must not touch the unused path.
+            Loaded::empty()
         };
-        match marker_create(dst_ctl, &marker_path, &marker) {
-            Ok(None) => {}
-            Ok(Some(other)) => {
+        if let Some(ex) = &loaded.existing_identity {
+            if *ex != identity {
                 bail!(
-                    "destination was just claimed by another transfer (session {}, host {})",
-                    other.session_id,
-                    other.coordinator_host
+                    "checkpoint {} describes a different copy; choose another path or remove it",
+                    path.display()
                 );
             }
-            Err(e) => {
-                // Can't claim the destination (e.g. read-only dir): fall back to
-                // running without resume rather than failing the transfer.
-                if debug() {
-                    eprintln!("pcp: resume disabled (cannot create marker: {e:#})");
-                }
-                return Ok(None);
-            }
         }
-        journal.session_start(&session_id)?;
-        Ok(Some(ResumeState {
-            journal: std::sync::Arc::new(journal),
-            completed: std::sync::Arc::new(completed),
-            session_id,
-            marker_path: marker_path.clone(),
-            root_meta,
-        }))
-    };
-
-    match (&existing, &loaded.last) {
-        (Some(m), _) if m.job_identity != identity => bail!(
-            "destination is claimed by a different transfer (session {}, host {}); if it is stale, remove {}",
-            m.session_id, m.coordinator_host, display(&marker_path)
-        ),
-        (Some(m), LastSession::NeedsCleanup(sid, rm)) if sid == &m.session_id => {
-            let journal = Journal::open(&key, &identity, loaded.existing_identity.as_deref())?;
-            do_cleanup(dst_ctl, &journal, sid, rm.as_ref(), true)?;
-            drop(journal);
-            start_new(dst_ctl, loaded.completed)
-        }
-        (Some(m), LastSession::Incomplete(sid)) if sid == &m.session_id => {
-            let journal = Journal::open(&key, &identity, loaded.existing_identity.as_deref())?;
-            Ok(Some(ResumeState {
-                journal: std::sync::Arc::new(journal),
-                completed: std::sync::Arc::new(loaded.completed),
-                session_id: sid.clone(),
-                marker_path,
-                root_meta,
-            }))
-        }
-        (Some(m), other) => bail!(
-            "destination is owned by session {} but the local journal does not match ({other:?}); resume needs the matching local journal, or remove {} to start over",
-            m.session_id, display(&marker_path)
-        ),
-        (None, LastSession::NeedsCleanup(sid, rm)) => {
-            let journal = Journal::open(&key, &identity, loaded.existing_identity.as_deref())?;
-            do_cleanup(dst_ctl, &journal, sid, rm.as_ref(), false)?;
-            drop(journal);
-            start_new(dst_ctl, loaded.completed)
-        }
-        (None, LastSession::Incomplete(sid)) => bail!(
-            "an interrupted transfer's journal exists (session {sid}) but its destination marker is gone; the destination may have changed — remove it and start over, or pass --no-resume"
-        ),
-        (None, _) => start_new(dst_ctl, loaded.completed),
-    }
-}
-
-/// Read the destination marker (if any) as a parsed struct.
-fn marker_read(ctl: &mut dyn Conn, path: &[u8]) -> Result<Option<crate::resume::Marker>> {
-    match ok(
-        ctl.call(Request::MarkerRead {
-            path: path.to_vec(),
-        })?,
-        "marker read",
-    )? {
-        Response::Marker(Some(data)) => Ok(serde_json::from_slice(&data).ok()),
-        Response::Marker(None) => Ok(None),
-        other => bail!("unexpected response {other:?}"),
-    }
-}
-
-/// Create the marker (exclusive). Ok(None) on success; Ok(Some(existing)) if it
-/// already existed.
-fn marker_create(
-    ctl: &mut dyn Conn,
-    path: &[u8],
-    m: &crate::resume::Marker,
-) -> Result<Option<crate::resume::Marker>> {
-    let data = serde_json::to_vec(m)?;
-    match ok(
-        ctl.call(Request::MarkerCreate {
-            path: path.to_vec(),
-            data,
-        })?,
-        "marker create",
-    )? {
-        Response::Ok => Ok(None),
-        Response::MarkerExists(existing) => Ok(Some(
-            serde_json::from_slice(&existing).unwrap_or_else(|_| m.clone()),
-        )),
-        other => bail!("unexpected response {other:?}"),
-    }
-}
-
-fn marker_remove(ctl: &mut dyn Conn, path: &[u8]) -> Result<()> {
-    ok(
-        ctl.call(Request::MarkerRemove {
-            path: path.to_vec(),
-        })?,
-        "marker remove",
-    )?;
-    Ok(())
-}
-
-/// Resume state for one transfer: the completion journal, the set of files
-/// already complete, the session id, and where the marker lives.
-struct ResumeState {
-    journal: std::sync::Arc<crate::resume::Journal>,
-    completed: std::sync::Arc<std::collections::HashMap<PathBytes, crate::resume::Completed>>,
-    session_id: String,
-    marker_path: PathBytes,
-    root_meta: Option<Meta>,
-}
-
-/// Shared with workers: the completion journal (if resume is active). Filled in
-/// after resume_setup, before the planner enqueues any work.
-#[derive(Default)]
-struct ResumeShared {
-    journal: Option<std::sync::Arc<crate::resume::Journal>>,
-}
-type ResumeSlot = std::sync::Arc<std::sync::OnceLock<ResumeShared>>;
-
-/// Marker path for a destination: inside the directory for a dir scope, else a
-/// sidecar next to the file.
-fn marker_path_for(dst_root: &[u8], dst_is_dir: bool) -> PathBytes {
-    use crate::resume::MARKER_NAME;
-    if dst_is_dir {
-        join(dst_root, MARKER_NAME.as_bytes())
+        (None, loaded)
     } else {
-        let p = std::path::Path::new(std::ffi::OsStr::from_bytes(dst_root));
-        let name = p
-            .file_name()
-            .map(|n| n.as_bytes().to_vec())
-            .unwrap_or_else(|| b"root".to_vec());
-        let mut sidecar = b".".to_vec();
-        sidecar.extend_from_slice(&name);
-        sidecar.extend_from_slice(MARKER_NAME.as_bytes());
-        match p.parent() {
-            Some(par) if !par.as_os_str().is_empty() => join(par.as_os_str().as_bytes(), &sidecar),
-            _ => sidecar,
-        }
-    }
+        // When the destination disappeared, open and validate the checkpoint
+        // before resetting its locked inode. Never unlink an arbitrary path.
+        let (checkpoint, loaded) = Checkpoint::open(path, &identity, opts.fsync, !dst_existed)?;
+        let checkpoint = std::sync::Arc::new(checkpoint);
+        checkpoint.spawn_flusher();
+        (Some(checkpoint), loaded)
+    };
+    Ok(Some(CheckpointState {
+        checkpoint,
+        completed: std::sync::Arc::new(loaded.completed),
+        path: path.to_path_buf(),
+    }))
 }
+
+/// Explicit checkpoint state for one transfer.
+struct CheckpointState {
+    checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
+    completed: std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>,
+    path: std::path::PathBuf,
+}
+
+/// Shared with workers after checkpoint setup and before planning enqueues work.
+#[derive(Default)]
+struct CheckpointShared {
+    checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
+}
+type CheckpointSlot = std::sync::Arc<std::sync::OnceLock<CheckpointShared>>;
 
 pub fn debug() -> bool {
     std::env::var_os("PCP_DEBUG").is_some()
@@ -532,7 +296,6 @@ pub fn run(args: Args) -> Result<i32> {
         checksum: args.checksum,
         verify_only: args.verify_only,
         inplace: args.inplace,
-        atomic: args.atomic,
         fsync: args.fsync,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         dry_run: args.dry_run,
@@ -565,11 +328,11 @@ pub fn run(args: Args) -> Result<i32> {
     // handshakes (at sshd's MaxStartups or a serialized ssh agent). The tuner
     // may spawn more workers later, so the handles live behind a mutex.
     let gate = Gate::new(args.connections);
-    let resume_slot: ResumeSlot = std::sync::Arc::new(std::sync::OnceLock::new());
+    let checkpoint_slot: CheckpointSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
         Arc::new(Mutex::new(Vec::new()));
     let spawn_worker: Arc<dyn Fn(usize) + Send + Sync> = {
-        let (src_ep, dst_ep, sched, progress, opts, gate, workers, resume_slot, bwlimit) = (
+        let (src_ep, dst_ep, sched, progress, opts, gate, workers, checkpoint_slot, bwlimit) = (
             src_ep.clone(),
             dst_ep.clone(),
             sched.clone(),
@@ -577,19 +340,19 @@ pub fn run(args: Args) -> Result<i32> {
             opts.clone(),
             gate.clone(),
             workers.clone(),
-            resume_slot.clone(),
+            checkpoint_slot.clone(),
             bwlimit.clone(),
         );
         let compress = args.compress;
         Arc::new(move |id: usize| {
-            let (src_ep, dst_ep, sched, progress, opts, gate, resume, bwlimit) = (
+            let (src_ep, dst_ep, sched, progress, opts, gate, checkpoint, bwlimit) = (
                 src_ep.clone(),
                 dst_ep.clone(),
                 sched.clone(),
                 progress.clone(),
                 opts.clone(),
                 gate.clone(),
-                resume_slot.clone(),
+                checkpoint_slot.clone(),
                 bwlimit.clone(),
             );
             let h = std::thread::spawn(move || -> Result<()> {
@@ -609,7 +372,7 @@ pub fn run(args: Args) -> Result<i32> {
                     sched,
                     progress,
                     opts,
-                    resume,
+                    checkpoint,
                     bwlimit,
                     gate,
                     t: [0.0; 4],
@@ -707,6 +470,10 @@ pub fn run(args: Args) -> Result<i32> {
 
     let dst_root = dst.path.as_bytes().to_vec();
     let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root, false)?;
+    // A destination that is a symlink to a directory is that directory (as
+    // for rsync); a symlink to anything else is replaced like any other file.
+    let dst_root_entry = follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?;
+    let dst_existed = dst_root_entry.is_some();
     let dst_is_dir = match &dst_root_entry {
         Some(e) if e.kind == Kind::Dir => true,
         Some(_) if srcs.len() > 1 => {
@@ -724,23 +491,25 @@ pub fn run(args: Args) -> Result<i32> {
     let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
         || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
     if same_machine {
-        let local = !dst.is_remote();
+        // Both ends are one machine, so either control connection resolves
+        // paths the way that machine's kernel does (symlinks included).
+        let remote = dst.is_remote();
         for s in srcs {
             // Only a directory source can trigger the recurse-into-itself trap.
             let src_is_dir = matches!(stat_one(&mut *src_ctl, s.path.as_bytes(), false)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
             }
-            let sn = norm_path(&s.path, local);
+            let sn = canonical_path(&mut *src_ctl, &s.path, remote)?;
             // Effective destination(s): the destination itself, plus
             // destination/basename only when the destination is really an
             // existing directory (so a bare source lands inside it).
-            let mut effs = vec![norm_path(&dst.path, local)];
+            let mut effs = vec![canonical_path(&mut *src_ctl, &dst.path, remote)?];
             if dst_is_dir && !s.copies_contents() {
                 let base = s.basename();
                 if !base.is_empty() {
                     let joined = format!("{}/{}", dst.path.trim_end_matches('/'), base);
-                    effs.push(norm_path(&joined, local));
+                    effs.push(canonical_path(&mut *src_ctl, &joined, remote)?);
                 }
             }
             for eff in effs {
@@ -756,7 +525,14 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
-    if dst_root_entry.is_none() && dst_is_dir && !args.dry_run && !args.existing {
+    // Create a missing directory destination — never in the read-only modes,
+    // and never under --existing.
+    if dst_root_entry.is_none()
+        && dst_is_dir
+        && !args.dry_run
+        && !args.verify_only
+        && !args.existing
+    {
         match ok(
             dst_ctl.call(Request::Apply(vec![Op::Mkdir {
                 path: dst_root.clone(),
@@ -773,28 +549,24 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
-    // Resume: read/create the destination marker and load the completion journal.
-    // --existing into a destination that doesn't exist writes nothing, so it
-    // must not create the root for a marker either.
-    let resume_state = if args.existing && dst_root_entry.is_none() {
-        None
-    } else {
-        resume_setup(
-            &args,
-            srcs,
-            dst,
-            &mut *src_ctl,
-            &mut *dst_ctl,
-            &dst_root,
-            dst_is_dir,
-            &opts,
-        )?
-    };
-    let resume_completed = resume_state.as_ref().map(|r| r.completed.clone());
-    let resume_journal = resume_state.as_ref().map(|r| r.journal.clone());
-    if let Some(r) = &resume_state {
-        let _ = resume_slot.set(ResumeShared {
-            journal: Some(r.journal.clone()),
+    let checkpoint_state = checkpoint_setup(
+        &args,
+        srcs,
+        dst,
+        &mut *src_ctl,
+        &mut *dst_ctl,
+        dst_existed,
+        &opts,
+    )?;
+    let checkpoint_completed = checkpoint_state
+        .as_ref()
+        .map(|state| state.completed.clone());
+    let checkpoint_writer = checkpoint_state
+        .as_ref()
+        .and_then(|state| state.checkpoint.clone());
+    if let Some(checkpoint) = &checkpoint_writer {
+        let _ = checkpoint_slot.set(CheckpointShared {
+            checkpoint: Some(checkpoint.clone()),
         });
     }
 
@@ -805,9 +577,8 @@ pub fn run(args: Args) -> Result<i32> {
         sched: &sched,
         progress: &progress,
         opts: &opts,
-        completed: resume_completed.clone(),
-        journal: resume_journal.clone(),
-        reserved: resume_state.as_ref().map(|r| r.marker_path.clone()),
+        completed: checkpoint_completed,
+        checkpoint: checkpoint_writer,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         excluded: std::collections::HashSet::new(),
@@ -927,28 +698,30 @@ pub fn run(args: Args) -> Result<i32> {
 
     let errors = progress.errors.load(Relaxed);
 
-    // Resume cleanup: on full success, release the marker and close the session;
-    // otherwise leave marker + journal so the same command can resume.
-    if let Some(r) = &resume_state {
-        if !aborted && errors == 0 {
-            let mf = opts.flags & (flags::MODE | flags::OWNER | flags::GROUP | flags::TIMES);
-            let rm = r.root_meta.as_ref().map(root_meta_from);
-            let res: Result<()> = (|| {
-                r.journal.session_complete(&r.session_id, rm)?;
-                marker_remove(&mut *dst_ctl, &r.marker_path)?;
-                if let Some(m) = &r.root_meta {
-                    restore_root_meta(&mut *dst_ctl, &dst_root, m, mf)?;
+    // Settle an explicit checkpoint. A recording failure only makes a retry
+    // recheck more files; a clean copy removes the no-longer-needed state.
+    if let Some(state) = &checkpoint_state {
+        let failed = state.checkpoint.as_ref().and_then(|checkpoint| {
+            checkpoint
+                .close()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .or_else(|| checkpoint.take_error())
+        });
+        if let Some(e) = failed {
+            eprintln!(
+                "pcp: warning: checkpoint recording stopped ({e}); a retry will recheck files completed after that point"
+            );
+        }
+        if !opts.dry_run && !aborted && errors == 0 {
+            if let Some(checkpoint) = &state.checkpoint {
+                if let Err(e) = checkpoint.remove() {
+                    eprintln!(
+                        "pcp: warning: completed copy but could not remove checkpoint {}: {e:#}",
+                        state.path.display()
+                    );
                 }
-                r.journal.cleanup_complete(&r.session_id)?;
-                Ok(())
-            })();
-            if let Err(e) = res {
-                eprintln!(
-                    "pcp: resume cleanup: {e:#} (transfer completed; the next run will finish cleanup)"
-                );
             }
-        } else {
-            let _ = r.journal.flush();
         }
     }
     let elapsed = progress.start.elapsed().as_secs_f64();
@@ -1094,8 +867,14 @@ fn scan_into_planner(
         &mut |batch| f(pl, batch),
         &mut |_| Ok(()),
         &mut |w| {
-            warned.set(true);
-            progress.error(&format!("pcp: {w}"))
+            // "skipping …" is a notice (nothing the copy owes is missing);
+            // anything else from the scanner means an entry was lost.
+            if w.starts_with("skipping ") {
+                progress.eprintln(&format!("pcp: {w}"));
+            } else {
+                warned.set(true);
+                progress.error(&format!("pcp: {w}"));
+            }
         },
     );
     if warned.get() {
@@ -1104,9 +883,50 @@ fn scan_into_planner(
     res
 }
 
+/// If `entry` is a symlink whose (possibly chained) target is a directory,
+/// return that directory's entry; otherwise `entry` unchanged.
+fn follow_dir_symlink(
+    conn: &mut dyn Conn,
+    path: &[u8],
+    entry: Option<Entry>,
+) -> Result<Option<Entry>> {
+    let Some(first) = entry.as_ref().filter(|e| e.kind == Kind::Symlink) else {
+        return Ok(entry);
+    };
+    let mut cur_path = path.to_vec();
+    let mut cur = first.clone();
+    for _ in 0..16 {
+        let Some(target) = cur.link.clone() else {
+            break;
+        };
+        let next_path = if target.starts_with(b"/") {
+            target
+        } else {
+            let parent = cur_path
+                .iter()
+                .rposition(|&c| c == b'/')
+                .map(|i| cur_path[..i].to_vec())
+                .unwrap_or_default();
+            join(&parent, &target)
+        };
+        match stat_one(conn, &next_path, false)? {
+            Some(e) if e.kind == Kind::Dir => return Ok(Some(e)),
+            Some(e) if e.kind == Kind::Symlink => {
+                cur = e;
+                cur_path = next_path;
+            }
+            _ => break,
+        }
+    }
+    Ok(entry)
+}
+
 fn display(p: &[u8]) -> String {
     String::from_utf8_lossy(p).into_owned()
 }
+
+/// What to checkpoint for a quick-check-identical file once metadata repair succeeds.
+type QuickCheckRecord = (PathBytes, Entry);
 
 struct Planner<'a> {
     dst: &'a mut dyn Conn,
@@ -1122,11 +942,8 @@ struct Planner<'a> {
     /// size limits, --existing, ...); their partials are resume state, not garbage.
     excluded: std::collections::HashSet<PathBytes>,
     completed:
-        Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::resume::Completed>>>,
-    journal: Option<std::sync::Arc<crate::resume::Journal>>,
-    /// The resume marker's destination path, if resume is active. A source entry
-    /// that maps onto it must be refused rather than clobbering the interlock.
-    reserved: Option<PathBytes>,
+        Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>>,
+    checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
     collision: bool,
     /// (dst path, meta, flags, depth) for directories, applied deepest-first at the end.
     deferred: Vec<(PathBytes, Meta, u8, usize)>,
@@ -1436,11 +1253,7 @@ impl Planner<'_> {
             }
             let dst_rel = join(sub_b, &e.path);
             let dst = join(dst_root, &dst_rel);
-            let rel = if dst_rel.is_empty() {
-                display(src_root.rsplit(|&c| c == b'/').next().unwrap_or(src_root))
-            } else {
-                display(&dst_rel)
-            };
+            let rel = self.rel_name(src_root, sub_b, &e.path);
             // Every source entry claims its destination here, before any
             // decision about it: that blocks two sources from mapping onto one
             // path, and it is what makes --delete safe — whatever happens
@@ -1492,11 +1305,28 @@ impl Planner<'_> {
         // metadata so they can't disagree.
         let need_stats = opts.verify_only || !opts.dry_run || opts.existing;
         if !dirs.is_empty() && (need_stats || opts.verbose > 0) {
-            let stats: Vec<Option<Entry>> = if need_stats {
+            let mut stats: Vec<Option<Entry>> = if need_stats {
                 self.stat_many(true, dirs.iter().map(|(p, _)| p.clone()).collect())?
             } else {
                 vec![None; dirs.len()]
             };
+            // A destination symlink to a directory is that directory (rsync
+            // semantics; Mkdir treats it so too), so resolve those before
+            // deciding what exists and what needs opening up.
+            let links: Vec<usize> = stats
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| matches!(s, Some(e) if e.kind == Kind::Symlink))
+                .map(|(i, _)| i)
+                .collect();
+            if !links.is_empty() {
+                let paths = links.iter().map(|&i| dirs[i].0.clone()).collect();
+                for (i, f) in links.into_iter().zip(stat_many(self.dst, paths, true)?) {
+                    if matches!(f, Some(ref e) if e.kind == Kind::Dir) {
+                        stats[i] = f;
+                    }
+                }
+            }
             let mut planned: Vec<(PathBytes, &Entry, Option<Entry>)> = Vec::new();
             for ((p, e), st) in dirs.into_iter().zip(stats) {
                 let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
@@ -1511,9 +1341,9 @@ impl Planner<'_> {
                     continue;
                 }
                 // --existing creates nothing. A non-directory at the path (a
-                // file, a symlink even to a directory) counts as missing: we
-                // won't replace it and won't write through it, and since
-                // entries come parent-first, everything below is skipped too.
+                // file, a dangling or non-directory symlink) counts as missing:
+                // we won't replace it, and since entries come parent-first,
+                // everything below is skipped too.
                 if opts.existing && (!is_dir || self.under_missing_dir(&p, dst_root)) {
                     self.missing_dirs.insert(p);
                     continue;
@@ -1564,9 +1394,21 @@ impl Planner<'_> {
                 if !opts.perms {
                     flags &= !flags::MODE;
                 }
-                for (p, e, _) in &planned {
+                for (p, e, s) in &planned {
                     let depth = p.iter().filter(|&&c| c == b'/').count();
-                    self.deferred.push((p.clone(), e.meta(), flags, depth));
+                    let mut meta = e.meta();
+                    let mut flags = flags;
+                    // An existing directory we had to open up (u+rwx) gets its
+                    // own mode back at the end when nothing else sets it.
+                    if flags & flags::MODE == 0 {
+                        if let Some(d) = s {
+                            if d.kind == Kind::Dir && d.mode & 0o700 != 0o700 {
+                                meta.mode = d.mode & 0o7777;
+                                flags |= flags::MODE;
+                            }
+                        }
+                    }
+                    self.deferred.push((p.clone(), meta, flags, depth));
                 }
             }
         }
@@ -1574,20 +1416,17 @@ impl Planner<'_> {
         if others.is_empty() {
             return Ok(());
         }
-        // Journal skip: a file whose completion record still matches the source
-        // fingerprint is complete without a destination stat. Bypassed under -c.
-        // Runs after the mapping loop above, so a skipped file has already
-        // claimed its destination (--delete never treats it as an extra).
+        // An explicitly requested checkpoint may trust a matching source
+        // fingerprint without a destination stat. This runs after the mapping
+        // loop above, so a skipped file has already claimed its destination
+        // (--delete never treats it as an extra).
         if self.completed.is_some() && !opts.checksum {
             let completed = self.completed.clone().unwrap();
             let mut kept = Vec::with_capacity(others.len());
             for p in others.into_iter() {
                 if p.e.kind == Kind::File {
                     if let Some(c) = completed.get(&p.dst_rel) {
-                        if c.size == p.e.size
-                            && c.mtime_sec == p.e.mtime
-                            && c.mtime_nsec == p.e.mtime_nsec
-                        {
+                        if c.matches(p.e, opts.flags) {
                             self.progress.files_skipped.fetch_add(1, Relaxed);
                             self.progress.bytes_skipped.fetch_add(p.e.size, Relaxed);
                             continue;
@@ -1601,7 +1440,9 @@ impl Planner<'_> {
         let stats = self.stat_many(true, others.iter().map(|p| p.dst.clone()).collect())?;
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<String> = Vec::new();
-        let mut meta_fixes: Vec<Op> = Vec::new();
+        // Metadata repairs for quick-check-identical files, each with the
+        // checkpoint record once the repair has actually succeeded.
+        let mut meta_fixes: Vec<(Op, Option<QuickCheckRecord>)> = Vec::new();
         for (p, dst_entry) in others.into_iter().zip(stats) {
             let Planned {
                 src: src_path,
@@ -1645,15 +1486,6 @@ impl Planner<'_> {
                         self.progress.error(&format!(
                             "pcp: {rel}: two sources map to the same destination {} — refusing to clobber it",
                             display(&dst_path)
-                        ));
-                        self.collision = true;
-                        continue;
-                    }
-                    // Never let a source file land on the resume marker: that
-                    // would destroy the cross-machine interlock for this run.
-                    if self.reserved.as_deref() == Some(dst_path.as_slice()) {
-                        self.progress.error(&format!(
-                            "pcp: {rel}: destination path is reserved by pcp's resume marker — refusing to overwrite it"
                         ));
                         self.collision = true;
                         continue;
@@ -1710,23 +1542,25 @@ impl Planner<'_> {
                                 ff |= flags::GROUP;
                             }
                             if ff != 0 {
-                                meta_fixes.push(Op::SetMeta {
-                                    path: dst_path.clone(),
-                                    meta: e.meta(),
-                                    flags: ff,
-                                });
+                                meta_fixes.push((
+                                    Op::SetMeta {
+                                        path: dst_path.clone(),
+                                        meta: e.meta(),
+                                        flags: ff,
+                                    },
+                                    self.checkpoint
+                                        .as_ref()
+                                        .map(|_| (dst_rel.clone(), e.clone())),
+                                ));
+                                self.progress.files_skipped.fetch_add(1, Relaxed);
+                                self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                                continue;
                             }
                         }
                         self.progress.files_skipped.fetch_add(1, Relaxed);
                         self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
-                        if let Some(j) = &self.journal {
-                            j.record_complete(
-                                &dst_rel,
-                                e.size,
-                                e.mtime,
-                                e.mtime_nsec,
-                                "quick-check",
-                            );
+                        if let Some(checkpoint) = &self.checkpoint {
+                            checkpoint.record_complete(&dst_rel, e, "quick-check");
                         }
                     } else if opts.dry_run {
                         self.progress.files_total.fetch_add(1, Relaxed);
@@ -1825,8 +1659,17 @@ impl Planner<'_> {
             }
         }
         if !meta_fixes.is_empty() {
-            for err in self.apply(true, meta_fixes)?.into_iter().flatten() {
-                self.progress.error(&format!("pcp: {err}"));
+            let (ops, records): (Vec<Op>, Vec<_>) = meta_fixes.into_iter().unzip();
+            for (err, rec) in self.apply(true, ops)?.into_iter().zip(records) {
+                match err {
+                    Some(err) => self.progress.error(&format!("pcp: {err}")),
+                    None => {
+                        // Only now is the file complete in every respect.
+                        if let (Some(checkpoint), Some((rel, entry))) = (&self.checkpoint, rec) {
+                            checkpoint.record_complete(&rel, &entry, "quick-check");
+                        }
+                    }
+                }
             }
         }
         if !ops.is_empty() {
@@ -1843,6 +1686,17 @@ impl Planner<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Display name for a source entry: its destination-relative path, or the
+    /// source's basename when a single file is copied to an exact destination.
+    fn rel_name(&self, src_root: &[u8], sub_b: &[u8], path: &[u8]) -> String {
+        let r = join(sub_b, path);
+        if r.is_empty() {
+            display(src_root.rsplit(|&c| c == b'/').next().unwrap_or(src_root))
+        } else {
+            display(&r)
+        }
     }
 
     /// Record a leaf (file/symlink/special) destination; return false if this
@@ -1974,8 +1828,7 @@ impl Planner<'_> {
                             continue;
                         }
                         let full = join(&root, &e.path);
-                        if e.path == crate::resume::MARKER_NAME.as_bytes()
-                            || nested.iter().any(|n| *n == full || inside(&full, n))
+                        if nested.iter().any(|n| *n == full || inside(&full, n))
                             || shielded.iter().any(|d| inside(&full, d))
                         {
                             continue;
@@ -2062,7 +1915,7 @@ impl Planner<'_> {
         }
         let dirs = std::mem::take(&mut self.deletes.dirs);
         let mut n = 0u64;
-        let journal = self.journal.clone();
+        let checkpoint = self.checkpoint.clone();
         let mut run =
             |me: &mut Self, items: &[(PathBytes, String, PathBytes)], rmdir: bool| -> Result<()> {
                 for chunk in items.chunks(1000) {
@@ -2095,8 +1948,8 @@ impl Planner<'_> {
                                 // Forget any completion record: if the source ever
                                 // brings this path back with the same fingerprint,
                                 // it must be transferred, not assumed present.
-                                if let (Some(j), false) = (&journal, dst_rel.is_empty()) {
-                                    j.record_deleted(dst_rel);
+                                if let (Some(c), false) = (&checkpoint, dst_rel.is_empty()) {
+                                    c.record_deleted(dst_rel);
                                 }
                             }
                             Some(e) => me.progress.error(&format!("pcp: delete {rel}: {e}")),
@@ -2154,7 +2007,7 @@ struct Worker {
     sched: Arc<Sched>,
     progress: Arc<Progress>,
     opts: Arc<Opts>,
-    resume: ResumeSlot,
+    checkpoint: CheckpointSlot,
     bwlimit: Option<Arc<BandwidthLimit>>,
     gate: Arc<Gate>,
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
@@ -2255,15 +2108,14 @@ impl Worker {
         }
     }
 
-    /// Small new files (no existing destination file) are sent without a
-    /// per-file round trip: one pipelined burst of reads, one of
-    /// prepare+write+finalize, one stat — a few RTTs for the whole batch.
+    /// Small new files are sent without a per-file round trip: one pipelined
+    /// burst of reads and one of atomic sidecar writes — a few RTTs for the
+    /// whole batch.
     fn fast_eligible(&self, idx: usize) -> bool {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.verify_only
             && !self.opts.inplace
-            && !self.opts.atomic
             && j.entry.size <= self.transfer_block()
             && j.dst_entry.is_none()
     }
@@ -2312,8 +2164,8 @@ impl Worker {
                 Err(e) => Err(e),
             });
         }
-        // One PutSmall per file (pipelined): the server writes each small new
-        // file straight to its final path (no rename), which is the big NFS win.
+        // One PutSmall per file (pipelined): the server writes each small file
+        // through its sidecar and atomically renames it into place.
         let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
         let mut sent: Vec<bool> = Vec::with_capacity(jobs.len());
         for (j, d) in jobs.iter().zip(data.iter_mut()) {
@@ -2409,12 +2261,7 @@ impl Worker {
             self.progress.add_bytes(j.entry.size);
             j.done.store(j.entry.size, Relaxed);
             self.progress.files_done.fetch_add(1, Relaxed);
-            self.record_done(
-                &j.rel_bytes,
-                j.entry.size,
-                j.entry.mtime,
-                j.entry.mtime_nsec,
-            );
+            self.record_done(&j.rel_bytes, &j.entry);
             if self.opts.verbose > 0 {
                 self.progress.println(&j.rel);
             }
@@ -2453,6 +2300,22 @@ impl Worker {
         );
 
         let inplace = self.opts.inplace;
+        // The planner already statted the final path. Only the deterministic
+        // sidecar needs another lookup before choosing the transfer basis.
+        // --inplace never uses that sidecar, so it avoids the lookup entirely.
+        let partial_size = if inplace {
+            None
+        } else {
+            match ok(
+                self.dst.call(Request::ProbePartial {
+                    path: job.dst.clone(),
+                })?,
+                "probe partial",
+            )? {
+                Response::PartialSize(size) => size,
+                other => bail!("unexpected response {other:?}"),
+            }
+        };
         // Same-machine copy: let the kernel move the bytes (reflink / NFS
         // server-side copy) instead of streaming them through userspace.
         // copy_file_range cannot be paced, so a limited same-machine transfer
@@ -2461,6 +2324,7 @@ impl Worker {
             && !self.opts.checksum
             && self.bwlimit.is_none()
             && job.entry.size > 0
+            && partial_size.is_none()
         {
             match self.try_copy_local(idx, &job) {
                 Ok(true) => return Ok(()),
@@ -2471,19 +2335,10 @@ impl Worker {
                 }
             }
         }
-        let planned: Result<Vec<(u64, u64)>> = (|| {
-            let (partial_size, final_entry) = match ok(
-                self.dst.call(Request::Probe {
-                    path: job.dst.clone(),
-                })?,
-                "probe",
-            )? {
-                Response::Probed {
-                    partial_size,
-                    final_entry,
-                } => (partial_size, final_entry),
-                other => bail!("unexpected response {other:?}"),
-            };
+        // bool = this path still needs Finalize (as opposed to content that
+        // matched the existing final file and only needed metadata repair).
+        let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
+            let final_entry = job.dst_entry.clone();
             if let Some(f) = &final_entry {
                 if f.kind == Kind::Dir {
                     bail!("destination is a directory");
@@ -2491,12 +2346,9 @@ impl Worker {
             }
             let final_is_file = final_entry.as_ref().is_some_and(|f| f.kind == Kind::File);
             let full = || if size > 0 { vec![(0, size)] } else { vec![] };
-            // Larger files go through a partial file + atomic rename even when
-            // new (unless --inplace): an interrupted in-place file sits under its
-            // final name and could later be mistaken for complete by the quick
-            // check. Small new files use the in-place fast-batch path instead
-            // (written straight to their final path — fast on NFS, but not
-            // atomically visible); this handle_file path is for the larger ones.
+            // Unless --inplace was explicit, every file is published through
+            // a sidecar + atomic rename. Small new files normally take the
+            // pipelined PutSmall path instead of reaching this worker path.
             self.set_inplace(idx, inplace);
 
             if inplace {
@@ -2511,9 +2363,9 @@ impl Worker {
                     "prepare",
                 )?;
                 if final_is_file && size > 0 {
-                    return self.diff_blocks(&job, Which::Final);
+                    return Ok((self.diff_blocks(&job, Which::Final)?, true));
                 }
-                return Ok(full());
+                return Ok((full(), true));
             }
             if partial_size.is_some() {
                 ok(
@@ -2527,9 +2379,9 @@ impl Worker {
                     "prepare",
                 )?;
                 if size == 0 {
-                    return Ok(vec![]);
+                    return Ok((vec![], true));
                 }
-                return self.diff_blocks(&job, Which::Partial);
+                return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
             if final_is_file && (size > 0 && final_entry.as_ref().unwrap().size > 0 || size == 0) {
                 let ranges = if size > 0 {
@@ -2556,7 +2408,7 @@ impl Worker {
                     if let Some(e) = errs.into_iter().flatten().next() {
                         bail!("{e}");
                     }
-                    return Ok(vec![]);
+                    return Ok((vec![], false));
                 }
                 ok(
                     self.dst.call(Request::Prepare {
@@ -2568,7 +2420,7 @@ impl Worker {
                     })?,
                     "prepare",
                 )?;
-                return Ok(ranges);
+                return Ok((ranges, true));
             }
             ok(
                 self.dst.call(Request::Prepare {
@@ -2580,11 +2432,11 @@ impl Worker {
                 })?,
                 "prepare",
             )?;
-            Ok(full())
+            Ok((full(), true))
         })();
 
-        let ranges = match planned {
-            Ok(r) => r,
+        let (ranges, needs_finalize) = match planned {
+            Ok(result) => result,
             Err(e) => {
                 self.sched.ranges_ready(idx, vec![]);
                 return Err(e);
@@ -2596,18 +2448,6 @@ impl Worker {
             .bytes_skipped
             .fetch_add(size - to_send, Relaxed);
         self.progress.bytes_total.fetch_sub(size - to_send, Relaxed);
-        let metadata_only = ranges.is_empty()
-            && to_send == 0
-            && !inplace
-            && matches!(
-                self.sched.jobs.lock().unwrap()[idx].dst_entry,
-                Some(Entry {
-                    kind: Kind::File,
-                    ..
-                })
-            )
-            && !self.probe_left_partial(&job)?;
-
         match self.sched.ranges_ready(idx, ranges) {
             Some(h) => {
                 let res = self.transfer_range(&h);
@@ -2619,28 +2459,29 @@ impl Worker {
                 }
             }
             None => {
-                if metadata_only {
+                if !needs_finalize {
                     self.progress.files_total.fetch_sub(1, Relaxed);
                     self.progress.files_skipped.fetch_add(1, Relaxed);
+                    // Content matched block for block and the metadata is now
+                    // right: complete, so checkpoint it (after the same source
+                    // re-check a transferred file gets) and spare the next
+                    // run the stat and the hashing.
+                    let unchanged = matches!(
+                        stat_one(&mut *self.src, &job.src, false)?,
+                        Some(ref e) if e.kind == Kind::File
+                            && e.size == job.entry.size
+                            && e.mtime == job.entry.mtime
+                            && e.mtime_nsec == job.entry.mtime_nsec
+                    );
+                    if unchanged {
+                        self.record_done(&job.rel_bytes, &job.entry);
+                    }
                 } else {
                     self.finish_file(idx)?;
                 }
             }
         }
         Ok(())
-    }
-
-    /// Whether a partial file exists for this job on the destination.
-    fn probe_left_partial(&mut self, job: &FileJob) -> Result<bool> {
-        match ok(
-            self.dst.call(Request::Probe {
-                path: job.dst.clone(),
-            })?,
-            "probe",
-        )? {
-            Response::Probed { partial_size, .. } => Ok(partial_size.is_some()),
-            other => bail!("unexpected response {other:?}"),
-        }
     }
 
     /// Record the in-place decision on the job so every range worker and the
@@ -2652,21 +2493,6 @@ impl Worker {
     /// Attempt an in-kernel same-host copy. Ok(true) = done; Ok(false) =
     /// kernel can't offload, caller should stream; Err = real failure.
     fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
-        // If a partial exists, prefer the streaming path so its hash-based
-        // resume reuses the bytes already on disk; copy_file_range would
-        // discard them and recopy the whole file.
-        let partial = match ok(
-            self.dst.call(Request::Probe {
-                path: job.dst.clone(),
-            })?,
-            "probe",
-        )? {
-            Response::Probed { partial_size, .. } => partial_size.is_some(),
-            _ => false,
-        };
-        if partial {
-            return Ok(false);
-        }
         // Write to a partial and let finish_file rename it, so an interrupted
         // copy_file_range never leaves a final-named file the quick check could
         // mistake for complete. Only --inplace writes the final path directly.
@@ -2856,11 +2682,11 @@ impl Worker {
         }
     }
 
-    /// Record a completed file in the resume journal (if active).
-    fn record_done(&self, rel_bytes: &[u8], size: u64, mtime: i64, mtime_nsec: u32) {
-        if let Some(rs) = self.resume.get() {
-            if let Some(j) = &rs.journal {
-                j.record_complete(rel_bytes, size, mtime, mtime_nsec, "transferred");
+    /// Record a completed file in the explicit checkpoint, if active.
+    fn record_done(&self, rel_bytes: &[u8], entry: &Entry) {
+        if let Some(shared) = self.checkpoint.get() {
+            if let Some(checkpoint) = &shared.checkpoint {
+                checkpoint.record_complete(rel_bytes, entry, "transferred");
             }
         }
     }
@@ -2920,12 +2746,7 @@ impl Worker {
             bail!("source changed during transfer (or vanished)");
         }
         self.progress.files_done.fetch_add(1, Relaxed);
-        self.record_done(
-            &job.rel_bytes,
-            job.entry.size,
-            job.entry.mtime,
-            job.entry.mtime_nsec,
-        );
+        self.record_done(&job.rel_bytes, &job.entry);
         if self.opts.verbose > 0 {
             self.progress.println(&job.rel);
         }
