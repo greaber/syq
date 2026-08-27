@@ -128,6 +128,9 @@ pub struct Args {
     /// Send all data over the ssh connection instead of separate TCP data connections
     #[arg(long)]
     pub no_tcp: bool,
+    /// Disable the resume marker/journal (no destination marker, no completion journal)
+    #[arg(long)]
+    pub no_resume: bool,
     /// Port range the remote listens on for --tcp
     #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
     pub tcp_ports: String,

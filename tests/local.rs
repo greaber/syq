@@ -50,9 +50,11 @@ impl Drop for Tmp {
 }
 
 fn pcp(args: &[&str]) -> Output {
+    let state = std::env::temp_dir().join(format!("pcp-test-state-{}", std::process::id()));
     Command::new(env!("CARGO_BIN_EXE_pcp"))
         .args(args)
         .arg("--no-progress")
+        .env("PCP_STATE_DIR", &state)
         .output()
         .expect("run pcp")
 }
@@ -460,6 +462,7 @@ fn large_file_parallel_chunks() {
     set_mtime(&t.path("src/huge.bin"), 1_600_000_000);
     run_ok(&[
         "-a",
+        "--no-resume",
         "-j",
         "8",
         "--block-size",
@@ -481,6 +484,7 @@ fn large_file_parallel_chunks() {
     fs::remove_file(t.path("dst/huge.bin")).unwrap();
     run_ok(&[
         "-a",
+        "--no-resume",
         "-j",
         "8",
         "--block-size",
@@ -1151,4 +1155,64 @@ fn ignore_conflicts_with_rm() {
     ]);
     assert!(!out.status.success());
     assert!(t.path("tree/hello.txt").is_file());
+}
+
+// Resume: a successful transfer leaves no marker behind, and the retained
+// journal is authoritative — a completed file is skipped on a plain rerun even
+// if the destination was externally deleted, while -c bypasses the journal.
+#[test]
+fn resume_marker_lifecycle_and_journal_authority() {
+    let t = Tmp::new();
+    write(&t.path("src/f.bin"), b"hello world");
+    set_mtime(&t.path("src/f.bin"), 1_600_000_000);
+
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/f.bin")), b"hello world");
+    assert!(
+        !t.path("dst/.pcp-transfer-session.json").exists(),
+        "marker must be removed after a successful transfer"
+    );
+
+    // The journal, not the destination, decides completeness. Delete the dest
+    // file; a plain rerun trusts the journal and does not recopy it.
+    fs::remove_file(t.path("dst/f.bin")).unwrap();
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert!(
+        !t.path("dst/f.bin").exists(),
+        "a journal-complete file is skipped without a destination stat"
+    );
+    assert!(!t.path("dst/.pcp-transfer-session.json").exists());
+
+    // -c ignores the journal and reconciles against the real destination.
+    run_ok(&["-a", "-c", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/f.bin")), b"hello world");
+
+    // --no-resume also ignores the journal (independent of -c).
+    fs::remove_file(t.path("dst/f.bin")).unwrap();
+    run_ok(&["-a", "--no-resume", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/f.bin")), b"hello world");
+}
+
+// A source file that would map onto the reserved marker path is refused rather
+// than clobbering the interlock.
+#[test]
+fn resume_reserved_marker_path_is_protected() {
+    let t = Tmp::new();
+    write(
+        &t.path("src/.pcp-transfer-session.json"),
+        b"not really a marker",
+    );
+    write(&t.path("src/ok.bin"), b"fine");
+    let out = pcp(&["-a", &t.s("src/"), &t.s("dst/")]);
+    // The clash is reported and exit is non-zero, but other files still land.
+    assert!(
+        !out.status.success(),
+        "reserved-path clash must fail the run"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("reserved"),
+        "stderr should explain the reservation: {err}"
+    );
+    assert_eq!(read(&t.path("dst/ok.bin")), b"fine");
 }

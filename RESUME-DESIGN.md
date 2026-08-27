@@ -51,6 +51,8 @@ Version 1 does not attempt to guarantee correct fast resume when:
 - source files change during a running copy;
 - completed destination files are deleted or modified outside PCP;
 - two matching resume processes start at almost exactly the same time;
+- independent jobs run concurrently under the same destination marker scope,
+  even when their intended payload paths do not overlap;
 - a session is automatically adopted by a different coordinating machine; or
 - a destination acknowledges a non-`--fsync` write and subsequently loses it
   during a machine or storage-system power failure.
@@ -200,6 +202,13 @@ The marker is a persistent claim, not a held advisory lock. A crashed process
 leaves it behind intentionally so another machine cannot treat the incomplete
 destination as fresh.
 
+One marker claims the entire destination scope. Two jobs targeting the same
+destination root are therefore serialized even if one intends to populate `A/`
+and the other `B/`: the second job sees a different identity and aborts. Jobs
+that name `A/` and `B/` themselves as separate destination roots have separate
+marker scopes and may run independently. Version 1 chooses this conservative
+root-level policy instead of trying to prove that two mappings cannot overlap.
+
 ## Local journal format
 
 The local journal is append-only JSON Lines. Rewriting a large JSON array for
@@ -212,12 +221,19 @@ Illustrative records are:
 {"type":"session_start","session_id":"80e00c95b8ff4d108e125bc8d29166fd","started_at":"2026-08-27T15:00:00Z"}
 {"type":"complete","path_b64":"YS9maWxlMQ==","kind":"file","size":1234,"mtime_sec":1700000000,"mtime_nsec":123456789,"basis":"transferred"}
 {"type":"complete","path_b64":"Yi9maWxlMg==","kind":"file","size":9876,"mtime_sec":1700000001,"mtime_nsec":987654321,"basis":"quick-check"}
-{"type":"session_complete","session_id":"80e00c95b8ff4d108e125bc8d29166fd","completed_at":"2026-08-27T15:30:00Z"}
+{"type":"session_complete","session_id":"80e00c95b8ff4d108e125bc8d29166fd","completed_at":"2026-08-27T15:30:00Z","root_meta":{"mode":493,"uid":1000,"gid":1000,"mtime_sec":1700000002,"mtime_nsec":0}}
+{"type":"cleanup_complete","session_id":"80e00c95b8ff4d108e125bc8d29166fd","completed_at":"2026-08-27T15:30:01Z"}
 ```
 
 Paths are encoded without assuming UTF-8; base64 is sufficient for JSON.
 Completion records persist across sessions. The latest valid completion record
 for a destination-relative path wins.
+
+`session_complete` means that all payload and ordinary metadata work succeeded
+and the session may release its marker. It also retains the destination-root
+metadata needed for idempotent post-marker cleanup. `cleanup_complete` means
+the matching marker is absent and the root metadata has been restored after
+marker removal.
 
 A malformed or unterminated final line is treated as a crash-truncated tail and
 ignored. A malformed interior record means the journal is corrupt; PCP must
@@ -231,8 +247,8 @@ format without changing these semantics.
 Before payload operations, PCP determines the effective destination scope and
 the corresponding marker location.
 
-When no marker exists and the local journal is absent or its latest session is
-complete:
+When no marker exists and the local journal is absent or its latest session has
+`cleanup_complete`:
 
 1. Normalize and validate the job identity.
 2. Open or create the job-keyed local journal and validate its header.
@@ -244,6 +260,11 @@ complete:
 7. If the journal update fails, reread the marker, remove it only if its session
    ID is still ours, and abort before payload operations.
 8. Begin the ordinary source scan and transfer.
+
+If the latest local session has `session_complete` but not
+`cleanup_complete`, PCP first finishes the idempotent cleanup described below.
+This applies whether its marker remains or was already removed before a crash.
+Only after recording `cleanup_complete` may it enter the new-session flow.
 
 If an incomplete local session exists but its destination marker is missing,
 PCP should abort by default. The marker may have been removed manually or the
@@ -259,7 +280,8 @@ When a destination marker exists:
 2. Locate the local journal directly from the current job key.
 3. Validate the complete job identity stored in the journal and marker.
 4. If the matching session already has a durable `session_complete`, reread and
-   conditionally remove its stale marker, then restart the new-session flow.
+   conditionally remove its stale marker, restore the recorded destination-root
+   metadata, append `cleanup_complete`, and then restart the new-session flow.
 5. Otherwise, confirm that the journal's latest incomplete `session_start` has
    the same session ID as the marker.
 6. If all identities match, resume using the existing completion records and
@@ -360,24 +382,28 @@ Only after all payload work and deferred child-directory metadata finish
 without errors should PCP:
 
 1. flush pending file-completion records;
-2. reread the destination marker and confirm its session ID still matches;
-3. remove that marker;
-4. reapply the requested destination-root metadata, because marker removal
+2. append `session_complete`, including the root metadata needed for cleanup,
+   and sync the journal before releasing the destination marker;
+3. reread the destination marker and confirm its session ID still matches;
+4. remove that marker;
+5. reapply the requested destination-root metadata, because marker removal
    changed the root directory's mtime;
-5. append and flush `session_complete` for the active session; and
-6. retain the job-keyed local journal for later reruns.
+6. append and flush `cleanup_complete`; and
+7. retain the job-keyed local journal for later reruns.
 
-This leaves only the interval of one final metadata operation between marker
-removal and durable session completion. Version 1 accepts that narrow cleanup
-window rather than adding a second marker or lease protocol. A crash in that
-window leaves an incomplete local session with no marker and therefore enters
-the explicit recovery path instead of being trusted as complete.
+The ordering makes both cleanup crash windows automatic. A crash after durable
+`session_complete` but before marker removal leaves a completed session with a
+stale marker; the next invocation conditionally removes it and finishes
+cleanup. A crash after marker removal but before root-metadata restoration or
+`cleanup_complete` leaves a completed session with no marker; the next
+invocation restores the recorded root metadata and finishes cleanup. Neither
+case is mistaken for an incomplete payload or requires manual reset.
 
 If PCP exits due to interruption or a transfer error before cleanup begins, the
-marker and journal remain. If conditional marker removal fails, PCP does not
-write `session_complete`. A defensive implementation may also recognize a
-matching completed session whose stale marker remains, conditionally remove
-that marker, and then begin a new session.
+marker and journal remain. If conditional marker removal fails after
+`session_complete`, PCP reports the cleanup failure and leaves the marker in
+place; the next invocation recognizes the matching completed session and
+retries cleanup safely.
 
 Marker removal must never delete destination payload or `.pcp-partial` files.
 
@@ -425,7 +451,7 @@ After a clean session, PCP may compact the local journal atomically to:
 
 - one validated header;
 - the latest completion record for each destination-relative path; and
-- the most recent `session_complete` record.
+- the most recent `session_complete` and `cleanup_complete` records.
 
 Compaction reduces replay of superseded records but not the one-record-per-file
 floor. If multi-million-file datasets are normal, a compact binary/indexed
@@ -440,6 +466,14 @@ Two matching processes can observe the same marker and local session before
 either makes progress. Both may proceed. Eliminating this completely requires
 a local lock or a distributed compare-and-swap/lease mechanism. Version 1
 accepts the race rather than adding lock lifecycle and stale-lock handling.
+
+### Independent jobs sharing one destination root
+
+A single marker serializes the whole destination scope. Two different jobs
+cannot concurrently populate disjoint names under the same destination root;
+the second aborts on the first job's marker. Users who need independent
+concurrency should name non-overlapping subdirectories as separate destination
+roots. Version 1 does not implement per-subtree ownership or overlap analysis.
 
 ### Remote work briefly outliving the coordinator
 
@@ -459,6 +493,13 @@ deletion or modification can therefore remain unnoticed. `-c`,
 
 For archive copies, PCP already avoids resending bytes for completed files.
 The journal improves planning and restart latency.
+
+The benefit is asymmetric because the journal removes destination metadata
+requests, not the required source scan. A push from a fast local source to a
+slow NFS destination is the primary win. A pull from NFS to a fast local
+destination still pays for the expensive NFS source scan, so its improvement
+is usually modest. For NFS-to-NFS copies, the journal removes most repeated
+destination-side work but cannot remove the source-side scan.
 
 For a large small-file tree on shared NFS, a resume or completed rerun should
 require:
@@ -483,11 +524,12 @@ same destination sees that another session may have left it incomplete.
 5. Integrate journal lookups before destination `StatMany` planning for normal
    copies.
 6. Explicitly bypass journal skipping for `-c` and `--verify-only`.
-7. Append `session_complete`, remove only the matching marker, and retain the
-   journal after success.
+7. Durably append `session_complete`, remove only the matching marker, restore
+   root metadata, append `cleanup_complete`, and retain the journal.
 8. Add optional atomic compaction after clean sessions.
 9. Test shared-NFS visibility through two mount aliases, interrupted resume,
-   completed rerun, marker mismatch, missing journal, truncated journal,
-   reserved-path collision, and simultaneous marker creation.
+   completed rerun, both cleanup crash windows, marker mismatch, missing
+   journal, truncated journal, reserved-path collision, root-scope
+   serialization, and simultaneous marker creation.
 10. Benchmark cold planning, interrupted resume, and completed rerun on a
     representative multi-million-file NFS tree.

@@ -199,6 +199,19 @@ pub enum Request {
     FileHash {
         path: PathBytes,
     },
+    /// Create a marker file with exclusive-create semantics.
+    MarkerCreate {
+        path: PathBytes,
+        data: Vec<u8>,
+    },
+    /// Read a marker file if present.
+    MarkerRead {
+        path: PathBytes,
+    },
+    /// Remove a marker file (idempotent).
+    MarkerRemove {
+        path: PathBytes,
+    },
     Shutdown,
 }
 
@@ -213,6 +226,10 @@ pub enum Response {
         port: u16,
         addrs: Vec<(String, u32)>,
     },
+    /// The marker already existed; carries its current content.
+    MarkerExists(Vec<u8>),
+    /// A marker's content, or None if absent.
+    Marker(Option<Vec<u8>>),
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
     ScanDone,

@@ -79,6 +79,7 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
 | `--verify-only` | Hash every file on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
+| `--no-resume` | Don't drop a destination marker or write a completion journal for this run |
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
 | `--pcp-path PATH` | Location of `pcp` on the remote host |
 | `--bootstrap` | Copy this binary to the remote's `~/.local/bin/pcp` if starting it fails |
@@ -160,22 +161,46 @@ on NFS and NVMe.
 
 ### Resume
 
-There is no state file. On restart:
+Ctrl-C is always safe: kill it, rerun the same command. Resume works at two
+levels.
+
+**Within a file.** There is no per-file state file — the partial *is* the state:
 
 - Files whose size and mtime already match are skipped (the rsync quick check).
 - If a `.name.pcp-partial` exists, both sides hash it and the source in
-  `--block-size` blocks and only the mismatching blocks are sent. The partial
-  *is* the state, so it can't disagree with reality.
+  `--block-size` blocks and only the mismatching blocks are sent.
 - If the destination file exists but differs, its blocks are hashed against
   the source too; if all match only metadata is fixed, otherwise the matching
   blocks are copied locally into a new partial and the rest transferred.
-
-Ctrl-C is therefore always safe: kill it, rerun the same command.
 
 This block-level skip catches appends and in-place modifications (VM images,
 databases, logs). It does **not** catch a byte inserted near the start of a
 file, which rsync's rolling checksum would — for pcp's intended use (fresh
 uploads and downloads) that trade was made deliberately.
+
+**Across the whole job.** So a rerun of a large tree doesn't have to re-stat
+every destination file, pcp keeps a small completion journal per job (keyed to
+the exact source→destination paths and the metadata-affecting flags) under
+`$XDG_STATE_HOME/pcp` (default `~/.local/state/pcp`; override with
+`PCP_STATE_DIR`). While a transfer runs it also drops a marker file,
+`.pcp-transfer-session.json`, on the *destination* filesystem:
+
+- The marker keeps two transfers from writing the same destination at once. If
+  a second run finds a live marker for a different session it stops and tells
+  you which host and session owns it, rather than interleaving writes.
+- On success the marker is removed and the destination root's own
+  metadata restored; the journal is kept so the next identical run is fast.
+- If a run is interrupted, the marker and journal stay. Rerun the same command
+  and pcp skips the files the journal already recorded as complete (matching
+  source size + mtime) without stat'ing the destination, then finishes the rest.
+
+Because the journal is authoritative, changes made to the destination *outside*
+pcp are not noticed by a plain rerun — a file the journal calls complete is
+skipped even if you deleted it. Pass `-c` (compare every file against the real
+destination) or `--no-resume` (ignore the journal and marker entirely) to force
+reconciliation against what is actually on disk. The journal is an optimization,
+never a correctness crutch: if the marker can't be created (e.g. a read-only
+destination directory) the transfer still runs, just without cross-run resume.
 
 ### Verification and consistency
 
