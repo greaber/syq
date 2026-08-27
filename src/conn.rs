@@ -212,9 +212,8 @@ pub struct RemoteSpec {
     pub host: String,
     pub rsh: Vec<String>,
     pub pcp_path: Option<String>,
-    /// Suppress the "falling back to ssh" notice when TCP is only the default
-    /// (not explicitly requested), so ordinary transfers stay quiet.
-    pub quiet_tcp: bool,
+    /// `-q`: suppress the "falling back to ssh" notice.
+    pub quiet: bool,
     /// Shared across clones so workers see the TCP setup done on the control connection.
     pub tcp: std::sync::Arc<std::sync::Mutex<Option<TcpInfo>>>,
 }
@@ -599,10 +598,8 @@ impl Endpoint {
                             if let Some(i) = g.as_mut() {
                                 if !i.failed {
                                     i.failed = true;
-                                    if !spec.quiet_tcp {
+                                    if !spec.quiet || crate::transfer::debug() {
                                         eprintln!("pcp: {}: TCP data connection failed ({e:#}); falling back to ssh (is port {} open?)", spec.label(), info.port);
-                                    } else if crate::transfer::debug() {
-                                        eprintln!("pcp: {}: TCP data connection failed ({e:#}); using ssh", spec.label());
                                     }
                                 }
                             }
