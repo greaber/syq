@@ -188,8 +188,12 @@ impl Drop for RemoteConn {
     }
 }
 
-/// At most this many ssh sessions are being established at any moment.
-const MAX_CONCURRENT_CONNECTS: usize = 6;
+/// At most this many *data* ssh sessions are being established at any
+/// moment. sshd's default `MaxStartups 10:30:100` starts randomly dropping
+/// new connections beyond 10 unauthenticated ones; 8 workers plus the one
+/// control connection (which bypasses this limit) stays under that, so the
+/// default starting set comes up in a single round of handshakes.
+const MAX_CONCURRENT_CONNECTS: usize = 8;
 static CONNECTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 static CONNECTS_CV: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -281,7 +285,15 @@ impl RemoteSpec {
     /// connections at random when many are being set up at once, so we also
     /// limit how many connects are in flight.
     pub fn connect(&self, compress: bool) -> Result<RemoteConn> {
-        let first = self.connect_retried(compress);
+        self.connect_with(compress, true)
+    }
+
+    /// `limited`: take a connect slot (data connections). The control
+    /// connection passes false: everything waits on it, so it must never
+    /// queue behind workers. Either way the versioned helper is installed on
+    /// first use if the remote lacks it.
+    pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
+        let first = self.connect_retried(compress, limited);
         let Err(first_error) = first else {
             return first;
         };
@@ -290,7 +302,7 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress).with_context(|| {
+        self.connect_retried(compress, limited).with_context(|| {
             format!(
                 "could not start the {} helper installed on {}",
                 remote_helper::release_key(),
@@ -299,11 +311,11 @@ impl RemoteSpec {
         })
     }
 
-    fn connect_retried(&self, compress: bool) -> Result<RemoteConn> {
+    fn connect_retried(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
         for attempt in 0..6 {
-            let _slot = connect_slot();
+            let _slot = limited.then(connect_slot);
             match self.connect_once(compress) {
                 Ok(c) => return Ok(c),
                 // Don't retry what won't change: missing binary (127) or a version mismatch.
