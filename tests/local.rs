@@ -78,7 +78,10 @@ fn transferred(stdout: &str) -> u64 {
         .unwrap_or_else(|| panic!("no summary line in {stdout:?}"));
     let after = line.split("transfer").nth(1).unwrap();
     let after = after.trim_start_matches("red").trim_start();
-    let n: String = after.chars().take_while(|c| c.is_ascii_digit() || *c == ',').collect();
+    let n: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .collect();
     n.replace(',', "").parse().unwrap()
 }
 
@@ -100,10 +103,23 @@ fn set_mtime(p: &Path, secs: i64) {
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(p.as_os_str().as_bytes()).unwrap();
     let ts = [
-        libc::timespec { tv_sec: secs, tv_nsec: 0 },
-        libc::timespec { tv_sec: secs, tv_nsec: 0 },
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 0,
+        },
     ];
-    let r = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+    let r = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            ts.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
     assert_eq!(r, 0, "utimensat {}", p.display());
 }
 
@@ -117,7 +133,10 @@ fn mkfifo(p: &Path) {
 /// Cheap deterministic pseudo-random bytes.
 fn prng(len: usize, seed: u64) -> Vec<u8> {
     let mut v = vec![0u8; len];
-    let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) | 1;
+    let mut x = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+        | 1;
     for chunk in v.chunks_mut(8) {
         x ^= x << 13;
         x ^= x >> 7;
@@ -132,22 +151,50 @@ fn prng(len: usize, seed: u64) -> Vec<u8> {
 fn assert_same_tree(a: &Path, b: &Path) {
     let ma = fs::symlink_metadata(a).unwrap_or_else(|e| panic!("{}: {e}", a.display()));
     let mb = fs::symlink_metadata(b).unwrap_or_else(|e| panic!("{}: {e}", b.display()));
-    assert_eq!(ma.file_type(), mb.file_type(), "kind differs: {} vs {}", a.display(), b.display());
+    assert_eq!(
+        ma.file_type(),
+        mb.file_type(),
+        "kind differs: {} vs {}",
+        a.display(),
+        b.display()
+    );
     if ma.file_type().is_symlink() {
-        assert_eq!(fs::read_link(a).unwrap(), fs::read_link(b).unwrap(), "link target {}", a.display());
+        assert_eq!(
+            fs::read_link(a).unwrap(),
+            fs::read_link(b).unwrap(),
+            "link target {}",
+            a.display()
+        );
         return;
     }
-    assert_eq!(ma.mode() & 0o7777, mb.mode() & 0o7777, "mode differs: {}", a.display());
+    assert_eq!(
+        ma.mode() & 0o7777,
+        mb.mode() & 0o7777,
+        "mode differs: {}",
+        a.display()
+    );
     assert_eq!(ma.mtime(), mb.mtime(), "mtime differs: {}", a.display());
     if ma.is_file() {
         assert_eq!(ma.len(), mb.len(), "size differs: {}", a.display());
         assert!(read(a) == read(b), "content differs: {}", a.display());
     } else if ma.is_dir() {
-        let mut ea: Vec<_> = fs::read_dir(a).unwrap().map(|e| e.unwrap().file_name()).collect();
-        let mut eb: Vec<_> = fs::read_dir(b).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let mut ea: Vec<_> = fs::read_dir(a)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let mut eb: Vec<_> = fs::read_dir(b)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         ea.sort();
         eb.sort();
-        assert_eq!(ea, eb, "directory listing differs: {} vs {}", a.display(), b.display());
+        assert_eq!(
+            ea,
+            eb,
+            "directory listing differs: {} vs {}",
+            a.display(),
+            b.display()
+        );
         for name in ea {
             assert_same_tree(&a.join(&name), &b.join(&name));
         }
@@ -159,7 +206,10 @@ fn make_tree(root: &Path) {
     write(&root.join("hello.txt"), b"hello\n");
     write(&root.join("a/med.bin"), &prng(3 * 1024 * 1024 + 17, 1));
     for i in 0..30 {
-        write(&root.join(format!("a/b/f{i}")), &prng((i * 977) % 5000, i as u64));
+        write(
+            &root.join(format!("a/b/f{i}")),
+            &prng((i * 977) % 5000, i as u64),
+        );
     }
     write(&root.join("a/b/c/zero"), b"");
     fs::create_dir_all(root.join("empty")).unwrap();
@@ -263,17 +313,37 @@ fn metadata_preserved_with_archive() {
     assert_eq!(md.mode() & 0o777, 0o640);
     assert_eq!(md.mtime(), 1_577_934_245);
     assert_eq!(fs::metadata(d.join("a")).unwrap().mode() & 0o777, 0o750);
-    assert_eq!(fs::read_link(d.join("badlink")).unwrap(), PathBuf::from("/nonexistent/target"));
-    assert_eq!(fs::read_link(d.join("link")).unwrap(), PathBuf::from("hello.txt"));
-    assert!(std::os::unix::fs::FileTypeExt::is_fifo(&fs::symlink_metadata(d.join("fifo")).unwrap().file_type()));
+    assert_eq!(
+        fs::read_link(d.join("badlink")).unwrap(),
+        PathBuf::from("/nonexistent/target")
+    );
+    assert_eq!(
+        fs::read_link(d.join("link")).unwrap(),
+        PathBuf::from("hello.txt")
+    );
+    assert!(std::os::unix::fs::FileTypeExt::is_fifo(
+        &fs::symlink_metadata(d.join("fifo")).unwrap().file_type()
+    ));
     assert_eq!(fs::metadata(d.join("a/b/c/zero")).unwrap().len(), 0);
     assert!(d.join("empty").is_dir());
     assert_eq!(fs::read_dir(d.join("empty")).unwrap().count(), 0);
     // Directory mtimes survive their children being written.
-    assert_eq!(fs::metadata(d.join("a")).unwrap().mtime(), 1_577_934_245 + 5);
-    assert_eq!(fs::metadata(d.join("a/b")).unwrap().mtime(), 1_577_934_245 + 4);
-    assert_eq!(fs::metadata(d.join("a/b/c")).unwrap().mtime(), 1_577_934_245 + 3);
-    assert_eq!(fs::metadata(d.join("empty")).unwrap().mtime(), 1_577_934_245 + 6);
+    assert_eq!(
+        fs::metadata(d.join("a")).unwrap().mtime(),
+        1_577_934_245 + 5
+    );
+    assert_eq!(
+        fs::metadata(d.join("a/b")).unwrap().mtime(),
+        1_577_934_245 + 4
+    );
+    assert_eq!(
+        fs::metadata(d.join("a/b/c")).unwrap().mtime(),
+        1_577_934_245 + 3
+    );
+    assert_eq!(
+        fs::metadata(d.join("empty")).unwrap().mtime(),
+        1_577_934_245 + 6
+    );
     assert_eq!(fs::metadata(&d).unwrap().mtime(), 1_577_934_245 + 7);
     assert_same_tree(&t.path("src"), &d);
 }
@@ -285,7 +355,11 @@ fn rerun_transfers_nothing() {
     let out = run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
     assert!(transferred(&out) > 0);
     let out = run_ok(&["-av", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(transferred(&out), 0, "second run should transfer nothing: {out}");
+    assert_eq!(
+        transferred(&out),
+        0,
+        "second run should transfer nothing: {out}"
+    );
     assert_same_tree(&t.path("src"), &t.path("dst"));
 }
 
@@ -303,7 +377,13 @@ fn resume_from_partial() {
         (&f).write_all(&data[..data.len() / 2]).unwrap();
         f.set_len(data.len() as u64).unwrap();
     }
-    let out = run_ok(&["-a", "--block-size", "1M", &t.s("src/big.bin"), &t.s("dst/")]);
+    let out = run_ok(&[
+        "-a",
+        "--block-size",
+        "1M",
+        &t.s("src/big.bin"),
+        &t.s("dst/"),
+    ]);
     assert!(read(&t.path("dst/big.bin")) == data);
     assert!(!partial.exists(), "partial should be gone after finalize");
     assert_same_tree(&t.path("src/big.bin"), &t.path("dst/big.bin"));
@@ -326,12 +406,18 @@ fn checksum_repairs_silent_corruption() {
 
     let out = run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(transferred(&out), 0, "quick check should skip: {out}");
-    assert!(read(&t.path("dst/f.bin")) == bad, "without -c the file must be left alone");
+    assert!(
+        read(&t.path("dst/f.bin")) == bad,
+        "without -c the file must be left alone"
+    );
 
     let out = run_ok(&["-ac", "--block-size", "1M", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(transferred(&out), 1, "{out}");
     assert!(read(&t.path("dst/f.bin")) == data, "-c should repair");
-    assert!(out.contains("(1.00 MiB)"), "only one block should be resent: {out}");
+    assert!(
+        out.contains("(1.00 MiB)"),
+        "only one block should be resent: {out}"
+    );
     assert_same_tree(&t.path("src"), &t.path("dst"));
 }
 
@@ -341,12 +427,19 @@ fn verify_only_detects_differences() {
     make_tree(&t.path("src"));
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
     let out = pcp(&["-a", "--verify-only", &t.s("src/"), &t.s("dst/")]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut bad = read(&t.path("dst/a/med.bin"));
     bad[1000] ^= 1;
     write(&t.path("dst/a/med.bin"), &bad);
-    set_mtime(&t.path("dst/a/med.bin"), fs::metadata(t.path("src/a/med.bin")).unwrap().mtime());
+    set_mtime(
+        &t.path("dst/a/med.bin"),
+        fs::metadata(t.path("src/a/med.bin")).unwrap().mtime(),
+    );
     fs::remove_file(t.path("dst/hello.txt")).unwrap();
 
     let out = pcp(&["-a", "--verify-only", &t.s("src/"), &t.s("dst/")]);
@@ -365,7 +458,17 @@ fn large_file_parallel_chunks() {
     let data = prng(200 * 1024 * 1024 + 4321, 99);
     write(&t.path("src/huge.bin"), &data);
     set_mtime(&t.path("src/huge.bin"), 1_600_000_000);
-    run_ok(&["-a", "-j", "8", "--block-size", "1M", "--min-split", "2M", &t.s("src/"), &t.s("dst/")]);
+    run_ok(&[
+        "-a",
+        "-j",
+        "8",
+        "--block-size",
+        "1M",
+        "--min-split",
+        "2M",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
     assert!(read(&t.path("dst/huge.bin")) == data);
     assert_same_tree(&t.path("src/huge.bin"), &t.path("dst/huge.bin"));
     assert!(!t.path("dst/.huge.bin.pcp-partial").exists());
@@ -376,7 +479,17 @@ fn large_file_parallel_chunks() {
         f.set_len(data.len() as u64).unwrap();
     }
     fs::remove_file(t.path("dst/huge.bin")).unwrap();
-    run_ok(&["-a", "-j", "8", "--block-size", "1M", "--min-split", "2M", &t.s("src/"), &t.s("dst/")]);
+    run_ok(&[
+        "-a",
+        "-j",
+        "8",
+        "--block-size",
+        "1M",
+        "--min-split",
+        "2M",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
     assert!(read(&t.path("dst/huge.bin")) == data);
 }
 
@@ -385,7 +498,10 @@ fn dry_run_creates_nothing() {
     let t = Tmp::new();
     make_tree(&t.path("src"));
     let out = run_ok(&["-an", &t.s("src"), &t.s("dst")]);
-    assert!(!t.path("dst").exists(), "dry run must not create the destination");
+    assert!(
+        !t.path("dst").exists(),
+        "dry run must not create the destination"
+    );
     assert!(out.contains("would transfer"), "{out}");
     assert!(transferred(&out) > 0);
 }
@@ -420,7 +536,12 @@ fn unreadable_source_reports_error_but_continues() {
     write(&t.path("src/also_ok.txt"), b"fine too");
     fs::set_permissions(t.path("src/secret.txt"), fs::Permissions::from_mode(0o000)).unwrap();
     let out = pcp(&["-a", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(out.status.code(), Some(23), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("secret.txt"), "{err}");
     assert_eq!(read(&t.path("dst/ok.txt")), b"fine");
@@ -442,7 +563,10 @@ fn updates_changed_file_and_skips_symlink_only_when_same() {
     let out = run_ok(&["-av", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(transferred(&out), 1);
     assert_eq!(read(&t.path("dst/f.txt")), b"v2 longer");
-    assert_eq!(fs::read_link(t.path("dst/l")).unwrap(), PathBuf::from("other"));
+    assert_eq!(
+        fs::read_link(t.path("dst/l")).unwrap(),
+        PathBuf::from("other")
+    );
     assert_same_tree(&t.path("src"), &t.path("dst"));
 }
 
@@ -478,7 +602,10 @@ fn inplace_replaces_symlink_dest_not_its_target() {
     run_ok(&["-a", "--inplace", &t.s("src"), &t.s("link")]);
     // The symlink target must be untouched; the dest is now a regular file.
     assert_eq!(read(&t.path("external")), b"EXTERNAL");
-    assert!(fs::symlink_metadata(t.path("link")).unwrap().file_type().is_file());
+    assert!(fs::symlink_metadata(t.path("link"))
+        .unwrap()
+        .file_type()
+        .is_file());
     assert_eq!(read(&t.path("link")), b"SRCDATA");
 }
 
@@ -523,7 +650,10 @@ fn duplicate_destination_rejected() {
     write(&t.path("b/same"), b"B");
     fs::create_dir_all(t.path("dest")).unwrap();
     let out = pcp(&["-a", &t.s("a/same"), &t.s("b/same"), &t.s("dest/")]);
-    assert!(!out.status.success(), "two sources named 'same' must be rejected");
+    assert!(
+        !out.status.success(),
+        "two sources named 'same' must be rejected"
+    );
     assert!(!t.path("dest/same").exists());
 }
 
@@ -602,7 +732,10 @@ fn partial_symlink_is_not_followed() {
     std::os::unix::fs::symlink("external", t.path(".out.pcp-partial")).unwrap();
     run_ok(&["-a", &t.s("src"), &t.s("out")]);
     assert_eq!(read(&t.path("external")), b"EXTERNAL-DO-NOT-TOUCH");
-    assert!(fs::symlink_metadata(t.path("out")).unwrap().file_type().is_file());
+    assert!(fs::symlink_metadata(t.path("out"))
+        .unwrap()
+        .file_type()
+        .is_file());
     assert_eq!(read(&t.path("out")).len(), 5 * 1024 * 1024);
 }
 
@@ -618,11 +751,19 @@ fn rm_rejects_dot_final_component() {
 #[test]
 fn dir_vs_file_destination_collision_rejected() {
     let t = Tmp::new();
-    write(&t.path("A/x"), b"aaa");        // A/x is a file
-    write(&t.path("B/x/y"), b"yyy");      // B/x is a directory
+    write(&t.path("A/x"), b"aaa"); // A/x is a file
+    write(&t.path("B/x/y"), b"yyy"); // B/x is a directory
     fs::create_dir_all(t.path("dest")).unwrap();
-    let out = pcp(&["-a", &format!("{}/", t.s("A")), &format!("{}/", t.s("B")), &format!("{}/", t.s("dest"))]);
-    assert!(!out.status.success(), "conflicting file-vs-dir destination must be rejected");
+    let out = pcp(&[
+        "-a",
+        &format!("{}/", t.s("A")),
+        &format!("{}/", t.s("B")),
+        &format!("{}/", t.s("dest")),
+    ]);
+    assert!(
+        !out.status.success(),
+        "conflicting file-vs-dir destination must be rejected"
+    );
 }
 
 #[test]
@@ -632,7 +773,12 @@ fn verify_only_detects_symlink_difference() {
     fs::create_dir_all(t.path("d")).unwrap();
     std::os::unix::fs::symlink("target-a", t.path("s/l")).unwrap();
     std::os::unix::fs::symlink("target-b", t.path("d/l")).unwrap();
-    let out = pcp(&["-a", "--verify-only", &format!("{}/", t.s("s")), &format!("{}/", t.s("d"))]);
+    let out = pcp(&[
+        "-a",
+        "--verify-only",
+        &format!("{}/", t.s("s")),
+        &format!("{}/", t.s("d")),
+    ]);
     assert_eq!(out.status.code(), Some(23));
     assert!(String::from_utf8_lossy(&out.stderr).contains("DIFFERS"));
 }
@@ -643,10 +789,21 @@ fn small_files_atomic_no_partials() {
     for i in 0..200 {
         write(&t.path(&format!("sm/f{i}")), format!("data-{i}").as_bytes());
     }
-    run_ok(&["-a", &format!("{}/", t.s("sm")), &format!("{}/", t.s("smd"))]);
-    let partials = fs::read_dir(t.path("smd")).unwrap().filter(|e| {
-        e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pcp-partial")
-    }).count();
+    run_ok(&[
+        "-a",
+        &format!("{}/", t.s("sm")),
+        &format!("{}/", t.s("smd")),
+    ]);
+    let partials = fs::read_dir(t.path("smd"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pcp-partial")
+        })
+        .count();
     assert_eq!(partials, 0);
     assert_eq!(read(&t.path("smd/f7")), b"data-7");
 }
@@ -656,15 +813,23 @@ fn small_files_atomic_no_partials() {
 #[test]
 fn quick_skipped_file_still_claims_destination() {
     let t = Tmp::new();
-    write(&t.path("A/x"), b"aaa");     // A/x is a file
-    write(&t.path("B/x/y"), b"yyy");   // B/x is a directory
-    // Pre-populate dest/x identical to A/x so A/x is quick-skipped.
+    write(&t.path("A/x"), b"aaa"); // A/x is a file
+    write(&t.path("B/x/y"), b"yyy"); // B/x is a directory
+                                     // Pre-populate dest/x identical to A/x so A/x is quick-skipped.
     write(&t.path("dest/x"), b"aaa");
     set_mtime(&t.path("A/x"), 1_000_000_000);
     set_mtime(&t.path("dest/x"), 1_000_000_000);
-    let out = pcp(&["-a", &format!("{}/", t.s("A")), &format!("{}/", t.s("B")), &format!("{}/", t.s("dest"))]);
+    let out = pcp(&[
+        "-a",
+        &format!("{}/", t.s("A")),
+        &format!("{}/", t.s("B")),
+        &format!("{}/", t.s("dest")),
+    ]);
     // The skipped file must still claim dest/x, so B's directory is rejected.
-    assert!(!out.status.success(), "quick-skipped file must still block a colliding directory");
+    assert!(
+        !out.status.success(),
+        "quick-skipped file must still block a colliding directory"
+    );
 }
 
 #[test]
@@ -672,10 +837,19 @@ fn verify_only_flags_missing_directory() {
     let t = Tmp::new();
     write(&t.path("s/sub/f"), b"f");
     fs::create_dir_all(t.path("d")).unwrap(); // d exists but d/sub does not
-    let out = pcp(&["-a", "--verify-only", &format!("{}/", t.s("s")), &format!("{}/", t.s("d"))]);
+    let out = pcp(&[
+        "-a",
+        "--verify-only",
+        &format!("{}/", t.s("s")),
+        &format!("{}/", t.s("d")),
+    ]);
     assert_eq!(out.status.code(), Some(23));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("MISSING") &&
-            String::from_utf8_lossy(&out.stderr).to_lowercase().contains("director"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("MISSING")
+            && String::from_utf8_lossy(&out.stderr)
+                .to_lowercase()
+                .contains("director")
+    );
 }
 
 #[test]
@@ -686,8 +860,47 @@ fn verify_only_flags_missing_special() {
     // create a fifo in the source
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(t.path("s/pipe").as_os_str().as_bytes()).unwrap();
-    unsafe { assert_eq!(libc::mkfifo(c.as_ptr(), 0o644), 0); }
-    let out = pcp(&["-a", "--verify-only", &format!("{}/", t.s("s")), &format!("{}/", t.s("d"))]);
+    unsafe {
+        assert_eq!(libc::mkfifo(c.as_ptr(), 0o644), 0);
+    }
+    let out = pcp(&[
+        "-a",
+        "--verify-only",
+        &format!("{}/", t.s("s")),
+        &format!("{}/", t.s("d")),
+    ]);
     assert_eq!(out.status.code(), Some(23));
     assert!(String::from_utf8_lossy(&out.stderr).contains("special"));
+}
+
+// ---- Review round 5 ----
+
+#[test]
+fn rejects_copying_directory_into_itself() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"hi");
+    let out = pcp(&[
+        "-a",
+        &format!("{}/", t.s("src")),
+        &format!("{}/", t.s("src/dst")),
+    ]);
+    assert!(!out.status.success(), "dest inside source must be rejected");
+    // src must be untouched (no dst subtree created)
+    assert!(!t.path("src/dst").exists());
+}
+
+#[test]
+fn hardlinked_partial_does_not_corrupt_external_file() {
+    let t = Tmp::new();
+    write(&t.path("src"), &vec![9u8; 5 * 1024 * 1024]);
+    write(&t.path("external"), b"EXTERNAL-DO-NOT-TOUCH");
+    // A partial hardlinked to an external file (as a dedup/backup tool might make).
+    fs::hard_link(t.path("external"), t.path(".out.pcp-partial")).unwrap();
+    run_ok(&["-a", &t.s("src"), &t.s("out")]);
+    assert_eq!(read(&t.path("external")), b"EXTERNAL-DO-NOT-TOUCH");
+    assert_eq!(read(&t.path("out")).len(), 5 * 1024 * 1024);
+    // out and external must be different inodes
+    let mo = fs::metadata(t.path("out")).unwrap();
+    let me = fs::metadata(t.path("external")).unwrap();
+    assert!(!(mo.dev() == me.dev() && mo.ino() == me.ino()));
 }

@@ -96,12 +96,12 @@ pub struct Args {
     pub verify_only: bool,
     /// Update files in place instead of writing a partial and renaming. Use this to modify a
     /// large existing file without copying it first (saves time and disk space when only part
-    /// of it changes) — not for speed on small files, where the default is just as fast and
-    /// stays crash-atomic
+    /// of it changes)
     #[arg(long, conflicts_with = "atomic")]
     pub inplace: bool,
-    /// Always write through a partial file and an atomic rename, even for new files (rsync
-    /// semantics; costs a rename per file, which is slow on NFS)
+    /// Always write through a partial file and an atomic rename, even for small new files.
+    /// Use this when another process may read the destination while pcp writes it, so a file
+    /// only ever appears complete (rsync semantics; costs a rename per file, slow on NFS)
     #[arg(long)]
     pub atomic: bool,
     /// fsync each file and its parent directory around the rename, so a completed file
@@ -235,7 +235,11 @@ impl Location {
             }
         };
         let Some(c) = remote_split else {
-            return Ok(Location { user: None, host: None, path: s.to_string() });
+            return Ok(Location {
+                user: None,
+                host: None,
+                path: s.to_string(),
+            });
         };
         let (hostpart, path) = (&s[..c], &s[c + 1..]);
         if path.starts_with(':') {
@@ -245,14 +249,24 @@ impl Location {
             Some((u, h)) => (Some(u.to_string()), h),
             None => (None, hostpart),
         };
-        let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
         if host.is_empty() {
             bail!("empty host in {s:?}");
         }
-        let path = if path.is_empty() { ".".to_string() } else { path.to_string() };
-        Ok(Location { user, host: Some(host), path })
+        let path = if path.is_empty() {
+            ".".to_string()
+        } else {
+            path.to_string()
+        };
+        Ok(Location {
+            user,
+            host: Some(host),
+            path,
+        })
     }
-
 
     #[allow(dead_code)]
     pub fn is_remote(&self) -> bool {

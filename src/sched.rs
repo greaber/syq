@@ -145,7 +145,7 @@ impl Sched {
         for (i, h) in g.inflight.iter().enumerate() {
             let r = h.lock().unwrap();
             let rem = r.end.saturating_sub(r.pos);
-            if rem >= 2 * self.min_split && best.map_or(true, |(b, _)| rem > b) {
+            if rem >= 2 * self.min_split && best.is_none_or(|(b, _)| rem > b) {
                 best = Some((rem, i));
             }
         }
@@ -161,7 +161,11 @@ impl Sched {
         r.end = split;
         drop(r);
         *g.outstanding.entry(idx).or_insert(0) += 1;
-        let h = Arc::new(Mutex::new(RangeState { idx, pos: split, end: old_end }));
+        let h = Arc::new(Mutex::new(RangeState {
+            idx,
+            pos: split,
+            end: old_end,
+        }));
         g.inflight.push(h.clone());
         Some(h)
     }

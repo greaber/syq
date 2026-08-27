@@ -51,7 +51,10 @@ pub fn join(root: &[u8], rel: &[u8]) -> PathBytes {
 }
 
 pub fn partial_path(final_: &Path) -> PathBuf {
-    let name = final_.file_name().map(|n| n.to_os_string()).unwrap_or_else(|| OsString::from("root"));
+    let name = final_
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| OsString::from("root"));
     let mut pn = OsString::from(".");
     pn.push(&name);
     pn.push(PARTIAL_SUFFIX);
@@ -89,7 +92,9 @@ pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry 
         }
     };
     let link = if kind == Kind::Symlink {
-        fs::read_link(full).ok().map(|t| t.into_os_string().into_vec())
+        fs::read_link(full)
+            .ok()
+            .map(|t| t.into_os_string().into_vec())
     } else {
         None
     };
@@ -139,7 +144,10 @@ impl Default for FsOps {
 
 impl FsOps {
     pub fn new() -> Self {
-        FsOps { fds: HashMap::new(), fd_order: Vec::new() }
+        FsOps {
+            fds: HashMap::new(),
+            fd_order: Vec::new(),
+        }
     }
 
     fn cached(&mut self, p: &Path, write: bool) -> Result<&File> {
@@ -181,11 +189,15 @@ impl FsOps {
         let create_idx: Vec<usize> = (0..ops.len()).filter(|&i| !is_meta(&ops[i])).collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
         let mut out: Vec<Option<String>> = vec![None; ops.len()];
-        let cres = parallel_map(&create_idx, |&i| apply_one(&ops[i]).err().as_ref().map(errstr));
+        let cres = parallel_map(&create_idx, |&i| {
+            apply_one(&ops[i]).err().as_ref().map(errstr)
+        });
         for (i, r) in create_idx.iter().zip(cres) {
             out[*i] = r;
         }
-        let mres = parallel_map(&meta_idx, |&i| apply_one(&ops[i]).err().as_ref().map(errstr));
+        let mres = parallel_map(&meta_idx, |&i| {
+            apply_one(&ops[i]).err().as_ref().map(errstr)
+        });
         for (i, r) in meta_idx.iter().zip(mres) {
             out[*i] = r;
         }
@@ -243,15 +255,18 @@ fn apply_one(op: &Op) -> Result<()> {
                     Err(_) => {}
                 }
                 let c = cstr(&p)?;
-                let r = unsafe { libc::mknod(c.as_ptr(), *mode as libc::mode_t, *rdev as libc::dev_t) };
+                let r =
+                    unsafe { libc::mknod(c.as_ptr(), *mode as libc::mode_t, *rdev as libc::dev_t) };
                 if r != 0 {
-                    return Err(io::Error::last_os_error()).with_context(|| format!("mknod {}", p.display()));
+                    return Err(io::Error::last_os_error())
+                        .with_context(|| format!("mknod {}", p.display()));
                 }
                 Ok(())
             }
             Op::SetMeta { path, meta, flags } => {
                 let p = resolve(path);
-                set_meta_path(&p, meta, *flags).with_context(|| format!("set metadata {}", p.display()))
+                set_meta_path(&p, meta, *flags)
+                    .with_context(|| format!("set metadata {}", p.display()))
             }
             Op::Rmdir { path } => {
                 let p = resolve(path);
@@ -283,7 +298,10 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
             .chunks(chunk)
             .map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<R>>()))
             .collect();
-        handles.into_iter().flat_map(|h| h.join().expect("stat thread")).collect()
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("stat thread"))
+            .collect()
     })
 }
 
@@ -295,10 +313,20 @@ impl FsOps {
             .filter(|m| m.is_file())
             .map(|m| m.len());
         let final_entry = lstat_entry(Vec::new(), &p).ok();
-        Ok(Response::Probed { partial_size, final_entry })
+        Ok(Response::Probed {
+            partial_size,
+            final_entry,
+        })
     }
 
-    pub fn prepare(&mut self, path: &[u8], size: u64, inplace: bool, from_final: bool, mode: u32) -> Result<()> {
+    pub fn prepare(
+        &mut self,
+        path: &[u8],
+        size: u64,
+        inplace: bool,
+        from_final: bool,
+        mode: u32,
+    ) -> Result<()> {
         let p = resolve(path);
         if inplace {
             self.uncache(&p);
@@ -331,10 +359,18 @@ impl FsOps {
         let pp = partial_path(&p);
         self.uncache(&pp);
         if let Ok(md) = fs::symlink_metadata(&pp) {
-            if md.is_file() {
-                let f = OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(&pp)?;
-                f.set_len(size)?;
-                return Ok(());
+            // Resume only a private regular partial. A partial with more than one
+            // link (hardlinked to some other file by a backup/dedup tool) must be
+            // discarded, or writing to it would corrupt that other file.
+            if md.is_file() && md.nlink() == 1 {
+                let f = OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&pp)?;
+                if f.metadata()?.nlink() == 1 {
+                    f.set_len(size)?;
+                    return Ok(());
+                }
             }
             fs::remove_file(&pp).ok();
         }
@@ -347,9 +383,11 @@ impl FsOps {
         if from_final {
             // Seed the partial with the existing file for block-diff, but never
             // keep more than `size` bytes (a longer destination must shrink).
-            let mut src = File::open(&p).with_context(|| format!("open {} to seed repair", p.display()))?;
+            let mut src =
+                File::open(&p).with_context(|| format!("open {} to seed repair", p.display()))?;
             let mut dst = &f;
-            io::copy(&mut (&mut src).take(size), &mut dst).with_context(|| format!("seed partial from {}", p.display()))?;
+            io::copy(&mut (&mut src).take(size), &mut dst)
+                .with_context(|| format!("seed partial from {}", p.display()))?;
         }
         preallocate(&f, size)?;
         f.set_len(size)?; // exact length: fallocate never shrinks an already-longer file
@@ -361,7 +399,14 @@ impl FsOps {
     /// without server-side copy, or an unsupported filesystem) so the caller
     /// can use the normal streaming path.
     #[cfg(target_os = "linux")]
-    pub fn copy_local(&mut self, src: &[u8], dst: &[u8], inplace: bool, size: u64, mode: u32) -> Result<()> {
+    pub fn copy_local(
+        &mut self,
+        src: &[u8],
+        dst: &[u8],
+        inplace: bool,
+        size: u64,
+        mode: u32,
+    ) -> Result<()> {
         use std::os::unix::io::AsRawFd;
         let sp = resolve(src);
         let s = File::open(&sp).with_context(|| format!("open {}", sp.display()))?;
@@ -374,7 +419,11 @@ impl FsOps {
             }
         }
         self.uncache(&dp);
-        let target = if inplace { dp.clone() } else { partial_path(&dp) };
+        let target = if inplace {
+            dp.clone()
+        } else {
+            partial_path(&dp)
+        };
         self.uncache(&target);
         if let Some(parent) = target.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -399,7 +448,12 @@ impl FsOps {
                 let e = io::Error::last_os_error();
                 let raw = e.raw_os_error().unwrap_or(0);
                 // First-block failure with a "can't offload" errno: signal fallback.
-                if remaining == size && matches!(raw, libc::EXDEV | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) {
+                if remaining == size
+                    && matches!(
+                        raw,
+                        libc::EXDEV | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL
+                    )
+                {
                     drop(d);
                     let _ = fs::remove_file(&target);
                     bail!("EXDEV");
@@ -407,7 +461,9 @@ impl FsOps {
                 if raw == libc::EINTR {
                     continue;
                 }
-                return Err(e).with_context(|| format!("copy_file_range {} -> {}", sp.display(), target.display()));
+                return Err(e).with_context(|| {
+                    format!("copy_file_range {} -> {}", sp.display(), target.display())
+                });
             }
             if n == 0 {
                 break; // source shorter than expected; finalize what we have
@@ -418,7 +474,14 @@ impl FsOps {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub fn copy_local(&mut self, _src: &[u8], _dst: &[u8], _inplace: bool, _size: u64, _mode: u32) -> Result<()> {
+    pub fn copy_local(
+        &mut self,
+        _src: &[u8],
+        _dst: &[u8],
+        _inplace: bool,
+        _size: u64,
+        _mode: u32,
+    ) -> Result<()> {
         bail!("EXDEV")
     }
 
@@ -427,7 +490,15 @@ impl FsOps {
     /// write leaves a *short* file that the next run detects (size mismatch) and
     /// re-transfers — so there is no "full size, wrong content" state to mistake
     /// for complete. Saves the rename op, which dominates small-file cost on NFS.
-    pub fn put_small(&mut self, path: &[u8], data: &[u8], hash: u64, meta: &Meta, flags: u8, fsync: bool) -> Result<()> {
+    pub fn put_small(
+        &mut self,
+        path: &[u8],
+        data: &[u8],
+        hash: u64,
+        meta: &Meta,
+        flags: u8,
+        fsync: bool,
+    ) -> Result<()> {
         if xxh3_64(data) != hash {
             bail!("block hash mismatch on receive");
         }
@@ -444,20 +515,37 @@ impl FsOps {
             }
         }
         let f = open_regular_write(&p, meta.mode)?;
-        f.write_all_at(data, 0).with_context(|| format!("write {}", p.display()))?;
+        f.write_all_at(data, 0)
+            .with_context(|| format!("write {}", p.display()))?;
         set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", p.display()))?;
         if fsync {
-            f.sync_all().with_context(|| format!("fsync {}", p.display()))?;
-            let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-            let df = File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
-            df.sync_all().with_context(|| format!("fsync directory {}", dir.display()))?;
+            f.sync_all()
+                .with_context(|| format!("fsync {}", p.display()))?;
+            let dir = p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let df =
+                File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
+            df.sync_all()
+                .with_context(|| format!("fsync directory {}", dir.display()))?;
         }
         Ok(())
     }
 
-    pub fn hash_blocks(&mut self, path: &[u8], which: Which, block: u64, len: u64) -> Result<Vec<u64>> {
+    pub fn hash_blocks(
+        &mut self,
+        path: &[u8],
+        which: Which,
+        block: u64,
+        len: u64,
+    ) -> Result<Vec<u64>> {
         let p = resolve(path);
-        let p = if which == Which::Partial { partial_path(&p) } else { p };
+        let p = if which == Which::Partial {
+            partial_path(&p)
+        } else {
+            p
+        };
         let mut f = File::open(&p).with_context(|| format!("open {}", p.display()))?;
         let n = len.div_ceil(block) as usize;
         let mut out = Vec::with_capacity(n);
@@ -496,17 +584,32 @@ impl FsOps {
         Ok(Response::Block { off, hash, data })
     }
 
-    pub fn write_range(&mut self, path: &[u8], inplace: bool, off: u64, hash: u64, data: &[u8]) -> Result<()> {
+    pub fn write_range(
+        &mut self,
+        path: &[u8],
+        inplace: bool,
+        off: u64,
+        hash: u64,
+        data: &[u8],
+    ) -> Result<()> {
         if xxh3_64(data) != hash {
             bail!("block hash mismatch on receive @{off}");
         }
         let p = resolve(path);
         let p = if inplace { p } else { partial_path(&p) };
         let f = self.cached(&p, true)?;
-        f.write_all_at(data, off).with_context(|| format!("write {} @{off}", p.display()))
+        f.write_all_at(data, off)
+            .with_context(|| format!("write {} @{off}", p.display()))
     }
 
-    pub fn finalize(&mut self, path: &[u8], inplace: bool, meta: &Meta, flags: u8, fsync: bool) -> Result<()> {
+    pub fn finalize(
+        &mut self,
+        path: &[u8],
+        inplace: bool,
+        meta: &Meta,
+        flags: u8,
+        fsync: bool,
+    ) -> Result<()> {
         let p = resolve(path);
         let src = if inplace { p.clone() } else { partial_path(&p) };
         let f = match self.uncache(&src) {
@@ -516,9 +619,11 @@ impl FsOps {
                 .open(&src)
                 .with_context(|| format!("open {}", src.display()))?,
         };
-        set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", src.display()))?;
+        set_meta_file(&f, meta, flags)
+            .with_context(|| format!("set metadata {}", src.display()))?;
         if fsync {
-            f.sync_all().with_context(|| format!("fsync {}", src.display()))?;
+            f.sync_all()
+                .with_context(|| format!("fsync {}", src.display()))?;
         }
         drop(f);
         if !inplace {
@@ -527,13 +632,19 @@ impl FsOps {
                     bail!("destination {} is a directory", p.display());
                 }
             }
-            fs::rename(&src, &p).with_context(|| format!("rename {} -> {}", src.display(), p.display()))?;
+            fs::rename(&src, &p)
+                .with_context(|| format!("rename {} -> {}", src.display(), p.display()))?;
         }
         if fsync {
             // Make the rename (or in-place write) itself durable.
-            let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-            let df = File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
-            df.sync_all().with_context(|| format!("fsync directory {}", dir.display()))?;
+            let dir = p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let df =
+                File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
+            df.sync_all()
+                .with_context(|| format!("fsync directory {}", dir.display()))?;
         }
         Ok(())
     }
@@ -553,7 +664,10 @@ impl FsOps {
             size += n as u64;
         }
         let _ = xxh3_128; // keep the symbol in case of future use
-        Ok(Response::FileHash { size, hash: h.digest128() })
+        Ok(Response::FileHash {
+            size,
+            hash: h.digest128(),
+        })
     }
 
     /// Dispatch a request that has a single response (everything except Scan).
@@ -562,29 +676,66 @@ impl FsOps {
             Request::StatMany(paths) => Ok(Response::Stats(self.stat_many(paths))),
             Request::Apply(ops) => Ok(Response::Applied(self.apply(ops))),
             Request::Probe { path } => self.probe(path),
-            Request::Prepare { path, size, inplace, from_final, mode } => {
-                self.prepare(path, *size, *inplace, *from_final, *mode).map(|_| Response::Ok)
-            }
-            Request::CopyLocal { src, dst, inplace, size, mode } => {
-                self.copy_local(src, dst, *inplace, *size, *mode).map(|_| Response::Ok)
-            }
-            Request::PutSmall { path, data, hash, meta, flags, fsync } => {
-                self.put_small(path, data, *hash, meta, *flags, *fsync).map(|_| Response::Ok)
-            }
-            Request::HashBlocks { path, which, block, len } => {
-                self.hash_blocks(path, *which, *block, *len).map(Response::Hashes)
-            }
+            Request::Prepare {
+                path,
+                size,
+                inplace,
+                from_final,
+                mode,
+            } => self
+                .prepare(path, *size, *inplace, *from_final, *mode)
+                .map(|_| Response::Ok),
+            Request::CopyLocal {
+                src,
+                dst,
+                inplace,
+                size,
+                mode,
+            } => self
+                .copy_local(src, dst, *inplace, *size, *mode)
+                .map(|_| Response::Ok),
+            Request::PutSmall {
+                path,
+                data,
+                hash,
+                meta,
+                flags,
+                fsync,
+            } => self
+                .put_small(path, data, *hash, meta, *flags, *fsync)
+                .map(|_| Response::Ok),
+            Request::HashBlocks {
+                path,
+                which,
+                block,
+                len,
+            } => self
+                .hash_blocks(path, *which, *block, *len)
+                .map(Response::Hashes),
             Request::ReadRange { path, off, len } => self.read_range(path, *off, *len),
-            Request::WriteRange { path, inplace, off, hash, data } => {
-                self.write_range(path, *inplace, *off, *hash, data).map(|_| Response::Ok)
-            }
-            Request::Finalize { path, inplace, meta, flags, fsync } => {
-                self.finalize(path, *inplace, meta, *flags, *fsync).map(|_| Response::Ok)
-            }
+            Request::WriteRange {
+                path,
+                inplace,
+                off,
+                hash,
+                data,
+            } => self
+                .write_range(path, *inplace, *off, *hash, data)
+                .map(|_| Response::Ok),
+            Request::Finalize {
+                path,
+                inplace,
+                meta,
+                flags,
+                fsync,
+            } => self
+                .finalize(path, *inplace, meta, *flags, *fsync)
+                .map(|_| Response::Ok),
             Request::FileHash { path } => self.file_hash(path),
-            Request::Hello { .. } | Request::Scan { .. } | Request::Shutdown | Request::TcpListen { .. } => {
-                Err(anyhow!("unexpected request"))
-            }
+            Request::Hello { .. }
+            | Request::Scan { .. }
+            | Request::Shutdown
+            | Request::TcpListen { .. } => Err(anyhow!("unexpected request")),
         };
         match r {
             Ok(resp) => resp,
@@ -647,7 +798,10 @@ fn preallocate(f: &File, size: u64) -> Result<()> {
 }
 
 fn timespec(sec: i64, nsec: u32) -> libc::timespec {
-    libc::timespec { tv_sec: sec as libc::time_t, tv_nsec: nsec as libc::c_long }
+    libc::timespec {
+        tv_sec: sec as libc::time_t,
+        tv_nsec: nsec as libc::c_long,
+    }
 }
 
 fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
@@ -667,7 +821,10 @@ fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
         }
     }
     if flags & flags::TIMES != 0 {
-        let ts = [timespec(0, libc::UTIME_OMIT as u32), timespec(meta.mtime, meta.mtime_nsec)];
+        let ts = [
+            timespec(0, libc::UTIME_OMIT as u32),
+            timespec(meta.mtime, meta.mtime_nsec),
+        ];
         let r = unsafe { libc::futimens(f.as_raw_fd(), ts.as_ptr()) };
         if r != 0 {
             return Err(io::Error::last_os_error().into());
@@ -680,14 +837,26 @@ fn set_meta_path(p: &Path, meta: &Meta, flags: u8) -> Result<()> {
     let md = fs::symlink_metadata(p)?;
     let is_link = md.file_type().is_symlink();
     // Owner first: chown clears setuid/setgid, so mode is applied afterwards.
-    apply_owner(flags, meta, |uid, gid| std::os::unix::fs::lchown(p, uid, gid))?;
+    apply_owner(flags, meta, |uid, gid| {
+        std::os::unix::fs::lchown(p, uid, gid)
+    })?;
     if flags & flags::MODE != 0 && !is_link {
         fs::set_permissions(p, fs::Permissions::from_mode(meta.mode & 0o7777))?;
     }
     if flags & flags::TIMES != 0 {
-        let ts = [timespec(0, libc::UTIME_OMIT as u32), timespec(meta.mtime, meta.mtime_nsec)];
+        let ts = [
+            timespec(0, libc::UTIME_OMIT as u32),
+            timespec(meta.mtime, meta.mtime_nsec),
+        ];
         let c = cstr(p)?;
-        let r = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+        let r = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                ts.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
         if r != 0 {
             return Err(io::Error::last_os_error().into());
         }
@@ -697,9 +866,21 @@ fn set_meta_path(p: &Path, meta: &Meta, flags: u8) -> Result<()> {
 
 /// Owner only as root; group as anyone (may fail with EPERM, which we ignore
 /// like rsync does for groups the user isn't a member of).
-fn apply_owner(flags: u8, meta: &Meta, chown: impl Fn(Option<u32>, Option<u32>) -> io::Result<()>) -> Result<()> {
-    let uid = if flags & flags::OWNER != 0 && is_root() { Some(meta.uid) } else { None };
-    let gid = if flags & flags::GROUP != 0 { Some(meta.gid) } else { None };
+fn apply_owner(
+    flags: u8,
+    meta: &Meta,
+    chown: impl Fn(Option<u32>, Option<u32>) -> io::Result<()>,
+) -> Result<()> {
+    let uid = if flags & flags::OWNER != 0 && is_root() {
+        Some(meta.uid)
+    } else {
+        None
+    };
+    let gid = if flags & flags::GROUP != 0 {
+        Some(meta.gid)
+    } else {
+        None
+    };
     if uid.is_none() && gid.is_none() {
         return Ok(());
     }

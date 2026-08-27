@@ -42,7 +42,8 @@ impl Pool {
         }
     }
     fn abort(&self) {
-        self.aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.aborted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.cv.notify_all();
     }
     fn is_aborted(&self) -> bool {
@@ -59,7 +60,12 @@ impl Pool {
     }
 }
 
-fn worker(pool: Arc<Pool>, rx: Arc<Mutex<mpsc::Receiver<Vec<Op>>>>, ep: Endpoint, compress: bool) -> Result<()> {
+fn worker(
+    pool: Arc<Pool>,
+    rx: Arc<Mutex<mpsc::Receiver<Vec<Op>>>>,
+    ep: Endpoint,
+    compress: bool,
+) -> Result<()> {
     let mut conn: Box<dyn Conn> = ep.connect(compress)?;
     loop {
         let ops = match rx.lock().unwrap().recv() {
@@ -88,7 +94,9 @@ fn worker(pool: Arc<Pool>, rx: Arc<Mutex<mpsc::Receiver<Vec<Op>>>>, ep: Endpoint
                     }
                 }
             }
-            Ok(other) => pool.progress.error(&format!("pcp: unexpected response {other:?}")),
+            Ok(other) => pool
+                .progress
+                .error(&format!("pcp: unexpected response {other:?}")),
             Err(e) => {
                 pool.progress.error(&format!("pcp: {e:#}"));
                 pool.done();
@@ -122,14 +130,22 @@ fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
             bail!("refusing to remove {:?}", l.path);
         }
         if last == "." || last == ".." {
-            bail!("\"{}\" may not be removed: its final path component is {:?}", l.path, last);
+            bail!(
+                "\"{}\" may not be removed: its final path component is {:?}",
+                l.path,
+                last
+            );
         }
     }
     Ok(())
 }
 
 pub fn run(args: Args) -> Result<i32> {
-    let locs: Vec<Location> = args.paths.iter().map(|p| Location::parse(p)).collect::<Result<_>>()?;
+    let locs: Vec<Location> = args
+        .paths
+        .iter()
+        .map(|p| Location::parse(p))
+        .collect::<Result<_>>()?;
     for l in &locs {
         if !l.same_host(&locs[0]) {
             bail!("all paths must be on the same host");
@@ -144,7 +160,13 @@ pub fn run(args: Args) -> Result<i32> {
     let mut ctl = connect_ctl(&ep, &args)?;
 
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(args.connections, show_progress, args.progress, args.width, args.progress_json);
+    let progress = Progress::new(
+        args.connections,
+        show_progress,
+        args.progress,
+        args.width,
+        args.progress_json,
+    );
     // Safety: Progress is behind an Arc we just created; set the mode before anyone reads it.
     let progress = {
         let mut p = Arc::try_unwrap(progress).ok().expect("fresh progress");
@@ -230,8 +252,17 @@ pub fn run(args: Args) -> Result<i32> {
             }
             continue;
         }
-        for chunk in paths.chunks(BATCH.max(paths.len() / (args.connections * 2).max(1)).min(BATCH)) {
-            pool.submit(chunk.iter().map(|p| Op::Rmdir { path: p.clone() }).collect());
+        for chunk in paths.chunks(
+            BATCH
+                .max(paths.len() / (args.connections * 2).max(1))
+                .min(BATCH),
+        ) {
+            pool.submit(
+                chunk
+                    .iter()
+                    .map(|p| Op::Rmdir { path: p.clone() })
+                    .collect(),
+            );
         }
         pool.wait_idle();
     }
@@ -253,10 +284,18 @@ pub fn run(args: Args) -> Result<i32> {
     if !args.quiet {
         println!(
             "pcp: {} {} entries in {}{}",
-            if args.dry_run { "would remove" } else { "removed" },
+            if args.dry_run {
+                "would remove"
+            } else {
+                "removed"
+            },
             commas(progress.files_done.load(Relaxed)),
             crate::progress::hms(progress.start.elapsed().as_secs_f64()),
-            if errors > 0 { format!(", {errors} errors") } else { String::new() }
+            if errors > 0 {
+                format!(", {errors} errors")
+            } else {
+                String::new()
+            }
         );
     }
     Ok(if errors > 0 { 23 } else { 0 })

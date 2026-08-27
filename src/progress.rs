@@ -41,7 +41,13 @@ struct TermState {
 }
 
 impl Progress {
-    pub fn new(n_workers: usize, enabled: bool, force: bool, width: Option<usize>, json: bool) -> Arc<Self> {
+    pub fn new(
+        n_workers: usize,
+        enabled: bool,
+        force: bool,
+        width: Option<usize>,
+        json: bool,
+    ) -> Arc<Self> {
         Arc::new(Progress {
             enabled: enabled && (force || std::io::stderr().is_terminal()),
             json,
@@ -58,7 +64,11 @@ impl Progress {
             errors: AtomicU64::new(0),
             start: Instant::now(),
             workers: Mutex::new(vec![None; n_workers]),
-            term: Mutex::new(TermState { lines_drawn: 0, samples: VecDeque::new(), last_json: None }),
+            term: Mutex::new(TermState {
+                lines_drawn: 0,
+                samples: VecDeque::new(),
+                last_json: None,
+            }),
             stop: AtomicBool::new(false),
         })
     }
@@ -124,11 +134,17 @@ impl Progress {
         let skipped = self.bytes_skipped.load(Relaxed);
         let scan_done = self.scan_done.load(Relaxed);
         let remaining = total.saturating_sub(done);
-        let eta = if rate > 0.0 && scan_done { Some(remaining as f64 / rate) } else { None };
+        let eta = if rate > 0.0 && scan_done {
+            Some(remaining as f64 / rate)
+        } else {
+            None
+        };
 
         if self.json {
             let now = Instant::now();
-            if t.last_json.map_or(true, |l| now - l >= Duration::from_secs(1)) {
+            if t.last_json
+                .is_none_or(|l| now - l >= Duration::from_secs(1))
+            {
                 t.last_json = Some(now);
                 eprintln!(
                     "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_skipped\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_skipped\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
@@ -164,7 +180,10 @@ impl Progress {
             head.push_str(&format!("  (unchanged {})", human(skipped)));
         }
         if !scan_done {
-            head.push_str(&format!("  scanning: {} entries", self.scanned.load(Relaxed)));
+            head.push_str(&format!(
+                "  scanning: {} entries",
+                self.scanned.load(Relaxed)
+            ));
         }
         lines.push(head);
         // One line per file in flight; several workers may share a file.
@@ -179,7 +198,11 @@ impl Progress {
             let done = done.min(total);
             let pct = if total > 0 { done * 100 / total } else { 100 };
             let prefix = format!("  {pct:>3}% ");
-            let suffix = if n > 1 { format!("  ×{n}") } else { String::new() };
+            let suffix = if n > 1 {
+                format!("  ×{n}")
+            } else {
+                String::new()
+            };
             let room = width.saturating_sub(prefix.len() + suffix.len() + 1);
             lines.push(format!("{prefix}{}{suffix}", truncate(&path, room)));
         }
@@ -234,7 +257,14 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let keep = max - 1;
     // keep the tail (file names matter more than leading dirs)
-    let tail: String = s.chars().rev().take(keep).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("…{tail}")
 }
 
@@ -270,7 +300,7 @@ pub fn commas(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

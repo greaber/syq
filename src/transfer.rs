@@ -65,12 +65,68 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
 
 fn parse_ports(s: &str) -> Result<(u16, u16)> {
     let (a, b) = s.split_once('-').unwrap_or((s, s));
-    let lo: u16 = a.trim().parse().map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
-    let hi: u16 = b.trim().parse().map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
+    let lo: u16 = a
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
+    let hi: u16 = b
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
     if hi < lo {
         bail!("bad port range {s:?}");
     }
     Ok((lo, hi))
+}
+
+/// Absolute, normalized form of a path for containment checks. Locally we
+/// canonicalize the longest existing prefix (resolving symlinks and `..`);
+/// remotely we can only normalize lexically.
+fn norm_path(p: &str, local: bool) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let raw = crate::fsops::resolve(p.as_bytes());
+    let abs = if raw.is_absolute() {
+        raw
+    } else if local {
+        std::env::current_dir().unwrap_or_default().join(raw)
+    } else {
+        // A remote relative path is relative to the remote home; keep it as-is
+        // and rely on lexical comparison of like-formed paths.
+        raw
+    };
+    // Lexical normalization (drop `.`, resolve `..`).
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c.as_os_str()),
+        }
+    }
+    if local {
+        // Canonicalize the longest existing prefix so symlinked sources compare
+        // by their real location; re-append the not-yet-existing tail.
+        let mut existing = out.clone();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        while !existing.as_os_str().is_empty() {
+            if let Ok(mut real) = std::fs::canonicalize(&existing) {
+                for name in tail.iter().rev() {
+                    real.push(name);
+                }
+                return real;
+            }
+            match existing.file_name().map(|n| n.to_os_string()) {
+                Some(name) => {
+                    tail.push(name);
+                    existing.pop();
+                }
+                None => break,
+            }
+        }
+    }
+    out
 }
 
 pub fn debug() -> bool {
@@ -90,7 +146,11 @@ pub fn run(args: Args) -> Result<i32> {
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
     let block = parse_size(&args.block_size)?.clamp(64 * 1024, 64 << 20);
     let min_split = parse_size(&args.min_split)?;
-    let locs: Vec<Location> = args.paths.iter().map(|p| Location::parse(p)).collect::<Result<_>>()?;
+    let locs: Vec<Location> = args
+        .paths
+        .iter()
+        .map(|p| Location::parse(p))
+        .collect::<Result<_>>()?;
     if locs.len() < 2 {
         bail!("need at least one source and a destination");
     }
@@ -113,12 +173,32 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
+    // Reject copying a directory into itself: if the destination resolves to a
+    // path inside a source, the scanner would discover the freshly-created
+    // destination and recurse. Covered for same-machine transfers.
+    let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
+        || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
+    if same_machine {
+        let local = !dst.is_remote();
+        let dn = norm_path(&dst.path, local);
+        for s in srcs {
+            let sn = norm_path(&s.path, local);
+            if dn != sn && dn.starts_with(&sn) {
+                bail!(
+                    "destination {:?} is inside source {:?} — that would copy the directory into itself",
+                    dst.path, s.path
+                );
+            }
+        }
+    }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
     if args.connections_default && !src_ep.is_remote() && !dst_ep.is_remote() {
         // Local threads are cheap and network filesystems want the concurrency,
         // but don't oversubscribe a small machine (a laptop shouldn't spawn 32).
-        let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let ncpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         args.connections = ncpu.clamp(4, LOCAL_DEFAULT_CONNECTIONS);
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
@@ -149,7 +229,13 @@ pub fn run(args: Args) -> Result<i32> {
     });
 
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(args.connections, show_progress, args.progress, args.width, args.progress_json);
+    let progress = Progress::new(
+        args.connections,
+        show_progress,
+        args.progress,
+        args.width,
+        args.progress_json,
+    );
     let sched = Arc::new(Sched::new(block, min_split));
 
     // Workers connect on their own threads, in parallel with the control
@@ -157,8 +243,13 @@ pub fn run(args: Args) -> Result<i32> {
     let mut workers: Vec<std::thread::JoinHandle<Result<()>>> = Vec::new();
     let spawn_workers = |workers: &mut Vec<std::thread::JoinHandle<Result<()>>>| {
         for id in 0..args.connections {
-            let (src_ep, dst_ep, sched, progress, opts) =
-                (src_ep.clone(), dst_ep.clone(), sched.clone(), progress.clone(), opts.clone());
+            let (src_ep, dst_ep, sched, progress, opts) = (
+                src_ep.clone(),
+                dst_ep.clone(),
+                sched.clone(),
+                progress.clone(),
+                opts.clone(),
+            );
             let compress = args.compress;
             workers.push(std::thread::spawn(move || -> Result<()> {
                 let t0 = std::time::Instant::now();
@@ -172,7 +263,10 @@ pub fn run(args: Args) -> Result<i32> {
                     t: [0.0; 4],
                 };
                 if debug() {
-                    eprintln!("pcp: worker {id} connected in {:.2}s", t0.elapsed().as_secs_f64());
+                    eprintln!(
+                        "pcp: worker {id} connected in {:.2}s",
+                        t0.elapsed().as_secs_f64()
+                    );
                 }
                 w.run()
             }));
@@ -194,7 +288,9 @@ pub fn run(args: Args) -> Result<i32> {
         let (a, b) = (src_ep.clone(), args.clone());
         let t = std::thread::spawn(move || connect_ctl(&a, &b));
         let dst_ctl = connect_ctl(&dst_ep, &args);
-        let src_ctl = t.join().map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
+        let src_ctl = t
+            .join()
+            .map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
         match (src_ctl, dst_ctl) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) | (_, Err(e)) => {
@@ -205,7 +301,10 @@ pub fn run(args: Args) -> Result<i32> {
         }
     };
     if debug() {
-        eprintln!("pcp: control connections up in {:.2}s", t0.elapsed().as_secs_f64());
+        eprintln!(
+            "pcp: control connections up in {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
     }
     if use_tcp {
         let ports = parse_ports(&args.tcp_ports)?;
@@ -213,14 +312,28 @@ pub fn run(args: Args) -> Result<i32> {
             if let Endpoint::Remote(spec) = ep {
                 if let Err(e) = spec.setup_tcp(&mut **ctl, args.tcp_plain, ports) {
                     if tcp_explicit {
-                        eprintln!("pcp: {}: cannot set up TCP data connections ({e:#}); using ssh", spec.label());
+                        eprintln!(
+                            "pcp: {}: cannot set up TCP data connections ({e:#}); using ssh",
+                            spec.label()
+                        );
                     } else if debug() {
-                        eprintln!("pcp: {}: TCP data unavailable ({e:#}); using ssh", spec.label());
+                        eprintln!(
+                            "pcp: {}: TCP data unavailable ({e:#}); using ssh",
+                            spec.label()
+                        );
                     }
                     continue;
                 }
                 if debug() {
-                    eprintln!("pcp: {}: tcp data port {:?}", spec.label(), spec.tcp.lock().unwrap().as_ref().map(|i| (i.addrs.clone(), i.port)));
+                    eprintln!(
+                        "pcp: {}: tcp data port {:?}",
+                        spec.label(),
+                        spec.tcp
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map(|i| (i.addrs.clone(), i.port))
+                    );
                 }
             }
         }
@@ -233,13 +346,21 @@ pub fn run(args: Args) -> Result<i32> {
     let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root)?;
     let dst_is_dir = match &dst_root_entry {
         Some(e) if e.kind == Kind::Dir => true,
-        Some(_) if srcs.len() > 1 => bail!("destination must be a directory when copying multiple sources"),
+        Some(_) if srcs.len() > 1 => {
+            bail!("destination must be a directory when copying multiple sources")
+        }
         Some(_) => false,
         None => srcs.len() > 1 || dst.copies_contents(),
     };
 
     if dst_root_entry.is_none() && dst_is_dir && !args.dry_run {
-        match ok(dst_ctl.call(Request::Apply(vec![Op::Mkdir { path: dst_root.clone(), mode: 0o755 }]))?, "mkdir")? {
+        match ok(
+            dst_ctl.call(Request::Apply(vec![Op::Mkdir {
+                path: dst_root.clone(),
+                mode: 0o755,
+            }]))?,
+            "mkdir",
+        )? {
             Response::Applied(errs) => {
                 if let Some(e) = errs.into_iter().flatten().next() {
                     bail!("{e}");
@@ -271,8 +392,19 @@ pub fn run(args: Args) -> Result<i32> {
         // A bare directory source goes to dest/basename even when dest doesn't
         // exist yet; a non-directory source only does so when dest is a directory
         // (decided once the root entry is seen).
-        let sub = if follow { String::new() } else { src.basename() };
-        if let Err(e) = st.scan_source(&mut *src_ctl, &src_root, follow, &sub, &dst_root, dst_is_dir) {
+        let sub = if follow {
+            String::new()
+        } else {
+            src.basename()
+        };
+        if let Err(e) = st.scan_source(
+            &mut *src_ctl,
+            &src_root,
+            follow,
+            &sub,
+            &dst_root,
+            dst_is_dir,
+        ) {
             scan_err = Some(e);
             break;
         }
@@ -324,21 +456,37 @@ pub fn run(args: Args) -> Result<i32> {
                 crate::progress::hms(elapsed)
             );
         } else {
-            let verb = if opts.dry_run { "would transfer" } else { "transferred" };
+            let verb = if opts.dry_run {
+                "would transfer"
+            } else {
+                "transferred"
+            };
             println!(
                 "pcp: {} {} files ({}), {} unchanged ({} files), {} dirs{}{}",
                 verb,
                 commas(progress.files_done.load(Relaxed)),
-                human(if opts.dry_run { progress.bytes_total.load(Relaxed) } else { done }),
+                human(if opts.dry_run {
+                    progress.bytes_total.load(Relaxed)
+                } else {
+                    done
+                }),
                 human(progress.bytes_skipped.load(Relaxed)),
                 commas(progress.files_skipped.load(Relaxed)),
                 commas(st_dirs(&progress)),
                 if opts.dry_run {
                     String::new()
                 } else {
-                    format!(", {} at {}/s", crate::progress::hms(elapsed), human((done as f64 / elapsed.max(0.001)) as u64))
+                    format!(
+                        ", {} at {}/s",
+                        crate::progress::hms(elapsed),
+                        human((done as f64 / elapsed.max(0.001)) as u64)
+                    )
                 },
-                if errors > 0 { format!(", {errors} errors") } else { String::new() }
+                if errors > 0 {
+                    format!(", {errors} errors")
+                } else {
+                    String::new()
+                }
             );
         }
         if args.stats {
@@ -363,7 +511,9 @@ pub fn run(args: Args) -> Result<i32> {
 }
 
 fn st_dirs(p: &Progress) -> u64 {
-    p.scanned.load(Relaxed).saturating_sub(p.files_total.load(Relaxed) + p.files_skipped.load(Relaxed))
+    p.scanned
+        .load(Relaxed)
+        .saturating_sub(p.files_total.load(Relaxed) + p.files_skipped.load(Relaxed))
 }
 
 fn stat_one(conn: &mut dyn Conn, path: &[u8]) -> Result<Option<Entry>> {
@@ -394,7 +544,15 @@ struct Planner<'a> {
 }
 
 impl Planner<'_> {
-    fn scan_source(&mut self, src: &mut dyn Conn, src_root: &[u8], follow: bool, sub: &str, dst_root: &[u8], dst_is_dir: bool) -> Result<()> {
+    fn scan_source(
+        &mut self,
+        src: &mut dyn Conn,
+        src_root: &[u8],
+        follow: bool,
+        sub: &str,
+        dst_root: &[u8],
+        dst_is_dir: bool,
+    ) -> Result<()> {
         let mut first = true;
         let mut sub = sub.to_string();
         let progress = self.progress;
@@ -423,7 +581,13 @@ impl Planner<'_> {
         )
     }
 
-    fn handle_batch(&mut self, batch: Vec<Entry>, src_root: &[u8], sub: &str, dst_root: &[u8]) -> Result<()> {
+    fn handle_batch(
+        &mut self,
+        batch: Vec<Entry>,
+        src_root: &[u8],
+        sub: &str,
+        dst_root: &[u8],
+    ) -> Result<()> {
         let opts = self.opts;
         let sub_b = sub.as_bytes();
         let mut mkdirs: Vec<Op> = Vec::new();
@@ -440,7 +604,10 @@ impl Planner<'_> {
                 if !self.claim_dst(&dst_path, &rel, true) {
                     continue;
                 }
-                mkdirs.push(Op::Mkdir { path: dst_path.clone(), mode: e.mode });
+                mkdirs.push(Op::Mkdir {
+                    path: dst_path.clone(),
+                    mode: e.mode,
+                });
                 dir_entries.push((dst_path, e));
             } else {
                 others.push((join(src_root, &e.path), dst_path, e));
@@ -448,14 +615,20 @@ impl Planner<'_> {
         }
 
         if opts.verify_only && !dir_entries.is_empty() {
-            let stats = self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
+            let stats =
+                self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
             for ((p, _), s) in dir_entries.iter().zip(stats) {
                 if !matches!(s, Some(ref d) if d.kind == Kind::Dir) {
-                    self.progress.error(&format!("{} {}/ (directory)", if s.is_none() { "MISSING" } else { "DIFFERS" }, display(p)));
+                    self.progress.error(&format!(
+                        "{} {}/ (directory)",
+                        if s.is_none() { "MISSING" } else { "DIFFERS" },
+                        display(p)
+                    ));
                 }
             }
         } else if !dir_entries.is_empty() && !opts.dry_run && !opts.verify_only {
-            let stats = self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
+            let stats =
+                self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
             let new_dirs: Vec<Op> = mkdirs
                 .into_iter()
                 .zip(stats.iter())
@@ -509,7 +682,11 @@ impl Planner<'_> {
         for ((src_path, dst_path, e), dst_entry) in others.into_iter().zip(stats) {
             let rel = {
                 let r = join(sub_b, &e.path);
-                if r.is_empty() { display(src_root.rsplit(|&c| c == b'/').next().unwrap_or(src_root)) } else { display(&r) }
+                if r.is_empty() {
+                    display(src_root.rsplit(|&c| c == b'/').next().unwrap_or(src_root))
+                } else {
+                    display(&r)
+                }
             };
             match e.kind {
                 Kind::File => {
@@ -517,9 +694,13 @@ impl Planner<'_> {
                     // symlinked alias) — with --inplace that would truncate the
                     // source. Only possible when both ends are the same machine.
                     if opts.same_host
-                        && dst_entry.as_ref().is_some_and(|d| d.dev == e.dev && d.ino == e.ino)
+                        && dst_entry
+                            .as_ref()
+                            .is_some_and(|d| d.dev == e.dev && d.ino == e.ino)
                     {
-                        self.progress.eprintln(&format!("skipping {rel}: source and destination are the same file"));
+                        self.progress.eprintln(&format!(
+                            "skipping {rel}: source and destination are the same file"
+                        ));
                         continue;
                     }
                     // Claim the destination BEFORE deciding skip-vs-transfer, so a
@@ -535,7 +716,13 @@ impl Planner<'_> {
                     });
                     if opts.verify_only {
                         if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
-                            self.enqueue(src_path.clone(), dst_path.clone(), rel.clone(), e.clone(), dst_entry.clone());
+                            self.enqueue(
+                                src_path.clone(),
+                                dst_path.clone(),
+                                rel.clone(),
+                                e.clone(),
+                                dst_entry.clone(),
+                            );
                         } else {
                             self.progress.error(&format!("MISSING {rel}"));
                         }
@@ -555,7 +742,11 @@ impl Planner<'_> {
                                 ff |= flags::GROUP;
                             }
                             if ff != 0 {
-                                meta_fixes.push(Op::SetMeta { path: dst_path.clone(), meta: e.meta(), flags: ff });
+                                meta_fixes.push(Op::SetMeta {
+                                    path: dst_path.clone(),
+                                    meta: e.meta(),
+                                    flags: ff,
+                                });
                             }
                         }
                         self.progress.files_skipped.fetch_add(1, Relaxed);
@@ -574,7 +765,8 @@ impl Planner<'_> {
                 Kind::Symlink => {
                     if !opts.links {
                         if opts.verbose > 0 {
-                            self.progress.eprintln(&format!("skipping non-regular file \"{rel}\""));
+                            self.progress
+                                .eprintln(&format!("skipping non-regular file \"{rel}\""));
                         }
                         continue;
                     }
@@ -582,7 +774,9 @@ impl Planner<'_> {
                         continue;
                     }
                     let target = e.link.clone().unwrap_or_default();
-                    let same = dst_entry.as_ref().is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
+                    let same = dst_entry.as_ref().is_some_and(|d| {
+                        d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..])
+                    });
                     if opts.verify_only {
                         if !same {
                             self.progress.error(&format!("DIFFERS {rel} (symlink)"));
@@ -594,29 +788,44 @@ impl Planner<'_> {
                     }
                     if opts.dry_run {
                         if opts.verbose > 0 {
-                            self.progress.println(&format!("{rel} -> {}", display(&target)));
+                            self.progress
+                                .println(&format!("{rel} -> {}", display(&target)));
                         }
                         continue;
                     }
                     op_names.push(format!("{rel} -> {}", display(&target)));
-                    ops.push(Op::Symlink { path: dst_path.clone(), target });
-                    ops.push(Op::SetMeta { path: dst_path, meta: e.meta(), flags: opts.flags & !flags::MODE });
+                    ops.push(Op::Symlink {
+                        path: dst_path.clone(),
+                        target,
+                    });
+                    ops.push(Op::SetMeta {
+                        path: dst_path,
+                        meta: e.meta(),
+                        flags: opts.flags & !flags::MODE,
+                    });
                     self.links_created += 1;
                 }
                 Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
                     if !opts.devices {
                         if opts.verbose > 0 {
-                            self.progress.eprintln(&format!("skipping non-regular file \"{rel}\""));
+                            self.progress
+                                .eprintln(&format!("skipping non-regular file \"{rel}\""));
                         }
                         continue;
                     }
                     if !self.claim_dst(&dst_path, &rel, false) {
                         continue;
                     }
-                    let same = dst_entry.as_ref().is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
+                    let same = dst_entry
+                        .as_ref()
+                        .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
                     if opts.verify_only {
                         if !same {
-                            let what = if dst_entry.is_none() { "MISSING" } else { "DIFFERS" };
+                            let what = if dst_entry.is_none() {
+                                "MISSING"
+                            } else {
+                                "DIFFERS"
+                            };
                             self.progress.error(&format!("{what} {rel} (special file)"));
                         }
                         continue;
@@ -628,8 +837,16 @@ impl Planner<'_> {
                         continue;
                     }
                     op_names.push(rel);
-                    ops.push(Op::Mknod { path: dst_path.clone(), mode: e.mode, rdev: e.rdev });
-                    ops.push(Op::SetMeta { path: dst_path, meta: e.meta(), flags: opts.flags });
+                    ops.push(Op::Mknod {
+                        path: dst_path.clone(),
+                        mode: e.mode,
+                        rdev: e.rdev,
+                    });
+                    ops.push(Op::SetMeta {
+                        path: dst_path,
+                        meta: e.meta(),
+                        flags: opts.flags,
+                    });
                     self.specials_created += 1;
                 }
                 Kind::Dir | Kind::Other => {}
@@ -676,10 +893,26 @@ impl Planner<'_> {
         }
     }
 
-    fn enqueue(&mut self, src: PathBytes, dst: PathBytes, rel: String, entry: Entry, dst_entry: Option<Entry>) {
+    fn enqueue(
+        &mut self,
+        src: PathBytes,
+        dst: PathBytes,
+        rel: String,
+        entry: Entry,
+        dst_entry: Option<Entry>,
+    ) {
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
-        self.sched.push_file(FileJob { src, dst, rel, entry, dst_entry, attempts: 0, done: Arc::new(AtomicU64::new(0)), inplace: false });
+        self.sched.push_file(FileJob {
+            src,
+            dst,
+            rel,
+            entry,
+            dst_entry,
+            attempts: 0,
+            done: Arc::new(AtomicU64::new(0)),
+            inplace: false,
+        });
     }
 
     fn stat_many(&mut self, _on_dst: bool, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
@@ -702,7 +935,11 @@ impl Planner<'_> {
         for chunk in d.chunks(1000) {
             let ops: Vec<Op> = chunk
                 .iter()
-                .map(|(p, m, f, _)| Op::SetMeta { path: p.clone(), meta: *m, flags: *f })
+                .map(|(p, m, f, _)| Op::SetMeta {
+                    path: p.clone(),
+                    meta: *m,
+                    flags: *f,
+                })
                 .collect();
             for err in self.apply(true, ops)?.into_iter().flatten() {
                 self.progress.error(&format!("pcp: {err}"));
@@ -752,8 +989,13 @@ impl Worker {
                 Item::File(idx) => {
                     if self.fast_eligible(idx) {
                         let mut batch = vec![idx];
-                        batch.extend(self.sched.take_small(self.opts.block, FAST_BATCH_FILES, FAST_BATCH_BYTES));
-                        let (fast, slow): (Vec<usize>, Vec<usize>) = batch.into_iter().partition(|&i| self.fast_eligible(i));
+                        batch.extend(self.sched.take_small(
+                            self.opts.block,
+                            FAST_BATCH_FILES,
+                            FAST_BATCH_BYTES,
+                        ));
+                        let (fast, slow): (Vec<usize>, Vec<usize>) =
+                            batch.into_iter().partition(|&i| self.fast_eligible(i));
                         if let Err(e) = self.fast_batch(&fast) {
                             // Transport-level failure: every file in the batch is affected.
                             for &i in &fast {
@@ -767,7 +1009,11 @@ impl Worker {
                             }
                         }
                     } else {
-                        let res = if self.opts.verify_only { self.verify_file(idx) } else { self.handle_file(idx) };
+                        let res = if self.opts.verify_only {
+                            self.verify_file(idx)
+                        } else {
+                            self.handle_file(idx)
+                        };
                         if let Err(e) = res {
                             self.file_error(idx, e)?;
                         }
@@ -799,7 +1045,11 @@ impl Worker {
     fn fast_eligible(&self, idx: usize) -> bool {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
-        !self.opts.verify_only && !self.opts.inplace && !self.opts.atomic && j.entry.size <= self.opts.block && j.dst_entry.is_none()
+        !self.opts.verify_only
+            && !self.opts.inplace
+            && !self.opts.atomic
+            && j.entry.size <= self.opts.block
+            && j.dst_entry.is_none()
     }
 
     fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
@@ -808,12 +1058,23 @@ impl Worker {
             batch.iter().map(|&i| all[i].clone()).collect()
         };
         if let Some(j) = jobs.last() {
-            self.progress.set_worker(self.id, Some(WorkerStatus { path: format!("{} (+{} small files)", j.rel, jobs.len() - 1), done: j.done.clone(), total: j.entry.size }));
+            self.progress.set_worker(
+                self.id,
+                Some(WorkerStatus {
+                    path: format!("{} (+{} small files)", j.rel, jobs.len() - 1),
+                    done: j.done.clone(),
+                    total: j.entry.size,
+                }),
+            );
         }
         // Reads.
         for j in &jobs {
             if j.entry.size > 0 {
-                self.src.send(Request::ReadRange { path: j.src.clone(), off: 0, len: j.entry.size as u32 })?;
+                self.src.send(Request::ReadRange {
+                    path: j.src.clone(),
+                    off: 0,
+                    len: j.entry.size as u32,
+                })?;
             }
         }
         let mut data: Vec<Result<Vec<u8>>> = Vec::with_capacity(jobs.len());
@@ -834,8 +1095,8 @@ impl Worker {
                 Err(e) => Err(e),
             });
         }
-        // One atomic PutSmall per file (pipelined): write partial, verify, set
-        // metadata, rename — nothing appears under the final name on failure.
+        // One PutSmall per file (pipelined): the server writes each small new
+        // file straight to its final path (no rename), which is the big NFS win.
         let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
         let mut sent: Vec<bool> = Vec::with_capacity(jobs.len());
         for (j, d) in jobs.iter().zip(data.iter_mut()) {
@@ -847,7 +1108,14 @@ impl Worker {
             let hash = xxh3_64(&bytes);
             let mut meta = j.entry.meta();
             meta.mode = self.create_mode(j);
-            self.dst.send(Request::PutSmall { path: j.dst.clone(), data: bytes, hash, meta, flags, fsync: self.opts.fsync })?;
+            self.dst.send(Request::PutSmall {
+                path: j.dst.clone(),
+                data: bytes,
+                hash,
+                meta,
+                flags,
+                fsync: self.opts.fsync,
+            })?;
             sent.push(true);
         }
         let mut results: Vec<Result<()>> = Vec::with_capacity(jobs.len());
@@ -868,7 +1136,11 @@ impl Worker {
             Response::Stats(v) => v,
             other => bail!("unexpected response {other:?}"),
         };
-        for ((idx, j), (res, now)) in batch.iter().zip(jobs.iter()).zip(results.into_iter().zip(now.into_iter())) {
+        for ((idx, j), (res, now)) in batch
+            .iter()
+            .zip(jobs.iter())
+            .zip(results.into_iter().zip(now.into_iter()))
+        {
             self.sched.ranges_ready(*idx, vec![]);
             if let Err(e) = res {
                 self.progress.error(&format!("pcp: {}: {e:#}", j.rel));
@@ -876,23 +1148,37 @@ impl Worker {
                 continue;
             }
             let changed = match &now {
-                Some(e) => e.kind != Kind::File || e.size != j.entry.size || e.mtime != j.entry.mtime || e.mtime_nsec != j.entry.mtime_nsec,
+                Some(e) => {
+                    e.kind != Kind::File
+                        || e.size != j.entry.size
+                        || e.mtime != j.entry.mtime
+                        || e.mtime_nsec != j.entry.mtime_nsec
+                }
                 None => true,
             };
             if changed {
                 if let (Some(e), true) = (now, j.attempts + 1 < MAX_ATTEMPTS) {
-                    self.progress.eprintln(&format!("pcp: {}: changed during transfer, retrying", j.rel));
+                    self.progress.eprintln(&format!(
+                        "pcp: {}: changed during transfer, retrying",
+                        j.rel
+                    ));
                     let mut all = self.sched.jobs.lock().unwrap();
                     let job = &mut all[*idx];
                     self.progress.bytes_total.fetch_add(e.size, Relaxed);
-                    job.entry = Entry { path: job.entry.path.clone(), ..e };
+                    job.entry = Entry {
+                        path: job.entry.path.clone(),
+                        ..e
+                    };
                     job.attempts += 1;
                     // Keep the original dst_entry so mode is preserved on retry
                     // without -p (don't adopt the source's mode).
                     drop(all);
                     self.sched.requeue(*idx);
                 } else {
-                    self.progress.error(&format!("pcp: {}: source changed during transfer (or vanished)", j.rel));
+                    self.progress.error(&format!(
+                        "pcp: {}: source changed during transfer (or vanished)",
+                        j.rel
+                    ));
                     self.sched.fail_file(*idx);
                 }
                 continue;
@@ -928,7 +1214,14 @@ impl Worker {
         let size = job.entry.size;
         let opts = self.opts.clone();
         let _ = &opts;
-        self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: size }));
+        self.progress.set_worker(
+            self.id,
+            Some(WorkerStatus {
+                path: job.rel.clone(),
+                done: job.done.clone(),
+                total: size,
+            }),
+        );
 
         let inplace = self.opts.inplace;
         // Same-machine copy: let the kernel move the bytes (reflink / NFS
@@ -944,8 +1237,16 @@ impl Worker {
             }
         }
         let planned: Result<Vec<(u64, u64)>> = (|| {
-            let (partial_size, final_entry) = match ok(self.dst.call(Request::Probe { path: job.dst.clone() })?, "probe")? {
-                Response::Probed { partial_size, final_entry } => (partial_size, final_entry),
+            let (partial_size, final_entry) = match ok(
+                self.dst.call(Request::Probe {
+                    path: job.dst.clone(),
+                })?,
+                "probe",
+            )? {
+                Response::Probed {
+                    partial_size,
+                    final_entry,
+                } => (partial_size, final_entry),
                 other => bail!("unexpected response {other:?}"),
             };
             if let Some(f) = &final_entry {
@@ -964,27 +1265,56 @@ impl Worker {
             self.set_inplace(idx, inplace);
 
             if inplace {
-                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: true, from_final: false, mode: self.create_mode(&job) })?, "prepare")?;
+                ok(
+                    self.dst.call(Request::Prepare {
+                        path: job.dst.clone(),
+                        size,
+                        inplace: true,
+                        from_final: false,
+                        mode: self.create_mode(&job),
+                    })?,
+                    "prepare",
+                )?;
                 if final_is_file && size > 0 {
                     return self.diff_blocks(&job, Which::Final);
                 }
                 return Ok(full());
             }
             if partial_size.is_some() {
-                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: false, mode: self.create_mode(&job) })?, "prepare")?;
+                ok(
+                    self.dst.call(Request::Prepare {
+                        path: job.dst.clone(),
+                        size,
+                        inplace: false,
+                        from_final: false,
+                        mode: self.create_mode(&job),
+                    })?,
+                    "prepare",
+                )?;
                 if size == 0 {
                     return Ok(vec![]);
                 }
                 return self.diff_blocks(&job, Which::Partial);
             }
             if final_is_file && (size > 0 && final_entry.as_ref().unwrap().size > 0 || size == 0) {
-                let ranges = if size > 0 { self.diff_blocks(&job, Which::Final)? } else { vec![] };
+                let ranges = if size > 0 {
+                    self.diff_blocks(&job, Which::Final)?
+                } else {
+                    vec![]
+                };
                 if ranges.is_empty() && final_entry.as_ref().unwrap().size == size {
                     // Content identical: just fix up metadata (mode per rsync rules).
                     let mut meta = job.entry.meta();
                     meta.mode = self.create_mode(&job);
                     let flags = self.opts.flags | flags::MODE;
-                    let errs = match ok(self.dst.call(Request::Apply(vec![Op::SetMeta { path: job.dst.clone(), meta, flags }]))?, "setmeta")? {
+                    let errs = match ok(
+                        self.dst.call(Request::Apply(vec![Op::SetMeta {
+                            path: job.dst.clone(),
+                            meta,
+                            flags,
+                        }]))?,
+                        "setmeta",
+                    )? {
                         Response::Applied(v) => v,
                         other => bail!("unexpected response {other:?}"),
                     };
@@ -993,10 +1323,28 @@ impl Worker {
                     }
                     return Ok(vec![]);
                 }
-                ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: true, mode: self.create_mode(&job) })?, "prepare")?;
+                ok(
+                    self.dst.call(Request::Prepare {
+                        path: job.dst.clone(),
+                        size,
+                        inplace: false,
+                        from_final: true,
+                        mode: self.create_mode(&job),
+                    })?,
+                    "prepare",
+                )?;
                 return Ok(ranges);
             }
-            ok(self.dst.call(Request::Prepare { path: job.dst.clone(), size, inplace: false, from_final: false, mode: self.create_mode(&job) })?, "prepare")?;
+            ok(
+                self.dst.call(Request::Prepare {
+                    path: job.dst.clone(),
+                    size,
+                    inplace: false,
+                    from_final: false,
+                    mode: self.create_mode(&job),
+                })?,
+                "prepare",
+            )?;
             Ok(full())
         })();
 
@@ -1009,10 +1357,20 @@ impl Worker {
         };
         let to_send: u64 = ranges.iter().map(|(o, e)| e - o).sum();
         job.done.store(size - to_send, Relaxed);
-        self.progress.bytes_skipped.fetch_add(size - to_send, Relaxed);
+        self.progress
+            .bytes_skipped
+            .fetch_add(size - to_send, Relaxed);
         self.progress.bytes_total.fetch_sub(size - to_send, Relaxed);
-        let metadata_only = ranges.is_empty() && to_send == 0 && !inplace
-            && matches!(self.sched.jobs.lock().unwrap()[idx].dst_entry, Some(Entry { kind: Kind::File, .. }))
+        let metadata_only = ranges.is_empty()
+            && to_send == 0
+            && !inplace
+            && matches!(
+                self.sched.jobs.lock().unwrap()[idx].dst_entry,
+                Some(Entry {
+                    kind: Kind::File,
+                    ..
+                })
+            )
             && !self.probe_left_partial(&job)?;
 
         match self.sched.ranges_ready(idx, ranges) {
@@ -1039,7 +1397,12 @@ impl Worker {
 
     /// Whether a partial file exists for this job on the destination.
     fn probe_left_partial(&mut self, job: &FileJob) -> Result<bool> {
-        match ok(self.dst.call(Request::Probe { path: job.dst.clone() })?, "probe")? {
+        match ok(
+            self.dst.call(Request::Probe {
+                path: job.dst.clone(),
+            })?,
+            "probe",
+        )? {
             Response::Probed { partial_size, .. } => Ok(partial_size.is_some()),
             other => bail!("unexpected response {other:?}"),
         }
@@ -1057,7 +1420,12 @@ impl Worker {
         // If a partial exists, prefer the streaming path so its hash-based
         // resume reuses the bytes already on disk; copy_file_range would
         // discard them and recopy the whole file.
-        let partial = match ok(self.dst.call(Request::Probe { path: job.dst.clone() })?, "probe")? {
+        let partial = match ok(
+            self.dst.call(Request::Probe {
+                path: job.dst.clone(),
+            })?,
+            "probe",
+        )? {
             Response::Probed { partial_size, .. } => partial_size.is_some(),
             _ => false,
         };
@@ -1079,7 +1447,14 @@ impl Worker {
         })?;
         match resp {
             Response::Ok => {
-                self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: job.entry.size }));
+                self.progress.set_worker(
+                    self.id,
+                    Some(WorkerStatus {
+                        path: job.rel.clone(),
+                        done: job.done.clone(),
+                        total: job.entry.size,
+                    }),
+                );
                 self.progress.add_bytes(job.entry.size);
                 job.done.store(job.entry.size, Relaxed);
                 self.sched.ranges_ready(idx, vec![]);
@@ -1110,8 +1485,18 @@ impl Worker {
     fn diff_blocks(&mut self, job: &FileJob, which: Which) -> Result<Vec<(u64, u64)>> {
         let block = self.opts.block;
         let size = job.entry.size;
-        self.src.send(Request::HashBlocks { path: job.src.clone(), which: Which::Final, block, len: size })?;
-        self.dst.send(Request::HashBlocks { path: job.dst.clone(), which, block, len: size })?;
+        self.src.send(Request::HashBlocks {
+            path: job.src.clone(),
+            which: Which::Final,
+            block,
+            len: size,
+        })?;
+        self.dst.send(Request::HashBlocks {
+            path: job.dst.clone(),
+            which,
+            block,
+            len: size,
+        })?;
         let sh = match ok(self.src.recv()?, "hash source")? {
             Response::Hashes(h) => h,
             other => bail!("unexpected response {other:?}"),
@@ -1147,7 +1532,14 @@ impl Worker {
             return Ok(());
         }
         let _ = (start, end0);
-        self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: job.entry.size }));
+        self.progress.set_worker(
+            self.id,
+            Some(WorkerStatus {
+                path: job.rel.clone(),
+                done: job.done.clone(),
+                total: job.entry.size,
+            }),
+        );
         let block = self.opts.block;
         let inplace = job.inplace;
         let mut reads_out = 0usize;
@@ -1164,7 +1556,11 @@ impl Worker {
                     g.pos += n;
                     (off, n)
                 };
-                self.src.send(Request::ReadRange { path: job.src.clone(), off, len: n as u32 })?;
+                self.src.send(Request::ReadRange {
+                    path: job.src.clone(),
+                    off,
+                    len: n as u32,
+                })?;
                 reads_out += 1;
             }
             if reads_out == 0 {
@@ -1182,7 +1578,13 @@ impl Worker {
             }
             let n = data.len() as u64;
             let t0 = std::time::Instant::now();
-            self.dst.send(Request::WriteRange { path: job.dst.clone(), inplace, off, hash, data })?;
+            self.dst.send(Request::WriteRange {
+                path: job.dst.clone(),
+                inplace,
+                off,
+                hash,
+                data,
+            })?;
             self.t[1] += t0.elapsed().as_secs_f64();
             writes_out += 1;
             if writes_out >= WINDOW {
@@ -1210,23 +1612,40 @@ impl Worker {
         meta.mode = self.create_mode(&job);
         let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
         ok(
-            self.dst.call(Request::Finalize { path: job.dst.clone(), inplace: job.inplace, meta, flags, fsync: self.opts.fsync })?,
+            self.dst.call(Request::Finalize {
+                path: job.dst.clone(),
+                inplace: job.inplace,
+                meta,
+                flags,
+                fsync: self.opts.fsync,
+            })?,
             "finalize",
         )?;
         // Did the source change under us?
         let now = stat_one(&mut *self.src, &job.src)?;
         let changed = match &now {
-            Some(e) => e.kind != Kind::File || e.size != job.entry.size || e.mtime != job.entry.mtime || e.mtime_nsec != job.entry.mtime_nsec,
+            Some(e) => {
+                e.kind != Kind::File
+                    || e.size != job.entry.size
+                    || e.mtime != job.entry.mtime
+                    || e.mtime_nsec != job.entry.mtime_nsec
+            }
             None => true,
         };
         if changed {
             if job.attempts + 1 < MAX_ATTEMPTS {
                 if let Some(e) = now {
-                    self.progress.eprintln(&format!("pcp: {}: changed during transfer, retrying", job.rel));
+                    self.progress.eprintln(&format!(
+                        "pcp: {}: changed during transfer, retrying",
+                        job.rel
+                    ));
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let j = &mut jobs[idx];
                     self.progress.bytes_total.fetch_add(e.size, Relaxed);
-                    j.entry = Entry { path: j.entry.path.clone(), ..e };
+                    j.entry = Entry {
+                        path: j.entry.path.clone(),
+                        ..e
+                    };
                     j.attempts += 1;
                     // Keep the original dst_entry: it drives mode preservation
                     // without -p, and re-reading the source must not change it.
@@ -1247,14 +1666,28 @@ impl Worker {
 
     fn verify_file(&mut self, idx: usize) -> Result<()> {
         let job = self.job(idx);
-        self.progress.set_worker(self.id, Some(WorkerStatus { path: job.rel.clone(), done: job.done.clone(), total: job.entry.size }));
+        self.progress.set_worker(
+            self.id,
+            Some(WorkerStatus {
+                path: job.rel.clone(),
+                done: job.done.clone(),
+                total: job.entry.size,
+            }),
+        );
         let r = (|| -> Result<bool> {
-            self.src.send(Request::FileHash { path: job.src.clone() })?;
-            self.dst.send(Request::FileHash { path: job.dst.clone() })?;
+            self.src.send(Request::FileHash {
+                path: job.src.clone(),
+            })?;
+            self.dst.send(Request::FileHash {
+                path: job.dst.clone(),
+            })?;
             let a = ok(self.src.recv()?, "hash source")?;
             let b = ok(self.dst.recv()?, "hash destination")?;
             match (a, b) {
-                (Response::FileHash { size: s1, hash: h1 }, Response::FileHash { size: s2, hash: h2 }) => Ok(s1 == s2 && h1 == h2),
+                (
+                    Response::FileHash { size: s1, hash: h1 },
+                    Response::FileHash { size: s2, hash: h2 },
+                ) => Ok(s1 == s2 && h1 == h2),
                 (a, b) => bail!("unexpected responses {a:?} {b:?}"),
             }
         })();
@@ -1277,4 +1710,3 @@ impl Worker {
         Ok(())
     }
 }
-

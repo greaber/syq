@@ -12,18 +12,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub fn run() -> Result<()> {
-    serve(io::stdin(), io::stdout().lock(), true, None)
+    serve(io::stdin(), io::stdout().lock(), true, None, None)
 }
 
 /// Serve one connection. `over_ssh` connections may set up a TCP listener;
 /// TCP connections must present `expect_token` in their Hello.
-fn serve<R: Read + Send + 'static, W: Write>(r: R, w: W, over_ssh: bool, expect_token: Option<Vec<u8>>) -> Result<()> {
+fn serve<R: Read + Send + 'static, W: Write>(
+    r: R,
+    w: W,
+    over_ssh: bool,
+    expect_token: Option<Vec<u8>>,
+    authed: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     let mut r = FrameReader::new(r);
     let mut w = FrameWriter::new(w, false);
 
     let debug;
     match r.read_msg::<Request>()? {
-        Request::Hello { version, compress, debug: d, token } => {
+        Request::Hello {
+            version,
+            compress,
+            debug: d,
+            token,
+        } => {
             debug = d;
             if let Some(t) = &expect_token {
                 if &token != t {
@@ -38,6 +49,9 @@ fn serve<R: Read + Send + 'static, W: Write>(r: R, w: W, over_ssh: bool, expect_
             }
             w.compress = compress;
             w.write_msg(&Response::HelloOk { version: VERSION })?;
+            if let Some(a) = authed {
+                a.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
         _ => bail!("expected Hello"),
     }
@@ -78,17 +92,31 @@ fn serve<R: Read + Send + 'static, W: Write>(r: R, w: W, over_ssh: bool, expect_
         }
         match req {
             Request::Shutdown => break,
-            Request::TcpListen { key, token, port_lo, port_hi } => {
+            Request::TcpListen {
+                key,
+                token,
+                port_lo,
+                port_hi,
+            } => {
                 if !over_ssh {
-                    w.write_msg(&Response::Err("TcpListen only allowed on the control connection".into()))?;
+                    w.write_msg(&Response::Err(
+                        "TcpListen only allowed on the control connection".into(),
+                    ))?;
                     continue;
                 }
                 match tcp_listen(key, token, port_lo, port_hi, debug, w.compress) {
-                    Ok(port) => w.write_msg(&Response::TcpListening { port, addrs: local_addrs() })?,
+                    Ok(port) => w.write_msg(&Response::TcpListening {
+                        port,
+                        addrs: local_addrs(),
+                    })?,
                     Err(e) => w.write_msg(&Response::Err(format!("{e:#}")))?,
                 }
             }
-            Request::Scan { root, follow_root, all } => {
+            Request::Scan {
+                root,
+                follow_root,
+                all,
+            } => {
                 let root = fsops::resolve(&root);
                 // Warnings are collected and sent between batches so a single
                 // writer borrow suffices.
@@ -140,9 +168,11 @@ fn serve<R: Read + Send + 'static, W: Write>(r: R, w: W, over_ssh: bool, expect_
 
 fn is_virtual_iface(name: &str) -> bool {
     name == "lo"
-        || ["docker", "veth", "br-", "virbr", "vmnet", "cni", "flannel", "cali", "kube", "ib"]
-            .iter()
-            .any(|p| name.starts_with(p))
+        || [
+            "docker", "veth", "br-", "virbr", "vmnet", "cni", "flannel", "cali", "kube", "ib",
+        ]
+        .iter()
+        .any(|p| name.starts_with(p))
         || std::path::Path::new(&format!("/sys/class/net/{name}/bridge")).exists()
 }
 
@@ -159,14 +189,23 @@ fn iface_speed(name: &str) -> u32 {
 /// session's own server-IP is first; virtual interfaces (docker/bridges/etc.)
 /// are skipped so multipath never fans out onto a dead bridge.
 fn local_addrs() -> Vec<(String, u32)> {
-    let ssh_ip = std::env::var("SSH_CONNECTION").ok().and_then(|c| c.split_whitespace().nth(2).map(str::to_string));
-    let out = std::process::Command::new("ip").args(["-o", "-4", "addr", "show"]).output();
-    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let ssh_ip = std::env::var("SSH_CONNECTION")
+        .ok()
+        .and_then(|c| c.split_whitespace().nth(2).map(str::to_string));
+    let out = std::process::Command::new("ip")
+        .args(["-o", "-4", "addr", "show"])
+        .output();
+    let text = out
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
     let mut addrs: Vec<(String, u32, u8)> = Vec::new(); // (ip, speed, priority-bucket)
     for line in text.lines() {
         // "3: bond0    inet 10.2.201.45/24 brd ... scope global bond0"
         let f: Vec<&str> = line.split_whitespace().collect();
-        let (Some(iface), Some(ipcidr)) = (f.get(1), f.iter().skip_while(|w| **w != "inet").nth(1)) else { continue };
+        let (Some(iface), Some(ipcidr)) = (f.get(1), f.iter().skip_while(|w| **w != "inet").nth(1))
+        else {
+            continue;
+        };
         if is_virtual_iface(iface) {
             continue;
         }
@@ -191,7 +230,14 @@ fn local_addrs() -> Vec<(String, u32)> {
     addrs.into_iter().map(|(ip, sp, _)| (ip, sp)).collect()
 }
 
-fn tcp_listen(key: Option<Vec<u8>>, token: Vec<u8>, lo: u16, hi: u16, debug: bool, compress: bool) -> Result<u16> {
+fn tcp_listen(
+    key: Option<Vec<u8>>,
+    token: Vec<u8>,
+    lo: u16,
+    hi: u16,
+    debug: bool,
+    compress: bool,
+) -> Result<u16> {
     let mut listener = None;
     for port in lo..=hi.max(lo) {
         if let Ok(l) = TcpListener::bind(("0.0.0.0", port)) {
@@ -208,7 +254,8 @@ fn tcp_listen(key: Option<Vec<u8>>, token: Vec<u8>, lo: u16, hi: u16, debug: boo
     // unbounded threads), and remember which client connection ids we've seen
     // so a captured record stream can't be replayed while the listener is up.
     let live = Arc::new(AtomicU32::new(0));
-    let seen: Arc<std::sync::Mutex<std::collections::HashSet<u32>>> = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let seen: Arc<std::sync::Mutex<std::collections::HashSet<u32>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     const MAX_LIVE: u32 = 256;
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -235,7 +282,15 @@ fn tcp_listen(key: Option<Vec<u8>>, token: Vec<u8>, lo: u16, hi: u16, debug: boo
     Ok(port)
 }
 
-fn serve_tcp(stream: TcpStream, id: u32, key: Option<Vec<u8>>, token: Vec<u8>, _debug: bool, _compress: bool, seen: &std::sync::Mutex<std::collections::HashSet<u32>>) -> Result<()> {
+fn serve_tcp(
+    stream: TcpStream,
+    id: u32,
+    key: Option<Vec<u8>>,
+    token: Vec<u8>,
+    _debug: bool,
+    _compress: bool,
+    seen: &std::sync::Mutex<std::collections::HashSet<u32>>,
+) -> Result<()> {
     stream.set_nodelay(true)?;
     // Scanners and stray connections must not hold a thread forever.
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -251,19 +306,32 @@ fn serve_tcp(stream: TcpStream, id: u32, key: Option<Vec<u8>>, token: Vec<u8>, _
         bail!("duplicate connection id {conn_id} (possible replay)");
     }
     let (rc, wc) = match &key {
-        Some(k) => (Some(Cipher::new(k, conn_id, 1)), Some(Cipher::new(k, conn_id, 2))),
+        Some(k) => (
+            Some(Cipher::new(k, conn_id, 1)),
+            Some(Cipher::new(k, conn_id, 2)),
+        ),
         None => (None, None),
     };
     let reader = RecordReader::new(stream.try_clone()?, rc);
     let writer = RecordWriter::new(stream.try_clone()?, wc);
-    // The record reader delivers whole frames; clear the handshake timeout only
-    // after the first complete record (which carries the Hello), not a partial read.
-    let res = serve(TimeoutOnce { inner: reader, stream: stream.try_clone()?, cleared: false }, writer, false, Some(token));
-    // If the connection never authenticated (bad token / error before completing
-    // the Hello), free its id so an unauthenticated peer can't reserve ids and
-    // force the client to fall back to ssh. A successful session keeps its id,
-    // which is what blocks replay.
-    if res.is_err() {
+    // Free the id only if the connection NEVER authenticated, so an
+    // unauthenticated peer can't reserve ids. Once the token authenticated, the
+    // id is retained permanently even if a later request fails — otherwise an
+    // on-path attacker could corrupt an authenticated stream to free the id and
+    // then replay captured records under it.
+    let authed = std::sync::atomic::AtomicBool::new(false);
+    let res = serve(
+        TimeoutOnce {
+            inner: reader,
+            stream: stream.try_clone()?,
+            cleared: false,
+        },
+        writer,
+        false,
+        Some(token),
+        Some(&authed),
+    );
+    if res.is_err() && !authed.load(std::sync::atomic::Ordering::SeqCst) {
         seen.lock().unwrap().remove(&conn_id);
     }
     res

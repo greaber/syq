@@ -18,8 +18,12 @@ pub fn scan(
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     warn: &mut dyn FnMut(String),
 ) -> Result<()> {
-    let md = if follow_root { fs::metadata(root) } else { fs::symlink_metadata(root) }
-        .with_context(|| format!("stat {}", root.display()))?;
+    let md = if follow_root {
+        fs::metadata(root)
+    } else {
+        fs::symlink_metadata(root)
+    }
+    .with_context(|| format!("stat {}", root.display()))?;
     let mut root_entry = crate::fsops::entry_from_meta(Vec::new(), root, &md);
     if follow_root && md.is_dir() {
         root_entry.kind = crate::proto::Kind::Dir;

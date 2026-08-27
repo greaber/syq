@@ -19,7 +19,12 @@ pub struct Cipher {
 
 impl Cipher {
     pub fn new(key: &[u8], conn_id: u32, dir: u8) -> Cipher {
-        Cipher { aead: Aes256Gcm::new_from_slice(key).expect("key length"), conn_id, dir, counter: 0 }
+        Cipher {
+            aead: Aes256Gcm::new_from_slice(key).expect("key length"),
+            conn_id,
+            dir,
+            counter: 0,
+        }
     }
     fn nonce(&mut self) -> [u8; 12] {
         let mut n = [0u8; 12];
@@ -32,14 +37,31 @@ impl Cipher {
     pub fn seal(&mut self, plain: &[u8]) -> Vec<u8> {
         let n = self.nonce();
         self.aead
-            .encrypt(Nonce::from_slice(&n), Payload { msg: plain, aad: &[] })
+            .encrypt(
+                Nonce::from_slice(&n),
+                Payload {
+                    msg: plain,
+                    aad: &[],
+                },
+            )
             .expect("encrypt")
     }
     pub fn open(&mut self, cipher: &[u8]) -> io::Result<Vec<u8>> {
         let n = self.nonce();
         self.aead
-            .decrypt(Nonce::from_slice(&n), Payload { msg: cipher, aad: &[] })
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "authentication failed (wrong key or corrupted data)"))
+            .decrypt(
+                Nonce::from_slice(&n),
+                Payload {
+                    msg: cipher,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "authentication failed (wrong key or corrupted data)",
+                )
+            })
     }
 }
 
@@ -51,7 +73,11 @@ pub struct RecordWriter<W: Write> {
 
 impl<W: Write> RecordWriter<W> {
     pub fn new(inner: W, cipher: Option<Cipher>) -> Self {
-        RecordWriter { inner, cipher, buf: Vec::with_capacity(RECORD_MAX) }
+        RecordWriter {
+            inner,
+            cipher,
+            buf: Vec::with_capacity(RECORD_MAX),
+        }
     }
     fn emit(&mut self) -> io::Result<()> {
         if self.buf.is_empty() {
@@ -93,14 +119,22 @@ pub struct RecordReader<R: Read> {
 
 impl<R: Read> RecordReader<R> {
     pub fn new(inner: R, cipher: Option<Cipher>) -> Self {
-        RecordReader { inner, cipher, buf: Vec::new(), pos: 0 }
+        RecordReader {
+            inner,
+            cipher,
+            buf: Vec::new(),
+            pos: 0,
+        }
     }
     fn fill(&mut self) -> io::Result<()> {
         let mut hdr = [0u8; 4];
         self.inner.read_exact(&mut hdr)?;
         let len = u32::from_le_bytes(hdr) as usize;
         if len == 0 || len > RECORD_MAX + 64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad record length {len}")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad record length {len}"),
+            ));
         }
         let mut body = vec![0u8; len];
         self.inner.read_exact(&mut body)?;
