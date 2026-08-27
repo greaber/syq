@@ -256,12 +256,12 @@ PCP_DST=/usr/local/bin/pcp
 install_pcp() {
   [ -f "$PCP_SRC" ] || die "$PCP_SRC not found (stage the binary on NFS first)"
   local want; want=$(cat /mnt/nfs/grant/pcp.version 2>/dev/null || echo "?")
-  local have; have=$("$PCP_DST" --version 2>/dev/null | awk '{print $2}')
+  local have=""; [ -x "$PCP_DST" ] && have=$("$PCP_DST" --version 2>/dev/null | awk '{print $2}')
   if [ "$have" = "$want" ] && [ -n "$have" ]; then
     say "pcp: /usr/local/bin/pcp already at $have"
   else
     run install -m 0755 "$PCP_SRC" "$PCP_DST"
-    say "pcp: installed $("$PCP_DST" --version 2>/dev/null) to $PCP_DST (was ${have:-absent})"
+    say "pcp: installed $("$PCP_DST" --version 2>/dev/null || echo '?') to $PCP_DST (was ${have:-absent})"
   fi
   # Point out per-user copies that would shadow the system one on PATH.
   for h in /home/*; do

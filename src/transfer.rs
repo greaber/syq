@@ -180,14 +180,38 @@ pub fn run(args: Args) -> Result<i32> {
         || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
     if same_machine {
         let local = !dst.is_remote();
-        let dn = norm_path(&dst.path, local);
         for s in srcs {
             let sn = norm_path(&s.path, local);
-            if dn != sn && dn.starts_with(&sn) {
-                bail!(
-                    "destination {:?} is inside source {:?} — that would copy the directory into itself",
-                    dst.path, s.path
-                );
+            // Only a *directory* source can cause the recurse-into-destination
+            // trap; a file onto itself is the no-op the dev+ino identity check
+            // handles. Locally we can confirm; remotely we assume a directory
+            // (conservative) and rely on component-wise containment.
+            let src_is_dir = if local { sn.is_dir() } else { true };
+            if !src_is_dir {
+                continue;
+            }
+            // Effective destination(s): the destination itself (trailing-slash
+            // "copy contents", or single-source rename) and, for a bare source,
+            // destination/basename (copy into an existing directory).
+            let mut effs = vec![norm_path(&dst.path, local)];
+            if !s.copies_contents() {
+                let base = s.basename();
+                if !base.is_empty() {
+                    let joined = format!("{}/{}", dst.path.trim_end_matches('/'), base);
+                    effs.push(norm_path(&joined, local));
+                }
+            }
+            for eff in effs {
+                if eff == sn {
+                    if local {
+                        bail!("source and destination are the same directory {:?}", s.path);
+                    }
+                } else if eff.starts_with(&sn) {
+                    bail!(
+                        "destination {:?} maps inside source {:?} — that would copy the directory into itself",
+                        dst.path, s.path
+                    );
+                }
             }
         }
     }
@@ -1253,9 +1277,9 @@ impl Worker {
             // Larger files go through a partial file + atomic rename even when
             // new (unless --inplace): an interrupted in-place file sits under its
             // final name and could later be mistaken for complete by the quick
-            // check. Small new files use the in-place fast-batch path instead,
-            // which completes atomically in one burst (that's where the NFS win
-            // is); this handle_file path is for the larger ones.
+            // check. Small new files use the in-place fast-batch path instead
+            // (written straight to their final path — fast on NFS, but not
+            // atomically visible); this handle_file path is for the larger ones.
             self.set_inplace(idx, inplace);
 
             if inplace {

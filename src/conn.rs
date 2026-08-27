@@ -418,23 +418,28 @@ impl RemoteSpec {
         let mut last = anyhow!("no data address");
         for k in 0..n {
             let addr = &info.addrs[(start + k) % n];
-            let sa = match (addr.as_str(), info.port)
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut i| i.next())
-            {
-                Some(sa) => sa,
-                None => {
+            let resolved: Vec<_> = match (addr.as_str(), info.port).to_socket_addrs() {
+                Ok(it) => it.collect(),
+                Err(_) => {
                     last = anyhow!("cannot resolve {addr}");
                     continue;
                 }
             };
-            let stream = match TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(4)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last = anyhow!("{addr}:{}: {e}", info.port);
-                    continue;
+            // Try each resolved address in turn (dual-stack names may list an
+            // unreachable family first).
+            let mut got = None;
+            for sa in &resolved {
+                match TcpStream::connect_timeout(sa, std::time::Duration::from_secs(4)) {
+                    Ok(s) => {
+                        got = Some(s);
+                        break;
+                    }
+                    Err(e) => last = anyhow!("{addr}:{}: {e}", info.port),
                 }
+            }
+            let stream = match got {
+                Some(s) => s,
+                None => continue,
             };
             let addr_s = stream
                 .peer_addr()
@@ -475,12 +480,15 @@ fn probe_reachable(advertised: &[(String, u32)], port: u16) -> Vec<(String, u32)
     for (i, (addr, speed)) in advertised.iter().cloned().enumerate() {
         let tx = tx.clone();
         std::thread::spawn(move || {
+            // Try every resolved address (a dual-stack name may return IPv6
+            // first while the listener is IPv4-only): reachable if any connects.
             let ok = (addr.as_str(), port)
                 .to_socket_addrs()
-                .ok()
-                .and_then(|mut it| it.next())
-                .map(|sa| {
-                    TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1000)).is_ok()
+                .map(|it| {
+                    it.into_iter().any(|sa| {
+                        TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1000))
+                            .is_ok()
+                    })
                 })
                 .unwrap_or(false);
             let _ = tx.send((i, addr, speed, ok));
