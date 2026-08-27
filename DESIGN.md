@@ -1,6 +1,12 @@
 # pcp — parallel copy with an rsync-shaped interface
 
-**Status:** implemented through milestone 5's direct remote→remote mode; see README.md for usage. Remaining from the plan: `--bwlimit`, `--exclude` globs, `--delete`.
+**Status:** implemented and in use; see README.md for the current, authoritative
+behavior. This document is the original design and its rationale — where it and
+the code disagree, the code (and README) win. Since it was written the data
+plane moved to TCP-by-default (ssh for auth), gitignore-style `--ignore`
+replaced the planned `--exclude` globs, and `--rm`, `--detach`/`--follow`, and a
+cross-job resume journal + destination marker were added. Still not built:
+`--bwlimit`, `--delete`.
 
 ## Goal
 
@@ -12,9 +18,10 @@ this from server A to server B" — that:
 3. **resumes** without redoing work and can **verify** a copy completed,
 4. supports the handful of rsync options people actually use (`-avz`).
 
-Non-goals for v1: rsync filter rules, `--delete`, `--link-dest`, hardlinks
-(`-H`), ACLs/xattrs, rsync-daemon compatibility, rsync's shift-tolerant
-rolling-checksum delta.
+Non-goals for v1: rsync's include/exclude/filter *rule language* (pcp instead
+has one gitignore-style `--ignore`, see README), `--delete`, `--link-dest`,
+hardlinks (`-H`), ACLs/xattrs, rsync-daemon compatibility, rsync's
+shift-tolerant rolling-checksum delta.
 
 ## Why rsync can't do this
 
@@ -62,19 +69,26 @@ v1 options:
 | `-z` | zstd compression inside our protocol (not `ssh -C`) |
 | `-n` / `--dry-run` | scan and report, transfer nothing |
 | `-j N` / `--connections N` | data connections (default 8) |
-| `--chunk-size SIZE` | split threshold and chunk size (default 64M) |
-| `--progress` / `--no-progress` | default: on when stdout is a TTY |
+| `--block-size SIZE` | transfer/hash block size (default 4M) |
+| `--min-split SIZE` | don't split an in-flight file with less than this left (default 32M) |
+| `--progress` / `--no-progress` | default: on when stderr is a TTY |
 | `--progress-json` | machine-readable progress on stderr |
 | `--stats` | summary at end |
-| `-c` / `--verify` | hash-compare every file on both sides; with `--verify-only`, transfer nothing |
+| `-c` / `--checksum` | compare every file block by block, not just size+mtime; repair mismatches |
+| `--verify-only` | hash every file on both sides and report differences; transfer nothing |
+| `--inplace` / `--atomic` | write in place / force partial+rename for every file |
+| `--fsync` | fsync each file and its parent dir around the rename |
 | `-e CMD` | remote shell command (default `ssh`) |
-| `--relay` | force remote→remote via the local machine |
+| `--no-tcp` / `--tcp-plain` / `--tcp-ports LO-HI` | ssh-only data / unencrypted TCP / listener port range |
+| `-i` / `--ignore-from` | gitignore-style path filtering |
+| `--rm` | parallel recursive removal |
+| `--relay` / `--detach` / `--follow` | remote→remote routing, detached run, log follow |
+| `--no-resume` | disable the destination marker and completion journal |
 | `--bootstrap` | copy the pcp binary to the remote if missing |
-| `--inplace` | write directly to target instead of partial+rename |
 | `-h`, `--version` | |
 
-Later: `--bwlimit`, `--exclude GLOB` (gitignore-style, not rsync rules),
-`--gitignore`, `--delete`, `-u`, `--files-from`.
+Data connections default to encrypted TCP (see below); `--no-tcp` keeps them on
+ssh. Later: `--bwlimit`, `--delete`, `-u`, `--files-from`.
 
 ## Architecture
 
@@ -125,17 +139,26 @@ WriteRange { partial_id, off, len, bytes, hash }
 HashRange  { path, off, len }       -> hash
 ```
 
-Remote data workers are independent `pcp --server --data` processes; several
-processes `pwrite` into the same preallocated partial file. The control
-connection is the only thing that creates or renames partials.
+The control connection is the only thing that creates or renames partials; the
+data connections carry only range reads/writes and several of them `pwrite`
+into the same partial.
 
-Data connections are separate `ssh` processes started with
-`-o ControlMaster=no -o ControlPath=none` so they get their own TCP flow and
+By default the data connections are **separate TCP sockets** carrying
+AES-256-GCM records, keyed by a secret exchanged over the ssh control session:
+the remote opens a listener (port range `--tcp-ports`) and advertises its
+addresses, and when several comparable-speed NICs are reachable (e.g. an 8-rail
+RoCE fabric) pcp spreads connections across them (multipath). This sidesteps
+ssh's per-channel flow-control window and per-process cipher ceiling. If the
+port can't be reached pcp falls back to ssh data connections; `--no-tcp` forces
+that, and `--tcp-plain` drops the encryption on trusted networks. Under ssh
+fallback the data connections are separate `ssh` processes started with
+`-o ControlMaster=no -o ControlPath=none` so each gets its own TCP flow and
 cipher CPU.
 
 ### Work queue and scheduling
 
-Work item = `(file, offset, len)`. Files above `--chunk-size` are split.
+Work item = `(file, offset, len)`. Files are split into `--block-size` ranges;
+a file is not split further once less than `--min-split` remains.
 Order: largest first (avoids the long tail). Idle workers **steal** the back
 half of the remaining range of an in-flight file, so the tail of "one giant
 file at the end" degrades to N-way parallel automatically without
@@ -143,7 +166,11 @@ pre-deciding chunk counts.
 
 ### Write path (receiver)
 
-1. `fallocate` `.<name>.pcp-partial` in the target directory to the final size.
+1. `fallocate` `.<name>.pcp-partial` in the target directory to the final size
+   (large files and existing-file updates). Small new files — up to the block
+   size — are instead written straight to their final path with no preallocation
+   and no rename, a measurable NFS win; `--atomic` forces the partial+rename path
+   for every file.
 2. Workers `pwrite` chunks; each chunk's hash is checked on arrival, mismatch
    → re-fetch.
 3. All chunks done → `fsync` → set mode/owner/mtime → `rename` over target.
@@ -156,39 +183,50 @@ partial for the no-space-for-a-copy case.
 
 ### Block-level skip (our "delta")
 
-For a file that fails quick-check, both sides hash each chunk (xxh3; blake3
-under `--verify`); equal chunks are skipped. Catches appends and in-place
+For a file that fails quick-check, both sides hash each block (xxh3, the same
+algorithm used for `-c` verification); equal blocks are skipped. Catches appends and in-place
 modification (VM images, DBs, logs); misses byte insertions that shift the
 rest of the file, which rsync's rolling checksum would catch. Accepted
 trade-off — the normal case is fresh uploads/downloads, not syncing edits.
 
 ### Resume
 
-Falls out of the above; there is no state file.
+Two levels. *Within a file* there is no state file — the partial is the state:
 
 - Completed files: quick-check skip.
 - Partial found at `.<name>.pcp-partial`: hash each chunk locally, compare to
-  source chunk hashes, fetch only mismatches. The partial *is* the state, so
-  it can't disagree with reality. (A completed-chunk bitmap is a possible
-  later optimization; local sequential hashing is cheap next to network.)
+  source chunk hashes, fetch only mismatches. The partial *is* the state, so it
+  can't disagree with reality.
 - Ctrl-C is always safe.
+
+*Across a whole job* pcp keeps a completion journal (JSONL, keyed to the
+source→destination paths and metadata-affecting flags) under
+`$XDG_STATE_HOME/pcp`, and drops a marker file on the destination filesystem
+while a run is in progress. The marker is a cross-machine interlock — a second
+run targeting the same destination sees a foreign session and aborts rather than
+interleaving writes; it is removed on success and left behind on interruption so
+the next identical run resumes, skipping journaled files without re-stat'ing the
+destination. The journal is authoritative (external destination edits need `-c`
+or `--no-resume`), and marker-creation failure degrades to a no-resume run
+rather than failing the copy. `--no-resume` disables both. See RESUME-DESIGN.md.
 
 ### Verify
 
 - Built in: every chunk hashed on both ends; post-transfer source re-stat;
   non-zero exit if anything failed to verify.
-- `--verify` / `-c`: hash every file in parallel on both sides, report
-  differences. `--verify-only` does this without transferring — the "did it
-  finish?" check.
+- `-c` / `--checksum`: block-compare every file on both sides and repair
+  mismatches, not just the ones that fail the quick check. `--verify-only`
+  reports differences without transferring — the "did it finish?" check.
 
 ### Remote → remote
 
 - **Relay** (`--relay`, v1): orchestrator local, data A→local→B. Halves
   bandwidth, uses your uplink, but always works. Zero extra code.
-- **Direct** (v1.5, default when possible): run the orchestrator *on A*
+- **Direct** (default when possible): run the orchestrator *on A*
   (`ssh -A A pcp src B:dst`), reducing to push mode. Needs A→B reachability
-  and credentials (agent forwarding covers the usual case). Fall back to relay
-  if A can't reach B.
+  and credentials (agent forwarding covers the usual case). Falls back to relay
+  if A can't reach B. `--detach` runs it detached on A so it survives losing the
+  launching ssh session; `--follow HOST:LOG` reattaches to its progress log.
 
 ### Compression
 
@@ -205,21 +243,28 @@ After the scan the totals are exact. Show:
 - files done / total, EWMA throughput, ETA;
 - per-connection activity; in-flight files with chunk completion.
 
-Multi-line `indicatif` TUI on a TTY, single updating line otherwise,
+Multi-line meter on a TTY, single updating line otherwise,
 `--progress-json` for scripts, rsync-style `--stats` at the end.
 
 ### Bootstrap
 
-Single static binary (musl). `--bootstrap`: if `pcp` isn't on the remote's
-PATH, copy this binary to `~/.local/bin/pcp` over the control ssh and retry.
+Single static binary — built glibc-static
+(`RUSTFLAGS="-C target-feature=+crt-static"` on `x86_64-unknown-linux-gnu`; no
+`musl-gcc` needed for the bundled zstd), macOS built natively. `--bootstrap`: if
+`pcp` isn't on the remote's PATH, copy this binary to `~/.local/bin/pcp` over
+the control ssh and retry (the remote must match the local architecture).
 Version mismatch is detected at handshake.
 
 ## Rust building blocks
 
-`tokio` (I/O, ssh child processes), `clap`, `jwalk`, `xxhash-rust`, `blake3`,
-`zstd`, `serde` + `postcard` (wire framing), `indicatif`, `nix`/`libc`
-(`fallocate`, `pwrite`, `fchown`, `utimensat`, `mknod`). Target
-`x86_64-unknown-linux-musl` (+ aarch64) for static binaries.
+As built (no async runtime — plain threads, not `tokio`): `clap`, `jwalk` +
+`ignore` (parallel walk, gitignore matching), `xxhash-rust` (xxh3, used for both
+transfer and verify — no `blake3`), `zstd`, `serde` + `postcard` (wire framing),
+`aes-gcm` + `getrandom` (TCP record layer), `serde_json` + `base64` (resume
+journal), `shell-words`, and `libc` directly (`fallocate`, `pwrite`, `fchown`,
+`utimensat`, `mknod`, `copy_file_range`) — no `nix`. Progress is a hand-rolled
+renderer, not `indicatif`. Target `x86_64-unknown-linux-gnu` (crt-static) plus
+native macOS.
 
 ## Milestones
 
@@ -228,14 +273,17 @@ Version mismatch is detected at handshake.
    pull; whole files; one connection.
 2. **Parallel + progress** — N connections, work queue, largest-first,
    partial→rename, progress meter, `--stats`.
-3. **Chunks, resume, verify** — splitting, work stealing, per-chunk hashing,
-   resume from partials, `--verify`.
+3. **Chunks, resume, verify** — splitting, work stealing, per-block hashing,
+   resume from partials, `-c`/`--verify-only`.
 4. **Relay remote→remote**, `-z`, `--bootstrap`, `--dry-run`.
 5. **Direct remote→remote**, `--bwlimit`, `--exclude` globs, `--delete`.
 
-## Open questions
+All five milestones are implemented, plus TCP data connections, `--ignore`,
+`--rm`, `--detach`/`--follow`, and cross-job resume.
 
-- Name collision: Performance Co-Pilot ships a `pcp` binary on some distros.
-  Live with it, or install as something else (`pcpy`, `prsync`)?
-- Default `-j`: fixed 8, or derive from host CPU count?
-- Should `--progress` be on by default even when rsync wouldn't (yes, when TTY)?
+## Resolved questions
+
+- Name collision with Performance Co-Pilot's `pcp`: lived with; the binary is
+  `pcp`.
+- Default `-j`: 8 over ssh, `min(cpu, 32)` when everything is local.
+- `--progress` on by default when stderr is a TTY: yes.
