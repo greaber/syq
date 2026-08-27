@@ -4,10 +4,12 @@
 
 Start any task that may change the repository in a task-specific git worktree,
 before investigating or editing code for that task. Treat the primary checkout
-as a coordination checkout: it must stay on `master` with a clean working tree.
-Do not edit tracked files, create commits, or switch branches there, and do not
-disturb changes already present. Fast-forwarding `master` after a remote merge
-and administering branches and worktrees are the only normal exceptions.
+as a coordination checkout on `master`; do not introduce working-tree changes
+there. Do not edit tracked files, create commits, or switch branches there. If
+it is already dirty, preserve and report the existing changes: inherited
+dirtiness does not block creating or using a separate task worktree, and is not
+permission to clean, reset, or stash them. Apart from administering branches
+and worktrees, only writes to gitignored files are normally allowed there.
 
 Check `git status` and `git worktree list` before choosing a worktree. A branch
 and worktree should correspond 1:1 with a task or pull request; the normal setup
@@ -32,14 +34,15 @@ a plausible branch name. Before every file edit or write, confirm that
   `master` go through a pull request; do not commit them directly on `master` or
   merge task branches from the coordination checkout. Do not merge a pull
   request unless the user explicitly asks.
-- An active worktree may be dirty while work is in progress, but do not rebase,
-  reset, or otherwise synchronize its branch with advancing `master` while its
-  only unique state is uncommitted. Prefer a checkpoint commit on the task
-  branch, then synchronize the committed branch.
-- If a safety stash is genuinely necessary, give it a task-specific name and
-  include untracked files. Restore it once, verify the resulting worktree, and
-  drop it after the corresponding work is committed. Report any retained stash
-  and why it is still needed in the handoff.
+- Before rebasing, resetting, or otherwise synchronizing a task branch with
+  advancing `master`, require its worktree to be clean, including staged and
+  untracked changes. Prefer a checkpoint commit on the task branch. Never use
+  reset to discard task work.
+- If a safety stash is genuinely necessary to make the worktree clean, give it
+  a task-specific name and include untracked files. Restore it after the
+  synchronization, verify the resulting worktree, and drop it after the
+  corresponding work is committed. Report any retained stash and why it is
+  still needed in the handoff.
 - At review handoff, state the branch and exact short commit SHA, whether the
   worktree is clean, and which checks passed, failed, or were not run. Treat
   review-ready and merge-ready as separate states.
