@@ -70,7 +70,7 @@ outlive its premise and steer later work in the wrong direction.
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
 
-## Working on PCP
+## Working on syq
 
 - `README.md` is the user-facing contract; the code is authoritative for
   everything else. `RESUME-DESIGN.md` covers the resume feature's design.
@@ -84,7 +84,7 @@ outlive its premise and steer later work in the wrong direction.
 - Copy failures must be visible. Do not make an incomplete or truncated result
   look successful.
 - Exercise copy, resume, verification, and removal behavior in disposable
-  temporary directories. Treat `pcp --rm`, remote destinations, bootstrap
+  temporary directories. Treat `syq --rm`, remote destinations, bootstrap
   installation, and operations on real user data as potentially destructive.
 
 ## Verification

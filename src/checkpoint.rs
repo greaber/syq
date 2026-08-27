@@ -179,7 +179,7 @@ impl Checkpoint {
                 } => {
                     if format != FORMAT {
                         bail!(
-                            "checkpoint {} has format {format}, but this pcp reads format {FORMAT}",
+                            "checkpoint {} has format {format}, but this syq reads format {FORMAT}",
                             path.display()
                         );
                     }
@@ -225,7 +225,7 @@ impl Checkpoint {
         }
         if has_data && out.existing_identity.is_none() {
             bail!(
-                "{} is not a PCP checkpoint (no valid header); choose another path",
+                "{} is not a SYQ checkpoint (no valid header); choose another path",
                 path.display()
             );
         }
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn round_trip_and_metadata_matching() {
         let dir = std::env::temp_dir().join(format!(
-            "pcp-checkpoint-unit-{}-round-trip",
+            "syq-checkpoint-unit-{}-round-trip",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn identity_mismatch_is_rejected() {
         let dir = std::env::temp_dir().join(format!(
-            "pcp-checkpoint-unit-{}-identity",
+            "syq-checkpoint-unit-{}-identity",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn concurrent_writer_is_rejected() {
         let dir =
-            std::env::temp_dir().join(format!("pcp-checkpoint-unit-{}-locked", std::process::id()));
+            std::env::temp_dir().join(format!("syq-checkpoint-unit-{}-locked", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.jsonl");
         let _ = fs::remove_file(&path);
