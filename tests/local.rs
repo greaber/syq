@@ -996,6 +996,24 @@ fn dir_vs_file_destination_collision_rejected() {
 }
 
 #[test]
+fn file_over_nonempty_destination_directory_reports_error_without_panicking() {
+    let t = Tmp::new();
+    write(&t.path("src/foo"), b"source");
+    write(&t.path("dest/foo/keep"), b"keep");
+
+    let out = pcp(&["-j", "1", "--no-resume", &t.s("src/foo"), &t.s("dest")]);
+
+    assert_eq!(out.status.code(), Some(23));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("destination") && err.contains("is a directory"),
+        "{err}"
+    );
+    assert!(!err.contains("panicked"), "{err}");
+    assert_eq!(read(&t.path("dest/foo/keep")), b"keep");
+}
+
+#[test]
 fn verify_only_detects_symlink_difference() {
     let t = Tmp::new();
     fs::create_dir_all(t.path("s")).unwrap();
