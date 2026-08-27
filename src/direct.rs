@@ -16,7 +16,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             host: src_host.clone(),
             rsh: rsh.clone(),
             pcp_path: args.pcp_path.clone(),
-            quiet_tcp: !(args.tcp || args.tcp_plain || args.no_tcp),
+            quiet: args.quiet,
             tcp: Default::default(),
         };
         if spec.connect(false).is_err() {

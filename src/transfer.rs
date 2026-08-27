@@ -43,7 +43,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             host: h.clone(),
             rsh: parse_rsh(&args.rsh)?,
             pcp_path: args.pcp_path.clone(),
-            quiet_tcp: !(args.tcp || args.tcp_plain || args.no_tcp),
+            quiet: args.quiet,
             tcp: Default::default(),
         }),
     })
@@ -278,7 +278,6 @@ pub fn run(args: Args) -> Result<i32> {
     let use_tcp = !args.no_tcp && (src_ep.is_remote() || dst_ep.is_remote());
     // Whether the user said anything about TCP, which controls how loudly we
     // report a fallback (silent when it's just the default).
-    let tcp_explicit = args.tcp || args.tcp_plain || args.no_tcp;
     if !opts.dry_run && !args.bootstrap && !use_tcp {
         spawn_workers(&mut workers);
     }
@@ -311,14 +310,9 @@ pub fn run(args: Args) -> Result<i32> {
         for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
             if let Endpoint::Remote(spec) = ep {
                 if let Err(e) = spec.setup_tcp(&mut **ctl, args.tcp_plain, ports) {
-                    if tcp_explicit {
+                    if !args.quiet || debug() {
                         eprintln!(
-                            "pcp: {}: cannot set up TCP data connections ({e:#}); using ssh",
-                            spec.label()
-                        );
-                    } else if debug() {
-                        eprintln!(
-                            "pcp: {}: TCP data unavailable ({e:#}); using ssh",
+                            "pcp: {}: cannot set up TCP data connections ({e:#}); using ssh (slower per stream; --tcp-ports / firewall?)",
                             spec.label()
                         );
                     }

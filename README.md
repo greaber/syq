@@ -247,8 +247,11 @@ reached — a firewall, typically — pcp says so once and falls back to ssh dat
 connections, so `--tcp` is always safe to pass.
 
 The remote advertises every address it has (the one your ssh session arrived
-on first, then private LAN, then CGNAT/Tailscale, then public); the client
-tries them all and prefers the best that answers. When several NICs of
+on first, then private LAN, then public, then CGNAT/Tailscale); the client
+adds the name it reached ssh through — the only address that works for a
+host behind NAT or port forwarding — ahead of the overlay ones, tries them
+all, and prefers the best that answers. If none answers it says so and uses
+ssh (silenced by `-q`). When several NICs of
 comparable speed are reachable (e.g. an 8-rail RoCE fabric), pcp spreads its
 data connections across all of them (multipath) — it keeps only paths within
 2x of the fastest, so it never drags a fast transfer down by mixing in a slow
