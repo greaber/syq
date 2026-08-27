@@ -57,8 +57,15 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     })
 }
 
+/// Open a control connection. It bypasses the data-connection connect
+/// limiter: the scan, and therefore every worker, waits on it.
 pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
-    ep.connect(args.compress)
+    match ep {
+        Endpoint::Local => ep.connect(args.compress),
+        Endpoint::Remote(spec) => spec
+            .connect_with(args.compress, false)
+            .map(|c| Box::new(c) as Box<dyn Conn>),
+    }
 }
 
 fn parse_ports(s: &str) -> Result<(u16, u16)> {
