@@ -339,9 +339,19 @@ impl RemoteSpec {
             Response::TcpListening { port, addrs } => (port, addrs),
             other => bail!("unexpected response {other:?}"),
         };
-        if advertised.is_empty() {
-            if let Some(h) = self.resolved_hostname() {
-                advertised.push((h, 0));
+        // Always also try the name we reached ssh through: a server behind
+        // NAT / port forwarding advertises only its private addresses, which
+        // are unreachable from outside, while its public address is exactly
+        // what we connected to. It goes after the LAN / fast-NIC addresses
+        // (better when reachable) but before CGNAT / Tailscale ones, which
+        // are overlay paths and must not win over the direct public address.
+        if let Some(h) = self.resolved_hostname() {
+            if !advertised.iter().any(|(a, _)| *a == h) {
+                let at = advertised
+                    .iter()
+                    .position(|(a, _)| a.starts_with("100."))
+                    .unwrap_or(advertised.len());
+                advertised.insert(at, (h, 0));
             }
         }
         // Probe which advertised addresses this client can actually reach.
