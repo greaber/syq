@@ -15,6 +15,9 @@ git worktree add .worktrees/<task> -b <task> master
 cd .worktrees/<task>
 ```
 
+Use plain git commands as shown above. Do not use the `EnterWorktree` or
+`ExitWorktree` tools; they are denied in `.claude/settings.json`.
+
 Continue in an existing worktree only when you created it for the current task
 or the user explicitly identified it as the target. Never infer ownership from
 a plausible branch name. Before editing, confirm that

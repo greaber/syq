@@ -1,3 +1,4 @@
 /target
-/.claude
+/.claude/*
+!/.claude/settings.json
 /.worktrees/
