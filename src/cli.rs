@@ -176,9 +176,20 @@ pub struct Args {
 
     /// Delete extraneous files from the destination directories (paths the source does not
     /// have). Deletion happens after the transfer and is skipped entirely if the source scan
-    /// reported any error. Ignored paths (-i) are protected on both sides
-    #[arg(long, conflicts_with_all = ["verify_only", "files_from"])]
+    /// reported any error. Ignored paths (-i) are protected on both sides. rsync's
+    /// --delete-after and --delete-delay mean the same thing and are accepted
+    #[arg(
+        long,
+        aliases = ["delete-after", "delete-delay"],
+        conflicts_with_all = ["verify_only", "files_from"]
+    )]
     pub delete: bool,
+    /// With --delete, also remove destination paths that the -i patterns exclude
+    #[arg(long, requires = "delete")]
+    pub delete_excluded: bool,
+    /// With --delete, refuse to delete anything if more than N deletions are planned (exit 25)
+    #[arg(long, value_name = "N", requires = "delete")]
+    pub max_delete: Option<u64>,
     /// Skip files that are newer on the destination
     #[arg(short = 'u', long)]
     pub update: bool,
@@ -383,6 +394,7 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         "--max-size",
         "--min-size",
         "--files-from",
+        "--max-delete",
         "--checkpoint",
         "--tcp-ports",
         "--pcp-path",
@@ -430,13 +442,17 @@ fn unsupported_message(tok: &str) -> Option<String> {
 }
 
 const FILTER_MSG: &str = "pcp has no --exclude/--include/--filter. Use -i/--ignore (or --ignore-from), which takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `-i node_modules`. See the README's \"Ignoring paths\" section.";
-const DELETE_MSG: &str = "pcp has one deletion mode, --delete (after the transfer, only on a clean source scan); --delete-before/-during/-delay/-after, --delete-excluded, --max-delete and --force are not supported.";
+const DELETE_MSG: &str = "pcp deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 
 fn message_for_long(base: &str) -> Option<&'static str> {
     Some(match base {
         "exclude" | "exclude-from" | "include" | "include-from" | "filter" => FILTER_MSG,
-        "delete-excluded" | "max-delete" | "force" => DELETE_MSG,
-        _ if base.starts_with("delete-") => DELETE_MSG,
+        "force" => DELETE_MSG,
+        _ if base.starts_with("delete-")
+            && !matches!(base, "delete-after" | "delete-delay" | "delete-excluded") =>
+        {
+            DELETE_MSG
+        }
         "one-file-system" => "pcp does not implement -x/--one-file-system.",
         "sparse" => "pcp does not implement -S/--sparse.",
         "hard-links" => "pcp does not preserve hard links (-H/--hard-links).",

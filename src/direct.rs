@@ -71,6 +71,12 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.delete {
         remote.push("--delete".into());
     }
+    if args.delete_excluded {
+        remote.push("--delete-excluded".into());
+    }
+    if let Some(n) = args.max_delete {
+        remote.push(format!("--max-delete={n}"));
+    }
     if args.update {
         remote.push("--update".into());
     }

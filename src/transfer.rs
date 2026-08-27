@@ -40,6 +40,10 @@ pub struct Opts {
     pub ignore: Vec<String>,
     /// --delete: remove destination paths the source doesn't have (see Planner::plan_deletes).
     pub delete: bool,
+    /// --delete-excluded: ignored destination paths are extras too.
+    pub delete_excluded: bool,
+    /// --max-delete: delete nothing if more than this many deletions are planned.
+    pub max_delete: Option<u64>,
     /// -u: skip files that are newer on the destination.
     pub update: bool,
     /// --ignore-existing: never touch a destination path that already exists.
@@ -367,6 +371,8 @@ pub fn run(args: Args) -> Result<i32> {
         umask: read_umask(),
         ignore: args.ignore_lines.clone(),
         delete: args.delete,
+        delete_excluded: args.delete_excluded,
+        max_delete: args.max_delete,
         update: args.update,
         ignore_existing: args.ignore_existing,
         existing: args.existing,
@@ -658,6 +664,7 @@ pub fn run(args: Args) -> Result<i32> {
         links_created: 0,
         specials_created: 0,
         scan_warned: false,
+        max_delete_hit: false,
         keep_dirs: args.files_from.is_some(),
         delete_roots: Vec::new(),
         deletes: Deletes::default(),
@@ -758,6 +765,7 @@ pub fn run(args: Args) -> Result<i32> {
     if !aborted && !opts.dry_run && !opts.verify_only {
         st.apply_deferred()?;
     }
+    let max_delete_hit = st.max_delete_hit;
     drop(st);
 
     progress.stop();
@@ -872,6 +880,8 @@ pub fn run(args: Args) -> Result<i32> {
         1
     } else if errors > 0 {
         23
+    } else if max_delete_hit {
+        25
     } else {
         0
     })
@@ -1012,6 +1022,8 @@ struct Planner<'a> {
     specials_created: u64,
     /// A source scan reported a non-fatal problem (unreadable directory, ...).
     scan_warned: bool,
+    /// --max-delete stopped the deletions (exit 25, as rsync).
+    max_delete_hit: bool,
     /// --files-from: listed directories are created even without -r (which
     /// then only decides whether their contents are walked).
     keep_dirs: bool,
@@ -1850,7 +1862,13 @@ impl Planner<'_> {
             if stat_one(self.dst, &root, false)?.is_none() {
                 continue;
             }
-            let ignore = self.opts.ignore.clone();
+            // --delete-excluded: walk without the patterns, so ignored paths
+            // are ordinary unclaimed extras (and nothing is protected).
+            let ignore = if self.opts.delete_excluded {
+                Vec::new()
+            } else {
+                self.opts.ignore.clone()
+            };
             let mut found = Deletes::default();
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
@@ -1958,6 +1976,16 @@ impl Planner<'_> {
             }
         }
         let dirs = std::mem::take(&mut self.deletes.dirs);
+        let planned = leaves.len() as u64 + dirs.values().map(|v| v.len() as u64).sum::<u64>();
+        if let Some(max) = opts.max_delete {
+            if planned > max {
+                self.progress.eprintln(&format!(
+                    "pcp: {planned} deletions planned, more than --max-delete {max}; deleting nothing"
+                ));
+                self.max_delete_hit = true;
+                return Ok(0);
+            }
+        }
         let mut n = 0u64;
         let checkpoint = self.checkpoint.clone();
         let mut run =

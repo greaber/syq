@@ -2938,9 +2938,9 @@ fn unsupported_rsync_flags_explain_themselves() {
     assert!(err.contains("-i/--ignore"), "should point to -i: {err}");
     assert!(err.contains("gitignore"), "should mention gitignore: {err}");
 
-    let out = pcp(&["-a", "--delete-excluded", &t.s("src/"), &t.s("dst/")]);
+    let out = pcp(&["-a", "--delete-during", &t.s("src/"), &t.s("dst/")]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("one deletion mode"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("after the transfer"));
 
     // Bundled short flags from a pasted `rsync -aHz` are caught too (the
     // unsupported letter is found inside the cluster).
@@ -3102,4 +3102,92 @@ fn stats_report_connection_tuning_mode() {
     // An explicit -j is used as given, with no tuning.
     let out = run_ok(&["-a", "--stats", "-j", "3", &t.s("src/"), &t.s("fixed/")]);
     assert!(out.contains("connections: 3\n"), "{out}");
+}
+
+// --------------------------------------- --delete-after/-delay, --delete-excluded, --max-delete
+
+#[test]
+fn delete_after_and_delay_are_synonyms() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    for flag in ["--delete-after", "--delete-delay"] {
+        write(&t.path("dst/extra"), b"x");
+        run_ok(&["-a", flag, &t.s("src/"), &t.s("dst")]);
+        assert!(!t.path("dst/extra").exists(), "{flag}");
+    }
+    let out = pcp(&["-a", "--delete-before", &t.s("src/"), &t.s("dst")]);
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("after the transfer"));
+}
+
+#[test]
+fn delete_excluded_removes_ignored_destination_paths() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("src/junk.log"), b"src log, never copied");
+    write(&t.path("dst/keep/k.log"), b"k");
+    write(&t.path("dst/junk.log"), b"old");
+    // Protected without the flag...
+    run_ok(&["-a", "--delete", "-i", "*.log", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(
+        listing(&t.path("dst")),
+        ["a", "junk.log", "keep", "keep/k.log"]
+    );
+    // ...extras with it, including the directory that only held them.
+    let so = run_ok(&[
+        "-a",
+        "--delete",
+        "--delete-excluded",
+        "-i",
+        "*.log",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(listing(&t.path("dst")), ["a"]);
+    assert!(so.contains("3 deleted"), "{so}");
+    assert!(
+        !t.path("dst/junk.log").exists(),
+        "source's ignored file is not copied either"
+    );
+}
+
+#[test]
+fn max_delete_refuses_everything_past_the_limit() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    for i in 0..5 {
+        write(&t.path(&format!("dst/extra{i}")), b"x");
+    }
+    let out = pcp(&[
+        "-a",
+        "--delete",
+        "--max-delete",
+        "3",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(out.status.code(), Some(25), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("5 deletions planned"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(listing(&t.path("dst")).len(), 6, "nothing deleted");
+    assert_eq!(
+        read(&t.path("dst/a")),
+        b"a",
+        "the copy itself still happened"
+    );
+    run_ok(&[
+        "-a",
+        "--delete",
+        "--max-delete",
+        "5",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(listing(&t.path("dst")), ["a"]);
+    // --max-delete without --delete is a usage error.
+    let out = pcp(&["-a", "--max-delete", "5", &t.s("src/"), &t.s("dst")]);
+    assert!(!out.status.success());
 }

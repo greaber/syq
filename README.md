@@ -107,7 +107,9 @@ pcp -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
 | `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
-| `--delete` | Remove destination paths the source doesn't have (see below) |
+| `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
+| `--delete-excluded` | With `--delete`, also remove destination paths the `-i` patterns exclude |
+| `--max-delete N` | With `--delete`, delete nothing if more than N deletions are planned (exit 25) |
 | `-u`, `--update` | Skip files that are newer on the destination |
 | `--existing` | Only update files that already exist on the destination; create nothing |
 | `--ignore-existing` | Only create files missing on the destination; update nothing |
@@ -316,8 +318,8 @@ the transfer (see below); hardlinks aren't implemented.
 - rsync filter rules (`--exclude`/`--include`/`--filter`); use `-i` (gitignore
   syntax) instead.
 - `--link-dest`, `--backup`.
-- `--delete`'s variants: `--delete-before`/`--delete-during`,
-  `--delete-excluded`, `--max-delete`, `--force`. pcp has one deletion mode.
+- `--delete-before`/`--delete-during` and `--force`. pcp deletes only after
+  the transfer (`--delete-after`/`--delete-delay` are accepted as synonyms).
 - Hardlinks (`-H`), ACLs and xattrs (`-A`/`-X`).
 - rsync daemon mode / `rsync://`. pcp speaks its own protocol; it cannot talk
   to an rsync server.
@@ -459,8 +461,8 @@ have is removed. The rules are simpler than rsync's, deliberately:
 - **Ignored means out of scope, on both sides.** The `-i` patterns are applied
   to the destination walk from the same roots, so an ignored path is neither
   copied nor deleted, and a directory that holds one is kept (`not deleting
-  keep/: it holds ignored paths`, on stderr, not an error). There is no
-  `--delete-excluded`.
+  keep/: it holds ignored paths`, on stderr, not an error). `--delete-excluded`
+  drops that protection: ignored paths on the destination are extras too.
 - **Anything the source has is safe.** A file skipped by `-u`, `--existing`,
   `--ignore-existing`, `--max-size` or `--min-size` — or a symlink or special
   file skipped for lack of `-l`/`-D` — still exists in the source, so its
@@ -475,6 +477,8 @@ have is removed. The rules are simpler than rsync's, deliberately:
   whose file is already up to date, or whose source is gone — is removed.
   The partial of a file that *failed* this run is kept: it is the resume state
   for the retry.
+- `--max-delete N` refuses to delete anything — not the first N — when more
+  than N deletions are planned, says so, and exits 25 (rsync's code for it).
 - `-n --delete -v` lists every `deleting path` line a real run would print
   (a stale partial that the real run resumes from and renames away is the one
   thing `-n` lists that it won't delete separately). The summary reports
@@ -586,4 +590,5 @@ fix for that.
 |---|---|
 | 0 | Everything copied and verified |
 | 23 | Finished, but some files failed (unreadable source, `DIFFERS`, changed during transfer …) — errors are on stderr |
+| 25 | Finished, but `--max-delete` stopped the deletions |
 | 1 | Fatal: bad arguments, couldn't connect, remote `pcp` missing, connection lost |
