@@ -119,6 +119,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 root,
                 follow_root,
                 all,
+                ignore,
             } => {
                 let root = fsops::resolve(&root);
                 // Warnings are collected and sent between batches so a single
@@ -129,6 +130,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     &root,
                     follow_root,
                     all,
+                    &ignore,
                     &mut |batch| {
                         let mut w = wref.borrow_mut();
                         for m in warns.borrow_mut().drain(..) {

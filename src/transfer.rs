@@ -33,6 +33,8 @@ pub struct Opts {
     pub dry_run: bool,
     pub verbose: u8,
     pub umask: u32,
+    /// gitignore-style patterns applied to every source (see scan.rs).
+    pub ignore: Vec<String>,
 }
 
 pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
@@ -208,6 +210,7 @@ pub fn run(args: Args) -> Result<i32> {
         dry_run: args.dry_run,
         verbose: args.verbose,
         umask: read_umask(),
+        ignore: args.ignore_lines.clone(),
     });
 
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
@@ -577,6 +580,7 @@ impl Planner<'_> {
             src_root,
             follow,
             false,
+            &self.opts.ignore,
             &mut |batch: Vec<Entry>| {
                 if first {
                     first = false;
