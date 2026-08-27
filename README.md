@@ -31,7 +31,9 @@ ARM64 and macOS Apple Silicon and Intel are published.
 The managed cache accepts only the downloaded, verified release binary. If the
 remote cannot download it, bootstrapping fails visibly; install a compatible
 binary yourself and pass `--pcp-path /path/to/pcp`, or put it on the
-non-interactive remote `PATH` and use `--no-bootstrap`.
+non-interactive remote `PATH` and use `--no-bootstrap`. Helpers cached by an
+older upload-capable version are never executed and are removed when their
+download-only replacement is installed.
 
 The remote download uses `curl` or `wget`, `gzip`, and one of `sha256sum`,
 `shasum`, or `openssl`. Version directories coexist and the helper cache can be
