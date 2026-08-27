@@ -256,7 +256,11 @@ PCP_DST=/usr/local/bin/pcp
 install_pcp() {
   [ -f "$PCP_SRC" ] || die "$PCP_SRC not found (stage the binary on NFS first)"
   local want; want=$(cat /mnt/nfs/grant/pcp.version 2>/dev/null || echo "?")
-  local have=""; [ -x "$PCP_DST" ] && have=$("$PCP_DST" --version 2>/dev/null | awk '{print $2}')
+  # Tolerate a missing OR broken existing binary (pipefail would abort otherwise).
+  local have=""
+  if [ -x "$PCP_DST" ]; then
+    have=$("$PCP_DST" --version 2>/dev/null | awk '{print $2}') || have=""
+  fi
   if [ "$have" = "$want" ] && [ -n "$have" ]; then
     say "pcp: /usr/local/bin/pcp already at $have"
   else

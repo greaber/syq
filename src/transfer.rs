@@ -173,48 +173,6 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
-    // Reject copying a directory into itself: if the destination resolves to a
-    // path inside a source, the scanner would discover the freshly-created
-    // destination and recurse. Covered for same-machine transfers.
-    let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
-        || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
-    if same_machine {
-        let local = !dst.is_remote();
-        for s in srcs {
-            let sn = norm_path(&s.path, local);
-            // Only a *directory* source can cause the recurse-into-destination
-            // trap; a file onto itself is the no-op the dev+ino identity check
-            // handles. Locally we can confirm; remotely we assume a directory
-            // (conservative) and rely on component-wise containment.
-            let src_is_dir = if local { sn.is_dir() } else { true };
-            if !src_is_dir {
-                continue;
-            }
-            // Effective destination(s): the destination itself (trailing-slash
-            // "copy contents", or single-source rename) and, for a bare source,
-            // destination/basename (copy into an existing directory).
-            let mut effs = vec![norm_path(&dst.path, local)];
-            if !s.copies_contents() {
-                let base = s.basename();
-                if !base.is_empty() {
-                    let joined = format!("{}/{}", dst.path.trim_end_matches('/'), base);
-                    effs.push(norm_path(&joined, local));
-                }
-            }
-            for eff in effs {
-                if eff == sn {
-                    if local {
-                        bail!("source and destination are the same directory {:?}", s.path);
-                    }
-                } else if eff.starts_with(&sn) {
-                    bail!(
-                        "destination {:?} maps inside source {:?} — that would copy the directory into itself",
-                        dst.path, s.path
-                    );
-                }
-            }
-        }
-    }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
     if args.connections_default && !src_ep.is_remote() && !dst_ep.is_remote() {
@@ -370,6 +328,46 @@ pub fn run(args: Args) -> Result<i32> {
         Some(_) => false,
         None => srcs.len() > 1 || dst.copies_contents(),
     };
+
+    // Reject copying a directory into itself: if the effective destination
+    // resolves to (or inside) a source directory, the scanner would discover
+    // the freshly-created destination and recurse. Now that both control
+    // connections exist we can check the real source type and destination-dir
+    // status, so a file copied onto itself is not misdiagnosed.
+    let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
+        || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
+    if same_machine {
+        let local = !dst.is_remote();
+        for s in srcs {
+            // Only a directory source can trigger the recurse-into-itself trap.
+            let src_is_dir = matches!(stat_one(&mut *src_ctl, s.path.as_bytes())?, Some(ref e) if e.kind == Kind::Dir);
+            if !src_is_dir {
+                continue;
+            }
+            let sn = norm_path(&s.path, local);
+            // Effective destination(s): the destination itself, plus
+            // destination/basename only when the destination is really an
+            // existing directory (so a bare source lands inside it).
+            let mut effs = vec![norm_path(&dst.path, local)];
+            if dst_is_dir && !s.copies_contents() {
+                let base = s.basename();
+                if !base.is_empty() {
+                    let joined = format!("{}/{}", dst.path.trim_end_matches('/'), base);
+                    effs.push(norm_path(&joined, local));
+                }
+            }
+            for eff in effs {
+                if eff == sn {
+                    bail!("source and destination are the same directory {:?}", s.path);
+                } else if eff.starts_with(&sn) {
+                    bail!(
+                        "destination {:?} maps inside source {:?} — that would copy the directory into itself",
+                        dst.path, s.path
+                    );
+                }
+            }
+        }
+    }
 
     if dst_root_entry.is_none() && dst_is_dir && !args.dry_run {
         match ok(
