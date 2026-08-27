@@ -3,21 +3,51 @@
 use crate::fsops::{is_partial_name, lstat_entry, path_bytes};
 use crate::proto::Entry;
 use anyhow::{Context, Result};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use jwalk::WalkDirGeneric;
 use std::fs;
 use std::path::Path;
 
 pub const BATCH: usize = 1000;
 
+/// Per-entry result of the parallel read_dir hook.
+#[derive(Clone, Default, Debug)]
+enum State {
+    /// lstat failed (warned about, unless it's a skipped partial).
+    #[default]
+    Failed,
+    /// Partial file or ignored path: silently dropped, subtree pruned.
+    Skipped,
+    Keep(Entry),
+}
+
+/// Build a gitignore-style matcher from `lines` (the lines of a virtual .gitignore
+/// anchored at the scan root). Returns None when there is nothing to match.
+pub fn build_ignore(lines: &[String]) -> Result<Option<Gitignore>> {
+    if lines.iter().all(|l| l.trim().is_empty()) {
+        return Ok(None);
+    }
+    let mut b = GitignoreBuilder::new("");
+    for l in lines {
+        b.add_line(None, l)
+            .map_err(|e| anyhow::anyhow!("bad ignore pattern {l:?}: {e}"))?;
+    }
+    Ok(Some(b.build()?))
+}
+
 /// Walk `root`, calling `sink` with batches of entries (root first, as path "").
 /// `warn` receives non-fatal errors (unreadable directories etc.).
+/// `ignore` holds gitignore-style patterns relative to `root`; a matching directory
+/// is pruned with its whole subtree. The root itself is never ignored.
 pub fn scan(
     root: &Path,
     follow_root: bool,
     all: bool,
+    ignore: &[String],
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     warn: &mut dyn FnMut(String),
 ) -> Result<()> {
+    let ignore = build_ignore(ignore)?;
     let md = if follow_root {
         fs::metadata(root)
     } else {
@@ -35,18 +65,33 @@ pub fn scan(
     let mut batch = Vec::with_capacity(BATCH);
     batch.push(root_entry);
 
-    let walk = WalkDirGeneric::<((), Option<Entry>)>::new(root)
+    let root_buf = root.to_path_buf();
+    let walk = WalkDirGeneric::<((), State)>::new(root)
         .follow_links(false)
         .skip_hidden(false)
         .process_read_dir(move |_depth, _path, _state, children| {
             for child in children.iter_mut().flatten() {
                 if !all && is_partial_name(&child.file_name) {
                     child.read_children_path = None;
-                    child.client_state = None;
+                    child.client_state = State::Skipped;
                     continue;
                 }
                 let full = child.path();
-                child.client_state = lstat_entry(Vec::new(), &full).ok();
+                let Ok(entry) = lstat_entry(Vec::new(), &full) else {
+                    child.client_state = State::Failed;
+                    continue;
+                };
+                if let Some(ig) = &ignore {
+                    let rel = full.strip_prefix(&root_buf).unwrap_or(&full);
+                    let is_dir = entry.kind == crate::proto::Kind::Dir;
+                    if ig.matched(rel, is_dir).is_ignore() {
+                        // Pruned: neither listed nor descended into.
+                        child.read_children_path = None;
+                        child.client_state = State::Skipped;
+                        continue;
+                    }
+                }
+                child.client_state = State::Keep(entry);
             }
         });
     for item in walk {
@@ -63,11 +108,13 @@ pub fn scan(
         if let Some(e) = de.read_children_error.take() {
             warn(format!("scan: {}: {e}", de.path().display()));
         }
-        let Some(mut entry) = de.client_state.take() else {
-            if all || !is_partial_name(&de.file_name) {
+        let mut entry = match std::mem::take(&mut de.client_state) {
+            State::Keep(e) => e,
+            State::Skipped => continue,
+            State::Failed => {
                 warn(format!("scan: cannot stat {}", de.path().display()));
+                continue;
             }
-            continue;
         };
         let full = de.path();
         let rel = full.strip_prefix(root).unwrap_or(&full);

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 const COMPRESS_MIN: usize = 512;
 
@@ -126,10 +126,12 @@ pub enum Request {
         port_hi: u16,
     },
     /// `all`: include pcp's own partial files (used by --rm).
+    /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
     Scan {
         root: PathBytes,
         follow_root: bool,
         all: bool,
+        ignore: Vec<String>,
     },
     StatMany(Vec<PathBytes>),
     Apply(Vec<Op>),

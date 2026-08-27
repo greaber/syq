@@ -210,6 +210,7 @@ pub fn run(args: Args) -> Result<i32> {
             &root,
             false,
             true,
+            &[],
             &mut |entries: Vec<Entry>| {
                 for e in entries {
                     let full = join(&root, &e.path);

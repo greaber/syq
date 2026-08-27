@@ -926,3 +926,167 @@ fn file_onto_itself_is_allowed_noop() {
     run_ok(&["-a", "--inplace", &t.s("f"), &t.s("f")]);
     assert_eq!(read(&t.path("f")), b"hello");
 }
+
+/// Tree for the --ignore tests.
+fn make_ignore_tree(root: &Path) {
+    for f in [
+        "hello.txt",
+        "x.o",
+        "a/y.o",
+        "a/b/z.jpg",
+        "a/pic.jpg",
+        "node_modules/x/m.js",
+        "a/node_modules/n.js",
+        "build/out",
+        "a/build/out2",
+        "logs/l1",
+        "logs/keep/k",
+    ] {
+        write(&root.join(f), f.as_bytes());
+    }
+    fs::create_dir_all(root.join("empty")).unwrap();
+}
+
+fn listing(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, p: &Path, out: &mut Vec<String>) {
+        let mut names: Vec<_> = fs::read_dir(p)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        names.sort();
+        for n in names {
+            out.push(n.strip_prefix(root).unwrap().to_string_lossy().into_owned());
+            if n.symlink_metadata().unwrap().is_dir() {
+                walk(root, &n, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+#[test]
+fn ignore_patterns_prune_dirs_and_files() {
+    let t = Tmp::new();
+    make_ignore_tree(&t.path("src"));
+    // `node_modules` at any depth, `*.o` anywhere, `/build` only at the root.
+    run_ok(&[
+        "-a",
+        "-i",
+        "node_modules",
+        "-i",
+        "*.o",
+        "-i",
+        "/build",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(
+        listing(&t.path("dst")),
+        [
+            "a",
+            "a/b",
+            "a/b/z.jpg",
+            "a/build",
+            "a/build/out2",
+            "a/pic.jpg",
+            "empty",
+            "hello.txt",
+            "logs",
+            "logs/keep",
+            "logs/keep/k",
+            "logs/l1",
+        ]
+    );
+}
+
+#[test]
+fn ignore_only_idiom_and_empty_dirs() {
+    let t = Tmp::new();
+    make_ignore_tree(&t.path("src"));
+    // The gitignore "only *.jpg" idiom: directories are still all created.
+    run_ok(&[
+        "-a",
+        "-i",
+        "*",
+        "-i",
+        "!*/",
+        "-i",
+        "!*.jpg",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    let l = listing(&t.path("dst"));
+    assert!(l.contains(&"a/b/z.jpg".to_string()));
+    assert!(l.contains(&"a/pic.jpg".to_string()));
+    assert!(l.contains(&"empty".to_string()));
+    assert!(l.contains(&"node_modules/x".to_string()));
+    assert!(!l
+        .iter()
+        .any(|p| p.ends_with(".o") || p.ends_with(".txt") || p.ends_with(".js")));
+    // Without any pattern, empty dirs are copied too.
+    run_ok(&["-a", &t.s("src/"), &t.s("dst2")]);
+    assert!(t.path("dst2/empty").is_dir());
+}
+
+#[test]
+fn ignore_from_file_and_later_negation_wins() {
+    let t = Tmp::new();
+    make_ignore_tree(&t.path("src"));
+    write(&t.path("pats"), b"# comment\nnode_modules\n\n*.o\r\n");
+    run_ok(&[
+        "-a",
+        "--ignore-from",
+        &t.s("pats"),
+        "-i",
+        "!x.o",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    let l = listing(&t.path("dst"));
+    assert!(
+        l.contains(&"x.o".to_string()),
+        "later -i '!x.o' must override file"
+    );
+    assert!(!l.contains(&"a/y.o".to_string()));
+    assert!(!l.iter().any(|p| p.contains("node_modules")));
+    // And the other order: the file's `*.o` comes last, so x.o stays ignored.
+    run_ok(&[
+        "-a",
+        "-i",
+        "!x.o",
+        "--ignore-from",
+        &t.s("pats"),
+        &t.s("src/"),
+        &t.s("dst2"),
+    ]);
+    assert!(!t.path("dst2/x.o").exists());
+    // Missing file is an error.
+    let out = pcp(&[
+        "-a",
+        "--ignore-from",
+        &t.s("nope"),
+        &t.s("src/"),
+        &t.s("dst3"),
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--ignore-from"));
+}
+
+#[test]
+fn ignore_applies_per_source_root_and_dry_run() {
+    let t = Tmp::new();
+    make_ignore_tree(&t.path("s1"));
+    make_ignore_tree(&t.path("s2"));
+    fs::create_dir(t.path("dst")).unwrap();
+    // `/build` is anchored at each source's root, not the destination.
+    run_ok(&["-a", "-i", "/build", &t.s("s1"), &t.s("s2"), &t.s("dst")]);
+    assert!(!t.path("dst/s1/build").exists());
+    assert!(!t.path("dst/s2/build").exists());
+    assert!(t.path("dst/s1/a/build/out2").is_file());
+    // Dry run with the root itself matching a pattern: the root is never ignored.
+    let out = run_ok(&["-an", "-i", "s1", "-i", "*.o", &t.s("s1"), &t.s("dst2")]);
+    assert!(!t.path("dst2").exists());
+    assert!(out.contains("would transfer 9 files"), "{out}");
+}

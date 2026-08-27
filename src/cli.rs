@@ -145,6 +145,20 @@ pub struct Args {
     #[arg(long, hide = true)]
     pub width: Option<usize>,
 
+    /// Skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
+    /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together
+    /// with --ignore-from the patterns act like the lines of one .gitignore file, in
+    /// command-line order, anchored at each source root. Skipping a directory skips its
+    /// whole subtree, so to copy only *.jpg use: -i '*' -i '!*/' -i '!*.jpg'
+    #[arg(short = 'i', long = "ignore", value_name = "PATTERN")]
+    pub ignore: Vec<String>,
+    /// Read ignore patterns from FILE (one per line, # comments); repeatable
+    #[arg(long, value_name = "FILE")]
+    pub ignore_from: Vec<String>,
+    /// All ignore patterns, in command-line order (filled by parse_args)
+    #[arg(skip)]
+    pub ignore_lines: Vec<String>,
+
     /// Remove the given paths recursively and in parallel (like rm -rf); honours -j, -n, -v, -q, -e
     #[arg(long)]
     pub rm: bool,
@@ -155,6 +169,38 @@ pub struct Args {
 }
 
 impl Args {
+    /// Parse the command line and read --ignore-from files, keeping --ignore and
+    /// --ignore-from patterns in the order they were given (later lines win, as in
+    /// a .gitignore file).
+    pub fn parse_args() -> Result<Args> {
+        use clap::{CommandFactory, FromArgMatches};
+        let m = Args::command().get_matches();
+        let mut args = Args::from_arg_matches(&m)?;
+        let mut items: Vec<(usize, bool, String)> = Vec::new();
+        if let Some(idx) = m.indices_of("ignore") {
+            for (i, v) in idx.zip(&args.ignore) {
+                items.push((i, false, v.clone()));
+            }
+        }
+        if let Some(idx) = m.indices_of("ignore_from") {
+            for (i, v) in idx.zip(&args.ignore_from) {
+                items.push((i, true, v.clone()));
+            }
+        }
+        items.sort_by_key(|(i, _, _)| *i);
+        for (_, from_file, v) in items {
+            if from_file {
+                let text = std::fs::read_to_string(&v)
+                    .map_err(|e| anyhow::anyhow!("--ignore-from {v}: {e}"))?;
+                args.ignore_lines
+                    .extend(text.lines().map(|l| l.trim_end_matches('\r').to_string()));
+            } else {
+                args.ignore_lines.push(v);
+            }
+        }
+        Ok(args)
+    }
+
     pub fn normalize(&mut self) {
         if self.archive {
             self.recursive = true;

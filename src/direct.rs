@@ -88,6 +88,11 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.progress_json {
         remote.push("--progress-json".into());
     }
+    // --ignore-from files were read locally; forward the merged lines.
+    for l in &args.ignore_lines {
+        remote.push("--ignore".into());
+        remote.push(l.clone());
+    }
     if args.no_progress || args.quiet {
         remote.push("--no-progress".into());
     } else if std::io::stderr().is_terminal() {

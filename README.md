@@ -85,6 +85,8 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `--tcp` | Data over TCP sockets (AES-256-GCM) after ssh auth; falls back to ssh if unreachable |
 | `--tcp-plain` | Like `--tcp` without encryption (trusted networks only) |
 | `--tcp-ports LO-HI` | Port range the remote listens on for `--tcp` (default 47600-47699) |
+| `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
+| `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
 | `-h` | Accepted for compatibility; sizes are always human-readable. Use `--help` for help |
@@ -213,8 +215,8 @@ ordering question for them.
 
 ## Not implemented (on purpose, for now)
 
-- rsync filter rules (`--exclude`/`--include`/`--filter`). A gitignore-style
-  `--exclude` may come later.
+- rsync filter rules (`--exclude`/`--include`/`--filter`); use `-i` (gitignore
+  syntax) instead.
 - `--delete`, `--link-dest`, `-u`/`--update`, `--files-from`, `--bwlimit`.
 - Hardlinks (`-H`), ACLs and xattrs (`-A`/`-X`).
 - rsync daemon mode / `rsync://`. pcp speaks its own protocol; it cannot talk
@@ -276,6 +278,31 @@ chmod, no rename); existing files are replaced through a partial file and an
 atomic rename unless `--inplace`. `--atomic` forces the partial+rename path
 for every file (rsync semantics) when readers might open files mid-transfer. When both ends are local, 32 workers are
 used. On NFS these choices are the difference between ~300 and ~850 files/s.
+
+## Ignoring paths (`-i`, `--ignore-from`)
+
+pcp has one filter mechanism instead of rsync's include/exclude/filter rules:
+every `-i PATTERN` is a line of a virtual `.gitignore` anchored at each source
+root, and `--ignore-from FILE` splices in the lines of a file. Patterns from
+both are applied in command-line order with gitignore semantics (last match
+wins, `!` re-includes), so anything you'd write in a `.gitignore` works here:
+
+```sh
+pcp -a -i node_modules -i .git src/ host:dst/   # a name matches at any depth
+pcp -a -i '*.o' -i /build src/ host:dst/         # glob; leading / anchors to the root
+pcp -a -i 'logs/**' -i '!logs/keep/**' src/ dst/ # re-include a subtree
+pcp -a --ignore-from .gitignore -i '!dist/' repo/ host:repo/
+pcp -a -i '*' -i '!*/' -i '!*.jpg' photos/ bak/  # copy only *.jpg
+```
+
+Rules of thumb (they're git's): `foo` matches a file or directory named `foo`
+at any depth; `/foo` only at the source root; `foo/` only a directory; `*`
+doesn't cross `/`, `**` does. An ignored directory is pruned, so nothing inside
+it is transferred or even scanned — which is why "only `*.jpg`" needs the
+`!*/` line to keep descending. Empty directories are copied like any other
+(this is a filter on the walk, not git's notion of what's tracked). The source
+root itself is never ignored; with several sources each is filtered from its
+own root. `-n` previews exactly what a real run would send.
 
 ## Parallel removal (`--rm`)
 

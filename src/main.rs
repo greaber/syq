@@ -11,8 +11,6 @@ mod sched;
 mod server;
 mod transfer;
 
-use clap::Parser;
-
 /// Keep multi-megabyte block buffers in the heap instead of mmap/munmap-ing
 /// each one: page faults and TLB shootdowns across many threads otherwise
 /// dominate at high throughput.
@@ -55,7 +53,13 @@ fn main() {
         }
         return;
     }
-    let mut args = cli::Args::parse();
+    let mut args = match cli::Args::parse_args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("pcp: {e:#}");
+            std::process::exit(2);
+        }
+    };
     args.normalize();
     let result = if args.follow {
         direct::follow(&args)
