@@ -1504,3 +1504,22 @@ fn flag_like_ignore_pattern_is_not_rejected() {
     run_ok(&["-a", "-i", "--exclude", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/keep")), b"k");
 }
+
+#[test]
+fn stats_report_connection_tuning_mode() {
+    let t = Tmp::new();
+    std::fs::create_dir_all(t.path("src")).unwrap();
+    for i in 0..20 {
+        std::fs::write(t.path(&format!("src/f{i}")), vec![b'x'; 1000]).unwrap();
+    }
+    // Without -j the count is auto-tuned; a short local copy never leaves the
+    // local starting count of 32.
+    let out = run_ok(&["-a", "--stats", &t.s("src/"), &t.s("auto/")]);
+    assert!(
+        out.contains("connections: auto: settled at 32 (path 32, peak 32)"),
+        "{out}"
+    );
+    // An explicit -j is used as given, with no tuning.
+    let out = run_ok(&["-a", "--stats", "-j", "3", &t.s("src/"), &t.s("fixed/")]);
+    assert!(out.contains("connections: 3\n"), "{out}");
+}
