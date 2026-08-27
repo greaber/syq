@@ -300,25 +300,30 @@ ordering question for them.
 
 Without `-j`, pcp tunes the number of workers while the transfer runs
 instead of guessing. It starts with 8 over the network (32 when both ends are
-local: threads are free, connections are not), and every 5 seconds compares
-progress (bytes, plus a small credit per completed file so small-file trees
-count) with the previous window: while a doubling improves it by more than
-15 % it doubles again, up to 64; when a doubling buys nothing it goes back to
-the smaller count that did the same work, then keeps halving as long as that
-costs nothing (down to 2). It never stops watching: every 30 s it
-probes one step down (kept if throughput doesn't drop — this is what saves a
-spinning disk from seek thrash) or one step up (the route or a shared NAS may
-have freed up). Surplus workers are parked, not closed: they keep their
-connections and stop taking work, handing back the rest of their range, so
-un-parking is instant. Transfers shorter than a window or two just run with
-the starting count. The progress line shows the current count (`16 conn`), and `--stats`
-reports the path it took (`connections: auto: settled at 16 (path 8 -> 16 ->
-32 -> 16, peak 32)`).
+local: threads are free, connections are not) and measures: progress (bytes,
+plus a small credit per completed file so small-file trees count) is sampled
+every 2.5 s, and a count has been *measured* only once two consecutive
+samples agree within 10 % — so a burst that gets throttled, or a link still
+ramping up, is waited out (up to 20 s) rather than credited to the last
+change. Each measured count is compared with the previous one: it grows by
+1.3× while a step gains at least a third of what linear scaling would (up to
+64); when a step buys nothing it goes back and shrinks by 1.3× as long as
+that costs less than 5 % (down to 2); then it holds. It never stops
+watching: after every 6 measurements it probes one step down (kept if
+throughput doesn't drop — this is what saves a spinning disk from seek
+thrash) or one step up (the route or a shared NAS may have freed up), and a
+direction that keeps failing is tried progressively less often. Surplus
+workers are parked, not closed: they keep their connections and stop taking
+work, handing back the rest of their range, so un-parking is instant.
+Transfers shorter than a measurement or two just run with the starting
+count. The progress line shows the current count (`13 conn`), and `--stats`
+reports the path it took (`connections: auto: settled at 13 (path 8 -> 10 ->
+13 -> 17 -> 13, peak 17)`).
 
 Measured from a 1 Gbit box in Germany to a host in Japan (265 ms): over TCP
-data connections it settles at 8–16 at line rate; over ssh data connections
-(where each stream is capped by OpenSSH's 2 MB window) it climbs to 32 and
-gets 112 MB/s where a fixed `-j 8` managed 44.
+data connections it settles around 8–13 at line rate; over ssh data
+connections (where each stream is capped by OpenSSH's 2 MB window) it keeps
+climbing and gets ~110 MB/s where a fixed `-j 8` managed 44.
 
 `-j N` fixes the count and disables tuning. Use it when you know better (a
 spinning disk that must not be read in parallel: `-j 1`), or to be polite on
