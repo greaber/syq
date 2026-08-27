@@ -10,6 +10,7 @@ use crate::proto::VERSION;
 pub const RELEASE_BASE_URL: &str = "https://github.com/greaber/pcp/releases/download";
 pub const HELPER_MISSING_EXIT: i32 = 125;
 pub const HELPER_NOT_EXECUTABLE_EXIT: i32 = 126;
+const DOWNLOAD_CACHE_GENERATION: &str = "download-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -42,6 +43,15 @@ impl Target {
 }
 
 pub fn release_key() -> String {
+    format!(
+        "v{}-p{VERSION}-{DOWNLOAD_CACHE_GENERATION}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Cache key used before managed helpers became download-only. Helpers at this
+/// path may have been uploaded from a developer machine and must not be run.
+fn legacy_release_key() -> String {
     format!("v{}-p{VERSION}", env!("CARGO_PKG_VERSION"))
 }
 
@@ -75,12 +85,16 @@ exec "$program" "$@""#,
 
 pub fn download_script(target: Target) -> String {
     let release = release_key();
+    let legacy_release = legacy_release_key();
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let url = format!("{RELEASE_BASE_URL}/{tag}/{}.gz", target.asset);
     let expected_version = format!("pcp {}", env!("CARGO_PKG_VERSION"));
     let expected_helper_id = release_key();
     format!(
         r#"set -eu
+legacy_dir="$HOME/.cache/pcp/helpers/{legacy_release}/{target_key}"
+rm -f "$legacy_dir/pcp"
+rmdir "$legacy_dir" "$HOME/.cache/pcp/helpers/{legacy_release}" 2>/dev/null || :
 dir="$HOME/.cache/pcp/helpers/{release}/{target_key}"
 program="$dir/pcp"
 tmp="$dir/.pcp.$$.tmp"
@@ -138,6 +152,7 @@ mv "$tmp" "$program"
 cleanup
 trap - EXIT HUP INT TERM"#,
         target_key = target.key,
+        legacy_release = legacy_release,
         url = shell_words::quote(&url),
         sum_url = shell_words::quote(&format!("{url}.sha256")),
         expected_version = shell_words::quote(&expected_version),
@@ -170,6 +185,7 @@ mod tests {
     fn launcher_uses_versioned_path_and_quotes_arguments() {
         let command = launcher(&["--server".into(), "argument with spaces".into()]);
         assert!(command.contains(&release_key()));
+        assert!(command.contains(DOWNLOAD_CACHE_GENERATION));
         assert!(command.contains("linux-x86_64"));
         assert!(command.contains("'argument with spaces'"));
     }
@@ -184,5 +200,7 @@ mod tests {
         )));
         assert!(script.contains("sha256sum"));
         assert!(script.contains("checksum mismatch"));
+        assert!(script.contains(&legacy_release_key()));
+        assert!(script.contains("rm -f \"$legacy_dir/pcp\""));
     }
 }

@@ -132,6 +132,7 @@ fn remote_pcp(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
         .env("FAKE_RELEASE_ARCHIVE", t.path("release.gz"))
         .env("FAKE_CURL_LOG", t.path("curl.log"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_LEGACY_LOG", t.path("legacy.log"))
         .env("PCP_STATE_DIR", t.path("state"));
     cmd.output().expect("run pcp through fake remote shell")
 }
@@ -164,10 +165,35 @@ fn cached_remote_helper(t: &Tmp) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+fn legacy_cached_remote_helper(t: &Tmp) -> PathBuf {
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .arg("--remote-helper-id")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let current = String::from_utf8(out.stdout).unwrap();
+    let legacy = current
+        .trim()
+        .strip_suffix("-download-v1")
+        .expect("download-only cache generation suffix");
+    t.path(&format!(
+        "remote-home/.cache/pcp/helpers/{legacy}/linux-x86_64/pcp"
+    ))
+}
+
+#[cfg(target_os = "linux")]
 #[test]
-fn remote_helper_download_is_verified_and_cached() {
+fn legacy_remote_helper_is_replaced_by_verified_download_and_cached() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
+    let legacy_helper = legacy_cached_remote_helper(&t);
+    executable(
+        &legacy_helper,
+        br#"#!/bin/sh
+printf 'legacy helper ran\n' >> "$FAKE_LEGACY_LOG"
+exit 99
+"#,
+    );
     let archive = File::create(t.path("release.gz")).unwrap();
     let status = Command::new("gzip")
         .args(["-9", "-n", "-c", env!("CARGO_BIN_EXE_pcp")])
@@ -216,6 +242,8 @@ esac
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
     assert!(cached_remote_helper(&t).is_file());
+    assert!(!legacy_helper.exists());
+    assert!(!t.path("legacy.log").exists(), "legacy helper was executed");
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
     let probes = fs::read_to_string(t.path("rsh.log"))
