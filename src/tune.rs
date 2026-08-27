@@ -42,6 +42,10 @@ pub const MAX: usize = 64;
 pub const MIN: usize = 2;
 /// Multiplicative step between worker counts, up or down.
 pub const STEP: f64 = 1.3;
+/// The initial ramp-up uses this coarser step, so a path that wants many
+/// connections gets them in a few steps; once a coarse step stops paying,
+/// the ramp goes back to the last good count and refines with STEP.
+pub const COARSE_STEP: f64 = 2.0;
 /// A step up is kept if it gains at least this fraction of what linear
 /// scaling would have given (STEP - 1). Lenient on purpose: a false "no
 /// gain" strands a window-capped ssh path at half speed, while a false
@@ -68,9 +72,12 @@ const TAIL_BYTES_PER_WORKER: u64 = 64 << 20;
 /// (where bytes are negligible) still produce a usable signal.
 pub const FILE_CREDIT: u64 = 512 * 1024;
 
-/// Next count up / down by STEP, always moving by at least one.
+/// Next count up / down by `factor`, always moving by at least one.
+pub fn step_up_by(n: usize, factor: f64) -> usize {
+    ((n as f64 * factor).round() as usize).max(n + 1)
+}
 pub fn step_up(n: usize) -> usize {
-    ((n as f64 * STEP).round() as usize).max(n + 1)
+    step_up_by(n, STEP)
 }
 pub fn step_down(n: usize) -> usize {
     ((n as f64 / STEP).round() as usize).min(n.saturating_sub(1))
@@ -118,9 +125,9 @@ impl Sampler {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
-    /// Stepping up while each step pays (`up`), or down while each step
-    /// costs nothing (`!up`).
-    Ramp { up: bool },
+    /// Stepping up while each step pays (`up`; by COARSE_STEP first, then
+    /// STEP), or down while each step costs nothing (`!up`).
+    Ramp { up: bool, coarse: bool },
     /// Steady; counting measurements until the next probe.
     Hold { measured: usize, next_up: bool },
     /// Trying a different count; `from` is where to go back to.
@@ -154,7 +161,10 @@ impl Policy {
             min,
             max,
             peak: n,
-            state: State::Ramp { up: true },
+            state: State::Ramp {
+                up: true,
+                coarse: true,
+            },
             prev: n,
             base: None,
             fails: [0, 0],
@@ -191,9 +201,9 @@ impl Policy {
         };
     }
 
-    /// The gain a step up must show to be kept.
-    fn gain_needed() -> f64 {
-        1.0 + (STEP - 1.0) * GAIN_FRACTION
+    /// The gain a step up by `factor` must show to be kept.
+    fn gain_needed(factor: f64) -> f64 {
+        1.0 + (factor - 1.0) * GAIN_FRACTION
     }
 
     /// One stable measurement of the current count. Returns the worker count
@@ -201,9 +211,12 @@ impl Policy {
     pub fn observe(&mut self, score: f64) -> usize {
         let Some(base) = self.base else {
             self.base = Some(score);
-            if self.state == (State::Ramp { up: true }) && score > 0.0 {
-                // First real measurement: try a step up right away.
-                self.set(step_up(self.n));
+            if let State::Ramp { up: true, coarse } = self.state {
+                if score > 0.0 {
+                    // First real measurement: try a step up right away.
+                    let f = if coarse { COARSE_STEP } else { STEP };
+                    self.set(step_up_by(self.n, f));
+                }
             }
             return self.n;
         };
@@ -216,28 +229,40 @@ impl Policy {
             f64::INFINITY
         };
         match self.state {
-            State::Ramp { up: true } => {
-                if ratio > Self::gain_needed() && self.n < self.max {
+            State::Ramp { up: true, coarse } => {
+                let factor = if coarse { COARSE_STEP } else { STEP };
+                let p = self.prev.min(self.n);
+                if ratio > Self::gain_needed(factor) && self.n < self.max {
                     self.base = Some(score);
-                    self.set(step_up(self.n));
-                } else {
-                    // The step from `prev` bought nothing (or hurt): `prev`
-                    // did the same work for less. Maybe fewer still does —
-                    // ramp down, judging each step against prev's score
+                    self.set(step_up_by(self.n, factor));
+                } else if coarse && step_up(p) < self.n {
+                    // The doubling from `p` didn't pay as a whole, but the
+                    // best count may lie between p and 2p: go back to p and
+                    // refine upward in finer steps, judged against p's score.
+                    self.set(step_up(p));
+                    self.prev = p;
+                    self.state = State::Ramp {
+                        up: true,
+                        coarse: false,
+                    };
+                } else if p > self.min && step_down(p) >= self.min {
+                    // Even a fine step from `p` bought nothing (or hurt):
+                    // `p` did the same work for less. Maybe fewer still
+                    // does — ramp down, judging each step against p's score
                     // (`base`), going there directly.
-                    let p = self.prev.min(self.n);
-                    if p > self.min && step_down(p) >= self.min {
-                        self.set(step_down(p));
-                        self.prev = p;
-                        self.state = State::Ramp { up: false };
-                    } else {
-                        self.set(p);
-                        self.base = Some(score);
-                        self.hold(false);
-                    }
+                    self.set(step_down(p));
+                    self.prev = p;
+                    self.state = State::Ramp {
+                        up: false,
+                        coarse: false,
+                    };
+                } else {
+                    self.set(p);
+                    self.base = Some(score);
+                    self.hold(false);
                 }
             }
-            State::Ramp { up: false } => {
+            State::Ramp { up: false, .. } => {
                 if ratio >= 1.0 - DOWN_TOLERANCE {
                     // Fewer kept up: keep it, try fewer again.
                     self.base = Some(score);
@@ -277,7 +302,7 @@ impl Policy {
             }
             State::Probe { from, up } => {
                 let keep = if up {
-                    ratio > Self::gain_needed()
+                    ratio > Self::gain_needed(STEP)
                 } else {
                     ratio >= 1.0 - DOWN_TOLERANCE
                 };
@@ -456,18 +481,41 @@ mod tests {
     #[test]
     fn ramps_to_the_plateau_and_holds() {
         let p = simulate(START, 32, 40, |_| 1.0);
-        // Climbs to within one step of the knee (either side) and stays there.
+        // Doubles up to the knee, overshoots once, refines, and stays.
+        assert_eq!(
+            &p.history[..5],
+            &[8, 16, 32, 64, 42],
+            "history {:?}",
+            p.history
+        );
         assert!((25..=42).contains(&p.settled()), "history {:?}", p.history);
-        assert!(p.peak <= step_up(step_up(32)), "history {:?}", p.history);
+    }
+
+    #[test]
+    fn coarse_ramp_refines_between_doublings() {
+        // Scales linearly up to 24 workers: 16 -> 32 as a whole gains only
+        // 50% of the 100% linear would give... which is above a third, so
+        // model a sharper case: flat past 20. 16 -> 32 gains 25% (< 33%),
+        // so it goes back to 16 and refines: 21 (+25% of 30%: kept), 27
+        // (flat), back to 21, then descends 16 (worse), settles 21.
+        let p = simulate(START, 20, 40, |_| 1.0);
+        assert_eq!(
+            &p.history[..5],
+            &[8, 16, 32, 21, 27],
+            "history {:?}",
+            p.history
+        );
+        assert_eq!(p.settled(), 21, "history {:?}", p.history);
     }
 
     #[test]
     fn does_not_grow_when_it_never_pays() {
         // One worker already saturates the link (TCP on a clean path).
         let p = simulate(START, 1, 40, |_| 1.0);
-        // The first step up fails, then it walks down since nothing drops.
+        // The doubling fails, the fine step fails, then it walks down since
+        // nothing drops.
         assert!(p.settled() < START, "history {:?}", p.history);
-        assert!(p.peak == step_up(START));
+        assert_eq!(&p.history[..3], &[8, 16, 10]);
     }
 
     #[test]
@@ -485,10 +533,10 @@ mod tests {
             p.observe(score(p.n));
         }
         assert_eq!(p.settled(), 8, "history {:?}", p.history);
-        // 10 hurt; 6 (judged against 8) was too few; back to 8.
-        assert_eq!(&p.history[..4], &[8, 10, 6, 8]);
+        // 16 hurt; refine: 10 hurt too; 6 (judged against 8) was too few; back to 8.
+        assert_eq!(&p.history[..5], &[8, 16, 10, 6, 8]);
         // Probes back off: far fewer than one excursion per 6 measurements.
-        assert!(p.history.len() <= 10, "history {:?}", p.history);
+        assert!(p.history.len() <= 12, "history {:?}", p.history);
     }
 
     #[test]
@@ -511,15 +559,15 @@ mod tests {
         }
         // The 1.3x grid around the knee is 7 / 9, so 7 is the best it can do.
         assert!((7..=8).contains(&p.settled()), "history {:?}", p.history);
-        // 32 -> 42 (hurt) -> 25 -> 19 -> 15 -> 12 -> 9 -> 7 -> 5 (worse) -> 7:
-        // one measurement per step.
+        // 32 -> 64 (hurt) -> 42 (hurt) -> 25 -> 19 -> 15 -> 12 -> 9 -> 7 -> 5
+        // (worse) -> 7: one measurement per step.
         assert!(
-            settled_at.unwrap() <= 12,
+            settled_at.unwrap() <= 13,
             "took {:?}: {:?}",
             settled_at,
             p.history
         );
-        assert_eq!(&p.history[..3], &[32, 42, 25]);
+        assert_eq!(&p.history[..4], &[32, 64, 42, 25]);
     }
 
     #[test]

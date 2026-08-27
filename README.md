@@ -305,10 +305,11 @@ plus a small credit per completed file so small-file trees count) is sampled
 every 2.5 s, and a count has been *measured* only once two consecutive
 samples agree within 10 % — so a burst that gets throttled, or a link still
 ramping up, is waited out (up to 20 s) rather than credited to the last
-change. Each measured count is compared with the previous one: it grows by
-1.3× while a step gains at least a third of what linear scaling would (up to
-64); when a step buys nothing it goes back and shrinks by 1.3× as long as
-that costs less than 5 % (down to 2); then it holds. It never stops
+change. Each measured count is compared with the previous one: it doubles
+while a doubling gains at least a third of what linear scaling would (up to
+64); when a doubling doesn't, it goes back to the last good count and
+refines upward in 1.3× steps; when even that buys nothing it shrinks by 1.3×
+as long as that costs less than 5 % (down to 2); then it holds. It never stops
 watching: after every 6 measurements it probes one step down (kept if
 throughput doesn't drop — this is what saves a spinning disk from seek
 thrash) or one step up (the route or a shared NAS may have freed up), and a
@@ -322,8 +323,9 @@ reports the path it took (`connections: auto: settled at 13 (path 8 -> 10 ->
 
 Measured from a 1 Gbit box in Germany to a host in Japan (265 ms): over TCP
 data connections it settles around 8–13 at line rate; over ssh data
-connections (where each stream is capped by OpenSSH's 2 MB window) it keeps
-climbing and gets ~110 MB/s where a fixed `-j 8` managed 44.
+connections (where each stream is capped by OpenSSH's 2 MB window) it
+reaches line rate (~110 MB/s, where a fixed `-j 8` managed 44) about 30 s
+after the connections are up.
 
 `-j N` fixes the count and disables tuning. Use it when you know better (a
 spinning disk that must not be read in parallel: `-j 1`), or to be polite on
