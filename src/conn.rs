@@ -188,23 +188,38 @@ impl Drop for RemoteConn {
     }
 }
 
-/// At most this many *data* ssh sessions are being established at any
-/// moment. sshd's default `MaxStartups 10:30:100` starts randomly dropping
-/// new connections beyond 10 unauthenticated ones; 8 workers plus the one
-/// control connection (which bypasses this limit) stays under that, so the
-/// default starting set comes up in a single round of handshakes.
-const MAX_CONCURRENT_CONNECTS: usize = 8;
+/// How many *data* ssh sessions may be establishing at once. Starts high:
+/// on a server tuned for pcp (`MaxStartups 100`) a burst of 32 handshakes
+/// takes 14 s where four rounds of 8 would take 26. sshd's default
+/// `MaxStartups 10:30:100` randomly drops new connections beyond 10
+/// unauthenticated ones, so each failed connect halves the limit (down to
+/// MIN_CONCURRENT_CONNECTS) for the rest of the run, and the retry then
+/// succeeds. The control connection bypasses this entirely.
+const START_CONCURRENT_CONNECTS: usize = 32;
+const MIN_CONCURRENT_CONNECTS: usize = 4;
+static CONNECT_LIMIT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(START_CONCURRENT_CONNECTS);
 static CONNECTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 static CONNECTS_CV: std::sync::Condvar = std::sync::Condvar::new();
 
 struct ConnectSlot;
 fn connect_slot() -> ConnectSlot {
     let mut n = CONNECTS.lock().unwrap();
-    while *n >= MAX_CONCURRENT_CONNECTS {
+    while *n >= CONNECT_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
         n = CONNECTS_CV.wait(n).unwrap();
     }
     *n += 1;
     ConnectSlot
+}
+
+/// A data connect failed in a way that looks like the server shedding load:
+/// halve how many we attempt at once. Returns the new limit.
+fn tighten_connect_limit() -> usize {
+    let _g = CONNECTS.lock().unwrap();
+    let cur = CONNECT_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+    let new = (cur / 2).max(MIN_CONCURRENT_CONNECTS);
+    CONNECT_LIMIT.store(new, std::sync::atomic::Ordering::Relaxed);
+    new
 }
 impl Drop for ConnectSlot {
     fn drop(&mut self) {
@@ -336,11 +351,19 @@ impl RemoteSpec {
                     return Err(e)
                 }
                 Err(e) => {
+                    let limit = if limited {
+                        Some(tighten_connect_limit())
+                    } else {
+                        None
+                    };
                     if crate::transfer::debug() {
                         eprintln!(
-                            "pcp: connect to {} failed (attempt {}): {e:#}",
+                            "pcp: connect to {} failed (attempt {}): {e:#}{}",
                             self.label(),
-                            attempt + 1
+                            attempt + 1,
+                            limit
+                                .map(|l| format!("; now at most {l} connects at once"))
+                                .unwrap_or_default()
                         );
                     }
                     last = Some(e);
