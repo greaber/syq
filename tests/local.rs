@@ -2261,3 +2261,113 @@ fn flag_like_ignore_pattern_is_not_rejected() {
     run_ok(&["-a", "-i", "--exclude", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/keep")), b"k");
 }
+
+// ------------------------------------------------------------ review round 6
+
+#[test]
+fn existing_opens_up_readonly_dirs_even_after_a_symlinked_dir() {
+    let t = Tmp::new();
+    write(&t.path("src/s/x"), b"x");
+    write(&t.path("src/r/y"), b"new");
+    write(&t.path("elsewhere/x"), b"x");
+    write(&t.path("dst/r/y"), b"old");
+    set_mtime(&t.path("src/r/y"), 2000);
+    set_mtime(&t.path("dst/r/y"), 1000);
+    // `s` sorts before `r`? No — make the symlinked dir sort first explicitly.
+    fs::rename(t.path("src/s"), t.path("src/a")).unwrap();
+    std::os::unix::fs::symlink(t.path("elsewhere"), t.path("dst/a")).unwrap();
+    fs::set_permissions(t.path("dst/r"), fs::Permissions::from_mode(0o500)).unwrap();
+    let so = run_ok(&["-rt", "--existing", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(read(&t.path("dst/r/y")), b"new", "{so}");
+    assert_eq!(read(&t.path("elsewhere/x")), b"x");
+}
+
+#[test]
+fn partial_named_symlink_is_a_symlink_not_a_leftover() {
+    let t = Tmp::new();
+    write(&t.path("a/target"), b"t");
+    std::os::unix::fs::symlink("target", t.path("a/.x.pcp-partial")).unwrap();
+    write(&t.path("b/other"), b"o");
+    std::os::unix::fs::symlink("target", t.path("b/.x.pcp-partial")).unwrap();
+    run_ok(&["-a", &t.s("a/"), &t.s("dst")]);
+    assert!(t
+        .path("dst/.x.pcp-partial")
+        .symlink_metadata()
+        .unwrap()
+        .is_symlink());
+    // Without -l the symlinks are skipped, and two sources skipping the same
+    // path is not a collision.
+    run_ok(&["-r", &t.s("a/"), &t.s("b/"), &t.s("dst2")]);
+    assert!(!t.path("dst2/.x.pcp-partial").exists());
+    assert!(t.path("dst2/target").is_file() && t.path("dst2/other").is_file());
+}
+
+#[test]
+fn copy_onto_itself_among_sources_is_order_independent() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("dst/a"), b"a");
+    let so = run_ok(&["-r", &t.s("src/"), &t.s("dst/a"), &t.s("dst/")]);
+    assert!(!so.contains("errors"), "{so}");
+    let so = run_ok(&["-r", &t.s("dst/a"), &t.s("src/"), &t.s("dst/")]);
+    assert!(!so.contains("errors"), "{so}");
+    assert_eq!(read(&t.path("dst/a")), b"a");
+    // Two different files onto one destination is still a collision.
+    write(&t.path("src2/a"), b"different");
+    let out = pcp(&["-r", &t.s("src/"), &t.s("src2/"), &t.s("dst3/")]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn bad_size_limits_fail_before_anything_connects() {
+    let t0 = std::time::Instant::now();
+    let out = pcp(&[
+        "-a",
+        "--max-size",
+        "12Q",
+        "nohost-a.invalid:x",
+        "nohost-b.invalid:y",
+    ]);
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("bad size"), "{}", stderr_of(&out));
+    assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn verify_only_checks_the_filtered_scope() {
+    let t = Tmp::new();
+    write(&t.path("src/big"), b"abc");
+    write(&t.path("dst/big"), b"xyz");
+    let out = pcp(&["-a", "--verify-only", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(out.status.code(), Some(23));
+    let so = run_ok(&[
+        "-a",
+        "--verify-only",
+        "--max-size",
+        "1",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(so.contains("verified 0 files"), "{so}");
+    set_mtime(&t.path("src/big"), 1000);
+    set_mtime(&t.path("dst/big"), 2000);
+    let so = run_ok(&["-a", "--verify-only", "-u", &t.s("src/"), &t.s("dst")]);
+    assert!(so.contains("verified 0 files"), "{so}");
+}
+
+#[test]
+fn files_from_leaves_no_ancestors_behind_on_a_bad_chain() {
+    let t = Tmp::new();
+    write(&t.path("src/a/b"), b"b is a file");
+    write(&t.path("list"), b"a/b/c\n");
+    let out = pcp(&[
+        "-a",
+        "--no-resume",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(out.status.code(), Some(23));
+    assert_eq!(listing(&t.path("dst")), Vec::<String>::new());
+}

@@ -314,8 +314,9 @@ impl Args {
 }
 
 /// Read a --files-from list: one path per line (or NUL-separated with --from0),
-/// relative to the source root. Blank lines are dropped; a leading `/` or `./`
-/// is stripped; `..` components and absolute escapes are rejected.
+/// relative to the source root. Blank lines are dropped; `.` and empty
+/// components (so leading `/`, `./`, trailing `/`, `a//b`) are removed; `..`
+/// components and lines naming the root itself are rejected.
 fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
     use std::io::Read;
     let mut raw = Vec::new();
@@ -336,13 +337,7 @@ fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
         if item.is_empty() {
             continue;
         }
-        let mut p = item;
-        while let Some(rest) = p.strip_prefix(b"./").or_else(|| p.strip_prefix(b"/")) {
-            p = rest;
-        }
-        while let Some(rest) = p.strip_suffix(b"/") {
-            p = rest;
-        }
+        let p = item;
         if p.split(|&b| b == b'/').any(|c| c == b"..") {
             bail!(
                 "--files-from: {:?} contains a `..` component",

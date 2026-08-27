@@ -459,6 +459,8 @@ pub fn run(args: Args) -> Result<i32> {
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
     let block = parse_size(&args.block_size)?.clamp(64 * 1024, 64 << 20);
     let min_split = parse_size(&args.min_split)?;
+    let max_size = args.max_size.as_deref().map(parse_size).transpose()?;
+    let min_size = args.min_size.as_deref().map(parse_size).transpose()?;
     let bwlimit = (args.bwlimit_bytes > 0)
         .then_some(args.bwlimit_bytes)
         .map(BandwidthLimit::new)
@@ -530,8 +532,8 @@ pub fn run(args: Args) -> Result<i32> {
         update: args.update,
         ignore_existing: args.ignore_existing,
         existing: args.existing,
-        max_size: args.max_size.as_deref().map(parse_size).transpose()?,
-        min_size: args.min_size.as_deref().map(parse_size).transpose()?,
+        max_size,
+        min_size,
     });
     if args.files_from.is_some() && srcs.len() > 1 {
         bail!("--files-from takes exactly one source directory");
@@ -970,17 +972,56 @@ fn st_dirs(p: &Progress) -> u64 {
     )
 }
 
-fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Entry>> {
-    match ok(
-        conn.call(Request::StatMany {
-            paths: vec![path.to_vec()],
-            follow,
-        })?,
-        "stat",
-    )? {
-        Response::Stats(mut v) => Ok(v.pop().flatten()),
+/// lstat (or stat, with `follow`) each path on `conn`.
+fn stat_many(
+    conn: &mut dyn Conn,
+    paths: Vec<PathBytes>,
+    follow: bool,
+) -> Result<Vec<Option<Entry>>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    match ok(conn.call(Request::StatMany { paths, follow })?, "stat")? {
+        Response::Stats(v) => Ok(v),
         other => bail!("unexpected response {other:?}"),
     }
+}
+
+fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Entry>> {
+    Ok(stat_many(conn, vec![path.to_vec()], follow)?
+        .pop()
+        .flatten())
+}
+
+/// Run a source scan whose batches feed the planner, and remember whether it
+/// reported any problem — `scan_warned` is what gates --delete, so every
+/// source walk must go through here.
+fn scan_into_planner(
+    pl: &mut Planner<'_>,
+    src: &mut dyn Conn,
+    root: &[u8],
+    follow_root: bool,
+    ignore: &[String],
+    mut f: impl FnMut(&mut Planner<'_>, Vec<Entry>) -> Result<()>,
+) -> Result<()> {
+    let progress = pl.progress;
+    let warned = std::cell::Cell::new(false);
+    let res = src.scan(
+        root,
+        follow_root,
+        ignore,
+        false,
+        &mut |batch| f(pl, batch),
+        &mut |_| Ok(()),
+        &mut |w| {
+            warned.set(true);
+            progress.error(&format!("pcp: {w}"))
+        },
+    );
+    if warned.get() {
+        pl.scan_warned = true;
+    }
+    res
 }
 
 fn display(p: &[u8]) -> String {
@@ -1032,8 +1073,25 @@ struct Planner<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Claim {
     Dir,
+    /// A regular file pcp intends to write.
+    File,
+    /// A symlink or special file pcp intends to create.
     Leaf,
     Weak,
+}
+
+/// Everything the planner decided about one source entry, made once in the
+/// mapping loop so the directory pass and the per-kind arms can't disagree.
+struct Planned<'a> {
+    src: PathBytes,
+    dst: PathBytes,
+    dst_rel: PathBytes,
+    rel: String,
+    e: &'a Entry,
+    /// Another source already claimed `dst` as a regular file. Resolved once
+    /// the destination is stat'ed: fine if that file *is* this file (a copy
+    /// onto itself), a collision otherwise.
+    contested: bool,
 }
 
 /// What --delete found on the destination that the source doesn't have.
@@ -1061,49 +1119,33 @@ impl Planner<'_> {
     ) -> Result<()> {
         let mut first = true;
         let mut sub = sub.to_string();
-        let progress = self.progress;
-        let recursive = self.opts.recursive;
-        let warned = std::cell::Cell::new(false);
         let mut skip_all = false;
-        let res = src.scan(
-            src_root,
-            follow,
-            &self.opts.ignore,
-            false,
-            &mut |batch: Vec<Entry>| {
-                if skip_all {
-                    return Ok(());
-                }
-                if first {
-                    first = false;
-                    if let Some(root) = batch.first() {
-                        if root.kind != Kind::Dir && !dst_is_dir {
-                            sub = String::new();
-                        }
-                        if root.kind == Kind::Dir && !recursive {
-                            progress.eprintln(&format!("skipping directory {}", display(src_root)));
-                            skip_all = true;
-                            return Ok(());
-                        }
-                        if root.kind == Kind::Dir {
-                            self.delete_roots
-                                .push((join(dst_root, sub.as_bytes()), sub.clone()));
-                        }
+        let ignore = self.opts.ignore.clone();
+        scan_into_planner(self, src, src_root, follow, &ignore, |pl, batch| {
+            if skip_all {
+                return Ok(());
+            }
+            if first {
+                first = false;
+                if let Some(root) = batch.first() {
+                    if root.kind != Kind::Dir && !dst_is_dir {
+                        sub = String::new();
+                    }
+                    if root.kind == Kind::Dir && !pl.opts.recursive {
+                        pl.progress
+                            .eprintln(&format!("skipping directory {}", display(src_root)));
+                        skip_all = true;
+                        return Ok(());
+                    }
+                    if root.kind == Kind::Dir {
+                        pl.delete_roots
+                            .push((join(dst_root, sub.as_bytes()), sub.clone()));
                     }
                 }
-                progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-                self.handle_batch(batch, src_root, &sub, dst_root)
-            },
-            &mut |_| Ok(()),
-            &mut |w| {
-                warned.set(true);
-                progress.error(&format!("pcp: {w}"))
-            },
-        );
-        if warned.get() {
-            self.scan_warned = true;
-        }
-        res
+            }
+            pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+            pl.handle_batch(batch, src_root, &sub, dst_root)
+        })
     }
 
     /// --files-from: instead of walking the source, stat each listed path (and
@@ -1153,23 +1195,12 @@ impl Planner<'_> {
                 .map(|(i, _)| line[..i].to_vec())
                 .collect()
         };
-        let stat = |src: &mut dyn Conn,
-                    paths: Vec<PathBytes>,
-                    follow: bool|
-         -> Result<Vec<Option<Entry>>> {
-            if paths.is_empty() {
-                return Ok(Vec::new());
-            }
-            match ok(
-                src.call(Request::StatMany {
-                    paths: paths.iter().map(|r| join(src_root, r)).collect(),
-                    follow,
-                })?,
-                "stat",
-            )? {
-                Response::Stats(v) => Ok(v),
-                other => bail!("unexpected response {other:?}"),
-            }
+        let stat = |src: &mut dyn Conn, paths: Vec<PathBytes>, follow: bool| {
+            stat_many(
+                src,
+                paths.iter().map(|r| join(src_root, r)).collect(),
+                follow,
+            )
         };
         for chunk in lines.chunks(crate::scan::BATCH) {
             let mut want_parents: Vec<PathBytes> = Vec::new();
@@ -1215,6 +1246,9 @@ impl Planner<'_> {
             let mut subtrees: Vec<PathBytes> = Vec::new();
             'line: for line in chunk {
                 let shown = display(line);
+                // Validate the whole chain before emitting any of it, so a bad
+                // path leaves no half-created ancestors behind.
+                let mut chain: Vec<Entry> = Vec::new();
                 for anc in ancestors(line) {
                     match parents.get(&anc).and_then(|e| e.as_ref()) {
                         Some(e) if e.kind == Kind::Dir => match emitted.get(&anc) {
@@ -1227,8 +1261,9 @@ impl Planner<'_> {
                                 continue 'line;
                             }
                             None => {
-                                emitted.insert(anc.clone(), Kind::Dir);
-                                batch.push(e.clone());
+                                if !chain.iter().any(|c| c.path == anc) {
+                                    chain.push(e.clone());
+                                }
                             }
                         },
                         Some(_) => {
@@ -1246,19 +1281,22 @@ impl Planner<'_> {
                         }
                     }
                 }
-                match leaves.get(line).and_then(|e| e.as_ref()) {
-                    Some(e) => {
-                        if e.kind == Kind::Dir && recurse && recursed.insert(line.clone()) {
-                            subtrees.push(line.clone());
-                        }
-                        if !emitted.contains_key(line) {
-                            emitted.insert(line.clone(), e.kind);
-                            batch.push(e.clone());
-                        }
-                    }
-                    None => self.progress.error(&format!(
+                let Some(e) = leaves.get(line).and_then(|e| e.as_ref()) else {
+                    self.progress.error(&format!(
                         "pcp: --files-from: {shown}: no such file or directory"
-                    )),
+                    ));
+                    continue;
+                };
+                for c in chain {
+                    emitted.insert(c.path.clone(), Kind::Dir);
+                    batch.push(c);
+                }
+                if e.kind == Kind::Dir && recurse && recursed.insert(line.clone()) {
+                    subtrees.push(line.clone());
+                }
+                if !emitted.contains_key(line) {
+                    emitted.insert(line.clone(), e.kind);
+                    batch.push(e.clone());
                 }
             }
             self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
@@ -1279,43 +1317,26 @@ impl Planner<'_> {
         dst_root: &[u8],
         emitted: &mut std::collections::HashMap<PathBytes, Kind>,
     ) -> Result<()> {
-        let progress = self.progress;
-        let warned = std::cell::Cell::new(false);
-        let res = src.scan(
-            &join(src_root, rel),
-            false,
-            &[],
-            false,
-            &mut |batch: Vec<Entry>| {
-                let batch: Vec<Entry> = batch
-                    .into_iter()
-                    .filter(|e| !e.path.is_empty())
-                    .map(|mut e| {
-                        e.path = join(rel, &e.path);
-                        e
-                    })
-                    .filter(|e| {
-                        if emitted.contains_key(&e.path) {
-                            false
-                        } else {
-                            emitted.insert(e.path.clone(), e.kind);
-                            true
-                        }
-                    })
-                    .collect();
-                progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-                self.handle_batch(batch, src_root, "", dst_root)
-            },
-            &mut |_| Ok(()),
-            &mut |w| {
-                warned.set(true);
-                progress.error(&format!("pcp: {w}"))
-            },
-        );
-        if warned.get() {
-            self.scan_warned = true;
-        }
-        res
+        scan_into_planner(self, src, &join(src_root, rel), false, &[], |pl, batch| {
+            let batch: Vec<Entry> = batch
+                .into_iter()
+                .filter(|e| !e.path.is_empty())
+                .map(|mut e| {
+                    e.path = join(rel, &e.path);
+                    e
+                })
+                .filter(|e| {
+                    if emitted.contains_key(&e.path) {
+                        false
+                    } else {
+                        emitted.insert(e.path.clone(), e.kind);
+                        true
+                    }
+                })
+                .collect();
+            pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+            pl.handle_batch(batch, src_root, "", dst_root)
+        })
     }
 
     fn handle_batch(
@@ -1327,15 +1348,14 @@ impl Planner<'_> {
     ) -> Result<()> {
         let opts = self.opts;
         let sub_b = sub.as_bytes();
-        let mut mkdirs: Vec<Op> = Vec::new();
-        let mut dir_entries: Vec<(PathBytes, &Entry)> = Vec::new();
-        let mut others: Vec<(PathBytes, PathBytes, PathBytes, String, &Entry)> = Vec::new();
+        let mut dirs: Vec<(PathBytes, &Entry)> = Vec::new();
+        let mut others: Vec<Planned> = Vec::new();
         for e in &batch {
             if e.kind == Kind::Dir && !opts.recursive && !self.keep_dirs {
                 continue;
             }
             let dst_rel = join(sub_b, &e.path);
-            let dst_path = join(dst_root, &dst_rel);
+            let dst = join(dst_root, &dst_rel);
             let rel = if dst_rel.is_empty() {
                 display(src_root.rsplit(|&c| c == b'/').next().unwrap_or(src_root))
             } else {
@@ -1343,143 +1363,130 @@ impl Planner<'_> {
             };
             // Every source entry claims its destination here, before any
             // decision about it: that blocks two sources from mapping onto one
-            // path, and it is what makes --delete safe — whatever the arms
-            // below decide (skip, filter, unsupported type, resumed from a
-            // journal), a path the source has is never an extra.
-            let partial_named = e.kind != Kind::Dir
+            // path, and it is what makes --delete safe — whatever happens
+            // below (skip, filter, unsupported type, resumed from a journal),
+            // a path the source has is never an extra.
+            let partial_named = e.kind == Kind::File
                 && crate::fsops::is_partial_name(std::ffi::OsStr::from_bytes(
                     e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path),
                 ));
-            let transferable = match e.kind {
-                Kind::Dir | Kind::File => !partial_named,
-                Kind::Symlink => opts.links,
-                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => opts.devices,
-                Kind::Other => false,
+            let claim = match e.kind {
+                Kind::Dir => Claim::Dir,
+                Kind::File if !partial_named => Claim::File,
+                Kind::Symlink if opts.links => Claim::Leaf,
+                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev if opts.devices => {
+                    Claim::Leaf
+                }
+                _ => Claim::Weak,
             };
-            let claim = match (e.kind, transferable) {
-                (Kind::Dir, _) => Claim::Dir,
-                (_, true) => Claim::Leaf,
-                (_, false) => Claim::Weak,
-            };
-            if !self.claim_dst(&dst_path, &rel, claim) {
+            let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
                 continue;
-            }
-            if e.kind == Kind::Dir {
-                mkdirs.push(Op::Mkdir {
-                    path: dst_path.clone(),
-                    mode: e.mode,
-                });
-                dir_entries.push((dst_path, e));
-            } else if partial_named {
-                // pcp's own leftovers are never copied; claimed above, so a
-                // same-named file on the destination is not an extra either.
-                self.progress.files_excluded.fetch_add(1, Relaxed);
-            } else {
-                others.push((join(src_root, &e.path), dst_path, dst_rel, rel, e));
+            };
+            match claim {
+                Claim::Dir => dirs.push((dst, e)),
+                Claim::Weak if partial_named || e.kind == Kind::Other => {
+                    // Never transferred: pcp's own leftovers, unknown types.
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                }
+                Claim::Weak => {
+                    // Symlink without -l, special without -D.
+                    if opts.verbose > 0 {
+                        self.progress
+                            .eprintln(&format!("skipping non-regular file \"{rel}\""));
+                    }
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                }
+                Claim::File | Claim::Leaf => others.push(Planned {
+                    src: join(src_root, &e.path),
+                    dst,
+                    dst_rel,
+                    rel,
+                    e,
+                    contested,
+                }),
             }
         }
 
-        if opts.verify_only && !dir_entries.is_empty() {
-            let stats =
-                self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
-            for ((p, _), s) in dir_entries.iter().zip(stats) {
-                if !matches!(s, Some(ref d) if d.kind == Kind::Dir) {
-                    self.progress.error(&format!(
-                        "{} {}/ (directory)",
-                        if s.is_none() { "MISSING" } else { "DIFFERS" },
-                        display(p)
-                    ));
-                }
-            }
-        } else if !dir_entries.is_empty() && !opts.dry_run && !opts.verify_only {
-            let stats =
-                self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
-            if opts.existing {
-                // Don't create missing directories; their contents are skipped
-                // too, since every path under them is missing on the destination.
-                // A non-directory there is "missing" too: creating the directory
-                // would mean unlinking it.
-                // Entries come parent-first, so a directory below one we just
-                // marked missing is seen after it. (A destination symlink to a
-                // directory counts as missing: we won't replace it, and we
-                // won't write through it either.)
-                let mut missing: Vec<bool> = Vec::with_capacity(stats.len());
-                for ((p, _), s) in dir_entries.iter().zip(&stats) {
-                    let m = !matches!(s, Some(e) if e.kind == Kind::Dir)
-                        || self.under_missing_dir(p, dst_root);
-                    if m {
-                        self.missing_dirs.insert(p.clone());
+        // Directories: one stat pass decides everything about each one, and
+        // the same filtered list drives creation, listing and deferred
+        // metadata so they can't disagree.
+        let need_stats = opts.verify_only || !opts.dry_run || opts.existing;
+        if !dirs.is_empty() && (need_stats || opts.verbose > 0) {
+            let stats: Vec<Option<Entry>> = if need_stats {
+                self.stat_many(true, dirs.iter().map(|(p, _)| p.clone()).collect())?
+            } else {
+                vec![None; dirs.len()]
+            };
+            let mut planned: Vec<(PathBytes, &Entry, Option<Entry>)> = Vec::new();
+            for ((p, e), st) in dirs.into_iter().zip(stats) {
+                let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
+                if opts.verify_only {
+                    if !is_dir {
+                        self.progress.error(&format!(
+                            "{} {}/ (directory)",
+                            if st.is_none() { "MISSING" } else { "DIFFERS" },
+                            display(&p)
+                        ));
                     }
-                    missing.push(m);
+                    continue;
                 }
-                let mut i = 0;
-                dir_entries.retain(|_| {
-                    i += 1;
-                    !missing[i - 1]
-                });
-                i = 0;
-                mkdirs.retain(|_| {
-                    i += 1;
-                    !missing[i - 1]
-                });
+                // --existing creates nothing. A non-directory at the path (a
+                // file, a symlink even to a directory) counts as missing: we
+                // won't replace it and won't write through it, and since
+                // entries come parent-first, everything below is skipped too.
+                if opts.existing && (!is_dir || self.under_missing_dir(&p, dst_root)) {
+                    self.missing_dirs.insert(p);
+                    continue;
+                }
+                planned.push((p, e, st));
             }
-            let stats: Vec<&Option<Entry>> = stats
-                .iter()
-                .filter(|s| !opts.existing || matches!(s, Some(e) if e.kind == Kind::Dir))
-                .collect();
-            let new_dirs: Vec<Op> = mkdirs
-                .into_iter()
-                .zip(stats.iter())
-                // Keep the op for new dirs, and for existing dirs we can't yet
+            if opts.dry_run {
+                if opts.verbose > 0 {
+                    for (p, _, _) in &planned {
+                        self.progress.println(&format!("{}/", display(p)));
+                    }
+                }
+            } else if !opts.verify_only {
+                // Create new dirs; also "create" existing ones we can't yet
                 // write into (0o700 not set) so apply() opens them up.
-                .filter(|(_, s)| !matches!(s, Some(e) if e.kind == Kind::Dir && e.mode & 0o700 == 0o700))
-                .map(|(op, _)| op)
-                .collect();
-            if !new_dirs.is_empty() {
-                let n = new_dirs.len();
-                let names: Vec<PathBytes> = new_dirs
+                let new_dirs: Vec<Op> = planned
                     .iter()
-                    .map(|op| match op {
-                        Op::Mkdir { path, .. } => path.clone(),
-                        _ => unreachable!(),
+                    .filter(|(_, _, st)| {
+                        !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
+                    })
+                    .map(|(p, e, _)| Op::Mkdir {
+                        path: p.clone(),
+                        mode: e.mode,
                     })
                     .collect();
-                let errs = self.apply(true, new_dirs)?;
-                let mut failed = 0;
-                for (name, err) in names.iter().zip(errs) {
-                    if let Some(err) = err {
-                        failed += 1;
-                        self.progress.error(&format!("pcp: {err}"));
-                    } else if opts.verbose > 0 {
-                        self.progress.println(&format!("{}/", display(name)));
+                if !new_dirs.is_empty() {
+                    let n = new_dirs.len();
+                    let names: Vec<PathBytes> = new_dirs
+                        .iter()
+                        .map(|op| match op {
+                            Op::Mkdir { path, .. } => path.clone(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    let errs = self.apply(true, new_dirs)?;
+                    let mut failed = 0;
+                    for (name, err) in names.iter().zip(errs) {
+                        if let Some(err) = err {
+                            failed += 1;
+                            self.progress.error(&format!("pcp: {err}"));
+                        } else if opts.verbose > 0 {
+                            self.progress.println(&format!("{}/", display(name)));
+                        }
                     }
+                    self.dirs_created += (n - failed) as u64;
                 }
-                self.dirs_created += (n - failed) as u64;
-            }
-            let mut flags = opts.flags;
-            if !opts.perms {
-                flags &= !flags::MODE;
-            }
-            for (p, e) in &dir_entries {
-                let depth = p.iter().filter(|&&c| c == b'/').count();
-                self.deferred.push((p.clone(), e.meta(), flags, depth));
-            }
-        } else if opts.dry_run && (opts.verbose > 0 || opts.existing) && !dir_entries.is_empty() {
-            // --existing creates nothing, so only list directories that exist
-            // (and remember the others, so their contents are skipped too).
-            let stats: Vec<Option<Entry>> = if opts.existing {
-                self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?
-            } else {
-                Vec::new()
-            };
-            for (i, (p, _)) in dir_entries.iter().enumerate() {
-                let ok = !opts.existing
-                    || (matches!(stats[i], Some(ref e) if e.kind == Kind::Dir)
-                        && !self.under_missing_dir(p, dst_root));
-                if ok && opts.verbose > 0 {
-                    self.progress.println(&format!("{}/", display(p)));
-                } else if !ok {
-                    self.missing_dirs.insert(p.clone());
+                let mut flags = opts.flags;
+                if !opts.perms {
+                    flags &= !flags::MODE;
+                }
+                for (p, e, _) in &planned {
+                    let depth = p.iter().filter(|&&c| c == b'/').count();
+                    self.deferred.push((p.clone(), e.meta(), flags, depth));
                 }
             }
         }
@@ -1494,31 +1501,36 @@ impl Planner<'_> {
         if self.completed.is_some() && !opts.checksum {
             let completed = self.completed.clone().unwrap();
             let mut kept = Vec::with_capacity(others.len());
-            for (src, dst, dst_rel, rel, e) in others.into_iter() {
-                if e.kind == Kind::File {
-                    if let Some(c) = completed.get(&dst_rel) {
-                        if c.size == e.size
-                            && c.mtime_sec == e.mtime
-                            && c.mtime_nsec == e.mtime_nsec
+            for p in others.into_iter() {
+                if p.e.kind == Kind::File {
+                    if let Some(c) = completed.get(&p.dst_rel) {
+                        if c.size == p.e.size
+                            && c.mtime_sec == p.e.mtime
+                            && c.mtime_nsec == p.e.mtime_nsec
                         {
                             self.progress.files_skipped.fetch_add(1, Relaxed);
-                            self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                            self.progress.bytes_skipped.fetch_add(p.e.size, Relaxed);
                             continue;
                         }
                     }
                 }
-                kept.push((src, dst, dst_rel, rel, e));
+                kept.push(p);
             }
             others = kept;
         }
-        let stats = self.stat_many(
-            true,
-            others.iter().map(|(_, d, _, _, _)| d.clone()).collect(),
-        )?;
+        let stats = self.stat_many(true, others.iter().map(|p| p.dst.clone()).collect())?;
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<String> = Vec::new();
         let mut meta_fixes: Vec<Op> = Vec::new();
-        for ((src_path, dst_path, dst_rel, rel, e), dst_entry) in others.into_iter().zip(stats) {
+        for (p, dst_entry) in others.into_iter().zip(stats) {
+            let Planned {
+                src: src_path,
+                dst: dst_path,
+                dst_rel,
+                rel,
+                e,
+                contested,
+            } = p;
             if opts.existing && self.under_missing_dir(&dst_path, dst_root) {
                 // Below a directory we won't create: nothing to do, even if the
                 // destination has something reachable there through a symlink.
@@ -1531,17 +1543,30 @@ impl Planner<'_> {
                     // Never copy a file onto itself (same path, hardlink, or a
                     // symlinked alias) — with --inplace that would truncate the
                     // source. Only possible when both ends are the same machine.
-                    if opts.same_host
+                    // This is also what settles a contested claim: two sources
+                    // may map onto one destination file only if one of them
+                    // *is* that file (so nothing is actually written twice).
+                    let same_file = opts.same_host
                         && dst_entry
                             .as_ref()
-                            .is_some_and(|d| d.dev == e.dev && d.ino == e.ino)
-                    {
+                            .is_some_and(|d| d.dev == e.dev && d.ino == e.ino);
+                    if same_file {
                         self.progress.eprintln(&format!(
                             "skipping {rel}: source and destination are the same file"
                         ));
                         self.progress.files_excluded.fetch_add(1, Relaxed);
-                        // Nothing will be written here; let another source have it.
-                        self.dst_seen.insert(dst_path, Claim::Weak);
+                        if !contested {
+                            // Nothing will be written here; let another source have it.
+                            self.dst_seen.insert(dst_path, Claim::Weak);
+                        }
+                        continue;
+                    }
+                    if contested {
+                        self.progress.error(&format!(
+                            "pcp: {rel}: two sources map to the same destination {} — refusing to clobber it",
+                            display(&dst_path)
+                        ));
+                        self.collision = true;
                         continue;
                     }
                     // Never let a source file land on the resume marker: that
@@ -1571,7 +1596,7 @@ impl Planner<'_> {
                             d.kind == Kind::File
                                 && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
                         });
-                    if dst_newer && !opts.verify_only {
+                    if dst_newer {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         self.excluded.insert(dst_path);
                         continue;
@@ -1642,14 +1667,6 @@ impl Planner<'_> {
                     }
                 }
                 Kind::Symlink => {
-                    if !opts.links {
-                        if opts.verbose > 0 {
-                            self.progress
-                                .eprintln(&format!("skipping non-regular file \"{rel}\""));
-                        }
-                        self.progress.files_excluded.fetch_add(1, Relaxed);
-                        continue;
-                    }
                     if self.skip_existing(&dst_entry) {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
@@ -1687,14 +1704,6 @@ impl Planner<'_> {
                     self.links_created += 1;
                 }
                 Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
-                    if !opts.devices {
-                        if opts.verbose > 0 {
-                            self.progress
-                                .eprintln(&format!("skipping non-regular file \"{rel}\""));
-                        }
-                        self.progress.files_excluded.fetch_add(1, Relaxed);
-                        continue;
-                    }
                     if self.skip_existing(&dst_entry) {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
@@ -1732,11 +1741,7 @@ impl Planner<'_> {
                     });
                     self.specials_created += 1;
                 }
-                Kind::Other => {
-                    // Unknown type: never transferred (claimed above).
-                    self.progress.files_excluded.fetch_add(1, Relaxed);
-                }
-                Kind::Dir => {}
+                Kind::Dir | Kind::Other => unreachable!("handled in the mapping loop"),
             }
         }
         if !meta_fixes.is_empty() {
@@ -1762,24 +1767,26 @@ impl Planner<'_> {
 
     /// Record a leaf (file/symlink/special) destination; return false if this
     /// exact destination was already claimed by another source (a collision).
-    fn claim_dst(&mut self, dst: &PathBytes, rel: &str, claim: Claim) -> bool {
+    /// Some(contested) if the claim stands; None on a conflict (reported).
+    fn claim_dst(&mut self, dst: &PathBytes, rel: &str, claim: Claim) -> Option<bool> {
         match (self.dst_seen.get(dst), claim) {
-            (Some(Claim::Dir), Claim::Dir) | (Some(_), Claim::Weak) => true,
+            (Some(Claim::Dir), Claim::Dir) | (Some(_), Claim::Weak) => Some(false),
             (Some(Claim::Weak), c) => {
                 self.dst_seen.insert(dst.clone(), c);
-                true
+                Some(false)
             }
+            (Some(Claim::File), Claim::File) => Some(true),
             (Some(_), _) => {
                 self.progress.error(&format!(
                     "pcp: {rel}: two sources map to the same destination {} with conflicting types — refusing to clobber it",
                     display(dst)
                 ));
                 self.collision = true;
-                false
+                None
             }
             (None, c) => {
                 self.dst_seen.insert(dst.clone(), c);
-                true
+                Some(false)
             }
         }
     }
@@ -2030,16 +2037,7 @@ impl Planner<'_> {
     }
 
     fn stat_many(&mut self, _on_dst: bool, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
-        match ok(
-            self.dst.call(Request::StatMany {
-                paths,
-                follow: false,
-            })?,
-            "stat",
-        )? {
-            Response::Stats(v) => Ok(v),
-            other => bail!("unexpected response {other:?}"),
-        }
+        stat_many(self.dst, paths, false)
     }
 
     fn apply(&mut self, _on_dst: bool, ops: Vec<Op>) -> Result<Vec<Option<String>>> {

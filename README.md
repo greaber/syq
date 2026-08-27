@@ -430,6 +430,9 @@ destination side unlinks each batch in parallel); it isn't spread over the
   transferred (`4K`, `100M`, `2G`; the same suffixes as `--block-size`).
   Directories and symlinks are unaffected.
 
+All of these define the scope of the run, so `--verify-only` checks the files
+the same command would transfer and nothing else.
+
 ## Copying a list (`--files-from`)
 
 `pcp -a --files-from list.txt host:src/ dst/` copies only the paths named in
