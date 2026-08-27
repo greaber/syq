@@ -115,12 +115,12 @@ pub struct Args {
     /// Remote shell command (default: ssh)
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
-    /// Path to pcp on the remote host
+    /// Use this exact pcp executable on the remote instead of the managed helper
     #[arg(long, value_name = "PATH")]
     pub pcp_path: Option<String>,
-    /// Install this pcp binary on the remote host (~/.local/bin/pcp) if missing
+    /// Require pcp on the remote PATH instead of installing a versioned helper
     #[arg(long)]
-    pub bootstrap: bool,
+    pub no_bootstrap: bool,
     /// Use TCP data connections without encryption (trusted networks only)
     #[arg(long)]
     pub tcp_plain: bool,

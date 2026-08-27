@@ -1,5 +1,5 @@
-# Build release binaries for the J servers (Linux x86_64) and Mac users
-# (Apple Silicon + Intel), and attach them to a GitHub Release.
+# Build stripped release binaries for Linux and macOS on x86-64 and ARM64,
+# and attach raw, gzip-compressed, and SHA-256 assets to a GitHub Release.
 #
 # Trigger: push a tag like v0.1.0  (git tag v0.1.0 && git push origin v0.1.0)
 # or run manually from the Actions tab (workflow_dispatch).
@@ -21,10 +21,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             name: pcp-linux-x86_64            # static, runs on any glibc-or-not Linux
             flags: "-C target-feature=+crt-static"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            name: pcp-linux-aarch64           # static, native GitHub ARM64 runner
+            flags: "-C target-feature=+crt-static"
           - os: macos-14                       # Apple Silicon runner
             target: aarch64-apple-darwin
             name: pcp-macos-arm64
-          - os: macos-13                       # Intel runner
+          - os: macos-15-intel                 # Intel runner
             target: x86_64-apple-darwin
             name: pcp-macos-x86_64
     runs-on: ${{ matrix.os }}
@@ -33,6 +37,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version"
       - name: Build
         env:
           RUSTFLAGS: ${{ matrix.flags }}
@@ -41,10 +50,12 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/pcp dist/${{ matrix.name }}
+          gzip -9 -n -c dist/${{ matrix.name }} > dist/${{ matrix.name }}.gz
+          shasum -a 256 dist/${{ matrix.name }}.gz | awk '{print $1}' > dist/${{ matrix.name }}.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/${{ matrix.name }}
+          path: dist/*
 
   release:
     needs: build

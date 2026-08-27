@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Parallel copy with an rsync-shaped interface"
 license = "MIT"
+repository = "https://github.com/greaber/pcp"
 
 [dependencies]
 anyhow = "1"
@@ -27,6 +28,7 @@ opt-level = 3
 lto = "thin"
 codegen-units = 4
 debug = 1
+strip = "symbols"
 
 [dev-dependencies]
 libc = "0.2"

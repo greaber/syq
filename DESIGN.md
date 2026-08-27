@@ -84,7 +84,8 @@ v1 options:
 | `--rm` | parallel recursive removal |
 | `--relay` / `--detach` / `--follow` | remote→remote routing, detached run, log follow |
 | `--no-resume` | disable the destination marker and completion journal |
-| `--bootstrap` | copy the pcp binary to the remote if missing |
+| `--pcp-path PATH` | use an administrator-managed remote pcp |
+| `--no-bootstrap` | require a preinstalled remote pcp instead of the automatic versioned helper |
 | `-h`, `--version` | |
 
 Data connections default to encrypted TCP (see below); `--no-tcp` keeps them on
@@ -114,7 +115,8 @@ trait Endpoint {
 }
 ```
 
-Implementations: `Local`, `Ssh` (spawns `ssh host pcp --server`). Everything —
+Implementations: `Local`, `Ssh` (spawns the exact versioned remote helper with
+`--server`). Everything —
 push, pull, local→local, remote→remote relay — is just a choice of two
 endpoints. That is what makes relay mode free.
 
@@ -246,14 +248,20 @@ After the scan the totals are exact. Show:
 Multi-line meter on a TTY, single updating line otherwise,
 `--progress-json` for scripts, rsync-style `--stats` at the end.
 
-### Bootstrap
+### Remote helper
 
-Single static binary — built glibc-static
-(`RUSTFLAGS="-C target-feature=+crt-static"` on `x86_64-unknown-linux-gnu`; no
-`musl-gcc` needed for the bundled zstd), macOS built natively. `--bootstrap`: if
-`pcp` isn't on the remote's PATH, copy this binary to `~/.local/bin/pcp` over
-the control ssh and retry (the remote must match the local architecture).
-Version mismatch is detected at handshake.
+Remote pcp is a managed, versioned implementation detail. The launcher execs
+`~/.cache/pcp/helpers/<release+protocol>/<target>/pcp` directly, avoiding PATH
+resolution and the Performance Co-Pilot name collision. On a cache miss the
+client detects the remote OS/architecture and asks it to download the matching
+gzip-compressed GitHub release asset and SHA-256 sidecar. Installation uses a
+unique temporary file, validates the checksum and reported version, and then
+renames atomically. If the download is unavailable and both platforms match,
+the client uploads its current executable instead. `--pcp-path` selects an
+administrator-managed binary; `--no-bootstrap` requires `pcp` on remote PATH.
+The handshake checks both wire protocol and package release. Published Linux
+helpers are glibc-static (`RUSTFLAGS="-C target-feature=+crt-static"` on the
+GNU target); macOS helpers are built natively.
 
 ## Rust building blocks
 
@@ -275,7 +283,7 @@ native macOS.
    partial→rename, progress meter, `--stats`.
 3. **Chunks, resume, verify** — splitting, work stealing, per-block hashing,
    resume from partials, `-c`/`--verify-only`.
-4. **Relay remote→remote**, `-z`, `--bootstrap`, `--dry-run`.
+4. **Relay remote→remote**, `-z`, managed remote helpers, `--dry-run`.
 5. **Direct remote→remote**, `--bwlimit`, `--exclude` globs, `--delete`.
 
 All five milestones are implemented, plus TCP data connections, `--ignore`,
@@ -283,7 +291,7 @@ All five milestones are implemented, plus TCP data connections, `--ignore`,
 
 ## Resolved questions
 
-- Name collision with Performance Co-Pilot's `pcp`: lived with; the binary is
-  `pcp`.
+- Name collision with Performance Co-Pilot's `pcp`: managed remote helpers use
+  an exact private path; the user-facing local binary remains `pcp`.
 - Default `-j`: 8 over ssh, `min(cpu, 32)` when everything is local.
 - `--progress` on by default when stderr is a TTY: yes.

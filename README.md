@@ -19,23 +19,32 @@ cargo build --release          # binary at target/release/pcp
 cargo install --path .         # or: put it on your PATH
 ```
 
-The remote side needs `pcp` too, just as rsync needs `rsync` there. It is
-started as `pcp --server` over the remote shell. Options:
+The remote side runs `pcp --server`, but it does not need to be installed or
+configured first. pcp uses an exact versioned helper under
+`~/.cache/pcp/helpers/`. On first use of a version it detects the remote
+platform, downloads the matching compressed binary from that version's GitHub
+release, verifies its SHA-256 checksum, and installs it atomically. Later runs
+execute that exact path without an extra probe connection. Linux x86-64 and
+ARM64 and macOS Apple Silicon and Intel are published.
 
-- Install it on the remote host and make sure it is on the `PATH` of a
-  non-interactive ssh shell, or pass `--pcp-path /path/to/pcp`.
-- `--bootstrap`: if starting the remote `pcp` fails, copy *this* binary to
-  `~/.local/bin/pcp` on the remote host and retry. The default remote command
-  falls back to `~/.local/bin/pcp` automatically. The remote must be the same
-  architecture as the local binary.
+If the remote cannot reach GitHub, pcp uploads its current executable when the
+local and remote platforms match. For a different-platform host without
+outbound access, install a compatible binary yourself and pass
+`--pcp-path /path/to/pcp`. `--no-bootstrap` disables managed helpers and
+requires `pcp` on the non-interactive remote `PATH`.
+
+The remote download uses `curl` or `wget`, `gzip`, and one of `sha256sum`,
+`shasum`, or `openssl`. Version directories coexist and the helper cache can be
+removed at any time; pcp recreates the helper it needs on the next connection.
+
 - **macOS (Apple Silicon / Intel):** build natively on the Mac with
   `cargo build --release` (needs the Xcode command-line tools, `xcode-select
   --install`, for the bundled zstd C library). The tool is otherwise pure Rust
   and uses only POSIX calls; Linux-only optimizations (`fallocate`,
   glibc `mallopt`) are compiled out automatically. copy_file_range's local
   fast path is Linux-only; on macOS same-machine copies use the normal path.
-- For portability across distributions (e.g. to `--bootstrap` onto hosts with
-  an older glibc), build a static binary:
+- For portability across distributions (e.g. for the offline upload fallback
+  to a host with an older glibc), build a static binary:
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
   (the musl target also works if `musl-gcc` is installed, which `zstd-sys` needs).
 
@@ -58,7 +67,7 @@ pcp -a -e 'ssh -p 2222 -i ~/.ssh/other' src host:dst
 pcp -a --dry-run -v src host:dst              # show what would be copied
 pcp -ac src host:dst                          # skip the quick check; compare blocks, repair differences
 pcp -a --verify-only src host:dst             # compare only; transfer nothing
-pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if needed
+pcp -a src newhost:dst                        # the matching remote helper is automatic
 ```
 
 ### Options
@@ -87,8 +96,8 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `--fsync` | fsync each file and its parent dir around the rename (survives a crash; slower) |
 | `--no-resume` | Don't drop a destination marker or write a completion journal for this run |
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
-| `--pcp-path PATH` | Location of `pcp` on the remote host |
-| `--bootstrap` | Copy this binary to the remote's `~/.local/bin/pcp` if starting it fails |
+| `--pcp-path PATH` | Use this exact remote `pcp` instead of the managed helper |
+| `--no-bootstrap` | Require `pcp` on the remote `PATH`; do not install a managed helper |
 | `--no-tcp` | Send data over the ssh connection instead of separate TCP sockets |
 | `--tcp-plain` | TCP data connections without encryption (trusted networks only) |
 | `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
@@ -104,10 +113,11 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 
 `pcp hostA:src hostB:dst` starts the orchestrator *on hostA* over `ssh -A`
 (agent forwarding), which then pushes to hostB with N connections, so data
-flows A → B directly. That needs pcp on both hosts and hostA able to ssh to
-hostB (with your forwarded agent, or its own keys). Progress and `-v` output
-are streamed back. If hostA can't reach hostB, `--relay` keeps the orchestrator
-here and routes every byte A → you → B — always works, at half the bandwidth.
+flows A → B directly. Matching helpers are installed automatically on both
+hosts. HostA must be able to ssh to hostB (with your forwarded agent, or its
+own keys). Progress and `-v` output are streamed back. If hostA can't reach
+hostB, `--relay` keeps the orchestrator here and routes every byte A → you → B
+— always works, at half the bandwidth.
 
 Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
 launched it: pcp starts it on hostA, returns, and writes progress to a log on
