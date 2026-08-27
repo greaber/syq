@@ -238,7 +238,7 @@ esac
 }
 
 #[test]
-fn remote_helper_falls_back_to_same_platform_upload() {
+fn remote_helper_download_failure_does_not_upload_local_binary() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     executable(
@@ -252,10 +252,15 @@ exit 22
     write(&t.path("src"), b"offline");
     let remote = format!("fake:{}", t.s("dst"));
     let out = remote_pcp(&t, &rsh, &["-a", &t.s("src"), &remote]);
-    assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), b"offline");
-    assert!(cached_remote_helper(&t).is_file());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
+    assert!(!out.status.success(), "bootstrap unexpectedly succeeded");
+    assert!(!t.path("dst").exists());
+    assert!(!cached_remote_helper(&t).exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("could not install the authorized"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("uploading"), "{stderr}");
     assert_eq!(read(&t.path("curl.log")), b"fetch failed\n");
 }
 
@@ -272,6 +277,38 @@ fn no_bootstrap_uses_remote_path_without_managed_cache() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"preinstalled");
     assert!(!t.path("remote-home/.cache/pcp/helpers").exists());
+}
+
+#[test]
+fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"tcp default");
+    let remote = format!("127.0.0.1:{}", t.s("dst"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_pcp"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--pcp-path")
+        .arg(env!("CARGO_BIN_EXE_pcp"))
+        .args(["--tcp-plain", "--stats", "-a"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PCP_STATE_DIR", t.path("state"))
+        .output()
+        .expect("run pcp over TCP through fake remote shell");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"tcp default");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("connections: auto: settled at 16 (path 16, peak 16)"),
+        "{stdout}"
+    );
 }
 
 fn set_mtime(p: &Path, secs: i64) {

@@ -655,8 +655,7 @@ fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteC
 
 impl RemoteSpec {
     /// Ensure the exact release/protocol helper exists in the remote cache.
-    /// Release assets are preferred so unlike architectures work without
-    /// crossing the ssh link; uploading this executable is the offline fallback.
+    /// Only authorized release assets may populate the managed helper cache.
     pub fn install_helper(&self) -> Result<()> {
         let mut installed = self.helper_install.lock().unwrap();
         if *installed {
@@ -672,43 +671,16 @@ impl RemoteSpec {
                 target.key
             );
         }
-        match self.download_helper(target) {
-            Ok(()) => {
-                *installed = true;
-                Ok(())
-            }
-            Err(download_error) if Target::local() == Some(target) => {
-                if !self.quiet {
-                    eprintln!(
-                        "pcp: {}: release download unavailable; uploading this executable",
-                        self.label()
-                    );
-                }
-                if crate::transfer::debug() {
-                    eprintln!(
-                        "pcp: {}: remote helper download failed: {download_error:#}",
-                        self.label()
-                    );
-                }
-                self.upload_helper(target).with_context(|| {
-                    format!(
-                        "download failed ({download_error:#}); local executable upload also failed"
-                    )
-                })?;
-                *installed = true;
-                Ok(())
-            }
-            Err(download_error) => {
-                let local = Target::local().map_or("unsupported", |t| t.key);
-                bail!(
-                    "could not install {} helper on {} ({}) and cannot upload the local {} executable: {download_error:#}; install a compatible pcp and pass --pcp-path",
-                    remote_helper::release_key(),
-                    self.label(),
-                    target.key,
-                    local
-                );
-            }
-        }
+        self.download_helper(target).with_context(|| {
+            format!(
+                "could not install the authorized {} helper on {} ({}); install a compatible pcp and pass --pcp-path",
+                remote_helper::release_key(),
+                self.label(),
+                target.key
+            )
+        })?;
+        *installed = true;
+        Ok(())
     }
 
     fn remote_target(&self) -> Result<Target> {
@@ -757,44 +729,6 @@ impl RemoteSpec {
         if !out.status.success() {
             bail!(
                 "remote download exited {}{}",
-                out.status,
-                output_suffix(&out.stderr)
-            );
-        }
-        Ok(())
-    }
-
-    fn upload_helper(&self, target: Target) -> Result<()> {
-        let exe = std::env::current_exe().context("locate current pcp executable")?;
-        let mut input = std::fs::File::open(&exe)
-            .with_context(|| format!("open current executable {}", exe.display()))?;
-        let bytes = input.metadata()?.len();
-        if !self.quiet {
-            eprintln!(
-                "pcp: {}: uploading {:.1} MiB",
-                self.label(),
-                bytes as f64 / (1 << 20) as f64
-            );
-        }
-
-        let script = remote_helper::upload_script(target);
-        let mut cmd = self.ssh_command();
-        cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("start helper upload to {}", self.label()))?;
-        {
-            let mut stdin = child.stdin.take().unwrap();
-            std::io::copy(&mut input, &mut stdin)
-                .with_context(|| format!("upload helper to {}", self.label()))?;
-        }
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
-            bail!(
-                "remote install exited {}{}",
                 out.status,
                 output_suffix(&out.stderr)
             );

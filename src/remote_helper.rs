@@ -3,8 +3,7 @@
 //! The local client always names the exact release/protocol helper it expects.
 //! A cache hit adds no extra ssh round trip: the normal remote command computes
 //! the target name and execs the cached binary directly.  On a miss, `conn`
-//! probes the target, downloads the matching release asset, or uploads the
-//! current executable when it can run on the remote platform.
+//! probes the target and downloads the matching authorized release asset.
 
 use crate::proto::VERSION;
 
@@ -39,17 +38,6 @@ impl Target {
             }),
             _ => None,
         }
-    }
-
-    pub fn local() -> Option<Self> {
-        Self::from_uname(
-            match std::env::consts::OS {
-                "linux" => "Linux",
-                "macos" => "Darwin",
-                other => other,
-            },
-            std::env::consts::ARCH,
-        )
     }
 }
 
@@ -152,44 +140,6 @@ trap - EXIT HUP INT TERM"#,
         target_key = target.key,
         url = shell_words::quote(&url),
         sum_url = shell_words::quote(&format!("{url}.sha256")),
-        expected_version = shell_words::quote(&expected_version),
-        expected_helper_id = shell_words::quote(&expected_helper_id),
-    )
-}
-
-pub fn upload_script(target: Target) -> String {
-    let expected_version = format!("pcp {}", env!("CARGO_PKG_VERSION"));
-    let expected_helper_id = release_key();
-    format!(
-        r#"set -eu
-dir="$HOME/.cache/pcp/helpers/{release}/{target_key}"
-program="$dir/pcp"
-tmp="$dir/.pcp.$$.tmp"
-mkdir -p "$dir"
-cleanup() {{ rm -f "$tmp"; }}
-trap cleanup EXIT HUP INT TERM
-cat > "$tmp"
-chmod 700 "$tmp"
-got=$("$tmp" --version 2>/dev/null) || {{
-    echo "pcp: uploaded helper cannot run on this host" >&2
-    exit 1
-}}
-[ "$got" = {expected_version} ] || {{
-    echo "pcp: uploaded helper has unexpected version: $got" >&2
-    exit 1
-}}
-got_id=$("$tmp" --remote-helper-id 2>/dev/null) || {{
-    echo "pcp: uploaded helper does not report a helper identity" >&2
-    exit 1
-}}
-[ "$got_id" = {expected_helper_id} ] || {{
-    echo "pcp: uploaded helper has unexpected identity: $got_id" >&2
-    exit 1
-}}
-mv "$tmp" "$program"
-trap - EXIT HUP INT TERM"#,
-        release = release_key(),
-        target_key = target.key,
         expected_version = shell_words::quote(&expected_version),
         expected_helper_id = shell_words::quote(&expected_helper_id),
     )
