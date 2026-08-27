@@ -452,7 +452,11 @@ fn verify_file(path: &Path, expected: &ReleaseFile) -> Result<()> {
         }
         hasher.update(&buffer[..count]);
     }
-    let actual = format!("{:x}", hasher.finalize());
+    let actual: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     if actual != expected.sha256 {
         bail!("downloaded release archive failed SHA-256 verification");
     }
@@ -672,7 +676,7 @@ impl TempFile {
     fn new(parent: &Path, suffix: &str) -> Result<Self> {
         for _ in 0..16 {
             let mut random = [0u8; 12];
-            getrandom::getrandom(&mut random)
+            getrandom::fill(&mut random)
                 .map_err(|e| anyhow!("generate a temporary file name: {e}"))?;
             let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
             let path = parent.join(format!(".syq-{}-{token}{suffix}", std::process::id()));
