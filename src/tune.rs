@@ -1,22 +1,27 @@
 //! Automatic tuning of the number of parallel workers / connections.
 //!
 //! When `-j` is not given, pcp does not guess: it starts with a few workers
-//! and measures. Every window it compares progress (bytes, plus a small credit
-//! per completed file so small-file transfers count too) with the previous
-//! window, doubles the worker count while that pays, and when a doubling
-//! buys nothing it halves while *that* costs nothing, then holds. It never
-//! stops watching: in the hold phase it periodically probes
-//! a step down (if throughput doesn't drop, fewer connections were enough —
-//! this is what saves a spinning disk from seek thrash) and a step up (the
-//! route or a shared NAS may have freed up).
+//! and measures. Progress (bytes, plus a small credit per completed file so
+//! small-file transfers count too) is sampled every few seconds; a worker
+//! count has been *measured* once the rate has stopped changing — two
+//! consecutive samples agree — so a burst credit running out, or a link that
+//! is still ramping up, is waited out rather than attributed to the last
+//! change. Each measured count is compared with the previous one: the count
+//! grows by [`STEP`] while that pays at least a third of what linear scaling
+//! would give, shrinks by [`STEP`] while that costs nothing, and then holds.
+//! It never stops watching: in the hold phase it periodically probes a step
+//! down (if throughput doesn't drop, fewer connections were enough — this is
+//! what saves a spinning disk from seek thrash) and a step up (the route or a
+//! shared NAS may have freed up).
 //!
 //! Workers are never killed. Surplus ones are *parked* — they keep their
 //! connections open and simply stop taking work — so un-parking is instant.
 //! Parking takes effect within one block even in the middle of a huge range:
 //! the worker hands the rest of its range back to the scheduler.
 //!
-//! The policy is a pure state machine ([`Policy`]) so it can be unit tested;
-//! [`Gate`] is the shared switch the workers consult; [`run`] is the driver.
+//! [`Sampler`] turns raw samples into stable measurements and [`Policy`] is
+//! the decision state machine; both are pure and unit tested. [`Gate`] is the
+//! shared switch the workers consult; [`run`] is the driver.
 
 use crate::sched::Sched;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -29,20 +34,33 @@ use std::time::Duration;
 pub const START: usize = 8;
 /// Workers to start with when both ends are local: threads are free, network
 /// filesystems like the concurrency, and short bursts never reach the first
-/// window. If it's too many for a spinning disk the ramp-down finds out.
+/// measurement. If it's too many for a spinning disk the ramp-down finds out.
 pub const START_LOCAL: usize = 32;
 /// Never auto-tune beyond this many workers.
 pub const MAX: usize = 64;
 /// Never auto-tune below this many.
 pub const MIN: usize = 2;
-/// Measurement window. Long enough for BBR to settle on a 250 ms path.
-pub const WINDOW: Duration = Duration::from_secs(5);
-/// Relative gain that justifies more workers.
-const GAIN: f64 = 0.15;
+/// Multiplicative step between worker counts, up or down.
+pub const STEP: f64 = 1.3;
+/// A step up is kept if it gains at least this fraction of what linear
+/// scaling would have given (STEP - 1). Lenient on purpose: a false "no
+/// gain" strands a window-capped ssh path at half speed, while a false
+/// "gain" costs a few idle connections that the next down-probe reclaims.
+const GAIN_FRACTION: f64 = 1.0 / 3.0;
 /// A step down is kept unless throughput fell by more than this.
 const DOWN_TOLERANCE: f64 = 0.05;
-/// Hold windows between probes (6 × 5 s = 30 s).
+/// Measurements in the hold phase between probes. Each failed probe in a
+/// direction doubles the wait before that direction is tried again (up to
+/// 2^PROBE_BACKOFF_MAX times), so a sharp knee — a disk that collapses one
+/// step up — isn't paid for every few measurements forever.
 const PROBE_EVERY: usize = 6;
+const PROBE_BACKOFF_MAX: u32 = 3;
+/// How often progress is sampled.
+pub const SAMPLE: Duration = Duration::from_millis(2500);
+/// Two consecutive samples this close count as a stable rate.
+const STABLE_WITHIN: f64 = 0.10;
+/// Give up waiting for stability after this many samples and use what we have.
+const MAX_SAMPLES: usize = 8;
 /// Don't judge a worker count unless each worker has at least this much left
 /// to do: in the tail of a transfer, idle workers say nothing about the path.
 const TAIL_BYTES_PER_WORKER: u64 = 64 << 20;
@@ -50,19 +68,67 @@ const TAIL_BYTES_PER_WORKER: u64 = 64 << 20;
 /// (where bytes are negligible) still produce a usable signal.
 pub const FILE_CREDIT: u64 = 512 * 1024;
 
+/// Next count up / down by STEP, always moving by at least one.
+pub fn step_up(n: usize) -> usize {
+    ((n as f64 * STEP).round() as usize).max(n + 1)
+}
+pub fn step_down(n: usize) -> usize {
+    ((n as f64 / STEP).round() as usize).min(n.saturating_sub(1))
+}
+
+/// Turns per-sample rates into one score per *stable* stretch: the first
+/// sample after a change is discarded (connections coming up, congestion
+/// control adapting), then samples are collected until two in a row agree
+/// within STABLE_WITHIN, or MAX_SAMPLES have passed. The score is the mean
+/// of the last two samples.
+#[derive(Debug, Default)]
+pub struct Sampler {
+    samples: Vec<f64>,
+    discard: bool,
+}
+
+impl Sampler {
+    /// The worker count just changed: start over, ignoring the next sample.
+    pub fn reset(&mut self) {
+        self.samples.clear();
+        self.discard = true;
+    }
+
+    /// Feed one sample; returns a score once the rate is stable.
+    pub fn push(&mut self, rate: f64) -> Option<f64> {
+        if self.discard {
+            self.discard = false;
+            return None;
+        }
+        self.samples.push(rate);
+        let n = self.samples.len();
+        if n < 2 {
+            return None;
+        }
+        let (a, b) = (self.samples[n - 2], self.samples[n - 1]);
+        let stable = (a - b).abs() <= STABLE_WITHIN * a.max(b) || (a == 0.0 && b == 0.0);
+        if stable || n >= MAX_SAMPLES {
+            self.samples.clear();
+            Some(0.5 * (a + b))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
-    /// Doubling while each step pays (`up`), or halving while each step
+    /// Stepping up while each step pays (`up`), or down while each step
     /// costs nothing (`!up`).
     Ramp { up: bool },
-    /// Steady; counting windows until the next probe.
-    Hold { windows: usize, next_up: bool },
+    /// Steady; counting measurements until the next probe.
+    Hold { measured: usize, next_up: bool },
     /// Trying a different count; `from` is where to go back to.
     Probe { from: usize, up: bool },
 }
 
-/// Pure decision logic. Feed it one score per window; it returns the number
-/// of workers that should be active from now on.
+/// Pure decision logic. Feed it one stable score per worker count; it
+/// returns the number of workers that should be active from now on.
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub n: usize,
@@ -70,10 +136,12 @@ pub struct Policy {
     pub max: usize,
     pub peak: usize,
     state: State,
-    /// Score of the window(s) at the current baseline.
+    /// The count before the last change.
+    prev: usize,
+    /// Score of the count we compare against.
     base: Option<f64>,
-    /// The first window after a change is spent settling; ignore it.
-    settle: bool,
+    /// Consecutive failed probes up / down.
+    fails: [u32; 2],
     /// Decision log, for --stats / debug.
     pub history: Vec<usize>,
 }
@@ -87,10 +155,9 @@ impl Policy {
             max,
             peak: n,
             state: State::Ramp { up: true },
+            prev: n,
             base: None,
-            // The first window is warm-up (connections, congestion control
-            // ramping); don't let the first doubling take credit for it.
-            settle: true,
+            fails: [0, 0],
             history: vec![n],
         }
     }
@@ -104,30 +171,39 @@ impl Policy {
         }
     }
 
-    fn set(&mut self, n: usize) {
+    /// Change the count (clamped). Returns true if it actually changed.
+    fn set(&mut self, n: usize) -> bool {
         let n = n.clamp(self.min, self.max);
-        if n != self.n {
-            self.n = n;
-            self.peak = self.peak.max(n);
-            self.settle = true;
-            self.base = None;
-            self.history.push(n);
+        if n == self.n {
+            return false;
         }
+        self.prev = self.n;
+        self.n = n;
+        self.peak = self.peak.max(n);
+        self.history.push(n);
+        true
     }
 
-    /// One measurement window has passed with `score` units of progress.
-    /// Returns the worker count to apply (unchanged when it returns `self.n`).
+    fn hold(&mut self, next_up: bool) {
+        self.state = State::Hold {
+            measured: 0,
+            next_up,
+        };
+    }
+
+    /// The gain a step up must show to be kept.
+    fn gain_needed() -> f64 {
+        1.0 + (STEP - 1.0) * GAIN_FRACTION
+    }
+
+    /// One stable measurement of the current count. Returns the worker count
+    /// to apply from now on (`self.n` when nothing changes).
     pub fn observe(&mut self, score: f64) -> usize {
-        if self.settle {
-            self.settle = false;
-            return self.n;
-        }
         let Some(base) = self.base else {
             self.base = Some(score);
-            if self.state == (State::Ramp { up: true }) && score > 0.0 && self.n < self.max {
-                // First real measurement: try doubling right away.
-                self.set(self.n * 2);
-                self.base = Some(score);
+            if self.state == (State::Ramp { up: true }) && score > 0.0 {
+                // First real measurement: try a step up right away.
+                self.set(step_up(self.n));
             }
             return self.n;
         };
@@ -141,107 +217,83 @@ impl Policy {
         };
         match self.state {
             State::Ramp { up: true } => {
-                if ratio > 1.0 + GAIN && self.n < self.max {
-                    self.set(self.n * 2);
-                    // Judge the doubled count against what we just measured.
+                if ratio > Self::gain_needed() && self.n < self.max {
                     self.base = Some(score);
+                    self.set(step_up(self.n));
                 } else {
-                    // The doubling from p bought nothing (or hurt): p did the
-                    // same work for less. Maybe p/2 does too — ramp down,
-                    // judging each halving against p's score (`base`).
-                    let p = if self.history.len() > 1 {
-                        self.n / 2
-                    } else {
-                        self.n
-                    };
-                    if p / 2 >= self.min && p < self.n {
-                        self.set(p / 2);
-                        self.base = Some(base);
+                    // The step from `prev` bought nothing (or hurt): `prev`
+                    // did the same work for less. Maybe fewer still does —
+                    // ramp down, judging each step against prev's score
+                    // (`base`), going there directly.
+                    let p = self.prev.min(self.n);
+                    if p > self.min && step_down(p) >= self.min {
+                        self.set(step_down(p));
+                        self.prev = p;
                         self.state = State::Ramp { up: false };
                     } else {
                         self.set(p);
                         self.base = Some(score);
-                        self.state = State::Hold {
-                            windows: 0,
-                            next_up: false,
-                        };
+                        self.hold(false);
                     }
                 }
             }
             State::Ramp { up: false } => {
                 if ratio >= 1.0 - DOWN_TOLERANCE {
-                    // Halving didn't cost anything: keep it, try halving again.
+                    // Fewer kept up: keep it, try fewer again.
                     self.base = Some(score);
-                    if self.n / 2 >= self.min && self.n > self.min {
-                        self.set(self.n / 2);
-                        self.base = Some(score);
+                    if self.n > self.min && step_down(self.n) >= self.min {
+                        self.set(step_down(self.n));
                     } else {
-                        self.state = State::Hold {
-                            windows: 0,
-                            next_up: true,
-                        };
+                        self.hold(true);
                     }
                 } else {
                     // Too few: go back to the last count that kept up.
-                    self.set(self.n * 2);
-                    self.base = Some(base);
-                    self.state = State::Hold {
-                        windows: 0,
-                        next_up: true,
-                    };
+                    self.set(self.prev);
+                    self.hold(true);
                 }
             }
-            State::Hold { windows, next_up } => {
+            State::Hold { measured, next_up } => {
                 // Track the baseline slowly so a drifting route doesn't make
                 // every later comparison meaningless.
                 self.base = Some(0.5 * base + 0.5 * score);
-                let windows = windows + 1;
-                if windows < PROBE_EVERY {
-                    self.state = State::Hold { windows, next_up };
+                let measured = measured + 1;
+                let backoff = self.fails[usize::from(!next_up)].min(PROBE_BACKOFF_MAX);
+                if measured < PROBE_EVERY << backoff {
+                    self.state = State::Hold { measured, next_up };
                 } else {
-                    let step = (self.n / 4).max(1);
                     let target = if next_up {
-                        self.n + step
+                        step_up(self.n)
                     } else {
-                        self.n.saturating_sub(step)
+                        step_down(self.n)
                     };
-                    let target = target.clamp(self.min, self.max);
-                    if target == self.n {
-                        // Can't move that way; try the other direction next time.
-                        self.state = State::Hold {
-                            windows: 0,
-                            next_up: !next_up,
-                        };
-                    } else {
-                        let from = self.n;
-                        let keep_base = self.base;
-                        self.set(target);
-                        self.base = keep_base; // compare the probe against the hold baseline
+                    let from = self.n;
+                    if self.set(target) {
                         self.state = State::Probe { from, up: next_up };
+                    } else {
+                        // Can't move that way; try the other direction next time.
+                        self.hold(!next_up);
                     }
                 }
             }
             State::Probe { from, up } => {
                 let keep = if up {
-                    ratio > 1.0 + GAIN
+                    ratio > Self::gain_needed()
                 } else {
                     ratio >= 1.0 - DOWN_TOLERANCE
                 };
                 if keep {
-                    // A successful move: try further in the same direction next.
+                    // A successful move: try further in the same direction
+                    // sooner than usual.
+                    self.fails[usize::from(!up)] = 0;
                     self.base = Some(score);
                     self.state = State::Hold {
-                        windows: PROBE_EVERY / 2,
+                        measured: PROBE_EVERY / 2,
                         next_up: up,
                     };
                 } else {
-                    let keep_base = self.base;
+                    self.fails[usize::from(!up)] += 1;
                     self.set(from);
-                    self.base = keep_base;
-                    self.state = State::Hold {
-                        windows: 0,
-                        next_up: !up,
-                    };
+                    self.hold(!up);
                 }
             }
         }
@@ -305,8 +357,9 @@ pub trait Meter: Send + Sync {
     fn set_active(&self, n: usize);
 }
 
-/// Drive the policy: measure every WINDOW, apply decisions to the gate and
-/// spawn workers that don't exist yet. Returns the final policy (for stats).
+/// Drive the policy: sample progress, hand stable scores to the policy,
+/// apply its decisions to the gate and spawn workers that don't exist yet.
+/// Returns the final policy (for stats).
 pub fn run(
     policy: Policy,
     gate: Arc<Gate>,
@@ -316,32 +369,38 @@ pub fn run(
     mut spawned: usize,
 ) -> Policy {
     let mut policy = policy;
+    let mut sampler = Sampler::default();
+    sampler.reset();
     let mut last = (meter.bytes(), meter.files());
-    let mut window_start = std::time::Instant::now();
+    let mut sample_start = std::time::Instant::now();
     meter.set_active(policy.n);
     loop {
         std::thread::sleep(Duration::from_millis(250));
         if sched.is_aborted() || sched.finished() {
             break;
         }
-        if window_start.elapsed() < WINDOW {
+        if sample_start.elapsed() < SAMPLE {
             continue;
         }
         let now = (meter.bytes(), meter.files());
-        let secs = window_start.elapsed().as_secs_f64();
-        window_start = std::time::Instant::now();
+        let secs = sample_start.elapsed().as_secs_f64();
+        sample_start = std::time::Instant::now();
         // Only judge a configuration once every requested worker is actually
         // connected (ssh sessions can take seconds each), and only while there
-        // is queued work — in the tail, idle workers say nothing about the path.
+        // is enough work left — in the tail, idle workers say nothing.
         let all_up = gate.connected.load(Relaxed) >= policy.n.min(spawned);
         if !all_up || !sched.work_left_for(policy.n, TAIL_BYTES_PER_WORKER) {
             last = now;
+            sampler.reset();
             continue;
         }
-        // Per second, so sleep jitter in the window length doesn't masquerade
-        // as a throughput change.
-        let score = ((now.0 - last.0) as f64 + (now.1 - last.1) as f64 * FILE_CREDIT as f64) / secs;
+        // Per second, so jitter in the sample length doesn't masquerade as a
+        // throughput change.
+        let rate = ((now.0 - last.0) as f64 + (now.1 - last.1) as f64 * FILE_CREDIT as f64) / secs;
         last = now;
+        let Some(score) = sampler.push(rate) else {
+            continue;
+        };
         let before = policy.n;
         let n = policy.observe(score);
         if n != before {
@@ -351,9 +410,10 @@ pub fn run(
             }
             gate.set_limit(n);
             meter.set_active(n);
+            sampler.reset();
             if crate::transfer::debug() {
                 eprintln!(
-                    "pcp: tune: {before} -> {n} workers (window {:.1} MB/s, state {:?})",
+                    "pcp: tune: {before} -> {n} workers (measured {:.1} MB/s at {before}, state {:?})",
                     score / 1e6,
                     policy.state
                 );
@@ -369,38 +429,50 @@ mod tests {
 
     /// Feed the policy a model where throughput rises linearly with workers
     /// up to `cap` workers and is flat after.
-    fn simulate(cap: usize, windows: usize, noise: impl Fn(usize) -> f64) -> Policy {
-        let mut p = Policy::new(START, MIN, MAX);
-        for i in 0..windows {
+    fn simulate(start: usize, cap: usize, rounds: usize, noise: impl Fn(usize) -> f64) -> Policy {
+        let mut p = Policy::new(start, MIN, MAX);
+        for i in 0..rounds {
             let eff = p.n.min(cap) as f64;
-            let score = eff * 10e6 * noise(i);
-            p.observe(score);
+            p.observe(eff * 10e6 * noise(i));
         }
         p
     }
 
     #[test]
+    fn steps_are_geometric_and_move() {
+        assert_eq!(step_up(8), 10);
+        assert_eq!(step_up(2), 3);
+        assert_eq!(step_down(8), 6);
+        assert_eq!(step_down(3), 2);
+        let mut n = START;
+        let mut steps = 0;
+        while n < MAX {
+            n = step_up(n);
+            steps += 1;
+        }
+        assert!((7..=9).contains(&steps), "{steps} steps");
+    }
+
+    #[test]
     fn ramps_to_the_plateau_and_holds() {
-        let p = simulate(32, 40, |_| 1.0);
-        // 8 -> 16 -> 32 pays; 64 does not (flat), so it holds at 32; a later
-        // down-probe to 24 costs throughput and is undone.
-        assert_eq!(p.n, 32, "history {:?}", p.history);
-        assert!(p.history.contains(&16) && p.history.contains(&32));
+        let p = simulate(START, 32, 40, |_| 1.0);
+        // Climbs to within one step of the knee (either side) and stays there.
+        assert!((25..=42).contains(&p.settled()), "history {:?}", p.history);
+        assert!(p.peak <= step_up(step_up(32)), "history {:?}", p.history);
     }
 
     #[test]
     fn does_not_grow_when_it_never_pays() {
         // One worker already saturates the link (TCP on a clean path).
-        let p = simulate(1, 40, |_| 1.0);
-        assert!(p.n <= START, "history {:?}", p.history);
-        // Down-probes keep succeeding (throughput never drops), so it walks down.
-        assert!(p.n < START, "history {:?}", p.history);
+        let p = simulate(START, 1, 40, |_| 1.0);
+        // The first step up fails, then it walks down since nothing drops.
+        assert!(p.settled() < START, "history {:?}", p.history);
+        assert!(p.peak == step_up(START));
     }
 
     #[test]
     fn backs_off_when_more_workers_hurt() {
         // A spinning disk: scales to 8 workers, collapses past that.
-        let mut p = Policy::new(START, MIN, MAX);
         let score = |n: usize| {
             if n <= 8 {
                 n as f64 * 12.5e6
@@ -408,20 +480,20 @@ mod tests {
                 30e6
             }
         };
+        let mut p = Policy::new(START, MIN, MAX);
         for _ in 0..40 {
             p.observe(score(p.n));
         }
         assert_eq!(p.settled(), 8, "history {:?}", p.history);
-        // 16 hurt; 4 (judged against 8) was too few; back to 8.
-        assert_eq!(&p.history[..4], &[8, 16, 4, 8]);
-        // Every later excursion away from 8 was a probe that came straight back.
-        assert!(p.history.iter().all(|&n| (4..=16).contains(&n)));
+        // 10 hurt; 6 (judged against 8) was too few; back to 8.
+        assert_eq!(&p.history[..4], &[8, 10, 6, 8]);
+        // Probes back off: far fewer than one excursion per 6 measurements.
+        assert!(p.history.len() <= 10, "history {:?}", p.history);
     }
 
     #[test]
     fn descends_quickly_from_a_high_local_start() {
         // Same disk, started at the local default of 32.
-        let mut p = Policy::new(START_LOCAL, MIN, MAX);
         let score = |n: usize| {
             if n <= 8 {
                 n as f64 * 12.5e6
@@ -429,28 +501,31 @@ mod tests {
                 30e6
             }
         };
-        let mut windows_to_settle = None;
-        for i in 0..40 {
+        let mut p = Policy::new(START_LOCAL, MIN, MAX);
+        let mut settled_at = None;
+        for i in 0..60 {
             p.observe(score(p.n));
-            if windows_to_settle.is_none() && p.settled() == 8 && p.n == 8 {
-                windows_to_settle = Some(i + 1);
+            if settled_at.is_none() && (7..=8).contains(&p.settled()) && p.n == p.settled() {
+                settled_at = Some(i + 1);
             }
         }
-        assert_eq!(p.settled(), 8, "history {:?}", p.history);
-        // 32 -> 64 (hurt) -> 16 (same as 32) -> 8 (better) -> 4 (worse) -> 8:
-        // each step is a settle window plus a measured one.
+        // The 1.3x grid around the knee is 7 / 9, so 7 is the best it can do.
+        assert!((7..=8).contains(&p.settled()), "history {:?}", p.history);
+        // 32 -> 42 (hurt) -> 25 -> 19 -> 15 -> 12 -> 9 -> 7 -> 5 (worse) -> 7:
+        // one measurement per step.
         assert!(
-            windows_to_settle.unwrap() <= 12,
+            settled_at.unwrap() <= 12,
             "took {:?}: {:?}",
-            windows_to_settle,
+            settled_at,
             p.history
         );
+        assert_eq!(&p.history[..3], &[32, 42, 25]);
     }
 
     #[test]
     fn ignores_noise_within_tolerance() {
-        let p = simulate(32, 60, |i| if i % 2 == 0 { 1.0 } else { 0.92 });
-        assert!(p.n >= 24 && p.n <= 40, "history {:?}", p.history);
+        let p = simulate(START, 32, 60, |i| if i % 2 == 0 { 1.0 } else { 0.93 });
+        assert!((20..=42).contains(&p.settled()), "history {:?}", p.history);
     }
 
     #[test]
@@ -459,8 +534,38 @@ mod tests {
         for _ in 0..10 {
             p.observe(0.0);
         }
-        assert_eq!(p.n, START);
         assert_eq!(p.history, vec![START]);
+    }
+
+    #[test]
+    fn sampler_waits_for_a_stable_rate() {
+        let mut s = Sampler::default();
+        s.reset();
+        assert_eq!(
+            s.push(50.0),
+            None,
+            "first sample after a change is discarded"
+        );
+        // A burst that gets throttled: 100, 60, 40, 39 -> stable at ~40.
+        assert_eq!(s.push(100.0), None);
+        assert_eq!(s.push(60.0), None);
+        assert_eq!(s.push(40.0), None);
+        assert_eq!(s.push(39.0), Some(39.5));
+        // A link that ramps up: 10, 20, 30, 31 -> stable at ~30.
+        assert_eq!(s.push(10.0), None);
+        assert_eq!(s.push(20.0), None);
+        assert_eq!(s.push(30.0), None);
+        assert_eq!(s.push(31.0), Some(30.5));
+    }
+
+    #[test]
+    fn sampler_gives_up_eventually() {
+        let mut s = Sampler::default();
+        let mut out = None;
+        for i in 0..MAX_SAMPLES {
+            out = s.push(100.0 * (i as f64 + 1.0)); // never stable
+        }
+        assert!(out.is_some(), "no score after {MAX_SAMPLES} samples");
     }
 
     #[test]
