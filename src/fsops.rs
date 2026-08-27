@@ -422,36 +422,32 @@ impl FsOps {
         bail!("EXDEV")
     }
 
-    /// Atomic whole-file put: verify, write a partial, set metadata, rename.
-    /// If any step fails, no file appears under the final name.
+    /// Write a small new file straight to its final path (no partial, no rename,
+    /// no preallocation). Because the size isn't preallocated, an interrupted
+    /// write leaves a *short* file that the next run detects (size mismatch) and
+    /// re-transfers — so there is no "full size, wrong content" state to mistake
+    /// for complete. Saves the rename op, which dominates small-file cost on NFS.
     pub fn put_small(&mut self, path: &[u8], data: &[u8], hash: u64, meta: &Meta, flags: u8, fsync: bool) -> Result<()> {
         if xxh3_64(data) != hash {
             bail!("block hash mismatch on receive");
         }
         let p = resolve(path);
-        let pp = partial_path(&p);
-        self.uncache(&pp);
-        if let Some(parent) = pp.parent() {
+        self.uncache(&p);
+        if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 fs::create_dir_all(parent).ok();
             }
         }
-        {
-            let f = open_regular_write(&pp, meta.mode)?;
-            f.write_all_at(data, 0).with_context(|| format!("write {}", pp.display()))?;
-            set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", pp.display()))?;
-            if fsync {
-                f.sync_all().with_context(|| format!("fsync {}", pp.display()))?;
-            }
-        }
         if let Ok(md) = fs::symlink_metadata(&p) {
             if md.is_dir() {
-                let _ = fs::remove_file(&pp);
                 bail!("destination {} is a directory", p.display());
             }
         }
-        fs::rename(&pp, &p).with_context(|| format!("rename {} -> {}", pp.display(), p.display()))?;
+        let f = open_regular_write(&p, meta.mode)?;
+        f.write_all_at(data, 0).with_context(|| format!("write {}", p.display()))?;
+        set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", p.display()))?;
         if fsync {
+            f.sync_all().with_context(|| format!("fsync {}", p.display()))?;
             let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
             if let Ok(df) = File::open(dir) {
                 let _ = df.sync_all();
