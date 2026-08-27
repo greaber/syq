@@ -650,3 +650,44 @@ fn small_files_atomic_no_partials() {
     assert_eq!(partials, 0);
     assert_eq!(read(&t.path("smd/f7")), b"data-7");
 }
+
+// ---- Review round 4 (integrity) ----
+
+#[test]
+fn quick_skipped_file_still_claims_destination() {
+    let t = Tmp::new();
+    write(&t.path("A/x"), b"aaa");     // A/x is a file
+    write(&t.path("B/x/y"), b"yyy");   // B/x is a directory
+    // Pre-populate dest/x identical to A/x so A/x is quick-skipped.
+    write(&t.path("dest/x"), b"aaa");
+    set_mtime(&t.path("A/x"), 1_000_000_000);
+    set_mtime(&t.path("dest/x"), 1_000_000_000);
+    let out = pcp(&["-a", &format!("{}/", t.s("A")), &format!("{}/", t.s("B")), &format!("{}/", t.s("dest"))]);
+    // The skipped file must still claim dest/x, so B's directory is rejected.
+    assert!(!out.status.success(), "quick-skipped file must still block a colliding directory");
+}
+
+#[test]
+fn verify_only_flags_missing_directory() {
+    let t = Tmp::new();
+    write(&t.path("s/sub/f"), b"f");
+    fs::create_dir_all(t.path("d")).unwrap(); // d exists but d/sub does not
+    let out = pcp(&["-a", "--verify-only", &format!("{}/", t.s("s")), &format!("{}/", t.s("d"))]);
+    assert_eq!(out.status.code(), Some(23));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("MISSING") &&
+            String::from_utf8_lossy(&out.stderr).to_lowercase().contains("director"));
+}
+
+#[test]
+fn verify_only_flags_missing_special() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("s")).unwrap();
+    fs::create_dir_all(t.path("d")).unwrap();
+    // create a fifo in the source
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(t.path("s/pipe").as_os_str().as_bytes()).unwrap();
+    unsafe { assert_eq!(libc::mkfifo(c.as_ptr(), 0o644), 0); }
+    let out = pcp(&["-a", "--verify-only", &format!("{}/", t.s("s")), &format!("{}/", t.s("d"))]);
+    assert_eq!(out.status.code(), Some(23));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("special"));
+}
