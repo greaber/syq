@@ -51,9 +51,12 @@ pub struct Args {
     /// Show what would be transferred without doing it
     #[arg(short = 'n', long)]
     pub dry_run: bool,
-    /// Accepted for rsync compatibility (sizes are always human-readable)
+    /// No-op accepted for rsync compatibility (sizes are always human-readable)
     #[arg(short = 'h', long)]
     pub human_readable: bool,
+    /// No-op accepted for rsync compatibility (pcp always uses numeric uid/gid)
+    #[arg(long)]
+    pub numeric_ids: bool,
 
     /// Number of parallel connections/workers (default: 8 over ssh, 32 when everything is local)
     #[arg(short = 'j', long, value_name = "N")]
@@ -78,7 +81,7 @@ pub struct Args {
     /// Same as --progress --partial
     #[arg(short = 'P')]
     pub p_flag: bool,
-    /// Keep partially transferred files (always on; accepted for compatibility)
+    /// No-op accepted for rsync compatibility (pcp always keeps partial files)
     #[arg(long)]
     pub partial: bool,
     /// Emit machine-readable progress lines (JSON) on stderr
@@ -178,6 +181,8 @@ impl Args {
     /// a .gitignore file).
     pub fn parse_args() -> Result<Args> {
         use clap::{CommandFactory, FromArgMatches};
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        reject_unsupported_rsync_flags(&argv)?;
         let m = Args::command().get_matches();
         let mut args = Args::from_arg_matches(&m)?;
         let mut items: Vec<(usize, bool, String)> = Vec::new();
@@ -241,6 +246,105 @@ impl Args {
         }
         f
     }
+}
+
+/// Common rsync flags pcp deliberately doesn't implement get a one-line
+/// explanation instead of clap's generic "unexpected argument", so pasting an
+/// rsync command tells you exactly what to change. Flags pcp *does* accept
+/// (including the compatibility no-ops) are not listed here; genuinely unknown
+/// flags fall through to clap. No translation is performed.
+fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
+    // Options that consume a following, separate token as their value — skip
+    // that token so a value like `-e 'ssh ...'` is never mistaken for a flag.
+    let value_long = [
+        "--rsh",
+        "--ignore",
+        "--ignore-from",
+        "--connections",
+        "--block-size",
+        "--min-split",
+        "--tcp-ports",
+        "--pcp-path",
+        "--width",
+    ];
+    let mut skip_next = false;
+    for tok in argv {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if tok == "--" {
+            break; // end of options; the rest are paths
+        }
+        if value_long.contains(&tok.as_str())
+            || (!tok.starts_with("--") && matches!(tok.as_str(), "-e" | "-i" | "-j"))
+        {
+            skip_next = true;
+            continue;
+        }
+        if let Some(msg) = unsupported_message(tok) {
+            bail!("{msg}");
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_message(tok: &str) -> Option<String> {
+    if let Some(long) = tok.strip_prefix("--") {
+        return message_for_long(long.split('=').next().unwrap_or(long)).map(str::to_string);
+    }
+    if let Some(cluster) = tok.strip_prefix('-') {
+        // Bundled short flags (e.g. `-auHz`): stop at the first value-taking
+        // short, since everything after it is that option's value.
+        for c in cluster.chars() {
+            if matches!(c, 'e' | 'i' | 'j') {
+                break;
+            }
+            if let Some(m) = message_for_short(c) {
+                return Some(m.to_string());
+            }
+        }
+    }
+    None
+}
+
+const FILTER_MSG: &str = "pcp has no --exclude/--include/--filter. Use -i/--ignore (or --ignore-from), which takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `-i node_modules`. See the README's \"Ignoring paths\" section.";
+const DELETE_MSG: &str = "pcp does not implement --delete; it never removes files from the destination. To delete paths, run `pcp --rm PATH...` explicitly.";
+
+fn message_for_long(base: &str) -> Option<&'static str> {
+    Some(match base {
+        "exclude" | "exclude-from" | "include" | "include-from" | "filter" => FILTER_MSG,
+        "delete" => DELETE_MSG,
+        _ if base.starts_with("delete-") => DELETE_MSG,
+        "update" => "pcp does not implement -u/--update (skip files newer on the receiver).",
+        "bwlimit" => "pcp does not implement --bwlimit.",
+        "one-file-system" => "pcp does not implement -x/--one-file-system.",
+        "sparse" => "pcp does not implement -S/--sparse.",
+        "hard-links" => "pcp does not preserve hard links (-H/--hard-links).",
+        "acls" => "pcp does not preserve ACLs (-A/--acls).",
+        "xattrs" => "pcp does not preserve extended attributes (-X/--xattrs).",
+        "copy-links" | "copy-unsafe-links" | "copy-dirlinks" => {
+            "pcp does not implement -L/--copy-links; it copies symlinks as symlinks (-l)."
+        }
+        "files-from" => "pcp does not implement --files-from.",
+        "link-dest" | "compare-dest" | "copy-dest" => {
+            "pcp does not implement --link-dest/--compare-dest/--copy-dest."
+        }
+        _ => return None,
+    })
+}
+
+fn message_for_short(c: char) -> Option<&'static str> {
+    message_for_long(match c {
+        'u' => "update",
+        'H' => "hard-links",
+        'A' => "acls",
+        'X' => "xattrs",
+        'S' => "sparse",
+        'x' => "one-file-system",
+        'L' => "copy-links",
+        _ => return None,
+    })
 }
 
 pub fn parse_size(s: &str) -> Result<u64> {

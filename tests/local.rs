@@ -1216,3 +1216,66 @@ fn resume_reserved_marker_path_is_protected() {
     );
     assert_eq!(read(&t.path("dst/ok.bin")), b"fine");
 }
+
+// Unsupported rsync flags get a helpful, specific error (not clap's generic
+// "unexpected argument"), and the filter family points at -i.
+#[test]
+fn unsupported_rsync_flags_explain_themselves() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"x");
+
+    let out = pcp(&[
+        "-a",
+        "--exclude",
+        "node_modules",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("-i/--ignore"), "should point to -i: {err}");
+    assert!(err.contains("gitignore"), "should mention gitignore: {err}");
+
+    let out = pcp(&["-a", "--delete", &t.s("src/"), &t.s("dst/")]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--rm"));
+
+    // Bundled short flags from a pasted `rsync -aHz` are caught too (the
+    // unsupported letter is found inside the cluster).
+    let out = pcp(&["-aHz", &t.s("src/"), &t.s("dst/")]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("hard links"),
+        "bundled -H should be explained: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// Compatibility no-ops are accepted and change nothing.
+#[test]
+fn rsync_compat_noops_are_accepted() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"hello");
+    // --numeric-ids, --partial, -P, -h are all no-ops here.
+    run_ok(&[
+        "-a",
+        "--numeric-ids",
+        "--partial",
+        "-P",
+        "-h",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(read(&t.path("dst/f")), b"hello");
+}
+
+// A value that happens to look like an unsupported flag is not misread.
+#[test]
+fn flag_like_ignore_pattern_is_not_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"k");
+    // `-i --exclude` means "ignore a pattern literally named --exclude"; it must
+    // not trip the --exclude rejection.
+    run_ok(&["-a", "-i", "--exclude", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/keep")), b"k");
+}

@@ -75,7 +75,9 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `--block-size SIZE` | Transfer and hash block size (default 4M) |
 | `--min-split SIZE` | Don't split an in-flight file with less than this left (default 32M) |
 | `--progress` / `--no-progress` | Progress meter (default on when stderr is a terminal) |
-| `-P` | `--progress --partial` (partials are always kept; accepted for compatibility) |
+| `-P` | Turns on `--progress` (the `--partial` half is always on; see below) |
+| `--partial` | No-op for rsync compatibility (pcp always keeps partial files) |
+| `--numeric-ids` | No-op for rsync compatibility (pcp always uses numeric uid/gid) |
 | `--progress-json` | One JSON line per second on stderr |
 | `--stats` | Summary counts at the end |
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
@@ -96,7 +98,7 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
 | `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
-| `-h` | Accepted for compatibility; sizes are always human-readable. Use `--help` for help |
+| `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
 ### Remote-to-remote
 
