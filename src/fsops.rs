@@ -64,9 +64,28 @@ pub fn partial_path(final_: &Path) -> PathBuf {
     }
 }
 
+/// The final path a partial file `dir/.name.pcp-partial` belongs to.
+pub fn partial_target(partial: &[u8]) -> PathBytes {
+    let (dir, name) = match partial.iter().rposition(|&c| c == b'/') {
+        Some(i) => (&partial[..i + 1], &partial[i + 1..]),
+        None => (&partial[..0], partial),
+    };
+    assert!(
+        is_partial_name(OsStr::from_bytes(name)),
+        "partial_target: {name:?} is not a partial name"
+    );
+    let inner = &name[1..name.len() - PARTIAL_SUFFIX.len()];
+    let mut v = dir.to_vec();
+    v.extend_from_slice(inner);
+    v
+}
+
+/// `.name.pcp-partial` with a non-empty `name` (a bare `.pcp-partial` is not one).
 pub fn is_partial_name(name: &OsStr) -> bool {
     let b = name.as_bytes();
-    b.starts_with(b".") && b.ends_with(PARTIAL_SUFFIX.as_bytes())
+    b.len() > 1 + PARTIAL_SUFFIX.len()
+        && b.starts_with(b".")
+        && b.ends_with(PARTIAL_SUFFIX.as_bytes())
 }
 
 pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry {
@@ -175,8 +194,16 @@ impl FsOps {
 
     /// Batches are statted on several threads: on network filesystems each
     /// lstat is a round trip and the planner would otherwise starve the workers.
-    pub fn stat_many(&mut self, paths: &[PathBytes]) -> Vec<Option<Entry>> {
-        parallel_map(paths, |p| lstat_entry(Vec::new(), &resolve(p)).ok())
+    pub fn stat_many(&mut self, paths: &[PathBytes], follow: bool) -> Vec<Option<Entry>> {
+        parallel_map(paths, |p| {
+            let full = resolve(p);
+            let md = if follow {
+                fs::metadata(&full)
+            } else {
+                fs::symlink_metadata(&full)
+            };
+            md.ok().map(|md| entry_from_meta(Vec::new(), &full, &md))
+        })
     }
 
     /// Ops within a batch are independent (the planner orders batches so that
@@ -673,7 +700,9 @@ impl FsOps {
     /// Dispatch a request that has a single response (everything except Scan).
     pub fn handle(&mut self, req: &Request) -> Response {
         let r: Result<Response> = match req {
-            Request::StatMany(paths) => Ok(Response::Stats(self.stat_many(paths))),
+            Request::StatMany { paths, follow } => {
+                Ok(Response::Stats(self.stat_many(paths, *follow)))
+            }
             Request::Apply(ops) => Ok(Response::Applied(self.apply(ops))),
             Request::Probe { path } => self.probe(path),
             Request::Prepare {

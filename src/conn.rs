@@ -22,14 +22,17 @@ pub trait Conn: Send {
     fn is_dead(&self) -> bool {
         false
     }
-    /// Streamed scan; `sink` gets batches, `warn` gets non-fatal messages.
+    /// Streamed scan; `sink` gets batches, `warn` gets non-fatal messages,
+    /// `ignored` gets the paths the patterns pruned (only if `report_ignored`).
+    #[allow(clippy::too_many_arguments)]
     fn scan(
         &mut self,
         root: &[u8],
         follow_root: bool,
-        all: bool,
         ignore: &[String],
+        report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()>;
 }
@@ -71,12 +74,21 @@ impl Conn for LocalConn {
         &mut self,
         root: &[u8],
         follow_root: bool,
-        all: bool,
         ignore: &[String],
+        report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
-        crate::scan::scan(&fsops::resolve(root), follow_root, all, ignore, sink, warn)
+        crate::scan::scan(
+            &fsops::resolve(root),
+            follow_root,
+            ignore,
+            report_ignored,
+            sink,
+            ignored,
+            warn,
+        )
     }
 }
 
@@ -153,20 +165,22 @@ impl Conn for RemoteConn {
         &mut self,
         root: &[u8],
         follow_root: bool,
-        all: bool,
         ignore: &[String],
+        report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
         self.send(Request::Scan {
             root: root.to_vec(),
             follow_root,
-            all,
             ignore: ignore.to_vec(),
+            report_ignored,
         })?;
         loop {
             match self.recv()? {
                 Response::ScanBatch(b) => sink(b)?,
+                Response::ScanIgnored(v) => ignored(v)?,
                 Response::ScanWarn(w) => warn(w),
                 Response::ScanDone => return Ok(()),
                 Response::Err(e) => bail!("{}: scan: {e}", self.label),

@@ -8,7 +8,8 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-pub const VERSION: u32 = 3;
+// 5: Scan.report_ignored + ScanIgnored (--delete); bumped past master's 4.
+pub const VERSION: u32 = 5;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 const COMPRESS_MIN: usize = 512;
 
@@ -125,15 +126,19 @@ pub enum Request {
         port_lo: u16,
         port_hi: u16,
     },
-    /// `all`: include pcp's own partial files (used by --rm).
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
+    /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
     Scan {
         root: PathBytes,
         follow_root: bool,
-        all: bool,
         ignore: Vec<String>,
+        report_ignored: bool,
     },
-    StatMany(Vec<PathBytes>),
+    /// lstat each path; with `follow`, stat through symlinks instead.
+    StatMany {
+        paths: Vec<PathBytes>,
+        follow: bool,
+    },
     Apply(Vec<Op>),
     /// What exists at `path` on the receiving side: the final file and/or a partial.
     Probe {
@@ -215,6 +220,8 @@ pub enum Response {
     },
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
+    /// Paths (relative to the root) pruned by the ignore patterns.
+    ScanIgnored(Vec<PathBytes>),
     ScanDone,
     Stats(Vec<Option<Entry>>),
     Applied(Vec<Option<String>>),
@@ -247,7 +254,9 @@ impl SizeHint for Request {
         match self {
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
             Request::PutSmall { data, path, .. } => data.len() + path.len() + 96,
-            Request::StatMany(v) => v.iter().map(|p| p.len() + 8).sum::<usize>() + 16,
+            Request::StatMany { paths, .. } => {
+                paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
+            }
             Request::Apply(v) => v.len() * 128 + 16,
             _ => 256,
         }

@@ -1,6 +1,6 @@
 # pcp — parallel copy with an rsync-shaped interface
 
-**Status:** implemented through milestone 5's direct remote→remote mode; see README.md for usage. Remaining from the plan: `--bwlimit`, `--exclude` globs, `--delete`.
+**Status:** implemented through milestone 5's direct remote→remote mode; see README.md for usage. `--exclude` globs became `-i`/`--ignore-from` (gitignore syntax); `--delete`, `-u`, `--existing`/`--ignore-existing`, `--max-size`/`--min-size` and `--files-from` are in. Remaining from the plan: `--bwlimit`.
 
 ## Goal
 
@@ -73,8 +73,8 @@ v1 options:
 | `--inplace` | write directly to target instead of partial+rename |
 | `-h`, `--version` | |
 
-Later: `--bwlimit`, `--exclude GLOB` (gitignore-style, not rsync rules),
-`--gitignore`, `--delete`, `-u`, `--files-from`.
+Later: `--bwlimit`. Done since: `-i` (gitignore-style, not rsync rules),
+`--delete`, `-u`, `--files-from` — see README.md.
 
 ## Architecture
 

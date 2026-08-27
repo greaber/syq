@@ -118,8 +118,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Request::Scan {
                 root,
                 follow_root,
-                all,
                 ignore,
+                report_ignored,
             } => {
                 let root = fsops::resolve(&root);
                 // Warnings are collected and sent between batches so a single
@@ -129,8 +129,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 let res = crate::scan::scan(
                     &root,
                     follow_root,
-                    all,
                     &ignore,
+                    report_ignored,
                     &mut |batch| {
                         let mut w = wref.borrow_mut();
                         for m in warns.borrow_mut().drain(..) {
@@ -138,6 +138,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         }
                         Ok(w.write_msg(&Response::ScanBatch(batch))?)
                     },
+                    &mut |paths| Ok(wref.borrow_mut().write_msg(&Response::ScanIgnored(paths))?),
                     &mut |msg| warns.borrow_mut().push(msg),
                 );
                 for m in warns.borrow_mut().drain(..) {

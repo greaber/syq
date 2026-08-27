@@ -115,6 +115,13 @@ impl Sched {
         self.inner.lock().unwrap().failed.contains(&idx)
     }
 
+    /// Destination paths of every file that failed this run.
+    pub fn failed_dsts(&self) -> Vec<PathBytes> {
+        let g = self.inner.lock().unwrap();
+        let jobs = self.jobs.lock().unwrap();
+        g.failed.iter().map(|&i| jobs[i].dst.clone()).collect()
+    }
+
     pub fn next(&self) -> Item {
         let mut g = self.inner.lock().unwrap();
         loop {

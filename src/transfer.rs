@@ -7,6 +7,7 @@ use crate::progress::{commas, human, Progress, WorkerStatus};
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
 use anyhow::{bail, Result};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
@@ -35,6 +36,17 @@ pub struct Opts {
     pub umask: u32,
     /// gitignore-style patterns applied to every source (see scan.rs).
     pub ignore: Vec<String>,
+    /// --delete: remove destination paths the source doesn't have (see Planner::plan_deletes).
+    pub delete: bool,
+    /// -u: skip files that are newer on the destination.
+    pub update: bool,
+    /// --ignore-existing: never touch a destination path that already exists.
+    pub ignore_existing: bool,
+    /// --existing: never create a destination path that doesn't exist.
+    pub existing: bool,
+    /// --max-size / --min-size: regular files outside the range are not transferred.
+    pub max_size: Option<u64>,
+    pub min_size: Option<u64>,
 }
 
 pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
@@ -211,7 +223,16 @@ pub fn run(args: Args) -> Result<i32> {
         verbose: args.verbose,
         umask: read_umask(),
         ignore: args.ignore_lines.clone(),
+        delete: args.delete,
+        update: args.update,
+        ignore_existing: args.ignore_existing,
+        existing: args.existing,
+        max_size: args.max_size.as_deref().map(parse_size).transpose()?,
+        min_size: args.min_size.as_deref().map(parse_size).transpose()?,
     });
+    if args.files_from.is_some() && srcs.len() > 1 {
+        bail!("--files-from takes exactly one source directory");
+    }
 
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let progress = Progress::new(
@@ -324,14 +345,14 @@ pub fn run(args: Args) -> Result<i32> {
     }
 
     let dst_root = dst.path.as_bytes().to_vec();
-    let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root)?;
+    let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root, false)?;
     let dst_is_dir = match &dst_root_entry {
         Some(e) if e.kind == Kind::Dir => true,
         Some(_) if srcs.len() > 1 => {
             bail!("destination must be a directory when copying multiple sources")
         }
         Some(_) => false,
-        None => srcs.len() > 1 || dst.copies_contents(),
+        None => srcs.len() > 1 || dst.copies_contents() || args.files_from.is_some(),
     };
 
     // Reject copying a directory into itself: if the effective destination
@@ -345,7 +366,7 @@ pub fn run(args: Args) -> Result<i32> {
         let local = !dst.is_remote();
         for s in srcs {
             // Only a directory source can trigger the recurse-into-itself trap.
-            let src_is_dir = matches!(stat_one(&mut *src_ctl, s.path.as_bytes())?, Some(ref e) if e.kind == Kind::Dir);
+            let src_is_dir = matches!(stat_one(&mut *src_ctl, s.path.as_bytes(), false)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
             }
@@ -374,7 +395,7 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
-    if dst_root_entry.is_none() && dst_is_dir && !args.dry_run {
+    if dst_root_entry.is_none() && dst_is_dir && !args.dry_run && !args.existing {
         match ok(
             dst_ctl.call(Request::Apply(vec![Op::Mkdir {
                 path: dst_root.clone(),
@@ -399,15 +420,33 @@ pub fn run(args: Args) -> Result<i32> {
         progress: &progress,
         opts: &opts,
         dst_seen: std::collections::HashMap::new(),
+        missing_dirs: std::collections::HashSet::new(),
+        excluded: std::collections::HashSet::new(),
         collision: false,
         deferred: Vec::new(),
         dirs_created: 0,
         links_created: 0,
         specials_created: 0,
+        scan_warned: false,
+        keep_dirs: args.files_from.is_some(),
+        delete_roots: Vec::new(),
+        deletes: Deletes::default(),
     };
 
     let mut scan_err = None;
-    for src in srcs {
+    if args.files_from.is_some() {
+        let src = &srcs[0];
+        if let Err(e) = st.scan_files_from(
+            &mut *src_ctl,
+            src.path.as_bytes(),
+            &dst_root,
+            &args.files_from_lines,
+            args.recursive_explicit,
+        ) {
+            scan_err = Some(e);
+        }
+    }
+    for src in srcs.iter().filter(|_| args.files_from.is_none()) {
         let src_root = src.path.as_bytes().to_vec();
         let follow = src.copies_contents();
         // A bare directory source goes to dest/basename even when dest doesn't
@@ -440,7 +479,6 @@ pub fn run(args: Args) -> Result<i32> {
     if collision {
         sched.abort();
     }
-
     for w in workers {
         match w.join() {
             Ok(Ok(())) => {}
@@ -453,6 +491,22 @@ pub fn run(args: Args) -> Result<i32> {
     }
 
     let aborted = sched.is_aborted();
+    let mut deleted = 0u64;
+    // --delete runs once the workers are done, so the destination walk sees a
+    // quiescent tree (no partials being renamed, no entries being replaced),
+    // and before apply_deferred, since unlinking bumps directory mtimes. Any
+    // source-side scan problem disables deletion: a directory we couldn't
+    // read would otherwise look like one whose contents vanished.
+    if !aborted && opts.delete && scan_err.is_none() && !collision {
+        if st.scan_warned {
+            progress.eprintln("pcp: source scan reported errors; skipping deletions");
+        } else {
+            match st.plan_deletes() {
+                Ok(()) => deleted = st.run_deletes(&sched.failed_dsts())?,
+                Err(e) => progress.error(&format!("pcp: delete: {e:#}")),
+            }
+        }
+    }
     if !aborted && !opts.dry_run && !opts.verify_only {
         st.apply_deferred()?;
     }
@@ -483,7 +537,7 @@ pub fn run(args: Args) -> Result<i32> {
                 "transferred"
             };
             println!(
-                "pcp: {} {} files ({}), {} unchanged ({} files), {} dirs{}{}",
+                "pcp: {} {} files ({}), {} unchanged ({} files), {} dirs{}{}{}",
                 verb,
                 commas(progress.files_done.load(Relaxed)),
                 human(if opts.dry_run {
@@ -494,6 +548,19 @@ pub fn run(args: Args) -> Result<i32> {
                 human(progress.bytes_skipped.load(Relaxed)),
                 commas(progress.files_skipped.load(Relaxed)),
                 commas(st_dirs(&progress)),
+                if opts.delete {
+                    format!(
+                        ", {} {}",
+                        commas(deleted),
+                        if opts.dry_run {
+                            "would be deleted"
+                        } else {
+                            "deleted"
+                        }
+                    )
+                } else {
+                    String::new()
+                },
                 if opts.dry_run {
                     String::new()
                 } else {
@@ -512,10 +579,11 @@ pub fn run(args: Args) -> Result<i32> {
         }
         if args.stats {
             println!(
-                "  scanned entries: {}\n  files to transfer: {}\n  files unchanged: {}\n  bytes transferred: {}\n  bytes unchanged: {}\n  elapsed: {:.2}s",
+                "  scanned entries: {}\n  files to transfer: {}\n  files unchanged: {}\n  files excluded: {}\n  bytes transferred: {}\n  bytes unchanged: {}\n  elapsed: {:.2}s",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
                 commas(progress.files_skipped.load(Relaxed)),
+                commas(progress.files_excluded.load(Relaxed)),
                 commas(done),
                 commas(progress.bytes_skipped.load(Relaxed)),
                 elapsed
@@ -532,13 +600,21 @@ pub fn run(args: Args) -> Result<i32> {
 }
 
 fn st_dirs(p: &Progress) -> u64 {
-    p.scanned
-        .load(Relaxed)
-        .saturating_sub(p.files_total.load(Relaxed) + p.files_skipped.load(Relaxed))
+    p.scanned.load(Relaxed).saturating_sub(
+        p.files_total.load(Relaxed)
+            + p.files_skipped.load(Relaxed)
+            + p.files_excluded.load(Relaxed),
+    )
 }
 
-fn stat_one(conn: &mut dyn Conn, path: &[u8]) -> Result<Option<Entry>> {
-    match ok(conn.call(Request::StatMany(vec![path.to_vec()]))?, "stat")? {
+fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Entry>> {
+    match ok(
+        conn.call(Request::StatMany {
+            paths: vec![path.to_vec()],
+            follow,
+        })?,
+        "stat",
+    )? {
         Response::Stats(mut v) => Ok(v.pop().flatten()),
         other => bail!("unexpected response {other:?}"),
     }
@@ -553,15 +629,59 @@ struct Planner<'a> {
     sched: &'a Sched,
     progress: &'a Progress,
     opts: &'a Opts,
-    /// Leaf destination paths already claimed, to reject two sources writing one file.
-    /// dest path -> is_dir. Two dirs merge; a dir vs a leaf, or two leaves, conflict.
-    dst_seen: std::collections::HashMap<PathBytes, bool>,
+    /// Destination paths claimed by source entries (see `Claim`).
+    dst_seen: std::collections::HashMap<PathBytes, Claim>,
+    /// --existing: destination directories that don't exist (or aren't
+    /// directories); nothing under them is touched.
+    missing_dirs: std::collections::HashSet<PathBytes>,
+    /// Destination files the source has but this run chose not to send (-u,
+    /// size limits, --existing, ...); their partials are resume state, not garbage.
+    excluded: std::collections::HashSet<PathBytes>,
     collision: bool,
     /// (dst path, meta, flags, depth) for directories, applied deepest-first at the end.
     deferred: Vec<(PathBytes, Meta, u8, usize)>,
     dirs_created: u64,
     links_created: u64,
     specials_created: u64,
+    /// A source scan reported a non-fatal problem (unreadable directory, ...).
+    scan_warned: bool,
+    /// --files-from: listed directories are created even without -r (which
+    /// then only decides whether their contents are walked).
+    keep_dirs: bool,
+    /// (destination directory, its path relative to the transfer root) for every
+    /// directory source; --delete removes extras inside these.
+    delete_roots: Vec<(PathBytes, String)>,
+    deletes: Deletes,
+}
+
+/// What a source entry asserts about its destination path. Two dirs merge;
+/// a dir against a leaf, or two leaves, conflict. A `Weak` claim comes from
+/// an entry pcp will not transfer (a symlink without -l, a special file
+/// without -D, an unknown type): it still marks the path as the source's —
+/// so --delete leaves it alone — but yields to any real claim, so two
+/// sources overlapping on such an entry are not a conflict.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Claim {
+    Dir,
+    Leaf,
+    Weak,
+}
+
+/// pcp's own destination-session marker (see RESUME-DESIGN.md; the resume
+/// implementation defines it as `resume::MARKER_NAME`). It lives in the
+/// destination root and is never an extra to delete.
+const RESUME_MARKER: &[u8] = b".pcp-transfer-session.json";
+
+/// What --delete found on the destination that the source doesn't have.
+#[derive(Default)]
+struct Deletes {
+    /// (path, display name) of files, symlinks and specials to unlink.
+    leaves: Vec<(PathBytes, String)>,
+    /// Directories by depth, removed deepest-first once they are empty.
+    dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String)>>,
+    /// (partial path, final path, display name): stale unless the final path
+    /// failed this run (then it is the resume state for the retry).
+    partials: Vec<(PathBytes, PathBytes, String)>,
 }
 
 impl Planner<'_> {
@@ -578,12 +698,17 @@ impl Planner<'_> {
         let mut sub = sub.to_string();
         let progress = self.progress;
         let recursive = self.opts.recursive;
-        src.scan(
+        let warned = std::cell::Cell::new(false);
+        let mut skip_all = false;
+        let res = src.scan(
             src_root,
             follow,
-            false,
             &self.opts.ignore,
+            false,
             &mut |batch: Vec<Entry>| {
+                if skip_all {
+                    return Ok(());
+                }
                 if first {
                     first = false;
                     if let Some(root) = batch.first() {
@@ -592,15 +717,240 @@ impl Planner<'_> {
                         }
                         if root.kind == Kind::Dir && !recursive {
                             progress.eprintln(&format!("skipping directory {}", display(src_root)));
+                            skip_all = true;
                             return Ok(());
+                        }
+                        if root.kind == Kind::Dir {
+                            self.delete_roots
+                                .push((join(dst_root, sub.as_bytes()), sub.clone()));
                         }
                     }
                 }
                 progress.scanned.fetch_add(batch.len() as u64, Relaxed);
                 self.handle_batch(batch, src_root, &sub, dst_root)
             },
-            &mut |w| progress.error(&format!("pcp: {w}")),
-        )
+            &mut |_| Ok(()),
+            &mut |w| {
+                warned.set(true);
+                progress.error(&format!("pcp: {w}"))
+            },
+        );
+        if warned.get() {
+            self.scan_warned = true;
+        }
+        res
+    }
+
+    /// --files-from: instead of walking the source, stat each listed path (and
+    /// the directories leading to it) and feed them to the planner as if a scan
+    /// had produced them. Every ancestor must be a real directory: a symlink in
+    /// the middle of a listed path would let the copy read outside the source
+    /// root (and, mirrored on the destination, write outside it). Listed
+    /// directories — only those, not implied parents — are walked with an
+    /// explicit -r.
+    fn scan_files_from(
+        &mut self,
+        src: &mut dyn Conn,
+        src_root: &[u8],
+        dst_root: &[u8],
+        lines: &[PathBytes],
+        recurse: bool,
+    ) -> Result<()> {
+        use std::collections::{HashMap, HashSet};
+        // Through a symlink: `pcp --files-from L link dst` should work like `link/`.
+        let root = match stat_one(src, src_root, true)? {
+            Some(e) if e.kind == Kind::Dir => e,
+            Some(_) => bail!(
+                "--files-from: source {} is not a directory",
+                display(src_root)
+            ),
+            None => bail!("--files-from: source {} does not exist", display(src_root)),
+        };
+        self.progress.scanned.fetch_add(1, Relaxed);
+        self.handle_batch(vec![root], src_root, "", dst_root)?;
+
+        // Listed paths are lstat'ed (a listed symlink copies as a symlink).
+        // Implied ancestors are stat'ed *through* symlinks and must resolve to
+        // directories: the user named a path through them, and on the
+        // destination they become real directories, so nothing is ever
+        // written through a symlink there. Results are kept for the whole
+        // list, since a later line may repeat a path or name one first seen
+        // as a parent.
+        let mut leaves: HashMap<PathBytes, Option<Entry>> = HashMap::new();
+        let mut parents: HashMap<PathBytes, Option<Entry>> = HashMap::new();
+        // What the planner has been given for each path (Dir or not).
+        let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
+        let mut recursed: HashSet<PathBytes> = HashSet::new();
+        let ancestors = |line: &[u8]| -> Vec<PathBytes> {
+            line.iter()
+                .enumerate()
+                .filter(|(_, &b)| b == b'/')
+                .map(|(i, _)| line[..i].to_vec())
+                .collect()
+        };
+        let stat = |src: &mut dyn Conn,
+                    paths: Vec<PathBytes>,
+                    follow: bool|
+         -> Result<Vec<Option<Entry>>> {
+            if paths.is_empty() {
+                return Ok(Vec::new());
+            }
+            match ok(
+                src.call(Request::StatMany {
+                    paths: paths.iter().map(|r| join(src_root, r)).collect(),
+                    follow,
+                })?,
+                "stat",
+            )? {
+                Response::Stats(v) => Ok(v),
+                other => bail!("unexpected response {other:?}"),
+            }
+        };
+        for chunk in lines.chunks(crate::scan::BATCH) {
+            let mut want_parents: Vec<PathBytes> = Vec::new();
+            let mut want_leaves: Vec<PathBytes> = Vec::new();
+            for line in chunk {
+                for anc in ancestors(line) {
+                    if !parents.contains_key(&anc) && !want_parents.contains(&anc) {
+                        want_parents.push(anc);
+                    }
+                }
+                if !leaves.contains_key(line) && !want_leaves.contains(line) {
+                    want_leaves.push(line.clone());
+                }
+            }
+            for (rel, st) in
+                want_parents
+                    .iter()
+                    .cloned()
+                    .zip(stat(src, want_parents.clone(), true)?)
+            {
+                parents.insert(
+                    rel.clone(),
+                    st.map(|mut e| {
+                        e.path = rel;
+                        e
+                    }),
+                );
+            }
+            for (rel, st) in want_leaves
+                .iter()
+                .cloned()
+                .zip(stat(src, want_leaves.clone(), false)?)
+            {
+                leaves.insert(
+                    rel.clone(),
+                    st.map(|mut e| {
+                        e.path = rel;
+                        e
+                    }),
+                );
+            }
+            let mut batch: Vec<Entry> = Vec::new();
+            let mut subtrees: Vec<PathBytes> = Vec::new();
+            'line: for line in chunk {
+                let shown = display(line);
+                for anc in ancestors(line) {
+                    match parents.get(&anc).and_then(|e| e.as_ref()) {
+                        Some(e) if e.kind == Kind::Dir => match emitted.get(&anc) {
+                            Some(Kind::Dir) => {}
+                            Some(_) => {
+                                self.progress.error(&format!(
+                                    "pcp: --files-from: {shown}: {} was listed as a non-directory",
+                                    display(&anc)
+                                ));
+                                continue 'line;
+                            }
+                            None => {
+                                emitted.insert(anc.clone(), Kind::Dir);
+                                batch.push(e.clone());
+                            }
+                        },
+                        Some(_) => {
+                            self.progress.error(&format!(
+                                "pcp: --files-from: {shown}: {} is not a directory",
+                                display(&anc)
+                            ));
+                            continue 'line;
+                        }
+                        None => {
+                            self.progress.error(&format!(
+                                "pcp: --files-from: {shown}: no such file or directory"
+                            ));
+                            continue 'line;
+                        }
+                    }
+                }
+                match leaves.get(line).and_then(|e| e.as_ref()) {
+                    Some(e) => {
+                        if e.kind == Kind::Dir && recurse && recursed.insert(line.clone()) {
+                            subtrees.push(line.clone());
+                        }
+                        if !emitted.contains_key(line) {
+                            emitted.insert(line.clone(), e.kind);
+                            batch.push(e.clone());
+                        }
+                    }
+                    None => self.progress.error(&format!(
+                        "pcp: --files-from: {shown}: no such file or directory"
+                    )),
+                }
+            }
+            self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+            self.handle_batch(batch, src_root, "", dst_root)?;
+            for rel in subtrees {
+                self.scan_subtree(src, src_root, &rel, dst_root, &mut emitted)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk `src_root/rel` and plan its entries under the same relative prefix.
+    fn scan_subtree(
+        &mut self,
+        src: &mut dyn Conn,
+        src_root: &[u8],
+        rel: &[u8],
+        dst_root: &[u8],
+        emitted: &mut std::collections::HashMap<PathBytes, Kind>,
+    ) -> Result<()> {
+        let progress = self.progress;
+        let warned = std::cell::Cell::new(false);
+        let res = src.scan(
+            &join(src_root, rel),
+            false,
+            &[],
+            false,
+            &mut |batch: Vec<Entry>| {
+                let batch: Vec<Entry> = batch
+                    .into_iter()
+                    .filter(|e| !e.path.is_empty())
+                    .map(|mut e| {
+                        e.path = join(rel, &e.path);
+                        e
+                    })
+                    .filter(|e| {
+                        if emitted.contains_key(&e.path) {
+                            false
+                        } else {
+                            emitted.insert(e.path.clone(), e.kind);
+                            true
+                        }
+                    })
+                    .collect();
+                progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                self.handle_batch(batch, src_root, "", dst_root)
+            },
+            &mut |_| Ok(()),
+            &mut |w| {
+                warned.set(true);
+                progress.error(&format!("pcp: {w}"))
+            },
+        );
+        if warned.get() {
+            self.scan_warned = true;
+        }
+        res
     }
 
     fn handle_batch(
@@ -614,25 +964,53 @@ impl Planner<'_> {
         let sub_b = sub.as_bytes();
         let mut mkdirs: Vec<Op> = Vec::new();
         let mut dir_entries: Vec<(PathBytes, &Entry)> = Vec::new();
-        let mut others: Vec<(PathBytes, PathBytes, &Entry)> = Vec::new();
+        let mut others: Vec<(PathBytes, PathBytes, String, &Entry)> = Vec::new();
         for e in &batch {
-            if e.kind == Kind::Dir && !opts.recursive {
+            if e.kind == Kind::Dir && !opts.recursive && !self.keep_dirs {
                 continue;
             }
             let dst_rel = join(sub_b, &e.path);
             let dst_path = join(dst_root, &dst_rel);
+            let rel = if dst_rel.is_empty() {
+                display(src_root.rsplit(|&c| c == b'/').next().unwrap_or(src_root))
+            } else {
+                display(&dst_rel)
+            };
+            // Every source entry claims its destination here, before any
+            // decision about it: that blocks two sources from mapping onto one
+            // path, and it is what makes --delete safe — whatever the arms
+            // below decide (skip, filter, unsupported type, resumed from a
+            // journal), a path the source has is never an extra.
+            let partial_named = e.kind != Kind::Dir
+                && crate::fsops::is_partial_name(std::ffi::OsStr::from_bytes(
+                    e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path),
+                ));
+            let transferable = match e.kind {
+                Kind::Dir | Kind::File => !partial_named,
+                Kind::Symlink => opts.links,
+                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => opts.devices,
+                Kind::Other => false,
+            };
+            let claim = match (e.kind, transferable) {
+                (Kind::Dir, _) => Claim::Dir,
+                (_, true) => Claim::Leaf,
+                (_, false) => Claim::Weak,
+            };
+            if !self.claim_dst(&dst_path, &rel, claim) {
+                continue;
+            }
             if e.kind == Kind::Dir {
-                let rel = display(&join(sub_b, &e.path));
-                if !self.claim_dst(&dst_path, &rel, true) {
-                    continue;
-                }
                 mkdirs.push(Op::Mkdir {
                     path: dst_path.clone(),
                     mode: e.mode,
                 });
                 dir_entries.push((dst_path, e));
+            } else if partial_named {
+                // pcp's own leftovers are never copied; claimed above, so a
+                // same-named file on the destination is not an extra either.
+                self.progress.files_excluded.fetch_add(1, Relaxed);
             } else {
-                others.push((join(src_root, &e.path), dst_path, e));
+                others.push((join(src_root, &e.path), dst_path, rel, e));
             }
         }
 
@@ -651,6 +1029,39 @@ impl Planner<'_> {
         } else if !dir_entries.is_empty() && !opts.dry_run && !opts.verify_only {
             let stats =
                 self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
+            if opts.existing {
+                // Don't create missing directories; their contents are skipped
+                // too, since every path under them is missing on the destination.
+                // A non-directory there is "missing" too: creating the directory
+                // would mean unlinking it.
+                // Entries come parent-first, so a directory below one we just
+                // marked missing is seen after it. (A destination symlink to a
+                // directory counts as missing: we won't replace it, and we
+                // won't write through it either.)
+                let mut missing: Vec<bool> = Vec::with_capacity(stats.len());
+                for ((p, _), s) in dir_entries.iter().zip(&stats) {
+                    let m = !matches!(s, Some(e) if e.kind == Kind::Dir)
+                        || self.under_missing_dir(p, dst_root);
+                    if m {
+                        self.missing_dirs.insert(p.clone());
+                    }
+                    missing.push(m);
+                }
+                let mut i = 0;
+                dir_entries.retain(|_| {
+                    i += 1;
+                    !missing[i - 1]
+                });
+                i = 0;
+                mkdirs.retain(|_| {
+                    i += 1;
+                    !missing[i - 1]
+                });
+            }
+            let stats: Vec<&Option<Entry>> = stats
+                .iter()
+                .filter(|s| !opts.existing || matches!(s, Some(e) if e.kind == Kind::Dir))
+                .collect();
             let new_dirs: Vec<Op> = mkdirs
                 .into_iter()
                 .zip(stats.iter())
@@ -688,28 +1099,41 @@ impl Planner<'_> {
                 let depth = p.iter().filter(|&&c| c == b'/').count();
                 self.deferred.push((p.clone(), e.meta(), flags, depth));
             }
-        } else if opts.dry_run && opts.verbose > 0 {
-            for (p, _) in &dir_entries {
-                self.progress.println(&format!("{}/", display(p)));
+        } else if opts.dry_run && (opts.verbose > 0 || opts.existing) && !dir_entries.is_empty() {
+            // --existing creates nothing, so only list directories that exist
+            // (and remember the others, so their contents are skipped too).
+            let stats: Vec<Option<Entry>> = if opts.existing {
+                self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?
+            } else {
+                Vec::new()
+            };
+            for (i, (p, _)) in dir_entries.iter().enumerate() {
+                let ok = !opts.existing
+                    || (matches!(stats[i], Some(ref e) if e.kind == Kind::Dir)
+                        && !self.under_missing_dir(p, dst_root));
+                if ok && opts.verbose > 0 {
+                    self.progress.println(&format!("{}/", display(p)));
+                } else if !ok {
+                    self.missing_dirs.insert(p.clone());
+                }
             }
         }
 
         if others.is_empty() {
             return Ok(());
         }
-        let stats = self.stat_many(true, others.iter().map(|(_, d, _)| d.clone()).collect())?;
+        let stats = self.stat_many(true, others.iter().map(|(_, d, _, _)| d.clone()).collect())?;
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<String> = Vec::new();
         let mut meta_fixes: Vec<Op> = Vec::new();
-        for ((src_path, dst_path, e), dst_entry) in others.into_iter().zip(stats) {
-            let rel = {
-                let r = join(sub_b, &e.path);
-                if r.is_empty() {
-                    display(src_root.rsplit(|&c| c == b'/').next().unwrap_or(src_root))
-                } else {
-                    display(&r)
-                }
-            };
+        for ((src_path, dst_path, rel, e), dst_entry) in others.into_iter().zip(stats) {
+            if opts.existing && self.under_missing_dir(&dst_path, dst_root) {
+                // Below a directory we won't create: nothing to do, even if the
+                // destination has something reachable there through a symlink.
+                self.excluded.insert(dst_path);
+                self.progress.files_excluded.fetch_add(1, Relaxed);
+                continue;
+            }
             match e.kind {
                 Kind::File => {
                     // Never copy a file onto itself (same path, hardlink, or a
@@ -723,12 +1147,17 @@ impl Planner<'_> {
                         self.progress.eprintln(&format!(
                             "skipping {rel}: source and destination are the same file"
                         ));
+                        self.progress.files_excluded.fetch_add(1, Relaxed);
+                        // Nothing will be written here; let another source have it.
+                        self.dst_seen.insert(dst_path, Claim::Weak);
                         continue;
                     }
-                    // Claim the destination BEFORE deciding skip-vs-transfer, so a
-                    // quick-skipped file still blocks another source (or a dir)
-                    // from mapping onto the same path.
-                    if !self.claim_dst(&dst_path, &rel, false) {
+                    if opts.max_size.is_some_and(|m| e.size > m)
+                        || opts.min_size.is_some_and(|m| e.size < m)
+                        || self.skip_existing(&dst_entry)
+                    {
+                        self.progress.files_excluded.fetch_add(1, Relaxed);
+                        self.excluded.insert(dst_path);
                         continue;
                     }
                     let same = dst_entry.as_ref().is_some_and(|d| {
@@ -736,6 +1165,16 @@ impl Planner<'_> {
                             && d.size == e.size
                             && (opts.flags & flags::TIMES != 0 && d.mtime == e.mtime)
                     });
+                    let dst_newer = opts.update
+                        && dst_entry.as_ref().is_some_and(|d| {
+                            d.kind == Kind::File
+                                && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
+                        });
+                    if dst_newer && !opts.verify_only {
+                        self.progress.files_excluded.fetch_add(1, Relaxed);
+                        self.excluded.insert(dst_path);
+                        continue;
+                    }
                     if opts.verify_only {
                         if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
                             self.enqueue(
@@ -790,9 +1229,11 @@ impl Planner<'_> {
                             self.progress
                                 .eprintln(&format!("skipping non-regular file \"{rel}\""));
                         }
+                        self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
-                    if !self.claim_dst(&dst_path, &rel, false) {
+                    if self.skip_existing(&dst_entry) {
+                        self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
                     let target = e.link.clone().unwrap_or_default();
@@ -833,9 +1274,11 @@ impl Planner<'_> {
                             self.progress
                                 .eprintln(&format!("skipping non-regular file \"{rel}\""));
                         }
+                        self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
-                    if !self.claim_dst(&dst_path, &rel, false) {
+                    if self.skip_existing(&dst_entry) {
+                        self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
                     let same = dst_entry
@@ -871,7 +1314,11 @@ impl Planner<'_> {
                     });
                     self.specials_created += 1;
                 }
-                Kind::Dir | Kind::Other => {}
+                Kind::Other => {
+                    // Unknown type: never transferred (claimed above).
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                }
+                Kind::Dir => {}
             }
         }
         if !meta_fixes.is_empty() {
@@ -897,10 +1344,14 @@ impl Planner<'_> {
 
     /// Record a leaf (file/symlink/special) destination; return false if this
     /// exact destination was already claimed by another source (a collision).
-    fn claim_dst(&mut self, dst: &PathBytes, rel: &str, is_dir: bool) -> bool {
-        match self.dst_seen.get(dst) {
-            Some(&prev_dir) if prev_dir && is_dir => true,
-            Some(_) => {
+    fn claim_dst(&mut self, dst: &PathBytes, rel: &str, claim: Claim) -> bool {
+        match (self.dst_seen.get(dst), claim) {
+            (Some(Claim::Dir), Claim::Dir) | (Some(_), Claim::Weak) => true,
+            (Some(Claim::Weak), c) => {
+                self.dst_seen.insert(dst.clone(), c);
+                true
+            }
+            (Some(_), _) => {
                 self.progress.error(&format!(
                     "pcp: {rel}: two sources map to the same destination {} with conflicting types — refusing to clobber it",
                     display(dst)
@@ -908,11 +1359,35 @@ impl Planner<'_> {
                 self.collision = true;
                 false
             }
-            None => {
-                self.dst_seen.insert(dst.clone(), is_dir);
+            (None, c) => {
+                self.dst_seen.insert(dst.clone(), c);
                 true
             }
         }
+    }
+
+    /// --existing: is some directory between the destination root and `dst`
+    /// one we decided not to create?
+    fn under_missing_dir(&self, dst: &[u8], dst_root: &[u8]) -> bool {
+        if self.missing_dirs.is_empty() {
+            return false;
+        }
+        // The root itself may be the missing one (e.g. a symlink to a
+        // directory elsewhere, which we must neither replace nor write through).
+        if self.missing_dirs.contains(dst_root) {
+            return true;
+        }
+        let mut end = dst.len();
+        while let Some(i) = dst[..end].iter().rposition(|&c| c == b'/') {
+            if i <= dst_root.len() {
+                break;
+            }
+            if self.missing_dirs.contains(&dst[..i]) {
+                return true;
+            }
+            end = i;
+        }
+        false
     }
 
     fn enqueue(
@@ -937,8 +1412,198 @@ impl Planner<'_> {
         });
     }
 
+    /// --ignore-existing / --existing for a leaf, given what's on the destination.
+    fn skip_existing(&self, dst_entry: &Option<Entry>) -> bool {
+        (self.opts.ignore_existing && dst_entry.is_some())
+            || (self.opts.existing && dst_entry.is_none())
+    }
+
+    /// Walk every destination directory the sources map onto and record what
+    /// isn't claimed by a source entry. The same ignore patterns apply,
+    /// anchored at the same roots, so an ignored path is out of scope on both
+    /// sides and never deleted — and a directory holding one can't be deleted
+    /// either, which is decided here (not by a failing rmdir) so -n and the
+    /// real run agree. Partials are recorded separately: whether one is
+    /// garbage depends on how its file fares this run.
+    fn plan_deletes(&mut self) -> Result<()> {
+        let mut roots = std::mem::take(&mut self.delete_roots);
+        roots.sort();
+        roots.dedup();
+        let inside = |p: &[u8], r: &[u8]| {
+            p.starts_with(r) && (r.ends_with(b"/") || p.get(r.len()) == Some(&b'/'))
+        };
+        for (root, sub) in roots.clone() {
+            // Every root is walked with its own -i anchoring. A root nested in
+            // this one (`pcp --delete a b/ dst`: dst/a inside dst) is left to
+            // its own walk, so its patterns apply and nothing is deleted twice.
+            let nested: Vec<PathBytes> = roots
+                .iter()
+                .filter(|(r, _)| *r != root && inside(r, &root))
+                .map(|(r, _)| r.clone())
+                .collect();
+            // Not there yet (a dry run into a new destination): nothing to delete.
+            if stat_one(self.dst, &root, false)?.is_none() {
+                continue;
+            }
+            let ignore = self.opts.ignore.clone();
+            let mut found = Deletes::default();
+            // Destination directories that hold an ignored path, so must stay.
+            let mut protected: std::collections::HashSet<PathBytes> =
+                std::collections::HashSet::new();
+            let seen = &self.dst_seen;
+            // Destination directories whose path the source claims as a
+            // non-directory (a file we chose not to send, a symlink skipped
+            // without -l, ...). The source has that path, so pcp doesn't touch
+            // it — and gutting the directory underneath would be touching it.
+            let mut shielded: Vec<PathBytes> = Vec::new();
+            let res = self.dst.scan(
+                &root,
+                false,
+                &ignore,
+                true,
+                &mut |batch: Vec<Entry>| {
+                    for e in batch {
+                        if e.path.is_empty() {
+                            continue;
+                        }
+                        let full = join(&root, &e.path);
+                        if e.path == RESUME_MARKER
+                            || nested.iter().any(|n| *n == full || inside(&full, n))
+                            || shielded.iter().any(|d| inside(&full, d))
+                        {
+                            continue;
+                        }
+                        match seen.get(&full) {
+                            Some(Claim::Dir) => continue,
+                            Some(_) => {
+                                if e.kind == Kind::Dir {
+                                    shielded.push(full);
+                                }
+                                continue;
+                            }
+                            None => {}
+                        }
+                        let rel = display(&join(sub.as_bytes(), &e.path));
+                        let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
+                        // Only a regular file can be pcp's leftover; a directory
+                        // or symlink with that name is an ordinary extra.
+                        if e.kind == Kind::File
+                            && crate::fsops::is_partial_name(std::ffi::OsStr::from_bytes(name))
+                        {
+                            let target = crate::fsops::partial_target(&full);
+                            found.partials.push((full, target, rel));
+                        } else {
+                            if e.kind == Kind::Dir {
+                                let depth = full.iter().filter(|&&c| c == b'/').count();
+                                found
+                                    .dirs
+                                    .entry(depth)
+                                    .or_default()
+                                    .push((full, format!("{rel}/")));
+                            } else {
+                                found.leaves.push((full, rel));
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+                &mut |paths: Vec<PathBytes>| {
+                    for p in paths {
+                        // Every ancestor of an ignored path is protected.
+                        for (i, &c) in p.iter().enumerate() {
+                            if c == b'/' {
+                                protected.insert(join(&root, &p[..i]));
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+                &mut |w| self.progress.error(&format!("pcp: delete: {w}")),
+            );
+            res?;
+            self.deletes.leaves.append(&mut found.leaves);
+            self.deletes.partials.append(&mut found.partials);
+            for (d, v) in found.dirs {
+                for (path, rel) in v {
+                    if protected.contains(&path) {
+                        self.progress
+                            .eprintln(&format!("pcp: not deleting {rel}: it holds ignored paths"));
+                    } else {
+                        self.deletes.dirs.entry(d).or_default().push((path, rel));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove what plan_deletes found: leaves first, then directories deepest
+    /// first. Returns the number of entries removed (or that would be, with -n).
+    fn run_deletes(&mut self, failed: &[PathBytes]) -> Result<u64> {
+        let opts = self.opts;
+        let failed: std::collections::HashSet<&PathBytes> = failed.iter().collect();
+        let mut leaves = std::mem::take(&mut self.deletes.leaves);
+        // The walk ran after the transfer, so every partial still present is a
+        // leftover — except those of files that failed this run or that a
+        // filter kept us from sending: those are the resume state of a
+        // transfer that hasn't happened yet.
+        for (partial, target, rel) in std::mem::take(&mut self.deletes.partials) {
+            if !failed.contains(&target) && !self.excluded.contains(&target) {
+                leaves.push((partial, rel));
+            }
+        }
+        let dirs = std::mem::take(&mut self.deletes.dirs);
+        let mut n = 0u64;
+        let mut run = |me: &mut Self, items: &[(PathBytes, String)], rmdir: bool| -> Result<()> {
+            for chunk in items.chunks(1000) {
+                if opts.dry_run {
+                    for (_, rel) in chunk {
+                        n += 1;
+                        if opts.verbose > 0 {
+                            me.progress.println(&format!("deleting {rel}"));
+                        }
+                    }
+                    continue;
+                }
+                let ops: Vec<Op> = chunk
+                    .iter()
+                    .map(|(p, _)| {
+                        if rmdir {
+                            Op::Rmdir { path: p.clone() }
+                        } else {
+                            Op::Remove { path: p.clone() }
+                        }
+                    })
+                    .collect();
+                for ((_, rel), err) in chunk.iter().zip(me.apply(true, ops)?) {
+                    match err {
+                        None => {
+                            n += 1;
+                            if opts.verbose > 0 {
+                                me.progress.println(&format!("deleting {rel}"));
+                            }
+                        }
+                        Some(e) => me.progress.error(&format!("pcp: delete {rel}: {e}")),
+                    }
+                }
+            }
+            Ok(())
+        };
+        run(self, &leaves, false)?;
+        for (_, items) in dirs.iter().rev() {
+            run(self, items, true)?;
+        }
+        Ok(n)
+    }
+
     fn stat_many(&mut self, _on_dst: bool, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
-        match ok(self.dst.call(Request::StatMany(paths))?, "stat")? {
+        match ok(
+            self.dst.call(Request::StatMany {
+                paths,
+                follow: false,
+            })?,
+            "stat",
+        )? {
             Response::Stats(v) => Ok(v),
             other => bail!("unexpected response {other:?}"),
         }
@@ -1154,7 +1819,13 @@ impl Worker {
         }
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
-        let now = match ok(self.src.call(Request::StatMany(paths))?, "stat")? {
+        let now = match ok(
+            self.src.call(Request::StatMany {
+                paths,
+                follow: false,
+            })?,
+            "stat",
+        )? {
             Response::Stats(v) => v,
             other => bail!("unexpected response {other:?}"),
         };
@@ -1644,7 +2315,7 @@ impl Worker {
             "finalize",
         )?;
         // Did the source change under us?
-        let now = stat_one(&mut *self.src, &job.src)?;
+        let now = stat_one(&mut *self.src, &job.src, false)?;
         let changed = match &now {
             Some(e) => {
                 e.kind != Kind::File

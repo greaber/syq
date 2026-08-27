@@ -209,8 +209,8 @@ pub fn run(args: Args) -> Result<i32> {
         let res = ctl.scan(
             &root,
             false,
-            true,
             &[],
+            false,
             &mut |entries: Vec<Entry>| {
                 for e in entries {
                     let full = join(&root, &e.path);
@@ -232,6 +232,7 @@ pub fn run(args: Args) -> Result<i32> {
                 }
                 Ok(())
             },
+            &mut |_| Ok(()),
             &mut |w| progress.error(&format!("pcp: {w}")),
         );
         pool.submit(batch);

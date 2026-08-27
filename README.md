@@ -79,16 +79,28 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
 | `--verify-only` | Hash every file on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
+| `--atomic` | Partial + rename for every file, even small new ones (see below) |
+| `--fsync` | fsync each file (and its directory) before the rename |
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
 | `--pcp-path PATH` | Location of `pcp` on the remote host |
 | `--bootstrap` | Copy this binary to the remote's `~/.local/bin/pcp` if starting it fails |
 | `--tcp` | Data over TCP sockets (AES-256-GCM) after ssh auth; falls back to ssh if unreachable |
 | `--tcp-plain` | Like `--tcp` without encryption (trusted networks only) |
+| `--no-tcp` | Send data over the ssh connections instead |
 | `--tcp-ports LO-HI` | Port range the remote listens on for `--tcp` (default 47600-47699) |
 | `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
+| `--delete` | Remove destination paths the source doesn't have (see below) |
+| `-u`, `--update` | Skip files that are newer on the destination |
+| `--existing` | Only update files that already exist on the destination; create nothing |
+| `--ignore-existing` | Only create files missing on the destination; update nothing |
+| `--max-size SIZE`, `--min-size SIZE` | Don't transfer regular files larger / smaller than SIZE |
+| `--files-from FILE` | Copy only the listed paths (relative to the one source directory; see below) |
+| `--from0` | `--files-from` entries are NUL-separated |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
+| `--detach` | Remote-to-remote: start the transfer detached on the source host and return |
+| `--follow HOST:LOG` | Watch a detached transfer's log |
 | `-h` | Accepted for compatibility; sizes are always human-readable. Use `--help` for help |
 
 ### Remote-to-remote
@@ -210,20 +222,24 @@ Compared with rsync: the atomic rename guarantee is the same for large and
 existing files (and, unlike `rsync -P`, still holds for partial files), but
 small new files are written in place by default for NFS speed — use `--atomic`
 to match rsync's every-file atomicity; the change-during-transfer check
-is the same idea; deletes and hardlinks aren't implemented, so there is no
-ordering question for them.
+is the same idea; `--delete` runs strictly after the transfer (see below);
+hardlinks aren't implemented.
 
 ## Not implemented (on purpose, for now)
 
 - rsync filter rules (`--exclude`/`--include`/`--filter`); use `-i` (gitignore
   syntax) instead.
-- `--delete`, `--link-dest`, `-u`/`--update`, `--files-from`, `--bwlimit`.
+- `--link-dest`, `--bwlimit`, `--backup`.
+- `--delete`'s variants: `--delete-before`/`--delete-during`,
+  `--delete-excluded`, `--max-delete`, `--force`. pcp has one deletion mode.
 - Hardlinks (`-H`), ACLs and xattrs (`-A`/`-X`).
 - rsync daemon mode / `rsync://`. pcp speaks its own protocol; it cannot talk
   to an rsync server.
 - Rolling-checksum delta transfer (see Resume above).
 - Preserving existing partial files from `rsync --partial`; only pcp's own
-  `.name.pcp-partial` files are recognised.
+  `.name.pcp-partial` files are recognised. A *source* file with such a name
+  is never copied (it's assumed to be pcp's leftover), though `--delete`
+  still treats it as the source's and leaves a same-named destination file.
 
 ## When parallelism helps
 
@@ -309,6 +325,75 @@ As in git, a `!` rule cannot re-include something whose parent directory is
 ignored: `logs/**` prunes `logs/keep` itself, so `!logs/keep/**` after it has
 nothing to act on. Ignore the siblings instead (`logs/*`, which does not cross
 `/`) and re-include the directory (`!logs/keep/`), as above.
+
+## Deleting extras (`--delete`)
+
+`pcp -a --delete src/ host:dst/` makes `dst` look like `src`: after the
+transfer, anything under a destination directory that the source doesn't
+have is removed. The rules are simpler than rsync's, deliberately:
+
+- **Scope.** Only inside directories the sources map onto: `pcp --delete a b
+  dst/` cleans `dst/a` and `dst/b`, never `dst/c`. A single-file source deletes
+  nothing.
+- **Ignored means out of scope, on both sides.** The `-i` patterns are applied
+  to the destination walk from the same roots, so an ignored path is neither
+  copied nor deleted, and a directory that holds one is kept (`not deleting
+  keep/: it holds ignored paths`, on stderr, not an error). There is no
+  `--delete-excluded`.
+- **Anything the source has is safe.** A file skipped by `-u`, `--existing`,
+  `--ignore-existing`, `--max-size` or `--min-size` — or a symlink or special
+  file skipped for lack of `-l`/`-D` — still exists in the source, so its
+  destination copy is left alone (rsync would delete a `--max-size`
+  casualty). Such files are reported under `files excluded` in `--stats`.
+- **After, not before.** Deletions run once every file has been transferred
+  and only if the whole source scan succeeded: an unreadable source directory
+  would otherwise look like one whose contents vanished (`source scan reported
+  errors; skipping deletions`). An interrupted run therefore never deletes
+  anything, and directory mtimes are set after the deletes.
+- **pcp's own leftovers count as extras.** A stale `.name.pcp-partial` — one
+  whose file is already up to date, or whose source is gone — is removed.
+  The partial of a file that *failed* this run is kept: it is the resume state
+  for the retry.
+- `-n --delete -v` lists every `deleting path` line a real run would print
+  (a stale partial that the real run resumes from and renames away is the one
+  thing `-n` lists that it won't delete separately). The summary reports
+  `N deleted` / `N would be deleted`.
+
+Deletion goes through the control connection in batches of 1000 (the
+destination side unlinks each batch in parallel); it isn't spread over the
+`-j` data connections like `--rm` is.
+
+## Skipping by state and size
+
+- `-u` / `--update`: a file whose destination copy has a newer mtime is left
+  alone (regular files only).
+- `--existing`: never create anything — files, symlinks, specials,
+  directories, *or the destination itself* — that isn't already there;
+  existing files are still updated. `--ignore-existing` is the mirror image: create what's
+  missing, never touch what exists. Both apply to every non-directory entry.
+- `--max-size` / `--min-size`: regular files outside the range are not
+  transferred (`4K`, `100M`, `2G`; the same suffixes as `--block-size`).
+  Directories and symlinks are unaffected.
+
+## Copying a list (`--files-from`)
+
+`pcp -a --files-from list.txt host:src/ dst/` copies only the paths named in
+`list.txt`, one per line (`--from0`: NUL-separated; `-` reads stdin), each
+relative to the single source directory, to the same relative path under the
+destination. The source is not walked, which is the point on a slow
+filesystem when the list is known. Parent directories of listed paths are
+created (with their metadata). A parent that is a symlink on the source is
+followed — you named a path through it — and becomes a real directory on the
+destination, so nothing is ever written through a destination symlink; a
+parent that resolves to a file or dangles is an error. A listed directory is copied *without*
+its contents unless `-r` is given on the command line itself — `-a` alone
+does not count, as in rsync — so `-a -r --files-from` walks the directories
+the list names (never the implied parents).
+Blank lines are ignored, leading `/` or `./` and trailing `/` are stripped,
+and `..` components or a line that names the root itself are rejected. A listed path that doesn't exist is an
+error (exit 23) and the rest is still copied. `--files-from` can't be combined
+with `-i`/`--ignore-from` or `--delete`; for a remote-to-remote copy it needs
+`--relay` (the list is read on this machine).
 
 ## Parallel removal (`--rm`)
 

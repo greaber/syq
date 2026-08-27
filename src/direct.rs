@@ -72,6 +72,24 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.fsync {
         remote.push("--fsync".into());
     }
+    if args.delete {
+        remote.push("--delete".into());
+    }
+    if args.update {
+        remote.push("--update".into());
+    }
+    if args.ignore_existing {
+        remote.push("--ignore-existing".into());
+    }
+    if args.existing {
+        remote.push("--existing".into());
+    }
+    if let Some(m) = &args.max_size {
+        remote.push(format!("--max-size={m}"));
+    }
+    if let Some(m) = &args.min_size {
+        remote.push(format!("--min-size={m}"));
+    }
     if args.bootstrap {
         remote.push("--bootstrap".into());
     }

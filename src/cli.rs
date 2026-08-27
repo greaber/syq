@@ -164,8 +164,45 @@ pub struct Args {
     #[arg(skip)]
     pub ignore_lines: Vec<String>,
 
+    /// Delete extraneous files from the destination directories (paths the source does not
+    /// have). Deletion happens after the transfer and is skipped entirely if the source scan
+    /// reported any error. Ignored paths (-i) are protected on both sides
+    #[arg(long, conflicts_with_all = ["verify_only", "files_from"])]
+    pub delete: bool,
+    /// Skip files that are newer on the destination
+    #[arg(short = 'u', long)]
+    pub update: bool,
+    /// Skip updating files that already exist on the destination
+    #[arg(long)]
+    pub ignore_existing: bool,
+    /// Skip creating files and directories that don't exist yet on the destination
+    #[arg(long)]
+    pub existing: bool,
+    /// Don't transfer regular files larger than SIZE (e.g. 100M). With --delete the
+    /// destination copy of such a file is left alone
+    #[arg(long, value_name = "SIZE")]
+    pub max_size: Option<String>,
+    /// Don't transfer regular files smaller than SIZE
+    #[arg(long, value_name = "SIZE")]
+    pub min_size: Option<String>,
+    /// Copy only the paths listed in FILE (one per line, relative to the single source
+    /// directory; `-` reads stdin). Listed directories are copied without their contents
+    /// unless -r is given explicitly; missing parent directories are created
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["ignore", "ignore_from"])]
+    pub files_from: Option<String>,
+    /// --files-from entries are NUL-separated instead of one per line
+    #[arg(long, requires = "files_from")]
+    pub from0: bool,
+    /// Paths read from --files-from (filled by parse_args)
+    #[arg(skip)]
+    pub files_from_lines: Vec<Vec<u8>>,
+    /// -r given on the command line itself (not via -a); decides whether --files-from
+    /// directories are copied with their contents
+    #[arg(skip)]
+    pub recursive_explicit: bool,
+
     /// Remove the given paths recursively and in parallel (like rm -rf); honours -j, -n, -v, -q, -e
-    #[arg(long, conflicts_with_all = ["ignore", "ignore_from"])]
+    #[arg(long, conflicts_with_all = ["ignore", "ignore_from", "delete", "files_from"])]
     pub rm: bool,
 
     /// Source(s) and destination (or, with --rm, the paths to remove)
@@ -204,10 +241,27 @@ impl Args {
                 args.ignore_lines.push(v);
             }
         }
+        if let Some(f) = &args.files_from {
+            // Check this before reading the list (it may be stdin) and before
+            // anything connects: the list lives on this machine, but a direct
+            // remote-to-remote copy would run the orchestrator on the source.
+            if !args.rm && !args.follow && !args.relay && args.paths.len() >= 2 {
+                let locs: Vec<Location> = args
+                    .paths
+                    .iter()
+                    .map(|p| Location::parse(p))
+                    .collect::<Result<_>>()?;
+                if locs[0].is_remote() && locs[locs.len() - 1].is_remote() {
+                    bail!("--files-from with a remote-to-remote copy needs --relay");
+                }
+            }
+            args.files_from_lines = read_files_from(f, args.from0)?;
+        }
         Ok(args)
     }
 
     pub fn normalize(&mut self) {
+        self.recursive_explicit = self.recursive;
         if self.archive {
             self.recursive = true;
             self.links = true;
@@ -242,6 +296,59 @@ impl Args {
         }
         f
     }
+}
+
+/// Read a --files-from list: one path per line (or NUL-separated with --from0),
+/// relative to the source root. Blank lines are dropped; a leading `/` or `./`
+/// is stripped; `..` components and absolute escapes are rejected.
+fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    if file == "-" {
+        std::io::stdin().read_to_end(&mut raw)?;
+    } else {
+        raw = std::fs::read(file).map_err(|e| anyhow::anyhow!("--files-from {file}: {e}"))?;
+    }
+    let mut out = Vec::new();
+    let items: Vec<&[u8]> = if nul {
+        raw.split(|&b| b == 0).collect()
+    } else {
+        raw.split(|&b| b == b'\n')
+            .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+            .collect()
+    };
+    for item in items {
+        if item.is_empty() {
+            continue;
+        }
+        let mut p = item;
+        while let Some(rest) = p.strip_prefix(b"./").or_else(|| p.strip_prefix(b"/")) {
+            p = rest;
+        }
+        while let Some(rest) = p.strip_suffix(b"/") {
+            p = rest;
+        }
+        if p.split(|&b| b == b'/').any(|c| c == b"..") {
+            bail!(
+                "--files-from: {:?} contains a `..` component",
+                String::from_utf8_lossy(item)
+            );
+        }
+        // Drop `.` and empty components (`a/./b`, `a//b` -> `a/b`) so one path
+        // has one spelling and the planner never schedules a file twice.
+        let parts: Vec<&[u8]> = p
+            .split(|&b| b == b'/')
+            .filter(|c| *c != b"." && !c.is_empty())
+            .collect();
+        if parts.is_empty() {
+            bail!(
+                "--files-from: {:?} names the source root itself",
+                String::from_utf8_lossy(item)
+            );
+        }
+        out.push(parts.join(&b'/'));
+    }
+    Ok(out)
 }
 
 pub fn parse_size(s: &str) -> Result<u64> {
@@ -320,7 +427,6 @@ impl Location {
         })
     }
 
-    #[allow(dead_code)]
     pub fn is_remote(&self) -> bool {
         self.host.is_some()
     }

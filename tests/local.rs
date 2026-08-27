@@ -1152,3 +1152,750 @@ fn ignore_conflicts_with_rm() {
     assert!(!out.status.success());
     assert!(t.path("tree/hello.txt").is_file());
 }
+
+// ---------------------------------------------------------------- --delete
+
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn delete_removes_extras_and_protects_ignored() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("src/d/b"), b"b");
+    write(&t.path("dst/a"), b"old");
+    write(&t.path("dst/d/b"), b"b");
+    write(&t.path("dst/c"), b"extra");
+    write(&t.path("dst/extra/x/y"), b"extra");
+    write(&t.path("dst/keep/k.log"), b"protected");
+    write(&t.path("dst/keep/gone"), b"not protected");
+    std::os::unix::fs::symlink("nowhere", t.path("dst/dangling")).unwrap();
+
+    // Dry run: everything listed, nothing removed.
+    let out = pcp(&[
+        "-a",
+        "-n",
+        "-v",
+        "--delete",
+        "-i",
+        "*.log",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(out.status.success());
+    let so = String::from_utf8_lossy(&out.stdout);
+    for l in [
+        "deleting c",
+        "deleting extra/x/y",
+        "deleting extra/x/",
+        "deleting extra/",
+        "deleting keep/gone",
+        "deleting dangling",
+    ] {
+        assert!(so.contains(l), "missing {l:?} in {so}");
+    }
+    assert!(!so.contains("k.log"), "{so}");
+    assert!(!so.lines().any(|l| l == "deleting keep/"), "{so}");
+    assert!(so.contains("6 would be deleted"), "{so}");
+    assert!(
+        stderr_of(&out).contains("not deleting keep/"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(t.path("dst/c").exists() && t.path("dst/extra/x/y").exists());
+
+    let out = pcp(&[
+        "-a",
+        "-v",
+        "--delete",
+        "-i",
+        "*.log",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(
+        listing(&t.path("dst")),
+        ["a", "d", "d/b", "keep", "keep/k.log"]
+    );
+    assert_eq!(read(&t.path("dst/a")), b"a");
+    let so = String::from_utf8_lossy(&out.stdout);
+    assert!(so.contains("6 deleted"), "{so}");
+    // keep/ stays because it holds a protected file: reported, not an error.
+    let se = stderr_of(&out);
+    assert!(se.contains("not deleting keep/"), "{se}");
+}
+
+#[test]
+fn delete_cleans_stale_partials_but_keeps_resume_state_of_failed_files() {
+    let t = Tmp::new();
+    write(&t.path("src/ok"), b"ok");
+    write(&t.path("src/bad"), b"unreadable");
+    write(&t.path("dst/ok"), b"ok");
+    set_mtime(&t.path("src/ok"), 1_600_000_000);
+    set_mtime(&t.path("dst/ok"), 1_600_000_000);
+    // Stale: target is up to date. Orphan: no such source. Failed: kept.
+    write(&t.path("dst/.ok.pcp-partial"), b"stale");
+    write(&t.path("dst/.orphan.pcp-partial"), b"orphan");
+    write(&t.path("dst/.bad.pcp-partial"), b"resume-state");
+    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = pcp(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(!t.path("dst/.ok.pcp-partial").exists());
+    assert!(!t.path("dst/.orphan.pcp-partial").exists());
+    assert!(t.path("dst/.bad.pcp-partial").exists());
+    assert!(t.path("dst/ok").is_file());
+}
+
+#[test]
+fn delete_is_skipped_when_the_source_scan_has_errors() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("src/locked/inner"), b"x");
+    write(&t.path("dst/extra"), b"extra");
+    fs::set_permissions(t.path("src/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let out = pcp(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(out.status.code(), Some(23));
+    assert!(t.path("dst/extra").exists(), "nothing may be deleted");
+    assert!(
+        stderr_of(&out).contains("skipping deletions"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn delete_only_inside_directories_the_sources_map_onto() {
+    let t = Tmp::new();
+    write(&t.path("s1/a"), b"a");
+    write(&t.path("s2/b"), b"b");
+    write(&t.path("dst/s1/extra"), b"x");
+    write(&t.path("dst/s2/extra"), b"x");
+    write(&t.path("dst/other"), b"untouched");
+    // pcp's own session marker is never an extra.
+    write(&t.path("dst/s1/.pcp-transfer-session.json"), b"{}");
+    run_ok(&["-a", "--delete", &t.s("s1"), &t.s("s2"), &t.s("dst")]);
+    assert_eq!(
+        listing(&t.path("dst")),
+        [
+            "other",
+            "s1",
+            "s1/.pcp-transfer-session.json",
+            "s1/a",
+            "s2",
+            "s2/b"
+        ]
+    );
+    // A dry run into a destination that doesn't exist yet has nothing to delete.
+    let so = run_ok(&["-a", "-n", "--delete", &t.s("s1/"), &t.s("nowhere")]);
+    assert!(so.contains("0 would be deleted"), "{so}");
+    assert!(!t.path("nowhere").exists());
+    // A single-file source deletes nothing.
+    write(&t.path("dst2/junk"), b"j");
+    run_ok(&["-a", "--delete", &t.s("s1/a"), &t.s("dst2/")]);
+    assert!(t.path("dst2/junk").exists());
+}
+
+// --------------------------------------------- -u, --existing, --ignore-existing
+
+#[test]
+fn update_skips_files_newer_on_the_destination() {
+    let t = Tmp::new();
+    write(&t.path("src/newer"), b"src-new");
+    write(&t.path("src/older"), b"src-old");
+    write(&t.path("dst/newer"), b"dst-old");
+    write(&t.path("dst/older"), b"dst-new");
+    set_mtime(&t.path("src/newer"), 2000);
+    set_mtime(&t.path("dst/newer"), 1000);
+    set_mtime(&t.path("src/older"), 1000);
+    set_mtime(&t.path("dst/older"), 2000);
+    let so = run_ok(&["-a", "-u", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(transferred(&so), 1);
+    assert_eq!(read(&t.path("dst/newer")), b"src-new");
+    assert_eq!(read(&t.path("dst/older")), b"dst-new");
+    // Without -u the older destination file is replaced too.
+    run_ok(&["-a", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(read(&t.path("dst/older")), b"src-old");
+}
+
+#[test]
+fn ignore_existing_and_existing() {
+    let t = Tmp::new();
+    write(&t.path("src/have"), b"new content");
+    write(&t.path("src/new"), b"n");
+    write(&t.path("src/sub/deep"), b"d");
+    write(&t.path("dst/have"), b"old content");
+    set_mtime(&t.path("src/have"), 2000);
+    set_mtime(&t.path("dst/have"), 1000);
+
+    let so = run_ok(&["-a", "--ignore-existing", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(transferred(&so), 2);
+    assert_eq!(read(&t.path("dst/have")), b"old content");
+    assert!(t.path("dst/new").is_file() && t.path("dst/sub/deep").is_file());
+
+    let t = Tmp::new();
+    write(&t.path("src/have"), b"new content");
+    write(&t.path("src/new"), b"n");
+    write(&t.path("src/sub/deep"), b"d");
+    write(&t.path("dst/have"), b"old content");
+    set_mtime(&t.path("src/have"), 2000);
+    set_mtime(&t.path("dst/have"), 1000);
+    let so = run_ok(&["-a", "--existing", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(transferred(&so), 1);
+    assert_eq!(read(&t.path("dst/have")), b"new content");
+    assert_eq!(listing(&t.path("dst")), ["have"]);
+    // --existing --delete still removes extras.
+    write(&t.path("dst/extra"), b"e");
+    run_ok(&["-a", "--existing", "--delete", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(listing(&t.path("dst")), ["have"]);
+}
+
+// ------------------------------------------------------- --max-size / --min-size
+
+#[test]
+fn size_limits_filter_files_and_protect_them_from_delete() {
+    let t = Tmp::new();
+    write(&t.path("src/small"), &[0u8; 10]);
+    write(&t.path("src/mid"), &[0u8; 2048]);
+    write(&t.path("src/big"), &[0u8; 8192]);
+    write(&t.path("dst/big"), b"stays");
+    let so = run_ok(&[
+        "-a",
+        "--delete",
+        "--max-size",
+        "4K",
+        "--min-size",
+        "1K",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(transferred(&so), 1);
+    assert_eq!(listing(&t.path("dst")), ["big", "mid"]);
+    assert_eq!(read(&t.path("dst/big")), b"stays");
+}
+
+// --------------------------------------------------------------- --files-from
+
+#[test]
+fn files_from_copies_listed_paths_with_their_parents() {
+    let t = Tmp::new();
+    for f in ["a/1", "a/2", "b/c/3", "b/c/4", "d/5", "top"] {
+        write(&t.path("src").join(f), f.as_bytes());
+    }
+    write(&t.path("list"), b"a/1\n\n./b/c/3\n/top\nb/c/\nmissing/x\n");
+    let out = pcp(&["-a", "--files-from", &t.s("list"), &t.s("src"), &t.s("dst")]);
+    // The missing entry is an error but the rest is copied.
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("missing/x"));
+    // b/c is listed as a directory but -r wasn't given explicitly: no contents
+    // beyond what the list names.
+    assert_eq!(
+        listing(&t.path("dst")),
+        ["a", "a/1", "b", "b/c", "b/c/3", "top"]
+    );
+    assert_eq!(read(&t.path("dst/b/c/3")), b"b/c/3");
+
+    // Explicit -r walks listed directories; --from0 takes NUL separators.
+    write(&t.path("list0"), b"b/c\0d\0");
+    run_ok(&[
+        "-a",
+        "-r",
+        "--files-from",
+        &t.s("list0"),
+        "--from0",
+        &t.s("src/"),
+        &t.s("dst2"),
+    ]);
+    assert_eq!(
+        listing(&t.path("dst2")),
+        ["b", "b/c", "b/c/3", "b/c/4", "d", "d/5"]
+    );
+
+    // Alternate spellings of one path are one path: no double scheduling.
+    write(&t.path("list-dup"), b"a/1\na//1\n./a/./1/\n");
+    let so = run_ok(&[
+        "-a",
+        "--files-from",
+        &t.s("list-dup"),
+        &t.s("src"),
+        &t.s("dst4"),
+    ]);
+    assert_eq!(transferred(&so), 1);
+    assert_eq!(listing(&t.path("dst4")), ["a", "a/1"]);
+
+    // A `..` component is rejected before anything happens.
+    write(&t.path("bad"), b"../etc\n");
+    let out = pcp(&["-a", "--files-from", &t.s("bad"), &t.s("src"), &t.s("dst3")]);
+    assert!(!out.status.success());
+    assert!(!t.path("dst3").exists());
+}
+
+// ------------------------------------------------------------ review fixes
+
+#[test]
+fn delete_never_removes_paths_the_source_has_but_skips() {
+    let t = Tmp::new();
+    write(&t.path("src/plain"), b"p");
+    write(&t.path("src/hard"), b"h");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::hard_link(t.path("src/hard"), t.path("dst/hard")).unwrap();
+    std::os::unix::fs::symlink("plain", t.path("src/link")).unwrap();
+    std::os::unix::fs::symlink("plain", t.path("dst/link")).unwrap();
+    write(&t.path("dst/extra"), b"x");
+    // No -l: the symlink is skipped, but it is the source's, so it stays.
+    // The hardlinked file is "the same file" and skipped, and stays.
+    let so = run_ok(&["-rt", "--delete", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(listing(&t.path("dst")), ["hard", "link", "plain"]);
+    // Skipped files are not reported as directories.
+    assert!(so.contains(", 1 dirs"), "{so}");
+    write(&t.path("src2/big"), b"bb");
+    let so = run_ok(&["-a", "--max-size", "1", &t.s("src2/"), &t.s("dst2")]);
+    assert!(
+        so.contains("transferred 0 files") && so.contains(", 1 dirs"),
+        "{so}"
+    );
+}
+
+#[test]
+fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
+    let t = Tmp::new();
+    write(&t.path("outside/secret"), b"secret");
+    fs::create_dir_all(t.path("src/a")).unwrap();
+    std::os::unix::fs::symlink("../outside", t.path("src/link")).unwrap();
+    write(&t.path("src/a/listed"), b"l");
+    write(&t.path("src/a/unlisted"), b"u");
+    write(&t.path("list"), b"link/secret\na/listed\n");
+    let out = pcp(&[
+        "-a",
+        "-r",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    // `link` resolves to a directory, so the listed path is followed: the
+    // implied parent becomes a real directory on the destination (never a
+    // symlink a later write could go through). `a` was not recursed into
+    // despite -r: only listed directories are walked.
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(
+        listing(&t.path("dst")),
+        ["a", "a/listed", "link", "link/secret"]
+    );
+    assert!(t.path("dst/link").symlink_metadata().unwrap().is_dir());
+    assert_eq!(read(&t.path("dst/link/secret")), b"secret");
+
+    // An ancestor that resolves to a file, or dangles, is an error.
+    std::os::unix::fs::symlink("a/listed", t.path("src/tofile")).unwrap();
+    std::os::unix::fs::symlink("nowhere", t.path("src/dangling")).unwrap();
+    write(&t.path("list2"), b"tofile/x\ndangling/y\n");
+    let out = pcp(&[
+        "-a",
+        "--files-from",
+        &t.s("list2"),
+        &t.s("src"),
+        &t.s("dst2"),
+    ]);
+    assert_eq!(out.status.code(), Some(23));
+    let se = stderr_of(&out);
+    assert!(
+        se.contains("tofile is not a directory") && se.contains("dangling/y: no such file"),
+        "{se}"
+    );
+    assert_eq!(listing(&t.path("dst2")), Vec::<String>::new());
+
+    // Listing a symlink itself and a path through it conflicts; the path is
+    // refused rather than written through the destination symlink.
+    write(&t.path("list3"), b"link\nlink/secret\n");
+    let out = pcp(&[
+        "-a",
+        "--files-from",
+        &t.s("list3"),
+        &t.s("src"),
+        &t.s("dst3"),
+    ]);
+    assert_eq!(out.status.code(), Some(23));
+    assert!(stderr_of(&out).contains("listed as a non-directory"));
+    assert!(t.path("dst3/link").symlink_metadata().unwrap().is_symlink());
+    assert!(!t.path("outside/secret2").exists());
+}
+
+#[test]
+fn existing_never_creates_the_destination_root() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"f");
+    let so = run_ok(&["-a", "--existing", &t.s("src/"), &t.s("dst/")]);
+    assert!(!t.path("dst").exists(), "{so}");
+    write(&t.path("src2/g"), b"g");
+    let so = run_ok(&["-a", "--existing", &t.s("src"), &t.s("src2"), &t.s("dst2")]);
+    assert!(!t.path("dst2").exists(), "{so}");
+}
+
+#[test]
+fn delete_exempts_the_marker_only_at_the_root() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("dst/.pcp-transfer-session.json"), b"{}");
+    write(&t.path("dst/extra/.pcp-transfer-session.json"), b"{}");
+    run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(listing(&t.path("dst")), [".pcp-transfer-session.json", "a"]);
+}
+
+#[test]
+fn files_from_repeats_and_late_listed_dirs_across_chunks() {
+    let t = Tmp::new();
+    write(&t.path("src/d/inner"), b"i");
+    write(&t.path("src/d/sub/deep"), b"x");
+    let mut list = String::from("d/inner\n");
+    for i in 0..1200 {
+        write(&t.path(&format!("src/many/f{i}")), b"f");
+        list.push_str(&format!("many/f{i}\n"));
+    }
+    // After the 1000-entry boundary: repeat a path, and list `d` (so far only
+    // an implied parent) explicitly so -r walks it.
+    list.push_str("d/inner\nd\n");
+    write(&t.path("list"), list.as_bytes());
+    let so = run_ok(&[
+        "-a",
+        "-r",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(transferred(&so), 1202);
+    assert!(t.path("dst/d/sub/deep").is_file());
+    assert!(t.path("dst/many/f1199").is_file());
+}
+
+#[test]
+fn existing_dry_run_lists_no_missing_directories() {
+    let t = Tmp::new();
+    write(&t.path("src/there/f"), b"f");
+    write(&t.path("src/missing/g"), b"g");
+    fs::create_dir_all(t.path("dst/there")).unwrap();
+    let so = run_ok(&["-a", "-n", "-v", "--existing", &t.s("src/"), &t.s("dst")]);
+    assert!(so.contains("dst/there/"), "{so}");
+    assert!(!so.contains("missing"), "{so}");
+    assert!(!so.contains("there/f"), "--existing creates no files: {so}");
+}
+
+// ------------------------------------------------------------ review round 3
+
+#[test]
+fn existing_leaves_a_file_where_a_source_directory_would_go() {
+    let t = Tmp::new();
+    write(&t.path("src/d/inner"), b"i");
+    write(&t.path("dst/d"), b"a file, not a directory");
+    let so = run_ok(&["-a", "--existing", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(read(&t.path("dst/d")), b"a file, not a directory");
+    assert_eq!(listing(&t.path("dst")), ["d"]);
+    let so2 = run_ok(&["-a", "-n", "-v", "--existing", &t.s("src/"), &t.s("dst")]);
+    assert!(!so2.contains("dst/d/"), "{so2}\n{so}");
+}
+
+#[test]
+fn delete_keeps_user_files_named_like_partials_and_survives_bare_suffix() {
+    let t = Tmp::new();
+    write(&t.path("src/.notes.pcp-partial"), b"mine");
+    write(&t.path("src/real"), b"r");
+    write(&t.path("dst/.notes.pcp-partial"), b"mine");
+    write(&t.path("dst/.pcp-partial"), b"odd name");
+    write(&t.path("dst/.gone.pcp-partial"), b"leftover");
+    let so = run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
+    // The source's partial-looking file is never copied (pcp's own naming)
+    // but it is the source's, so the destination copy stays. The bare suffix
+    // is an ordinary extra, and the orphaned partial is garbage.
+    assert_eq!(listing(&t.path("dst")), [".notes.pcp-partial", "real"]);
+    assert!(so.contains("2 deleted"), "{so}");
+}
+
+#[test]
+fn files_from_creates_listed_and_implied_dirs_without_r() {
+    let t = Tmp::new();
+    write(&t.path("src/a/1"), b"1");
+    fs::create_dir_all(t.path("src/b/inner")).unwrap();
+    fs::set_permissions(t.path("src/a"), fs::Permissions::from_mode(0o750)).unwrap();
+    fs::set_permissions(t.path("src/b"), fs::Permissions::from_mode(0o710)).unwrap();
+    write(&t.path("list"), b"a/1\nb\n");
+    // -t only: no -r, no -a. Directories must still be created, with metadata.
+    run_ok(&[
+        "-pt",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(listing(&t.path("dst")), ["a", "a/1", "b"]);
+    assert_eq!(fs::metadata(t.path("dst/a")).unwrap().mode() & 0o777, 0o750);
+    assert_eq!(fs::metadata(t.path("dst/b")).unwrap().mode() & 0o777, 0o710);
+}
+
+#[test]
+fn delete_with_nested_roots_deletes_once() {
+    let t = Tmp::new();
+    write(&t.path("a/x"), b"x");
+    write(&t.path("b/y"), b"y");
+    write(&t.path("dst/a/extra/deep"), b"e");
+    write(&t.path("dst/stray"), b"s");
+    let so = run_ok(&["-a", "-v", "--delete", &t.s("a"), &t.s("b/"), &t.s("dst")]);
+    assert_eq!(listing(&t.path("dst")), ["a", "a/x", "y"]);
+    assert!(so.contains("3 deleted"), "{so}");
+    assert!(!so.contains("errors"), "{so}");
+}
+
+#[test]
+fn delete_with_inplace_replacing_many_symlinks() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("dst")).unwrap();
+    for i in 0..3000 {
+        write(&t.path(&format!("src/f{i}")), b"file now");
+        std::os::unix::fs::symlink("nowhere", t.path(&format!("dst/f{i}"))).unwrap();
+    }
+    let so = run_ok(&[
+        "-a",
+        "--inplace",
+        "--delete",
+        "-j",
+        "16",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(!so.contains("errors"), "{so}");
+    assert_eq!(read(&t.path("dst/f2999")), b"file now");
+}
+
+// ------------------------------------------------------------ review round 5
+
+#[test]
+fn unreadable_source_root_disables_delete() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("dst/precious"), b"p");
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o000)).unwrap();
+    // -rt rather than -a, so dst doesn't faithfully inherit the 000 mode.
+    let out = pcp(&["-rt", "--delete", &t.s("src/"), &t.s("dst")]);
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    assert!(t.path("dst/precious").exists(), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("skipping deletions"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn delete_nested_roots_keep_their_own_anchored_ignores() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("src2/foo/g"), b"g");
+    write(&t.path("src2/b"), b"b");
+    write(&t.path("dst/src2/foo/g"), b"g");
+    write(&t.path("dst/src2/junk"), b"j");
+    write(&t.path("dst/foo/h"), b"h");
+    let so = run_ok(&[
+        "-a",
+        "-v",
+        "--delete",
+        "-i",
+        "/foo",
+        &t.s("src/"),
+        &t.s("src2"),
+        &t.s("dst"),
+    ]);
+    // /foo is anchored at each root: dst/src2/foo is protected (ignored on
+    // both sides of the src2 mapping), dst/foo likewise for src/; junk goes.
+    assert_eq!(
+        listing(&t.path("dst")),
+        [
+            "a",
+            "foo",
+            "foo/h",
+            "src2",
+            "src2/b",
+            "src2/foo",
+            "src2/foo/g"
+        ]
+    );
+    assert!(so.contains("1 deleted"), "{so}");
+}
+
+#[test]
+fn delete_treats_partial_named_directory_as_ordinary_extra() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("dst/.d.pcp-partial/x"), b"x");
+    write(&t.path("dst/.d.pcp-partial/keep.log"), b"k");
+    let so = run_ok(&[
+        "-a",
+        "-v",
+        "--delete",
+        "-i",
+        "*.log",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(
+        listing(&t.path("dst")),
+        [".d.pcp-partial", ".d.pcp-partial/keep.log", "a"]
+    );
+    assert!(so.contains("1 deleted") && !so.contains("errors"), "{so}");
+}
+
+#[test]
+fn untransferred_entries_yield_to_another_source() {
+    let t = Tmp::new();
+    std::os::unix::fs::symlink(
+        "nowhere",
+        t.path("a/x")
+            .parent()
+            .map(|p| {
+                fs::create_dir_all(p).unwrap();
+                t.path("a/x")
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    write(&t.path("b/x"), b"hi");
+    // No -l: a/x is skipped and must not block b/x (either order).
+    run_ok(&["-r", &t.s("a/"), &t.s("b/"), &t.s("dst")]);
+    assert_eq!(read(&t.path("dst/x")), b"hi");
+    run_ok(&["-r", &t.s("b/"), &t.s("a/"), &t.s("dst2")]);
+    assert_eq!(read(&t.path("dst2/x")), b"hi");
+    // But a real conflict is still one.
+    write(&t.path("c/x"), b"other");
+    let out = pcp(&["-r", &t.s("b/"), &t.s("c/"), &t.s("dst3")]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn delete_keeps_partials_of_filtered_files() {
+    let t = Tmp::new();
+    write(&t.path("src/big"), &[0u8; 100]);
+    write(&t.path("src/newer-on-dst"), b"src");
+    write(&t.path("dst/newer-on-dst"), b"dst");
+    set_mtime(&t.path("src/newer-on-dst"), 1000);
+    set_mtime(&t.path("dst/newer-on-dst"), 2000);
+    write(&t.path("dst/.big.pcp-partial"), b"half");
+    write(&t.path("dst/.newer-on-dst.pcp-partial"), b"half");
+    write(&t.path("dst/.orphan.pcp-partial"), b"garbage");
+    run_ok(&[
+        "-a",
+        "--delete",
+        "-u",
+        "--max-size",
+        "10",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(t.path("dst/.big.pcp-partial").exists());
+    assert!(t.path("dst/.newer-on-dst.pcp-partial").exists());
+    assert!(!t.path("dst/.orphan.pcp-partial").exists());
+}
+
+#[test]
+fn existing_does_not_write_through_a_destination_symlink_dir() {
+    let t = Tmp::new();
+    write(&t.path("src/d/f"), b"new");
+    write(&t.path("src/d/sub/g"), b"new");
+    write(&t.path("elsewhere/f"), b"old");
+    write(&t.path("elsewhere/sub/g"), b"old");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    std::os::unix::fs::symlink(t.path("elsewhere"), t.path("dst/d")).unwrap();
+    set_mtime(&t.path("src/d/f"), 2000);
+    set_mtime(&t.path("elsewhere/f"), 1000);
+    let so = run_ok(&["-a", "--existing", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(read(&t.path("elsewhere/f")), b"old", "{so}");
+    assert_eq!(read(&t.path("elsewhere/sub/g")), b"old", "{so}");
+    assert!(t.path("dst/d").symlink_metadata().unwrap().is_symlink());
+    let so = run_ok(&["-a", "-n", "--existing", &t.s("src/"), &t.s("dst")]);
+    assert!(so.contains("would transfer 0 files"), "{so}");
+}
+
+#[test]
+fn no_recursive_skips_every_batch_of_a_directory_source() {
+    let t = Tmp::new();
+    for i in 0..1500 {
+        write(&t.path(&format!("src/f{i}")), b"f");
+    }
+    let so = run_ok(&["-t", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(transferred(&so), 0);
+    assert!(!t.path("dst/f1400").exists());
+}
+
+#[test]
+fn files_from_root_may_be_a_symlink_and_root_lines_are_rejected() {
+    let t = Tmp::new();
+    write(&t.path("real/f"), b"f");
+    std::os::unix::fs::symlink(t.path("real"), t.path("link")).unwrap();
+    write(&t.path("list"), b"f\n");
+    run_ok(&[
+        "-a",
+        "--files-from",
+        &t.s("list"),
+        &t.s("link"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/f")), b"f");
+    write(&t.path("bad"), b"././//\n");
+    let out = pcp(&[
+        "-a",
+        "--files-from",
+        &t.s("bad"),
+        &t.s("real"),
+        &t.s("dst2"),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("names the source root"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn delete_leaves_directory_contents_under_a_skipped_source_path() {
+    let t = Tmp::new();
+    write(&t.path("src/big"), &[0u8; 100]);
+    std::os::unix::fs::symlink("nowhere", t.path("src/lnk")).unwrap();
+    write(&t.path("src/real"), b"r");
+    write(&t.path("dst/big/inside"), b"i");
+    write(&t.path("dst/lnk/deep/inside"), b"i");
+    write(&t.path("dst/extra"), b"e");
+    let so = run_ok(&[
+        "-rt",
+        "--delete",
+        "--max-size",
+        "10",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(
+        listing(&t.path("dst")),
+        [
+            "big",
+            "big/inside",
+            "lnk",
+            "lnk/deep",
+            "lnk/deep/inside",
+            "real"
+        ]
+    );
+    assert!(so.contains("1 deleted"), "{so}");
+}
+
+#[test]
+fn existing_does_not_write_through_a_destination_root_symlink() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"new");
+    write(&t.path("elsewhere/f"), b"old");
+    set_mtime(&t.path("src/f"), 2000);
+    set_mtime(&t.path("elsewhere/f"), 1000);
+    std::os::unix::fs::symlink(t.path("elsewhere"), t.path("dst")).unwrap();
+    let so = run_ok(&["-a", "--existing", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(read(&t.path("elsewhere/f")), b"old", "{so}");
+    assert!(t.path("dst").symlink_metadata().unwrap().is_symlink());
+}

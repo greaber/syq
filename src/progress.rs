@@ -25,6 +25,9 @@ pub struct Progress {
     pub files_total: AtomicU64,
     pub files_done: AtomicU64,
     pub files_skipped: AtomicU64,
+    /// Source files deliberately not transferred (-u, size limits, --existing,
+    /// symlinks without -l, ...); neither "transferred" nor "unchanged".
+    pub files_excluded: AtomicU64,
     pub scanned: AtomicU64,
     pub scan_done: AtomicBool,
     pub errors: AtomicU64,
@@ -59,6 +62,7 @@ impl Progress {
             files_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
             files_skipped: AtomicU64::new(0),
+            files_excluded: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
             scan_done: AtomicBool::new(false),
             errors: AtomicU64::new(0),
