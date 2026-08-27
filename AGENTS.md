@@ -34,6 +34,30 @@ or the user explicitly identified it as the target. Never infer ownership from
 a plausible branch name. Before every file edit or write, confirm that
 `git rev-parse --show-toplevel` points at the task worktree.
 
+## SSH from long-lived tmux sessions
+
+A long-lived tmux server can retain the working SSH-agent forwarding
+environment while a newly attached shell has stale or missing `SSH_*`
+variables. Before concluding that a cluster host is inaccessible or that
+SSH authentication is broken, restore those variables in the same shell
+that will run `ssh`:
+
+```bash
+eval "$(tmux show-env -s | grep '^SSH_')"
+```
+
+Each agent tool command starts a new shell, so prefix the relevant SSH
+command with this restoration when necessary.
+
+## Long-running commands and readiness
+
+- Use the repository's readiness or wait command when one exists. Do not replace it with an unbounded `until`/`while` loop.
+- Every custom poll must have a hard deadline, emit periodic progress, and report the last observed state when it times out.
+- Treat exit status or structured output as the machine-readable contract. Do not `grep` human-readable status text, which may be written to a different stream or change independently of the contract.
+- Keep long-running command output live. Do not pipe it directly through buffering or early-exit consumers such as `tail`, `head`, or `grep -q`; use the repository's foreground runner or `tee` when output also needs to be captured.
+- If the command runtime moves a live command into the background, continue monitoring the original task or session handle. Do not launch a second copy. When stopping an owned command, terminate and verify its whole process group so children cannot survive as stale workers or lock holders.
+- For asynchronous CI, use the repository's CI monitor/wait mechanism instead of shell polling.
+
 ## Documentation over agent memory
 
 Prefer durable, committed documentation over private memory. Facts worth
@@ -70,6 +94,28 @@ outlive its premise and steer later work in the wrong direction.
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
 
+## Always report the commit you are talking about
+
+- Any status report about branch or PR work states the short SHA it refers
+  to: what you just pushed, what CI ran against, what you are about to
+  change. "PR #123 is green" is not actionable; "PR #123 is green at
+  `ab12cd3`" is.
+- This pairs with the reviewer-side rule below. When the working agent and
+  the reviewing agent both name a SHA, the reader can tell at a glance
+  whose turn it is: same SHA means the review covers the current work,
+  different SHAs mean one of them is behind and needs to act.
+- State the SHA even when nothing changed — "unchanged at `ab12cd3`" is
+  the fact the reader needs to route the next step.
+
+## PR review freshness
+
+- For any GitHub PR review or re-review, never assume the current checkout `HEAD` is the latest PR code. Resolve the PR's `headRefName` and GitHub `headRefOid` first.
+- In this repo's multi-worktree review workflow, also resolve the local branch ref for that same `headRefName`. A detached review worktree can stay pinned to an old commit even when the branch ref has moved.
+- Choose the review target from the named branch ref / GitHub head comparison, not from the current worktree `HEAD`. If local and GitHub match, review that SHA.
+- If the local branch is ahead of GitHub, do not silently review the stale GitHub PR head. Tell the user GitHub is stale and either review the local branch tip explicitly or wait for the fixes to be pushed.
+- If the chosen review target SHA matches the last SHA already reviewed, stop immediately and report that the PR is unchanged instead of producing another review.
+- Always state the exact reviewed SHA and whether it came from the local branch tip or the GitHub PR head.
+
 ## Working on syq
 
 - `README.md` is the user-facing contract; the code is authoritative for
@@ -86,6 +132,8 @@ outlive its premise and steer later work in the wrong direction.
 - Exercise copy, resume, verification, and removal behavior in disposable
   temporary directories. Treat `syq --rm`, remote destinations, bootstrap
   installation, and operations on real user data as potentially destructive.
+
+**Do not drop agreed requirements silently**: If you agreed to implement a user requirement and later conclude it is unsafe, incorrect, infeasible, or should be deferred, stop and tell the user before proceeding. Explain the technical reason and ask whether to change scope. Do not quietly omit, reverse, or postpone the requirement and leave it to a summary for the user to notice.
 
 ## Release secrets
 
@@ -106,6 +154,8 @@ Use dotenvx 2.21.0 for this inventory. Initialize it once with
 every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
 
 ## Verification
+
+**Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, install it yourself and retry. Do not silently skip the step. If you can't fix the problem (e.g., sudo required, credentials missing), ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
 
 Run checks proportionate to the change. The normal Rust checks are:
 
