@@ -53,6 +53,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     remote.push(format!("--block-size={}", args.block_size));
     remote.push(format!("--min-split={}", args.min_split));
+    if let Some(rate) = &args.bwlimit {
+        remote.push(format!("--bwlimit={rate}"));
+    }
     if args.stats {
         remote.push("--stats".into());
     }

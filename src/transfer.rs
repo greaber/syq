@@ -1,5 +1,6 @@
 //! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
 
+use crate::bwlimit::BandwidthLimit;
 use crate::cli::{parse_rsh, parse_size, Args, Location};
 use crate::conn::{ok, Conn, Endpoint, RemoteSpec};
 use crate::fsops::join;
@@ -447,6 +448,10 @@ pub fn run(args: Args) -> Result<i32> {
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
     let block = parse_size(&args.block_size)?.clamp(64 * 1024, 64 << 20);
     let min_split = parse_size(&args.min_split)?;
+    let bwlimit = (args.bwlimit_bytes > 0)
+        .then_some(args.bwlimit_bytes)
+        .map(BandwidthLimit::new)
+        .map(Arc::new);
     let locs: Vec<Location> = args
         .paths
         .iter()
@@ -528,13 +533,14 @@ pub fn run(args: Args) -> Result<i32> {
     let resume_slot: ResumeSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let spawn_workers = |workers: &mut Vec<std::thread::JoinHandle<Result<()>>>| {
         for id in 0..args.connections {
-            let (src_ep, dst_ep, sched, progress, opts, resume) = (
+            let (src_ep, dst_ep, sched, progress, opts, resume, bwlimit) = (
                 src_ep.clone(),
                 dst_ep.clone(),
                 sched.clone(),
                 progress.clone(),
                 opts.clone(),
                 resume_slot.clone(),
+                bwlimit.clone(),
             );
             let compress = args.compress;
             workers.push(std::thread::spawn(move || -> Result<()> {
@@ -547,6 +553,7 @@ pub fn run(args: Args) -> Result<i32> {
                     progress,
                     opts,
                     resume,
+                    bwlimit,
                     t: [0.0; 4],
                 };
                 if debug() {
@@ -1386,6 +1393,7 @@ struct Worker {
     progress: Arc<Progress>,
     opts: Arc<Opts>,
     resume: ResumeSlot,
+    bwlimit: Option<Arc<BandwidthLimit>>,
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
     t: [f64; 4],
 }
@@ -1419,11 +1427,16 @@ impl Worker {
                 Item::File(idx) => {
                     if self.fast_eligible(idx) {
                         let mut batch = vec![idx];
-                        batch.extend(self.sched.take_small(
-                            self.opts.block,
-                            FAST_BATCH_FILES,
-                            FAST_BATCH_BYTES,
-                        ));
+                        // The fast path reads a whole batch before sending it.
+                        // Keep rate-limited batches to one file so a push can't
+                        // accumulate locally and then hit the network in a burst.
+                        if self.bwlimit.is_none() {
+                            batch.extend(self.sched.take_small(
+                                self.opts.block,
+                                FAST_BATCH_FILES,
+                                FAST_BATCH_BYTES,
+                            ));
+                        }
                         let (fast, slow): (Vec<usize>, Vec<usize>) =
                             batch.into_iter().partition(|&i| self.fast_eligible(i));
                         if let Err(e) = self.fast_batch(&fast) {
@@ -1478,7 +1491,7 @@ impl Worker {
         !self.opts.verify_only
             && !self.opts.inplace
             && !self.opts.atomic
-            && j.entry.size <= self.opts.block
+            && j.entry.size <= self.transfer_block()
             && j.dst_entry.is_none()
     }
 
@@ -1500,6 +1513,7 @@ impl Worker {
         // Reads.
         for j in &jobs {
             if j.entry.size > 0 {
+                self.limit(j.entry.size);
                 self.src.send(Request::ReadRange {
                     path: j.src.clone(),
                     off: 0,
@@ -1662,7 +1676,13 @@ impl Worker {
         let inplace = self.opts.inplace;
         // Same-machine copy: let the kernel move the bytes (reflink / NFS
         // server-side copy) instead of streaming them through userspace.
-        if self.opts.same_host && !self.opts.checksum && job.entry.size > 0 {
+        // copy_file_range cannot be paced, so a limited same-machine transfer
+        // uses the regular userspace path (also useful for mounted NFS paths).
+        if self.opts.same_host
+            && !self.opts.checksum
+            && self.bwlimit.is_none()
+            && job.entry.size > 0
+        {
             match self.try_copy_local(idx, &job) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {} // not offloadable — fall through to streaming
@@ -1976,7 +1996,7 @@ impl Worker {
                 total: job.entry.size,
             }),
         );
-        let block = self.opts.block;
+        let block = self.transfer_block();
         let inplace = job.inplace;
         let mut reads_out = 0usize;
         let mut writes_out = 0usize;
@@ -1992,6 +2012,7 @@ impl Worker {
                     g.pos += n;
                     (off, n)
                 };
+                self.limit(n);
                 self.src.send(Request::ReadRange {
                     path: job.src.clone(),
                     off,
@@ -2037,6 +2058,18 @@ impl Worker {
             writes_out -= 1;
         }
         Ok(())
+    }
+
+    fn transfer_block(&self) -> u64 {
+        self.bwlimit.as_ref().map_or(self.opts.block, |limit| {
+            self.opts.block.min(limit.burst_bytes())
+        })
+    }
+
+    fn limit(&self, bytes: u64) {
+        if let Some(limit) = &self.bwlimit {
+            limit.wait(bytes);
+        }
     }
 
     /// Record a completed file in the resume journal (if active).
