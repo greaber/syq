@@ -41,6 +41,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     bail!("bad token on data connection");
                 }
             }
+            // The token is the credential: once it matches, the peer is
+            // authenticated. Mark it now so a later failure (version mismatch,
+            // a failed HelloOk write) can't free the connection id for replay.
+            if let Some(a) = authed {
+                a.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if version != VERSION {
                 w.write_msg(&Response::Err(format!(
                     "protocol version mismatch (remote {VERSION}, client {version})"
@@ -49,9 +55,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
             }
             w.compress = compress;
             w.write_msg(&Response::HelloOk { version: VERSION })?;
-            if let Some(a) = authed {
-                a.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
         }
         _ => bail!("expected Hello"),
     }

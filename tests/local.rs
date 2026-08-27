@@ -904,3 +904,25 @@ fn hardlinked_partial_does_not_corrupt_external_file() {
     let me = fs::metadata(t.path("external")).unwrap();
     assert!(!(mo.dev() == me.dev() && mo.ino() == me.ino()));
 }
+
+#[test]
+fn rejects_bare_dir_into_parent_mapping_onto_itself() {
+    let t = Tmp::new();
+    write(&t.path("sub/f"), b"x");
+    // Copying t/sub into t (existing dir) maps to t/sub — the source itself.
+    let out = pcp(&["-a", &t.s("sub"), &t.s(".")]);
+    // t.s(".") is the tmp dir itself (existing), so effective dest = <tmp>/sub.
+    assert!(
+        !out.status.success(),
+        "bare dir whose effective destination is itself must be rejected"
+    );
+    assert!(t.path("sub/f").exists());
+}
+
+#[test]
+fn file_onto_itself_is_allowed_noop() {
+    let t = Tmp::new();
+    write(&t.path("f"), b"hello");
+    run_ok(&["-a", "--inplace", &t.s("f"), &t.s("f")]);
+    assert_eq!(read(&t.path("f")), b"hello");
+}

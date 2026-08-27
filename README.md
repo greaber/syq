@@ -185,7 +185,9 @@ Always:
 - After a file completes, the source is re-stat'ed. If its size or mtime
   changed during the transfer the file is redone (up to three attempts), then
   reported as an error.
-- Destination files appear atomically via rename.
+- Destination files appear atomically via rename — **except small new files**
+  (up to the block size), which are written straight to their final path for
+  speed; pass `--atomic` to make every file appear atomically.
 - Non-zero exit if anything failed.
 
 On request:
@@ -202,8 +204,10 @@ different moments, so a file being written while copied may come out mixed —
 the re-stat catches the common case, `--verify-only` afterwards catches the
 rest.
 
-Compared with rsync: the atomic rename guarantee is the same (and, unlike
-`rsync -P`, still holds for partial files); the change-during-transfer check
+Compared with rsync: the atomic rename guarantee is the same for large and
+existing files (and, unlike `rsync -P`, still holds for partial files), but
+small new files are written in place by default for NFS speed — use `--atomic`
+to match rsync's every-file atomicity; the change-during-transfer check
 is the same idea; deletes and hardlinks aren't implemented, so there is no
 ordering question for them.
 
