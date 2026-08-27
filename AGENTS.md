@@ -12,13 +12,19 @@ permission to clean, reset, or stash them. Apart from administering branches
 and worktrees, only writes to gitignored files are normally allowed there.
 
 Check `git status` and `git worktree list` before choosing a worktree. A branch
-and worktree should correspond 1:1 with a task or pull request; the normal setup
-from the primary checkout is:
+and worktree should correspond 1:1 with a task or pull request. Also check the
+primary checkout's `current-plans/` for plans or handoff notes that cover the
+topic. The normal setup from the primary checkout is:
 
 ```bash
 git worktree add .worktrees/<task> -b <task> master
+ln -s ../../current-plans .worktrees/<task>/current-plans
 cd .worktrees/<task>
 ```
+
+Keep `current-plans/` shared by symlinking it from task worktrees as shown
+above; do not copy it. This keeps short-lived planning state visible across
+conversations and worktrees.
 
 Use plain git commands as shown above. Do not use the `EnterWorktree` or
 `ExitWorktree` tools; they are denied in `.claude/settings.json`.
@@ -27,6 +33,20 @@ Continue in an existing worktree only when you created it for the current task
 or the user explicitly identified it as the target. Never infer ownership from
 a plausible branch name. Before every file edit or write, confirm that
 `git rev-parse --show-toplevel` points at the task worktree.
+
+## Documentation over agent memory
+
+Prefer durable, committed documentation over private memory. Facts worth
+keeping (behavior, measured performance, design rationale, and invariants) go
+in the appropriate committed documentation; guidance every session needs goes
+here in `AGENTS.md`. Plans and handoff notes that change too fast for git or do
+not belong to a branch go in `current-plans/` (gitignored by design; check it
+before starting work on a topic it covers). Use memory only for what fits none
+of those.
+
+When writing any of these, record decisions as current state plus the rationale
+at the time, not as timeless policy. An assumption encoded as a requirement can
+outlive its premise and steer later work in the wrong direction.
 
 ## Branch synchronization and handoff
 
