@@ -21,23 +21,24 @@ releases setting so published assets and tags cannot be changed afterward.
    `v*` tags to release maintainers. GitHub's ruleset signature rule applies to
    commits, not annotated tag-object signatures; the release workflow checks
    the latter explicitly through GitHub's tag verification API.
-4. Give a fine-grained token write access only to the contents of
-   `greaber/homebrew-tap`. It does not need access to the syq repository. This
-   token and the release signing key enter the encrypted inventory described
-   below; do not paste either value into GitHub directly.
+4. The encrypted inventory initializer generates a dedicated SSH deploy key
+   for `greaber/homebrew-tap`. The sync installs its public half on that
+   repository with write access and places only its private half in the
+   protected `release` environment. It has no access to the syq repository or
+   to any other repository in the account.
 
 ## Encrypted release inventory
 
 The committed `.env.release` file is the canonical release-credential
 inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64` and
-`HOMEBREW_TAP_TOKEN`, plus the corresponding public
+`HOMEBREW_TAP_DEPLOY_KEY`, plus the corresponding public
 `SYQ_RELEASE_PUBLIC_KEY`. Its decryption authority lives only in the
 gitignored `.env.keys`. Forks receive the ciphertext but neither the
 decryption key nor official publishing authority.
 
 Install the pinned maintainer tool, then initialize the inventory on an
-encrypted developer machine. The initializer prompts without echoing for the
-fine-grained Homebrew token and generates the Ed25519 signing key locally:
+encrypted developer machine. The initializer generates independent Ed25519
+keys for manifest signing and Homebrew tap access; it needs no secret input:
 
 ```sh
 npm install --global @dotenvx/dotenvx@2.21.0
@@ -60,23 +61,19 @@ gh secret list --repo greaber/syq --env release
 gh variable list --repo greaber/syq
 ```
 
-The sync sends the individual private key and tap token to environment secrets;
-it sends the public key to the repository variable used by every official
+The sync sends the two individual private keys to environment secrets, installs
+the Homebrew key's public half as a write-enabled deploy key on the tap, and
+sends the release public key to the repository variable used by every official
 build. It never sends `.env.keys`, any `DOTENV_PRIVATE_KEY_*` value, or an
-undeclared entry from the encrypted file. It also derives the public key from
-the private key and refuses to update GitHub if they differ.
+undeclared entry from the encrypted file. It derives both public keys locally
+and refuses a mismatched release signing pair or tap deploy key.
 
-To rotate the Homebrew token, update the canonical ciphertext and rerun the
-same dry-run/execute sequence:
-
-```sh
-read -r -s -p 'New Homebrew tap token: ' token; printf '\n'
-dotenvx set HOMEBREW_TAP_TOKEN "$token" -f .env.release --no-native
-unset token
-git add .env.release && git commit -m 'Rotate Homebrew tap token'
-scripts/sync-github-secrets.sh
-scripts/sync-github-secrets.sh --execute
-```
+The Homebrew deploy key is already restricted to one repository and should not
+need routine rotation. If it is exposed, replace its ciphertext with a newly
+generated Ed25519 private key, remove the deploy key titled `syq release
+workflow` from the tap, commit `.env.release`, and rerun the dry-run/execute
+sync. The sync will install the new public half before updating the protected
+environment secret.
 
 Do not rotate the release signing key casually: installed clients trust it, so
 a planned rotation first needs a release that trusts both old and new keys.

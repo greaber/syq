@@ -80,9 +80,29 @@ case "${1:-}:${2:-}" in
     exit 0
     ;;
   repo:view)
-    printf 'greaber/syq\n'
+    case "$3" in
+      greaber/syq|greaber/homebrew-tap) printf '%s\n' "$3" ;;
+      *) exit 94 ;;
+    esac
     ;;
   api:*)
+    if [[ " $* " == *' --method POST '* ]]; then
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          -f)
+            case "$2" in
+              key=*) printf '%s' "${2#key=}" > "$state/homebrew-deploy-public-key" ;;
+            esac
+            shift 2
+            ;;
+          *) shift ;;
+        esac
+      done
+    elif [[ " $* " == *' repos/greaber/homebrew-tap/keys '* ]] \
+      && [ -f "$state/homebrew-deploy-public-key" ]; then
+      cat "$state/homebrew-deploy-public-key"
+      printf '\n'
+    fi
     exit 0
     ;;
   secret:set)
@@ -116,17 +136,20 @@ common_env=(
   "FAKE_GH_STATE=$fake_state"
 )
 
-tap_token=github_pat_test_homebrew_token
-printf '%s\n' "$tap_token" \
-  | env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh" \
-      > "$work/init-output" 2>&1
+env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh" \
+  > "$work/init-output" 2>&1
 [ -f "$repo/.env.release" ] || fail "initializer did not create .env.release"
 [ -f "$repo/.env.keys" ] || fail "initializer did not create .env.keys"
 [ "$(stat -c '%a' "$repo/.env.keys")" = 600 ] || fail ".env.keys is not mode 0600"
-grep -Fq "$tap_token" "$repo/.env.release" && fail "encrypted inventory contains the plaintext token"
-grep -Fq "$tap_token" "$work/init-output" && fail "initializer printed the token"
-cmp -s "$fake_state/HOMEBREW_TAP_TOKEN" <(printf '%s' "$tap_token") \
-  || fail "initializer stored the wrong Homebrew token"
+grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$repo/.env.release" \
+  && fail "encrypted inventory contains the plaintext Homebrew key"
+grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$work/init-output" \
+  && fail "initializer printed the Homebrew key"
+printf '%s\n' "$(cat "$fake_state/HOMEBREW_TAP_DEPLOY_KEY")" > "$work/homebrew-tap"
+chmod 600 "$work/homebrew-tap"
+homebrew_public=$(ssh-keygen -y -f "$work/homebrew-tap")
+[[ "$homebrew_public" == 'ssh-ed25519 '* ]] \
+  || fail "initializer did not store an Ed25519 Homebrew key"
 
 openssl base64 -d -A -in "$fake_state/SYQ_RELEASE_SIGNING_KEY_PEM_B64" \
   -out "$work/signing.pem"
@@ -138,7 +161,7 @@ derived_public=$(openssl pkey -in "$work/signing.pem" -pubout -outform DER \
 env_hash=$(sha256sum "$repo/.env.release")
 keys_hash=$(sha256sum "$repo/.env.keys")
 expect_failure "$work/reinit-output" \
-  env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh" <<< 'replacement-token'
+  env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh"
 [ "$env_hash" = "$(sha256sum "$repo/.env.release")" ] \
   || fail "reinitialization changed .env.release"
 [ "$keys_hash" = "$(sha256sum "$repo/.env.keys")" ] \
@@ -160,11 +183,14 @@ env "${common_env[@]}" "$repo/scripts/sync-github-secrets.sh" \
   > "$work/dry-run-output" 2>&1
 grep -q '^\[dry-run\] set environment secret SYQ_RELEASE_SIGNING_KEY_PEM_B64$' \
   "$work/dry-run-output" || fail "dry run omitted the signing-key action"
-grep -q '^\[dry-run\] set environment secret HOMEBREW_TAP_TOKEN$' \
-  "$work/dry-run-output" || fail "dry run omitted the tap-token action"
-grep -q 'secret set\|variable set' "$fake_state/calls" \
+grep -q '^\[dry-run\] set environment secret HOMEBREW_TAP_DEPLOY_KEY$' \
+  "$work/dry-run-output" || fail "dry run omitted the tap-key action"
+grep -q '^\[dry-run\] configure Homebrew tap deploy key$' \
+  "$work/dry-run-output" || fail "dry run omitted the public deploy-key action"
+grep -q 'secret set\|variable set\|--method POST' "$fake_state/calls" \
   && fail "dry run mutated GitHub"
-grep -Fq "$tap_token" "$work/dry-run-output" && fail "dry run printed the token"
+grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$work/dry-run-output" \
+  && fail "dry run printed the Homebrew key"
 
 : > "$fake_state/calls"
 env "${common_env[@]}" "$repo/scripts/sync-github-secrets.sh" --execute \
@@ -172,12 +198,18 @@ env "${common_env[@]}" "$repo/scripts/sync-github-secrets.sh" --execute \
 cmp -s "$fake_state/SYQ_RELEASE_SIGNING_KEY_PEM_B64" \
   "$fake_state/secret-SYQ_RELEASE_SIGNING_KEY_PEM_B64" \
   || fail "sync forwarded the wrong signing key"
-cmp -s "$fake_state/HOMEBREW_TAP_TOKEN" "$fake_state/secret-HOMEBREW_TAP_TOKEN" \
-  || fail "sync forwarded the wrong Homebrew token"
+cmp -s "$fake_state/HOMEBREW_TAP_DEPLOY_KEY" \
+  "$fake_state/secret-HOMEBREW_TAP_DEPLOY_KEY" \
+  || fail "sync forwarded the wrong Homebrew deploy key"
 cmp -s "$fake_state/SYQ_RELEASE_PUBLIC_KEY" "$fake_state/variable-SYQ_RELEASE_PUBLIC_KEY" \
   || fail "sync forwarded the wrong public key"
-grep -Fq "$tap_token" "$work/execute-output" && fail "sync printed the token"
-grep -Fq "$tap_token" "$fake_state/calls" && fail "sync put the token in a gh argument"
+expected_homebrew_public=$(ssh-keygen -y -f "$work/homebrew-tap")
+[ "$expected_homebrew_public" = "$(cat "$fake_state/homebrew-deploy-public-key")" ] \
+  || fail "sync installed the wrong Homebrew public deploy key"
+grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$work/execute-output" \
+  && fail "sync printed the Homebrew private key"
+grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$fake_state/calls" \
+  && fail "sync put the Homebrew private key in a gh argument"
 
 printf '%s' AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
   > "$fake_state/SYQ_RELEASE_PUBLIC_KEY"
