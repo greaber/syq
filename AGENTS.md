@@ -87,6 +87,24 @@ outlive its premise and steer later work in the wrong direction.
   temporary directories. Treat `syq --rm`, remote destinations, bootstrap
   installation, and operations on real user data as potentially destructive.
 
+## Release secrets
+
+Once provisioned, `.env.release` is the committed dotenvx-encrypted source of
+truth for release credentials. `.env.keys` is its gitignored decryption
+authority and must remain on developer-controlled machines and in protected
+backup storage. Never upload `.env.keys` or a `DOTENV_PRIVATE_KEY_*` value to
+GitHub, CI, the Homebrew tap, or a runtime system.
+
+CI consumes only the two individual environment secrets it needs. A maintainer
+materializes those values locally with `scripts/sync-github-secrets.sh`; the
+script has a fixed inventory and refuses to target anything except
+`github.com/greaber/syq`. Do not change that boundary to let CI decrypt
+`.env.release`, and do not add a general dotenvx key to GitHub secrets.
+
+Use dotenvx 2.21.0 for this inventory. Initialize it once with
+`scripts/init-release-secrets.sh`, and run the sync without `--execute` before
+every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
+
 ## Verification
 
 Run checks proportionate to the change. The normal Rust checks are:
