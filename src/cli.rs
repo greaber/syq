@@ -58,9 +58,10 @@ pub struct Args {
     #[arg(long)]
     pub numeric_ids: bool,
 
-    /// Parallel connections/workers. Default for copies: auto-tuned — starts at 8
-    /// (32 when local), grows while throughput improves, shrinks when that costs
-    /// nothing. Give a number to fix it. --rm uses a fixed 8 (32 when local).
+    /// Parallel connections/workers. Default for copies: auto-tuned — starts at 16
+    /// over TCP, 8 over ssh, or 32 when local; grows while throughput improves and
+    /// shrinks when that costs nothing. Give a number to fix it. --rm uses a fixed
+    /// 8 (32 when local).
     #[arg(short = 'j', long, value_name = "N")]
     pub connections_opt: Option<usize>,
     #[arg(skip)]

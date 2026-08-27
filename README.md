@@ -28,11 +28,10 @@ release, verifies its SHA-256 checksum, and installs it atomically. Later runs
 execute that exact path without an extra probe connection. Linux x86-64 and
 ARM64 and macOS Apple Silicon and Intel are published.
 
-If the remote cannot reach GitHub, pcp uploads its current executable when the
-local and remote platforms match. For a different-platform host without
-outbound access, install a compatible binary yourself and pass
-`--pcp-path /path/to/pcp`. `--no-bootstrap` disables managed helpers and
-requires `pcp` on the non-interactive remote `PATH`.
+The managed cache accepts only the downloaded, verified release binary. If the
+remote cannot download it, bootstrapping fails visibly; install a compatible
+binary yourself and pass `--pcp-path /path/to/pcp`, or put it on the
+non-interactive remote `PATH` and use `--no-bootstrap`.
 
 The remote download uses `curl` or `wget`, `gzip`, and one of `sha256sum`,
 `shasum`, or `openssl`. Version directories coexist and the helper cache can be
@@ -44,8 +43,8 @@ removed at any time; pcp recreates the helper it needs on the next connection.
   and uses only POSIX calls; Linux-only optimizations (`fallocate`,
   glibc `mallopt`) are compiled out automatically. copy_file_range's local
   fast path is Linux-only; on macOS same-machine copies use the normal path.
-- For portability across distributions (e.g. for the offline upload fallback
-  to a host with an older glibc), build a static binary:
+- For a manually installed binary that is portable across distributions (for
+  example, a host with an older glibc), build a static binary:
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
   (the musl target also works if `musl-gcc` is installed, which `zstd-sys` needs).
 
@@ -326,27 +325,26 @@ implemented, so there is no ordering question for them.
 
 Without `-j`, pcp tunes the number of workers while a copy runs instead of
 guessing (`--rm` keeps a fixed 8, or 32 locally: removal is metadata-bound
-and short). It starts with 8 over the network (32 when both ends are
-local: threads are free, connections are not) and measures: progress (bytes,
-plus a small credit per completed file so small-file trees count) is sampled
-every 2.5 s, and a count has been *measured* only once two consecutive
-samples agree within 10 % — so a burst that gets throttled, or a link still
-ramping up, is waited out (up to 20 s) rather than credited to the last
-change. Each measured count is compared with the previous one: it doubles
-while a doubling gains at least a third of what linear scaling would (up to
-64); when a doubling doesn't, it goes back to the last good count and
-refines upward in 1.3× steps; when even that buys nothing it shrinks by 1.3×
-as long as that costs less than 5 % (down to 2); then it holds. It never stops
-watching: after every 6 measurements it probes one step down (kept if
-throughput doesn't drop — this is what saves a spinning disk from seek
-thrash) or one step up (the route or a shared NAS may have freed up), and a
-direction that keeps failing is tried progressively less often. Surplus
-workers are parked, not closed: they keep their connections and stop taking
-work, handing back the rest of their range, so un-parking is instant.
-Transfers shorter than a measurement or two just run with the starting
-count. The progress line shows the current count (`13 conn`), and `--stats`
-reports the path it took (`connections: auto: settled at 13 (path 8 -> 10 ->
-13 -> 17 -> 13, peak 17)`).
+and short). It starts with 16 when every remote endpoint has a reachable TCP
+data path, 8 over ssh, or 32 when both ends are local (threads are free,
+connections are not), and measures: progress (bytes, plus a small credit per
+completed file so small-file trees count) is sampled every 2.5 s, and a count
+has been *measured* only once two consecutive samples agree within 10 % — so a
+burst that gets throttled, or a link still ramping up, is waited out (up to 20
+s) rather than credited to the last change. Each measured count is compared
+with the previous one: it doubles while a doubling gains at least a third of
+what linear scaling would (up to 64); when a doubling doesn't, it goes back to
+the last good count and refines upward in 1.3× steps; when even that buys
+nothing it shrinks by 1.3× as long as that costs less than 5 % (down to 2);
+then it holds. It never stops watching: after every 6 measurements it probes
+one step down (kept if throughput doesn't drop — this is what saves a spinning
+disk from seek thrash) or one step up (the route or a shared NAS may have freed
+up), and a direction that keeps failing is tried progressively less often.
+Surplus workers are parked, not closed: they keep their connections and stop
+taking work, handing back the rest of their range, so un-parking is instant.
+Transfers shorter than a measurement or two just run with the starting count.
+The progress line shows the current count (`16 conn`), and `--stats` reports
+the path it took (`connections: auto: settled at 16 (path 16, peak 16)`).
 
 Measured from a 1 Gbit box in Germany to a host in Japan (265 ms): over TCP
 data connections it settles around 8–13 at line rate; over ssh data
@@ -476,8 +474,8 @@ fix for that.
   sessions beyond 10 being set up at once — pcp halves that number for the
   rest of the run and retries. On a server set up for pcp (`MaxStartups
   100`, see `scripts/server-setup.sh`) 32 sessions come up in one round.
-  Auto-tuning starts at 8 and only opens more once they have been shown to
-  pay.
+  Auto-tuning starts at 16 for TCP data, or 8 for ssh data, and only opens more
+  once they have been shown to pay.
 - Direct remote→remote with a *forwarded* agent authenticates every session
   through your machine; over a slow link that dominates setup time. Keys on the
   source host avoid it.
