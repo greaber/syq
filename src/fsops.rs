@@ -449,9 +449,8 @@ impl FsOps {
         if fsync {
             f.sync_all().with_context(|| format!("fsync {}", p.display()))?;
             let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-            if let Ok(df) = File::open(dir) {
-                let _ = df.sync_all();
-            }
+            let df = File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
+            df.sync_all().with_context(|| format!("fsync directory {}", dir.display()))?;
         }
         Ok(())
     }
@@ -533,9 +532,8 @@ impl FsOps {
         if fsync {
             // Make the rename (or in-place write) itself durable.
             let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-            if let Ok(df) = File::open(dir) {
-                let _ = df.sync_all();
-            }
+            let df = File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
+            df.sync_all().with_context(|| format!("fsync directory {}", dir.display()))?;
         }
         Ok(())
     }

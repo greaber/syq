@@ -447,7 +447,14 @@ impl Planner<'_> {
             }
         }
 
-        if !dir_entries.is_empty() && !opts.dry_run && !opts.verify_only {
+        if opts.verify_only && !dir_entries.is_empty() {
+            let stats = self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
+            for ((p, _), s) in dir_entries.iter().zip(stats) {
+                if !matches!(s, Some(ref d) if d.kind == Kind::Dir) {
+                    self.progress.error(&format!("{} {}/ (directory)", if s.is_none() { "MISSING" } else { "DIFFERS" }, display(p)));
+                }
+            }
+        } else if !dir_entries.is_empty() && !opts.dry_run && !opts.verify_only {
             let stats = self.stat_many(true, dir_entries.iter().map(|(p, _)| p.clone()).collect())?;
             let new_dirs: Vec<Op> = mkdirs
                 .into_iter()
@@ -515,6 +522,12 @@ impl Planner<'_> {
                         self.progress.eprintln(&format!("skipping {rel}: source and destination are the same file"));
                         continue;
                     }
+                    // Claim the destination BEFORE deciding skip-vs-transfer, so a
+                    // quick-skipped file still blocks another source (or a dir)
+                    // from mapping onto the same path.
+                    if !self.claim_dst(&dst_path, &rel, false) {
+                        continue;
+                    }
                     let same = dst_entry.as_ref().is_some_and(|d| {
                         d.kind == Kind::File
                             && d.size == e.size
@@ -554,7 +567,7 @@ impl Planner<'_> {
                         if opts.verbose > 0 {
                             self.progress.println(&rel);
                         }
-                    } else if self.claim_dst(&dst_path, &rel, false) {
+                    } else {
                         self.enqueue(src_path, dst_path, rel, e.clone(), dst_entry);
                     }
                 }
@@ -563,6 +576,9 @@ impl Planner<'_> {
                         if opts.verbose > 0 {
                             self.progress.eprintln(&format!("skipping non-regular file \"{rel}\""));
                         }
+                        continue;
+                    }
+                    if !self.claim_dst(&dst_path, &rel, false) {
                         continue;
                     }
                     let target = e.link.clone().unwrap_or_default();
@@ -582,9 +598,6 @@ impl Planner<'_> {
                         }
                         continue;
                     }
-                    if !self.claim_dst(&dst_path, &rel, false) {
-                        continue;
-                    }
                     op_names.push(format!("{rel} -> {}", display(&target)));
                     ops.push(Op::Symlink { path: dst_path.clone(), target });
                     ops.push(Op::SetMeta { path: dst_path, meta: e.meta(), flags: opts.flags & !flags::MODE });
@@ -597,14 +610,21 @@ impl Planner<'_> {
                         }
                         continue;
                     }
+                    if !self.claim_dst(&dst_path, &rel, false) {
+                        continue;
+                    }
                     let same = dst_entry.as_ref().is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
-                    if same || opts.verify_only || opts.dry_run {
-                        if opts.dry_run && !same && opts.verbose > 0 {
-                            self.progress.println(&rel);
+                    if opts.verify_only {
+                        if !same {
+                            let what = if dst_entry.is_none() { "MISSING" } else { "DIFFERS" };
+                            self.progress.error(&format!("{what} {rel} (special file)"));
                         }
                         continue;
                     }
-                    if !self.claim_dst(&dst_path, &rel, false) {
+                    if same || opts.dry_run {
+                        if opts.dry_run && !same && opts.verbose > 0 {
+                            self.progress.println(&rel);
+                        }
                         continue;
                     }
                     op_names.push(rel);
@@ -867,7 +887,8 @@ impl Worker {
                     self.progress.bytes_total.fetch_add(e.size, Relaxed);
                     job.entry = Entry { path: job.entry.path.clone(), ..e };
                     job.attempts += 1;
-                    job.dst_entry = Some(job.entry.clone());
+                    // Keep the original dst_entry so mode is preserved on retry
+                    // without -p (don't adopt the source's mode).
                     drop(all);
                     self.sched.requeue(*idx);
                 } else {
