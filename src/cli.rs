@@ -150,7 +150,12 @@ pub struct Args {
     /// with --ignore-from the patterns act like the lines of one .gitignore file, in
     /// command-line order, anchored at each source root. Skipping a directory skips its
     /// whole subtree, so to copy only *.jpg use: -i '*' -i '!*/' -i '!*.jpg'
-    #[arg(short = 'i', long = "ignore", value_name = "PATTERN")]
+    #[arg(
+        short = 'i',
+        long = "ignore",
+        value_name = "PATTERN",
+        allow_hyphen_values = true
+    )]
     pub ignore: Vec<String>,
     /// Read ignore patterns from FILE (one per line, # comments); repeatable
     #[arg(long, value_name = "FILE")]
@@ -160,7 +165,7 @@ pub struct Args {
     pub ignore_lines: Vec<String>,
 
     /// Remove the given paths recursively and in parallel (like rm -rf); honours -j, -n, -v, -q, -e
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["ignore", "ignore_from"])]
     pub rm: bool,
 
     /// Source(s) and destination (or, with --rm, the paths to remove)
@@ -192,6 +197,7 @@ impl Args {
             if from_file {
                 let text = std::fs::read_to_string(&v)
                     .map_err(|e| anyhow::anyhow!("--ignore-from {v}: {e}"))?;
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
                 args.ignore_lines
                     .extend(text.lines().map(|l| l.trim_end_matches('\r').to_string()));
             } else {

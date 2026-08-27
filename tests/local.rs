@@ -1090,3 +1090,65 @@ fn ignore_applies_per_source_root_and_dry_run() {
     assert!(!t.path("dst2").exists());
     assert!(out.contains("would transfer 9 files"), "{out}");
 }
+
+#[test]
+fn ignore_reinclude_subdir_idiom() {
+    let t = Tmp::new();
+    make_ignore_tree(&t.path("src"));
+    // Everything directly under logs/ except the keep/ directory (git idiom).
+    run_ok(&[
+        "-a",
+        "-i",
+        "logs/*",
+        "-i",
+        "!logs/keep/",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(t.path("dst/logs/keep/k").is_file());
+    assert!(!t.path("dst/logs/l1").exists());
+}
+
+#[test]
+fn ignore_from_strips_bom_and_hyphen_patterns_work() {
+    let t = Tmp::new();
+    make_ignore_tree(&t.path("src"));
+    write(&t.path("-dash"), b"d");
+    write(&t.path("src/-secret"), b"s");
+    write(&t.path("pats"), "\u{feff}*.o\n".as_bytes());
+    run_ok(&[
+        "-a",
+        "--ignore-from",
+        &t.s("pats"),
+        "-i",
+        "-secret",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(
+        !t.path("dst/x.o").exists(),
+        "BOM must not hide the first rule"
+    );
+    assert!(!t.path("dst/-secret").exists());
+    assert!(t.path("dst/hello.txt").is_file());
+}
+
+#[test]
+fn ignore_conflicts_with_rm() {
+    let t = Tmp::new();
+    make_ignore_tree(&t.path("tree"));
+    let out = pcp(&["--rm", "-i", "keep", &t.s("tree")]);
+    assert!(!out.status.success(), "--rm with -i must be rejected");
+    assert!(
+        t.path("tree/logs/keep/k").is_file(),
+        "nothing may be removed"
+    );
+    let out = pcp(&[
+        "--rm",
+        "--ignore-from",
+        &t.s("tree/hello.txt"),
+        &t.s("tree"),
+    ]);
+    assert!(!out.status.success());
+    assert!(t.path("tree/hello.txt").is_file());
+}
