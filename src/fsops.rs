@@ -1,5 +1,5 @@
 //! Local filesystem operations. Used directly by the local endpoint and
-//! by `pcp --server` for remote endpoints, so both sides behave identically.
+//! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::proto::*;
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,7 +12,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64, Xxh3};
 
-pub const PARTIAL_SUFFIX: &str = ".pcp-partial";
+pub const PARTIAL_SUFFIX: &str = ".syq-partial";
 const FD_CACHE_MAX: usize = 16;
 
 pub fn resolve(p: &[u8]) -> PathBuf {
@@ -309,7 +309,7 @@ fn apply_one(op: &Op) -> Result<()> {
             Op::SetMeta { path, meta, flags } => {
                 let p = resolve(path);
                 #[cfg(debug_assertions)]
-                if let Some(pat) = std::env::var_os("PCP_TEST_FAIL_SETMETA") {
+                if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_SETMETA") {
                     // Test hook (debug builds only): fail metadata for matching paths.
                     if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
                         return Err(anyhow!("set metadata {}: injected failure", p.display()));
@@ -597,7 +597,7 @@ impl FsOps {
         }
         drop(f);
         #[cfg(debug_assertions)]
-        if let Some(pat) = std::env::var_os("PCP_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
+        if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
             // Test hook (debug builds only): model interruption after the
             // sidecar is complete but before it becomes the final name.
             if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
@@ -831,7 +831,7 @@ impl FsOps {
 /// Open `target` for writing as a regular file, replacing any existing
 /// symlink/dir/special and refusing to follow a symlink (O_NOFOLLOW), then
 /// verify the opened fd is a regular file. Used for every write target so a
-/// malicious or stale `.pcp-partial` symlink can't redirect the write.
+/// malicious or stale `.syq-partial` symlink can't redirect the write.
 fn open_regular_write(target: &Path, mode: u32) -> Result<File> {
     if let Ok(md) = fs::symlink_metadata(target) {
         if !md.is_file() {

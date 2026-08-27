@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# server-setup.sh — one idempotent script for everything pcp/RoCE needs on a
+# server-setup.sh — one idempotent script for everything syq/RoCE needs on a
 # Japanese GPU host. Run as root; rerun any time (it only changes what differs).
 #
 #   sudo ./server-setup.sh plan      # print exactly what `apply` would change here
 #   sudo ./server-setup.sh apply     # do everything below
 #   sudo ./server-setup.sh status    # show what is / isn't in place (no changes)
-#   sudo ./server-setup.sh install-pcp # install the pcp binary system-wide (/usr/local/bin)
+#   sudo ./server-setup.sh install-syq # install the syq binary system-wide (/usr/local/bin)
 #   sudo ./server-setup.sh roce-clean# remove only the RoCE bits this script added (keep the rest)
 #
 # There is intentionally no blanket "undo": these settings (BBR, buffers,
@@ -14,11 +14,11 @@
 #
 # What `apply` does (each step is skipped when already done):
 #   1. TCP tuning for long-RTT transfers: 64 MB socket buffers, BBR, fq.
-#      -> /etc/sysctl.d/90-pcp-net.conf, /etc/modules-load.d/pcp-bbr.conf
+#      -> /etc/sysctl.d/90-syq-net.conf, /etc/modules-load.d/syq-bbr.conf
 #   2. sshd MaxStartups 100:30:200 so many parallel ssh sessions aren't dropped.
 #      -> the MaxStartups line in /etc/ssh/sshd_config itself (uncommented /
 #         replaced in place, added if absent) + sshd reload
-#   3. ufw: allow pcp's TCP data ports (47600-47699) from the cluster LAN, from
+#   3. ufw: allow syq's TCP data ports (47600-47699) from the cluster LAN, from
 #      each cluster host's public IP, and from the listed client machines.
 #   4. RoCE: bring the ConnectX ports up; if any have link, give each an
 #      address 192.168.<100+N>.<host octet>/24 with MTU 9000 via
@@ -27,7 +27,7 @@
 #      `netplan apply`, which would re-touch bond0). Ports without a cable are
 #      left alone, so this is a no-op on hosts that aren't wired yet.
 #
-# Everything this script writes carries a "pcp-setup" marker. Nothing here
+# Everything this script writes carries a "syq-setup" marker. Nothing here
 # touches bond0, NFS mounts, or the provider's RoCE fabric.
 
 set -euo pipefail
@@ -36,16 +36,16 @@ set -euo pipefail
 CLUSTER_LAN=10.2.201.0/24
 CLUSTER_PUBLIC=(157.66.255.44 157.66.255.45 157.66.255.46 157.66.255.59)   # j3 j2 j4 j5
 CLIENTS=(116.202.146.123)                                                 # grant's Hetzner box
-PCP_PORTS=47600:47699
+SYQ_PORTS=47600:47699
 ROCE_SUBNET_BASE=100
-MARK=pcp-setup
+MARK=syq-setup
 
-ETC=${PCP_SETUP_ETC:-/etc}           # overridable for testing only
-SYSCTL_FILE=$ETC/sysctl.d/90-pcp-net.conf
+ETC=${SYQ_SETUP_ETC:-/etc}           # overridable for testing only
+SYSCTL_FILE=$ETC/sysctl.d/90-syq-net.conf
 OLD_SYSCTL_FILE=$ETC/sysctl.d/99-net.conf
-MODULES_FILE=$ETC/modules-load.d/pcp-bbr.conf
+MODULES_FILE=$ETC/modules-load.d/syq-bbr.conf
 SSHD_CONFIG=$ETC/ssh/sshd_config
-OLD_SSHD_FILE=$ETC/ssh/sshd_config.d/60-pcp.conf   # from an earlier version of this script
+OLD_SSHD_FILE=$ETC/ssh/sshd_config.d/60-syq.conf   # from an earlier version of this script
 NETPLAN_FILE=$ETC/netplan/60-roce.yaml
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -60,7 +60,7 @@ write_file() { if [ "$DRY" = 1 ]; then echo "    would write: $1"; sed 's/^/    
 # ---- 1. sysctl -----------------------------------------------------------------
 sysctl_wanted() {
   cat <<EOF
-# $MARK: TCP tuning for pcp / long-RTT transfers
+# $MARK: TCP tuning for syq / long-RTT transfers
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.ipv4.tcp_rmem = 4096 131072 67108864
@@ -128,21 +128,21 @@ ufw_active() {
   grep -q "Status: active" <<<"$UFW_STATUS"
 }
 # `ufw status verbose` always prints the direction ("ALLOW IN"); plain status doesn't.
-ufw_has() { grep -qE "^$PCP_PORTS/tcp +ALLOW IN +$1( |$)" <<<"$UFW_STATUS"; }
+ufw_has() { grep -qE "^$SYQ_PORTS/tcp +ALLOW IN +$1( |$)" <<<"$UFW_STATUS"; }
 ufw_has_iface() { grep -qE "^Anywhere on $1 +ALLOW IN" <<<"$UFW_STATUS"; }
 ufw_status() {
   if ! ufw_active; then say "ufw: inactive (nothing to do)"; return 0; fi
   local ok=0 missing=""
   for s in $(ufw_sources); do ufw_has "$s" || missing="$missing $s"; done
-  say "ufw: pcp ports $PCP_PORTS/tcp ${missing:+missing from:$missing}${missing:-allowed from all listed sources}"
+  say "ufw: syq ports $SYQ_PORTS/tcp ${missing:+missing from:$missing}${missing:-allowed from all listed sources}"
   [ -z "$missing" ]
 }
 ufw_apply() {
   if ! ufw_active; then say "ufw: inactive, skipping"; return; fi
   for s in $(ufw_sources); do
     if ufw_has "$s"; then continue; fi
-    run ufw allow from "$s" to any port "$PCP_PORTS" proto tcp comment "$MARK pcp data" >/dev/null
-    say "ufw: allowed $PCP_PORTS/tcp from $s"
+    run ufw allow from "$s" to any port "$SYQ_PORTS" proto tcp comment "$MARK syq data" >/dev/null
+    say "ufw: allowed $SYQ_PORTS/tcp from $s"
   done
   say "ufw: done"
 }
@@ -250,26 +250,26 @@ roce_clean() {
   say "roce: removed $removed of our 192.168.10x addresses (provider addresses left intact)"
 }
 
-# ---- install pcp system-wide ------------------------------------------------
-PCP_SRC=/mnt/nfs/grant/pcp.bin        # staged static binary on NFS
-PCP_DST=/usr/local/bin/pcp
-install_pcp() {
-  [ -f "$PCP_SRC" ] || die "$PCP_SRC not found (stage the binary on NFS first)"
-  local want; want=$(cat /mnt/nfs/grant/pcp.version 2>/dev/null || echo "?")
+# ---- install syq system-wide ------------------------------------------------
+SYQ_SRC=/mnt/nfs/grant/syq.bin        # staged static binary on NFS
+SYQ_DST=/usr/local/bin/syq
+install_syq() {
+  [ -f "$SYQ_SRC" ] || die "$SYQ_SRC not found (stage the binary on NFS first)"
+  local want; want=$(cat /mnt/nfs/grant/syq.version 2>/dev/null || echo "?")
   # Tolerate a missing OR broken existing binary (pipefail would abort otherwise).
   local have=""
-  if [ -x "$PCP_DST" ]; then
-    have=$("$PCP_DST" --version 2>/dev/null | awk '{print $2}') || have=""
+  if [ -x "$SYQ_DST" ]; then
+    have=$("$SYQ_DST" --version 2>/dev/null | awk '{print $2}') || have=""
   fi
   if [ "$have" = "$want" ] && [ -n "$have" ]; then
-    say "pcp: /usr/local/bin/pcp already at $have"
+    say "syq: /usr/local/bin/syq already at $have"
   else
-    run install -m 0755 "$PCP_SRC" "$PCP_DST"
-    say "pcp: installed $("$PCP_DST" --version 2>/dev/null || echo '?') to $PCP_DST (was ${have:-absent})"
+    run install -m 0755 "$SYQ_SRC" "$SYQ_DST"
+    say "syq: installed $("$SYQ_DST" --version 2>/dev/null || echo '?') to $SYQ_DST (was ${have:-absent})"
   fi
   # Point out per-user copies that would shadow the system one on PATH.
   for h in /home/*; do
-    [ -e "$h/.local/bin/pcp" ] && say "pcp: NOTE $h/.local/bin/pcp exists and may shadow $PCP_DST on that user's PATH"
+    [ -e "$h/.local/bin/syq" ] && say "syq: NOTE $h/.local/bin/syq exists and may shadow $SYQ_DST on that user's PATH"
   done
 }
 
@@ -279,7 +279,7 @@ case "${1:-}" in
   apply)  need_root apply; echo "== apply on $(hostname)"; sysctl_apply; sshd_apply; ufw_apply; roce_apply; echo "== done" ;;
   status) echo "== status on $(hostname)"; [ "$(id -u)" = 0 ] || say "(run as root for sshd/ufw details)"; sysctl_status || true; sshd_status || true; ufw_status || true; roce_status
           ;;
-  install-pcp) need_root install-pcp; echo "== install-pcp on $(hostname)"; install_pcp; echo "== done" ;;
+  install-syq) need_root install-syq; echo "== install-syq on $(hostname)"; install_syq; echo "== done" ;;
   roce-clean) need_root roce-clean; echo "== roce-clean on $(hostname)"; roce_clean; echo "== done" ;;
   *) sed -n '2,26p' "$0"; exit 1 ;;
 esac

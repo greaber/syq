@@ -1,4 +1,4 @@
-//! `pcp --rm`: recursive removal with N parallel connections. Files are
+//! `syq --rm`: recursive removal with N parallel connections. Files are
 //! unlinked in batches spread across workers; directories are removed
 //! deepest-first, each depth level in parallel.
 
@@ -84,7 +84,7 @@ fn worker(
             Ok(Response::Applied(errs)) => {
                 for (name, err) in names.iter().zip(errs) {
                     match err {
-                        Some(e) => pool.progress.error(&format!("pcp: {e}")),
+                        Some(e) => pool.progress.error(&format!("syq: {e}")),
                         None => {
                             pool.progress.files_done.fetch_add(1, Relaxed);
                             if pool.verbose {
@@ -96,9 +96,9 @@ fn worker(
             }
             Ok(other) => pool
                 .progress
-                .error(&format!("pcp: unexpected response {other:?}")),
+                .error(&format!("syq: unexpected response {other:?}")),
             Err(e) => {
-                pool.progress.error(&format!("pcp: {e:#}"));
+                pool.progress.error(&format!("syq: {e:#}"));
                 pool.done();
                 if conn.is_dead() {
                     pool.abort(); // wake wait_idle so the run doesn't hang on queued ops
@@ -232,7 +232,7 @@ pub fn run(args: Args) -> Result<i32> {
                 }
                 Ok(())
             },
-            &mut |w| progress.error(&format!("pcp: {w}")),
+            &mut |w| progress.error(&format!("syq: {w}")),
         );
         pool.submit(batch);
         if let Err(e) = res {
@@ -270,7 +270,7 @@ pub fn run(args: Args) -> Result<i32> {
     pool.close();
     for w in workers {
         if let Ok(Err(e)) = w.join() {
-            progress.error(&format!("pcp: worker: {e:#}"));
+            progress.error(&format!("syq: worker: {e:#}"));
         }
     }
     progress.stop();
@@ -279,12 +279,12 @@ pub fn run(args: Args) -> Result<i32> {
     }
     progress.clear();
     if let Some(e) = scan_err {
-        progress.error(&format!("pcp: {e:#}"));
+        progress.error(&format!("syq: {e:#}"));
     }
     let errors = progress.errors.load(Relaxed) + if pool.is_aborted() { 1 } else { 0 };
     if !args.quiet {
         println!(
-            "pcp: {} {} entries in {}{}",
+            "syq: {} {} entries in {}{}",
             if args.dry_run {
                 "would remove"
             } else {
