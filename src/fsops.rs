@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -670,6 +670,43 @@ impl FsOps {
         })
     }
 
+    fn marker_create(&mut self, path: &[u8], data: &[u8]) -> Result<Response> {
+        let p = resolve(path);
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                fs::create_dir_all(parent).ok();
+            }
+        }
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&p)
+        {
+            Ok(mut f) => {
+                f.write_all(data)
+                    .with_context(|| format!("write {}", p.display()))?;
+                Ok(Response::Ok)
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = fs::read(&p).unwrap_or_default();
+                Ok(Response::MarkerExists(existing))
+            }
+            Err(e) => {
+                Err(anyhow::Error::from(e)).with_context(|| format!("create {}", p.display()))
+            }
+        }
+    }
+
+    fn marker_read(&mut self, path: &[u8]) -> Result<Response> {
+        let p = resolve(path);
+        match fs::read(&p) {
+            Ok(d) => Ok(Response::Marker(Some(d))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Response::Marker(None)),
+            Err(e) => Err(anyhow::Error::from(e)).with_context(|| format!("read {}", p.display())),
+        }
+    }
+
     /// Dispatch a request that has a single response (everything except Scan).
     pub fn handle(&mut self, req: &Request) -> Response {
         let r: Result<Response> = match req {
@@ -732,6 +769,17 @@ impl FsOps {
                 .finalize(path, *inplace, meta, *flags, *fsync)
                 .map(|_| Response::Ok),
             Request::FileHash { path } => self.file_hash(path),
+            Request::MarkerCreate { path, data } => self.marker_create(path, data),
+            Request::MarkerRead { path } => self.marker_read(path),
+            Request::MarkerRemove { path } => {
+                let p = resolve(path);
+                match fs::remove_file(&p) {
+                    Ok(()) => Ok(Response::Ok),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Response::Ok),
+                    Err(e) => Err(anyhow::Error::from(e))
+                        .with_context(|| format!("remove {}", p.display())),
+                }
+            }
             Request::Hello { .. }
             | Request::Scan { .. }
             | Request::Shutdown

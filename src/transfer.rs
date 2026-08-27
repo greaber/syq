@@ -7,6 +7,7 @@ use crate::progress::{commas, human, Progress, WorkerStatus};
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
 use anyhow::{bail, Result};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
@@ -131,6 +132,312 @@ fn norm_path(p: &str, local: bool) -> std::path::PathBuf {
     out
 }
 
+/// Encode the content/metadata-affecting options into the job identity.
+fn semantic_flags(opts: &Opts, args: &Args) -> String {
+    format!(
+        "r={} l={} p={} t={} g={} o={} D={} inplace={} atomic={}",
+        opts.recursive,
+        opts.links,
+        opts.flags & flags::MODE != 0,
+        opts.flags & flags::TIMES != 0,
+        opts.flags & flags::GROUP != 0,
+        opts.flags & flags::OWNER != 0,
+        opts.devices,
+        args.inplace,
+        args.atomic,
+    )
+}
+
+fn root_meta_from(m: &Meta) -> crate::resume::RootMeta {
+    crate::resume::RootMeta {
+        mode: m.mode,
+        uid: m.uid,
+        gid: m.gid,
+        mtime_sec: m.mtime,
+        mtime_nsec: m.mtime_nsec,
+    }
+}
+fn meta_from_root(r: &crate::resume::RootMeta) -> Meta {
+    Meta {
+        mode: r.mode,
+        uid: r.uid,
+        gid: r.gid,
+        mtime: r.mtime_sec,
+        mtime_nsec: r.mtime_nsec,
+    }
+}
+
+/// Restore the destination-root metadata after the marker (a file inside it)
+/// was created/removed and bumped its mtime.
+fn restore_root_meta(ctl: &mut dyn Conn, dst_root: &[u8], meta: &Meta, flags: u8) -> Result<()> {
+    if flags == 0 {
+        return Ok(());
+    }
+    ok(
+        ctl.call(Request::Apply(vec![Op::SetMeta {
+            path: dst_root.to_vec(),
+            meta: *meta,
+            flags,
+        }]))?,
+        "restore root meta",
+    )?;
+    Ok(())
+}
+
+/// Decide fresh / resume / cleanup-then-fresh / abort, set up the journal and
+/// marker, and return the resume state (None if resume is disabled for this run).
+#[allow(clippy::too_many_arguments)]
+fn resume_setup(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    src_ctl: &mut dyn Conn,
+    dst_ctl: &mut dyn Conn,
+    dst_root: &[u8],
+    dst_is_dir: bool,
+    opts: &Opts,
+) -> Result<Option<ResumeState>> {
+    use crate::resume::{
+        job_key, journal_path, new_session_id, Journal, LastSession, Marker, FORMAT,
+    };
+    if args.no_resume || args.dry_run || args.verify_only {
+        return Ok(None);
+    }
+    let local = |l: &Location| !l.is_remote();
+    let src_ep = srcs[0].host.clone().unwrap_or_else(|| "local".into());
+    let dst_ep = dst.host.clone().unwrap_or_else(|| "local".into());
+    let src_roots: Vec<(String, bool)> = srcs
+        .iter()
+        .map(|l| {
+            (
+                norm_path(&l.path, local(l)).to_string_lossy().into_owned(),
+                l.copies_contents(),
+            )
+        })
+        .collect();
+    let dst_norm = norm_path(&dst.path, local(dst))
+        .to_string_lossy()
+        .into_owned();
+    let identity = crate::resume::job_identity(
+        &src_ep,
+        &src_roots,
+        &dst_ep,
+        &dst_norm,
+        &semantic_flags(opts, args),
+    );
+    let key = job_key(&identity);
+
+    let loaded = Journal::load(&key)?;
+    if let Some(ex) = &loaded.existing_identity {
+        if *ex != identity {
+            bail!(
+                "the resume journal for this destination describes a different copy; pass --no-resume or remove {}",
+                journal_path(&key).display()
+            );
+        }
+    }
+
+    let marker_path = marker_path_for(dst_root, dst_is_dir);
+    // Root metadata to restore after marker cleanup: only when a single source's
+    // contents map onto the destination root and we preserve its mode/times.
+    let meta_flags = opts.flags & (flags::MODE | flags::OWNER | flags::GROUP | flags::TIMES);
+    let root_meta: Option<Meta> = if srcs.len() == 1 && srcs[0].copies_contents() && meta_flags != 0
+    {
+        stat_one(src_ctl, srcs[0].path.as_bytes())?.map(|e| {
+            let mut m = e.meta();
+            if opts.flags & flags::MODE == 0 {
+                m.mode = e.mode & 0o777 & !opts.umask;
+            }
+            m
+        })
+    } else {
+        None
+    };
+
+    let existing = marker_read(dst_ctl, &marker_path)?;
+
+    // Cleanup helpers.
+    let do_cleanup = |dst_ctl: &mut dyn Conn,
+                      journal: &Journal,
+                      sid: &str,
+                      rm: Option<&crate::resume::RootMeta>,
+                      marker_present: bool|
+     -> Result<()> {
+        if marker_present {
+            marker_remove(dst_ctl, &marker_path)?;
+        }
+        if let Some(rm) = rm {
+            restore_root_meta(dst_ctl, dst_root, &meta_from_root(rm), meta_flags)?;
+        }
+        journal.cleanup_complete(sid)?;
+        Ok(())
+    };
+
+    let start_new = |dst_ctl: &mut dyn Conn,
+                     completed: std::collections::HashMap<PathBytes, crate::resume::Completed>|
+     -> Result<Option<ResumeState>> {
+        let journal = Journal::open(&key, &identity, loaded.existing_identity.as_deref())?;
+        let session_id = new_session_id();
+        let marker = Marker {
+            format: FORMAT,
+            session_id: session_id.clone(),
+            job_identity: identity.clone(),
+            created_at: 0,
+            coordinator_host: crate::resume::hostname(),
+        };
+        match marker_create(dst_ctl, &marker_path, &marker) {
+            Ok(None) => {}
+            Ok(Some(other)) => {
+                bail!(
+                    "destination was just claimed by another transfer (session {}, host {})",
+                    other.session_id,
+                    other.coordinator_host
+                );
+            }
+            Err(e) => {
+                // Can't claim the destination (e.g. read-only dir): fall back to
+                // running without resume rather than failing the transfer.
+                if debug() {
+                    eprintln!("pcp: resume disabled (cannot create marker: {e:#})");
+                }
+                return Ok(None);
+            }
+        }
+        journal.session_start(&session_id)?;
+        Ok(Some(ResumeState {
+            journal: std::sync::Arc::new(journal),
+            completed: std::sync::Arc::new(completed),
+            session_id,
+            marker_path: marker_path.clone(),
+            root_meta,
+        }))
+    };
+
+    match (&existing, &loaded.last) {
+        (Some(m), _) if m.job_identity != identity => bail!(
+            "destination is claimed by a different transfer (session {}, host {}); if it is stale, remove {}",
+            m.session_id, m.coordinator_host, display(&marker_path)
+        ),
+        (Some(m), LastSession::NeedsCleanup(sid, rm)) if sid == &m.session_id => {
+            let journal = Journal::open(&key, &identity, loaded.existing_identity.as_deref())?;
+            do_cleanup(dst_ctl, &journal, sid, rm.as_ref(), true)?;
+            drop(journal);
+            start_new(dst_ctl, loaded.completed)
+        }
+        (Some(m), LastSession::Incomplete(sid)) if sid == &m.session_id => {
+            let journal = Journal::open(&key, &identity, loaded.existing_identity.as_deref())?;
+            Ok(Some(ResumeState {
+                journal: std::sync::Arc::new(journal),
+                completed: std::sync::Arc::new(loaded.completed),
+                session_id: sid.clone(),
+                marker_path,
+                root_meta,
+            }))
+        }
+        (Some(m), other) => bail!(
+            "destination is owned by session {} but the local journal does not match ({other:?}); resume needs the matching local journal, or remove {} to start over",
+            m.session_id, display(&marker_path)
+        ),
+        (None, LastSession::NeedsCleanup(sid, rm)) => {
+            let journal = Journal::open(&key, &identity, loaded.existing_identity.as_deref())?;
+            do_cleanup(dst_ctl, &journal, sid, rm.as_ref(), false)?;
+            drop(journal);
+            start_new(dst_ctl, loaded.completed)
+        }
+        (None, LastSession::Incomplete(sid)) => bail!(
+            "an interrupted transfer's journal exists (session {sid}) but its destination marker is gone; the destination may have changed — remove it and start over, or pass --no-resume"
+        ),
+        (None, _) => start_new(dst_ctl, loaded.completed),
+    }
+}
+
+/// Read the destination marker (if any) as a parsed struct.
+fn marker_read(ctl: &mut dyn Conn, path: &[u8]) -> Result<Option<crate::resume::Marker>> {
+    match ok(
+        ctl.call(Request::MarkerRead {
+            path: path.to_vec(),
+        })?,
+        "marker read",
+    )? {
+        Response::Marker(Some(data)) => Ok(serde_json::from_slice(&data).ok()),
+        Response::Marker(None) => Ok(None),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+/// Create the marker (exclusive). Ok(None) on success; Ok(Some(existing)) if it
+/// already existed.
+fn marker_create(
+    ctl: &mut dyn Conn,
+    path: &[u8],
+    m: &crate::resume::Marker,
+) -> Result<Option<crate::resume::Marker>> {
+    let data = serde_json::to_vec(m)?;
+    match ok(
+        ctl.call(Request::MarkerCreate {
+            path: path.to_vec(),
+            data,
+        })?,
+        "marker create",
+    )? {
+        Response::Ok => Ok(None),
+        Response::MarkerExists(existing) => Ok(Some(
+            serde_json::from_slice(&existing).unwrap_or_else(|_| m.clone()),
+        )),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn marker_remove(ctl: &mut dyn Conn, path: &[u8]) -> Result<()> {
+    ok(
+        ctl.call(Request::MarkerRemove {
+            path: path.to_vec(),
+        })?,
+        "marker remove",
+    )?;
+    Ok(())
+}
+
+/// Resume state for one transfer: the completion journal, the set of files
+/// already complete, the session id, and where the marker lives.
+struct ResumeState {
+    journal: std::sync::Arc<crate::resume::Journal>,
+    completed: std::sync::Arc<std::collections::HashMap<PathBytes, crate::resume::Completed>>,
+    session_id: String,
+    marker_path: PathBytes,
+    root_meta: Option<Meta>,
+}
+
+/// Shared with workers: the completion journal (if resume is active). Filled in
+/// after resume_setup, before the planner enqueues any work.
+#[derive(Default)]
+struct ResumeShared {
+    journal: Option<std::sync::Arc<crate::resume::Journal>>,
+}
+type ResumeSlot = std::sync::Arc<std::sync::OnceLock<ResumeShared>>;
+
+/// Marker path for a destination: inside the directory for a dir scope, else a
+/// sidecar next to the file.
+fn marker_path_for(dst_root: &[u8], dst_is_dir: bool) -> PathBytes {
+    use crate::resume::MARKER_NAME;
+    if dst_is_dir {
+        join(dst_root, MARKER_NAME.as_bytes())
+    } else {
+        let p = std::path::Path::new(std::ffi::OsStr::from_bytes(dst_root));
+        let name = p
+            .file_name()
+            .map(|n| n.as_bytes().to_vec())
+            .unwrap_or_else(|| b"root".to_vec());
+        let mut sidecar = b".".to_vec();
+        sidecar.extend_from_slice(&name);
+        sidecar.extend_from_slice(MARKER_NAME.as_bytes());
+        match p.parent() {
+            Some(par) if !par.as_os_str().is_empty() => join(par.as_os_str().as_bytes(), &sidecar),
+            _ => sidecar,
+        }
+    }
+}
+
 pub fn debug() -> bool {
     std::env::var_os("PCP_DEBUG").is_some()
 }
@@ -226,14 +533,16 @@ pub fn run(args: Args) -> Result<i32> {
     // Workers connect on their own threads, in parallel with the control
     // connections below, so all ssh sessions come up at once.
     let mut workers: Vec<std::thread::JoinHandle<Result<()>>> = Vec::new();
+    let resume_slot: ResumeSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let spawn_workers = |workers: &mut Vec<std::thread::JoinHandle<Result<()>>>| {
         for id in 0..args.connections {
-            let (src_ep, dst_ep, sched, progress, opts) = (
+            let (src_ep, dst_ep, sched, progress, opts, resume) = (
                 src_ep.clone(),
                 dst_ep.clone(),
                 sched.clone(),
                 progress.clone(),
                 opts.clone(),
+                resume_slot.clone(),
             );
             let compress = args.compress;
             workers.push(std::thread::spawn(move || -> Result<()> {
@@ -245,6 +554,7 @@ pub fn run(args: Args) -> Result<i32> {
                     sched,
                     progress,
                     opts,
+                    resume,
                     t: [0.0; 4],
                 };
                 if debug() {
@@ -391,6 +701,25 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
+    // Resume: read/create the destination marker and load the completion journal.
+    let resume_state = resume_setup(
+        &args,
+        srcs,
+        dst,
+        &mut *src_ctl,
+        &mut *dst_ctl,
+        &dst_root,
+        dst_is_dir,
+        &opts,
+    )?;
+    let resume_completed = resume_state.as_ref().map(|r| r.completed.clone());
+    let resume_journal = resume_state.as_ref().map(|r| r.journal.clone());
+    if let Some(r) = &resume_state {
+        let _ = resume_slot.set(ResumeShared {
+            journal: Some(r.journal.clone()),
+        });
+    }
+
     let ticker = progress.spawn_ticker();
 
     let mut st = Planner {
@@ -398,6 +727,9 @@ pub fn run(args: Args) -> Result<i32> {
         sched: &sched,
         progress: &progress,
         opts: &opts,
+        completed: resume_completed.clone(),
+        journal: resume_journal.clone(),
+        reserved: resume_state.as_ref().map(|r| r.marker_path.clone()),
         dst_seen: std::collections::HashMap::new(),
         collision: false,
         deferred: Vec::new(),
@@ -465,6 +797,31 @@ pub fn run(args: Args) -> Result<i32> {
     progress.clear();
 
     let errors = progress.errors.load(Relaxed);
+
+    // Resume cleanup: on full success, release the marker and close the session;
+    // otherwise leave marker + journal so the same command can resume.
+    if let Some(r) = &resume_state {
+        if !aborted && errors == 0 {
+            let mf = opts.flags & (flags::MODE | flags::OWNER | flags::GROUP | flags::TIMES);
+            let rm = r.root_meta.as_ref().map(root_meta_from);
+            let res: Result<()> = (|| {
+                r.journal.session_complete(&r.session_id, rm)?;
+                marker_remove(&mut *dst_ctl, &r.marker_path)?;
+                if let Some(m) = &r.root_meta {
+                    restore_root_meta(&mut *dst_ctl, &dst_root, m, mf)?;
+                }
+                r.journal.cleanup_complete(&r.session_id)?;
+                Ok(())
+            })();
+            if let Err(e) = res {
+                eprintln!(
+                    "pcp: resume cleanup: {e:#} (transfer completed; the next run will finish cleanup)"
+                );
+            }
+        } else {
+            let _ = r.journal.flush();
+        }
+    }
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
     if !args.quiet {
@@ -553,6 +910,12 @@ struct Planner<'a> {
     sched: &'a Sched,
     progress: &'a Progress,
     opts: &'a Opts,
+    completed:
+        Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::resume::Completed>>>,
+    journal: Option<std::sync::Arc<crate::resume::Journal>>,
+    /// The resume marker's destination path, if resume is active. A source entry
+    /// that maps onto it must be refused rather than clobbering the interlock.
+    reserved: Option<PathBytes>,
     /// Leaf destination paths already claimed, to reject two sources writing one file.
     /// dest path -> is_dir. Two dirs merge; a dir vs a leaf, or two leaves, conflict.
     dst_seen: std::collections::HashMap<PathBytes, bool>,
@@ -614,7 +977,7 @@ impl Planner<'_> {
         let sub_b = sub.as_bytes();
         let mut mkdirs: Vec<Op> = Vec::new();
         let mut dir_entries: Vec<(PathBytes, &Entry)> = Vec::new();
-        let mut others: Vec<(PathBytes, PathBytes, &Entry)> = Vec::new();
+        let mut others: Vec<(PathBytes, PathBytes, PathBytes, &Entry)> = Vec::new();
         for e in &batch {
             if e.kind == Kind::Dir && !opts.recursive {
                 continue;
@@ -632,7 +995,7 @@ impl Planner<'_> {
                 });
                 dir_entries.push((dst_path, e));
             } else {
-                others.push((join(src_root, &e.path), dst_path, e));
+                others.push((join(src_root, &e.path), dst_path, dst_rel, e));
             }
         }
 
@@ -697,11 +1060,33 @@ impl Planner<'_> {
         if others.is_empty() {
             return Ok(());
         }
-        let stats = self.stat_many(true, others.iter().map(|(_, d, _)| d.clone()).collect())?;
+        // Journal skip: a file whose completion record still matches the source
+        // fingerprint is complete without a destination stat. Bypassed under -c.
+        if self.completed.is_some() && !opts.checksum {
+            let completed = self.completed.clone().unwrap();
+            let mut kept = Vec::with_capacity(others.len());
+            for (src, dst, dst_rel, e) in others.into_iter() {
+                if e.kind == Kind::File {
+                    if let Some(c) = completed.get(&dst_rel) {
+                        if c.size == e.size
+                            && c.mtime_sec == e.mtime
+                            && c.mtime_nsec == e.mtime_nsec
+                        {
+                            self.progress.files_skipped.fetch_add(1, Relaxed);
+                            self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                            continue;
+                        }
+                    }
+                }
+                kept.push((src, dst, dst_rel, e));
+            }
+            others = kept;
+        }
+        let stats = self.stat_many(true, others.iter().map(|(_, d, _, _)| d.clone()).collect())?;
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<String> = Vec::new();
         let mut meta_fixes: Vec<Op> = Vec::new();
-        for ((src_path, dst_path, e), dst_entry) in others.into_iter().zip(stats) {
+        for ((src_path, dst_path, dst_rel, e), dst_entry) in others.into_iter().zip(stats) {
             let rel = {
                 let r = join(sub_b, &e.path);
                 if r.is_empty() {
@@ -725,6 +1110,15 @@ impl Planner<'_> {
                         ));
                         continue;
                     }
+                    // Never let a source file land on the resume marker: that
+                    // would destroy the cross-machine interlock for this run.
+                    if self.reserved.as_deref() == Some(dst_path.as_slice()) {
+                        self.progress.error(&format!(
+                            "pcp: {rel}: destination path is reserved by pcp's resume marker — refusing to overwrite it"
+                        ));
+                        self.collision = true;
+                        continue;
+                    }
                     // Claim the destination BEFORE deciding skip-vs-transfer, so a
                     // quick-skipped file still blocks another source (or a dir)
                     // from mapping onto the same path.
@@ -742,6 +1136,7 @@ impl Planner<'_> {
                                 src_path.clone(),
                                 dst_path.clone(),
                                 rel.clone(),
+                                dst_rel.clone(),
                                 e.clone(),
                                 dst_entry.clone(),
                             );
@@ -773,6 +1168,15 @@ impl Planner<'_> {
                         }
                         self.progress.files_skipped.fetch_add(1, Relaxed);
                         self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                        if let Some(j) = &self.journal {
+                            j.record_complete(
+                                &dst_rel,
+                                e.size,
+                                e.mtime,
+                                e.mtime_nsec,
+                                "quick-check",
+                            );
+                        }
                     } else if opts.dry_run {
                         self.progress.files_total.fetch_add(1, Relaxed);
                         self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -781,7 +1185,14 @@ impl Planner<'_> {
                             self.progress.println(&rel);
                         }
                     } else {
-                        self.enqueue(src_path, dst_path, rel, e.clone(), dst_entry);
+                        self.enqueue(
+                            src_path,
+                            dst_path,
+                            rel,
+                            dst_rel.clone(),
+                            e.clone(),
+                            dst_entry,
+                        );
                     }
                 }
                 Kind::Symlink => {
@@ -920,6 +1331,7 @@ impl Planner<'_> {
         src: PathBytes,
         dst: PathBytes,
         rel: String,
+        rel_bytes: PathBytes,
         entry: Entry,
         dst_entry: Option<Entry>,
     ) {
@@ -929,6 +1341,7 @@ impl Planner<'_> {
             src,
             dst,
             rel,
+            rel_bytes,
             entry,
             dst_entry,
             attempts: 0,
@@ -978,6 +1391,7 @@ struct Worker {
     sched: Arc<Sched>,
     progress: Arc<Progress>,
     opts: Arc<Opts>,
+    resume: ResumeSlot,
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
     t: [f64; 4],
 }
@@ -1208,6 +1622,12 @@ impl Worker {
             self.progress.add_bytes(j.entry.size);
             j.done.store(j.entry.size, Relaxed);
             self.progress.files_done.fetch_add(1, Relaxed);
+            self.record_done(
+                &j.rel_bytes,
+                j.entry.size,
+                j.entry.mtime,
+                j.entry.mtime_nsec,
+            );
             if self.opts.verbose > 0 {
                 self.progress.println(&j.rel);
             }
@@ -1625,6 +2045,15 @@ impl Worker {
         Ok(())
     }
 
+    /// Record a completed file in the resume journal (if active).
+    fn record_done(&self, rel_bytes: &[u8], size: u64, mtime: i64, mtime_nsec: u32) {
+        if let Some(rs) = self.resume.get() {
+            if let Some(j) = &rs.journal {
+                j.record_complete(rel_bytes, size, mtime, mtime_nsec, "transferred");
+            }
+        }
+    }
+
     fn finish_file(&mut self, idx: usize) -> Result<()> {
         if self.sched.is_failed(idx) {
             return Ok(());
@@ -1680,6 +2109,12 @@ impl Worker {
             bail!("source changed during transfer (or vanished)");
         }
         self.progress.files_done.fetch_add(1, Relaxed);
+        self.record_done(
+            &job.rel_bytes,
+            job.entry.size,
+            job.entry.mtime,
+            job.entry.mtime_nsec,
+        );
         if self.opts.verbose > 0 {
             self.progress.println(&job.rel);
         }

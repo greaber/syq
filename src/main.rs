@@ -5,6 +5,7 @@ mod direct;
 mod fsops;
 mod progress;
 mod proto;
+mod resume;
 mod rm;
 mod scan;
 mod sched;
