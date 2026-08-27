@@ -9,20 +9,16 @@ use std::process::{Command, Stdio};
 pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     let rsh = parse_rsh(&args.rsh)?;
     let src_host = srcs[0].host.clone().unwrap();
-
-    if args.bootstrap {
-        let spec = crate::conn::RemoteSpec {
-            user: srcs[0].user.clone(),
-            host: src_host.clone(),
-            rsh: rsh.clone(),
-            pcp_path: args.pcp_path.clone(),
-            quiet: args.quiet,
-            tcp: Default::default(),
-        };
-        if spec.connect(false).is_err() {
-            spec.bootstrap()?;
-        }
-    }
+    let spec = crate::conn::RemoteSpec {
+        user: srcs[0].user.clone(),
+        host: src_host.clone(),
+        rsh: rsh.clone(),
+        pcp_path: args.pcp_path.clone(),
+        auto_helper: args.pcp_path.is_none() && !args.no_bootstrap,
+        helper_install: Default::default(),
+        quiet: args.quiet,
+        tcp: Default::default(),
+    };
 
     // Rebuild the option list for the remote orchestrator.
     let mut remote: Vec<String> = Vec::new();
@@ -57,6 +53,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     remote.push(format!("--block-size={}", args.block_size));
     remote.push(format!("--min-split={}", args.min_split));
+    if let Some(rate) = &args.bwlimit {
+        remote.push(format!("--bwlimit={rate}"));
+    }
     if args.stats {
         remote.push("--stats".into());
     }
@@ -90,11 +89,8 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if let Some(m) = &args.min_size {
         remote.push(format!("--min-size={m}"));
     }
-    if args.bootstrap {
-        remote.push("--bootstrap".into());
-    }
-    if args.tcp {
-        remote.push("--tcp".into());
+    if args.no_bootstrap {
+        remote.push("--no-bootstrap".into());
     }
     if args.no_tcp {
         remote.push("--no-tcp".into());
@@ -142,18 +138,18 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         remote.insert(0, "--progress-json".into());
         remote.insert(0, "-v".into());
     }
+    // A detached launcher returns before the background pcp execs, so a
+    // missing helper could otherwise look like a successful start.  Validate
+    // and, in automatic mode, install it before detaching.
+    if args.detach {
+        drop(spec.connect(false)?);
+    }
     let dbg = if crate::transfer::debug() {
         "PCP_DEBUG=1 "
     } else {
         ""
     };
-    let remote_cmd = match &args.pcp_path {
-        Some(p) => format!("{dbg}{} {}", shell_words::quote(p), shell_words::join(&remote)),
-        None => format!(
-            "{dbg}sh -c 'command -v pcp >/dev/null 2>&1 && exec pcp \"$@\"; exec \"$HOME/.local/bin/pcp\" \"$@\"' pcp {}",
-            shell_words::join(&remote)
-        ),
-    };
+    let remote_cmd = format!("{dbg}{}", spec.program_command(&remote));
 
     let remote_cmd = if args.detach {
         // Survive the loss of this ssh session: new session, no controlling
@@ -191,26 +187,35 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         remote_cmd
     };
 
-    let mut cmd = Command::new(&rsh[0]);
-    cmd.args(&rsh[1..]);
-    if rsh[0].ends_with("ssh") {
-        // Agent forwarding so the source host can authenticate to the destination.
-        cmd.arg("-A");
-        if let Some(u) = &srcs[0].user {
+    let make_command = || {
+        let mut cmd = Command::new(&rsh[0]);
+        cmd.args(&rsh[1..]);
+        if rsh[0].ends_with("ssh") {
+            // Agent forwarding so the source host can authenticate to the destination.
+            cmd.arg("-A");
+            if let Some(u) = &srcs[0].user {
+                cmd.args(["-l", u]);
+            }
+            cmd.arg("--");
+        } else if let Some(u) = &srcs[0].user {
             cmd.args(["-l", u]);
         }
-        cmd.arg("--");
-    } else if let Some(u) = &srcs[0].user {
-        cmd.args(["-l", u]);
-    }
-    cmd.arg(&src_host).arg(&remote_cmd);
+        cmd.arg(&src_host).arg(&remote_cmd);
+        cmd
+    };
     if args.detach {
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        let out = cmd
-            .output()
-            .with_context(|| format!("spawn {:?}", rsh[0]))?;
+        let run = || {
+            let mut cmd = make_command();
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            cmd.output().with_context(|| format!("spawn {:?}", rsh[0]))
+        };
+        let mut out = run()?;
+        if helper_missing(out.status.code(), spec.auto_helper) {
+            spec.install_helper()?;
+            out = run()?;
+        }
         let log = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !out.status.success() || log.is_empty() {
             bail!("could not start detached transfer on {src_host}");
@@ -219,15 +224,21 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         println!("pcp: follow with:  pcp --follow {src_host}:{log}");
         return Ok(0);
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
     if !args.quiet {
         eprintln!("pcp: remote-to-remote: running on {src_host} (use --relay to route data through this machine)");
     }
-    let status = cmd
-        .status()
-        .with_context(|| format!("spawn {:?}", rsh[0]))?;
+    let run = || {
+        let mut cmd = make_command();
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        cmd.status().with_context(|| format!("spawn {:?}", rsh[0]))
+    };
+    let mut status = run()?;
+    if helper_missing(status.code(), spec.auto_helper) {
+        spec.install_helper()?;
+        status = run()?;
+    }
     match status.code() {
         Some(0) => Ok(0),
         Some(c) => {
@@ -235,6 +246,15 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         }
         None => bail!("remote pcp on {src_host} killed by signal"),
     }
+}
+
+fn helper_missing(code: Option<i32>, automatic: bool) -> bool {
+    automatic
+        && matches!(
+            code,
+            Some(crate::remote_helper::HELPER_MISSING_EXIT)
+                | Some(crate::remote_helper::HELPER_NOT_EXECUTABLE_EXIT)
+        )
 }
 
 /// `pcp --follow HOST:LOG`: tail a detached transfer's log, rendering the JSON

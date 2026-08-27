@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -50,9 +50,11 @@ impl Drop for Tmp {
 }
 
 fn pcp(args: &[&str]) -> Output {
+    let state = std::env::temp_dir().join(format!("pcp-test-state-{}", std::process::id()));
     Command::new(env!("CARGO_BIN_EXE_pcp"))
         .args(args)
         .arg("--no-progress")
+        .env("PCP_STATE_DIR", &state)
         .output()
         .expect("run pcp")
 }
@@ -96,6 +98,186 @@ fn read(p: &Path) -> Vec<u8> {
     let mut v = Vec::new();
     File::open(p).unwrap().read_to_end(&mut v).unwrap();
     v
+}
+
+fn executable(p: &Path, body: &[u8]) {
+    write(p, body);
+    fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A remote shell that executes the supplied command locally with an isolated
+/// HOME.  This exercises pcp's real remote launcher/server protocol without
+/// touching ssh or a real remote machine.
+fn fake_rsh(t: &Tmp) -> PathBuf {
+    let path = t.path("fake-rsh");
+    executable(
+        &path,
+        br#"#!/bin/sh
+shift
+HOME="$FAKE_REMOTE_HOME"
+PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
+export HOME PATH
+printf '%s\n' "$1" >> "$FAKE_RSH_LOG"
+exec /bin/sh -c "$1"
+"#,
+    );
+    path
+}
+
+fn remote_pcp(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pcp"));
+    cmd.args(["-e", rsh.to_str().unwrap(), "--no-tcp", "-j", "1"])
+        .args(args)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RELEASE_ARCHIVE", t.path("release.gz"))
+        .env("FAKE_CURL_LOG", t.path("curl.log"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PCP_STATE_DIR", t.path("state"));
+    cmd.output().expect("run pcp through fake remote shell")
+}
+
+fn assert_output_ok(out: &Output) {
+    assert!(
+        out.status.success(),
+        "pcp failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn cached_remote_helper(t: &Tmp) -> PathBuf {
+    let root = t.path("remote-home/.cache/pcp/helpers");
+    let release = fs::read_dir(&root)
+        .unwrap()
+        .next()
+        .expect("release cache directory")
+        .unwrap()
+        .path();
+    let target = fs::read_dir(release)
+        .unwrap()
+        .next()
+        .expect("target cache directory")
+        .unwrap()
+        .path();
+    target.join("pcp")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_helper_download_is_verified_and_cached() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let archive = File::create(t.path("release.gz")).unwrap();
+    let status = Command::new("gzip")
+        .args(["-9", "-n", "-c", env!("CARGO_BIN_EXE_pcp")])
+        .stdout(Stdio::from(archive))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let sum = Command::new("sha256sum")
+        .arg(t.path("release.gz"))
+        .output()
+        .unwrap();
+    assert!(sum.status.success());
+    let digest = String::from_utf8(sum.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    write(
+        &t.path("release.gz.sha256"),
+        format!("{digest}\n").as_bytes(),
+    );
+
+    executable(
+        &t.path("remote-bin/curl"),
+        br#"#!/bin/sh
+printf 'fetch\n' >> "$FAKE_CURL_LOG"
+out=
+url=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output) out=$2; shift 2 ;;
+        *) url=$1; shift ;;
+    esac
+done
+case "$url" in
+    *.sha256) cp "$FAKE_RELEASE_ARCHIVE.sha256" "$out" ;;
+    *) cp "$FAKE_RELEASE_ARCHIVE" "$out" ;;
+esac
+"#,
+    );
+
+    write(&t.path("src"), b"first");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_pcp(&t, &rsh, &["-a", "--no-resume", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"first");
+    assert!(cached_remote_helper(&t).is_file());
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
+    let probes = fs::read_to_string(t.path("rsh.log"))
+        .unwrap()
+        .matches("pcp-helper-target:")
+        .count();
+    assert_eq!(probes, 1);
+
+    // A cache hit goes straight to the helper: no platform probe or download.
+    write(&t.path("src"), b"second");
+    let out = remote_pcp(&t, &rsh, &["-a", "--no-resume", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"second");
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
+    let probes = fs::read_to_string(t.path("rsh.log"))
+        .unwrap()
+        .matches("pcp-helper-target:")
+        .count();
+    assert_eq!(probes, 1, "cache hit should not probe the platform again");
+}
+
+#[test]
+fn remote_helper_falls_back_to_same_platform_upload() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    executable(
+        &t.path("remote-bin/curl"),
+        br#"#!/bin/sh
+printf 'fetch failed\n' >> "$FAKE_CURL_LOG"
+exit 22
+"#,
+    );
+
+    write(&t.path("src"), b"offline");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_pcp(&t, &rsh, &["-a", "--no-resume", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"offline");
+    assert!(cached_remote_helper(&t).is_file());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
+    assert_eq!(read(&t.path("curl.log")), b"fetch failed\n");
+}
+
+#[test]
+fn no_bootstrap_uses_remote_path_without_managed_cache() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_pcp"), t.path("remote-bin/pcp")).unwrap();
+
+    write(&t.path("src"), b"preinstalled");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_pcp(
+        &t,
+        &rsh,
+        &["-a", "--no-resume", "--no-bootstrap", &t.s("src"), &remote],
+    );
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"preinstalled");
+    assert!(!t.path("remote-home/.cache/pcp/helpers").exists());
 }
 
 fn set_mtime(p: &Path, secs: i64) {
@@ -460,6 +642,7 @@ fn large_file_parallel_chunks() {
     set_mtime(&t.path("src/huge.bin"), 1_600_000_000);
     run_ok(&[
         "-a",
+        "--no-resume",
         "-j",
         "8",
         "--block-size",
@@ -481,6 +664,7 @@ fn large_file_parallel_chunks() {
     fs::remove_file(t.path("dst/huge.bin")).unwrap();
     run_ok(&[
         "-a",
+        "--no-resume",
         "-j",
         "8",
         "--block-size",
@@ -491,6 +675,51 @@ fn large_file_parallel_chunks() {
         &t.s("dst/"),
     ]);
     assert!(read(&t.path("dst/huge.bin")) == data);
+}
+
+#[test]
+fn bwlimit_is_aggregate_across_workers() {
+    let t = Tmp::new();
+    for i in 0..4 {
+        write(
+            &t.path(&format!("src/{i}.bin")),
+            &prng(512 * 1024, i as u64 + 100),
+        );
+    }
+
+    // Four independent files keep four workers active. At 1 MiB/s, their
+    // aggregate 2 MiB must take about two seconds (minus the initial burst). A
+    // mistakenly per-worker limiter would finish in well under one second.
+    let start = std::time::Instant::now();
+    run_ok(&[
+        "-a",
+        "--no-resume",
+        "-j",
+        "4",
+        "--bwlimit",
+        "1M",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1600),
+        "aggregate 2 MiB copy completed too quickly: {elapsed:?}"
+    );
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+}
+
+#[test]
+fn bwlimit_rejects_invalid_rates() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"x");
+    let out = pcp(&["-a", "--bwlimit", "fast", &t.s("src/"), &t.s("dst/")]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("bad --bwlimit"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -1385,7 +1614,14 @@ fn files_from_copies_listed_paths_with_their_parents() {
         write(&t.path("src").join(f), f.as_bytes());
     }
     write(&t.path("list"), b"a/1\n\n./b/c/3\n/top\nb/c/\nmissing/x\n");
-    let out = pcp(&["-a", "--files-from", &t.s("list"), &t.s("src"), &t.s("dst")]);
+    let out = pcp(&[
+        "-a",
+        "--no-resume",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
     // The missing entry is an error but the rest is copied.
     assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
     assert!(stderr_of(&out).contains("missing/x"));
@@ -1493,6 +1729,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
     write(&t.path("list2"), b"tofile/x\ndangling/y\n");
     let out = pcp(&[
         "-a",
+        "--no-resume",
         "--files-from",
         &t.s("list2"),
         &t.s("src"),
@@ -1539,7 +1776,9 @@ fn delete_exempts_the_marker_only_at_the_root() {
     write(&t.path("src/a"), b"a");
     write(&t.path("dst/.pcp-transfer-session.json"), b"{}");
     write(&t.path("dst/extra/.pcp-transfer-session.json"), b"{}");
-    run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
+    // --no-resume: a live marker from another session would otherwise (rightly)
+    // stop the run; here we only care that --delete never treats it as an extra.
+    run_ok(&["-a", "--no-resume", "--delete", &t.s("src/"), &t.s("dst")]);
     assert_eq!(listing(&t.path("dst")), [".pcp-transfer-session.json", "a"]);
 }
 
@@ -1898,4 +2137,127 @@ fn existing_does_not_write_through_a_destination_root_symlink() {
     let so = run_ok(&["-a", "--existing", &t.s("src/"), &t.s("dst")]);
     assert_eq!(read(&t.path("elsewhere/f")), b"old", "{so}");
     assert!(t.path("dst").symlink_metadata().unwrap().is_symlink());
+}
+
+// Resume: a successful transfer leaves no marker behind, and the retained
+// journal is authoritative — a completed file is skipped on a plain rerun even
+// if the destination was externally deleted, while -c bypasses the journal.
+#[test]
+fn resume_marker_lifecycle_and_journal_authority() {
+    let t = Tmp::new();
+    write(&t.path("src/f.bin"), b"hello world");
+    set_mtime(&t.path("src/f.bin"), 1_600_000_000);
+
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/f.bin")), b"hello world");
+    assert!(
+        !t.path("dst/.pcp-transfer-session.json").exists(),
+        "marker must be removed after a successful transfer"
+    );
+
+    // The journal, not the destination, decides completeness. Delete the dest
+    // file; a plain rerun trusts the journal and does not recopy it.
+    fs::remove_file(t.path("dst/f.bin")).unwrap();
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert!(
+        !t.path("dst/f.bin").exists(),
+        "a journal-complete file is skipped without a destination stat"
+    );
+    assert!(!t.path("dst/.pcp-transfer-session.json").exists());
+
+    // -c ignores the journal and reconciles against the real destination.
+    run_ok(&["-a", "-c", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/f.bin")), b"hello world");
+
+    // --no-resume also ignores the journal (independent of -c).
+    fs::remove_file(t.path("dst/f.bin")).unwrap();
+    run_ok(&["-a", "--no-resume", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/f.bin")), b"hello world");
+}
+
+// A source file that would map onto the reserved marker path is refused rather
+// than clobbering the interlock.
+#[test]
+fn resume_reserved_marker_path_is_protected() {
+    let t = Tmp::new();
+    write(
+        &t.path("src/.pcp-transfer-session.json"),
+        b"not really a marker",
+    );
+    write(&t.path("src/ok.bin"), b"fine");
+    let out = pcp(&["-a", &t.s("src/"), &t.s("dst/")]);
+    // The clash is reported and exit is non-zero, but other files still land.
+    assert!(
+        !out.status.success(),
+        "reserved-path clash must fail the run"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("reserved"),
+        "stderr should explain the reservation: {err}"
+    );
+    assert_eq!(read(&t.path("dst/ok.bin")), b"fine");
+}
+
+// Unsupported rsync flags get a helpful, specific error (not clap's generic
+// "unexpected argument"), and the filter family points at -i.
+#[test]
+fn unsupported_rsync_flags_explain_themselves() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"x");
+
+    let out = pcp(&[
+        "-a",
+        "--exclude",
+        "node_modules",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("-i/--ignore"), "should point to -i: {err}");
+    assert!(err.contains("gitignore"), "should mention gitignore: {err}");
+
+    let out = pcp(&["-a", "--delete-excluded", &t.s("src/"), &t.s("dst/")]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("one deletion mode"));
+
+    // Bundled short flags from a pasted `rsync -aHz` are caught too (the
+    // unsupported letter is found inside the cluster).
+    let out = pcp(&["-aHz", &t.s("src/"), &t.s("dst/")]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("hard links"),
+        "bundled -H should be explained: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// Compatibility no-ops are accepted and change nothing.
+#[test]
+fn rsync_compat_noops_are_accepted() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"hello");
+    // --numeric-ids, --partial, -P, -h are all no-ops here.
+    run_ok(&[
+        "-a",
+        "--numeric-ids",
+        "--partial",
+        "-P",
+        "-h",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(read(&t.path("dst/f")), b"hello");
+}
+
+// A value that happens to look like an unsupported flag is not misread.
+#[test]
+fn flag_like_ignore_pattern_is_not_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"k");
+    // `-i --exclude` means "ignore a pattern literally named --exclude"; it must
+    // not trip the --exclude rejection.
+    run_ok(&["-a", "-i", "--exclude", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("dst/keep")), b"k");
 }

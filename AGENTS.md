@@ -15,6 +15,9 @@ git worktree add .worktrees/<task> -b <task> master
 cd .worktrees/<task>
 ```
 
+Use plain git commands as shown above. Do not use the `EnterWorktree` or
+`ExitWorktree` tools; they are denied in `.claude/settings.json`.
+
 Continue in an existing worktree only when you created it for the current task
 or the user explicitly identified it as the target. Never infer ownership from
 a plausible branch name. Before editing, confirm that
@@ -22,8 +25,8 @@ a plausible branch name. Before editing, confirm that
 
 ## Working on PCP
 
-- `README.md` is the user-facing contract. `DESIGN.md` provides context, but
-  verify its notes against the current code.
+- `README.md` is the user-facing contract; the code is authoritative for
+  everything else. `RESUME-DESIGN.md` covers the resume feature's design.
 - Distinguish explicit requirements from assumptions and design choices. If a
   supposed requirement creates substantial complexity, question the premise
   and look for a simpler interpretation. Ask the user when the answer would

@@ -51,9 +51,12 @@ pub struct Args {
     /// Show what would be transferred without doing it
     #[arg(short = 'n', long)]
     pub dry_run: bool,
-    /// Accepted for rsync compatibility (sizes are always human-readable)
+    /// No-op accepted for rsync compatibility (sizes are always human-readable)
     #[arg(short = 'h', long)]
     pub human_readable: bool,
+    /// No-op accepted for rsync compatibility (pcp always uses numeric uid/gid)
+    #[arg(long)]
+    pub numeric_ids: bool,
 
     /// Number of parallel connections/workers (default: 8 over ssh, 32 when everything is local)
     #[arg(short = 'j', long, value_name = "N")]
@@ -68,6 +71,11 @@ pub struct Args {
     /// Don't split in-flight files with less than this much left (e.g. 32M)
     #[arg(long, default_value = "32M", value_name = "SIZE")]
     pub min_split: String,
+    /// Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables)
+    #[arg(long, value_name = "RATE")]
+    pub bwlimit: Option<String>,
+    #[arg(skip)]
+    pub bwlimit_bytes: u64,
 
     /// Show progress (default when stderr is a terminal)
     #[arg(long, overrides_with = "no_progress")]
@@ -78,7 +86,7 @@ pub struct Args {
     /// Same as --progress --partial
     #[arg(short = 'P')]
     pub p_flag: bool,
-    /// Keep partially transferred files (always on; accepted for compatibility)
+    /// No-op accepted for rsync compatibility (pcp always keeps partial files)
     #[arg(long)]
     pub partial: bool,
     /// Emit machine-readable progress lines (JSON) on stderr
@@ -112,23 +120,22 @@ pub struct Args {
     /// Remote shell command (default: ssh)
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
-    /// Path to pcp on the remote host
+    /// Use this exact pcp executable on the remote instead of the managed helper
     #[arg(long, value_name = "PATH")]
     pub pcp_path: Option<String>,
-    /// Install this pcp binary on the remote host (~/.local/bin/pcp) if missing
+    /// Require pcp on the remote PATH instead of installing a versioned helper
     #[arg(long)]
-    pub bootstrap: bool,
-    /// TCP data connections (AES-256-GCM) after authenticating over ssh — this is the
-    /// default; the flag is accepted for explicitness. Falls back to ssh if unreachable
-    #[arg(long)]
-    pub tcp: bool,
+    pub no_bootstrap: bool,
     /// Use TCP data connections without encryption (trusted networks only)
     #[arg(long)]
     pub tcp_plain: bool,
     /// Send all data over the ssh connection instead of separate TCP data connections
     #[arg(long)]
     pub no_tcp: bool,
-    /// Port range the remote listens on for --tcp
+    /// Disable the resume marker/journal (no destination marker, no completion journal)
+    #[arg(long)]
+    pub no_resume: bool,
+    /// Port range the remote listens on for TCP data connections
     #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
     pub tcp_ports: String,
     /// Remote-to-remote: start the transfer detached on the source host (survives losing this
@@ -216,8 +223,16 @@ impl Args {
     /// a .gitignore file).
     pub fn parse_args() -> Result<Args> {
         use clap::{CommandFactory, FromArgMatches};
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        reject_unsupported_rsync_flags(&argv)?;
         let m = Args::command().get_matches();
         let mut args = Args::from_arg_matches(&m)?;
+        args.bwlimit_bytes = args
+            .bwlimit
+            .as_deref()
+            .map(crate::bwlimit::parse_rate)
+            .transpose()?
+            .unwrap_or(0);
         let mut items: Vec<(usize, bool, String)> = Vec::new();
         if let Some(idx) = m.indices_of("ignore") {
             for (i, v) in idx.zip(&args.ignore) {
@@ -349,6 +364,105 @@ fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
         out.push(parts.join(&b'/'));
     }
     Ok(out)
+}
+
+/// Common rsync flags pcp deliberately doesn't implement get a one-line
+/// explanation instead of clap's generic "unexpected argument", so pasting an
+/// rsync command tells you exactly what to change. Flags pcp *does* accept
+/// (including the compatibility no-ops) are not listed here; genuinely unknown
+/// flags fall through to clap. No translation is performed.
+fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
+    // Options that consume a following, separate token as their value — skip
+    // that token so a value like `-e 'ssh ...'` is never mistaken for a flag.
+    let value_long = [
+        "--rsh",
+        "--ignore",
+        "--ignore-from",
+        "--connections",
+        "--block-size",
+        "--min-split",
+        "--bwlimit",
+        "--max-size",
+        "--min-size",
+        "--files-from",
+        "--tcp-ports",
+        "--pcp-path",
+        "--width",
+    ];
+    let mut skip_next = false;
+    for tok in argv {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if tok == "--" {
+            break; // end of options; the rest are paths
+        }
+        if value_long.contains(&tok.as_str())
+            || (!tok.starts_with("--") && matches!(tok.as_str(), "-e" | "-i" | "-j"))
+        {
+            skip_next = true;
+            continue;
+        }
+        if let Some(msg) = unsupported_message(tok) {
+            bail!("{msg}");
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_message(tok: &str) -> Option<String> {
+    if let Some(long) = tok.strip_prefix("--") {
+        return message_for_long(long.split('=').next().unwrap_or(long)).map(str::to_string);
+    }
+    if let Some(cluster) = tok.strip_prefix('-') {
+        // Bundled short flags (e.g. `-auHz`): stop at the first value-taking
+        // short, since everything after it is that option's value.
+        for c in cluster.chars() {
+            if matches!(c, 'e' | 'i' | 'j') {
+                break;
+            }
+            if let Some(m) = message_for_short(c) {
+                return Some(m.to_string());
+            }
+        }
+    }
+    None
+}
+
+const FILTER_MSG: &str = "pcp has no --exclude/--include/--filter. Use -i/--ignore (or --ignore-from), which takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `-i node_modules`. See the README's \"Ignoring paths\" section.";
+const DELETE_MSG: &str = "pcp has one deletion mode, --delete (after the transfer, only on a clean source scan); --delete-before/-during/-delay/-after, --delete-excluded, --max-delete and --force are not supported.";
+
+fn message_for_long(base: &str) -> Option<&'static str> {
+    Some(match base {
+        "exclude" | "exclude-from" | "include" | "include-from" | "filter" => FILTER_MSG,
+        "delete-excluded" | "max-delete" | "force" => DELETE_MSG,
+        _ if base.starts_with("delete-") => DELETE_MSG,
+        "one-file-system" => "pcp does not implement -x/--one-file-system.",
+        "sparse" => "pcp does not implement -S/--sparse.",
+        "hard-links" => "pcp does not preserve hard links (-H/--hard-links).",
+        "acls" => "pcp does not preserve ACLs (-A/--acls).",
+        "xattrs" => "pcp does not preserve extended attributes (-X/--xattrs).",
+        "copy-links" | "copy-unsafe-links" | "copy-dirlinks" => {
+            "pcp does not implement -L/--copy-links; it copies symlinks as symlinks (-l)."
+        }
+        "link-dest" | "compare-dest" | "copy-dest" => {
+            "pcp does not implement --link-dest/--compare-dest/--copy-dest."
+        }
+        _ => return None,
+    })
+}
+
+fn message_for_short(c: char) -> Option<&'static str> {
+    message_for_long(match c {
+        'H' => "hard-links",
+        'A' => "acls",
+        'X' => "xattrs",
+        'S' => "sparse",
+        'x' => "one-file-system",
+        'L' => "copy-links",
+        _ => return None,
+    })
 }
 
 pub fn parse_size(s: &str) -> Result<u64> {

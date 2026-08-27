@@ -114,6 +114,7 @@ pub enum Op {
 pub enum Request {
     Hello {
         version: u32,
+        release: String,
         compress: bool,
         debug: bool,
         token: Vec<u8>,
@@ -204,6 +205,19 @@ pub enum Request {
     FileHash {
         path: PathBytes,
     },
+    /// Create a marker file with exclusive-create semantics.
+    MarkerCreate {
+        path: PathBytes,
+        data: Vec<u8>,
+    },
+    /// Read a marker file if present.
+    MarkerRead {
+        path: PathBytes,
+    },
+    /// Remove a marker file (idempotent).
+    MarkerRemove {
+        path: PathBytes,
+    },
     Shutdown,
 }
 
@@ -211,6 +225,7 @@ pub enum Request {
 pub enum Response {
     HelloOk {
         version: u32,
+        release: String,
     },
     /// Each advertised data address with its interface link speed in Mbps
     /// (0 = unknown). The address the client's ssh session arrived on is first.
@@ -218,6 +233,10 @@ pub enum Response {
         port: u16,
         addrs: Vec<(String, u32)>,
     },
+    /// The marker already existed; carries its current content.
+    MarkerExists(Vec<u8>),
+    /// A marker's content, or None if absent.
+    Marker(Option<Vec<u8>>),
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
     /// Paths (relative to the root) pruned by the ignore patterns.

@@ -5,6 +5,7 @@ use crate::fsops::{self, FsOps};
 #[allow(unused_imports)]
 use crate::proto::SizeHint;
 use crate::proto::*;
+use crate::remote_helper::{self, Target};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -230,6 +231,10 @@ pub struct RemoteSpec {
     pub host: String,
     pub rsh: Vec<String>,
     pub pcp_path: Option<String>,
+    /// Install and use the versioned helper rather than resolving `pcp` on PATH.
+    pub auto_helper: bool,
+    /// Serializes a first-use install across control and worker clones.
+    pub helper_install: std::sync::Arc<std::sync::Mutex<bool>>,
     /// `-q`: suppress the "falling back to ssh" notice.
     pub quiet: bool,
     /// Shared across clones so workers see the TCP setup done on the control connection.
@@ -273,18 +278,42 @@ impl RemoteSpec {
         cmd
     }
 
-    fn server_command(&self) -> String {
-        match &self.pcp_path {
-            Some(p) => format!("{} --server", shell_words::quote(p)),
-            None => "sh -c 'command -v pcp >/dev/null 2>&1 && exec pcp --server; exec \"$HOME/.local/bin/pcp\" --server'"
-                .to_string(),
+    /// A shell command that runs pcp with `args` on this host.  Automatic mode
+    /// addresses the exact versioned helper; explicit mode preserves the
+    /// administrator-provided path; --no-bootstrap uses normal PATH lookup.
+    pub fn program_command(&self, args: &[String]) -> String {
+        if let Some(p) = &self.pcp_path {
+            return format!("{} {}", shell_words::quote(p), shell_words::join(args));
         }
+        if self.auto_helper {
+            return remote_helper::launcher(args);
+        }
+        format!("pcp {}", shell_words::join(args))
     }
 
     /// Connect, retrying a few times: sshd's MaxStartups (default 10) drops
     /// connections at random when many are being set up at once, so we also
     /// limit how many connects are in flight.
     pub fn connect(&self, compress: bool) -> Result<RemoteConn> {
+        let first = self.connect_retried(compress);
+        let Err(first_error) = first else {
+            return first;
+        };
+        if !self.auto_helper || !helper_needs_install(&first_error) {
+            return Err(first_error);
+        }
+
+        self.install_helper()?;
+        self.connect_retried(compress).with_context(|| {
+            format!(
+                "could not start the {} helper installed on {}",
+                remote_helper::release_key(),
+                self.label()
+            )
+        })
+    }
+
+    fn connect_retried(&self, compress: bool) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
         for attempt in 0..6 {
@@ -295,7 +324,16 @@ impl RemoteSpec {
                 Err(e)
                     if attempt == 5
                         || e.to_string().contains("version mismatch")
-                        || e.to_string().contains("exit status: 127") =>
+                        || e.to_string().contains("release mismatch")
+                        || e.to_string().contains("exit status: 127")
+                        || e.to_string().contains(&format!(
+                            "exit status: {}",
+                            remote_helper::HELPER_MISSING_EXIT
+                        ))
+                        || e.to_string().contains(&format!(
+                            "exit status: {}",
+                            remote_helper::HELPER_NOT_EXECUTABLE_EXIT
+                        )) =>
                 {
                     return Err(e)
                 }
@@ -318,7 +356,7 @@ impl RemoteSpec {
 
     fn connect_once(&self, compress: bool) -> Result<RemoteConn> {
         let mut cmd = self.ssh_command();
-        cmd.arg(self.server_command());
+        cmd.arg(self.program_command(&["--server".into()]));
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -491,6 +529,18 @@ impl RemoteSpec {
     }
 }
 
+fn helper_needs_install(e: &anyhow::Error) -> bool {
+    let message = e.to_string();
+    message.contains(&format!(
+        "exit status: {}",
+        remote_helper::HELPER_MISSING_EXIT
+    )) || message.contains(&format!(
+        "exit status: {}",
+        remote_helper::HELPER_NOT_EXECUTABLE_EXIT
+    )) || message.contains("version mismatch")
+        || message.contains("release mismatch")
+}
+
 /// Concurrently probe which (addr, speed) entries accept a TCP connection on
 /// `port`, preserving the server's priority order. Used once per endpoint.
 fn probe_reachable(advertised: &[(String, u32)], port: u16) -> Vec<(String, u32)> {
@@ -551,52 +601,194 @@ fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteC
     {
         conn.send(Request::Hello {
             version: VERSION,
+            release: env!("CARGO_PKG_VERSION").to_string(),
             compress,
             debug: crate::transfer::debug(),
             token,
         })?;
         match conn.recv() {
-            Ok(Response::HelloOk { version }) if version == VERSION => Ok(conn),
-            Ok(Response::HelloOk { version }) => {
-                bail!("{}: protocol version mismatch (remote {version}, local {VERSION})", conn.label)
+            Ok(Response::HelloOk { version, release })
+                if version == VERSION && release == env!("CARGO_PKG_VERSION") =>
+            {
+                Ok(conn)
+            }
+            Ok(Response::HelloOk { version, release }) => {
+                if release != env!("CARGO_PKG_VERSION") {
+                    bail!(
+                        "{}: release mismatch (remote {release}, local {})",
+                        conn.label,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
+                bail!(
+                    "{}: protocol version mismatch (remote {version}, local {VERSION})",
+                    conn.label
+                )
             }
             Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
             Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
-            Err(e) => bail!(
-                "{e}\ncould not start pcp on {} — is it installed there? (try --bootstrap, or --pcp-path)",
-                conn.label
-            ),
+            Err(e) => bail!("{e}\ncould not start the remote pcp on {}", conn.label),
         }
     }
 }
 
 impl RemoteSpec {
-    /// Copy this binary to `~/.local/bin/pcp` on the remote host.
-    pub fn bootstrap(&self) -> Result<()> {
-        let exe = std::env::current_exe().context("locate own executable")?;
-        let bin = std::fs::read(&exe).with_context(|| format!("read {}", exe.display()))?;
-        eprintln!(
-            "pcp: installing pcp on {} (~/.local/bin/pcp, {} bytes)",
-            self.label(),
-            bin.len()
-        );
-        let mut cmd = self.ssh_command();
-        cmd.arg(
-            "sh -c 'd=\"$HOME/.local/bin\"; mkdir -p \"$d\" && cat > \"$d/pcp.tmp\" && chmod 755 \"$d/pcp.tmp\" && mv \"$d/pcp.tmp\" \"$d/pcp\" && \"$d/pcp\" --version'",
-        );
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        let mut child = cmd.spawn()?;
-        {
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(&bin)?;
+    /// Ensure the exact release/protocol helper exists in the remote cache.
+    /// Release assets are preferred so unlike architectures work without
+    /// crossing the ssh link; uploading this executable is the offline fallback.
+    pub fn install_helper(&self) -> Result<()> {
+        let mut installed = self.helper_install.lock().unwrap();
+        if *installed {
+            return Ok(());
         }
-        let status = child.wait()?;
-        if !status.success() {
-            bail!("bootstrap on {} failed ({status}); the remote may need a different architecture build", self.label());
+
+        let target = self.remote_target()?;
+        if !self.quiet {
+            eprintln!(
+                "pcp: {}: installing {} helper for {}",
+                self.label(),
+                remote_helper::release_key(),
+                target.key
+            );
+        }
+        match self.download_helper(target) {
+            Ok(()) => {
+                *installed = true;
+                Ok(())
+            }
+            Err(download_error) if Target::local() == Some(target) => {
+                if !self.quiet {
+                    eprintln!(
+                        "pcp: {}: release download unavailable; uploading this executable",
+                        self.label()
+                    );
+                }
+                if crate::transfer::debug() {
+                    eprintln!(
+                        "pcp: {}: remote helper download failed: {download_error:#}",
+                        self.label()
+                    );
+                }
+                self.upload_helper(target).with_context(|| {
+                    format!(
+                        "download failed ({download_error:#}); local executable upload also failed"
+                    )
+                })?;
+                *installed = true;
+                Ok(())
+            }
+            Err(download_error) => {
+                let local = Target::local().map_or("unsupported", |t| t.key);
+                bail!(
+                    "could not install {} helper on {} ({}) and cannot upload the local {} executable: {download_error:#}; install a compatible pcp and pass --pcp-path",
+                    remote_helper::release_key(),
+                    self.label(),
+                    target.key,
+                    local
+                );
+            }
+        }
+    }
+
+    fn remote_target(&self) -> Result<Target> {
+        let mut cmd = self.ssh_command();
+        cmd.arg(remote_helper::probe_command())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("probe platform on {}", self.label()))?;
+        if !out.status.success() {
+            bail!(
+                "could not detect the platform on {} ({}){}",
+                self.label(),
+                out.status,
+                output_suffix(&out.stderr)
+            );
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix("pcp-helper-target:"))
+            .ok_or_else(|| anyhow!("{}: platform probe returned no target", self.label()))?;
+        let (os, arch) = value
+            .split_once(':')
+            .ok_or_else(|| anyhow!("{}: malformed platform response {value:?}", self.label()))?;
+        Target::from_uname(os, arch).ok_or_else(|| {
+            anyhow!(
+                "{}: automatic remote helpers do not support {os} {arch}; install pcp there and pass --pcp-path",
+                self.label()
+            )
+        })
+    }
+
+    fn download_helper(&self, target: Target) -> Result<()> {
+        let script = remote_helper::download_script(target);
+        let mut cmd = self.ssh_command();
+        cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("download helper on {}", self.label()))?;
+        if !out.status.success() {
+            bail!(
+                "remote download exited {}{}",
+                out.status,
+                output_suffix(&out.stderr)
+            );
         }
         Ok(())
+    }
+
+    fn upload_helper(&self, target: Target) -> Result<()> {
+        let exe = std::env::current_exe().context("locate current pcp executable")?;
+        let mut input = std::fs::File::open(&exe)
+            .with_context(|| format!("open current executable {}", exe.display()))?;
+        let bytes = input.metadata()?.len();
+        if !self.quiet {
+            eprintln!(
+                "pcp: {}: uploading {:.1} MiB",
+                self.label(),
+                bytes as f64 / (1 << 20) as f64
+            );
+        }
+
+        let script = remote_helper::upload_script(target);
+        let mut cmd = self.ssh_command();
+        cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("start helper upload to {}", self.label()))?;
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            std::io::copy(&mut input, &mut stdin)
+                .with_context(|| format!("upload helper to {}", self.label()))?;
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!(
+                "remote install exited {}{}",
+                out.status,
+                output_suffix(&out.stderr)
+            );
+        }
+        Ok(())
+    }
+}
+
+fn output_suffix(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr);
+    let message = message.trim();
+    if message.is_empty() {
+        String::new()
+    } else {
+        format!(": {message}")
     }
 }
 

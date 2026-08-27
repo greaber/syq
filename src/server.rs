@@ -31,6 +31,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     match r.read_msg::<Request>()? {
         Request::Hello {
             version,
+            release,
             compress,
             debug: d,
             token,
@@ -53,8 +54,18 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 )))?;
                 bail!("protocol version mismatch");
             }
+            let expected_release = env!("CARGO_PKG_VERSION");
+            if release != expected_release {
+                w.write_msg(&Response::Err(format!(
+                    "release mismatch (remote {expected_release}, client {release})"
+                )))?;
+                bail!("release mismatch");
+            }
             w.compress = compress;
-            w.write_msg(&Response::HelloOk { version: VERSION })?;
+            w.write_msg(&Response::HelloOk {
+                version: VERSION,
+                release: expected_release.to_string(),
+            })?;
         }
         _ => bail!("expected Hello"),
     }

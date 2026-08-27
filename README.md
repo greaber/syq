@@ -2,7 +2,9 @@
 
 `pcp` is a parallel file copier with an rsync-shaped command line. It scans
 source and destination, works out what differs, and moves the data over
-**N independent ssh connections at once** — splitting large files into ranges
+**N independent connections at once** — encrypted TCP by default, authenticated
+over ssh, falling back to ssh's own channels when a direct port can't be
+reached — splitting large files into ranges
 that idle workers steal from each other, so a single huge file at the end of
 a transfer still uses every connection. Throughput is typically several times
 that of a single ssh stream. It also has a progress meter that separates
@@ -17,23 +19,32 @@ cargo build --release          # binary at target/release/pcp
 cargo install --path .         # or: put it on your PATH
 ```
 
-The remote side needs `pcp` too, just as rsync needs `rsync` there. It is
-started as `pcp --server` over the remote shell. Options:
+The remote side runs `pcp --server`, but it does not need to be installed or
+configured first. pcp uses an exact versioned helper under
+`~/.cache/pcp/helpers/`. On first use of a version it detects the remote
+platform, downloads the matching compressed binary from that version's GitHub
+release, verifies its SHA-256 checksum, and installs it atomically. Later runs
+execute that exact path without an extra probe connection. Linux x86-64 and
+ARM64 and macOS Apple Silicon and Intel are published.
 
-- Install it on the remote host and make sure it is on the `PATH` of a
-  non-interactive ssh shell, or pass `--pcp-path /path/to/pcp`.
-- `--bootstrap`: if starting the remote `pcp` fails, copy *this* binary to
-  `~/.local/bin/pcp` on the remote host and retry. The default remote command
-  falls back to `~/.local/bin/pcp` automatically. The remote must be the same
-  architecture as the local binary.
+If the remote cannot reach GitHub, pcp uploads its current executable when the
+local and remote platforms match. For a different-platform host without
+outbound access, install a compatible binary yourself and pass
+`--pcp-path /path/to/pcp`. `--no-bootstrap` disables managed helpers and
+requires `pcp` on the non-interactive remote `PATH`.
+
+The remote download uses `curl` or `wget`, `gzip`, and one of `sha256sum`,
+`shasum`, or `openssl`. Version directories coexist and the helper cache can be
+removed at any time; pcp recreates the helper it needs on the next connection.
+
 - **macOS (Apple Silicon / Intel):** build natively on the Mac with
   `cargo build --release` (needs the Xcode command-line tools, `xcode-select
   --install`, for the bundled zstd C library). The tool is otherwise pure Rust
   and uses only POSIX calls; Linux-only optimizations (`fallocate`,
   glibc `mallopt`) are compiled out automatically. copy_file_range's local
   fast path is Linux-only; on macOS same-machine copies use the normal path.
-- For portability across distributions (e.g. to `--bootstrap` onto hosts with
-  an older glibc), build a static binary:
+- For portability across distributions (e.g. for the offline upload fallback
+  to a host with an older glibc), build a static binary:
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
   (the musl target also works if `musl-gcc` is installed, which `zstd-sys` needs).
 
@@ -52,11 +63,12 @@ pcp -a /mnt/nfs/tree /local/tree              # local → local (parallel scan a
 pcp -a hostA:big/ hostB:big/                  # remote → remote: runs on hostA, data goes A → B directly
 pcp -a --relay hostA:big/ hostB:big/          # ...or relay through this machine if A can't reach B
 pcp -avz -j 16 bigdir server:dest             # 16 parallel connections
+pcp -a --bwlimit 50M src server:dst            # cap all connections at 50 MiB/s total
 pcp -a -e 'ssh -p 2222 -i ~/.ssh/other' src host:dst
 pcp -a --dry-run -v src host:dst              # show what would be copied
 pcp -ac src host:dst                          # skip the quick check; compare blocks, repair differences
 pcp -a --verify-only src host:dst             # compare only; transfer nothing
-pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if needed
+pcp -a src newhost:dst                        # the matching remote helper is automatic
 ```
 
 ### Options
@@ -69,25 +81,28 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `-q` | Errors only |
 | `-z`, `--compress` | zstd-compress data in transit (inside pcp's protocol, not `ssh -C`) |
 | `-n`, `--dry-run` | Scan and report; change nothing |
-| `-j N`, `--connections N` | Parallel data connections (default 8) |
+| `-j N`, `--connections N` | Parallel data connections (default 8 over ssh, 32 when fully local) |
+| `--bwlimit RATE` | Limit aggregate file-data throughput (bare rate is KiB/s; `0` disables) |
 | `--block-size SIZE` | Transfer and hash block size (default 4M) |
 | `--min-split SIZE` | Don't split an in-flight file with less than this left (default 32M) |
 | `--progress` / `--no-progress` | Progress meter (default on when stderr is a terminal) |
-| `-P` | `--progress --partial` (partials are always kept; accepted for compatibility) |
+| `-P` | Turns on `--progress` (the `--partial` half is always on; see below) |
+| `--partial` | No-op for rsync compatibility (pcp always keeps partial files) |
+| `--numeric-ids` | No-op for rsync compatibility (pcp always uses numeric uid/gid) |
 | `--progress-json` | One JSON line per second on stderr |
 | `--stats` | Summary counts at the end |
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
 | `--verify-only` | Hash every file on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
-| `--atomic` | Partial + rename for every file, even small new ones (see below) |
-| `--fsync` | fsync each file (and its directory) before the rename |
+| `--atomic` | Force partial + atomic rename for every file, including small new ones |
+| `--fsync` | fsync each file and its parent dir around the rename (survives a crash; slower) |
+| `--no-resume` | Don't drop a destination marker or write a completion journal for this run |
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
-| `--pcp-path PATH` | Location of `pcp` on the remote host |
-| `--bootstrap` | Copy this binary to the remote's `~/.local/bin/pcp` if starting it fails |
-| `--tcp` | Data over TCP sockets (AES-256-GCM) after ssh auth; falls back to ssh if unreachable |
-| `--tcp-plain` | Like `--tcp` without encryption (trusted networks only) |
-| `--no-tcp` | Send data over the ssh connections instead |
-| `--tcp-ports LO-HI` | Port range the remote listens on for `--tcp` (default 47600-47699) |
+| `--pcp-path PATH` | Use this exact remote `pcp` instead of the managed helper |
+| `--no-bootstrap` | Require `pcp` on the remote `PATH`; do not install a managed helper |
+| `--no-tcp` | Send data over the ssh connection instead of separate TCP sockets |
+| `--tcp-plain` | TCP data connections without encryption (trusted networks only) |
+| `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
 | `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
 | `--delete` | Remove destination paths the source doesn't have (see below) |
@@ -99,18 +114,30 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `--from0` | `--files-from` entries are NUL-separated |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
-| `--detach` | Remote-to-remote: start the transfer detached on the source host and return |
-| `--follow HOST:LOG` | Watch a detached transfer's log |
-| `-h` | Accepted for compatibility; sizes are always human-readable. Use `--help` for help |
+| `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
+| `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
+| `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
+
+`--bwlimit` is one approximate limit shared by every `-j` worker, not a
+per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
+`M`, `G`, and `MiB` use powers of 1024, a final `+1` or `-1` adjusts the scaled
+value by one byte, and `0` means unlimited. PCP counts uncompressed file bytes;
+protocol overhead is not counted, and `-z` may make the actual network rate
+lower. Scanning, hashing, and metadata operations are not limited.
 
 ### Remote-to-remote
 
 `pcp hostA:src hostB:dst` starts the orchestrator *on hostA* over `ssh -A`
 (agent forwarding), which then pushes to hostB with N connections, so data
-flows A → B directly. That needs pcp on both hosts and hostA able to ssh to
-hostB (with your forwarded agent, or its own keys). Progress and `-v` output
-are streamed back. If hostA can't reach hostB, `--relay` keeps the orchestrator
-here and routes every byte A → you → B — always works, at half the bandwidth.
+flows A → B directly. Matching helpers are installed automatically on both
+hosts. HostA must be able to ssh to hostB (with your forwarded agent, or its
+own keys). Progress and `-v` output are streamed back. If hostA can't reach
+hostB, `--relay` keeps the orchestrator here and routes every byte A → you → B
+— always works, at half the bandwidth.
+
+Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
+launched it: pcp starts it on hostA, returns, and writes progress to a log on
+hostA. Reattach with `pcp --follow hostA:LOG` to stream that progress.
 
 ## Path semantics
 
@@ -144,8 +171,9 @@ disturb them.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.
-`-j N` data connections — separate `ssh` processes, each its own TCP flow and
-cipher process — carry only "read range" / "write range" requests. Files go
+`-j N` data connections — by default separate TCP sockets carrying AES-256-GCM
+records (under `--no-tcp`, separate `ssh` processes instead), each its own flow
+and cipher — carry only "read range" / "write range" requests. Files go
 onto a largest-first queue; when a worker runs dry it steals the back half of
 the remaining range of whichever file has the most left, so the tail of a
 transfer stays parallel without pre-deciding chunk counts.
@@ -157,8 +185,8 @@ does not `fsync` each file (the rename still orders correctly, and per-file
 fsync is costly on NFS); pass `--fsync` to force each file durable before the
 rename for crash safety.
 Large files and existing-file updates go through this partial + rename, so their
-final name is never occupied by an incomplete file. **Small new files (up to the
-block size) are the exception**: they are written straight to their final path
+final name is never occupied by an incomplete file. **Small new files (up to one
+transfer block) are the exception**: they are written straight to their final path
 for speed (no rename), so a concurrent reader can observe one partially written,
 and an aborted run leaves an incomplete final-named file until you rerun (a
 rerun re-transfers it, since without preallocation it is detectably short — it
@@ -172,22 +200,49 @@ on NFS and NVMe.
 
 ### Resume
 
-There is no state file. On restart:
+Ctrl-C is always safe: kill it, rerun the same command. Resume works at two
+levels.
+
+**Within a file.** There is no per-file state file — the partial *is* the state:
 
 - Files whose size and mtime already match are skipped (the rsync quick check).
 - If a `.name.pcp-partial` exists, both sides hash it and the source in
-  `--block-size` blocks and only the mismatching blocks are sent. The partial
-  *is* the state, so it can't disagree with reality.
+  `--block-size` blocks and only the mismatching blocks are sent.
 - If the destination file exists but differs, its blocks are hashed against
   the source too; if all match only metadata is fixed, otherwise the matching
   blocks are copied locally into a new partial and the rest transferred.
-
-Ctrl-C is therefore always safe: kill it, rerun the same command.
 
 This block-level skip catches appends and in-place modifications (VM images,
 databases, logs). It does **not** catch a byte inserted near the start of a
 file, which rsync's rolling checksum would — for pcp's intended use (fresh
 uploads and downloads) that trade was made deliberately.
+
+**Across the whole job.** So a rerun of a large tree doesn't have to re-stat
+every destination file, pcp keeps a small completion journal per job (keyed to
+the exact source→destination paths and the metadata-affecting flags) under
+`$XDG_STATE_HOME/pcp` (default `~/.local/state/pcp`; override with
+`PCP_STATE_DIR`). While a transfer runs it also drops a marker file,
+`.pcp-transfer-session.json`, on the *destination* filesystem:
+
+- The marker keeps two transfers from writing the same destination at once. If
+  a second run finds a live marker for a different session it stops and tells
+  you which host and session owns it, rather than interleaving writes.
+- On success the marker is removed and the destination root's own
+  metadata restored; the journal is kept so the next identical run is fast.
+- If a run is interrupted, the marker and journal stay. Rerun the same command
+  and pcp skips the files the journal already recorded as complete (matching
+  source size + mtime) without stat'ing the destination, then finishes the rest.
+
+`--delete` records what it removes, so a file the source drops and later
+brings back is transferred again rather than assumed complete.
+
+Because the journal is authoritative, changes made to the destination *outside*
+pcp are not noticed by a plain rerun — a file the journal calls complete is
+skipped even if you deleted it. Pass `-c` (compare every file against the real
+destination) or `--no-resume` (ignore the journal and marker entirely) to force
+reconciliation against what is actually on disk. The journal is an optimization,
+never a correctness crutch: if the marker can't be created (e.g. a read-only
+destination directory) the transfer still runs, just without cross-run resume.
 
 ### Verification and consistency
 
@@ -229,7 +284,7 @@ hardlinks aren't implemented.
 
 - rsync filter rules (`--exclude`/`--include`/`--filter`); use `-i` (gitignore
   syntax) instead.
-- `--link-dest`, `--bwlimit`, `--backup`.
+- `--link-dest`, `--backup`.
 - `--delete`'s variants: `--delete-before`/`--delete-during`,
   `--delete-excluded`, `--max-delete`, `--force`. pcp has one deletion mode.
 - Hardlinks (`-H`), ACLs and xattrs (`-A`/`-X`).
@@ -255,7 +310,7 @@ hardlinks aren't implemented.
 - **Not** a single spinning disk: parallel reads of one file there mean seeks.
   Use `-j 1` or a large `--min-split`.
 
-## TCP data connections (`--tcp`)
+## TCP data connections
 
 ssh caps every stream at a few hundred MB/s of cipher CPU, and its 2 MB
 per-channel flow-control window caps a stream at roughly `2 MB / RTT` on long
@@ -266,7 +321,7 @@ connections: the remote opens a listener on a port from `--tcp-ports` (default
 AES-256-GCM records keyed by a secret exchanged over the ssh session
 (`--tcp-plain` skips the encryption on trusted networks; `--no-tcp` sends data over the ssh connection instead). If the port can't be
 reached — a firewall, typically — pcp says so once and falls back to ssh data
-connections, so `--tcp` is always safe to pass.
+connections, so the default is always safe.
 
 The remote advertises every address it has (the one your ssh session arrived
 on first, then private LAN, then public, then CGNAT/Tailscale); the client
@@ -284,7 +339,7 @@ sudo ufw allow from REMOVED/24 to any port 47600:47699 proto tcp   # LAN peers
 sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specific client
 ```
 
-Remote→remote (`pcp --tcp hostA:src hostB:dst`) works the same way: the
+Remote→remote (`pcp hostA:src hostB:dst`) works the same way: the
 orchestrator on hostA connects to hostB's listener.
 
 ## Defaults chosen for network filesystems
@@ -412,8 +467,11 @@ When source and destination are on the same machine, pcp copies each file with
 does a reflink or a straight in-kernel copy, and on NFS 4.2 the *server* copies
 the file internally (no client round trip). Measured: a single 8 GB file
 /raid→/raid at 24.8 GB/s vs 2.5 GB/s for `cp`; NFS→NFS at 3.3 GB/s vs 0.4.
-Hashing is skipped on this path (there's no wire to corrupt it); `-c` and any
-existing partial fall back to the streaming path, which keeps hash-based resume.
+Hashing is skipped on this path (there's no wire to corrupt it); `-c`, any
+existing partial, and `--bwlimit` disable this shortcut. Existing partials and
+larger bwlimited files use the hash-resumable streaming path. Small new
+bwlimited files that fit in one paced transfer block retain the `PutSmall`
+exception described above.
 
 ## NFS
 
