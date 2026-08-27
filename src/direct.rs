@@ -90,8 +90,8 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     // --ignore-from files were read locally; forward the merged lines.
     for l in &args.ignore_lines {
-        remote.push("--ignore".into());
-        remote.push(l.clone());
+        // One argument, so a pattern starting with '-' can't be taken for a flag.
+        remote.push(format!("--ignore={l}"));
     }
     if args.no_progress || args.quiet {
         remote.push("--no-progress".into());

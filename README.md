@@ -290,7 +290,7 @@ wins, `!` re-includes), so anything you'd write in a `.gitignore` works here:
 ```sh
 pcp -a -i node_modules -i .git src/ host:dst/   # a name matches at any depth
 pcp -a -i '*.o' -i /build src/ host:dst/         # glob; leading / anchors to the root
-pcp -a -i 'logs/**' -i '!logs/keep/**' src/ dst/ # re-include a subtree
+pcp -a -i 'logs/*' -i '!logs/keep/' src/ dst/    # everything in logs/ except keep/
 pcp -a --ignore-from .gitignore -i '!dist/' repo/ host:repo/
 pcp -a -i '*' -i '!*/' -i '!*.jpg' photos/ bak/  # copy only *.jpg
 ```
@@ -302,7 +302,13 @@ it is transferred or even scanned — which is why "only `*.jpg`" needs the
 `!*/` line to keep descending. Empty directories are copied like any other
 (this is a filter on the walk, not git's notion of what's tracked). The source
 root itself is never ignored; with several sources each is filtered from its
-own root. `-n` previews exactly what a real run would send.
+own root. `-n` previews exactly what a real run would send. `--rm` does not
+take filters (it always removes the whole tree), so `-i` conflicts with it.
+
+As in git, a `!` rule cannot re-include something whose parent directory is
+ignored: `logs/**` prunes `logs/keep` itself, so `!logs/keep/**` after it has
+nothing to act on. Ignore the siblings instead (`logs/*`, which does not cross
+`/`) and re-include the directory (`!logs/keep/`), as above.
 
 ## Parallel removal (`--rm`)
 
