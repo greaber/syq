@@ -22,8 +22,8 @@ a plausible branch name. Before editing, confirm that
 
 ## Working on PCP
 
-- `README.md` is the user-facing contract. `DESIGN.md` provides context, but
-  verify its notes against the current code.
+- `README.md` is the user-facing contract; the code is authoritative for
+  everything else. `RESUME-DESIGN.md` covers the resume feature's design.
 - Distinguish explicit requirements from assumptions and design choices. If a
   supposed requirement creates substantial complexity, question the premise
   and look for a simpler interpretation. Ask the user when the answer would
