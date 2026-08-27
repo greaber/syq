@@ -443,10 +443,14 @@ fix for that.
   ciphers). On x86 with AES-NI that is noticeably faster per stream than
   OpenSSH's default chacha20-poly1305.
 - Each connection costs one ssh handshake (~0.3 s on a LAN, several seconds
-  across continents), and sshd's `MaxStartups` (default 10) randomly rejects
-  sessions if too many are being set up at once, so pcp limits in-flight
-  connects and retries. Auto-tuning starts at 8 and only opens more once
-  they have been shown to pay.
+  across continents). The control connection always goes first (everything
+  waits on it); data connections are opened up to 32 at a time, and if the
+  server sheds one — sshd's `MaxStartups` (default 10) randomly rejects
+  sessions beyond 10 being set up at once — pcp halves that number for the
+  rest of the run and retries. On a server set up for pcp (`MaxStartups
+  100`, see `scripts/server-setup.sh`) 32 sessions come up in one round.
+  Auto-tuning starts at 8 and only opens more once they have been shown to
+  pay.
 - Direct remote→remote with a *forwarded* agent authenticates every session
   through your machine; over a slow link that dominates setup time. Keys on the
   source host avoid it.
