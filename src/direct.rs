@@ -75,9 +75,6 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.bootstrap {
         remote.push("--bootstrap".into());
     }
-    if args.tcp {
-        remote.push("--tcp".into());
-    }
     if args.no_tcp {
         remote.push("--no-tcp".into());
     }

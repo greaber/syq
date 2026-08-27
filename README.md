@@ -2,7 +2,9 @@
 
 `pcp` is a parallel file copier with an rsync-shaped command line. It scans
 source and destination, works out what differs, and moves the data over
-**N independent ssh connections at once** — splitting large files into ranges
+**N independent connections at once** — encrypted TCP by default, authenticated
+over ssh, falling back to ssh's own channels when a direct port can't be
+reached — splitting large files into ranges
 that idle workers steal from each other, so a single huge file at the end of
 a transfer still uses every connection. Throughput is typically several times
 that of a single ssh stream. It also has a progress meter that separates
@@ -69,7 +71,7 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `-q` | Errors only |
 | `-z`, `--compress` | zstd-compress data in transit (inside pcp's protocol, not `ssh -C`) |
 | `-n`, `--dry-run` | Scan and report; change nothing |
-| `-j N`, `--connections N` | Parallel data connections (default 8) |
+| `-j N`, `--connections N` | Parallel data connections (default 8 over ssh, 32 when fully local) |
 | `--block-size SIZE` | Transfer and hash block size (default 4M) |
 | `--min-split SIZE` | Don't split an in-flight file with less than this left (default 32M) |
 | `--progress` / `--no-progress` | Progress meter (default on when stderr is a terminal) |
@@ -79,17 +81,21 @@ pcp -a --bootstrap src newhost:dst            # install pcp on newhost first if 
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
 | `--verify-only` | Hash every file on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
+| `--atomic` | Force partial + atomic rename for every file, including small new ones |
+| `--fsync` | fsync each file and its parent dir around the rename (survives a crash; slower) |
 | `--no-resume` | Don't drop a destination marker or write a completion journal for this run |
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
 | `--pcp-path PATH` | Location of `pcp` on the remote host |
 | `--bootstrap` | Copy this binary to the remote's `~/.local/bin/pcp` if starting it fails |
-| `--tcp` | Data over TCP sockets (AES-256-GCM) after ssh auth; falls back to ssh if unreachable |
-| `--tcp-plain` | Like `--tcp` without encryption (trusted networks only) |
-| `--tcp-ports LO-HI` | Port range the remote listens on for `--tcp` (default 47600-47699) |
+| `--no-tcp` | Send data over the ssh connection instead of separate TCP sockets |
+| `--tcp-plain` | TCP data connections without encryption (trusted networks only) |
+| `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
 | `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
+| `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
+| `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | Accepted for compatibility; sizes are always human-readable. Use `--help` for help |
 
 ### Remote-to-remote
@@ -100,6 +106,10 @@ flows A → B directly. That needs pcp on both hosts and hostA able to ssh to
 hostB (with your forwarded agent, or its own keys). Progress and `-v` output
 are streamed back. If hostA can't reach hostB, `--relay` keeps the orchestrator
 here and routes every byte A → you → B — always works, at half the bandwidth.
+
+Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
+launched it: pcp starts it on hostA, returns, and writes progress to a log on
+hostA. Reattach with `pcp --follow hostA:LOG` to stream that progress.
 
 ## Path semantics
 
@@ -133,8 +143,9 @@ disturb them.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.
-`-j N` data connections — separate `ssh` processes, each its own TCP flow and
-cipher process — carry only "read range" / "write range" requests. Files go
+`-j N` data connections — by default separate TCP sockets carrying AES-256-GCM
+records (under `--no-tcp`, separate `ssh` processes instead), each its own flow
+and cipher — carry only "read range" / "write range" requests. Files go
 onto a largest-first queue; when a worker runs dry it steals the back half of
 the remaining range of whichever file has the most left, so the tail of a
 transfer stays parallel without pre-deciding chunk counts.
@@ -264,7 +275,7 @@ ordering question for them.
 - **Not** a single spinning disk: parallel reads of one file there mean seeks.
   Use `-j 1` or a large `--min-split`.
 
-## TCP data connections (`--tcp`)
+## TCP data connections
 
 ssh caps every stream at a few hundred MB/s of cipher CPU, and its 2 MB
 per-channel flow-control window caps a stream at roughly `2 MB / RTT` on long
@@ -275,7 +286,7 @@ connections: the remote opens a listener on a port from `--tcp-ports` (default
 AES-256-GCM records keyed by a secret exchanged over the ssh session
 (`--tcp-plain` skips the encryption on trusted networks; `--no-tcp` sends data over the ssh connection instead). If the port can't be
 reached — a firewall, typically — pcp says so once and falls back to ssh data
-connections, so `--tcp` is always safe to pass.
+connections, so the default is always safe.
 
 The remote advertises every address it has (the one your ssh session arrived
 on first, then private LAN, then public, then CGNAT/Tailscale); the client
@@ -293,7 +304,7 @@ sudo ufw allow from 10.2.201.0/24 to any port 47600:47699 proto tcp   # LAN peer
 sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specific client
 ```
 
-Remote→remote (`pcp --tcp hostA:src hostB:dst`) works the same way: the
+Remote→remote (`pcp hostA:src hostB:dst`) works the same way: the
 orchestrator on hostA connects to hostB's listener.
 
 ## Defaults chosen for network filesystems

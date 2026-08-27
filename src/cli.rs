@@ -118,10 +118,6 @@ pub struct Args {
     /// Install this pcp binary on the remote host (~/.local/bin/pcp) if missing
     #[arg(long)]
     pub bootstrap: bool,
-    /// TCP data connections (AES-256-GCM) after authenticating over ssh — this is the
-    /// default; the flag is accepted for explicitness. Falls back to ssh if unreachable
-    #[arg(long)]
-    pub tcp: bool,
     /// Use TCP data connections without encryption (trusted networks only)
     #[arg(long)]
     pub tcp_plain: bool,
@@ -131,7 +127,7 @@ pub struct Args {
     /// Disable the resume marker/journal (no destination marker, no completion journal)
     #[arg(long)]
     pub no_resume: bool,
-    /// Port range the remote listens on for --tcp
+    /// Port range the remote listens on for TCP data connections
     #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
     pub tcp_ports: String,
     /// Remote-to-remote: start the transfer detached on the source host (survives losing this
