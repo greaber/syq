@@ -611,7 +611,7 @@ impl Endpoint {
                                 if !i.failed {
                                     i.failed = true;
                                     if !spec.quiet || crate::transfer::debug() {
-                                        eprintln!("pcp: {}: TCP data connection failed ({e:#}); falling back to ssh (is port {} open?)", spec.label(), info.port);
+                                        eprintln!("pcp: {}: data over ssh (TCP port {} stopped answering: {e:#})", spec.label(), info.port);
                                     }
                                 }
                             }
