@@ -250,24 +250,12 @@ fn apply_one(op: &Op) -> Result<()> {
                 // A symlink to a directory counts as the directory (rsync
                 // semantics for a destination given as a symlink); anything
                 // else in the way is replaced.
-                let md = fs::symlink_metadata(&p).map(|md| {
-                    if md.file_type().is_symlink() {
-                        fs::metadata(&p).unwrap_or(md)
-                    } else {
-                        md
-                    }
-                });
+                let md = followed_metadata(&p);
                 match md {
-                    Ok(md) if md.is_dir() => {
-                        // Make sure we can write into it while transferring.
-                        if md.mode() & 0o700 != 0o700 {
-                            fs::set_permissions(&p, fs::Permissions::from_mode(md.mode() | 0o700))?;
-                        }
-                        Ok(())
-                    }
+                    Ok(md) if md.is_dir() => make_dir_writable(&p, &md),
                     Ok(_) => {
                         fs::remove_file(&p)?;
-                        mkdir(&p, *mode)
+                        mkdir_or_existing_dir(&p, *mode)
                     }
                     Err(_) => {
                         if let Some(parent) = p.parent() {
@@ -275,7 +263,7 @@ fn apply_one(op: &Op) -> Result<()> {
                                 fs::create_dir_all(parent)?;
                             }
                         }
-                        mkdir(&p, *mode)
+                        mkdir_or_existing_dir(&p, *mode)
                     }
                 }
                 .with_context(|| format!("mkdir {}", p.display()))
@@ -856,10 +844,37 @@ fn open_regular_write(target: &Path, mode: u32) -> Result<File> {
     Ok(f)
 }
 
-fn mkdir(p: &Path, mode: u32) -> Result<()> {
+fn mkdir(p: &Path, mode: u32) -> io::Result<()> {
     std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), (mode & 0o7777) | 0o700)
-        .create(p)?;
+        .create(p)
+}
+
+fn followed_metadata(p: &Path) -> io::Result<fs::Metadata> {
+    fs::symlink_metadata(p).map(|md| {
+        if md.file_type().is_symlink() {
+            fs::metadata(p).unwrap_or(md)
+        } else {
+            md
+        }
+    })
+}
+
+fn make_dir_writable(p: &Path, md: &fs::Metadata) -> Result<()> {
+    if md.mode() & 0o700 != 0o700 {
+        fs::set_permissions(p, fs::Permissions::from_mode(md.mode() | 0o700))?;
+    }
     Ok(())
+}
+
+fn mkdir_or_existing_dir(p: &Path, mode: u32) -> Result<()> {
+    match mkdir(p, mode) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => match followed_metadata(p) {
+            Ok(md) if md.is_dir() => make_dir_writable(p, &md),
+            _ => Err(err.into()),
+        },
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn preallocate(f: &File, size: u64) -> Result<()> {
