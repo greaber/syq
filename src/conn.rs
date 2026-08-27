@@ -202,19 +202,38 @@ impl Drop for RemoteConn {
     }
 }
 
-/// At most this many ssh sessions are being established at any moment.
-const MAX_CONCURRENT_CONNECTS: usize = 6;
+/// How many *data* ssh sessions may be establishing at once. Starts high:
+/// on a server tuned for pcp (`MaxStartups 100`) a burst of 32 handshakes
+/// takes 14 s where four rounds of 8 would take 26. sshd's default
+/// `MaxStartups 10:30:100` randomly drops new connections beyond 10
+/// unauthenticated ones, so each failed connect halves the limit (down to
+/// MIN_CONCURRENT_CONNECTS) for the rest of the run, and the retry then
+/// succeeds. The control connection bypasses this entirely.
+const START_CONCURRENT_CONNECTS: usize = 32;
+const MIN_CONCURRENT_CONNECTS: usize = 4;
+static CONNECT_LIMIT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(START_CONCURRENT_CONNECTS);
 static CONNECTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 static CONNECTS_CV: std::sync::Condvar = std::sync::Condvar::new();
 
 struct ConnectSlot;
 fn connect_slot() -> ConnectSlot {
     let mut n = CONNECTS.lock().unwrap();
-    while *n >= MAX_CONCURRENT_CONNECTS {
+    while *n >= CONNECT_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
         n = CONNECTS_CV.wait(n).unwrap();
     }
     *n += 1;
     ConnectSlot
+}
+
+/// A data connect failed in a way that looks like the server shedding load:
+/// halve how many we attempt at once. Returns the new limit.
+fn tighten_connect_limit() -> usize {
+    let _g = CONNECTS.lock().unwrap();
+    let cur = CONNECT_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+    let new = (cur / 2).max(MIN_CONCURRENT_CONNECTS);
+    CONNECT_LIMIT.store(new, std::sync::atomic::Ordering::Relaxed);
+    new
 }
 impl Drop for ConnectSlot {
     fn drop(&mut self) {
@@ -295,7 +314,15 @@ impl RemoteSpec {
     /// connections at random when many are being set up at once, so we also
     /// limit how many connects are in flight.
     pub fn connect(&self, compress: bool) -> Result<RemoteConn> {
-        let first = self.connect_retried(compress);
+        self.connect_with(compress, true)
+    }
+
+    /// `limited`: take a connect slot (data connections). The control
+    /// connection passes false: everything waits on it, so it must never
+    /// queue behind workers. Either way the versioned helper is installed on
+    /// first use if the remote lacks it.
+    pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
+        let first = self.connect_retried(compress, limited);
         let Err(first_error) = first else {
             return first;
         };
@@ -304,7 +331,7 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress).with_context(|| {
+        self.connect_retried(compress, limited).with_context(|| {
             format!(
                 "could not start the {} helper installed on {}",
                 remote_helper::release_key(),
@@ -313,11 +340,11 @@ impl RemoteSpec {
         })
     }
 
-    fn connect_retried(&self, compress: bool) -> Result<RemoteConn> {
+    fn connect_retried(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
         for attempt in 0..6 {
-            let _slot = connect_slot();
+            let _slot = limited.then(connect_slot);
             match self.connect_once(compress) {
                 Ok(c) => return Ok(c),
                 // Don't retry what won't change: missing binary (127) or a version mismatch.
@@ -338,11 +365,19 @@ impl RemoteSpec {
                     return Err(e)
                 }
                 Err(e) => {
+                    let limit = if limited {
+                        Some(tighten_connect_limit())
+                    } else {
+                        None
+                    };
                     if crate::transfer::debug() {
                         eprintln!(
-                            "pcp: connect to {} failed (attempt {}): {e:#}",
+                            "pcp: connect to {} failed (attempt {}): {e:#}{}",
                             self.label(),
-                            attempt + 1
+                            attempt + 1,
+                            limit
+                                .map(|l| format!("; now at most {l} connects at once"))
+                                .unwrap_or_default()
                         );
                     }
                     last = Some(e);

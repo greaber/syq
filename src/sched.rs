@@ -124,6 +124,58 @@ impl Sched {
         g.failed.iter().map(|&i| jobs[i].dst.clone()).collect()
     }
 
+    /// All work handed out and finished (what makes `next` return Exit).
+    pub fn finished(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.scan_done
+            && g.probing == 0
+            && g.inflight.is_empty()
+            && g.files.is_empty()
+            && g.ranges.is_empty()
+    }
+
+    /// Whether enough work is left for `n` workers to be measurable: the
+    /// scan is still producing, or at least `n` files are queued, or the
+    /// bytes left (queued files and ranges, plus what in-flight ranges have
+    /// not read yet) would keep `n` workers busy past the next window. When
+    /// this is false the transfer is in its tail and throughput says nothing
+    /// about the worker count.
+    pub fn work_left_for(&self, n: usize, bytes_per_worker: u64) -> bool {
+        let g = self.inner.lock().unwrap();
+        if !g.scan_done || g.files.len() >= n {
+            return true;
+        }
+        let mut bytes: u64 = g.files.iter().map(|(s, _)| *s).sum();
+        bytes += g.ranges.iter().map(|(_, o, e)| e - o).sum::<u64>();
+        bytes += g
+            .inflight
+            .iter()
+            .map(|h| {
+                let r = h.lock().unwrap();
+                r.end.saturating_sub(r.pos)
+            })
+            .sum::<u64>();
+        bytes >= n as u64 * bytes_per_worker
+    }
+
+    /// Hand the unread remainder of an in-flight range back to the queue (a
+    /// worker being parked). The caller's range ends at its current position
+    /// and drains normally.
+    pub fn release_rest(&self, h: &RangeHandle) {
+        let mut g = self.inner.lock().unwrap();
+        let mut r = h.lock().unwrap();
+        if r.end <= r.pos {
+            return;
+        }
+        let (idx, pos, end) = (r.idx, r.pos, r.end);
+        r.end = pos;
+        drop(r);
+        *g.outstanding.entry(idx).or_insert(0) += 1;
+        g.ranges.push((idx, pos, end));
+        g.ranges.sort_by_key(|(_, o, e)| e - o);
+        self.cv.notify_all();
+    }
+
     pub fn next(&self) -> Item {
         let mut g = self.inner.lock().unwrap();
         loop {

@@ -7,10 +7,12 @@ use crate::fsops::join;
 use crate::progress::{commas, human, Progress, WorkerStatus};
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
+use crate::tune::{self, Gate};
 use anyhow::{bail, Result};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
+use std::sync::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
 const WINDOW: usize = 4;
@@ -66,8 +68,15 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     })
 }
 
+/// Open a control connection. It bypasses the data-connection connect
+/// limiter: the scan, and therefore every worker, waits on it.
 pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
-    ep.connect(args.compress)
+    match ep {
+        Endpoint::Local => ep.connect(args.compress),
+        Endpoint::Remote(spec) => spec
+            .connect_with(args.compress, false)
+            .map(|c| Box::new(c) as Box<dyn Conn>),
+    }
 }
 
 fn parse_ports(s: &str) -> Result<(u16, u16)> {
@@ -494,13 +503,15 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
-    if args.connections_default && !src_ep.is_remote() && !dst_ep.is_remote() {
-        // Local threads are cheap and network filesystems want the concurrency,
-        // but don't oversubscribe a small machine (a laptop shouldn't spawn 32).
-        let ncpu = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        args.connections = ncpu.clamp(4, LOCAL_DEFAULT_CONNECTIONS);
+    // Without -j the worker count is tuned while the transfer runs (see tune.rs);
+    // this is only where it starts.
+    let autotune = args.connections_default;
+    if autotune {
+        args.connections = if src_ep.is_remote() || dst_ep.is_remote() {
+            tune::START
+        } else {
+            tune::START_LOCAL
+        };
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
@@ -549,33 +560,58 @@ pub fn run(args: Args) -> Result<i32> {
     );
     let sched = Arc::new(Sched::new(block, min_split));
 
-    // Workers connect on their own threads, in parallel with the control
-    // connections below, so all ssh sessions come up at once.
-    let mut workers: Vec<std::thread::JoinHandle<Result<()>>> = Vec::new();
+    // Workers connect on their own threads once the control connections are
+    // up: everything waits on those, so they must never compete with worker
+    // handshakes (at sshd's MaxStartups or a serialized ssh agent). The tuner
+    // may spawn more workers later, so the handles live behind a mutex.
+    let gate = Gate::new(args.connections);
     let resume_slot: ResumeSlot = std::sync::Arc::new(std::sync::OnceLock::new());
-    let spawn_workers = |workers: &mut Vec<std::thread::JoinHandle<Result<()>>>| {
-        for id in 0..args.connections {
-            let (src_ep, dst_ep, sched, progress, opts, resume, bwlimit) = (
+    let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let spawn_worker: Arc<dyn Fn(usize) + Send + Sync> = {
+        let (src_ep, dst_ep, sched, progress, opts, gate, workers, resume_slot, bwlimit) = (
+            src_ep.clone(),
+            dst_ep.clone(),
+            sched.clone(),
+            progress.clone(),
+            opts.clone(),
+            gate.clone(),
+            workers.clone(),
+            resume_slot.clone(),
+            bwlimit.clone(),
+        );
+        let compress = args.compress;
+        Arc::new(move |id: usize| {
+            let (src_ep, dst_ep, sched, progress, opts, gate, resume, bwlimit) = (
                 src_ep.clone(),
                 dst_ep.clone(),
                 sched.clone(),
                 progress.clone(),
                 opts.clone(),
+                gate.clone(),
                 resume_slot.clone(),
                 bwlimit.clone(),
             );
-            let compress = args.compress;
-            workers.push(std::thread::spawn(move || -> Result<()> {
+            let h = std::thread::spawn(move || -> Result<()> {
                 let t0 = std::time::Instant::now();
+                let conns = src_ep
+                    .connect(compress)
+                    .and_then(|s| Ok((s, dst_ep.connect(compress)?)));
+                // Counted whether or not it worked: the tuner waits for every
+                // requested worker to arrive before judging, and a failed one
+                // must not stall it.
+                gate.connected.fetch_add(1, Relaxed);
+                let (src, dst) = conns?;
                 let mut w = Worker {
                     id,
-                    src: src_ep.connect(compress)?,
-                    dst: dst_ep.connect(compress)?,
+                    src,
+                    dst,
                     sched,
                     progress,
                     opts,
                     resume,
                     bwlimit,
+                    gate,
                     t: [0.0; 4],
                 };
                 if debug() {
@@ -585,6 +621,26 @@ pub fn run(args: Args) -> Result<i32> {
                     );
                 }
                 w.run()
+            });
+            workers.lock().unwrap().push(h);
+        })
+    };
+    let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
+    let spawn_workers = || {
+        for id in 0..args.connections {
+            spawn_worker(id);
+        }
+        if autotune {
+            let (gate, sched, progress, spawn_worker) = (
+                gate.clone(),
+                sched.clone(),
+                progress.clone(),
+                spawn_worker.clone(),
+            );
+            let n0 = args.connections;
+            let policy = tune::Policy::new(n0, tune::MIN, tune::MAX);
+            *tuner.lock().unwrap() = Some(std::thread::spawn(move || {
+                tune::run(policy, gate, sched, progress, |id| spawn_worker(id), n0)
             }));
         }
     };
@@ -592,13 +648,6 @@ pub fn run(args: Args) -> Result<i32> {
     // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
     // Local<->local needs no data plane at all.
     let use_tcp = !args.no_tcp && (src_ep.is_remote() || dst_ep.is_remote());
-    // Whether the user said anything about TCP, which controls how loudly we
-    // report a fallback (silent when it's just the default).
-    let auto_helper =
-        args.pcp_path.is_none() && !args.no_bootstrap && (src_ep.is_remote() || dst_ep.is_remote());
-    if !opts.dry_run && !auto_helper && !use_tcp {
-        spawn_workers(&mut workers);
-    }
 
     let t0 = std::time::Instant::now();
     let (mut src_ctl, mut dst_ctl) = {
@@ -652,8 +701,8 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
-    if !opts.dry_run && (auto_helper || use_tcp) {
-        spawn_workers(&mut workers);
+    if !opts.dry_run {
+        spawn_workers();
     }
 
     let dst_root = dst.path.as_bytes().to_vec();
@@ -819,16 +868,34 @@ pub fn run(args: Args) -> Result<i32> {
     if collision {
         sched.abort();
     }
-    for w in workers {
-        match w.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                progress.error(&format!("pcp: worker: {e:#}"));
-                sched.abort();
+
+    // Join workers; the tuner may add more while we do, until it exits.
+    loop {
+        let batch: Vec<_> = std::mem::take(&mut *workers.lock().unwrap());
+        if batch.is_empty() {
+            let tuning = tuner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|t| !t.is_finished());
+            if !tuning {
+                break;
             }
-            Err(_) => progress.error("pcp: worker thread panicked"),
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        for w in batch {
+            match w.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    progress.error(&format!("pcp: worker: {e:#}"));
+                    sched.abort();
+                }
+                Err(_) => progress.error("pcp: worker thread panicked"),
+            }
         }
     }
+    let tuned = tuner.lock().unwrap().take().and_then(|t| t.join().ok());
 
     let aborted = sched.is_aborted();
     let mut deleted = 0u64;
@@ -944,14 +1011,27 @@ pub fn run(args: Args) -> Result<i32> {
         }
         if args.stats {
             println!(
-                "  scanned entries: {}\n  files to transfer: {}\n  files unchanged: {}\n  files excluded: {}\n  bytes transferred: {}\n  bytes unchanged: {}\n  elapsed: {:.2}s",
+                "  scanned entries: {}\n  files to transfer: {}\n  files unchanged: {}\n  files excluded: {}\n  bytes transferred: {}\n  bytes unchanged: {}\n  elapsed: {:.2}s\n  connections: {}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
                 commas(progress.files_skipped.load(Relaxed)),
                 commas(progress.files_excluded.load(Relaxed)),
                 commas(done),
                 commas(progress.bytes_skipped.load(Relaxed)),
-                elapsed
+                elapsed,
+                match &tuned {
+                    Some(p) => format!(
+                        "auto: settled at {} (path {}, peak {})",
+                        p.settled(),
+                        p.history
+                            .iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" -> "),
+                        p.peak
+                    ),
+                    None => args.connections.to_string(),
+                }
             );
         }
     }
@@ -2076,6 +2156,7 @@ struct Worker {
     opts: Arc<Opts>,
     resume: ResumeSlot,
     bwlimit: Option<Arc<BandwidthLimit>>,
+    gate: Arc<Gate>,
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
     t: [f64; 4],
 }
@@ -2093,6 +2174,16 @@ impl Worker {
 
     fn run_inner(&mut self) -> Result<()> {
         loop {
+            if !self.gate.allowed(self.id) {
+                // Parked by the tuner: keep the connections, take no work.
+                let sched = self.sched.clone();
+                if !self
+                    .gate
+                    .park(self.id, || sched.is_aborted() || sched.finished())
+                {
+                    return Ok(());
+                }
+            }
             let t0 = std::time::Instant::now();
             let item = self.sched.next();
             self.t[3] += t0.elapsed().as_secs_f64();
@@ -2689,6 +2780,11 @@ impl Worker {
         let mut reads_out = 0usize;
         let mut writes_out = 0usize;
         loop {
+            if !self.gate.allowed(self.id) {
+                // Being parked: give the rest of this range back so an active
+                // worker picks it up; what's already requested still completes.
+                self.sched.release_rest(h);
+            }
             while reads_out < WINDOW {
                 let (off, n) = {
                     let mut g = h.lock().unwrap();

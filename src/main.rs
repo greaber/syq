@@ -13,6 +13,7 @@ mod scan;
 mod sched;
 mod server;
 mod transfer;
+mod tune;
 
 /// Keep multi-megabyte block buffers in the heap instead of mmap/munmap-ing
 /// each one: page faults and TLB shootdowns across many threads otherwise
