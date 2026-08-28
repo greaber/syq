@@ -141,8 +141,7 @@ jobs:
           SYQ_RELEASE_SIGNING_KEY_PEM_B64: ${{ secrets.SYQ_RELEASE_SIGNING_KEY_PEM_B64 }}
         run: |
           scripts/sign-release-manifest.sh \
-            dist/syq-release-manifest.json dist/syq-release-manifest.json.sig \
-            dist/syq-linux-x86_64
+            dist/syq-release-manifest.json dist/syq-linux-x86_64
       - name: Verify final release inventory
         shell: bash
         run: |
@@ -151,7 +150,7 @@ jobs:
           for asset in syq-linux-x86_64 syq-linux-aarch64 syq-macos-arm64 syq-macos-x86_64; do
             printf '%s\n' "$asset" "$asset.sha256" "$asset.gz" "$asset.gz.sha256"
           done > "$expected"
-          printf '%s\n' install.sh syq-release-manifest.json syq-release-manifest.json.sig syq.rb >> "$expected"
+          printf '%s\n' install.sh syq-release-manifest.json syq.rb >> "$expected"
           sort -o "$expected" "$expected"
           find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$RUNNER_TEMP/actual-assets"
           diff -u "$expected" "$RUNNER_TEMP/actual-assets"

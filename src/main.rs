@@ -95,13 +95,6 @@ fn main() {
         }
         return;
     }
-    if args.enable_auto_update || args.disable_auto_update {
-        if let Err(e) = update::set_auto_update(args.enable_auto_update) {
-            eprintln!("syq: {e:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
     if args.register_standalone_install {
         if let Err(e) = update::register_standalone_install() {
             eprintln!("syq: {e:#}");
