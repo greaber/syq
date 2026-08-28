@@ -908,27 +908,7 @@ impl FsOps {
             if let Ok(pp) = partial_path(&p, partial_id) {
                 let _ = fs::remove_file(pp);
             }
-            // Don't follow a symlink (or write onto a dir/special): replace it
-            // with a regular file, like rsync does.
-            if let Ok(md) = fs::symlink_metadata(&p) {
-                if !md.is_file() {
-                    if md.is_dir() {
-                        bail!("destination {} is a directory", p.display());
-                    }
-                    fs::remove_file(&p).with_context(|| format!("replace {}", p.display()))?;
-                }
-            }
-            let f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .mode(mode & 0o7777)
-                .open(&p)
-                .with_context(|| format!("open {}", p.display()))?;
-            if !f.metadata()?.file_type().is_file() {
-                bail!("destination {} is not a regular file", p.display());
-            }
+            let f = open_regular_write(&p, mode, false)?;
             f.set_len(size)?;
             return Ok(());
         }
@@ -1072,7 +1052,7 @@ impl FsOps {
             }
         }
         let d = if inplace {
-            open_regular_write(&target, mode)?
+            open_regular_write(&target, mode, true)?
         } else {
             let (d, _) = self.open_private_partial(&target)?;
             d.set_len(0)?;
@@ -1453,28 +1433,58 @@ impl FsOps {
 /// symlink/dir/special and refusing to follow a symlink (O_NOFOLLOW), then
 /// verify the opened fd is a regular file. Used for every write target so a
 /// malicious or stale `.syq-part` symlink can't redirect the write.
-fn open_regular_write(target: &Path, mode: u32) -> Result<File> {
-    if let Ok(md) = fs::symlink_metadata(target) {
-        if !md.is_file() {
-            if md.is_dir() {
-                bail!("destination {} is a directory", target.display());
+fn open_regular_write(target: &Path, mode: u32, truncate: bool) -> Result<File> {
+    for _ in 0..8 {
+        match fs::symlink_metadata(target) {
+            Ok(md) if md.is_file() => {
+                // Do not pass O_CREAT for an existing file. Linux
+                // fs.protected_regular can reject that combination in a
+                // sticky directory even when the caller is allowed to open
+                // and update the inode (rsync's --inplace case).
+                match OpenOptions::new()
+                    .write(true)
+                    .truncate(truncate)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(target)
+                {
+                    Ok(file) if file.metadata()?.file_type().is_file() => return Ok(file),
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("open {}", target.display()))
+                    }
+                }
             }
-            fs::remove_file(target).with_context(|| format!("replace {}", target.display()))?;
+            Ok(md) if md.is_dir() => {
+                bail!("destination {} is a directory", target.display())
+            }
+            Ok(_) => {
+                fs::remove_file(target).with_context(|| format!("replace {}", target.display()))?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .truncate(truncate)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .mode(mode & 0o7777)
+                    .open(target)
+                {
+                    Ok(file) if file.metadata()?.file_type().is_file() => return Ok(file),
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("create {}", target.display()))
+                    }
+                }
+            }
+            Err(error) => return Err(error).with_context(|| format!("stat {}", target.display())),
         }
     }
-    let f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .mode(mode & 0o7777)
-        .open(target)
-        .with_context(|| format!("create {}", target.display()))?;
-    let md = f.metadata()?;
-    if !md.file_type().is_file() {
-        bail!("{} is not a regular file", target.display());
-    }
-    Ok(f)
+    bail!(
+        "destination {} changed repeatedly while opening it",
+        target.display()
+    )
 }
 
 /// Open an existing leaf without following a last-component symlink. Parent
