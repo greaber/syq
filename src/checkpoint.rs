@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
@@ -25,6 +25,22 @@ use std::time::{Duration, Instant};
 // refuse the file instead (restarting a checkpoint is always safe).
 pub const FORMAT: u32 = 3;
 const IDENTITY_FORMAT: u32 = 1;
+
+fn checkpoint_lock_error(path: &Path, error: io::Error) -> anyhow::Error {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        anyhow::anyhow!("checkpoint {} is already in use: {error}", path.display())
+    } else if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS)
+    ) {
+        anyhow::anyhow!(
+            "checkpoint locking is unavailable on the filesystem for {}: {error}",
+            path.display()
+        )
+    } else {
+        anyhow::anyhow!("lock checkpoint {}: {error}", path.display())
+    }
+}
 
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -263,11 +279,7 @@ impl Checkpoint {
             .open(path)
             .with_context(|| format!("open checkpoint {}", path.display()))?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            bail!(
-                "checkpoint {} is already in use: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            );
+            return Err(checkpoint_lock_error(path, io::Error::last_os_error()));
         }
         validate_writable_checkpoint(&file, path)?;
         // Validate and load only after locking the same file we will append to.
@@ -483,6 +495,27 @@ mod tests {
             ino: 0,
             link: None,
         }
+    }
+
+    #[test]
+    fn checkpoint_lock_errors_distinguish_contention_and_unsupported_filesystems() {
+        let path = Path::new("state.jsonl");
+        let contention =
+            checkpoint_lock_error(path, io::Error::from_raw_os_error(libc::EWOULDBLOCK))
+                .to_string();
+        assert!(contention.contains("already in use"), "{contention}");
+
+        let unavailable =
+            checkpoint_lock_error(path, io::Error::from_raw_os_error(libc::ENOLCK)).to_string();
+        assert!(
+            unavailable.contains("locking is unavailable"),
+            "{unavailable}"
+        );
+
+        let other =
+            checkpoint_lock_error(path, io::Error::from_raw_os_error(libc::EACCES)).to_string();
+        assert!(other.starts_with("lock checkpoint "), "{other}");
+        assert!(!other.contains("already in use"), "{other}");
     }
 
     #[test]

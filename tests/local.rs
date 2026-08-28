@@ -2744,12 +2744,15 @@ fn checkpoint_tombstone_precedes_destination_deletion() {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let deletion_observed = !t.path("dst/f").exists();
+    let kill_result = child.kill();
+    let wait_result = child.wait();
     assert!(
-        !t.path("dst/f").exists(),
+        deletion_observed,
         "delete attempt did not reach the interruption window"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    kill_result.unwrap();
+    wait_result.unwrap();
 
     // Recreate precisely the fingerprint stored by the first run. Without a
     // durable pre-delete tombstone, the checkpoint would skip this file while

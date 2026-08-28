@@ -39,9 +39,11 @@ jobs:
           key: cargo-rsync-compat-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-rsync-compat-${{ runner.os }}-
+      - name: Test compatibility harness
+        run: python3 tests/rsync-compat/harness_test.py
       - name: Run classified upstream tests
         run: python3 scripts/rsync-compat.py --profile default -j 4
-      - name: Run root-only circumstances
+      - name: Run suite as root, including root-only circumstances
         run: |
           sudo env \
             PATH="$PATH" \

@@ -449,6 +449,8 @@ def stream_command(argv: list[str], *, cwd: Path, env: dict[str, str]) -> tuple[
         cwd=cwd,
         env=env,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
@@ -457,16 +459,43 @@ def stream_command(argv: list[str], *, cwd: Path, env: dict[str, str]) -> tuple[
     for line in process.stdout:
         print(line, end="", flush=True)
         lines.append(line)
+    process.stdout.close()
     return process.wait(), "".join(lines)
 
 
-def parse_results(log: str) -> dict[str, str]:
+def parse_results(
+    log: str, expected_names: set[str]
+) -> tuple[dict[str, str], list[str]]:
     outcomes: dict[str, str] = {}
+    errors: list[str] = []
+    inside_test_log = False
     for line in log.splitlines():
+        if line.startswith("----- ") and line.endswith(" log follows"):
+            inside_test_log = True
+            continue
+        if inside_test_log and line.startswith("----- ") and line.endswith(" log ends"):
+            inside_test_log = False
+            continue
+        if inside_test_log:
+            continue
         match = RESULT_RE.match(line)
-        if match:
-            outcomes[match.group(2)] = match.group(1).lower()
-    return outcomes
+        if not match:
+            continue
+        name = match.group(2)
+        outcome = match.group(1).lower()
+        if name not in expected_names:
+            errors.append(f"unexpected result for {name}: {outcome}")
+        elif name in outcomes:
+            errors.append(
+                f"duplicate result for {name}: kept {outcomes[name]}, ignored {outcome}"
+            )
+        else:
+            outcomes[name] = outcome
+    if inside_test_log:
+        errors.append("runner output ended inside a framed test log")
+    for name in sorted(expected_names - outcomes.keys()):
+        errors.append(f"missing result for {name}")
+    return outcomes, errors
 
 
 def outcome_class(outcome: str) -> str:
@@ -508,6 +537,9 @@ def markdown_report(report: dict) -> str:
             f"- `{test['name']}`: expected {test['expected']}, got {test['actual']}"
             for test in mismatches
         )
+    if report["parser_errors"]:
+        lines.extend(["", "Runner output errors:", ""])
+        lines.extend(f"- {error}" for error in report["parser_errors"])
     lines.append("")
     return "\n".join(lines)
 
@@ -630,7 +662,9 @@ def main() -> int:
     env = os.environ.copy()
     env["scratchbase"] = str(scratch)
     returncode, log = stream_command(runner_args, cwd=suite, env=env)
-    actual = parse_results(log)
+    actual, parser_errors = parse_results(
+        log, {test["name"] for test in selected}
+    )
 
     test_results = []
     for test in selected:
@@ -674,6 +708,7 @@ def main() -> int:
         "ledger": {key: ledger_counts[key] for key in sorted(VALID_CLASSES)},
         "tests": test_results,
         "runner_exit_code": returncode,
+        "parser_errors": parser_errors,
     }
     reports = cache / "reports"
     reports.mkdir(exist_ok=True)
@@ -693,7 +728,7 @@ def main() -> int:
     if not args.preserve_scratch:
         shutil.rmtree(run_dir, ignore_errors=True)
     mismatches = [test for test in test_results if not test["matches"]]
-    return 1 if returncode or mismatches else 0
+    return 1 if returncode or mismatches or parser_errors else 0
 
 
 if __name__ == "__main__":

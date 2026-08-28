@@ -403,7 +403,9 @@ must be outside local source and destination trees; a hardlinked checkpoint is
 refused because appending or changing its permissions would also affect its
 other names. `-n` reads and validates existing state but never creates or
 changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`. One
-checkpoint file may be used by only one running copy at a time.
+checkpoint file may be used by only one running copy at a time. Its filesystem
+must support advisory file locking; SYQ fails rather than write checkpoint
+state without single-writer exclusion.
 
 A checkpoint is an explicit trust decision: SYQ does not inspect a destination
 file covered by a matching record. If another process deleted, replaced, or
