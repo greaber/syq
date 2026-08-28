@@ -169,6 +169,10 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
+Like rsync, `-q` suppresses non-error output: progress, summaries, warnings,
+notices, and `-v` file listings are hidden. Copy failures are still written to
+stderr and reflected in the exit status.
+
 `--bwlimit` is one approximate limit shared by every `-j` worker, not a
 per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
 `M`, `G`, and `MiB` use powers of 1024, a final `+1` or `-1` adjusts the scaled
