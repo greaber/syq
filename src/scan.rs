@@ -1,6 +1,6 @@
 //! Parallel directory walk producing `Entry` batches in parent-before-child order.
 
-use crate::fsops::{lstat_entry, path_bytes};
+use crate::fsops::{is_partial_name, lstat_entry, path_bytes};
 use crate::proto::{Entry, PathBytes};
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -38,8 +38,7 @@ pub fn build_ignore(lines: &[String]) -> Result<Option<Gitignore>> {
 }
 
 /// Walk `root`, calling `sink` with batches of entries (root first, as path "").
-/// Every entry is reported, pcp's own `.name.pcp-partial` files included (the
-/// planner decides what they mean). `warn` receives non-fatal errors
+/// SYQ's own partial files are skipped unless `all` is true. `warn` receives non-fatal errors
 /// (unreadable directories etc.). `ignore` holds gitignore-style patterns
 /// relative to `root`; a matching directory is pruned with its whole subtree.
 /// The root itself is never ignored. With `report_ignored`, the pruned paths
@@ -48,6 +47,7 @@ pub fn build_ignore(lines: &[String]) -> Result<Option<Gitignore>> {
 pub fn scan(
     root: &Path,
     follow_root: bool,
+    all: bool,
     ignore: &[String],
     report_ignored: bool,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
@@ -79,6 +79,11 @@ pub fn scan(
         .skip_hidden(false)
         .process_read_dir(move |_depth, _path, _state, children| {
             for child in children.iter_mut().flatten() {
+                if !all && is_partial_name(&child.file_name) {
+                    child.read_children = None;
+                    child.client_state = State::Skipped;
+                    continue;
+                }
                 let full = child.path();
                 let Ok(entry) = lstat_entry(Vec::new(), &full) else {
                     child.client_state = State::Failed;
@@ -89,7 +94,7 @@ pub fn scan(
                     let is_dir = entry.kind == crate::proto::Kind::Dir;
                     if ig.matched(rel, is_dir).is_ignore() {
                         // Pruned: neither listed nor descended into.
-                        child.read_children_path = None;
+                        child.read_children = None;
                         child.client_state = if report_ignored {
                             State::Ignored
                         } else {
@@ -111,7 +116,11 @@ pub fn scan(
         };
         // Check this before skipping the root: an unreadable root is the
         // most important warning there is (--delete relies on it).
-        if let Some(e) = de.read_children_error.take() {
+        if let Some(e) = de
+            .read_children
+            .as_ref()
+            .and_then(|children| children.error())
+        {
             warn(format!("scan: {}: {e}", de.path().display()));
         }
         if de.depth == 0 {

@@ -14,6 +14,7 @@ mod sched;
 mod server;
 mod transfer;
 mod tune;
+mod update;
 
 /// Keep multi-megabyte block buffers in the heap instead of mmap/munmap-ing
 /// each one: page faults and TLB shootdowns across many threads otherwise
@@ -56,7 +57,7 @@ fn main() {
     }
     if argv.get(1).map(String::as_str) == Some("--server") {
         if let Err(e) = server::run() {
-            eprintln!("pcp server: {e:#}");
+            eprintln!("syq server: {e:#}");
             std::process::exit(1);
         }
         return;
@@ -64,11 +65,33 @@ fn main() {
     let mut args = match cli::Args::parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("pcp: {e:#}");
+            eprintln!("syq: {e:#}");
             std::process::exit(2);
         }
     };
     args.normalize();
+    if args.self_update {
+        if let Err(e) = update::self_update() {
+            eprintln!("syq: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.enable_auto_update || args.disable_auto_update {
+        if let Err(e) = update::set_auto_update(args.enable_auto_update) {
+            eprintln!("syq: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.register_standalone_install {
+        if let Err(e) = update::register_standalone_install() {
+            eprintln!("syq: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let quiet = args.quiet;
     let result = if args.follow {
         direct::follow(&args)
     } else if args.rm {
@@ -77,9 +100,14 @@ fn main() {
         transfer::run(args)
     };
     match result {
-        Ok(code) => std::process::exit(code),
+        Ok(code) => {
+            if code == 0 {
+                update::after_success(quiet);
+            }
+            std::process::exit(code)
+        }
         Err(e) => {
-            eprintln!("pcp: {e:#}");
+            eprintln!("syq: {e:#}");
             std::process::exit(1);
         }
     }

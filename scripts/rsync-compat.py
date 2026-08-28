@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run PCP against a pinned, classified subset of the upstream rsync suite."""
+"""Run SYQ against a pinned, classified subset of the upstream rsync suite."""
 
 from __future__ import annotations
 
@@ -220,7 +220,7 @@ def prepare_base_suite(
     suites = cache / "suites"
     suites.mkdir(parents=True, exist_ok=True)
     destination = suites / key
-    marker = destination / ".pcp-rsync-suite.json"
+    marker = destination / ".syq-rsync-suite.json"
     if marker.is_file() and helpers_ready(destination, helpers):
         return destination
     if destination.exists():
@@ -274,7 +274,7 @@ def prepare_suite(
     suites = cache / "suites"
     suites.mkdir(parents=True, exist_ok=True)
     destination = suites / key
-    marker = destination / ".pcp-rsync-suite.json"
+    marker = destination / ".syq-rsync-suite.json"
     if marker.is_file() and helpers_ready(destination, helpers):
         return destination
     if destination.exists():
@@ -430,11 +430,11 @@ def check_ledger(
         )
 
 
-def make_wrapper(path: Path, pcp: Path, extra_args: list[str]) -> None:
+def make_wrapper(path: Path, syq: Path, extra_args: list[str]) -> None:
     body = (
         "#!/usr/bin/env python3\n"
         "import os, sys\n"
-        f"binary = {str(pcp)!r}\n"
+        f"binary = {str(syq)!r}\n"
         f"extra = {extra_args!r}\n"
         "os.execv(binary, [binary, *extra, *sys.argv[1:]])\n"
     )
@@ -514,15 +514,15 @@ def markdown_report(report: dict) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run PCP's classified compatibility subset of a pinned rsync test suite"
+        description="Run SYQ's classified compatibility subset of a pinned rsync test suite"
     )
     parser.add_argument("--profile", default="default")
     parser.add_argument(
-        "--pcp-bin",
+        "--syq-bin",
         type=Path,
-        help="PCP binary (defaults to the Cargo target directory's debug/pcp)",
+        help="SYQ binary (defaults to the Cargo target directory's debug/syq)",
     )
-    parser.add_argument("--no-build-pcp", action="store_true")
+    parser.add_argument("--no-build-syq", action="store_true")
     parser.add_argument("--rsync-src", type=Path, help="reuse an existing checkout at the pin")
     parser.add_argument(
         "--cache-dir", type=Path, default=ROOT / "target" / "rsync-compat"
@@ -538,11 +538,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def default_pcp_binary() -> Path:
+def default_syq_binary() -> Path:
     target = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
     if not target.is_absolute():
         target = ROOT / target
-    return target / "debug" / "pcp"
+    return target / "debug" / "syq"
 
 
 def main() -> int:
@@ -583,15 +583,15 @@ def main() -> int:
         source, cache, manifest, adaptations, args.jobs, source_was_explicit
     )
 
-    pcp = (args.pcp_bin or default_pcp_binary()).resolve()
-    if not args.no_build_pcp:
-        run(["cargo", "build", "--locked", "--bin", "pcp"], cwd=ROOT)
-    if not pcp.is_file():
-        raise CompatError(f"PCP binary not found at {pcp}")
+    syq = (args.syq_bin or default_syq_binary()).resolve()
+    if not args.no_build_syq:
+        run(["cargo", "build", "--locked", "--bin", "syq"], cwd=ROOT)
+    if not syq.is_file():
+        raise CompatError(f"SYQ binary not found at {syq}")
 
     run_dir = Path(tempfile.mkdtemp(prefix=f"run-{args.profile}-", dir=cache))
-    wrapper = run_dir / "pcp-rsync"
-    make_wrapper(wrapper, pcp, list(profile.get("args", [])))
+    wrapper = run_dir / "syq-rsync"
+    make_wrapper(wrapper, syq, list(profile.get("args", [])))
     expected = run_dir / "expected.txt"
     expected.write_text(
         "".join(f"{test['name']} {test['expect'][args.profile]}\n" for test in selected)

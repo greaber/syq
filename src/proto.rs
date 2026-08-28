@@ -132,11 +132,13 @@ pub enum Request {
         port_lo: u16,
         port_hi: u16,
     },
+    /// `all`: include syq's own partial files (used by --rm).
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
     /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
     Scan {
         root: PathBytes,
         follow_root: bool,
+        all: bool,
         ignore: Vec<String>,
         report_ignored: bool,
     },

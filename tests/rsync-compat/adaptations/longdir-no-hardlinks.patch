@@ -8,7 +8,7 @@ index 4676c3f..c5a7302 100644
  # 175-char directory names, drop a couple of files in the leaf, and
 -# verify that --delete -avH still produces an identical destination.
 +# verify that --delete -av still produces an identical destination. Hard-link
-+# preservation is a separate unsupported PCP feature.
++# preservation is a separate unsupported SYQ feature.
 
  from rsyncfns import (FROMDIR, TODIR, checkit, hands_setup, make_text_file,
                        test_skipped)

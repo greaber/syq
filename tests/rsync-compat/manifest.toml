@@ -9,7 +9,7 @@ helpers = ["tls", "trimslash", "t_unsafe", "t_chmod_secure", "t_secure_relpath",
 [profiles.default]
 enabled = true
 args = []
-description = "PCP's normal command-line semantics"
+description = "SYQ's normal command-line semantics"
 
 [profiles.strict]
 enabled = false
@@ -18,18 +18,18 @@ description = "Reserved for a strict compatibility flag that is not implemented 
 
 [reasons]
 rsync-internal = "Exercises rsync's implementation, build, helper programs, or test harness rather than command-line filesystem semantics."
-rsync-wire = "Exercises rsync's sender/receiver protocol or a malicious/legacy rsync peer; PCP intentionally speaks a different protocol."
-rsync-daemon = "Exercises rsync daemon configuration, modules, authentication, or daemon transport; PCP has no rsync daemon mode."
+rsync-wire = "Exercises rsync's sender/receiver protocol or a malicious/legacy rsync peer; SYQ intentionally speaks a different protocol."
+rsync-daemon = "Exercises rsync daemon configuration, modules, authentication, or daemon transport; SYQ has no rsync daemon mode."
 rrsync = "Exercises rrsync, rsync's restricted-command wrapper, rather than the copy command's filesystem semantics."
-unsupported-acls = "Requires rsync ACL behavior, which PCP does not implement."
-unsupported-alt-dest = "Requires rsync backup, link-dest, compare-dest, copy-dest, or alternate-basis behavior, which PCP does not implement."
-unsupported-batch = "Requires rsync batch-file behavior, which PCP does not implement."
-unsupported-filters = "Requires rsync's filter language; PCP currently exposes gitignore-style filters instead."
-unsupported-hardlinks = "Requires hard-link preservation, which PCP does not implement."
-unsupported-metadata = "Requires an rsync metadata option that PCP does not implement yet."
-unsupported-relative = "Requires rsync --relative/-R behavior, which PCP does not implement."
-unsupported-transfer-mode = "Requires an rsync transfer mode or output option that PCP does not implement."
-unsupported-xattrs = "Requires extended-attribute behavior, which PCP does not implement."
+unsupported-acls = "Requires rsync ACL behavior, which SYQ does not implement."
+unsupported-alt-dest = "Requires rsync backup, link-dest, compare-dest, copy-dest, or alternate-basis behavior, which SYQ does not implement."
+unsupported-batch = "Requires rsync batch-file behavior, which SYQ does not implement."
+unsupported-filters = "Requires rsync's filter language; SYQ currently exposes gitignore-style filters instead."
+unsupported-hardlinks = "Requires hard-link preservation, which SYQ does not implement."
+unsupported-metadata = "Requires an rsync metadata option that SYQ does not implement yet."
+unsupported-relative = "Requires rsync --relative/-R behavior, which SYQ does not implement."
+unsupported-transfer-mode = "Requires an rsync transfer mode or output option that SYQ does not implement."
+unsupported-xattrs = "Requires extended-attribute behavior, which SYQ does not implement."
 
 [[tests]]
 name = "chgrp"
@@ -65,7 +65,7 @@ expect = { default = "fail" }
 platforms = ["linux"]
 tags = ["local", "sources", "known-gap"]
 requirements = ["symlinks"]
-note = "PCP still treats repeated identical sources as destination collisions."
+note = "SYQ still treats repeated identical sources as destination collisions."
 
 [[tests]]
 name = "files-from-path-clamp"
@@ -74,7 +74,7 @@ expect = { default = "fail" }
 platforms = ["linux"]
 tags = ["local", "files-from", "known-gap"]
 requirements = []
-note = "PCP rejects parent components instead of clamping them at the source root."
+note = "SYQ rejects parent components instead of clamping them at the source root."
 
 [[tests]]
 name = "highfd-hang"
@@ -144,7 +144,7 @@ note = "Continue a transfer when a source file vanishes after the source scan."
 [[tests]]
 name = "chown"
 classification = "adapted"
-adaptation = "chown-pcp-cli"
+adaptation = "chown-syq-cli"
 expect = { default = "pass" }
 platforms = ["linux"]
 run_as = "root"
@@ -160,7 +160,7 @@ expect = { default = "pass" }
 platforms = ["linux"]
 tags = ["local", "paths", "depth"]
 requirements = ["paths deeper than 64 components"]
-note = "Copy a 70-level local tree; the rsync-daemon half is outside PCP's scope."
+note = "Copy a 70-level local tree; the rsync-daemon half is outside SYQ's scope."
 
 [[tests]]
 name = "growing-file"
@@ -175,7 +175,7 @@ note = "Copy the final contents of a file that grows after the source scan."
 [[tests]]
 name = "inplace"
 classification = "adapted"
-adaptation = "inplace-pcp-cli"
+adaptation = "inplace-syq-cli"
 expect = { default = "pass" }
 platforms = ["linux"]
 tags = ["local", "inplace", "inode"]
@@ -205,12 +205,12 @@ note = "Preserve modes and mtimes throughout a deep tree; upstream's unsupported
 [[tests]]
 name = "partial"
 classification = "adapted"
-adaptation = "pcp-partial-layout"
+adaptation = "syq-partial-layout"
 expect = { default = "pass" }
 platforms = ["linux"]
 tags = ["local", "resume", "partial-files"]
 requirements = ["signals", "bandwidth limiting"]
-note = "An interrupted transfer leaves PCP's deterministic sidecar and a rerun completes it."
+note = "An interrupted transfer leaves SYQ's deterministic sidecar and a rerun completes it."
 
 [[tests]]
 name = "protected-regular"
@@ -234,12 +234,12 @@ note = "A raced source parent cannot make the copy enumerate outside the source 
 [[tests]]
 name = "ssh-basic"
 classification = "adapted"
-adaptation = "ssh-pcp-path"
+adaptation = "ssh-syq-path"
 expect = { default = "pass" }
 platforms = ["linux"]
 tags = ["remote", "ssh", "delete"]
 requirements = ["rsync lsh test helper"]
-note = "Remote-shell copy and follow-up deletion using PCP's remote executable option."
+note = "Remote-shell copy and follow-up deletion using SYQ's remote executable option."
 
 [[tests]]
 name = "symlink-race-dest"
@@ -249,7 +249,7 @@ platforms = ["linux"]
 run_as = "root"
 tags = ["local", "security", "destination-symlink", "known-gap"]
 requirements = ["root", "a second uid", "symlinks"]
-note = "PCP follows an attacker-owned symlink in an operator-named absolute destination path."
+note = "SYQ follows an attacker-owned symlink in an operator-named absolute destination path."
 
 [[tests]]
 name = "symlink-race-relative-dest"
@@ -259,7 +259,7 @@ platforms = ["linux"]
 run_as = "root"
 tags = ["local", "security", "destination-symlink", "known-gap"]
 requirements = ["root", "a second uid", "symlinks"]
-note = "PCP follows an attacker-owned symlink in an operator-named relative destination path."
+note = "SYQ follows an attacker-owned symlink in an operator-named relative destination path."
 
 [[tests]]
 name = "symlink-race-source"
@@ -268,7 +268,7 @@ expect = { default = "pass" }
 platforms = ["linux"]
 tags = ["local", "security", "source-race"]
 requirements = ["symlinks", "C compiler", "renameat2"]
-note = "A raced source parent cannot make PCP read file contents from outside the source tree."
+note = "A raced source parent cannot make SYQ read file contents from outside the source tree."
 
 [[tests]]
 name = "update"

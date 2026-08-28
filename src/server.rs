@@ -1,4 +1,4 @@
-//! `pcp --server`: serve requests over stdin/stdout, and optionally over
+//! `syq --server`: serve requests over stdin/stdout, and optionally over
 //! TCP data connections (see `crypto.rs`) when the client asks for them.
 
 use crate::crypto::{Cipher, RecordReader, RecordWriter};
@@ -129,6 +129,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Request::Scan {
                 root,
                 follow_root,
+                all,
                 ignore,
                 report_ignored,
             } => {
@@ -140,6 +141,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 let res = crate::scan::scan(
                     &root,
                     follow_root,
+                    all,
                     &ignore,
                     report_ignored,
                     &mut |batch| {
@@ -172,7 +174,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     }
     if debug {
         eprintln!(
-            "pcp server{}: {blocks} blocks, {} MiB; waiting for input {:.2}s, handling {:.2}s, writing responses {:.2}s",
+            "syq server{}: {blocks} blocks, {} MiB; waiting for input {:.2}s, handling {:.2}s, writing responses {:.2}s",
             if over_ssh { "" } else { " (tcp)" },
             bytes >> 20,
             t[0],
@@ -280,7 +282,7 @@ fn tcp_listen(
             let id = next_id.fetch_add(1, Relaxed);
             if live.load(Relaxed) >= MAX_LIVE {
                 if debug {
-                    eprintln!("pcp server (tcp): refusing connection, {MAX_LIVE} already live");
+                    eprintln!("syq server (tcp): refusing connection, {MAX_LIVE} already live");
                 }
                 continue; // drop; stream closes
             }
@@ -289,7 +291,7 @@ fn tcp_listen(
             std::thread::spawn(move || {
                 if let Err(e) = serve_tcp(stream, id, key, token, debug, compress, &seen) {
                     if debug {
-                        eprintln!("pcp server (tcp {id}): {e:#}");
+                        eprintln!("syq server (tcp {id}): {e:#}");
                     }
                 }
                 live.fetch_sub(1, Relaxed);

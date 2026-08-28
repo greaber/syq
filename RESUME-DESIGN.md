@@ -1,10 +1,10 @@
-# PCP resume and checkpoint design
+# SYQ resume and checkpoint design
 
 **Status:** implemented. README.md is the user-facing contract.
 
 ## Goals
 
-PCP needs to recover efficiently at two different scales:
+SYQ needs to recover efficiently at two different scales:
 
 1. An interrupted large file should reuse bytes already present at the
    destination.
@@ -13,7 +13,7 @@ PCP needs to recover efficiently at two different scales:
    prohibitively expensive.
 
 Ordinary invocations must not leave a persistent history or make their result
-depend on hidden state from earlier PCP commands. The second optimization is
+depend on hidden state from earlier SYQ commands. The second optimization is
 therefore opt-in through `--checkpoint FILE`.
 
 Normal resumption never requires a checkpoint. Every ordinary rerun performs
@@ -23,13 +23,13 @@ only avoids destination lookups for whole files already recorded complete.
 ## Atomic publication and per-file resume
 
 Unless `--inplace` was explicit, every regular file is written to the
-deterministic destination-side name `.<name>.pcp-partial`, given its final
+deterministic destination-side name `.<name>.syq-partial`, given its final
 metadata, and atomically renamed over the requested pathname. Small files are
 still pipelined as whole-file protocol requests, but the receiver stages and
-renames each one before acknowledging it. PCP does not `fsync` by default;
+renames each one before acknowledging it. SYQ does not `fsync` by default;
 `--fsync` separately requests crash durability for the file and directory.
 
-The receiver holds an advisory exclusive lock on an active partial. Two PCP
+The receiver holds an advisory exclusive lock on an active partial. Two SYQ
 processes therefore never write the same staged inode: a simultaneous copy of
 the same destination file fails visibly in one command, while unrelated paths
 remain concurrent. Non-overlapping publications may still replace one another
@@ -37,7 +37,7 @@ as atomic whole files. `--inplace` does not provide this isolation.
 
 If a range transfer is interrupted, the partial itself is the per-file state.
 A normal rerun finds it, hashes it and the current source at fixed
-`--block-size` offsets, and transmits only mismatching blocks. PCP never needs a
+`--block-size` offsets, and transmits only mismatching blocks. SYQ never needs a
 local record to trust those bytes. A stale partial is content-safe because
 every reused block is compared with the current source. Pipelined small files
 are cheap enough to overwrite wholesale on retry; they avoid the extra partial
@@ -91,7 +91,7 @@ Malformed or crash-torn records are ignored.
 
 ## Using and retiring a checkpoint
 
-The source is scanned on every attempt. For each regular file, PCP first claims
+The source is scanned on every attempt. For each regular file, SYQ first claims
 its destination mapping (so checkpoint skipping cannot hide source collisions),
 then looks up its destination-relative path. A matching source fingerprint is
 counted complete without a destination stat. A missing or mismatching record
@@ -101,7 +101,7 @@ transfer path.
 The checkpoint persists after interruption, copy errors, and clean completion;
 the user removes it or stops passing it when its historical assertions are no
 longer wanted. It is never reset automatically. If it contains completed
-records but their destination root or mapped per-source target is missing, PCP
+records but their destination root or mapped per-source target is missing, SYQ
 fails and asks the user to remove the checkpoint to restart. A dry run reads
 and validates existing state but does not create or append to it.
 
@@ -121,7 +121,7 @@ than a copy.
 A checkpoint record is a historical assertion. A matching record intentionally
 wins over current destination reality: if another process deletes, replaces,
 or modifies that destination path between attempts, the retry skips it. This is
-why checkpointing is opt-in and why ordinary PCP runs keep no automatic
+why checkpointing is opt-in and why ordinary SYQ runs keep no automatic
 journal.
 
 The source fingerprint detects ordinary source changes between attempts but is
@@ -151,7 +151,7 @@ prevent the job from reaching new work.
 ## Removed automatic state
 
 An earlier implementation kept a job-keyed journal under
-`$XDG_STATE_HOME/pcp` for every copy and placed a session marker in the
+`$XDG_STATE_HOME/syq` for every copy and placed a session marker in the
 destination. That made ordinary results depend on invisible history, consumed
 coordinator storage without an explicit request, required a writable state
 directory, and introduced marker lifecycle and concurrency semantics unlike

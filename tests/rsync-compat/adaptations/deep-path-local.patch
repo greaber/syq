@@ -7,8 +7,8 @@ index 817524d..7b75556 100644
  # fallback) are transferred in one run, exercising the fast-path -> fallback
  # handoff on the sender AND the receiver (whose caches are independent).
 -# Plain local transfer + a no-chroot daemon push; no root required.
-+# PCP adaptation: exercise the portable local transfer; rsync daemon mode is
-+# outside PCP's compatibility scope.
++# SYQ adaptation: exercise the portable local transfer; rsync daemon mode is
++# outside SYQ's compatibility scope.
 
  import os
 

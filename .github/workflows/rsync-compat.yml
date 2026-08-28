@@ -15,21 +15,22 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/cargo
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install rsync test-build prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y autoconf automake build-essential
       - name: Cache pinned rsync source and helpers
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             target/rsync-compat/sources
             target/rsync-compat/suites
           key: rsync-compat-${{ runner.os }}-${{ hashFiles('scripts/rsync-compat.py', 'tests/rsync-compat/manifest.toml', 'tests/rsync-compat/inventory.tsv', 'tests/rsync-compat/adaptations/*.patch') }}
       - name: Cache Cargo dependencies and build output
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry
@@ -47,10 +48,10 @@ jobs:
             CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
             python3 scripts/rsync-compat.py --profile default --report-label root \
-              --no-build-pcp --pcp-bin "$PWD/target/cargo/debug/pcp" -j 4
+              --no-build-syq --syq-bin "$PWD/target/cargo/debug/syq" -j 4
       - name: Upload compatibility report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rsync-compatibility
           path: target/rsync-compat/reports/
