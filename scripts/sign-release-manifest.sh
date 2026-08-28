@@ -3,13 +3,12 @@
 # matches the public key embedded in official binaries.
 set -euo pipefail
 
-if [ "$#" -ne 3 ]; then
-  echo "usage: $0 MANIFEST SIGNATURE_OUTPUT SYQ_BINARY" >&2
+if [ "$#" -ne 2 ]; then
+  echo "usage: $0 MANIFEST SYQ_BINARY" >&2
   exit 2
 fi
 manifest=$1
-output=$2
-canonicalizer=$3
+canonicalizer=$2
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
   echo "missing regular release manifest: $manifest" >&2
   exit 1
@@ -47,8 +46,6 @@ payload="$work/manifest.jcs"
 verified_payload="$work/verified-manifest.jcs"
 embedded_signature="$work/embedded.sig"
 signed_manifest="$work/signed-manifest.json"
-detached_signature="$work/detached.sig"
-encoded="$work/manifest.sig.b64"
 configured_public="$work/configured-public-key"
 
 printf '%s' "$SYQ_RELEASE_SIGNING_KEY_PEM_B64" | openssl base64 -d -A > "$key"
@@ -79,13 +76,5 @@ cmp -s "$payload" "$verified_payload" || {
 openssl pkeyutl -verify -rawin -pubin -inkey "$public" \
   -in "$verified_payload" -sigfile "$embedded_signature" >/dev/null
 
-# Updaters through 0.1.1 verify this detached signature over the completed
-# manifest. New updaters verify the embedded JCS signature with one download.
-openssl pkeyutl -sign -rawin -inkey "$key" -in "$signed_manifest" -out "$detached_signature"
-openssl pkeyutl -verify -rawin -pubin -inkey "$public" \
-  -in "$signed_manifest" -sigfile "$detached_signature" >/dev/null
-openssl base64 -A -in "$detached_signature" -out "$encoded"
-printf '\n' >> "$encoded"
-chmod 644 "$signed_manifest" "$encoded"
+chmod 644 "$signed_manifest"
 mv -f "$signed_manifest" "$manifest"
-mv -f "$encoded" "$output"
