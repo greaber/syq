@@ -2,6 +2,7 @@
 /.claude/*
 !/.claude/settings.json
 /.worktrees/
+/.env.keys
 
 # Agent working notes / handoff plans (not committed).
 /current-plans

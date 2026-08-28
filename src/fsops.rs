@@ -1,5 +1,5 @@
 //! Local filesystem operations. Used directly by the local endpoint and
-//! by `pcp --server` for remote endpoints, so both sides behave identically.
+//! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::proto::*;
 use anyhow::{anyhow, bail, Context, Result};
@@ -13,7 +13,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64, Xxh3};
 
-pub const PARTIAL_SUFFIX: &str = ".pcp-partial";
+pub const PARTIAL_SUFFIX: &str = ".syq-partial";
 const FD_CACHE_MAX: usize = 16;
 
 pub fn resolve(p: &[u8]) -> PathBuf {
@@ -170,7 +170,7 @@ pub struct FsOps {
     fd_order: Vec<PathBuf>,
     /// Exclusive advisory locks on deterministic partials claimed by this
     /// connection. The lock stays held until the file is finalized or the
-    /// connection closes, so another pcp process cannot write the same inode.
+    /// connection closes, so another syq process cannot write the same inode.
     partial_leases: HashMap<PathBuf, PartialLease>,
 }
 
@@ -263,16 +263,10 @@ fn apply_one(op: &Op) -> Result<()> {
                 // symlink. Symlinks found inside the destination tree are
                 // payload conflicts and must be replaced, never traversed.
                 match fs::symlink_metadata(&p) {
-                    Ok(md) if md.is_dir() => {
-                        // Make sure we can write into it while transferring.
-                        if md.mode() & 0o700 != 0o700 {
-                            fs::set_permissions(&p, fs::Permissions::from_mode(md.mode() | 0o700))?;
-                        }
-                        Ok(())
-                    }
+                    Ok(md) if md.is_dir() => make_dir_writable(&p, &md),
                     Ok(_) => {
                         fs::remove_file(&p)?;
-                        mkdir(&p, *mode)
+                        mkdir_or_existing_dir(&p, *mode)
                     }
                     Err(_) => {
                         if let Some(parent) = p.parent() {
@@ -280,23 +274,7 @@ fn apply_one(op: &Op) -> Result<()> {
                                 fs::create_dir_all(parent)?;
                             }
                         }
-                        match mkdir(&p, *mode) {
-                            Ok(()) => Ok(()),
-                            Err(error) => match fs::symlink_metadata(&p) {
-                                // Another pcp may have created this same
-                                // destination directory after our first stat.
-                                Ok(md) if md.is_dir() => {
-                                    if md.mode() & 0o700 != 0o700 {
-                                        fs::set_permissions(
-                                            &p,
-                                            fs::Permissions::from_mode(md.mode() | 0o700),
-                                        )?;
-                                    }
-                                    Ok(())
-                                }
-                                _ => Err(error),
-                            },
-                        }
+                        mkdir_or_existing_dir(&p, *mode)
                     }
                 }
                 .with_context(|| format!("mkdir {}", p.display()))
@@ -330,7 +308,7 @@ fn apply_one(op: &Op) -> Result<()> {
             Op::SetMeta { path, meta, flags } => {
                 let p = resolve(path);
                 #[cfg(debug_assertions)]
-                if let Some(pat) = std::env::var_os("PCP_TEST_FAIL_SETMETA") {
+                if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_SETMETA") {
                     // Test hook (debug builds only): fail metadata for matching paths.
                     if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
                         return Err(anyhow!("set metadata {}: injected failure", p.display()));
@@ -395,7 +373,7 @@ impl FsOps {
     }
 
     /// Claim a deterministic partial for this transfer. flock is advisory,
-    /// but all pcp writers participate; unlike a process-local mutex it also
+    /// but all syq writers participate; unlike a process-local mutex it also
     /// coordinates separate local invocations and remote worker processes.
     fn acquire_partial(&mut self, pp: &Path) -> Result<Option<u64>> {
         if let Some(lease) = self.partial_leases.get(pp) {
@@ -442,7 +420,7 @@ impl FsOps {
                     if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
                     {
                         bail!(
-                            "destination partial {} is being replaced by another pcp process: {}",
+                            "destination partial {} is being replaced by another syq process: {}",
                             pp.display(),
                             io::Error::last_os_error()
                         );
@@ -491,7 +469,7 @@ impl FsOps {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 let error = io::Error::last_os_error();
                 bail!(
-                    "destination partial {} is in use by another pcp process: {error}",
+                    "destination partial {} is in use by another syq process: {error}",
                     pp.display()
                 );
             }
@@ -499,7 +477,7 @@ impl FsOps {
                 .insert(pp.to_path_buf(), PartialLease { file, basis_size });
             drop(claim_guard);
             #[cfg(debug_assertions)]
-            if let Some(ms) = std::env::var_os("PCP_TEST_HOLD_PARTIAL_MS") {
+            if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARTIAL_MS") {
                 if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
                     std::thread::sleep(std::time::Duration::from_millis(ms));
                 }
@@ -712,7 +690,7 @@ impl FsOps {
                 .with_context(|| format!("fsync {}", pp.display()))?;
         }
         #[cfg(debug_assertions)]
-        if let Some(pat) = std::env::var_os("PCP_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
+        if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
             // Test hook (debug builds only): model interruption after the
             // sidecar is complete but before it becomes the final name.
             if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
@@ -939,7 +917,7 @@ impl FsOps {
 /// Open `target` for writing as a regular file, replacing any existing
 /// symlink/dir/special and refusing to follow a symlink (O_NOFOLLOW), then
 /// verify the opened fd is a regular file. Used for every write target so a
-/// malicious or stale `.pcp-partial` symlink can't redirect the write.
+/// malicious or stale `.syq-partial` symlink can't redirect the write.
 fn open_regular_write(target: &Path, mode: u32) -> Result<File> {
     if let Ok(md) = fs::symlink_metadata(target) {
         if !md.is_file() {
@@ -964,10 +942,37 @@ fn open_regular_write(target: &Path, mode: u32) -> Result<File> {
     Ok(f)
 }
 
-fn mkdir(p: &Path, mode: u32) -> Result<()> {
+fn mkdir(p: &Path, mode: u32) -> io::Result<()> {
     std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), (mode & 0o7777) | 0o700)
-        .create(p)?;
+        .create(p)
+}
+
+fn followed_metadata(p: &Path) -> io::Result<fs::Metadata> {
+    fs::symlink_metadata(p).map(|md| {
+        if md.file_type().is_symlink() {
+            fs::metadata(p).unwrap_or(md)
+        } else {
+            md
+        }
+    })
+}
+
+fn make_dir_writable(p: &Path, md: &fs::Metadata) -> Result<()> {
+    if md.mode() & 0o700 != 0o700 {
+        fs::set_permissions(p, fs::Permissions::from_mode(md.mode() | 0o700))?;
+    }
     Ok(())
+}
+
+fn mkdir_or_existing_dir(p: &Path, mode: u32) -> Result<()> {
+    match mkdir(p, mode) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => match followed_metadata(p) {
+            Ok(md) if md.is_dir() => make_dir_writable(p, &md),
+            _ => Err(err.into()),
+        },
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn preallocate(f: &File, size: u64) -> Result<()> {

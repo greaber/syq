@@ -46,8 +46,8 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             user: loc.user.clone(),
             host: h.clone(),
             rsh: parse_rsh(&args.rsh)?,
-            pcp_path: args.pcp_path.clone(),
-            auto_helper: args.pcp_path.is_none() && !args.no_bootstrap,
+            syq_path: args.syq_path.clone(),
+            auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
             helper_install: Default::default(),
             quiet: args.quiet,
             tcp: Default::default(),
@@ -245,7 +245,7 @@ struct CheckpointShared {
 type CheckpointSlot = std::sync::Arc<std::sync::OnceLock<CheckpointShared>>;
 
 pub fn debug() -> bool {
-    std::env::var_os("PCP_DEBUG").is_some()
+    std::env::var_os("SYQ_DEBUG").is_some()
 }
 
 fn read_umask() -> u32 {
@@ -317,12 +317,16 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
+    // TCP data connections are the default (auto-selecting the fastest reachable
+    // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
+    // Local<->local needs no data plane at all.
+    let use_tcp = !args.no_tcp && (src_ep.is_remote() || dst_ep.is_remote());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
-    // this is only where it starts.
+    // start conservatively until TCP reachability has been established below.
     let autotune = args.connections_default;
     if autotune {
         args.connections = if src_ep.is_remote() || dst_ep.is_remote() {
-            tune::START
+            tune::START_SSH
         } else {
             tune::START_LOCAL
         };
@@ -332,7 +336,7 @@ pub fn run(args: Args) -> Result<i32> {
             return crate::direct::run(&args, srcs, dst);
         }
         if !args.quiet {
-            eprintln!("pcp: remote-to-remote transfer: relaying data through this machine");
+            eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
     }
 
@@ -420,7 +424,7 @@ pub fn run(args: Args) -> Result<i32> {
                 };
                 if debug() {
                     eprintln!(
-                        "pcp: worker {id} connected in {:.2}s",
+                        "syq: worker {id} connected in {:.2}s",
                         t0.elapsed().as_secs_f64()
                     );
                 }
@@ -430,8 +434,8 @@ pub fn run(args: Args) -> Result<i32> {
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
-    let spawn_workers = || {
-        for id in 0..args.connections {
+    let spawn_workers = |initial: usize| {
+        for id in 0..initial {
             spawn_worker(id);
         }
         if autotune {
@@ -441,18 +445,13 @@ pub fn run(args: Args) -> Result<i32> {
                 progress.clone(),
                 spawn_worker.clone(),
             );
-            let n0 = args.connections;
+            let n0 = initial;
             let policy = tune::Policy::new(n0, tune::MIN, tune::MAX);
             *tuner.lock().unwrap() = Some(std::thread::spawn(move || {
                 tune::run(policy, gate, sched, progress, |id| spawn_worker(id), n0)
             }));
         }
     };
-    // TCP data connections are the default (auto-selecting the fastest reachable
-    // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
-    // Local<->local needs no data plane at all.
-    let use_tcp = !args.no_tcp && (src_ep.is_remote() || dst_ep.is_remote());
-
     let t0 = std::time::Instant::now();
     let (mut src_ctl, mut dst_ctl) = {
         let (a, b) = (src_ep.clone(), args.clone());
@@ -472,7 +471,7 @@ pub fn run(args: Args) -> Result<i32> {
     };
     if debug() {
         eprintln!(
-            "pcp: control connections up in {:.2}s",
+            "syq: control connections up in {:.2}s",
             t0.elapsed().as_secs_f64()
         );
     }
@@ -483,7 +482,7 @@ pub fn run(args: Args) -> Result<i32> {
                 if let Err(e) = spec.setup_tcp(&mut **ctl, args.tcp_plain, ports) {
                     if !args.quiet || debug() {
                         eprintln!(
-                            "pcp: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}); a Tailscale address or an open port is faster",
+                            "syq: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}); a Tailscale address or an open port is faster",
                             spec.label(),
                             ports.0,
                             ports.1
@@ -493,7 +492,7 @@ pub fn run(args: Args) -> Result<i32> {
                 }
                 if debug() {
                     eprintln!(
-                        "pcp: {}: tcp data port {:?}",
+                        "syq: {}: tcp data port {:?}",
                         spec.label(),
                         spec.tcp
                             .lock()
@@ -505,8 +504,17 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
+    let all_remote_endpoints_use_tcp = use_tcp
+        && [&src_ep, &dst_ep].into_iter().all(|ep| match ep {
+            Endpoint::Local => true,
+            Endpoint::Remote(spec) => spec.tcp.lock().unwrap().is_some(),
+        });
+    if autotune && all_remote_endpoints_use_tcp {
+        args.connections = tune::START_TCP;
+        gate.set_limit(args.connections);
+    }
     if !opts.dry_run {
-        spawn_workers();
+        spawn_workers(args.connections);
     }
 
     let dst_root = dst.path.as_bytes().to_vec();
@@ -656,7 +664,7 @@ pub fn run(args: Args) -> Result<i32> {
     progress.scan_done.store(true, Relaxed);
     sched.scan_done();
     if let Some(e) = &scan_err {
-        progress.error(&format!("pcp: {e:#}"));
+        progress.error(&format!("syq: {e:#}"));
         sched.abort();
     }
     if collision {
@@ -682,10 +690,10 @@ pub fn run(args: Args) -> Result<i32> {
             match w.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    progress.error(&format!("pcp: worker: {e:#}"));
+                    progress.error(&format!("syq: worker: {e:#}"));
                     sched.abort();
                 }
-                Err(_) => progress.error("pcp: worker thread panicked"),
+                Err(_) => progress.error("syq: worker thread panicked"),
             }
         }
     }
@@ -717,7 +725,7 @@ pub fn run(args: Args) -> Result<i32> {
         });
         if let Some(e) = failed {
             eprintln!(
-                "pcp: warning: checkpoint recording stopped ({e}); a retry will recheck files completed after that point"
+                "syq: warning: checkpoint recording stopped ({e}); a retry will recheck files completed after that point"
             );
         }
     }
@@ -726,7 +734,7 @@ pub fn run(args: Args) -> Result<i32> {
     if !args.quiet {
         if opts.verify_only {
             println!(
-                "pcp: verified {} files, {} differ/missing, {} in {}",
+                "syq: verified {} files, {} differ/missing, {} in {}",
                 commas(progress.files_done.load(Relaxed) + errors),
                 errors,
                 human(done),
@@ -739,7 +747,7 @@ pub fn run(args: Args) -> Result<i32> {
                 "transferred"
             };
             println!(
-                "pcp: {} {} files ({}), {} unchanged ({} files), {} dirs{}{}",
+                "syq: {} {} files ({}), {} unchanged ({} files), {} dirs{}{}",
                 verb,
                 commas(progress.files_done.load(Relaxed)),
                 human(if opts.dry_run {
@@ -916,9 +924,9 @@ impl Planner<'_> {
                 // "skipping …" is a notice (nothing the copy owes is missing);
                 // anything else from the scanner means an entry was lost.
                 if w.starts_with("skipping ") {
-                    progress.eprintln(&format!("pcp: {w}"));
+                    progress.eprintln(&format!("syq: {w}"));
                 } else {
-                    progress.error(&format!("pcp: {w}"));
+                    progress.error(&format!("syq: {w}"));
                 }
             },
         )
@@ -1003,7 +1011,7 @@ impl Planner<'_> {
                 for (name, err) in names.iter().zip(errs) {
                     if let Some(err) = err {
                         failed += 1;
-                        self.progress.error(&format!("pcp: {err}"));
+                        self.progress.error(&format!("syq: {err}"));
                     } else if opts.verbose > 0 {
                         self.progress.println(&format!("{}/", display(name)));
                     }
@@ -1247,7 +1255,7 @@ impl Planner<'_> {
             let (ops, records): (Vec<Op>, Vec<_>) = meta_fixes.into_iter().unzip();
             for (err, rec) in self.apply(true, ops)?.into_iter().zip(records) {
                 match err {
-                    Some(err) => self.progress.error(&format!("pcp: {err}")),
+                    Some(err) => self.progress.error(&format!("syq: {err}")),
                     None => {
                         // Only now is the file complete in every respect.
                         if let (Some(checkpoint), Some((rel, entry))) = (&self.checkpoint, rec) {
@@ -1264,7 +1272,7 @@ impl Planner<'_> {
                 let e1 = errs.get(2 * i).cloned().flatten();
                 let e2 = errs.get(2 * i + 1).cloned().flatten();
                 if let Some(e) = e1.or(e2) {
-                    self.progress.error(&format!("pcp: {e}"));
+                    self.progress.error(&format!("syq: {e}"));
                 } else if opts.verbose > 0 {
                     self.progress.println(name);
                 }
@@ -1291,7 +1299,7 @@ impl Planner<'_> {
             Some(&prev_dir) if prev_dir && is_dir => true,
             Some(_) => {
                 self.progress.error(&format!(
-                    "pcp: {rel}: two sources map to the same destination {} with conflicting types — refusing to clobber it",
+                    "syq: {rel}: two sources map to the same destination {} with conflicting types — refusing to clobber it",
                     display(dst)
                 ));
                 self.collision = true;
@@ -1355,7 +1363,7 @@ impl Planner<'_> {
                 })
                 .collect();
             for err in self.apply(true, ops)?.into_iter().flatten() {
-                self.progress.error(&format!("pcp: {err}"));
+                self.progress.error(&format!("syq: {err}"));
             }
         }
         Ok(())
@@ -1406,7 +1414,7 @@ impl Worker {
                 Item::Exit => {
                     if debug() {
                         eprintln!(
-                            "pcp: worker {} blocked: src recv {:.2}s, dst send {:.2}s, dst ack {:.2}s, idle {:.2}s",
+                            "syq: worker {} blocked: src recv {:.2}s, dst send {:.2}s, dst ack {:.2}s, idle {:.2}s",
                             self.id, self.t[0], self.t[1], self.t[2], self.t[3]
                         );
                     }
@@ -1574,7 +1582,7 @@ impl Worker {
         {
             self.sched.ranges_ready(*idx, vec![]);
             if let Err(e) = res {
-                self.progress.error(&format!("pcp: {}: {e:#}", j.rel));
+                self.progress.error(&format!("syq: {}: {e:#}", j.rel));
                 self.sched.fail_file(*idx);
                 continue;
             }
@@ -1590,7 +1598,7 @@ impl Worker {
             if changed {
                 if let (Some(e), true) = (now, j.attempts + 1 < MAX_ATTEMPTS) {
                     self.progress.eprintln(&format!(
-                        "pcp: {}: changed during transfer, retrying",
+                        "syq: {}: changed during transfer, retrying",
                         j.rel
                     ));
                     let published = self.published_entry(j);
@@ -1607,7 +1615,7 @@ impl Worker {
                     self.sched.requeue(*idx);
                 } else {
                     self.progress.error(&format!(
-                        "pcp: {}: source changed during transfer (or vanished)",
+                        "syq: {}: source changed during transfer (or vanished)",
                         j.rel
                     ));
                     self.sched.fail_file(*idx);
@@ -1631,7 +1639,7 @@ impl Worker {
         }
         if !self.sched.is_failed(idx) {
             let rel = self.sched.jobs.lock().unwrap()[idx].rel.clone();
-            self.progress.error(&format!("pcp: {rel}: {e:#}"));
+            self.progress.error(&format!("syq: {rel}: {e:#}"));
             self.sched.fail_file(idx);
         }
         Ok(())
@@ -2089,10 +2097,10 @@ impl Worker {
                 flags,
                 fsync: self.opts.fsync,
             })?,
-            "finalize",
+            "finalize destination",
         )?;
         #[cfg(debug_assertions)]
-        if let Some(ms) = std::env::var_os("PCP_TEST_HOLD_AFTER_FINALIZE_MS") {
+        if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_AFTER_FINALIZE_MS") {
             if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
@@ -2112,7 +2120,7 @@ impl Worker {
             if job.attempts + 1 < MAX_ATTEMPTS {
                 if let Some(e) = now {
                     self.progress.eprintln(&format!(
-                        "pcp: {}: changed during transfer, retrying",
+                        "syq: {}: changed during transfer, retrying",
                         job.rel
                     ));
                     let published = self.published_entry(&job);

@@ -1,6 +1,6 @@
 //! Automatic tuning of the number of parallel workers / connections.
 //!
-//! When `-j` is not given, pcp does not guess: it starts with a few workers
+//! When `-j` is not given, syq does not guess: it starts with a few workers
 //! and measures. Progress (bytes, plus a small credit per completed file so
 //! small-file transfers count too) is sampled every few seconds; a worker
 //! count has been *measured* once the rate has stopped changing — two
@@ -28,10 +28,12 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-/// Workers to start with when auto-tuning over the network: each is an ssh
-/// handshake (seconds on a long path) or a TCP connection, so start modestly
-/// and let the tuner earn more.
-pub const START: usize = 8;
+/// Workers to start with when auto-tuning over ssh: handshakes can take seconds
+/// on a long path, so start modestly and let the tuner earn more.
+pub const START_SSH: usize = 8;
+/// Workers to start with when every remote endpoint has a TCP data path.
+/// TCP data connections are cheap once the ssh control connection is up.
+pub const START_TCP: usize = 16;
 /// Workers to start with when both ends are local: threads are free, network
 /// filesystems like the concurrency, and short bursts never reach the first
 /// measurement. If it's too many for a spinning disk the ramp-down finds out.
@@ -443,7 +445,7 @@ pub fn run(
             sampler.reset();
             if crate::transfer::debug() {
                 eprintln!(
-                    "pcp: tune: {before} -> {n} workers (measured {:.1} MB/s at {before}, state {:?})",
+                    "syq: tune: {before} -> {n} workers (measured {:.1} MB/s at {before}, state {:?})",
                     score / 1e6,
                     policy.state
                 );
@@ -474,7 +476,7 @@ mod tests {
         assert_eq!(step_up(2), 3);
         assert_eq!(step_down(8), 6);
         assert_eq!(step_down(3), 2);
-        let mut n = START;
+        let mut n = START_SSH;
         let mut steps = 0;
         while n < MAX {
             n = step_up(n);
@@ -485,7 +487,7 @@ mod tests {
 
     #[test]
     fn ramps_to_the_plateau_and_holds() {
-        let p = simulate(START, 32, 40, |_| 1.0);
+        let p = simulate(START_SSH, 32, 40, |_| 1.0);
         // Doubles up to the knee, overshoots once, refines, and stays.
         assert_eq!(
             &p.history[..5],
@@ -517,7 +519,7 @@ mod tests {
         // model a sharper case: flat past 20. 16 -> 32 gains 25% (< 33%),
         // so it goes back to 16 and refines: 21 (+25% of 30%: kept), 27
         // (flat), back to 21, then descends 16 (worse), settles 21.
-        let p = simulate(START, 20, 40, |_| 1.0);
+        let p = simulate(START_SSH, 20, 40, |_| 1.0);
         assert_eq!(
             &p.history[..5],
             &[8, 16, 32, 21, 27],
@@ -530,10 +532,10 @@ mod tests {
     #[test]
     fn does_not_grow_when_it_never_pays() {
         // One worker already saturates the link (TCP on a clean path).
-        let p = simulate(START, 1, 40, |_| 1.0);
+        let p = simulate(START_SSH, 1, 40, |_| 1.0);
         // The doubling fails, the fine step fails, then it walks down since
         // nothing drops.
-        assert!(p.settled() < START, "history {:?}", p.history);
+        assert!(p.settled() < START_SSH, "history {:?}", p.history);
         assert_eq!(&p.history[..3], &[8, 16, 10]);
     }
 
@@ -547,7 +549,7 @@ mod tests {
                 30e6
             }
         };
-        let mut p = Policy::new(START, MIN, MAX);
+        let mut p = Policy::new(START_SSH, MIN, MAX);
         for _ in 0..40 {
             p.observe(score(p.n));
         }
@@ -591,17 +593,17 @@ mod tests {
 
     #[test]
     fn ignores_noise_within_tolerance() {
-        let p = simulate(START, 32, 60, |i| if i % 2 == 0 { 1.0 } else { 0.93 });
+        let p = simulate(START_SSH, 32, 60, |i| if i % 2 == 0 { 1.0 } else { 0.93 });
         assert!((20..=42).contains(&p.settled()), "history {:?}", p.history);
     }
 
     #[test]
     fn silence_is_not_a_signal() {
-        let mut p = Policy::new(START, MIN, MAX);
+        let mut p = Policy::new(START_SSH, MIN, MAX);
         for _ in 0..10 {
             p.observe(0.0);
         }
-        assert_eq!(p.history, vec![START]);
+        assert_eq!(p.history, vec![START_SSH]);
     }
 
     #[test]
