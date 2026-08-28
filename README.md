@@ -670,7 +670,10 @@ destination side unlinks each batch in parallel); it isn't spread over the
 - `--existing`: never create anything — files, symlinks, specials,
   directories, *or the destination itself* — that isn't already there;
   existing files are still updated. `--ignore-existing` is the mirror image: create what's
-  missing, never touch what exists. Both apply to every non-directory entry.
+  missing, never touch what exists — including an existing file or symlink
+  where the source maps a *directory*: it stays, and that directory with its
+  whole subtree is skipped with a notice (rsync would delete the file to
+  make room). Both apply to every non-directory entry.
 - `--max-size` / `--min-size`: regular files outside the range are not
   transferred (`4K`, `100M`, `2G`; the same suffixes as `--block-size`).
   Directories and symlinks are unaffected.

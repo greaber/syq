@@ -1128,8 +1128,9 @@ struct Planner<'a> {
     opts: &'a Opts,
     /// Destination paths claimed by source entries (see `Claim`).
     dst_seen: std::collections::HashMap<PathBytes, Claim>,
-    /// --existing: destination directories that don't exist (or aren't
-    /// directories); nothing under them is touched.
+    /// Directories this run will not create — --existing: they don't exist
+    /// (or aren't directories); --ignore-existing: an existing non-directory
+    /// sits at their path. Nothing under them is touched.
     missing_dirs: std::collections::HashSet<PathBytes>,
     completed:
         Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>>,
@@ -1295,9 +1296,9 @@ impl Planner<'_> {
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
         // Through a symlink: `syq --files-from L link dst` should work like `link/`.
-        // Validate the root but never plan it: it isn't in the list, so its
-        // metadata is not ours to copy — an existing destination keeps its
-        // own mode/owner/mtime (creation-when-missing happened in run()).
+        // Validate the root but never plan it: it isn't in the list, so an
+        // existing destination is not stamped with source-root metadata
+        // (creation-when-missing happened in run()).
         match stat_one(src, src_root, true)? {
             Some(e) if e.kind == Kind::Dir => {}
             Some(_) => bail!(
@@ -1708,7 +1709,7 @@ impl Planner<'_> {
         // Directories: one stat pass decides everything about each one, and
         // the same filtered list drives creation, listing and deferred
         // metadata so they can't disagree.
-        let need_stats = opts.verify_only || !opts.dry_run || opts.existing;
+        let need_stats = opts.verify_only || !opts.dry_run || opts.existing || opts.ignore_existing;
         if !dirs.is_empty() && (need_stats || opts.verbose > 0) {
             let stats: Vec<Option<Entry>> = if need_stats {
                 self.stat_many(dirs.iter().map(|(p, _, _)| p.clone()).collect())?
@@ -1733,7 +1734,22 @@ impl Planner<'_> {
                 // replaced, never traversed) counts as missing: we won't
                 // replace it and won't write through it, and since entries
                 // come parent-first, everything below is skipped too.
-                if opts.existing && (!is_dir || self.under_missing_dir(&p, dst_root)) {
+                // --ignore-existing never touches what exists either: an
+                // existing non-directory where a directory maps stays, and the
+                // mapped directory with its whole subtree is skipped, visibly
+                // (rsync would unlink the file; see RSYNC-COMPAT.md).
+                let conflict = opts.ignore_existing && !is_dir && st.is_some();
+                if conflict
+                    || (opts.existing && !is_dir)
+                    || ((opts.existing || opts.ignore_existing)
+                        && self.under_missing_dir(&p, dst_root))
+                {
+                    if conflict && !opts.quiet {
+                        self.progress.eprintln(&format!(
+                            "syq: keeping existing {}; skipping the directory mapped onto it",
+                            display(&p)
+                        ));
+                    }
                     self.missing_dirs.insert(p);
                     continue;
                 }
@@ -1844,7 +1860,9 @@ impl Planner<'_> {
                 e,
                 contested,
             } = p;
-            if opts.existing && self.under_missing_dir(&dst_path, dst_root) {
+            if (opts.existing || opts.ignore_existing)
+                && self.under_missing_dir(&dst_path, dst_root)
+            {
                 // Below a directory we won't create: nothing to do, even if the
                 // destination has something reachable there through a symlink.
                 self.progress.files_excluded.fetch_add(1, Relaxed);

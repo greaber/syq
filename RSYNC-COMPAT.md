@@ -91,6 +91,15 @@ item.
    `copy_onto_itself_among_sources_is_order_independent`,
    `three_claimants_are_validated_as_a_group`.*
 
+5. **`--ignore-existing` keeps an existing non-directory even where the
+   source maps a directory.** rsync exempts directories from the flag ("this
+   does not ignore existing directories"), and consequently — believed from
+   the manpage, not yet measured — unlinks an existing destination file to
+   make room for a source directory. Under a flag whose whole meaning is
+   "what exists is authoritative", that is unrecoverable data loss; syq keeps
+   the file and skips the mapped directory with its subtree, with a notice.
+   *Test: `ignore_existing_keeps_a_file_where_a_source_directory_maps`.*
+
 ## Different, no claim of better
 
 1. **Ignore rules use gitignore syntax (`--ignore`/`--ignore-from`), not
