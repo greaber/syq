@@ -835,6 +835,8 @@ pub fn run(args: Args) -> Result<i32> {
         && !args.dry_run
         && !args.verify_only
         && !args.existing;
+    let dry_run_creates_root =
+        args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
     if create_root && srcs.len() == 1 {
         mkdir_root(&mut *dst_ctl, &dst_root)?;
     }
@@ -889,6 +891,13 @@ pub fn run(args: Args) -> Result<i32> {
         keep_dirs: args.files_from.is_some(),
         delete_roots: Vec::new(),
         deletes: Deletes::default(),
+        dry_run_changes: {
+            let mut changes = DryRunChanges::default();
+            if dry_run_creates_root {
+                changes.directories.insert(dst_root.clone());
+            }
+            changes
+        },
     };
 
     let mut scan_err = None;
@@ -1030,6 +1039,7 @@ pub fn run(args: Args) -> Result<i32> {
         st.apply_deferred()?;
     }
     let max_delete_hit = st.max_delete_hit;
+    let dry_run_changes = std::mem::take(&mut st.dry_run_changes);
     drop(st);
 
     progress.stop();
@@ -1062,7 +1072,13 @@ pub fn run(args: Args) -> Result<i32> {
     let done = progress.bytes_done.load(Relaxed);
     if !args.quiet && !aborted {
         if opts.dry_run {
-            print_dry_run_plan(
+            if args.verbose > 0 && dry_run_creates_root {
+                println!(
+                    "create directory {} (destination missing)",
+                    display_directory(&dst_root)
+                );
+            }
+            print_dry_run_summary(
                 srcs,
                 dst,
                 &dry_run_mappings,
@@ -1072,9 +1088,9 @@ pub fn run(args: Args) -> Result<i32> {
                 &opts,
                 &progress,
                 delete_plan,
+                &dry_run_changes,
             );
-        }
-        if opts.verify_only {
+        } else if opts.verify_only {
             println!(
                 "syq: verified {} files, {} differ/missing, {} in {}",
                 commas(progress.files_done.load(Relaxed) + errors),
@@ -1083,33 +1099,19 @@ pub fn run(args: Args) -> Result<i32> {
                 crate::progress::hms(elapsed)
             );
         } else {
-            let verb = if opts.dry_run {
-                "would transfer"
-            } else {
-                "transferred"
-            };
             println!(
-                "syq: {} {} files ({}), {} unchanged ({} files), {} dirs{}{}{}",
-                verb,
+                "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs{}{}{}",
                 commas(progress.files_done.load(Relaxed)),
-                human(if opts.dry_run {
-                    progress.bytes_total.load(Relaxed)
-                } else {
-                    done
-                }),
+                human(done),
                 human(progress.bytes_skipped.load(Relaxed)),
                 commas(progress.files_skipped.load(Relaxed)),
                 commas(st_dirs(&progress)),
-                deletion_summary(delete_plan, deleted, opts.dry_run, opts.max_delete),
-                if opts.dry_run {
-                    String::new()
-                } else {
-                    format!(
-                        ", {} at {}/s",
-                        crate::progress::hms(elapsed),
-                        human((done as f64 / elapsed.max(0.001)) as u64)
-                    )
-                },
+                deletion_summary(delete_plan, deleted, opts.max_delete),
+                format_args!(
+                    ", {} at {}/s",
+                    crate::progress::hms(elapsed),
+                    human((done as f64 / elapsed.max(0.001)) as u64)
+                ),
                 if errors > 0 {
                     format!(", {errors} errors")
                 } else {
@@ -1118,13 +1120,36 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
         if args.stats {
+            let (
+                files_label,
+                unchanged_files_label,
+                bytes_label,
+                unchanged_bytes_label,
+                bytes_work,
+            ) = if opts.dry_run {
+                (
+                    "files needing content work",
+                    "files with unchanged content",
+                    "logical bytes needing content work",
+                    "logical bytes with unchanged content",
+                    progress.bytes_total.load(Relaxed),
+                )
+            } else {
+                (
+                    "files to transfer",
+                    "files unchanged",
+                    "bytes transferred",
+                    "bytes unchanged",
+                    done,
+                )
+            };
             println!(
-                "  scanned entries: {}\n  files to transfer: {}\n  files unchanged: {}\n  files excluded: {}\n  bytes transferred: {}\n  bytes unchanged: {}\n  elapsed: {:.2}s\n  connections: {}",
+                "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
                 commas(progress.files_skipped.load(Relaxed)),
                 commas(progress.files_excluded.load(Relaxed)),
-                commas(done),
+                commas(bytes_work),
                 commas(progress.bytes_skipped.load(Relaxed)),
                 elapsed,
                 match &tuned {
@@ -1311,6 +1336,35 @@ fn display(p: &[u8]) -> String {
     String::from_utf8_lossy(p).into_owned()
 }
 
+fn display_directory(p: &[u8]) -> String {
+    let mut shown = display(p);
+    if !shown.ends_with('/') {
+        shown.push('/');
+    }
+    shown
+}
+
+fn kind_label(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Dir => "directory",
+        Kind::File => "regular file",
+        Kind::Symlink => "symlink",
+        Kind::Fifo => "FIFO",
+        Kind::Socket => "socket",
+        Kind::CharDev => "character device",
+        Kind::BlockDev => "block device",
+        Kind::Other => "unsupported entry",
+    }
+}
+
+fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
+    (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
+        || (flags & flags::OWNER != 0 && source.uid != destination.uid)
+        || (flags & flags::GROUP != 0 && source.gid != destination.gid)
+        || (flags & flags::TIMES != 0
+            && (source.mtime, source.mtime_nsec) != (destination.mtime, destination.mtime_nsec))
+}
+
 fn display_location(loc: &Location, path: &[u8]) -> String {
     let path = display(path);
     let Some(host) = &loc.host else {
@@ -1402,6 +1456,54 @@ struct DryRunMapping {
     semantics: &'static str,
 }
 
+/// A typed summary of final-state mutations found during a dry run. Type
+/// replacements overlap the primary categories; all others are disjoint.
+#[derive(Default)]
+struct DryRunChanges {
+    regular_files: u64,
+    directories: std::collections::HashSet<PathBytes>,
+    symlinks: u64,
+    specials: u64,
+    metadata_files: u64,
+    metadata_directories: std::collections::HashSet<PathBytes>,
+    type_replacements: u64,
+}
+
+impl DryRunChanges {
+    fn summary(&self) -> String {
+        let mut categories = Vec::new();
+        for (n, singular, plural) in [
+            (self.regular_files, "regular file", "regular files"),
+            (self.directories.len() as u64, "directory", "directories"),
+            (self.symlinks, "symlink", "symlinks"),
+            (self.specials, "special file", "special files"),
+            (
+                self.metadata_files + self.metadata_directories.len() as u64,
+                "metadata-only entry",
+                "metadata-only entries",
+            ),
+        ] {
+            if n > 0 {
+                categories.push(count_label(n, singular, plural));
+            }
+        }
+        if categories.is_empty() {
+            return "none".to_string();
+        }
+        if self.type_replacements > 0 {
+            categories.push(format!(
+                "{} among them",
+                count_label(
+                    self.type_replacements,
+                    "type replacement",
+                    "type replacements"
+                )
+            ));
+        }
+        categories.join("; ")
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DeletePlan {
     Disabled,
@@ -1413,7 +1515,7 @@ fn count_label(n: u64, singular: &str, plural: &str) -> String {
     format!("{} {}", commas(n), if n == 1 { singular } else { plural })
 }
 
-fn deletion_summary(plan: DeletePlan, deleted: u64, dry_run: bool, max: Option<u64>) -> String {
+fn deletion_summary(plan: DeletePlan, deleted: u64, max: Option<u64>) -> String {
     match plan {
         DeletePlan::Disabled => String::new(),
         DeletePlan::Planned(n) => {
@@ -1423,15 +1525,7 @@ fn deletion_summary(plan: DeletePlan, deleted: u64, dry_run: bool, max: Option<u
                     commas(n)
                 )
             } else {
-                format!(
-                    ", {} {}",
-                    commas(deleted),
-                    if dry_run {
-                        "would be deleted"
-                    } else {
-                        "deleted"
-                    }
-                )
+                format!(", {} deleted", commas(deleted))
             }
         }
         DeletePlan::Skipped(reason) => format!(", deletions skipped ({reason})"),
@@ -1439,7 +1533,7 @@ fn deletion_summary(plan: DeletePlan, deleted: u64, dry_run: bool, max: Option<u
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print_dry_run_plan(
+fn print_dry_run_summary(
     srcs: &[Location],
     dst: &Location,
     mappings: &[DryRunMapping],
@@ -1449,8 +1543,9 @@ fn print_dry_run_plan(
     opts: &Opts,
     progress: &Progress,
     deletes: DeletePlan,
+    changes: &DryRunChanges,
 ) {
-    println!("syq: dry-run plan");
+    println!("syq: dry-run summary");
     for (source, mapping) in srcs.iter().zip(mappings) {
         println!(
             "  mapping: {} -> {} ({})",
@@ -1459,12 +1554,31 @@ fn print_dry_run_plan(
             mapping.semantics
         );
     }
+    println!("  changes: {}", changes.summary());
+
+    match deletes {
+        DeletePlan::Disabled => println!("  deletions: disabled"),
+        DeletePlan::Planned(n) => {
+            if let Some(limit) = opts.max_delete.filter(|limit| n > *limit) {
+                println!(
+                    "  deletions: {} planned; blocked by --max-delete {limit}",
+                    count_label(n, "entry", "entries")
+                );
+            } else {
+                println!(
+                    "  deletions: {} planned after a successful copy",
+                    count_label(n, "entry", "entries")
+                );
+            }
+        }
+        DeletePlan::Skipped(reason) => println!("  deletions: skipped ({reason})"),
+    }
     println!(
-        "  plan: {}, {} to transfer; {}, {} unchanged",
-        count_label(progress.files_total.load(Relaxed), "file", "files"),
+        "  logical data: {} in {} needing content work (upper bound); {} in {} with unchanged content",
         human(progress.bytes_total.load(Relaxed)),
-        count_label(progress.files_skipped.load(Relaxed), "file", "files"),
-        human(progress.bytes_skipped.load(Relaxed))
+        count_label(progress.files_total.load(Relaxed), "file", "files"),
+        human(progress.bytes_skipped.load(Relaxed)),
+        count_label(progress.files_skipped.load(Relaxed), "file", "files")
     );
 
     let ignored = progress.paths_ignored.load(Relaxed);
@@ -1492,23 +1606,6 @@ fn print_dry_run_plan(
         }
     );
 
-    match deletes {
-        DeletePlan::Disabled => println!("  deletions: disabled"),
-        DeletePlan::Planned(n) => {
-            if let Some(limit) = opts.max_delete.filter(|limit| n > *limit) {
-                println!(
-                    "  deletions: {} planned; blocked by --max-delete {limit}",
-                    count_label(n, "entry", "entries")
-                );
-            } else {
-                println!(
-                    "  deletions: {} planned after a successful copy",
-                    count_label(n, "entry", "entries")
-                );
-            }
-        }
-        DeletePlan::Skipped(reason) => println!("  deletions: skipped ({reason})"),
-    }
     println!("  route: {}", selected_route(src_ep, dst_ep, args));
 }
 
@@ -1578,6 +1675,7 @@ struct Planner<'a> {
     /// directory source; --delete removes extras inside these.
     delete_roots: Vec<(PathBytes, String)>,
     deletes: Deletes,
+    dry_run_changes: DryRunChanges,
 }
 
 /// What a source entry asserts about its destination path. Two dirs merge;
@@ -2130,13 +2228,8 @@ impl Planner<'_> {
         // Directories: one stat pass decides everything about each one, and
         // the same filtered list drives creation, listing and deferred
         // metadata so they can't disagree.
-        let need_stats = opts.verify_only || !opts.dry_run || opts.existing || opts.ignore_existing;
-        if !dirs.is_empty() && (need_stats || opts.verbose > 0) {
-            let stats: Vec<Option<Entry>> = if need_stats {
-                self.stat_many(dirs.iter().map(|(p, _, _)| p.clone()).collect())?
-            } else {
-                vec![None; dirs.len()]
-            };
+        if !dirs.is_empty() {
+            let stats = self.stat_many(dirs.iter().map(|(p, _, _)| p.clone()).collect())?;
             let mut planned: Vec<(PathBytes, PathBytes, Entry, Option<Entry>)> = Vec::new();
             for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
                 let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
@@ -2177,9 +2270,43 @@ impl Planner<'_> {
                 planned.push((p, dst_rel, e, st));
             }
             if opts.dry_run {
-                if opts.verbose > 0 {
-                    for (p, _, _, _) in &planned {
-                        self.progress.println(&format!("{}/", display(p)));
+                let mut meta_flags = opts.flags;
+                if !opts.perms {
+                    meta_flags &= !flags::MODE;
+                }
+                for (p, _, e, destination) in &planned {
+                    match destination {
+                        None => {
+                            self.dry_run_changes.directories.insert(p.clone());
+                            if opts.verbose > 0 {
+                                self.progress.println(&format!(
+                                    "create directory {} (destination missing)",
+                                    display_directory(p)
+                                ));
+                            }
+                        }
+                        Some(d) if d.kind != Kind::Dir => {
+                            if self.dry_run_changes.directories.insert(p.clone()) {
+                                self.dry_run_changes.type_replacements += 1;
+                            }
+                            if opts.verbose > 0 {
+                                self.progress.println(&format!(
+                                    "replace with directory {} (destination is {})",
+                                    display_directory(p),
+                                    kind_label(d.kind)
+                                ));
+                            }
+                        }
+                        Some(d) if metadata_differs(e, d, meta_flags) => {
+                            self.dry_run_changes.metadata_directories.insert(p.clone());
+                            if opts.verbose > 0 {
+                                self.progress.println(&format!(
+                                    "update metadata {} (requested directory metadata differs)",
+                                    display_directory(p)
+                                ));
+                            }
+                        }
+                        Some(_) => {}
                     }
                 }
             } else if !opts.verify_only {
@@ -2376,6 +2503,18 @@ impl Planner<'_> {
                                 ff |= flags::GROUP;
                             }
                             if ff != 0 {
+                                self.progress.files_skipped.fetch_add(1, Relaxed);
+                                self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                                if opts.dry_run {
+                                    self.dry_run_changes.metadata_files += 1;
+                                    if opts.verbose > 0 {
+                                        self.progress.println(&format!(
+                                            "update metadata {} (requested file metadata differs)",
+                                            display(&dst_path)
+                                        ));
+                                    }
+                                    continue;
+                                }
                                 meta_fixes.push((
                                     Op::SetFileMetaIfSame {
                                         path: dst_path.clone(),
@@ -2388,8 +2527,6 @@ impl Planner<'_> {
                                         .as_ref()
                                         .map(|_| (dst_rel.clone(), e.clone())),
                                 ));
-                                self.progress.files_skipped.fetch_add(1, Relaxed);
-                                self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
                                 continue;
                             }
                         }
@@ -2402,8 +2539,35 @@ impl Planner<'_> {
                         self.progress.files_total.fetch_add(1, Relaxed);
                         self.progress.bytes_total.fetch_add(e.size, Relaxed);
                         self.progress.files_done.fetch_add(1, Relaxed);
+                        self.dry_run_changes.regular_files += 1;
+                        if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::File) {
+                            self.dry_run_changes.type_replacements += 1;
+                        }
                         if opts.verbose > 0 {
-                            self.progress.println(&rel);
+                            let shown = display(&dst_path);
+                            let action = match &dst_entry {
+                                None => format!("create file {shown} (destination missing)"),
+                                Some(d) if d.kind != Kind::File => format!(
+                                    "replace with file {shown} (destination is {})",
+                                    kind_label(d.kind)
+                                ),
+                                Some(d) if d.size != e.size => {
+                                    format!("update file {shown} (size differs)")
+                                }
+                                Some(_) if opts.checksum => {
+                                    format!("update file {shown} (content comparison requested)")
+                                }
+                                Some(d)
+                                    if opts.flags & flags::TIMES != 0
+                                        && (d.mtime, d.mtime_nsec) != (e.mtime, e.mtime_nsec) =>
+                                {
+                                    format!("update file {shown} (modification time differs)")
+                                }
+                                Some(_) => {
+                                    format!("update file {shown} (content quick check unavailable)")
+                                }
+                            };
+                            self.progress.println(&action);
                         }
                     } else {
                         self.enqueue(
@@ -2435,9 +2599,28 @@ impl Planner<'_> {
                         continue;
                     }
                     if opts.dry_run {
+                        self.dry_run_changes.symlinks += 1;
+                        if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::Symlink) {
+                            self.dry_run_changes.type_replacements += 1;
+                        }
                         if opts.verbose > 0 {
-                            self.progress
-                                .println(&format!("{rel} -> {}", display(&target)));
+                            let shown = display(&dst_path);
+                            let action = match &dst_entry {
+                                None => format!(
+                                    "create symlink {shown} -> {} (destination missing)",
+                                    display(&target)
+                                ),
+                                Some(d) if d.kind != Kind::Symlink => format!(
+                                    "replace with symlink {shown} -> {} (destination is {})",
+                                    display(&target),
+                                    kind_label(d.kind)
+                                ),
+                                Some(_) => format!(
+                                    "update symlink {shown} -> {} (target differs)",
+                                    display(&target)
+                                ),
+                            };
+                            self.progress.println(&action);
                         }
                         continue;
                     }
@@ -2476,8 +2659,30 @@ impl Planner<'_> {
                         continue;
                     }
                     if same || opts.dry_run {
-                        if opts.dry_run && !same && opts.verbose > 0 {
-                            self.progress.println(&rel);
+                        if opts.dry_run && !same {
+                            self.dry_run_changes.specials += 1;
+                            if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
+                                self.dry_run_changes.type_replacements += 1;
+                            }
+                            if opts.verbose > 0 {
+                                let shown = display(&dst_path);
+                                let action = match &dst_entry {
+                                    None => format!(
+                                        "create {} {shown} (destination missing)",
+                                        kind_label(e.kind)
+                                    ),
+                                    Some(d) if d.kind != e.kind => format!(
+                                        "replace with {} {shown} (destination is {})",
+                                        kind_label(e.kind),
+                                        kind_label(d.kind)
+                                    ),
+                                    Some(_) => format!(
+                                        "update {} {shown} (device identity differs)",
+                                        kind_label(e.kind)
+                                    ),
+                                };
+                                self.progress.println(&action);
+                            }
                         }
                         continue;
                     }
@@ -2934,7 +3139,8 @@ impl Planner<'_> {
                     for (_, rel, _) in chunk {
                         n += 1;
                         if opts.verbose > 0 {
-                            me.progress.println(&format!("deleting {rel}"));
+                            me.progress
+                                .println(&format!("delete {rel} (destination only)"));
                         }
                     }
                     continue;

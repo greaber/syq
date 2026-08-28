@@ -171,7 +171,7 @@ pub struct Args {
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
     pub width: Option<usize>,
-    /// Original source endpoint for a remotely orchestrated dry-run plan
+    /// Original source endpoint for a remotely orchestrated dry-run summary
     #[arg(long, hide = true)]
     pub plan_source_host: Option<String>,
 

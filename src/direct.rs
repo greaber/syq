@@ -395,7 +395,10 @@ pub fn follow(args: &Args) -> Result<i32> {
                 eprint!("\r\x1b[K");
             }
             println!("{line}");
-            if line.starts_with("syq: transferred") || line.starts_with("syq: would transfer") {
+            if line.starts_with("syq: transferred")
+                || line.starts_with("syq: would transfer")
+                || line.starts_with("  route:")
+            {
                 let _ = child.kill();
                 return Ok(0);
             }

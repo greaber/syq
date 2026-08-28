@@ -283,18 +283,20 @@ Identical to rsync:
   A colon before the first slash means remote; `./x:y` is local. All sources
   must be on the same host. `host::module` (daemon syntax) is not supported.
 
-### Previewing the concrete copy plan
+### Previewing a copy
 
 `-n` / `--dry-run` connects to the endpoints and scans both sides, but creates,
-updates, and deletes nothing. Its plan makes path placement and the selected
-data route explicit before a real copy:
+updates, and deletes nothing. Its concise preflight summary makes path
+placement, intended changes, logical work, and the selected data route explicit
+before a real copy:
 
 ```text
-syq: dry-run plan
+syq: dry-run summary
   mapping: ./dataset/ -> gpu01:/scratch/run42 (directory contents)
-  plan: 82,411 files, 1.70 TiB to transfer; 18,204 files, 340 GiB unchanged
-  exclusions: 3 paths/subtrees pruned by ignore rules; 12 other entries
+  changes: 82,411 regular files; 96 directories; 14 symlinks; 3 metadata-only entries; 2 type replacements among them
   deletions: 7 entries planned after a successful copy
+  logical data: 1.70 TiB in 82,411 files needing content work (upper bound); 340 GiB in 18,204 files with unchanged content
+  exclusions: 3 paths/subtrees pruned by ignore rules; 12 other entries
   route: encrypted TCP to gpu01; 16 initial connections (auto-tuned)
 ```
 
@@ -302,17 +304,27 @@ Each source gets its own `mapping` line. The annotation distinguishes directory
 contents, a directory copied as a child, a file placed inside a directory, and
 an exact destination path. `--files-from` is identified as a selected-path
 mapping. A destination-root symlink is shown as the effective directory it
-resolves to.
+resolves to. The `changes` line separately accounts for regular files,
+directories, symlinks, special files, and metadata-only updates; type
+replacements are called out as an overlapping subset. This is a current
+preflight assessment, not a frozen mutation ledger that can later be executed
+unchanged.
 
-The transfer byte total is an estimate based on the files that fail the
-planning-time metadata check, using their full logical sizes. Block reuse from
-an existing partial or a content comparison can make the real wire-byte count
-smaller. An ignored directory is pruned without scanning its descendants, so
-the exclusions line counts that directory as one `path/subtree`; it does not
+The logical-data upper bound is the full size of regular files that fail the
+planning-time metadata check. Resume state, block reuse, reflinks, compression,
+server-side copying, or a content comparison can make the real I/O or wire-byte
+count smaller. An ignored directory is pruned without scanning its descendants,
+so the exclusions line counts that directory as one `path/subtree`; it does not
 invent a descendant count. Other exclusions cover state and size options and
 unsupported entry types. With `--delete`, the destination is walked and the
 exact deletion count is shown; scan errors and `--max-delete` guards are shown
 as skipped or blocked rather than as a misleading zero.
+
+Add `-v` for a typed explanation of each intended change, for example `create
+file PATH (destination missing)`, `replace with symlink PATH -> TARGET
+(destination is regular file)`, `update metadata PATH (requested file metadata
+differs)`, or `delete PATH (destination only)`. The default stays compact for
+large trees.
 
 ### What `-a` does here
 
@@ -683,7 +695,7 @@ it is transferred or even scanned — which is why "only `*.jpg`" needs the
 `!*/` line to keep descending. Empty directories are copied like any other
 (this is a filter on the walk, not git's notion of what's tracked). The source
 root itself is never ignored; with several sources each is filtered from its
-own root. `-n` previews exactly what a real run would send. `--rm` does not
+own root. `-n` previews the selected scope and intended changes. `--rm` does not
 take filters (it always removes the whole tree), so `-i` conflicts with it.
 
 As in git, a `!` rule cannot re-include something whose parent directory is
@@ -740,8 +752,9 @@ have is removed. The rules are simpler than rsync's, deliberately:
   removed by `--delete`, inert otherwise.
 - `--max-delete N` refuses to delete anything — not the first N — when more
   than N deletions are planned, says so, and exits 25 (rsync's code for it).
-- `-n --delete -v` lists every `deleting path` line a real run would print.
-  The summary reports `N deleted` / `N would be deleted`. `--delete`
+- `-n --delete -v` lists every intended removal as `delete path (destination
+  only)`. The preflight summary reports the number planned; a real run reports
+  the number deleted. `--delete`
   conflicts with `--verify-only` (deleting is the opposite of writing
   nothing) and with `--files-from` (deletion scope under a file list is
   ambiguous).
