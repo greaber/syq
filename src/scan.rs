@@ -13,7 +13,7 @@ pub const BATCH: usize = 1000;
 /// Per-entry result of the parallel read_dir hook.
 #[derive(Clone, Default, Debug)]
 enum State {
-    /// lstat failed (warned about).
+    /// lstat failed and will be warned about.
     #[default]
     Failed,
     /// Ignored path: silently dropped, subtree pruned.

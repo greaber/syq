@@ -48,6 +48,7 @@ behavior; an entry without one is only believed, not held.
 | A destination *argument* that is a symlink to a directory is that directory | measured | `symlink_destination_is_followed`, `destination_root_symlink_preserves_target_metadata_for_both_spellings`, `existing_updates_through_a_destination_root_symlink_to_a_dir` |
 | A symlink to a directory found *inside* the destination tree is replaced with a real directory; only the argument itself is followed (rsync without `-K`) | measured | `in_tree_destination_symlink_is_replaced_not_followed`, `existing_does_not_write_through_a_destination_symlink_dir` |
 | `-P`, `-h`, `--partial`, `--numeric-ids`, `-V` accepted as no-ops/aliases; common unsupported flags are rejected with an explanation | by construction | `rsync_compat_noops_are_accepted`, `unsupported_rsync_flags_explain_themselves` |
+| Source entries whose names look like syq sidecars (`.name.syq-part.<id>`) are copied as ordinary payload (with one warning); only the exact case where a payload path equals a sidecar this job would use for another file is refused, before anything is written | by construction (PR #7's namespace preflight) | `sidecar_named_source_directory_is_payload`, `delete_keeps_payload_named_like_sidecars_and_other_jobs_sidecars`, `partial_named_symlink_is_a_symlink_not_a_leftover` |
 
 ## Incompatible on purpose
 
@@ -121,17 +122,7 @@ item.
    `--existing`, `--ignore-existing` narrow what a run would transfer, and
    `--verify-only` verifies exactly that set. rsync has no `--verify-only`.
    *Test: `verify_only_checks_the_filtered_scope`.*
-6. **Source entries named like sidecars (`.name.syq-part.<id>`) are never
-   copied**, whatever kind of entry carries the name (a directory so named is
-   left out with its contents). rsync copies them. The name is pcp's in-flight
-   file for `name` in the same directory; copying it would collide with, or
-   wedge, later transfers of `name`. The destination copy of such an entry is
-   still protected from `--delete`. Open issue 4 is about changing this.
-   *Test: `delete_keeps_user_files_named_like_partials_and_other_jobs_sidecars`,
-   `partial_named_symlink_is_a_symlink_not_a_leftover`,
-   `delete_treats_partial_named_directory_as_ordinary_extra`,
-   `sidecar_named_source_directory_is_not_copied`.*
-7. **Deletions are executed over the control connection** in batches of 1000
+6. **Deletions are executed over the control connection** in batches of 1000
    (the receiving side unlinks a batch in parallel), not spread over the `-j`
    data connections. rsync has one connection anyway; this is a note about
    pcp's own model.
@@ -179,15 +170,15 @@ command says what to change.
    collision (rsync scans a source given ten times once). Only for
    byte-identical source arguments including trailing-slash mode; distinct
    sources on one destination stay an error ("Incompatible on purpose" 4).
-4. **Reserved partial-name namespace in the source** ("Different" 6). Options:
-   move pcp's in-flight files to a private location so user files named
-   `.x.pcp-partial` are ordinary payload, or decide explicitly that they're
-   pcp's. Real trade-off: the deterministic partial *is* the resume state.
-5. **`-h` alone should print help**, as rsync does, while staying
+4. **`-h` alone should print help**, as rsync does, while staying
    `--human-readable` inside a cluster (`-avh`). Essentially free.
-6. **`-u` for symlinks/devices** — measure rsync, then align or record.
+5. **`-u` for symlinks/devices** — measure rsync, then align or record.
 
 ## Resolved
+
+- Source entries named like sidecars were excluded from copies; PR #7's
+  namespace preflight made them ordinary payload (rsync-compatible), and
+  this branch follows it. Former open issue 4.
 
 - `--delete-excluded`, `--max-delete`, `--delete-after`/`--delete-delay` —
   added (sync-options `118c8ee`).

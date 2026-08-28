@@ -103,6 +103,15 @@ pub enum Op {
         meta: Meta,
         flags: u8,
     },
+    /// Apply metadata to a regular file only if the path still names the inode
+    /// observed by the planner. A concurrent rename makes this a no-op.
+    SetFileMetaIfSame {
+        path: PathBytes,
+        expected_dev: u64,
+        expected_ino: u64,
+        meta: Meta,
+        flags: u8,
+    },
     Remove {
         path: PathBytes,
     },
@@ -146,6 +155,11 @@ pub enum Request {
         paths: Vec<PathBytes>,
         follow: bool,
     },
+    /// Compute the exact receiver-side sidecar names for collision preflight.
+    PartialPaths {
+        paths: Vec<PathBytes>,
+        partial_id: PartialId,
+    },
     Apply(Vec<Op>),
     /// Return the size of the deterministic sidecar, if it is a regular file.
     /// The planner has already statted the final path.
@@ -162,20 +176,28 @@ pub enum Request {
         partial_id: PartialId,
         mode: u32,
     },
-    /// Hash an existing final file while copying bytes from that same open
-    /// inode into this job's partial. This makes the hash basis and staged
-    /// basis one atomic snapshot even if another command publishes meanwhile.
-    SeedAndHash {
+    /// Hash an existing final file and retain that open inode as the repair
+    /// basis until FinishBasis or SeedBasis consumes it.
+    HashAndHold {
         path: PathBytes,
         partial_id: PartialId,
         block: u64,
         len: u64,
     },
-    /// Remove this job's unused staged copy after the existing final proved
-    /// content-identical.
-    DiscardPartial {
+    /// Apply metadata through the retained basis descriptor. If another job
+    /// renamed over the final path meanwhile, its complete file remains the
+    /// winner and this only touches the now-unlinked old inode.
+    FinishBasis {
         path: PathBytes,
         partial_id: PartialId,
+        meta: Meta,
+        flags: u8,
+    },
+    /// Seed this job's sidecar from the retained basis descriptor.
+    SeedBasis {
+        path: PathBytes,
+        partial_id: PartialId,
+        len: u64,
     },
     /// In-kernel copy of a same-machine file (copy_file_range: reflink / NFS
     /// server-side copy when possible). Err("EXDEV") tells the caller to fall
@@ -217,7 +239,6 @@ pub enum Request {
         partial_id: PartialId,
         meta: Meta,
         flags: u8,
-        fsync: bool,
     },
     /// Whole small file in one request: verify, write a sidecar, then rename it
     /// atomically over the final path. This preserves small-file pipelining
@@ -230,7 +251,6 @@ pub enum Request {
         hash: u64,
         meta: Meta,
         flags: u8,
-        fsync: bool,
     },
     FileHash {
         path: PathBytes,
@@ -260,6 +280,7 @@ pub enum Response {
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
     Stats(Vec<Option<Entry>>),
+    PathResults(Vec<std::result::Result<PathBytes, String>>),
     Applied(Vec<Option<String>>),
     PartialSize(Option<u64>),
     Hashes(Vec<u64>),

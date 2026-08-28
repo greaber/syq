@@ -151,7 +151,6 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
 | `--verify-only` | Hash every file on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
-| `--fsync` | fsync each file, rename, and explicit checkpoint state (crash-durable; slower) |
 | `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
 | `--syq-path PATH` | Use this exact remote `syq` instead of the managed helper |
@@ -221,10 +220,10 @@ Identical to rsync:
 - A destination that is a symlink to a directory is that directory (the link
   is kept, with or without a trailing slash); a symlink to anything else is
   replaced like a file.
-- syq's own bookkeeping is never payload (as rsync excludes its
-  `--partial-dir`): names reserved for `.syq-part` sidecars are silently left
-  out, whatever kind of entry carries them (a directory so named is left out
-  with its contents). Everything else is copied.
+- Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
+  payload and produce one warning summary. Before transfer starts, SYQ rejects
+  the exceptional case where a mapped payload path exactly equals a sidecar
+  this job would use for another mapped file.
 - `host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
   A colon before the first slash means remote; `./x:y` is local. All sources
   must be on the same host. `host::module` (daemon syntax) is not supported.
@@ -248,6 +247,8 @@ source's mode with `-p`.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.
+Workers connect while the source is scanned but begin file data only after
+the mapped payload/sidecar namespace preflight completes.
 The data connections — by default separate TCP sockets carrying AES-256-GCM
 records (under `--no-tcp`, separate `ssh` processes instead), each its own flow
 and cipher — carry only "read range" / "write range" requests. Files go
@@ -255,25 +256,30 @@ onto a largest-first queue; when a worker runs dry it steals the back half of
 the remaining range of whichever file has the most left, so the tail of a
 transfer stays parallel without pre-deciding chunk counts.
 
-On the receiving side each file is written beside its destination as
-`.name.syq-part.<job-id>` (preallocated with `fallocate`, written with `pwrite`
-from several workers), given its metadata, and `rename`d over the target. The
-job ID is a 128-bit digest of the normalized source/destination mapping and
+On the receiving side a file that needs content changes is written beside its
+destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
+written with `pwrite` from several workers), given its metadata, and `rename`d
+over the target. When an existing final file is the comparison basis, the
+receiver retains that open descriptor while its blocks are hashed. If every
+block matches, metadata is applied through the descriptor without allocating
+or publishing a sidecar; otherwise that exact descriptor seeds the sidecar.
+The job ID is a 128-bit digest of the normalized source/destination mapping and
 content-affecting options, and is stable when the same logical command is
-rerun. It includes trailing-slash mapping, filters, metadata semantics and
-block size, but not operational controls such as `-j`, verbosity, progress or
-bandwidth limiting. Long basenames are deterministically truncated and
-disambiguated to fit the usual filesystem component limit; exceptionally long
-full paths can still fail with a clear error. By default syq does not `fsync`
-each file (the rename still orders correctly, and per-file fsync is costly on
-NFS); pass `--fsync` to force each file durable before the rename for crash
-safety.
+rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
+semantics and block size, but not operational controls such as checksum
+checking, `-j`, verbosity, progress or bandwidth limiting. Filesystem
+component limits are queried and cached per directory; long basenames are
+deterministically truncated and disambiguated to fit. Exceptionally long full
+paths can still fail with a clear error. SYQ does not `fsync` transfer data;
+atomic sidecar publication provides old-or-new visibility and resumable
+interrupted work, not crash-durability across power loss.
 Small files still use a pipelined whole-file request, but the receiver writes
 each request through its sidecar and renames it before acknowledging success.
-Thus every non-`--inplace` final name appears atomically complete. `--inplace`
-writes every file directly (for example, to update a large file without room
-for a second copy), so readers can observe partially updated contents and an
-interruption leaves the final file unfinished.
+Thus every non-`--inplace` content change appears atomically complete, while
+a content-identical file keeps its inode and any destination hardlinks.
+`--inplace` writes every file directly (for example, to update a large file
+without room for a second copy), so readers can observe partially updated
+contents and an interruption leaves the final file unfinished.
 
 Local → local runs the same machinery in-process with N threads, which helps
 on NFS and NVMe.
@@ -325,12 +331,11 @@ path. Unfinished individual files are never checkpoint-complete; their actual
 
 The checkpoint is flushed about once a second and persists after both failed
 and successful runs until you remove or stop passing it. Losing its last
-buffered records only causes repeated work; `--fsync` makes each flush and the
-initial header durable. If an existing checkpoint has completed records but an
-expected destination root is missing, SYQ fails and asks you to remove the
-checkpoint to restart. The checkpoint must be outside local source and
-destination trees. `-n` reads and validates existing state but never creates or
-changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`.
+buffered records only causes repeated work. If an existing checkpoint has
+completed records but an expected destination root is missing, SYQ fails and
+asks you to remove the checkpoint to restart. The checkpoint must be outside
+local source and destination trees. `-n` reads and validates existing state but
+never creates or changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`.
 One checkpoint file may be used by only one running copy at a time.
 
 A checkpoint is an explicit trust decision: SYQ does not inspect a destination
@@ -344,10 +349,14 @@ and later brings back is transferred again rather than assumed complete.
 Like rsync, ordinary SYQ runs do not coordinate with each other. Different
 logical commands use different partial names, so concurrent copies into one
 tree produce the union of their files and one whole-file rename wins for any
-path both write. Starting the same logical command twice at once is unsupported:
-both invocations intentionally address the same resumable sidecars. After a
-crash, abandoned sidecars may be deleted manually if that command will not be
-resumed.
+path both write. A content-identical comparison applies metadata only through
+the inode it verified, so it cannot mix its metadata with another job's newly
+renamed contents. Quick-check metadata repair likewise verifies the inode
+before changing it, so a concurrent publication wins without mixed metadata.
+Starting the same logical command twice at once is
+unsupported: both invocations intentionally address the same resumable
+sidecars. After a crash, abandoned sidecars may be deleted manually if that
+command will not be resumed.
 
 ### Verification and consistency
 
@@ -359,8 +368,8 @@ Always:
 - After a file completes, the source is re-stat'ed. If its size or mtime
   changed during the transfer the file is redone (up to three attempts), then
   reported as an error.
-- Unless `--inplace` was explicit, destination files appear atomically via
-  rename, including new small files.
+- Unless `--inplace` was explicit, destination content changes appear
+  atomically via rename, including new small files.
 - Non-zero exit if anything failed.
 
 On request:
@@ -377,12 +386,12 @@ different moments, so a file being written while copied may come out mixed —
 the re-stat catches the common case, `--verify-only` afterwards catches the
 rest.
 
-Compared with rsync: ordinary writes use the same temporary-file plus atomic
-rename model; `--inplace` explicitly gives that up. Rsync chooses a random
-temporary suffix, while SYQ uses a deterministic job ID so an interrupted
-command can find its partial again without a local state file. The
-change-during-transfer check is the same idea; `--delete` runs strictly after
-the transfer (see below); hardlinks aren't implemented.
+Compared with rsync: ordinary content-changing writes use the same
+temporary-file plus atomic rename model; `--inplace` explicitly gives that up.
+Rsync chooses a random temporary suffix, while SYQ uses a deterministic job ID
+so an interrupted command can find its partial again without a local state
+file. The change-during-transfer check is the same idea; `--delete` runs
+strictly after the transfer (see below); hardlinks aren't implemented.
 
 ## Not implemented (on purpose, for now)
 
@@ -399,10 +408,7 @@ differs and why, what's missing, and the open issues. The short version:
   to an rsync server.
 - Rolling-checksum delta transfer (see Resume above).
 - Preserving existing partial files from `rsync --partial`; only syq's own
-  `.syq-part` sidecars for the same logical command are recognised. A *source* file
-  with such a name is never copied (it's assumed to be a sidecar), though
-  `--delete` still treats it as the source's and leaves a same-named
-  destination file.
+  `.syq-part` sidecars for the same logical command are recognised.
 
 ## When parallelism helps
 

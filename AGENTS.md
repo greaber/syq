@@ -125,7 +125,7 @@ outlive its premise and steer later work in the wrong direction.
 ## Working on syq
 
 - `README.md` is the user-facing contract; the code is authoritative for
-  everything else. `RESUME-DESIGN.md` covers the resume feature's design.
+  everything else.
 - Distinguish explicit requirements from assumptions and design choices. If a
   supposed requirement creates substantial complexity, question the premise
   and look for a simpler interpretation. Ask the user when the answer would
