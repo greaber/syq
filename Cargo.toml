@@ -10,6 +10,7 @@ readme = "README.md"
 keywords = ["copy", "rsync", "ssh", "parallel", "transfer"]
 categories = ["command-line-utilities", "filesystem"]
 include = [
+    "/build.rs",
     "/src/**",
     "/tests/**",
     "/Cargo.toml",

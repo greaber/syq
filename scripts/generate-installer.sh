@@ -13,7 +13,6 @@ command -v jq >/dev/null || { echo "generate-installer needs jq" >&2; exit 1; }
 
 version=$(jq -er '.version' "$manifest")
 tag=$(jq -er '.tag' "$manifest")
-helper_id=$(jq -er '.helper_id' "$manifest")
 repository=$(jq -er '.repository' "$manifest")
 test "$repository" = 'https://github.com/greaber/syq' || { echo "unexpected repository" >&2; exit 1; }
 
@@ -35,7 +34,6 @@ set -eu
 
 version='$version'
 tag='$tag'
-helper_id='$helper_id'
 base_url=\${SYQ_INSTALL_BASE_URL:-'$repository/releases/download/$tag'}
 bin_dir=\${HOME:+\$HOME/.local/bin}
 
@@ -47,7 +45,7 @@ Usage: install.sh [--bin-dir DIR]
 
 The default is \$HOME/.local/bin. The installer detects this host, downloads
 the pinned release archive, checks its embedded SHA-256 and size, verifies the
-binary's version and helper identity, then replaces the destination atomically.
+binary's version and release identity, then replaces the destination atomically.
 USAGE
 }
 
@@ -154,11 +152,11 @@ got=$("$program" --version 2>/dev/null) || {
   echo "install.sh: downloaded binary reports an unexpected version: $got" >&2
   exit 1
 }
-got_id=$("$program" --remote-helper-id 2>/dev/null) || {
-  echo 'install.sh: downloaded syq has no helper identity' >&2
+got_id=$("$program" --build-identity 2>/dev/null) || {
+  echo 'install.sh: downloaded syq has no build identity' >&2
   exit 1
 }
-[ "$got_id" = "$helper_id" ] || {
+[ "$got_id" = "$tag" ] || {
   echo "install.sh: downloaded binary reports an unexpected identity: $got_id" >&2
   exit 1
 }

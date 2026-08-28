@@ -28,12 +28,13 @@ size_file() {
 }
 
 write_program() {
-  local path=$1 target=$2 version=${3:-0.1.0} helper=${4:-v0.1.0-p4}
+  local path=$1 target=$2 version=${3:-0.1.0} identity=${4:-v0.1.0}
   cat > "$path" <<EOF
 #!/bin/sh
 case "\$1" in
   --version) echo 'syq $version' ;;
-  --remote-helper-id) echo '$helper' ;;
+  --build-identity) echo '$identity' ;;
+  --remote-helper-id) echo 'v$version-p0' ;;
   --register-standalone-install) exit 0 ;;
   --test-target) echo '$target' ;;
   *) exit 2 ;;
@@ -43,9 +44,9 @@ EOF
 }
 
 write_archive() {
-  local target=$1 version=${2:-0.1.0} helper=${3:-v0.1.0-p4}
+  local target=$1 version=${2:-0.1.0} identity=${3:-v0.1.0}
   local program="$work/program-$target"
-  write_program "$program" "$target" "$version" "$helper"
+  write_program "$program" "$target" "$version" "$identity"
   gzip -9 -n -c "$program" > "$release/syq-$target.gz"
 }
 
@@ -71,7 +72,7 @@ write_manifest() {
   done
   jq -n --sort-keys --argjson artifacts "$artifacts" '
     {schema:1,repository:"https://github.com/greaber/syq",version:"0.1.0",
-     tag:"v0.1.0",helper_id:"v0.1.0-p4",artifacts:$artifacts,
+     tag:"v0.1.0",helper_id:"v0.1.0-p0",artifacts:$artifacts,
      installer:{name:"install.sh",sha256:("1"*64),size:1},
      homebrew_formula:{name:"syq.rb",sha256:("2"*64),size:1}}' > "$output"
 }
@@ -203,9 +204,9 @@ expect_failure 'downloaded archive has size' env \
   sh "$work/install.sh" --bin-dir "$install_dir"
 test "$(hash_file "$install_dir/syq")" = "$installed_sha"
 
-# Even correctly hashed content is rejected if its helper identity does not
+# Even correctly hashed content is rejected if its build identity does not
 # match the release metadata, again without replacing the installed binary.
-write_archive linux-x86_64 0.1.0 v0.1.0-p999
+write_archive linux-x86_64 0.1.0 v0.1.0+dev.wrong
 write_manifest "$work/wrong-identity-manifest.json"
 "$script_dir/generate-installer.sh" \
   "$work/wrong-identity-manifest.json" "$work/wrong-identity-install.sh"

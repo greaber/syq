@@ -117,8 +117,9 @@ connection, so enable it only for a trusted release host rather than globally.
 
 1. Update the package version in `Cargo.toml`, run `cargo check` to refresh
    `Cargo.lock`, then run the normal locked checks to validate it. Update
-   release notes and merge through the protected branch. Change the protocol
-   version in `src/proto.rs` only for a wire-incompatible release.
+   release notes and merge through the protected branch. Peer compatibility is
+   the immutable release identity, so there is no separate protocol number to
+   maintain.
 2. Create and push a signed annotated tag matching the package version. Its
    signing key and email must be configured on your GitHub account so GitHub
    reports the tag-object signature as verified:
@@ -152,6 +153,14 @@ overwriting it. The workflow refuses to reuse drafts. It may safely be rerun
 after a fully published release: it downloads every published asset and
 requires byte-for-byte equality with the rebuilt release before forwarding the
 formula to the tap job.
+
+The release workflow sets `SYQ_RELEASE_BUILD=1`, which makes each platform
+binary report the tag (for example `v0.2.0`) as its build identity. Ordinary
+source builds instead include their Git revision and cannot populate the
+managed remote-helper cache. The manifest's `helper_id: v<release>-p0` and the
+binary's `--remote-helper-id` output are deprecated compatibility shims for
+updaters through 0.1.1; `p0` is fixed and must not be treated or bumped as a
+protocol version.
 
 ## macOS signing
 

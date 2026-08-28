@@ -25,9 +25,6 @@ test "$version" = "$package_version" || {
   echo "tag $tag does not match Cargo.toml version $package_version" >&2
   exit 1
 }
-protocol=$(sed -n 's/^pub const VERSION: u32 = \([0-9][0-9]*\);/\1/p' "$repo_dir/src/proto.rs")
-test -n "$protocol" || { echo "could not read protocol version" >&2; exit 1; }
-
 targets=(linux-x86_64 linux-aarch64 macos-arm64 macos-x86_64)
 assets=(syq-linux-x86_64 syq-linux-aarch64 syq-macos-arm64 syq-macos-x86_64)
 artifacts='{}'
@@ -65,7 +62,7 @@ jq -n --sort-keys \
   --arg repository 'https://github.com/greaber/syq' \
   --arg version "$version" \
   --arg tag "$tag" \
-  --arg helper_id "$tag-p$protocol" \
+  --arg helper_id "$tag-p0" \
   --argjson artifacts "$artifacts" \
   '{schema:1,repository:$repository,version:$version,tag:$tag,helper_id:$helper_id,artifacts:$artifacts}' \
   > "$manifest_core"
