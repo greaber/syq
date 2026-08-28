@@ -191,7 +191,8 @@ pub struct Args {
     /// Delete extraneous files from the destination directories (paths the source does not
     /// have). Deletion happens after the transfer and is skipped entirely if the source scan
     /// reported any error. Ignored paths (-i) are protected on both sides. rsync's
-    /// --delete-after and --delete-delay mean the same thing and are accepted
+    /// --delete-after and --delete-delay mean the same thing and are accepted. Cannot be combined
+    /// with --verify-only or --files-from
     #[arg(
         long,
         aliases = ["delete-after", "delete-delay"],

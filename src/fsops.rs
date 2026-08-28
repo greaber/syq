@@ -417,6 +417,22 @@ impl FsOps {
     /// but all syq writers participate; unlike a process-local mutex it also
     /// coordinates separate local invocations and remote worker processes.
     fn acquire_partial(&mut self, pp: &Path) -> Result<Option<u64>> {
+        // A different connection may have finalized one of this connection's
+        // partials after range stealing. Its lease fd then names the published
+        // inode, not `pp`; retaining or reusing it can leak descriptors and,
+        // on retry, truncate the final file. Keep only leases whose fd still
+        // names the inode currently present at the partial pathname.
+        self.partial_leases.retain(|path, lease| {
+            let Ok(fd_meta) = lease.file.metadata() else {
+                return false;
+            };
+            let Ok(path_meta) = fs::symlink_metadata(path) else {
+                return false;
+            };
+            path_meta.is_file()
+                && fd_meta.dev() == path_meta.dev()
+                && fd_meta.ino() == path_meta.ino()
+        });
         if let Some(lease) = self.partial_leases.get(pp) {
             return Ok(lease.basis_size);
         }
@@ -458,13 +474,18 @@ impl FsOps {
                         .unwrap_or_else(|| Path::new("."));
                     let guard =
                         File::open(parent).with_context(|| format!("open {}", parent.display()))?;
-                    if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
-                    {
+                    if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX) } != 0 {
                         bail!(
                             "destination partial {} is being replaced by another syq process: {}",
                             pp.display(),
                             io::Error::last_os_error()
                         );
+                    }
+                    #[cfg(debug_assertions)]
+                    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARTIAL_REPLACE_MS") {
+                        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                        }
                     }
                     match fs::symlink_metadata(pp) {
                         Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => continue,
@@ -1142,6 +1163,16 @@ fn apply_owner(
 mod tests {
     use super::*;
 
+    fn test_meta() -> Meta {
+        Meta {
+            mode: 0o600,
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            mtime: 1_600_000_000,
+            mtime_nsec: 0,
+        }
+    }
+
     #[test]
     fn unlink_never_recurses_into_a_directory() {
         let dir = std::env::temp_dir().join(format!("syq-unlink-{}", std::process::id()));
@@ -1167,5 +1198,48 @@ mod tests {
         assert!(errs[1].is_none() && !dir.join("f").exists());
         assert!(errs[2].is_none(), "a vanished leaf is not an error");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_connection_finalize_reaps_the_probers_stale_lease() {
+        let dir = std::env::temp_dir().join(format!("syq-partial-lease-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut prober = FsOps::new();
+        let mut finalizer = FsOps::new();
+
+        for i in 0..16 {
+            let path = dir.join(format!("file-{i}"));
+            let path_bytes = path_bytes(&path);
+            let payload = format!("published contents {i}");
+            prober
+                .prepare(&path_bytes, payload.len() as u64, false, false, 0o600)
+                .unwrap();
+            fs::write(partial_path(&path), payload.as_bytes()).unwrap();
+            finalizer
+                .finalize(&path_bytes, false, &test_meta(), 0, false)
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), payload.as_bytes());
+
+            // Acquiring the next file must reap the lease whose partial was
+            // renamed by `finalizer`, keeping the fd count bounded.
+            assert!(prober.partial_leases.len() <= 1);
+        }
+
+        let retry = dir.join("file-15");
+        let retry_bytes = path_bytes(&retry);
+        let expected = fs::read(&retry).unwrap();
+        prober
+            .prepare(&retry_bytes, expected.len() as u64, false, true, 0o600)
+            .unwrap();
+        assert_eq!(
+            fs::read(&retry).unwrap(),
+            expected,
+            "a stale lease must never truncate the published inode"
+        );
+        assert!(partial_path(&retry).is_file());
+        drop(prober);
+        drop(finalizer);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

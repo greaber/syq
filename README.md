@@ -161,7 +161,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
 | `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
-| `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
+| `--delete` | Remove destination paths the source doesn't have (see below); conflicts with `--verify-only` and `--files-from`; `--delete-after`/`--delete-delay` are synonyms |
 | `--delete-excluded` | With `--delete`, also remove destination paths the `-i` patterns exclude |
 | `--max-delete N` | With `--delete`, delete nothing if more than N deletions are planned (exit 25) |
 | `-u`, `--update` | Skip files that are newer on the destination |
@@ -517,7 +517,9 @@ nothing to act on. Ignore the siblings instead (`logs/*`, which does not cross
 
 `syq -a --delete src/ host:dst/` makes `dst` look like `src`: after the
 transfer, anything under a destination directory that the source doesn't
-have is removed. The rules are simpler than rsync's, deliberately:
+have is removed. Because it changes the destination, `--delete` conflicts
+with `--verify-only`; it also conflicts with `--files-from`. The rules are
+simpler than rsync's, deliberately:
 
 - **Scope.** Only inside directories the sources map onto: `syq --delete a b
   dst/` cleans `dst/a` and `dst/b`, never `dst/c`. A single-file source deletes

@@ -611,6 +611,50 @@ fn multiple_sources_require_dir_dest() {
 }
 
 #[test]
+fn content_source_and_files_from_require_directory_destination() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"payload");
+    write(&t.path("list"), b"f\n");
+    let (list, src, dst) = (t.s("list"), t.s("src/"), t.s("dst"));
+    for files_from in [false, true] {
+        write(&t.path("dst"), b"precious file");
+        let args = if files_from {
+            vec!["-a", "--files-from", &list, &src, &dst]
+        } else {
+            vec!["-a", &src, &dst]
+        };
+        let out = syq(&args);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+        assert!(
+            stderr_of(&out).contains("destination must be a directory"),
+            "{}",
+            stderr_of(&out)
+        );
+        assert_eq!(read(&t.path("dst")), b"precious file");
+    }
+}
+
+#[test]
+fn delete_conflicts_with_verify_only() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"payload");
+    let out = syq(&[
+        "-a",
+        "--delete",
+        "--verify-only",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("cannot be used with"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
 fn metadata_preserved_with_archive() {
     let t = Tmp::new();
     make_tree(&t.path("src"));
@@ -1299,6 +1343,27 @@ fn hardlinked_partial_does_not_corrupt_external_file() {
     let mo = fs::metadata(t.path("out")).unwrap();
     let me = fs::metadata(t.path("external")).unwrap();
     assert!(!(mo.dev() == me.dev() && mo.ino() == me.ino()));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn unsafe_partials_in_one_directory_serialize_replacement() {
+    let t = Tmp::new();
+    let payload = vec![b'x'; 5 * 1024 * 1024];
+    write(&t.path("src/a"), &payload);
+    write(&t.path("src/b"), &payload);
+    fs::create_dir_all(t.path("dst")).unwrap();
+    std::os::unix::fs::symlink("nowhere-a", t.path("dst/.a.syq-partial")).unwrap();
+    std::os::unix::fs::symlink("nowhere-b", t.path("dst/.b.syq-partial")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["-a", "-j", "2", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_TEST_HOLD_PARTIAL_REPLACE_MS", "500")
+        .output()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/a")), payload);
+    assert_eq!(read(&t.path("dst/b")), payload);
 }
 
 #[test]

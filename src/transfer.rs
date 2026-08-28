@@ -573,8 +573,13 @@ pub fn run(args: Args) -> Result<i32> {
     let dst_existed = dst_root_entry.is_some();
     let dst_is_dir = match &dst_root_entry {
         Some(e) if e.kind == Kind::Dir => true,
-        Some(_) if srcs.len() > 1 => {
-            bail!("destination must be a directory when copying multiple sources")
+        Some(_)
+            if srcs.len() > 1
+                || args.files_from.is_some()
+                || srcs[0].copies_contents()
+                || dst.copies_contents() =>
+        {
+            bail!("destination must be a directory for this copy")
         }
         Some(_) => false,
         None => srcs.len() > 1 || dst.copies_contents() || args.files_from.is_some(),
