@@ -24,9 +24,10 @@ const REPOSITORY: &str = "https://github.com/greaber/syq";
 const RELEASE_DOWNLOADS: &str = "https://github.com/greaber/syq/releases/download";
 const LATEST_DOWNLOADS: &str = "https://github.com/greaber/syq/releases/latest/download";
 const MANIFEST_NAME: &str = "syq-release-manifest.json";
-const SIGNATURE_NAME: &str = "syq-release-manifest.json.sig";
 const RECEIPT_SCHEMA: u32 = 1;
 const MANIFEST_SCHEMA: u32 = 1;
+const MANIFEST_SIGNATURE_SCHEME: &str = "ed25519-jcs-v1";
+const MAX_SAFE_JSON_INTEGER: u64 = (1 << 53) - 1;
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const RELEASE_PUBLIC_KEY: Option<&str> = option_env!("SYQ_RELEASE_PUBLIC_KEY");
 
@@ -41,7 +42,8 @@ struct InstallReceipt {
     auto_update: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReleaseManifest {
     schema: u32,
     repository: String,
@@ -53,15 +55,18 @@ struct ReleaseManifest {
     artifacts: BTreeMap<String, ReleaseArtifact>,
     installer: ReleaseFile,
     homebrew_formula: ReleaseFile,
+    signature_scheme: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReleaseArtifact {
     binary: ReleaseFile,
     archive: ReleaseFile,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReleaseFile {
     name: String,
     sha256: String,
@@ -241,23 +246,13 @@ fn fetch_verified(base_url: &str, mode: FetchMode) -> Result<VerifiedRelease> {
     let temp_dir = config_dir()?;
     create_private_dir(&temp_dir)?;
     let manifest_temp = TempFile::new(&temp_dir, ".json")?;
-    let signature_temp = TempFile::new(&temp_dir, ".sig")?;
     fetch(
         &format!("{base_url}/{MANIFEST_NAME}"),
         manifest_temp.path(),
         mode,
     )?;
-    fetch(
-        &format!("{base_url}/{SIGNATURE_NAME}"),
-        signature_temp.path(),
-        mode,
-    )?;
     let manifest_bytes = fs::read(manifest_temp.path()).context("read release manifest")?;
-    let signature =
-        fs::read_to_string(signature_temp.path()).context("read release manifest signature")?;
-    verify_manifest(&manifest_bytes, &signature, key.as_ref())?;
-    let manifest: ReleaseManifest =
-        serde_json::from_slice(&manifest_bytes).context("parse signed release manifest")?;
+    let manifest = verified_manifest(&manifest_bytes, key.as_ref())?;
     let version = validate_manifest(&manifest)?;
     Ok(VerifiedRelease { manifest, version })
 }
@@ -278,7 +273,21 @@ fn embedded_public_key() -> Result<Cow<'static, str>> {
         })
 }
 
-fn verify_manifest(manifest: &[u8], signature_b64: &str, public_key_b64: &str) -> Result<()> {
+fn verified_manifest(bytes: &[u8], public_key_b64: &str) -> Result<ReleaseManifest> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).context("parse signed release manifest")?;
+    let signature = value
+        .as_object_mut()
+        .and_then(|object| object.remove("signature"))
+        .and_then(|signature| signature.as_str().map(str::to_owned))
+        .ok_or_else(|| anyhow!("signed release manifest has no embedded signature"))?;
+    let canonical =
+        serde_json_canonicalizer::to_vec(&value).context("canonicalize signed release manifest")?;
+    verify_signature(&canonical, &signature, public_key_b64)?;
+    serde_json::from_value(value).context("parse verified release manifest")
+}
+
+fn verify_signature(payload: &[u8], signature_b64: &str, public_key_b64: &str) -> Result<()> {
     let public = base64::engine::general_purpose::STANDARD
         .decode(public_key_b64.trim())
         .context("decode the embedded release public key")?;
@@ -291,7 +300,7 @@ fn verify_manifest(manifest: &[u8], signature_b64: &str, public_key_b64: &str) -
         .context("decode the release manifest signature")?;
     let signature =
         Signature::from_slice(&signature).context("parse the release manifest signature")?;
-    key.verify_strict(manifest, &signature)
+    key.verify_strict(payload, &signature)
         .context("release manifest signature verification failed")
 }
 
@@ -301,6 +310,12 @@ fn validate_manifest(manifest: &ReleaseManifest) -> Result<Version> {
     }
     if manifest.repository != REPOSITORY {
         bail!("release manifest names an unexpected repository");
+    }
+    if manifest.signature_scheme != MANIFEST_SIGNATURE_SCHEME {
+        bail!(
+            "unsupported release manifest signature scheme {}",
+            manifest.signature_scheme
+        );
     }
     let version = Version::parse(&manifest.version).context("invalid release version")?;
     if manifest.tag != format!("v{version}") {
@@ -342,6 +357,9 @@ fn validate_release_file(target: &str, file: &ReleaseFile) -> Result<()> {
     }
     if file.size == 0 {
         bail!("release has an empty file for {target}");
+    }
+    if file.size > MAX_SAFE_JSON_INTEGER {
+        bail!("release file size is outside the JCS safe integer range for {target}");
     }
     if file.sha256.len() != 64
         || !file
@@ -434,6 +452,30 @@ fn latest_downloads() -> Cow<'static, str> {
         return Cow::Owned(url.to_string_lossy().into_owned());
     }
     Cow::Borrowed(LATEST_DOWNLOADS)
+}
+
+/// Emit the RFC 8785 signing payload for release tooling. The signature field
+/// is the only field excluded; every other present field is authenticated.
+pub fn write_manifest_signing_payload(path: &Path) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("parse release manifest signing input")?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("release manifest signing input is not a JSON object"))?;
+    if object
+        .get("signature")
+        .is_some_and(|signature| !signature.is_string())
+    {
+        bail!("release manifest signature is not a string");
+    }
+    object.remove("signature");
+    let mut output = BufWriter::new(std::io::stdout().lock());
+    serde_json_canonicalizer::to_writer(&value, &mut output)
+        .context("canonicalize release manifest signing input")?;
+    output
+        .flush()
+        .context("write release manifest signing payload")
 }
 
 fn verify_file(path: &Path, expected: &ReleaseFile) -> Result<()> {
@@ -749,19 +791,32 @@ mod tests {
                 sha256: "d".repeat(64),
                 size: 13,
             },
+            signature_scheme: MANIFEST_SIGNATURE_SCHEME.into(),
         }
     }
 
     #[test]
     fn verifies_a_signed_manifest_and_rejects_tampering() {
         let signing = SigningKey::from_bytes(&[7; 32]);
-        let bytes = br#"{"schema":1}"#;
-        let signature = signing.sign(bytes);
+        let mut value = serde_json::to_value(manifest()).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&value).unwrap();
+        let signature = signing.sign(&canonical);
         let signature = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        value["signature"] = signature.into();
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
         let public =
             base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
-        verify_manifest(bytes, &signature, &public).unwrap();
-        assert!(verify_manifest(br#"{"schema":2}"#, &signature, &public).is_err());
+        verified_manifest(&bytes, &public).unwrap();
+        value["schema"] = 2.into();
+        let tampered = serde_json::to_vec_pretty(&value).unwrap();
+        assert!(verified_manifest(&tampered, &public).is_err());
+    }
+
+    #[test]
+    fn pins_the_release_signature_canonical_json_contract() {
+        let value = serde_json::json!({"n": 1e30, "b": 2, "a": "€"});
+        let canonical = serde_json_canonicalizer::to_vec(&value).unwrap();
+        assert_eq!(canonical, r#"{"a":"€","b":2,"n":1e+30}"#.as_bytes());
     }
 
     #[test]
@@ -784,6 +839,16 @@ mod tests {
         assert!(validate_manifest(&value).is_err());
         value.tag = "v1.2.3".into();
         value.helper_id = "v1.2.2-p0".into();
+        assert!(validate_manifest(&value).is_err());
+        value.helper_id = "v1.2.3-p0".into();
+        value.signature_scheme = "unknown".into();
+        assert!(validate_manifest(&value).is_err());
+    }
+
+    #[test]
+    fn rejects_file_sizes_outside_the_jcs_safe_integer_range() {
+        let mut value = manifest();
+        value.installer.size = MAX_SAFE_JSON_INTEGER + 1;
         assert!(validate_manifest(&value).is_err());
     }
 }

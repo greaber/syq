@@ -62,6 +62,17 @@ fn main() {
         println!("{}", identity::legacy_helper_id());
         return;
     }
+    if argv.get(1).map(String::as_str) == Some("--release-manifest-signing-payload") {
+        if argv.len() != 3 {
+            eprintln!("syq: --release-manifest-signing-payload requires one manifest path");
+            std::process::exit(2);
+        }
+        if let Err(e) = update::write_manifest_signing_payload(std::path::Path::new(&argv[2])) {
+            eprintln!("syq: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if argv.get(1).map(String::as_str) == Some("--server") {
         if let Err(e) = server::run() {
             eprintln!("syq server: {e:#}");
