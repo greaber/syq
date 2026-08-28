@@ -2565,6 +2565,23 @@ fn checkpoint_conflicts_are_rejected() {
     assert!(!t.path("state").exists());
 }
 
+#[test]
+fn no_forward_agent_conflicts_with_explicit_rsh() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    let out = syq(&[
+        "--no-forward-agent",
+        "-e",
+        "ssh -a",
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot be used with"), "{err}");
+    assert!(!t.path("dst").exists());
+}
+
 // Ordinary copies keep no historical completion state: the current destination
 // determines what a later invocation repairs.
 #[test]
@@ -3650,6 +3667,30 @@ fn unreadable_interrupted_partials_are_reused() {
         assert_eq!(read(&t.path(&format!("out-{i}"))), contents);
         assert!(!partial.exists());
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn unchmodable_interrupted_partial_is_replaced() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    let src = t.s("src");
+    let dst = t.s("dst");
+    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let partial = interrupted_partial(&args, &t.0);
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_FAIL_PARTIAL_CHMOD", "1")
+        .output()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), contents);
+    assert!(!partial.exists());
 }
 
 #[cfg(debug_assertions)]

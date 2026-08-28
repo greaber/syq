@@ -822,25 +822,54 @@ impl FsOps {
                                 continue;
                             }
                             if fd_meta.mode() & 0o7777 != 0o600 {
-                                file.set_permissions(fs::Permissions::from_mode(0o600))
-                                    .with_context(|| {
-                                        format!("make partial private {}", pp.display())
-                                    })?;
+                                let repair = (|| -> Result<()> {
+                                    fail_partial_chmod_for_test()?;
+                                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                                    Ok(())
+                                })();
+                                if let Err(error) = repair {
+                                    drop(file);
+                                    discard_safe_partial_if_same(pp, &fd_meta).with_context(
+                                        || {
+                                            format!(
+                                                "replace partial {} after chmod failed: {error:#}",
+                                                pp.display()
+                                            )
+                                        },
+                                    )?;
+                                    continue;
+                                }
                             }
                             return Ok((file, Some(fd_meta.len())));
                         }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                        Err(error)
-                            if error.kind() == io::ErrorKind::PermissionDenied
-                                && !repaired_permissions =>
-                        {
+                        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                            if repaired_permissions {
+                                discard_safe_partial_if_same(pp, &md).with_context(|| {
+                                    format!(
+                                        "replace partial {} after it remained unreadable",
+                                        pp.display()
+                                    )
+                                })?;
+                                repaired_permissions = false;
+                                continue;
+                            }
                             // Open a metadata-only descriptor and chmod that,
                             // not the pathname: this works for mode-000 files
                             // and a co-writer cannot redirect the repair to a
                             // symlink target between lstat and chmod.
-                            let handle = open_metadata_handle(pp).with_context(|| {
-                                format!("open {} for permission repair", pp.display())
-                            })?;
+                            let handle = match open_metadata_handle(pp) {
+                                Ok(handle) => handle,
+                                Err(repair_error) => {
+                                    discard_safe_partial_if_same(pp, &md).with_context(|| {
+                                        format!(
+                                            "replace partial {} after permission repair failed: {repair_error:#}",
+                                            pp.display()
+                                        )
+                                    })?;
+                                    continue;
+                                }
+                            };
                             let fd_meta = handle.metadata()?;
                             let path_meta = fs::symlink_metadata(pp)?;
                             if !is_safe_partial(&fd_meta)
@@ -852,9 +881,21 @@ impl FsOps {
                             {
                                 continue;
                             }
-                            set_mode_handle(&handle, 0o600).with_context(|| {
-                                format!("make partial writable {}", pp.display())
-                            })?;
+                            let repair = (|| -> Result<()> {
+                                fail_partial_chmod_for_test()?;
+                                set_mode_handle(&handle, 0o600)?;
+                                Ok(())
+                            })();
+                            if let Err(error) = repair {
+                                drop(handle);
+                                discard_safe_partial_if_same(pp, &fd_meta).with_context(|| {
+                                    format!(
+                                        "replace partial {} after chmod failed: {error:#}",
+                                        pp.display()
+                                    )
+                                })?;
+                                continue;
+                            }
                             repaired_permissions = true;
                             continue;
                         }
@@ -1509,6 +1550,37 @@ fn require_safe_partial(file: &File, target: &Path) -> Result<()> {
 
 fn is_safe_partial(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file() && metadata.nlink() == 1
+}
+
+/// Remove only the same safe sidecar that was just inspected. If the pathname
+/// changed, let the caller retry the normal validation loop instead.
+fn discard_safe_partial_if_same(path: &Path, expected: &fs::Metadata) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(current)
+            if is_safe_partial(&current)
+                && current.dev() == expected.dev()
+                && current.ino() == expected.ino() =>
+        {
+            fs::remove_file(path).with_context(|| format!("replace {}", path.display()))?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn fail_partial_chmod_for_test() -> Result<()> {
+    if std::env::var_os("SYQ_TEST_FAIL_PARTIAL_CHMOD").is_some() {
+        bail!("injected partial chmod failure");
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn fail_partial_chmod_for_test() -> Result<()> {
+    Ok(())
 }
 
 fn mkdir(p: &Path, mode: u32) -> io::Result<()> {
