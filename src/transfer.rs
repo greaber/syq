@@ -1733,9 +1733,7 @@ impl Worker {
                 }
             }
         }
-        // bool = this path still needs Finalize (as opposed to content that
-        // matched the existing final file and only needed metadata repair).
-        let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
+        let planned: Result<Vec<(u64, u64)>> = (|| {
             let final_entry = job.dst_entry.clone();
             if let Some(f) = &final_entry {
                 if f.kind == Kind::Dir {
@@ -1761,9 +1759,9 @@ impl Worker {
                     "prepare",
                 )?;
                 if final_is_file && size > 0 {
-                    return Ok((self.diff_blocks(&job, Which::Final)?, true));
+                    return self.diff_blocks(&job, Which::Final);
                 }
-                return Ok((full(), true));
+                return Ok(full());
             }
             if partial_size.is_some() {
                 ok(
@@ -1777,46 +1775,11 @@ impl Worker {
                     "prepare",
                 )?;
                 if size == 0 {
-                    return Ok((vec![], true));
+                    return Ok(vec![]);
                 }
-                return Ok((self.diff_blocks(&job, Which::Partial)?, true));
+                return self.diff_blocks(&job, Which::Partial);
             }
             if final_is_file && (size > 0 && final_entry.as_ref().unwrap().size > 0 || size == 0) {
-                let ranges = if size > 0 {
-                    self.diff_final_and_seed(&job)?
-                } else {
-                    vec![]
-                };
-                if ranges.is_empty() && final_entry.as_ref().unwrap().size == size {
-                    if size > 0 {
-                        ok(
-                            self.dst.call(Request::DiscardPartial {
-                                path: job.dst.clone(),
-                                partial_id: self.partial_id(),
-                            })?,
-                            "discard unused partial",
-                        )?;
-                    }
-                    // Content identical: just fix up metadata (mode per rsync rules).
-                    let mut meta = job.entry.meta();
-                    meta.mode = self.create_mode(&job);
-                    let flags = self.opts.flags | flags::MODE;
-                    let errs = match ok(
-                        self.dst.call(Request::Apply(vec![Op::SetMeta {
-                            path: job.dst.clone(),
-                            meta,
-                            flags,
-                        }]))?,
-                        "setmeta",
-                    )? {
-                        Response::Applied(v) => v,
-                        other => bail!("unexpected response {other:?}"),
-                    };
-                    if let Some(e) = errs.into_iter().flatten().next() {
-                        bail!("{e}");
-                    }
-                    return Ok((vec![], false));
-                }
                 if size == 0 {
                     ok(
                         self.dst.call(Request::Prepare {
@@ -1828,8 +1791,14 @@ impl Worker {
                         })?,
                         "prepare",
                     )?;
+                    return Ok(vec![]);
                 }
-                return Ok((ranges, true));
+                // SeedAndHash made a complete snapshot of the final file.
+                // Publish it even when every block matched: applying metadata
+                // to the live path could otherwise race with another job's
+                // rename and produce one job's contents with the other's
+                // metadata.
+                return self.diff_final_and_seed(&job);
             }
             ok(
                 self.dst.call(Request::Prepare {
@@ -1841,10 +1810,10 @@ impl Worker {
                 })?,
                 "prepare",
             )?;
-            Ok((full(), true))
+            Ok(full())
         })();
 
-        let (ranges, needs_finalize) = match planned {
+        let ranges = match planned {
             Ok(result) => result,
             Err(e) => {
                 self.sched.ranges_ready(idx, vec![]);
@@ -1867,33 +1836,7 @@ impl Worker {
                     self.finish_file(idx)?;
                 }
             }
-            None => {
-                if !needs_finalize {
-                    self.progress.files_total.fetch_sub(1, Relaxed);
-                    self.progress.files_skipped.fetch_add(1, Relaxed);
-                    if self
-                        .checkpoint
-                        .get()
-                        .and_then(|shared| shared.checkpoint.as_ref())
-                        .is_some()
-                    {
-                        // Content matched block for block and the metadata is
-                        // now right: recheck the source before checkpointing it.
-                        let unchanged = matches!(
-                            stat_one(&mut *self.src, &job.src)?,
-                            Some(ref e) if e.kind == Kind::File
-                                && e.size == job.entry.size
-                                && e.mtime == job.entry.mtime
-                                && e.mtime_nsec == job.entry.mtime_nsec
-                        );
-                        if unchanged {
-                            self.record_done(&job.rel_bytes, &job.entry);
-                        }
-                    }
-                } else {
-                    self.finish_file(idx)?;
-                }
-            }
+            None => self.finish_file(idx)?,
         }
         Ok(())
     }

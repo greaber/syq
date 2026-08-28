@@ -2290,6 +2290,68 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn content_identical_seed_publishes_contents_and_metadata_atomically() {
+    let t = Tmp::new();
+    let first_contents = vec![b'a'; 8 * 1024 * 1024];
+    let second_contents = vec![b'b'; 8 * 1024 * 1024];
+    write(&t.path("basis"), &first_contents);
+    write(&t.path("first"), &first_contents);
+    write(&t.path("second"), &second_contents);
+    fs::set_permissions(t.path("first"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(t.path("second"), fs::Permissions::from_mode(0o640)).unwrap();
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    set_mtime(&t.path("first"), 1_600_000_001);
+    set_mtime(&t.path("second"), 1_600_000_002);
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "-j",
+            "1",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("first"),
+            &t.s("basis"),
+        ])
+        .env("SYQ_TEST_HOLD_AFTER_SEED_MS", "2000")
+        .spawn()
+        .unwrap();
+    let seeded = (0..300).any(|_| {
+        if partial_files(&t.0).len() == 1 {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(seeded, "first copy never seeded its sidecar");
+
+    let second = syq(&[
+        "-a",
+        "-j",
+        "1",
+        "--bwlimit",
+        "1G",
+        &t.s("second"),
+        &t.s("basis"),
+    ]);
+    assert_output_ok(&second);
+    assert_eq!(read(&t.path("basis")), second_contents);
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o640);
+    assert_eq!(published.mtime(), 1_600_000_002);
+
+    assert!(first.wait().unwrap().success());
+    assert_eq!(read(&t.path("basis")), first_contents);
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o600);
+    assert_eq!(published.mtime(), 1_600_000_001);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn readonly_interrupted_partial_is_reused() {
     let t = Tmp::new();
     let contents = vec![b'a'; 8 * 1024 * 1024];
