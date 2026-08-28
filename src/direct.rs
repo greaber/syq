@@ -11,14 +11,16 @@ fn direct_command(
     user: Option<&str>,
     host: &str,
     remote_cmd: &str,
-    forward_agent: bool,
+    default_ssh_forward_agent: Option<bool>,
 ) -> Command {
     let mut cmd = Command::new(&rsh[0]);
     cmd.args(&rsh[1..]);
     if rsh[0].ends_with("ssh") {
-        // Pass an explicit setting in both directions so ~/.ssh/config cannot
-        // silently override --no-forward-agent (or same-host suppression).
-        cmd.arg(if forward_agent { "-A" } else { "-a" });
+        // Manage agent forwarding only for syq's implicit `ssh`. An explicit
+        // -e/--rsh command is a complete user policy and is left unchanged.
+        if let Some(forward_agent) = default_ssh_forward_agent {
+            cmd.arg(if forward_agent { "-A" } else { "-a" });
+        }
         if let Some(user) = user {
             cmd.args(["-l", user]);
         }
@@ -208,14 +210,17 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         remote_cmd
     };
 
-    let forward_agent = !args.no_forward_agent && !srcs[0].same_host(dst);
+    let default_ssh_forward_agent = args
+        .rsh
+        .is_none()
+        .then(|| !args.no_forward_agent && !srcs[0].same_host(dst));
     let make_command = || {
         direct_command(
             &rsh,
             srcs[0].user.as_deref(),
             &src_host,
             &remote_cmd,
-            forward_agent,
+            default_ssh_forward_agent,
         )
     };
     if args.detach {
@@ -363,23 +368,35 @@ mod tests {
     }
 
     #[test]
-    fn direct_ssh_controls_agent_forwarding_explicitly() {
+    fn default_ssh_controls_agent_forwarding_explicitly() {
         let rsh = vec!["ssh".to_string(), "-p".to_string(), "2222".to_string()];
-        let forwarded = direct_command(&rsh, Some("alice"), "source", "syq ...", true);
+        let forwarded = direct_command(&rsh, Some("alice"), "source", "syq ...", Some(true));
         let forwarded = args(&forwarded);
         assert!(forwarded.contains(&OsStr::new("-A")));
         assert!(!forwarded.contains(&OsStr::new("-a")));
 
-        let disabled = direct_command(&rsh, Some("alice"), "source", "syq ...", false);
+        let disabled = direct_command(&rsh, Some("alice"), "source", "syq ...", Some(false));
         let disabled = args(&disabled);
         assert!(disabled.contains(&OsStr::new("-a")));
         assert!(!disabled.contains(&OsStr::new("-A")));
     }
 
     #[test]
+    fn explicit_ssh_does_not_get_agent_flags() {
+        let rsh = vec!["ssh".to_string(), "-a".to_string()];
+        let command = direct_command(&rsh, None, "source", "syq ...", None);
+        let args = args(&command);
+        assert!(!args.contains(&OsStr::new("-A")));
+        assert_eq!(
+            args.iter().filter(|arg| arg.to_str() == Some("-a")).count(),
+            1
+        );
+    }
+
+    #[test]
     fn custom_remote_shell_does_not_get_ssh_agent_flags() {
         let rsh = vec!["custom-rsh".to_string()];
-        let command = direct_command(&rsh, None, "source", "syq ...", false);
+        let command = direct_command(&rsh, None, "source", "syq ...", None);
         let args = args(&command);
         assert!(!args.contains(&OsStr::new("-a")));
         assert!(!args.contains(&OsStr::new("-A")));

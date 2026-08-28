@@ -154,7 +154,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--verify-only` | Hash every file on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
 | `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
-| `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
+| `-e CMD`, `--rsh CMD` | Remote shell command; controls agent forwarding when set (default `ssh`) |
 | `--syq-path PATH` | Use this exact remote `syq` instead of the managed helper |
 | `--no-bootstrap` | Require `syq` on the remote `PATH`; do not install a managed helper |
 | `--no-tcp` | Send data over the ssh connection instead of separate TCP sockets |
@@ -164,7 +164,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
-| `--no-forward-agent` | Remote-to-remote: disable SSH agent forwarding to the source host |
+| `--no-forward-agent` | Remote-to-remote with default `ssh`: disable agent forwarding (conflicts with `-e`) |
 | `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
@@ -196,8 +196,11 @@ Agent forwarding does not copy private keys to hostA, but a process that can
 access the forwarded socket while the SSH connection is alive can ask the
 agent to authenticate on its behalf. Pass `--no-forward-agent` to use `ssh -a`
 and override any `ForwardAgent yes` in SSH configuration; hostA must then have
-its own credentials for hostB. `--relay` also avoids exposing the agent to
-hostA, at the cost of routing the file data through this machine.
+its own credentials for hostB. With an explicit `-e/--rsh`, SYQ adds neither
+`-A` nor `-a`, so include the desired agent-forwarding policy in that command;
+`--no-forward-agent` therefore conflicts with `-e`. `--relay` also avoids
+exposing the agent to hostA, at the cost of routing the file data through this
+machine.
 
 Like rsync, SYQ leaves host-key checking to `ssh` and therefore inherits the
 user's SSH configuration and OpenSSH defaults. First contact therefore fails
@@ -266,12 +269,12 @@ transfer stays parallel without pre-deciding chunk counts.
 On the receiving side a file that needs content changes is written beside its
 destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
 written with `pwrite` from several workers), given its metadata, and `rename`d
-over the target. Visible sidecars are created mode `0600`, so incomplete data
-is private to the receiving user; final metadata is applied just before
-publication. When an existing final file is the comparison basis, the
-receiver retains that open descriptor while its blocks are hashed. If every
-block matches, metadata is applied through the descriptor without allocating
-or publishing a sidecar; otherwise that exact descriptor seeds the sidecar.
+over the target. Newly created sidecars are mode `0600`; final metadata is
+applied just before publication. When an existing final file is the comparison
+basis, the receiver retains that open descriptor while its blocks are hashed.
+If every block matches, metadata is applied through the descriptor without
+allocating or publishing a sidecar; otherwise that exact descriptor seeds the
+sidecar.
 The job ID is a 128-bit digest of the normalized source/destination mapping and
 content-affecting options, and is stable when the same logical command is
 rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
@@ -310,7 +313,9 @@ needed for this normal resumption. Resume works at two levels.
   blocks are sent. A leftover is reused only when it can be safely opened as a
   singly-linked regular file without following a symlink; numeric ownership is
   deliberately not required because NFS root squashing and some FUSE/CIFS
-  mounts remap it. Anything else is safely replaced or reported as an error.
+  mounts remap it. A safe leftover that cannot be made mode `0600` is discarded
+  and recreated instead of permanently blocking that file. Anything else is
+  safely replaced or reported as an error.
   On NFS, reuse requires the receiver to reread the partial; syq deliberately
   keeps no separate block-completion map.
   Pipelined small files are rewritten wholesale on retry instead of paying an
@@ -329,6 +334,18 @@ changing either starts a separate resumable namespace. Old sidecars are not
 garbage-collected automatically and may be deleted manually when the earlier
 command will not be resumed. Options that do not change the copy itself, such
 as `-c`, `--bwlimit`, and `-j`, do not change the partial ID.
+
+The directory containing a destination sidecar is a trust boundary, as with
+rsync's partial directories. It must not be writable by untrusted users,
+especially when SYQ runs with elevated privileges. A reused sidecar may have a
+filesystem-remapped numeric owner; mode and link-count validation cannot prove
+who originally created a deterministic pathname in a shared writable
+directory.
+
+Versions 0.1.1 and 0.1.2 used `.name.syq-partial`. This version deliberately
+does not recognize or resume that legacy form: remove any such destination
+sidecars manually after an interrupted old-version transfer. A legacy-named
+file in a source tree is copied as ordinary payload without a special warning.
 
 **Across the whole job.** Ordinary copies keep no transfer history, but their
 source and destination scans still skip files already complete. Deleting or
