@@ -296,6 +296,11 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     match status.code() {
         Some(0) => Ok(0),
+        // The remote orchestrator ran the actual transfer; its defined exit
+        // codes (23: some files failed, 25: --max-delete refused) are the
+        // result and pass through — its stderr was already inherited, so the
+        // errors have been printed. Anything else means it couldn't run.
+        Some(c @ (23 | 25)) => Ok(c),
         Some(c) => {
             bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
         }

@@ -4922,3 +4922,78 @@ fn live_sidecar_survives_delete_with_dotted_destination_spelling() {
         assert!(partial.exists(), "cross-spelling {spelling}: {so}");
     }
 }
+
+// ----------------------------------------------------------- review round 12
+
+#[test]
+fn files_from_leaves_unlisted_destination_root_metadata_alone() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o755)).unwrap();
+    write(&t.path("list"), b"a\n");
+    run_ok(&["-a", "--files-from", &t.s("list"), &t.s("src"), &t.s("dst")]);
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(read(&t.path("dst/a")), b"a");
+    assert_eq!(
+        fs::metadata(t.path("dst")).unwrap().mode() & 0o777,
+        0o755,
+        "the unlisted root keeps its own mode"
+    );
+    // An empty list still creates a missing destination, but modifies nothing.
+    write(&t.path("empty"), b"");
+    run_ok(&[
+        "-a",
+        "--files-from",
+        &t.s("empty"),
+        &t.s("src"),
+        &t.s("dst2"),
+    ]);
+    assert!(t.path("dst2").is_dir());
+}
+
+#[test]
+fn direct_remote_to_remote_passes_through_defined_exit_codes() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("dst/extra1"), b"x");
+    write(&t.path("dst/extra2"), b"y");
+    let src = format!("fake:{}", t.s("src/"));
+    let dst = format!("fake:{}", t.s("dst"));
+    // --max-delete refusal on the remote orchestrator must surface as 25.
+    let out = remote_syq(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--no-bootstrap",
+            "--delete",
+            "--max-delete",
+            "1",
+            &src,
+            &dst,
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(25),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(t.path("dst/extra1").exists() && t.path("dst/extra2").exists());
+    // Partial failure (unreadable source file) must surface as 23.
+    write(&t.path("src/bad"), b"unreadable");
+    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
+    let out = remote_syq(&t, &rsh, &["-a", "--no-bootstrap", &src, &dst]);
+    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

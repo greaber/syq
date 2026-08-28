@@ -1295,16 +1295,18 @@ impl Planner<'_> {
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
         // Through a symlink: `syq --files-from L link dst` should work like `link/`.
-        let root = match stat_one(src, src_root, true)? {
-            Some(e) if e.kind == Kind::Dir => e,
+        // Validate the root but never plan it: it isn't in the list, so its
+        // metadata is not ours to copy — an existing destination keeps its
+        // own mode/owner/mtime (creation-when-missing happened in run()).
+        match stat_one(src, src_root, true)? {
+            Some(e) if e.kind == Kind::Dir => {}
             Some(_) => bail!(
                 "--files-from: source {} is not a directory",
                 display(src_root)
             ),
             None => bail!("--files-from: source {} does not exist", display(src_root)),
-        };
+        }
         self.progress.scanned.fetch_add(1, Relaxed);
-        self.handle_batch(vec![root], src_root, "", dst_root)?;
 
         // Listed paths are lstat'ed (a listed symlink copies as a symlink).
         // Implied ancestors are stat'ed *through* symlinks and must resolve to
