@@ -131,6 +131,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Restore canonicalizer permission
+        run: chmod 755 dist/syq-linux-x86_64
       - name: Build and validate release metadata
         run: scripts/package-release.sh "$GITHUB_REF_NAME" dist
       - name: Sign release manifest and verify the configured key
