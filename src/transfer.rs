@@ -1192,7 +1192,7 @@ struct Planned {
 /// the destination is changed at all.
 struct Mapped {
     dst_root: PathBytes,
-    dirs: Vec<(PathBytes, Entry)>,
+    dirs: Vec<(PathBytes, PathBytes, Entry)>,
     others: Vec<Planned>,
 }
 
@@ -1531,7 +1531,7 @@ impl Planner<'_> {
     ) -> Mapped {
         let opts = self.opts;
         let sub_b = sub.as_bytes();
-        let mut dirs: Vec<(PathBytes, Entry)> = Vec::new();
+        let mut dirs: Vec<(PathBytes, PathBytes, Entry)> = Vec::new();
         let mut others: Vec<Planned> = Vec::new();
         for e in batch {
             if e.kind == Kind::Dir && !opts.recursive && !self.keep_dirs {
@@ -1562,7 +1562,7 @@ impl Planner<'_> {
             };
             let src = join(src_root, &e.path);
             match claim {
-                Claim::Dir => dirs.push((dst, e)),
+                Claim::Dir => dirs.push((dst, dst_rel, e)),
                 Claim::Weak if e.kind == Kind::Other => {
                     // Unknown type: never transferred.
                     self.progress.files_excluded.fetch_add(1, Relaxed);
@@ -1677,12 +1677,12 @@ impl Planner<'_> {
         let need_stats = opts.verify_only || !opts.dry_run || opts.existing;
         if !dirs.is_empty() && (need_stats || opts.verbose > 0) {
             let stats: Vec<Option<Entry>> = if need_stats {
-                self.stat_many(dirs.iter().map(|(p, _)| p.clone()).collect())?
+                self.stat_many(dirs.iter().map(|(p, _, _)| p.clone()).collect())?
             } else {
                 vec![None; dirs.len()]
             };
-            let mut planned: Vec<(PathBytes, Entry, Option<Entry>)> = Vec::new();
-            for ((p, e), st) in dirs.into_iter().zip(stats) {
+            let mut planned: Vec<(PathBytes, PathBytes, Entry, Option<Entry>)> = Vec::new();
+            for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
                 let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
                 if opts.verify_only {
                     if !is_dir {
@@ -1703,34 +1703,26 @@ impl Planner<'_> {
                     self.missing_dirs.insert(p);
                     continue;
                 }
-                planned.push((p, e, st));
+                planned.push((p, dst_rel, e, st));
             }
             if opts.dry_run {
                 if opts.verbose > 0 {
-                    for (p, _, _) in &planned {
+                    for (p, _, _, _) in &planned {
                         self.progress.println(&format!("{}/", display(p)));
                     }
                 }
             } else if !opts.verify_only {
                 // A directory about to occupy a checkpoint-complete file's
                 // path needs a write-ahead invalidation (see the fn).
-                let dst_root_len = dst_root.len();
-                planned.retain(|(p, _, _)| {
-                    let dst_rel = if p.len() > dst_root_len + 1 {
-                        &p[dst_root_len + 1..]
-                    } else {
-                        &[][..]
-                    };
-                    self.invalidate_completion(dst_rel)
-                });
+                planned.retain(|(_, dst_rel, _, _)| self.invalidate_completion(dst_rel));
                 // Create new dirs; also "create" existing ones we can't yet
                 // write into (0o700 not set) so apply() opens them up.
                 let new_dirs: Vec<Op> = planned
                     .iter()
-                    .filter(|(_, _, st)| {
+                    .filter(|(_, _, _, st)| {
                         !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
                     })
-                    .map(|(p, e, _)| Op::Mkdir {
+                    .map(|(p, _, e, _)| Op::Mkdir {
                         path: p.clone(),
                         mode: e.mode,
                     })
@@ -1760,7 +1752,7 @@ impl Planner<'_> {
                 if !opts.perms {
                     flags &= !flags::MODE;
                 }
-                for (p, e, s) in &planned {
+                for (p, _, e, s) in &planned {
                     let depth = p.iter().filter(|&&c| c == b'/').count();
                     let mut meta = e.meta();
                     let mut flags = flags;

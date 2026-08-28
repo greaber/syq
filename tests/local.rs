@@ -4846,3 +4846,36 @@ fn destination_walk_errors_disable_deletion() {
     assert!(t.path("dst/gone").exists(), "nothing may be deleted");
     assert!(t.path("dst/dark/inside").exists());
 }
+
+#[test]
+fn checkpoint_invalidation_survives_trailing_slash_destination() {
+    // Same type-change sequence as above, but the destination is spelled
+    // `dst/` and the file has a one-character name: join() adds no extra
+    // separator for a trailing slash, so slicing the full path used to drop
+    // the first byte of the key (or produce an empty one).
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let dst = format!("{}/", t.s("dst"));
+    run_ok(&["-a", "--checkpoint", &t.s("state"), &t.s("src/"), &dst]);
+    fs::remove_file(t.path("src/f")).unwrap();
+    write(&t.path("src/f/child"), b"c");
+    run_ok(&["-a", "--checkpoint", &t.s("state"), &t.s("src/"), &dst]);
+    assert!(t.path("dst/f").is_dir());
+    fs::remove_dir_all(t.path("src/f")).unwrap();
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        "--delete",
+        &t.s("src/"),
+        &dst,
+    ]);
+    assert!(!t.path("dst/f").exists());
+    write(&t.path("src/f"), b"data");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let so = run_ok(&["-a", "--checkpoint", &t.s("state"), &t.s("src/"), &dst]);
+    assert!(t.path("dst/f").is_file(), "{so}");
+    assert_eq!(read(&t.path("dst/f")), b"data");
+    assert_eq!(transferred(&so), 1, "{so}");
+}

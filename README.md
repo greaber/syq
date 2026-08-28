@@ -153,7 +153,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--progress-json` | One JSON line per second on stderr |
 | `--stats` | Summary counts at the end |
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
-| `--verify-only` | Hash every file on both sides and report differences; write nothing |
+| `--verify-only` | Hash every file in the run's scope on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
 | `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
 | `-e CMD`, `--rsh CMD` | Remote shell command; controls agent forwarding when set (default `ssh`) |
