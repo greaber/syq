@@ -674,7 +674,6 @@ pub fn run(args: Args) -> Result<i32> {
         checkpoint: checkpoint_writer,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
-        excluded: std::collections::HashSet::new(),
         collision: false,
         deferred: Vec::new(),
         dirs_created: 0,
@@ -789,7 +788,7 @@ pub fn run(args: Args) -> Result<i32> {
             progress.eprintln("syq: source scan reported errors; skipping deletions");
         } else {
             match st.plan_deletes() {
-                Ok(()) => deleted = st.run_deletes(&sched.failed_dsts())?,
+                Ok(()) => deleted = st.run_deletes()?,
                 Err(e) => progress.error(&format!("syq: delete: {e:#}")),
             }
         }
@@ -1058,9 +1057,6 @@ struct Planner<'a> {
     /// --existing: destination directories that don't exist (or aren't
     /// directories); nothing under them is touched.
     missing_dirs: std::collections::HashSet<PathBytes>,
-    /// Destination files the source has but this run chose not to send (-u,
-    /// size limits, --existing, ...); their partials are resume state, not garbage.
-    excluded: std::collections::HashSet<PathBytes>,
     completed:
         Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>>,
     checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
@@ -1141,9 +1137,6 @@ struct Deletes {
     leaves: Vec<(PathBytes, String, PathBytes)>,
     /// Directories by depth, removed deepest-first once they are empty.
     dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String)>>,
-    /// (partial path, final path, display name): stale unless the final path
-    /// failed this run (then it is the resume state for the retry).
-    partials: Vec<(PathBytes, PathBytes, String)>,
 }
 
 impl Planner<'_> {
@@ -1696,7 +1689,6 @@ impl Planner<'_> {
             if opts.existing && self.under_missing_dir(&dst_path, dst_root) {
                 // Below a directory we won't create: nothing to do, even if the
                 // destination has something reachable there through a symlink.
-                self.excluded.insert(dst_path);
                 self.progress.files_excluded.fetch_add(1, Relaxed);
                 continue;
             }
@@ -1736,7 +1728,6 @@ impl Planner<'_> {
                         || self.skip_existing(&dst_entry)
                     {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
-                        self.excluded.insert(dst_path);
                         continue;
                     }
                     let same = dst_entry.as_ref().is_some_and(|d| {
@@ -1751,7 +1742,6 @@ impl Planner<'_> {
                         });
                     if dst_newer {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
-                        self.excluded.insert(dst_path);
                         continue;
                     }
                     if opts.verify_only {
@@ -2106,12 +2096,19 @@ impl Planner<'_> {
                         // A truncated/compact name whose target can't be read
                         // back is left alone too.
                         if e.kind == Kind::File && crate::fsops::partial_job_id(name).is_some() {
+                            // Ours: an extra only if its target is not in the
+                            // source at all (orphan). A sidecar for a claimed
+                            // target — whether that file failed, was filtered,
+                            // or is already up to date — is resume state and
+                            // stays until a transfer of that file consumes it.
                             if crate::fsops::partial_job_id(name)
                                 == our_id.as_ref().map(|s| s.as_bytes())
                             {
                                 if let Some(target) = crate::fsops::partial_target(&full, &our_pid)
                                 {
-                                    found.partials.push((full, target, rel));
+                                    if !seen.contains_key(&target) {
+                                        found.leaves.push((full, rel, Vec::new()));
+                                    }
                                 }
                             }
                         } else {
@@ -2144,7 +2141,6 @@ impl Planner<'_> {
             );
             res?;
             self.deletes.leaves.append(&mut found.leaves);
-            self.deletes.partials.append(&mut found.partials);
             for (d, v) in found.dirs {
                 for (path, rel) in v {
                     if protected.contains(&path) {
@@ -2161,19 +2157,9 @@ impl Planner<'_> {
 
     /// Remove what plan_deletes found: leaves first, then directories deepest
     /// first. Returns the number of entries removed (or that would be, with -n).
-    fn run_deletes(&mut self, failed: &[PathBytes]) -> Result<u64> {
+    fn run_deletes(&mut self) -> Result<u64> {
         let opts = self.opts;
-        let failed: std::collections::HashSet<&PathBytes> = failed.iter().collect();
-        let mut leaves = std::mem::take(&mut self.deletes.leaves);
-        // The walk ran after the transfer, so every partial still present is a
-        // leftover — except those of files that failed this run or that a
-        // filter kept us from sending: those are the resume state of a
-        // transfer that hasn't happened yet.
-        for (partial, target, rel) in std::mem::take(&mut self.deletes.partials) {
-            if !failed.contains(&target) && !self.excluded.contains(&target) {
-                leaves.push((partial, rel, Vec::new()));
-            }
-        }
+        let leaves = std::mem::take(&mut self.deletes.leaves);
         let dirs = std::mem::take(&mut self.deletes.dirs);
         let planned = leaves.len() as u64 + dirs.values().map(|v| v.len() as u64).sum::<u64>();
         if let Some(max) = opts.max_delete {

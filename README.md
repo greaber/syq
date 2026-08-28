@@ -542,13 +542,13 @@ have is removed. The rules are simpler than rsync's, deliberately:
   would otherwise look like one whose contents vanished (`source scan reported
   errors; skipping deletions`). An interrupted run therefore never deletes
   anything, and directory mtimes are set after the deletes.
-- **This job's own leftovers count as extras.** A stale
-  `.name.syq-part.<job-id>` of *this* command — one whose file is already up
-  to date, or whose source is gone — is removed. The partial of a file that
-  *failed* this run, or that a rule kept this run from sending, is kept: it is
-  the resume state for the retry. Sidecars of *other* jobs (another logical
-  command into the same tree) are never touched: they are that command's live
-  state, not extras.
+- **This job's orphaned sidecars count as extras.** A
+  `.name.syq-part.<job-id>` of *this* command whose `name` is no longer in
+  the source is removed. One whose file *is* in the source stays, whatever
+  happened to that file this run (failed, filtered, already up to date): it
+  is resume state, and the next transfer of that file consumes it. Sidecars
+  of *other* jobs (another logical command into the same tree) are never
+  touched: they are that command's live state, not extras.
 - `--max-delete N` refuses to delete anything — not the first N — when more
   than N deletions are planned, says so, and exits 25 (rsync's code for it).
 - `-n --delete -v` lists every `deleting path` line a real run would print

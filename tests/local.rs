@@ -1673,10 +1673,11 @@ fn delete_removes_extras_and_protects_ignored() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn delete_cleans_this_jobs_stale_partials_and_keeps_resume_state() {
+fn delete_removes_only_this_jobs_orphaned_sidecars() {
     // Each scenario needs its own job (same source/destination/flags) so the
     // interrupted run and the --delete run share a partial id.
-    // 1. Stale: the file is up to date, so the leftover partial goes.
+    // 1. The file is still in the source (here even up to date): the sidecar
+    //    is resume state and stays.
     let t = Tmp::new();
     write(&t.path("src/ok"), &vec![7u8; 8 << 20]);
     let partial = interrupted_partial(&["-a", &t.s("src/"), &t.s("dst")], &t.path("dst"));
@@ -1685,18 +1686,19 @@ fn delete_cleans_this_jobs_stale_partials_and_keeps_resume_state() {
     set_mtime(&t.path("src/ok"), 1_600_000_000);
     set_mtime(&t.path("dst/ok"), 1_600_000_000);
     let so = run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
-    assert!(!partial.exists(), "{so}");
-    assert!(so.contains("1 deleted"), "{so}");
+    assert!(partial.exists(), "{so}");
+    assert!(so.contains("0 deleted"), "{so}");
 
-    // 2. Orphan: the source file is gone, so its partial is garbage.
+    // 2. Orphan: the source file is gone, so its sidecar is an extra.
     let t = Tmp::new();
     write(&t.path("src/gone"), &vec![7u8; 8 << 20]);
     let partial = interrupted_partial(&["-a", &t.s("src/"), &t.s("dst")], &t.path("dst"));
     fs::remove_file(t.path("src/gone")).unwrap();
-    run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
+    let so = run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
     assert!(!partial.exists());
+    assert!(so.contains("1 deleted"), "{so}");
 
-    // 3. Failed this run: the partial is the retry's resume state, kept.
+    // 3. Failed this run: still in the source, kept.
     let t = Tmp::new();
     write(&t.path("src/bad"), &vec![7u8; 8 << 20]);
     let partial = interrupted_partial(&["-a", &t.s("src/"), &t.s("dst")], &t.path("dst"));
@@ -1705,10 +1707,11 @@ fn delete_cleans_this_jobs_stale_partials_and_keeps_resume_state() {
     assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
     assert!(partial.exists());
 
-    // 4. Another job's sidecar (a different id) is that job's live state: kept.
+    // 4. Another job's sidecar (a different id) is that job's live state,
+    //    kept even though its name is an orphan here.
     let t = Tmp::new();
     write(&t.path("src/a"), b"a");
-    let other = format!("dst/.a.syq-part.{}", "a".repeat(26));
+    let other = format!("dst/.gone.syq-part.{}", "a".repeat(26));
     write(&t.path(&other), b"someone else's");
     run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
     assert!(t.path(&other).exists());
