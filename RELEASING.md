@@ -158,9 +158,9 @@ The release workflow sets `SYQ_RELEASE_BUILD=1`, which makes each platform
 binary report the tag (for example `v0.2.0`) as its build identity. Ordinary
 source builds instead include their Git revision and cannot populate the
 managed remote-helper cache. The manifest's `helper_id: v<release>-p0` and the
-binary's `--remote-helper-id` output are deprecated compatibility shims for the
-0.1.0 updater; `p0` is fixed and must not be treated or bumped as a protocol
-version.
+binary's `--remote-helper-id` output are deprecated compatibility shims for
+updaters through 0.1.1; `p0` is fixed and must not be treated or bumped as a
+protocol version.
 
 ## macOS signing
 

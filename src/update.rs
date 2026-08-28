@@ -47,7 +47,7 @@ struct ReleaseManifest {
     repository: String,
     version: String,
     tag: String,
-    /// Required so the 0.1.0 updater can consume future manifests. New code
+    /// Required so updaters through 0.1.1 can consume future manifests. New code
     /// does not use this legacy field as a compatibility decision.
     helper_id: String,
     artifacts: BTreeMap<String, ReleaseArtifact>,
@@ -306,7 +306,7 @@ fn validate_manifest(manifest: &ReleaseManifest) -> Result<Version> {
     if manifest.tag != format!("v{version}") {
         bail!("release tag does not match its version");
     }
-    // Versions through 0.1.0 require this shape before accepting an update.
+    // Versions through 0.1.1 require this shape before accepting an update.
     // The numeric suffix is retained as manifest compatibility data only.
     let helper_prefix = format!("{}-p", manifest.tag);
     let legacy_suffix = manifest

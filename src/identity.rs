@@ -12,7 +12,7 @@ pub fn release() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Kept so the 0.1.0 updater can validate newer binaries. It is no longer a
+/// Kept so updaters through 0.1.1 can validate newer binaries. It is no longer a
 /// protocol identity and deliberately has a fixed numeric suffix.
 pub fn legacy_helper_id() -> String {
     format!("{}-p0", release())
