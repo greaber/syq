@@ -23,6 +23,10 @@ macOS binary in `~/.local/bin`:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
 ```
 
+That initial shell installer necessarily needs `curl` or `wget` to obtain syq
+before syq exists. The installed application and its managed remote bootstrap
+do not depend on either command.
+
 To inspect it first, download the same URL without piping it to `sh`. Every
 release also has an immutable versioned installer, for example
 `https://github.com/greaber/syq/releases/download/v0.1.0/install.sh`. To choose
@@ -87,9 +91,10 @@ connection.
 
 If the remote toolchain is unavailable, a tool fails, or the download times
 out or otherwise fails, the local client downloads the target-specific archive
-instead. It verifies both the archive and decompressed binary, caches the
-verified binary under `$XDG_CACHE_HOME/syq/helpers/` (normally
-`~/.cache/syq/helpers/`), and uploads it through the configured SSH command.
+with its built-in rustls HTTP client instead. It verifies both the archive and
+decompressed binary, caches the verified binary under
+`$XDG_CACHE_HOME/syq/helpers/` (normally `~/.cache/syq/helpers/`), and uploads it
+through the configured SSH command.
 This fallback does not require a remote downloader, hasher, or decompressor.
 Remote filesystem and installation errors fail immediately because uploading
 the same helper cannot fix them. A completed download with the wrong digest is

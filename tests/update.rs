@@ -38,14 +38,6 @@ impl Drop for TempDir {
     }
 }
 
-fn write_executable(path: &Path, bytes: &[u8]) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(path, bytes).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 #[cfg(target_os = "linux")]
 struct UpdateFixture {
     temp: TempDir,
@@ -126,21 +118,6 @@ impl UpdateFixture {
         let public_key =
             base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
 
-        write_executable(
-            &temp.path("fake-bin/curl"),
-            br#"#!/bin/sh
-out=
-url=
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --output) out=$2; shift 2 ;;
-    *) url=$1; shift ;;
-  esac
-done
-cp "$SYQ_TEST_FIXTURES/${url##*/}" "$out"
-"#,
-        );
-
         Self {
             config: temp.path("config"),
             temp,
@@ -164,10 +141,6 @@ cp "$SYQ_TEST_FIXTURES/${url##*/}" "$out"
                 "https://release.invalid/download",
             )
             .env("SYQ_TEST_FIXTURES", self.temp.path("fixtures"))
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", self.temp.path("fake-bin").display()),
-            )
             .output()
             .unwrap()
     }

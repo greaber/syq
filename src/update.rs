@@ -274,17 +274,22 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
         helper.archive.name
     );
     fetch(&url, archive.path(), FetchMode::Interactive)?;
-    verify_file(archive.path(), &helper.archive)?;
+    verify_file_as(
+        archive.path(),
+        &helper.archive,
+        "downloaded remote helper archive",
+    )?;
 
     let input = File::open(archive.path()).context("open downloaded remote helper archive")?;
-    let mut decoder = GzDecoder::new(BufReader::new(input));
+    let decoder = GzDecoder::new(BufReader::new(input));
     let output = OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(binary.path())
         .context("open temporary remote helper")?;
     let mut output = BufWriter::new(output);
-    std::io::copy(&mut decoder, &mut output).context("decompress the remote helper")?;
+    std::io::copy(&mut decoder.take(helper.binary.size + 1), &mut output)
+        .context("decompress the remote helper")?;
     output.flush().context("flush the remote helper")?;
     output
         .get_ref()
@@ -467,29 +472,7 @@ fn install_release(release: &VerifiedRelease, receipt: &mut InstallReceipt) -> R
     let parent = executable
         .parent()
         .ok_or_else(|| anyhow!("the syq executable has no parent directory"))?;
-    let archive = TempFile::new(parent, ".gz")?;
-    let binary = TempFile::new(parent, ".bin")?;
-    let url = format!(
-        "{}/{}/{}",
-        release_downloads(),
-        release.manifest.tag,
-        artifact.archive.name
-    );
-    fetch(&url, archive.path(), FetchMode::Interactive)?;
-    verify_file(archive.path(), &artifact.archive)?;
-
-    let input = File::open(archive.path()).context("open downloaded release archive")?;
-    let mut decoder = GzDecoder::new(BufReader::new(input));
-    let output = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(binary.path())
-        .context("open temporary update executable")?;
-    let mut output = BufWriter::new(output);
-    std::io::copy(&mut decoder, &mut output).context("decompress the syq update")?;
-    output.flush().context("flush the syq update")?;
-    output.get_ref().sync_all().context("sync the syq update")?;
-    drop(output);
+    let binary = download_artifact(release, artifact, parent)?;
     set_executable(binary.path())?;
     verify_executable(binary.path(), release)?;
 
@@ -545,12 +528,52 @@ pub fn write_manifest_signing_payload(path: &Path) -> Result<()> {
         .context("write release manifest signing payload")
 }
 
-fn verify_file(path: &Path, expected: &ReleaseFile) -> Result<()> {
-    verify_file_as(path, expected, "downloaded release archive")
+fn download_artifact(
+    release: &VerifiedRelease,
+    artifact: &ReleaseArtifact,
+    parent: &Path,
+) -> Result<TempFile> {
+    let archive = TempFile::new(parent, ".gz")?;
+    let binary = TempFile::new(parent, ".bin")?;
+    let url = format!(
+        "{}/{}/{}",
+        release_downloads(),
+        release.manifest.tag,
+        artifact.archive.name
+    );
+    fetch(&url, archive.path(), FetchMode::Interactive)?;
+    verify_file_as(
+        archive.path(),
+        &artifact.archive,
+        "downloaded release archive",
+    )?;
+
+    let input = File::open(archive.path()).context("open downloaded release archive")?;
+    let decoder = GzDecoder::new(BufReader::new(input));
+    let output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(binary.path())
+        .context("open temporary release executable")?;
+    let mut output = BufWriter::new(output);
+    std::io::copy(&mut decoder.take(artifact.binary.size + 1), &mut output)
+        .context("decompress the syq release executable")?;
+    output.flush().context("flush the syq release executable")?;
+    output
+        .get_ref()
+        .sync_all()
+        .context("sync the syq release executable")?;
+    drop(output);
+    verify_file_as(
+        binary.path(),
+        &artifact.binary,
+        "downloaded release executable",
+    )?;
+    Ok(binary)
 }
 
 fn verify_file_as(path: &Path, expected: &ReleaseFile, description: &str) -> Result<()> {
-    let metadata = fs::metadata(path).context("stat downloaded release archive")?;
+    let metadata = fs::metadata(path).with_context(|| format!("stat {description}"))?;
     if metadata.len() != expected.size {
         bail!(
             "{description} has size {}, expected {}",
@@ -558,11 +581,15 @@ fn verify_file_as(path: &Path, expected: &ReleaseFile, description: &str) -> Res
             expected.size
         );
     }
-    let mut input = BufReader::new(File::open(path).context("open release archive for hashing")?);
+    let mut input = BufReader::new(
+        File::open(path).with_context(|| format!("open {description} for hashing"))?,
+    );
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 128 * 1024];
     loop {
-        let count = input.read(&mut buffer).context("hash release archive")?;
+        let count = input
+            .read(&mut buffer)
+            .with_context(|| format!("hash {description}"))?;
         if count == 0 {
             break;
         }
@@ -604,53 +631,66 @@ fn verify_executable(path: &Path, release: &VerifiedRelease) -> Result<()> {
 }
 
 fn fetch(url: &str, destination: &Path, mode: FetchMode) -> Result<()> {
-    let mut curl = Command::new("curl");
-    curl.args([
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--location",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
-        "--connect-timeout",
-    ]);
-    match mode {
-        FetchMode::Interactive => {
-            curl.args(["10", "--retry", "2"]);
-        }
-        FetchMode::BackgroundCheck => {
-            curl.args(["2", "--max-time", "5"]);
-        }
-    }
-    curl.arg("--output").arg(destination).arg(url);
-    match curl.stdin(Stdio::null()).status() {
-        Ok(status) if status.success() => return Ok(()),
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("run curl"),
+    #[cfg(debug_assertions)]
+    if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty()) {
+        let name = url
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty() && !matches!(*name, "." | ".."))
+            .ok_or_else(|| anyhow!("test release URL has no fixture name"))?;
+        fs::copy(PathBuf::from(root).join(name), destination)
+            .with_context(|| format!("copy test release fixture {name}"))?;
+        return Ok(());
     }
 
-    let mut wget = Command::new("wget");
-    wget.args(["--quiet", "--https-only"]);
-    match mode {
-        FetchMode::Interactive => {
-            wget.args(["--timeout=10", "--tries=3"]);
-        }
-        FetchMode::BackgroundCheck => {
-            wget.args(["--timeout=5", "--tries=1"]);
+    let (connect_timeout, global_timeout, attempts) = match mode {
+        FetchMode::Interactive => (Duration::from_secs(10), None, 3),
+        FetchMode::BackgroundCheck => (Duration::from_secs(2), Some(Duration::from_secs(5)), 1),
+    };
+    let agent = ureq::Agent::config_builder()
+        .https_only(true)
+        .timeout_connect(Some(connect_timeout))
+        .timeout_global(global_timeout)
+        .user_agent(concat!("syq/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .new_agent();
+
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        let result = (|| -> Result<()> {
+            let mut response = agent
+                .get(url)
+                .call()
+                .with_context(|| format!("request {url}"))?;
+            let file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(destination)
+                .with_context(|| format!("open {} for download", destination.display()))?;
+            let mut file = BufWriter::new(file);
+            std::io::copy(&mut response.body_mut().as_reader(), &mut file)
+                .with_context(|| format!("download {url}"))?;
+            file.flush()
+                .with_context(|| format!("flush downloaded file {}", destination.display()))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let retryable = !matches!(
+                    error.downcast_ref::<ureq::Error>(),
+                    Some(ureq::Error::StatusCode(code))
+                        if *code < 500 && !matches!(*code, 408 | 429)
+                );
+                last_error = Some(error);
+                if !retryable || attempt + 1 == attempts {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+            }
         }
     }
-    wget.arg("-O").arg(destination).arg(url);
-    match wget.stdin(Stdio::null()).status() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => bail!("download {url} failed ({status})"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("downloading updates requires curl or wget")
-        }
-        Err(e) => Err(e).context("run wget"),
-    }
+    Err(last_error.unwrap()).with_context(|| format!("download {url}"))
 }
 
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
@@ -947,5 +987,21 @@ mod tests {
         assert!(!should_check_for_updates(true, true, false));
         assert!(!should_check_for_updates(false, false, false));
         assert!(!should_check_for_updates(false, true, true));
+    }
+
+    #[test]
+    fn release_fetches_reject_plain_http() {
+        let parent = std::env::temp_dir();
+        let destination = TempFile::new(&parent, ".http-test").unwrap();
+        let error = fetch(
+            "http://127.0.0.1:1/release",
+            destination.path(),
+            FetchMode::BackgroundCheck,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::RequireHttpsOnly(_))
+        ));
     }
 }

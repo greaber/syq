@@ -2,6 +2,7 @@
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
+use flate2::{write::GzEncoder, Compression};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -171,11 +172,8 @@ fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
         .arg("--no-progress")
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_RELEASE_ARCHIVE", t.path("release.gz"))
         .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("release.gz"))
         .env("FAKE_CURL_LOG", t.path("curl.log"))
-        .env("FAKE_LOCAL_CURL_LOG", t.path("local-curl.log"))
-        .env("FAKE_RELEASE_MANIFEST", t.path("release-manifest.json"))
         .env(
             "FAKE_REMOTE_RELEASE_MANIFEST",
             t.path("release-manifest.json"),
@@ -191,7 +189,7 @@ fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
                 "SYQ_TEST_RELEASE_DOWNLOADS",
                 "https://release.invalid/download",
             )
-            .env("PATH", format!("{}:/usr/bin:/bin", t.s("local-bin")));
+            .env("SYQ_TEST_FIXTURES", &t.0);
     }
     cmd
 }
@@ -274,15 +272,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(target_os = "linux")]
 fn setup_release_bootstrap(t: &Tmp) {
-    let archive = File::create(t.path("release.gz")).unwrap();
-    let status = Command::new("gzip")
-        .args(["-9", "-n", "-c", env!("CARGO_BIN_EXE_syq")])
-        .stdout(Stdio::from(archive))
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let archive_bytes = fs::read(t.path("release.gz")).unwrap();
     let binary_bytes = fs::read(env!("CARGO_BIN_EXE_syq")).unwrap();
+    let mut encoder = GzEncoder::new(
+        File::create(t.path("release.gz")).unwrap(),
+        Compression::best(),
+    );
+    encoder.write_all(&binary_bytes).unwrap();
+    encoder.finish().unwrap();
+    let archive_bytes = fs::read(t.path("release.gz")).unwrap();
     let (target, asset) = match std::env::consts::ARCH {
         "x86_64" => ("linux-x86_64", "syq-linux-x86_64"),
         "aarch64" => ("linux-aarch64", "syq-linux-aarch64"),
@@ -318,36 +315,16 @@ fn setup_release_bootstrap(t: &Tmp) {
         base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
     let mut manifest = manifest;
     manifest["signature"] = signature.into();
-    write(
-        &t.path("release-manifest.json"),
-        &serde_json::to_vec_pretty(&manifest).unwrap(),
-    );
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    write(&t.path("syq-release-manifest.json"), &manifest_bytes);
+    write(&t.path("release-manifest.json"), &manifest_bytes);
     write(
         &t.path("release-public-key"),
         base64::engine::general_purpose::STANDARD
             .encode(signing.verifying_key().to_bytes())
             .as_bytes(),
     );
-
-    executable(
-        &t.path("local-bin/curl"),
-        br#"#!/bin/sh
-printf 'fetch\n' >> "$FAKE_LOCAL_CURL_LOG"
-out=
-url=
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --output) out=$2; shift 2 ;;
-        *) url=$1; shift ;;
-    esac
-done
-case "$url" in
-    *.json) cp "$FAKE_RELEASE_MANIFEST" "$out" ;;
-    *.gz) cp "$FAKE_RELEASE_ARCHIVE" "$out" ;;
-    *) exit 22 ;;
-esac
-"#,
-    );
+    fs::copy(t.path("release.gz"), t.path(&format!("{asset}.gz"))).unwrap();
 
     executable(
         &t.path("remote-bin/curl"),
@@ -411,7 +388,6 @@ exit 99
     assert!(cached_remote_helper(&t).is_file());
     assert!(legacy_helpers.iter().all(|helper| helper.exists()));
     assert!(!t.path("legacy.log").exists(), "legacy helper was executed");
-    assert!(!t.path("local-curl.log").exists());
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
     assert!(
@@ -433,7 +409,6 @@ exit 99
     let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"second");
-    assert!(!t.path("local-curl.log").exists());
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!(
@@ -492,7 +467,6 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
         "{stderr}"
     );
     assert!(!stderr.contains("checksum mismatch"), "{stderr}");
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     let cache_entries: Vec<_> = fs::read_dir(cached_remote_helper(&t).parent().unwrap())
         .unwrap()
@@ -538,7 +512,6 @@ fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
         stderr.contains("uploading the verified helper over SSH"),
         "{stderr}"
     );
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
@@ -569,7 +542,6 @@ exit 22
         "{stderr}"
     );
     assert!(!stderr.contains("warning:"), "{stderr}");
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
 }
 
@@ -603,7 +575,6 @@ fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
         "{stderr}"
     );
     assert!(!t.path("curl.log").exists());
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
 }
 
 #[cfg(target_os = "linux")]
@@ -634,7 +605,6 @@ exit 1
         stderr.contains("uploading the verified helper over SSH"),
         "{stderr}"
     );
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
@@ -672,7 +642,6 @@ exit 22
         "{stderr}"
     );
     assert!(stderr.contains("discarding it"), "{stderr}");
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
 }
 
 #[cfg(target_os = "linux")]
@@ -707,7 +676,6 @@ exit 23
         !stderr.contains("uploading the verified helper"),
         "{stderr}"
     );
-    assert!(!t.path("local-curl.log").exists());
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
     assert!(!cached_local_helper(&t).exists());
 }
@@ -731,7 +699,6 @@ fn development_build_refuses_managed_remote_bootstrap() {
         "{stderr}"
     );
     assert!(!stderr.contains("uploading"), "{stderr}");
-    assert!(!t.path("curl.log").exists());
 }
 
 #[test]
