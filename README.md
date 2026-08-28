@@ -194,8 +194,10 @@ its own credentials for hostB. `--relay` also avoids exposing the agent to
 hostA, at the cost of routing the file data through this machine.
 
 Like rsync, SYQ leaves host-key checking to `ssh` and therefore inherits the
-user's SSH configuration and OpenSSH defaults. An `-e` command can supply a
-different policy when needed.
+user's SSH configuration and OpenSSH defaults. First contact therefore fails
+when `ssh` cannot interactively confirm an unknown host. If accepting and
+recording a new host key is appropriate, opt in explicitly with
+`-e 'ssh -o StrictHostKeyChecking=accept-new'`.
 
 Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
 launched it: syq starts it on hostA, returns, and writes progress to a log on
@@ -355,8 +357,9 @@ logical commands use different partial names, so concurrent copies into one
 tree produce the union of their files and one whole-file rename wins for any
 path both write. A content-identical comparison applies metadata only through
 the inode it verified, so it cannot mix its metadata with another job's newly
-renamed contents. Quick-check metadata repair likewise verifies the inode
-before changing it, so a concurrent publication wins without mixed metadata.
+renamed contents. Quick-check metadata repair likewise verifies the inode;
+if a concurrent publication replaced it, the repair reports an error instead
+of mixing metadata with the new contents.
 Starting the same logical command twice at once is
 unsupported: both invocations intentionally address the same resumable
 sidecars. After a crash, abandoned sidecars may be deleted manually if that

@@ -2641,7 +2641,7 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
     assert_eq!(published.mode() & 0o777, 0o640);
     assert_eq!(published.mtime(), 1_600_000_001);
 
-    assert!(first.wait().unwrap().success());
+    assert_eq!(first.wait().unwrap().code(), Some(23));
     assert_eq!(read(&t.path("basis")), b"bbbb");
     let published = fs::metadata(t.path("basis")).unwrap();
     assert_eq!(published.mode() & 0o777, 0o640);
@@ -2667,7 +2667,7 @@ fn quick_check_repairs_mode_without_destination_read_permission() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn quick_check_metadata_open_does_not_block_on_concurrent_fifo() {
+fn quick_check_metadata_open_reports_concurrent_fifo_without_blocking() {
     use std::os::unix::fs::FileTypeExt;
 
     let t = Tmp::new();
@@ -2709,7 +2709,7 @@ fn quick_check_metadata_open_does_not_block_on_concurrent_fifo() {
         let _ = first.wait();
         panic!("quick-check repair blocked while opening a concurrently published FIFO");
     }
-    assert!(status.unwrap().success());
+    assert_eq!(status.unwrap().code(), Some(23));
     assert!(fs::symlink_metadata(t.path("basis"))
         .unwrap()
         .file_type()
@@ -2742,19 +2742,21 @@ fn checksum_identical_file_preserves_destination_inode() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn readonly_interrupted_partial_is_reused() {
+fn unreadable_interrupted_partials_are_reused() {
     let t = Tmp::new();
     let contents = vec![b'a'; 8 * 1024 * 1024];
     write(&t.path("src"), &contents);
-    let src = t.s("src");
-    let dst = t.s("out");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
-    let partial = interrupted_partial(&args, &t.0);
-    fs::set_permissions(&partial, fs::Permissions::from_mode(0o444)).unwrap();
+    for (i, mode) in [0o444, 0o000].into_iter().enumerate() {
+        let src = t.s("src");
+        let dst = t.s(&format!("out-{i}"));
+        let args = ["-a", "--bwlimit", "1G", &src, &dst];
+        let partial = interrupted_partial(&args, &t.0);
+        fs::set_permissions(&partial, fs::Permissions::from_mode(mode)).unwrap();
 
-    run_ok(&args);
-    assert_eq!(read(&t.path("out")), contents);
-    assert!(!partial.exists());
+        run_ok(&args);
+        assert_eq!(read(&t.path(&format!("out-{i}"))), contents);
+        assert!(!partial.exists());
+    }
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -2799,6 +2801,49 @@ fn long_basename_partial_is_truncated_and_resumed() {
     run_ok(&args);
     assert_eq!(read(&t.path(&format!("dst/{basename}"))), contents);
     assert!(!partial.exists());
+}
+
+#[test]
+fn impossible_sidecar_name_fails_one_file_and_continues() {
+    let t = Tmp::new();
+    let mut deep = PathBuf::new();
+    let target_parent_len = libc::PATH_MAX as usize - 20;
+    loop {
+        let current = t
+            .path("dst")
+            .join(&deep)
+            .as_os_str()
+            .as_encoded_bytes()
+            .len();
+        if current >= target_parent_len {
+            break;
+        }
+        let component_len = (target_parent_len - current - 1).min(200);
+        assert!(component_len > 0);
+        deep.push("d".repeat(component_len));
+    }
+    assert!(
+        t.path("dst")
+            .join(&deep)
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            >= target_parent_len
+    );
+
+    write(&t.path("src/good"), b"copied");
+    write(
+        &t.path("src").join(&deep).join("x"),
+        b"cannot fit a sidecar",
+    );
+
+    let output = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
+
+    assert_eq!(output.status.code(), Some(23));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot create a safe sidecar"), "{stderr}");
+    assert_eq!(read(&t.path("dst/good")), b"copied");
+    assert!(!t.path("dst").join(deep).join("x").exists());
 }
 
 #[cfg(debug_assertions)]

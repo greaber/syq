@@ -650,6 +650,7 @@ pub fn run(args: Args) -> Result<i32> {
         dst_seen: std::collections::HashMap::new(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
+        unusable_files: std::collections::HashSet::new(),
         deferred_payloads: Vec::new(),
         source_partials: 0,
         collision: false,
@@ -936,6 +937,9 @@ struct Planner<'a> {
     /// Ordinary payload names cannot collide and do not need to stay in RAM.
     payload_paths: std::collections::HashMap<PathBytes, String>,
     sidecar_paths: std::collections::HashMap<PathBytes, String>,
+    /// Files whose destination cannot accommodate a safe sidecar name. They
+    /// fail individually while the rest of the scan and transfer continue.
+    unusable_files: std::collections::HashSet<PathBytes>,
     /// Payload paths inside the reserved-looking namespace are planned only
     /// after the full collision preflight succeeds.
     deferred_payloads: Vec<DeferredPayloadBatch>,
@@ -1067,6 +1071,9 @@ impl Planner<'_> {
                     // a directory from mapping onto the same path.
                     let rel = self.rel_name(src_root, sub_b, &e.path);
                     if !self.claim_dst(&dst_path, &rel, false) {
+                        continue;
+                    }
+                    if self.unusable_files.contains(&dst_path) {
                         continue;
                     }
                 }
@@ -1438,8 +1445,18 @@ impl Planner<'_> {
             return Ok(());
         }
         let sidecars = self.partial_paths(files.iter().map(|(path, _)| path.clone()).collect())?;
-        for ((_, file_rel), sidecar) in files.into_iter().zip(sidecars) {
-            let sidecar = sidecar.map_err(anyhow::Error::msg)?;
+        for ((dst_path, file_rel), sidecar) in files.into_iter().zip(sidecars) {
+            let sidecar = match sidecar {
+                Ok(sidecar) => sidecar,
+                Err(error) => {
+                    self.progress.error(&format!(
+                        "syq: {file_rel}: cannot create a safe sidecar beside {}: {error}",
+                        display(&dst_path)
+                    ));
+                    self.unusable_files.insert(dst_path);
+                    continue;
+                }
+            };
             if let Some(payload_rel) = self.payload_paths.get(&sidecar) {
                 self.progress.error(&format!(
                     "syq: source payload {payload_rel} maps to {}, which is the reserved sidecar for {file_rel}",

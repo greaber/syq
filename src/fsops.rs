@@ -116,7 +116,10 @@ fn nearest_existing_directory(path: &Path) -> PathBuf {
         path.to_path_buf()
     };
     loop {
-        if fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_dir()) {
+        // An in-tree symlink is replaced during planning, not traversed. Use
+        // lstat semantics here too so preflight and the eventual worker query
+        // the containing filesystem rather than the symlink target.
+        if fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.is_dir()) {
             return candidate;
         }
         if !candidate.pop() || candidate.as_os_str().is_empty() {
@@ -549,10 +552,9 @@ fn apply_one(op: &Op) -> Result<()> {
                 let file = match open_metadata_handle(&p) {
                     Ok(file) => file,
                     Err(open_error) => {
-                        // A concurrent publisher may have removed the path or
-                        // replaced the regular file with another object. That
-                        // publisher wins; report an error only if the original
-                        // inode is still there but could not be opened safely.
+                        // If the original inode is still present, preserve the
+                        // useful open error. Otherwise the planned repair is no
+                        // longer complete and must be visible as a copy error.
                         match fs::symlink_metadata(&p) {
                             Ok(md)
                                 if md.file_type().is_file()
@@ -563,7 +565,9 @@ fn apply_one(op: &Op) -> Result<()> {
                                     format!("open {} for metadata repair", p.display())
                                 });
                             }
-                            _ => return Ok(()),
+                            _ => {
+                                bail!("destination {} changed before metadata repair", p.display())
+                            }
                         }
                     }
                 };
@@ -572,7 +576,7 @@ fn apply_one(op: &Op) -> Result<()> {
                     || md.dev() != *expected_dev
                     || md.ino() != *expected_ino
                 {
-                    return Ok(());
+                    bail!("destination {} changed before metadata repair", p.display());
                 }
                 set_meta_handle(&file, meta, *flags)
                     .with_context(|| format!("set metadata {}", p.display()))
@@ -638,30 +642,7 @@ fn set_meta_handle(file: &File, meta: &Meta, flags: u8) -> Result<()> {
         let wanted = meta.mode & 0o7777;
         if current != wanted || (flags & (flags::OWNER | flags::GROUP) != 0 && wanted & 0o6000 != 0)
         {
-            let r = unsafe {
-                libc::fchmodat(
-                    fd,
-                    empty.as_ptr(),
-                    wanted as libc::mode_t,
-                    libc::AT_EMPTY_PATH,
-                )
-            };
-            if r != 0 {
-                let error = io::Error::last_os_error();
-                if !matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
-                ) {
-                    return Err(error.into());
-                }
-                // Older libc/kernel combinations do not expose fchmodat2's
-                // AT_EMPTY_PATH support. procfs still resolves this stable
-                // O_PATH descriptor, never the possibly replaced pathname.
-                fs::set_permissions(
-                    PathBuf::from("/proc/self/fd").join(fd.to_string()),
-                    fs::Permissions::from_mode(wanted),
-                )?;
-            }
+            set_mode_handle(file, wanted)?;
         }
     }
     if flags & flags::TIMES != 0 {
@@ -673,6 +654,36 @@ fn set_meta_handle(file: &File, meta: &Meta, flags: u8) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn set_meta_handle(file: &File, meta: &Meta, flags: u8) -> Result<()> {
     set_meta_file(file, meta, flags)
+}
+
+#[cfg(target_os = "linux")]
+fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let r = unsafe { libc::fchmodat(fd, c"".as_ptr(), mode as libc::mode_t, libc::AT_EMPTY_PATH) };
+    if r == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    ) {
+        return Err(error.into());
+    }
+    // Older libc/kernel combinations do not expose fchmodat2's AT_EMPTY_PATH
+    // support. procfs still resolves this stable O_PATH descriptor, never the
+    // possibly replaced pathname.
+    fs::set_permissions(
+        PathBuf::from("/proc/self/fd").join(fd.to_string()),
+        fs::Permissions::from_mode(mode),
+    )?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    Ok(())
 }
 
 #[cfg(debug_assertions)]
@@ -741,13 +752,7 @@ impl FsOps {
         let pp = partial_path(&p, partial_id)?;
         let partial_size = match fs::symlink_metadata(&pp) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Ok(metadata)
-                if metadata.is_file()
-                    && metadata.nlink() == 1
-                    && metadata.uid() == unsafe { libc::geteuid() } =>
-            {
-                Some(metadata.len())
-            }
+            Ok(metadata) if is_owned_private(&metadata) => Some(metadata.len()),
             Ok(_) => None,
             Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
         };
@@ -762,23 +767,18 @@ impl FsOps {
         let mut repaired_permissions = false;
         for _ in 0..8 {
             match fs::symlink_metadata(pp) {
-                Ok(md)
-                    if md.is_file()
-                        && md.nlink() == 1
-                        && md.uid() == unsafe { libc::geteuid() } =>
-                {
+                Ok(md) if is_owned_private(&md) => {
                     match OpenOptions::new()
                         .read(true)
                         .write(true)
-                        .custom_flags(libc::O_NOFOLLOW)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                         .open(pp)
                     {
                         Ok(file) => {
                             let fd_meta = file.metadata()?;
                             let path_meta = fs::symlink_metadata(pp)?;
-                            if !fd_meta.file_type().is_file()
-                                || fd_meta.nlink() != 1
-                                || fd_meta.uid() != unsafe { libc::geteuid() }
+                            if !is_owned_private(&fd_meta)
+                                || !is_owned_private(&path_meta)
                                 || fd_meta.dev() != path_meta.dev()
                                 || fd_meta.ino() != path_meta.ino()
                             {
@@ -791,30 +791,27 @@ impl FsOps {
                             if error.kind() == io::ErrorKind::PermissionDenied
                                 && !repaired_permissions =>
                         {
-                            // Open without following and chmod that descriptor,
-                            // not the pathname: a co-writer cannot redirect the
-                            // repair to a symlink target between lstat and chmod.
-                            let readonly = OpenOptions::new()
-                                .read(true)
-                                .custom_flags(libc::O_NOFOLLOW)
-                                .open(pp)
-                                .with_context(|| {
-                                    format!("open {} for permission repair", pp.display())
-                                })?;
-                            let fd_meta = readonly.metadata()?;
-                            if !fd_meta.file_type().is_file()
-                                || fd_meta.nlink() != 1
-                                || fd_meta.uid() != unsafe { libc::geteuid() }
+                            // Open a metadata-only descriptor and chmod that,
+                            // not the pathname: this works for mode-000 files
+                            // and a co-writer cannot redirect the repair to a
+                            // symlink target between lstat and chmod.
+                            let handle = open_metadata_handle(pp).with_context(|| {
+                                format!("open {} for permission repair", pp.display())
+                            })?;
+                            let fd_meta = handle.metadata()?;
+                            let path_meta = fs::symlink_metadata(pp)?;
+                            if !is_owned_private(&fd_meta)
+                                || !is_owned_private(&path_meta)
                                 || fd_meta.dev() != md.dev()
                                 || fd_meta.ino() != md.ino()
+                                || fd_meta.dev() != path_meta.dev()
+                                || fd_meta.ino() != path_meta.ino()
                             {
                                 continue;
                             }
-                            readonly
-                                .set_permissions(fs::Permissions::from_mode(0o600))
-                                .with_context(|| {
-                                    format!("make partial writable {}", pp.display())
-                                })?;
+                            set_mode_handle(&handle, 0o600).with_context(|| {
+                                format!("make partial writable {}", pp.display())
+                            })?;
                             repaired_permissions = true;
                             continue;
                         }
@@ -882,7 +879,7 @@ impl FsOps {
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .mode(mode & 0o7777)
                 .open(&p)
                 .with_context(|| format!("open {}", p.display()))?;
@@ -921,15 +918,8 @@ impl FsOps {
         if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
             bail!("injected retained-basis hash failure");
         }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&p)
+        let mut file = open_existing_regular(&p, false)
             .with_context(|| format!("open {} as repair basis", p.display()))?;
-        let metadata = file.metadata()?;
-        if !metadata.file_type().is_file() {
-            bail!("destination {} is not a regular file", p.display());
-        }
         let hashes = hash_reader(&mut file, block, len)?;
         self.held_basis = Some(HeldBasis {
             path: p,
@@ -1431,7 +1421,7 @@ fn open_regular_write(target: &Path, mode: u32) -> Result<File> {
         .write(true)
         .create(true)
         .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .mode(mode & 0o7777)
         .open(target)
         .with_context(|| format!("create {}", target.display()))?;
@@ -1463,16 +1453,19 @@ fn open_existing_regular(target: &Path, write: bool) -> Result<File> {
 
 fn require_owned_private(file: &File, target: &Path) -> Result<()> {
     let metadata = file.metadata()?;
-    if !metadata.file_type().is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
+    if !is_owned_private(&metadata) {
         bail!(
             "partial {} is not an owned, singly-linked regular file",
             target.display()
         );
     }
     Ok(())
+}
+
+fn is_owned_private(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file()
+        && metadata.nlink() == 1
+        && metadata.uid() == unsafe { libc::geteuid() }
 }
 
 fn mkdir(p: &Path, mode: u32) -> io::Result<()> {
@@ -1662,10 +1655,12 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
 
         let started = std::time::Instant::now();
-        let result = open_existing_regular(&fifo, true);
+        let read_result = open_existing_regular(&fifo, false);
+        let write_result = open_existing_regular(&fifo, true);
         fs::remove_dir_all(&dir).unwrap();
 
-        assert!(result.is_err());
+        assert!(read_result.is_err());
+        assert!(write_result.is_err());
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "opening a FIFO must not wait for a reader"
@@ -1733,8 +1728,13 @@ mod tests {
         let dir = test_dir();
         fs::create_dir(&dir).unwrap();
         let missing = dir.join("not-yet-created/deeper");
+        let target = dir.join("symlink-target");
+        let link = dir.join("in-tree-link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
 
         assert_eq!(nearest_existing_directory(&missing), dir);
+        assert_eq!(nearest_existing_directory(&link.join("deeper")), dir);
 
         fs::remove_dir_all(&dir).unwrap();
     }
