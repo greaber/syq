@@ -563,7 +563,13 @@ pub fn run(args: Args) -> Result<i32> {
         spawn_workers(args.connections);
     }
 
-    let dst_root = dst.path.as_bytes().to_vec();
+    // One spelling for the destination root: every derived key — claims,
+    // delete roots, destination-walk paths, receiver-computed sidecar names —
+    // flows from this, and the receiver rebuilds paths through `Path`, which
+    // silently drops `.` components and duplicate slashes. Cleaning here
+    // (lexically only; symlinks stay the self-copy guard's business) keeps
+    // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
+    let dst_root = clean_root(dst.path.as_bytes());
     let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root, false)?;
     // A destination that is a symlink to a directory is that directory (as
     // for rsync). Use the resolved target path for all planning and metadata,
@@ -995,6 +1001,28 @@ fn mkdir_root(conn: &mut dyn Conn, dst_root: &[u8]) -> Result<()> {
         }
         other => bail!("unexpected response {other:?}"),
     }
+}
+
+/// Lexically canonical spelling of a root path: `.` components and duplicate
+/// or trailing slashes dropped (`dst/.` -> `dst`, `dst//x` -> `dst/x`), the
+/// leading `/` or `~` kept, a path that is nothing but dots left as `.`.
+/// Trailing-slash semantics are read off the Location before this runs.
+fn clean_root(p: &[u8]) -> PathBytes {
+    let absolute = p.starts_with(b"/");
+    let mut out: PathBytes = if absolute { b"/".to_vec() } else { Vec::new() };
+    for comp in p.split(|&b| b == b'/') {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(b"/") {
+            out.push(b'/');
+        }
+        out.extend_from_slice(comp);
+    }
+    if out.is_empty() {
+        out.extend_from_slice(if absolute { b"/" } else { b"." });
+    }
+    out
 }
 
 fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Entry>> {

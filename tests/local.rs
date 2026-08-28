@@ -4879,3 +4879,46 @@ fn checkpoint_invalidation_survives_trailing_slash_destination() {
     assert_eq!(read(&t.path("dst/f")), b"data");
     assert_eq!(transferred(&so), 1, "{so}");
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn live_sidecar_survives_delete_with_dotted_destination_spelling() {
+    // `dst/.` and `dst//` must produce the same keys as `dst`: the receiver
+    // rebuilds sidecar paths through Path (which normalizes), the delete walk
+    // joins bytes (which doesn't), and a spelling mismatch classified the
+    // job's own live sidecar as an orphan.
+    for spelling in ["/.", "//"] {
+        let t = Tmp::new();
+        write(&t.path("src/f"), &vec![7u8; 8 << 20]);
+        fs::create_dir_all(t.path("dst")).unwrap();
+        let dst = format!("{}{spelling}", t.s("dst"));
+        let partial = interrupted_partial(
+            &["-a", "--bwlimit", "1G", &t.s("src/"), &dst],
+            &t.path("dst"),
+        );
+        // Filtered target: the sidecar is resume state and must survive, in
+        // this spelling and cross-spelling alike.
+        let so = run_ok(&[
+            "-a",
+            "--bwlimit",
+            "1G",
+            "--delete",
+            "--max-size",
+            "10",
+            &t.s("src/"),
+            &dst,
+        ]);
+        assert!(partial.exists(), "{spelling}: {so}");
+        let so = run_ok(&[
+            "-a",
+            "--bwlimit",
+            "1G",
+            "--delete",
+            "--max-size",
+            "10",
+            &t.s("src/"),
+            &t.s("dst"),
+        ]);
+        assert!(partial.exists(), "cross-spelling {spelling}: {so}");
+    }
+}
