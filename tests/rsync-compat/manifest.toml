@@ -3,7 +3,7 @@ schema = 1
 [upstream]
 repository = "https://github.com/RsyncProject/rsync.git"
 commit = "7c20b077c980036a19587701cec320cc88e42a4a"
-configure_args = ["--disable-md2man", "--disable-xxhash", "--disable-zstd", "--disable-lz4"]
+configure_args = ["--disable-md2man", "--disable-xxhash", "--disable-zstd", "--disable-lz4", "--disable-idn"]
 helpers = ["tls", "trimslash", "t_unsafe", "t_chmod_secure", "t_secure_relpath", "wildtest", "getgroups", "getfsdev"]
 
 [profiles.default]
