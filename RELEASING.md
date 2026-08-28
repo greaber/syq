@@ -78,29 +78,40 @@ environment secret.
 Do not rotate the release signing key casually: installed clients trust it, so
 a planned rotation first needs a release that trusts both old and new keys.
 
-## Rename cutover with active worktrees
+## Signing releases from the Linux server
 
-Treat the code rename and the GitHub repository rename as one coordinated
-cutover, after functional branches that still use `pcp` have merged:
+GitHub authentication and tag signing use separate credentials. The server's
+GitHub CLI login handles HTTPS pushes and API operations. The private SSH tag
+signing key stays on the maintainer's Mac and is made available to a trusted
+server session with SSH agent forwarding; it is never copied to the server,
+the repository, the encrypted release inventory, or GitHub Actions.
 
-1. Merge ready in-progress feature branches into `master` while the code still
-   uses the old name. Rebase this distribution branch onto that result and land
-   its mechanical `pcp`-to-`syq` rename once.
-2. Immediately rename `greaber/pcp` to `greaber/syq` in GitHub settings, as the
-   second half of the same cutover. Do not later create another `greaber/pcp`,
-   because that disables GitHub's old-URL redirect.
-3. From the primary checkout, run
-   `git remote set-url origin https://github.com/greaber/syq.git`. The remote
-   configuration is shared by all linked worktrees, so do this only once.
-4. Rebase any feature branch that must remain open onto the renamed `master`.
-   It then resolves the naming change once, rather than making every worktree
-   carry an independent partial rename.
+Connect from the Mac with agent forwarding enabled for that session:
 
-The local `/home/grant/repos/pcp` directory name is cosmetic. Do not move it
-while linked worktrees exist, because Git records their paths. If changing the
-directory name matters, remove completed linked worktrees first and make a
-fresh clone at `/home/grant/repos/syq`; otherwise leaving the directory named
-`pcp` has no user-visible effect.
+```sh
+ssh -A user@host
+```
+
+On the server, confirm that the forwarded signing key is visible before
+creating a tag. The expected fingerprint is public and can safely be checked
+into this maintainer documentation:
+
+```sh
+ssh-add -l -E sha256 | grep -F 'SHA256:y3++huNJminuTLAOkyb635Vohfph9TfrzbtmVzM0dk0'
+gh auth status
+```
+
+Configure each fresh clone once to use the public half of that forwarded key:
+
+```sh
+git config --local gpg.format ssh
+git config --local user.signingkey \
+  'key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIISayu4yojryfTmgi9qKUTlNkWkwNfVmA0GyVjbhHCQK'
+git config --local tag.gpgSign true
+```
+
+Agent forwarding lets the server request signatures for the duration of the
+connection, so enable it only for a trusted release host rather than globally.
 
 ## Cutting a release
 
@@ -117,13 +128,15 @@ fresh clone at `/home/grant/repos/syq`; otherwise leaving the directory named
    git push origin v0.1.0
    ```
 
-3. Approve the protected `release` environment. The workflow first verifies
-   that the annotated tag's signature is valid and that it directly targets
-   the workflow commit, and that this commit is reachable from protected
-   `master`. It then builds static GNU Linux x86-64/ARM64 binaries and native
-   macOS Apple Silicon/Intel binaries, signs the manifest, verifies the exact
-   asset inventory, creates provenance attestations, uploads a draft, checks
-   every uploaded byte, publishes it, and finally updates the tap.
+3. Approve the protected `release` environment for the publishing job, then
+   approve it again when the separate Homebrew tap job is ready. The workflow
+   first verifies that the annotated tag's signature is valid and that it
+   directly targets the workflow commit, and that this commit is reachable
+   from protected `master`. It then builds static GNU Linux x86-64/ARM64
+   binaries and native macOS Apple Silicon/Intel binaries, signs the manifest,
+   verifies the exact asset inventory, creates provenance attestations,
+   uploads a draft, checks every uploaded byte, publishes it, and finally
+   updates the tap.
 4. Verify one or more downloaded artifacts and exercise both install paths:
 
    ```sh
