@@ -4816,3 +4816,33 @@ fn files_from_self_copy_through_symlinked_root_is_rejected() {
     );
     assert_eq!(listing(&t.path("real")), ["a", "dstdir"], "nothing copied");
 }
+
+#[test]
+fn destination_walk_errors_disable_deletion() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("dst/gone"), b"an ordinary extra");
+    write(&t.path("dst/dark/inside"), b"unknown contents");
+    fs::set_permissions(t.path("dst/dark"), fs::Permissions::from_mode(0o000)).unwrap();
+    let src_arg = t.s("src/");
+    let dst_arg = t.s("dst");
+    for flags in [vec!["-rt", "-n"], vec!["-rt"]] {
+        let mut args = flags.clone();
+        args.extend(["--delete", &src_arg, &dst_arg]);
+        let out = syq(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(23),
+            "{flags:?}: {}",
+            stderr_of(&out)
+        );
+        assert!(
+            stderr_of(&out).contains("destination walk reported errors; skipping deletions"),
+            "{flags:?}: {}",
+            stderr_of(&out)
+        );
+    }
+    fs::set_permissions(t.path("dst/dark"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(t.path("dst/gone").exists(), "nothing may be deleted");
+    assert!(t.path("dst/dark/inside").exists());
+}

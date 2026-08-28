@@ -688,7 +688,7 @@ pub fn run(args: Args) -> Result<i32> {
         missing_dirs: std::collections::HashSet::new(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
-        live_sidecars: std::collections::HashSet::new(),
+        live_sidecars: Vec::new(),
         unusable_files: std::collections::HashSet::new(),
         deferred_payloads: Vec::new(),
         source_partials: 0,
@@ -699,6 +699,7 @@ pub fn run(args: Args) -> Result<i32> {
         specials_created: 0,
         scan_warned: false,
         max_delete_hit: false,
+        delete_walk_failed: false,
         buffer: if srcs.len() > 1 {
             Some(Vec::new())
         } else {
@@ -820,6 +821,9 @@ pub fn run(args: Args) -> Result<i32> {
             progress.eprintln("syq: source scan reported errors; skipping deletions");
         } else {
             match st.plan_deletes() {
+                Ok(()) if st.delete_walk_failed => {
+                    progress.eprintln("syq: destination walk reported errors; skipping deletions")
+                }
                 Ok(()) => deleted = st.run_deletes()?,
                 Err(e) => progress.error(&format!("syq: delete: {e:#}")),
             }
@@ -1107,8 +1111,10 @@ struct Planner<'a> {
     /// Ordinary payload names cannot collide and do not need to stay in RAM.
     payload_paths: std::collections::HashMap<PathBytes, String>,
     sidecar_paths: std::collections::HashMap<PathBytes, String>,
-    /// The keys of sidecar_paths, kept past finish_planning only for --delete.
-    live_sidecars: std::collections::HashSet<PathBytes>,
+    /// The keys of sidecar_paths, kept past finish_planning only for --delete
+    /// (sorted, binary-searched: one path per regular file is the dominant
+    /// resident cost of --delete on huge trees, so keep it lean).
+    live_sidecars: Vec<PathBytes>,
     /// Files whose destination cannot accommodate a safe sidecar name. They
     /// fail individually while the rest of the scan and transfer continue.
     unusable_files: std::collections::HashSet<PathBytes>,
@@ -1127,6 +1133,10 @@ struct Planner<'a> {
     scan_warned: bool,
     /// --max-delete stopped the deletions (exit 25, as rsync).
     max_delete_hit: bool,
+    /// The destination walk reported errors: an unreadable directory there
+    /// looks empty and would be rmdir'd over its unknown contents, so
+    /// deletion is skipped entirely (the errors already count).
+    delete_walk_failed: bool,
     /// Several sources: mapped batches waiting for all scans to finish
     /// (see `Mapped`). None with a single source, where batches stream.
     buffer: Option<Vec<Mapped>>,
@@ -1496,7 +1506,9 @@ impl Planner<'_> {
         self.payload_paths = std::collections::HashMap::new();
         let sidecars = std::mem::take(&mut self.sidecar_paths);
         if self.opts.delete {
-            self.live_sidecars = sidecars.into_keys().collect();
+            let mut keys: Vec<PathBytes> = sidecars.into_keys().collect();
+            keys.sort_unstable();
+            self.live_sidecars = keys;
         }
         let deferred = std::mem::take(&mut self.deferred_payloads);
         if let Some(buf) = &mut self.buffer {
@@ -2316,7 +2328,8 @@ impl Planner<'_> {
             // non-directory (a file we chose not to send, a symlink skipped
             // without -l, ...). The source has that path, so syq doesn't touch
             // it — and gutting the directory underneath would be touching it.
-            let mut shielded: Vec<PathBytes> = Vec::new();
+            let mut shielded: std::collections::HashSet<PathBytes> =
+                std::collections::HashSet::new();
             let res = self.dst.scan(
                 &root,
                 false,
@@ -2329,7 +2342,7 @@ impl Planner<'_> {
                         }
                         let full = join(&root, &e.path);
                         if nested.iter().any(|n| *n == full || inside(&full, n))
-                            || shielded.iter().any(|d| inside(&full, d))
+                            || Planner::under_any(&shielded, &full, &root)
                         {
                             continue;
                         }
@@ -2337,7 +2350,7 @@ impl Planner<'_> {
                             Some(Claim::Dir) => continue,
                             Some(_) => {
                                 if e.kind == Kind::Dir {
-                                    shielded.push(full);
+                                    shielded.insert(full);
                                 }
                                 continue;
                             }
@@ -2360,7 +2373,7 @@ impl Planner<'_> {
                         // deleting that job's unclaimed payload anyway.
                         if e.kind == Kind::File
                             && crate::fsops::is_partial_name(OsStr::from_bytes(name))
-                            && live_sidecars.contains(&full)
+                            && live_sidecars.binary_search(&full).is_ok()
                         {
                             // Live resume state of this very command.
                         } else {
@@ -2389,7 +2402,10 @@ impl Planner<'_> {
                     }
                     Ok(())
                 },
-                &mut |w| self.progress.error(&format!("syq: delete: {w}")),
+                &mut |w| {
+                    self.delete_walk_failed = true;
+                    self.progress.error(&format!("syq: delete: {w}"))
+                },
             );
             res?;
             self.deletes.leaves.append(&mut found.leaves);

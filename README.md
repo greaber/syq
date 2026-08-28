@@ -242,6 +242,8 @@ Identical to rsync:
   not even a missing destination directory is created (the transfer starts
   once the scans finish). Naming the destination file itself as one of the
   sources doesn't change that: it would be overwritten, so it's a conflict.
+  The price is memory: every scanned entry is held until the scans are
+  validated, roughly a few hundred bytes per entry across all sources.
 - An explicitly supplied destination root that is a symlink to a directory is
   that directory (the link is kept, with or without a trailing slash). A
   symlink encountered below the destination root is payload at that path: it
@@ -625,10 +627,15 @@ have is removed. The rules are simpler than rsync's, deliberately:
   file skipped for lack of `-l`/`-D` — still exists in the source, so its
   destination copy is left alone, as in rsync. Such files are reported under
   `files excluded` in `--stats`.
+- With `--delete` the sidecar path of every mapped regular file stays in
+  memory until deletions run (that set is what tells a live sidecar from an
+  orphan); on multi-million-file trees this is the option's main memory cost.
 - **After, not before.** Deletions run once every file has been transferred
   and only if the whole source scan succeeded: an unreadable source directory
   would otherwise look like one whose contents vanished (`source scan reported
-  errors; skipping deletions`). An interrupted run therefore never deletes
+  errors; skipping deletions`). The destination walk is held to the same rule:
+  an unreadable directory *there* looks empty and would be removed over its
+  unknown contents, so its errors also skip all deletions. An interrupted run therefore never deletes
   anything, and directory mtimes are set after the deletes.
 - **Sidecar-patterned files are extras unless they are this job's live
   resume state.** A `.name.syq-part.<job-id>` of *this* command whose `name`

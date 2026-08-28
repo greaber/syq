@@ -20,7 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const FORMAT: u32 = 2;
+// 3: Deleted invalidation records. An older syq would skip the unparseable
+// lines and trust the Complete records they void; the format check makes it
+// refuse the file instead (restarting a checkpoint is always safe).
+pub const FORMAT: u32 = 3;
 const IDENTITY_FORMAT: u32 = 1;
 
 fn b64(bytes: &[u8]) -> String {
@@ -370,11 +373,13 @@ impl Checkpoint {
         }
     }
 
-    /// --delete is about to unlink these paths: persist the intents *before*
-    /// the unlinks, durably, so a crash can never leave a stale Complete
-    /// record for a file that is gone. A stale Deleted intent (recorded, then
-    /// the unlink failed or never ran) only costs a recheck on retry. An Err
-    /// means the intents are NOT durable — the caller must not unlink.
+    /// A mutation is about to make these checkpoint-complete paths missing or
+    /// non-regular: persist the invalidation intents *first* — written and
+    /// flushed, though not fsynced; the checkpoint never promises power-loss
+    /// durability (see README) — so a crash can't leave a stale Complete
+    /// record for a file that is gone. A stale intent (recorded, then the
+    /// mutation failed or never ran) only costs a recheck on retry. An Err
+    /// means the intents did not persist — the caller must not mutate.
     pub fn record_deleted_batch<'a>(&self, paths: impl Iterator<Item = &'a [u8]>) -> Result<()> {
         if let Some(error) = self.failed.lock().unwrap().as_ref() {
             bail!("checkpoint recording already stopped: {error}");
