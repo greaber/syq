@@ -87,7 +87,7 @@ expect_failure 'does not match Cargo.toml version' \
 
 # Run the same signing operation used by the release workflow, verify the
 # result independently, and prove that a mismatched configured public key is
-# rejected without creating an output.
+# rejected without modifying the manifest.
 key="$work/signing.pem"
 public="$work/public.pem"
 openssl genpkey -algorithm ED25519 -out "$key" >/dev/null 2>&1
@@ -96,29 +96,26 @@ key_b64=$(openssl base64 -A -in "$key")
 public_b64=$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | openssl base64 -A)
 SYQ_RELEASE_SIGNING_KEY_PEM_B64="$key_b64" SYQ_RELEASE_PUBLIC_KEY="$public_b64" \
   "$script_dir/sign-release-manifest.sh" \
-  "$first/syq-release-manifest.json" "$first/syq-release-manifest.json.sig" \
-  "$canonicalizer"
+  "$first/syq-release-manifest.json" "$canonicalizer"
+test "$(find "$first" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 19
 embedded_b64=$(jq -er '.signature' "$first/syq-release-manifest.json")
 printf '%s' "$embedded_b64" | openssl base64 -d -A > "$work/embedded-signature.raw"
 "$canonicalizer" --release-manifest-signing-payload \
   "$first/syq-release-manifest.json" > "$work/manifest.jcs"
 openssl pkeyutl -verify -rawin -pubin -inkey "$public" \
   -in "$work/manifest.jcs" -sigfile "$work/embedded-signature.raw" >/dev/null
-openssl base64 -d -A -in "$first/syq-release-manifest.json.sig" \
-  -out "$work/signature.raw"
-openssl pkeyutl -verify -rawin -pubin -inkey "$public" \
-  -in "$first/syq-release-manifest.json" -sigfile "$work/signature.raw" >/dev/null
 
 other_key="$work/other.pem"
 openssl genpkey -algorithm ED25519 -out "$other_key" >/dev/null 2>&1
 other_public_b64=$(openssl pkey -in "$other_key" -pubout -outform DER | \
   tail -c 32 | openssl base64 -A)
-mismatch_output="$work/mismatched.sig"
+second_sha=$(sha256sum "$second/syq-release-manifest.json" | awk '{print $1}')
 expect_failure 'does not match SYQ_RELEASE_PUBLIC_KEY' env \
   SYQ_RELEASE_SIGNING_KEY_PEM_B64="$key_b64" SYQ_RELEASE_PUBLIC_KEY="$other_public_b64" \
   "$script_dir/sign-release-manifest.sh" \
-  "$second/syq-release-manifest.json" "$mismatch_output" "$canonicalizer"
-test ! -e "$mismatch_output"
+  "$second/syq-release-manifest.json" "$canonicalizer"
+test "$(sha256sum "$second/syq-release-manifest.json" | awk '{print $1}')" = "$second_sha"
+jq -e 'has("signature") | not' "$second/syq-release-manifest.json" >/dev/null
 
 # Verify the workflow's GitHub tag checks against controlled API responses.
 fakebin="$work/fakebin"

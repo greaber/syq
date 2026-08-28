@@ -7,7 +7,7 @@ use clap::Parser;
     version,
     about = "Parallel copy with an rsync-shaped interface",
     disable_help_flag = true,
-    override_usage = "syq [OPTIONS] SRC... DEST\n       syq [OPTIONS] [USER@]HOST:SRC... DEST\n       syq [OPTIONS] SRC... [USER@]HOST:DEST\n       syq --self-update\n       syq --enable-auto-update | --disable-auto-update"
+    override_usage = "syq [OPTIONS] SRC... DEST\n       syq [OPTIONS] [USER@]HOST:SRC... DEST\n       syq [OPTIONS] SRC... [USER@]HOST:DEST\n       syq --self-update"
 )]
 pub struct Args {
     /// Print help
@@ -17,12 +17,6 @@ pub struct Args {
     /// Install the newest signed release (standalone installer builds only)
     #[arg(long, exclusive = true)]
     pub self_update: bool,
-    /// Opt in to installing signed updates after successful interactive commands
-    #[arg(long, exclusive = true)]
-    pub enable_auto_update: bool,
-    /// Turn automatic updates off; update notices remain enabled
-    #[arg(long, exclusive = true)]
-    pub disable_auto_update: bool,
     /// Record an installation made by the official standalone installer
     #[arg(long, hide = true, exclusive = true)]
     pub register_standalone_install: bool,
@@ -132,7 +126,7 @@ pub struct Args {
     )]
     pub checkpoint: Option<String>,
 
-    /// Remote shell command (default: ssh)
+    /// Remote shell command (default: ssh); controls agent forwarding when set
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
     /// Use this exact syq executable on the remote instead of the managed helper
@@ -160,9 +154,9 @@ pub struct Args {
     /// Remote-to-remote: relay data through this machine instead of running on the source host
     #[arg(long)]
     pub relay: bool,
-    /// Remote-to-remote: disable SSH agent forwarding to the source host; it must authenticate
-    /// to the destination with its own credentials
-    #[arg(long)]
+    /// Remote-to-remote with the default ssh: disable agent forwarding to the source host; it
+    /// must authenticate to the destination with its own credentials
+    #[arg(long, conflicts_with = "rsh")]
     pub no_forward_agent: bool,
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
@@ -242,12 +236,7 @@ pub struct Args {
 
     /// Source(s) and destination (or, with --rm, the paths to remove)
     #[arg(
-        required_unless_present_any = [
-            "self_update",
-            "enable_auto_update",
-            "disable_auto_update",
-            "register_standalone_install"
-        ],
+        required_unless_present_any = ["self_update", "register_standalone_install"],
         num_args = 1..,
         value_name = "PATH"
     )]

@@ -38,8 +38,6 @@ struct InstallReceipt {
     version: String,
     target: String,
     binary: PathBuf,
-    #[serde(default)]
-    auto_update: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -88,7 +86,7 @@ enum FetchMode {
 /// installer. A package-manager binary cannot accidentally overwrite itself.
 pub fn self_update() -> Result<()> {
     let (_, mut receipt) = managed_receipt().context(
-        "self-update is only available for installs made by the standalone installer; use your package manager or reinstall with the curl installer",
+        "self-update is only available for installs made by the standalone installer; Homebrew installs should use `brew upgrade syq`, and source builds should be rebuilt or replaced with a standalone install",
     )?;
     let release = fetch_latest(FetchMode::Interactive)?;
     match release.version.cmp(&current_version()?) {
@@ -108,21 +106,6 @@ pub fn self_update() -> Result<()> {
     Ok(())
 }
 
-/// Change the opt-in automatic update setting in the standalone receipt.
-pub fn set_auto_update(enabled: bool) -> Result<()> {
-    let (path, mut receipt) = managed_receipt().context(
-        "automatic updates are only available for installs made by the standalone installer; package-manager installs should be updated by their package manager",
-    )?;
-    receipt.auto_update = enabled;
-    write_receipt(&path, &receipt)?;
-    if enabled {
-        println!("automatic signed updates enabled");
-    } else {
-        println!("automatic updates disabled; interactive update notices remain enabled");
-    }
-    Ok(())
-}
-
 /// Called by the generated installer after the verified binary has reached its
 /// final path. Keeping receipt creation inside syq avoids shell JSON escaping.
 pub fn register_standalone_install() -> Result<()> {
@@ -136,30 +119,29 @@ pub fn register_standalone_install() -> Result<()> {
     })?;
     let binary = canonical_current_exe()?;
     let path = receipt_path()?;
-    let auto_update = read_receipt(&path)
-        .ok()
-        .filter(|old| canonical_or_original(&old.binary) == binary)
-        .is_some_and(|old| old.auto_update);
     let receipt = InstallReceipt {
         schema: RECEIPT_SCHEMA,
         provider: "standalone".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         target: target.key.into(),
         binary,
-        auto_update,
     };
     write_receipt(&path, &receipt)
 }
 
-/// Check at most once per day after a successful interactive command. Errors
-/// never change the command's exit status. Automatic replacement is opt-in.
+/// Check at most once per day after a successful interactive command and print
+/// an update notice when needed. Errors never change the command's exit status.
 pub fn after_success(quiet: bool) {
-    if quiet || !std::io::stderr().is_terminal() {
+    if !should_check_for_updates(
+        quiet,
+        std::io::stderr().is_terminal(),
+        std::env::var_os("SYQ_NO_UPDATE_CHECK").is_some(),
+    ) {
         return;
     }
-    let Ok((_, mut receipt)) = managed_receipt() else {
+    if managed_receipt().is_err() {
         return;
-    };
+    }
     let Ok(stamp) = check_stamp_path() else {
         return;
     };
@@ -170,19 +152,9 @@ pub fn after_success(quiet: bool) {
     if touch_check_stamp(&stamp).is_err() {
         return;
     }
-    let mode = if receipt.auto_update {
-        FetchMode::Interactive
-    } else {
-        FetchMode::BackgroundCheck
-    };
-    let release = match fetch_latest(mode) {
+    let release = match fetch_latest(FetchMode::BackgroundCheck) {
         Ok(release) => release,
-        Err(e) => {
-            if receipt.auto_update {
-                eprintln!("syq: automatic update check failed: {e:#}");
-            }
-            return;
-        }
+        Err(_) => return,
     };
     let Ok(current) = current_version() else {
         return;
@@ -190,23 +162,14 @@ pub fn after_success(quiet: bool) {
     if release.version <= current {
         return;
     }
-    if receipt.auto_update {
-        match install_release(&release, &mut receipt) {
-            Ok(()) => eprintln!(
-                "syq: installed signed update {} (used on the next command)",
-                release.version
-            ),
-            Err(e) => eprintln!(
-                "syq: automatic update to {} failed: {e:#}; run `syq --self-update` to retry",
-                release.version
-            ),
-        }
-    } else {
-        eprintln!(
-            "syq: update {} is available; run `syq --self-update`",
-            release.version
-        );
-    }
+    eprintln!(
+        "syq: update {} is available; run `syq --self-update`",
+        release.version
+    );
+}
+
+fn should_check_for_updates(quiet: bool, stderr_is_terminal: bool, disabled: bool) -> bool {
+    !quiet && stderr_is_terminal && !disabled
 }
 
 /// Return the archive hash for this exact release after verifying its signed
@@ -850,5 +813,13 @@ mod tests {
         let mut value = manifest();
         value.installer.size = MAX_SAFE_JSON_INTEGER + 1;
         assert!(validate_manifest(&value).is_err());
+    }
+
+    #[test]
+    fn update_checks_require_an_unsuppressed_interactive_command() {
+        assert!(should_check_for_updates(false, true, false));
+        assert!(!should_check_for_updates(true, true, false));
+        assert!(!should_check_for_updates(false, false, false));
+        assert!(!should_check_for_updates(false, true, true));
     }
 }
