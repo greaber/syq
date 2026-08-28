@@ -23,17 +23,30 @@ only avoids destination lookups for whole files already recorded complete.
 ## Atomic publication and per-file resume
 
 Unless `--inplace` was explicit, every regular file is written to the
-deterministic destination-side name `.<name>.syq-partial`, given its final
-metadata, and atomically renamed over the requested pathname. Small files are
-still pipelined as whole-file protocol requests, but the receiver stages and
-renames each one before acknowledging it. SYQ does not `fsync` by default;
-`--fsync` separately requests crash durability for the file and directory.
+deterministic destination-side name `.<name>.syq-part.<job-id>`, given its
+final metadata, and atomically renamed over the requested pathname. The
+128-bit job ID is the SHA-256 prefix of the versioned JSON identity used by
+checkpoints: canonical endpoints and roots, trailing-slash mappings, filters,
+block size, and content/metadata semantics. Operational choices such as worker
+count, progress, verbosity, compression, and bandwidth limiting do not change
+it. Small files are still pipelined as whole-file protocol requests, but the
+receiver stages and renames each one before acknowledging it. SYQ does not
+`fsync` by default; `--fsync` separately requests crash durability for the file
+and directory.
 
-The receiver holds an advisory exclusive lock on an active partial. Two SYQ
-processes therefore never write the same staged inode: a simultaneous copy of
-the same destination file fails visibly in one command, while unrelated paths
-remain concurrent. Non-overlapping publications may still replace one another
-as atomic whole files. `--inplace` does not provide this isolation.
+Different logical jobs therefore never write one staged inode and need no
+partial-file locks. They may publish to the same final path; each publication
+is a whole-file atomic rename and the later rename wins. Running the same
+logical job concurrently is unsupported because those invocations deliberately
+address the same resumable sidecars. A normal post-crash retry computes the
+same name directly, with no directory search or attempt record.
+
+The common name keeps the full destination basename and base32 job ID visible.
+If that would exceed the usual component limit, the basename is truncated and
+a 96-bit basename digest disambiguates it. Near the full path limit a compact
+80-bit combined digest is used. If even that will not fit, the file fails
+visibly; SYQ does not add a directory-FD path subsystem solely for this edge
+case.
 
 If a range transfer is interrupted, the partial itself is the per-file state.
 A normal rerun finds it, hashes it and the current source at fixed
@@ -41,7 +54,16 @@ A normal rerun finds it, hashes it and the current source at fixed
 local record to trust those bytes. A stale partial is content-safe because
 every reused block is compared with the current source. Pipelined small files
 are cheap enough to overwrite wholesale on retry; they avoid the extra partial
-probe while retaining the same atomic publication boundary.
+probe while retaining the same atomic publication boundary. The receiver must
+reread the full partial to calculate those hashes, including when the partial
+is on NFS; no block-completion map is maintained.
+
+When an existing final file is the block-diff basis, the receiver opens it
+once, hashes it, and seeds the job's partial from that same descriptor. An
+atomic rename by another job cannot switch the basis between those operations.
+Per-connection file-descriptor caches are keyed by the source-change retry
+number, so a retry cannot write through an old descriptor after its sidecar was
+published.
 
 `--inplace` deliberately removes the staging boundary. It can save space and
 work for a changed large file, but readers may observe mixed contents and an
@@ -57,7 +79,7 @@ the coordinator is the source host; `--relay` keeps it on the invoking host.
 The checkpoint is append-only JSONL:
 
 ```json
-{"type":"header","format":1,"job_identity":"..."}
+{"type":"header","format":2,"job_identity":"..."}
 {"type":"complete","path_b64":"YS9maWxl","size":123,"mtime_sec":1700000000,"mtime_nsec":42,"mode":33188,"uid":1000,"gid":1000,"basis":"transferred"}
 ```
 

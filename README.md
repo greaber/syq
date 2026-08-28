@@ -200,7 +200,7 @@ Identical to rsync:
   is kept, with or without a trailing slash); a symlink to anything else is
   replaced like a file.
 - syq's own bookkeeping is never payload (as rsync excludes its
-  `--partial-dir`): a source entry named `.name.syq-partial` is silently left
+  `--partial-dir`): names reserved for `.syq-part` sidecars are silently left
   out. Everything else is copied.
 - `host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
   A colon before the first slash means remote; `./x:y` is local. All sources
@@ -232,12 +232,19 @@ onto a largest-first queue; when a worker runs dry it steals the back half of
 the remaining range of whichever file has the most left, so the tail of a
 transfer stays parallel without pre-deciding chunk counts.
 
-On the receiving side each file is written into `.name.syq-partial` in its
-directory (preallocated with `fallocate`, written with `pwrite` from several
-processes), given its metadata, and `rename`d over the target. By default syq
-does not `fsync` each file (the rename still orders correctly, and per-file
-fsync is costly on NFS); pass `--fsync` to force each file durable before the
-rename for crash safety.
+On the receiving side each file is written beside its destination as
+`.name.syq-part.<job-id>` (preallocated with `fallocate`, written with `pwrite`
+from several workers), given its metadata, and `rename`d over the target. The
+job ID is a 128-bit digest of the normalized source/destination mapping and
+content-affecting options, and is stable when the same logical command is
+rerun. It includes trailing-slash mapping, filters, metadata semantics and
+block size, but not operational controls such as `-j`, verbosity, progress or
+bandwidth limiting. Long basenames are deterministically truncated and
+disambiguated to fit the usual filesystem component limit; exceptionally long
+full paths can still fail with a clear error. By default syq does not `fsync`
+each file (the rename still orders correctly, and per-file fsync is costly on
+NFS); pass `--fsync` to force each file durable before the rename for crash
+safety.
 Small files still use a pipelined whole-file request, but the receiver writes
 each request through its sidecar and renames it before acknowledging success.
 Thus every non-`--inplace` final name appears atomically complete. `--inplace`
@@ -257,8 +264,10 @@ needed for this normal resumption. Resume works at two levels.
 **Within a file.** There is no per-file state file — the partial *is* the state:
 
 - Files whose size and mtime already match are skipped (the rsync quick check).
-- If a range-transfer `.name.syq-partial` exists, both sides hash it and the
-  source in `--block-size` blocks and only the mismatching blocks are sent.
+- If this job's range-transfer `.name.syq-part.<job-id>` exists, both sides
+  hash it and the source in `--block-size` blocks and only the mismatching
+  blocks are sent. On NFS this requires the receiver to reread the partial;
+  syq deliberately keeps no separate block-completion map.
   Pipelined small files are rewritten wholesale on retry instead of paying an
   extra partial-file probe.
 - If the destination file exists but differs, its blocks are hashed against
@@ -289,7 +298,7 @@ On retry, a record whose source fingerprint still matches (size, nanosecond
 mtime, and requested mode/owner/group metadata) skips that destination lookup.
 Everything else follows the normal quick check, partial hashing, and transfer
 path. Unfinished individual files are never checkpoint-complete; their actual
-`.syq-partial` contents remain the resume state.
+`.syq-part.<job-id>` contents remain the resume state.
 
 The checkpoint is flushed about once a second and persists after both failed
 and successful runs until you remove or stop passing it. Losing its last
@@ -307,9 +316,13 @@ modified that destination after it was recorded, a checkpointed retry will not
 notice. Do not use a checkpoint when the destination may be independently
 modified; omit the option and SYQ remains history-independent.
 
-Like rsync, ordinary SYQ runs do not coordinate with each other. Concurrent
-copies into one tree produce the union of their files, and one whole-file
-rename wins for any path both write.
+Like rsync, ordinary SYQ runs do not coordinate with each other. Different
+logical commands use different partial names, so concurrent copies into one
+tree produce the union of their files and one whole-file rename wins for any
+path both write. Starting the same logical command twice at once is unsupported:
+both invocations intentionally address the same resumable sidecars. After a
+crash, abandoned sidecars may be deleted manually if that command will not be
+resumed.
 
 ### Verification and consistency
 
@@ -340,8 +353,9 @@ the re-stat catches the common case, `--verify-only` afterwards catches the
 rest.
 
 Compared with rsync: ordinary writes use the same temporary-file plus atomic
-rename model; `--inplace` explicitly gives that up. SYQ's deterministic partial
-also remains reusable without publishing it under the final name. The
+rename model; `--inplace` explicitly gives that up. Rsync chooses a random
+temporary suffix, while SYQ uses a deterministic job ID so an interrupted
+command can find its partial again without a local state file. The
 change-during-transfer check is the same idea; deletes and hardlinks aren't
 implemented, so there is no ordering question for them.
 
@@ -355,7 +369,7 @@ implemented, so there is no ordering question for them.
   to an rsync server.
 - Rolling-checksum delta transfer (see Resume above).
 - Preserving existing partial files from `rsync --partial`; only syq's own
-  `.name.syq-partial` files are recognised.
+  `.syq-part` sidecars for the same logical command are recognised.
 
 ## When parallelism helps
 

@@ -8,12 +8,16 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 const COMPRESS_MIN: usize = 512;
 
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
+
+/// Stable identifier for one logical copy command. Destination partial names
+/// include this value so unrelated commands never write the same staged inode.
+pub type PartialId = [u8; 16];
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -140,6 +144,7 @@ pub enum Request {
     /// The planner has already statted the final path.
     ProbePartial {
         path: PathBytes,
+        partial_id: PartialId,
     },
     /// Create/adjust the write target for `path` with the given final size.
     /// `mode`: create new files with this mode so no separate chmod is needed.
@@ -147,8 +152,23 @@ pub enum Request {
         path: PathBytes,
         size: u64,
         inplace: bool,
-        from_final: bool,
+        partial_id: PartialId,
         mode: u32,
+    },
+    /// Hash an existing final file while copying bytes from that same open
+    /// inode into this job's partial. This makes the hash basis and staged
+    /// basis one atomic snapshot even if another command publishes meanwhile.
+    SeedAndHash {
+        path: PathBytes,
+        partial_id: PartialId,
+        block: u64,
+        len: u64,
+    },
+    /// Remove this job's unused staged copy after the existing final proved
+    /// content-identical.
+    DiscardPartial {
+        path: PathBytes,
+        partial_id: PartialId,
     },
     /// In-kernel copy of a same-machine file (copy_file_range: reflink / NFS
     /// server-side copy when possible). Err("EXDEV") tells the caller to fall
@@ -157,23 +177,28 @@ pub enum Request {
         src: PathBytes,
         dst: PathBytes,
         inplace: bool,
+        partial_id: PartialId,
         size: u64,
         mode: u32,
     },
     HashBlocks {
         path: PathBytes,
         which: Which,
+        partial_id: PartialId,
         block: u64,
         len: u64,
     },
     ReadRange {
         path: PathBytes,
+        attempt: u32,
         off: u64,
         len: u32,
     },
     WriteRange {
         path: PathBytes,
         inplace: bool,
+        partial_id: PartialId,
+        attempt: u32,
         off: u64,
         hash: u64,
         #[serde(with = "serde_bytes")]
@@ -182,6 +207,7 @@ pub enum Request {
     Finalize {
         path: PathBytes,
         inplace: bool,
+        partial_id: PartialId,
         meta: Meta,
         flags: u8,
         fsync: bool,
@@ -191,6 +217,7 @@ pub enum Request {
     /// without exposing partial final-named files.
     PutSmall {
         path: PathBytes,
+        partial_id: PartialId,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         hash: u64,

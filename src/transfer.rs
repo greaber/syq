@@ -35,6 +35,7 @@ pub struct Opts {
     pub dry_run: bool,
     pub verbose: u8,
     pub umask: u32,
+    pub partial_id: std::sync::OnceLock<PartialId>,
     /// gitignore-style patterns applied to every source (see scan.rs).
     pub ignore: Vec<String>,
 }
@@ -105,17 +106,21 @@ fn canonical_path(ctl: &mut dyn Conn, path: &str, remote: bool) -> Result<std::p
 
 /// Encode the content/metadata-affecting options into the job identity.
 fn semantic_flags(opts: &Opts, args: &Args) -> String {
-    format!(
-        "r={} l={} p={} t={} g={} o={} D={} inplace={}",
-        opts.recursive,
-        opts.links,
-        opts.flags & flags::MODE != 0,
-        opts.flags & flags::TIMES != 0,
-        opts.flags & flags::GROUP != 0,
-        opts.flags & flags::OWNER != 0,
-        opts.devices,
-        args.inplace,
-    )
+    serde_json::json!({
+        "partial_format": 1,
+        "recursive": opts.recursive,
+        "links": opts.links,
+        "perms": opts.flags & flags::MODE != 0,
+        "times": opts.flags & flags::TIMES != 0,
+        "group": opts.flags & flags::GROUP != 0,
+        "owner": opts.flags & flags::OWNER != 0,
+        "devices": opts.devices,
+        "checksum": opts.checksum,
+        "inplace": args.inplace,
+        "block_size": opts.block,
+        "ignore": opts.ignore,
+    })
+    .to_string()
 }
 
 /// The endpoint half of a job identity: `user@host` (the user matters — two
@@ -130,43 +135,54 @@ fn endpoint_identity(l: &Location) -> String {
 
 /// Load and, for a real copy, open the explicitly requested checkpoint.
 struct DestinationRoot<'a> {
-    location: &'a Location,
     path: &'a [u8],
     existed: bool,
     is_dir: bool,
+}
+
+fn copy_identity(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    src_ctl: &mut dyn Conn,
+    dst_ctl: &mut dyn Conn,
+    opts: &Opts,
+) -> Result<String> {
+    let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
+    for source in srcs {
+        let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
+        src_roots.push((
+            path.to_string_lossy().into_owned(),
+            source.copies_contents(),
+        ));
+    }
+    let dst_root = canonical_path(dst_ctl, &dst.path, dst.is_remote())?
+        .to_string_lossy()
+        .into_owned();
+    Ok(crate::checkpoint::job_identity(
+        &endpoint_identity(&srcs[0]),
+        &src_roots,
+        &endpoint_identity(dst),
+        &dst_root,
+        &semantic_flags(opts, args),
+    ))
 }
 
 fn checkpoint_setup(
     args: &Args,
     srcs: &[Location],
     dst: DestinationRoot<'_>,
-    src_ctl: &mut dyn Conn,
     dst_ctl: &mut dyn Conn,
-    opts: &Opts,
+    identity: &str,
 ) -> Result<Option<CheckpointState>> {
     use crate::checkpoint::Checkpoint;
     let Some(path) = args.checkpoint.as_deref().map(std::path::Path::new) else {
         return Ok(None);
     };
-    let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
-    for l in srcs {
-        let p = canonical_path(src_ctl, &l.path, l.is_remote())?;
-        src_roots.push((p.to_string_lossy().into_owned(), l.copies_contents()));
-    }
-    let dst_norm = canonical_path(dst_ctl, &dst.location.path, dst.location.is_remote())?
-        .to_string_lossy()
-        .into_owned();
-    let identity = crate::checkpoint::job_identity(
-        &endpoint_identity(&srcs[0]),
-        &src_roots,
-        &endpoint_identity(dst.location),
-        &dst_norm,
-        &semantic_flags(opts, args),
-    );
     let (checkpoint, loaded) = if args.dry_run {
         let loaded = Checkpoint::load(path)?;
         if let Some(ex) = &loaded.existing_identity {
-            if *ex != identity {
+            if ex != identity {
                 bail!(
                     "checkpoint {} describes a different copy; choose another path or remove it",
                     path.display()
@@ -175,7 +191,7 @@ fn checkpoint_setup(
         }
         (None, loaded)
     } else {
-        let (checkpoint, loaded) = Checkpoint::open(path, &identity, opts.fsync)?;
+        let (checkpoint, loaded) = Checkpoint::open(path, identity, args.fsync)?;
         (Some(checkpoint), loaded)
     };
     if !loaded.completed.is_empty() {
@@ -355,6 +371,7 @@ pub fn run(args: Args) -> Result<i32> {
         dry_run: args.dry_run,
         verbose: args.verbose,
         umask: read_umask(),
+        partial_id: std::sync::OnceLock::new(),
         ignore: args.ignore_lines.clone(),
     });
 
@@ -575,18 +592,21 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
+    let identity = copy_identity(&args, srcs, dst, &mut *src_ctl, &mut *dst_ctl, &opts)?;
+    opts.partial_id
+        .set(crate::checkpoint::partial_id(&identity))
+        .expect("partial identity set once");
+
     let checkpoint_state = checkpoint_setup(
         &args,
         srcs,
         DestinationRoot {
-            location: dst,
             path: &dst_root,
             existed: dst_existed,
             is_dir: dst_is_dir,
         },
-        &mut *src_ctl,
         &mut *dst_ctl,
-        &opts,
+        &identity,
     )?;
 
     // Create a missing directory destination — never in the read-only modes.
@@ -1511,6 +1531,7 @@ impl Worker {
                 self.limit(j.entry.size);
                 self.src.send(Request::ReadRange {
                     path: j.src.clone(),
+                    attempt: j.attempts,
                     off: 0,
                     len: j.entry.size as u32,
                 })?;
@@ -1549,6 +1570,7 @@ impl Worker {
             meta.mode = self.create_mode(j);
             self.dst.send(Request::PutSmall {
                 path: j.dst.clone(),
+                partial_id: self.partial_id(),
                 data: bytes,
                 hash,
                 meta,
@@ -1673,6 +1695,7 @@ impl Worker {
             let probed: Result<Option<u64>> = (|| match ok(
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
+                    partial_id: self.partial_id(),
                 })?,
                 "probe partial",
             )? {
@@ -1732,7 +1755,7 @@ impl Worker {
                         path: job.dst.clone(),
                         size,
                         inplace: true,
-                        from_final: false,
+                        partial_id: self.partial_id(),
                         mode: self.create_mode(&job),
                     })?,
                     "prepare",
@@ -1748,7 +1771,7 @@ impl Worker {
                         path: job.dst.clone(),
                         size,
                         inplace: false,
-                        from_final: false,
+                        partial_id: self.partial_id(),
                         mode: self.create_mode(&job),
                     })?,
                     "prepare",
@@ -1760,11 +1783,20 @@ impl Worker {
             }
             if final_is_file && (size > 0 && final_entry.as_ref().unwrap().size > 0 || size == 0) {
                 let ranges = if size > 0 {
-                    self.diff_blocks(&job, Which::Final)?
+                    self.diff_final_and_seed(&job)?
                 } else {
                     vec![]
                 };
                 if ranges.is_empty() && final_entry.as_ref().unwrap().size == size {
+                    if size > 0 {
+                        ok(
+                            self.dst.call(Request::DiscardPartial {
+                                path: job.dst.clone(),
+                                partial_id: self.partial_id(),
+                            })?,
+                            "discard unused partial",
+                        )?;
+                    }
                     // Content identical: just fix up metadata (mode per rsync rules).
                     let mut meta = job.entry.meta();
                     meta.mode = self.create_mode(&job);
@@ -1785,16 +1817,18 @@ impl Worker {
                     }
                     return Ok((vec![], false));
                 }
-                ok(
-                    self.dst.call(Request::Prepare {
-                        path: job.dst.clone(),
-                        size,
-                        inplace: false,
-                        from_final: true,
-                        mode: self.create_mode(&job),
-                    })?,
-                    "prepare",
-                )?;
+                if size == 0 {
+                    ok(
+                        self.dst.call(Request::Prepare {
+                            path: job.dst.clone(),
+                            size,
+                            inplace: false,
+                            partial_id: self.partial_id(),
+                            mode: self.create_mode(&job),
+                        })?,
+                        "prepare",
+                    )?;
+                }
                 return Ok((ranges, true));
             }
             ok(
@@ -1802,7 +1836,7 @@ impl Worker {
                     path: job.dst.clone(),
                     size,
                     inplace: false,
-                    from_final: false,
+                    partial_id: self.partial_id(),
                     mode: self.create_mode(&job),
                 })?,
                 "prepare",
@@ -1884,6 +1918,7 @@ impl Worker {
             src: job.src.clone(),
             dst: job.dst.clone(),
             inplace,
+            partial_id: self.partial_id(),
             size: job.entry.size,
             mode,
         })?;
@@ -1922,6 +1957,14 @@ impl Worker {
         }
     }
 
+    fn partial_id(&self) -> PartialId {
+        *self
+            .opts
+            .partial_id
+            .get()
+            .expect("partial identity initialized before planning")
+    }
+
     /// Metadata for the whole file just atomically published at the
     /// destination. A retry can use it as a block-diff basis without changing
     /// the no-`-p` mode chosen for the first attempt.
@@ -1939,12 +1982,14 @@ impl Worker {
         self.src.send(Request::HashBlocks {
             path: job.src.clone(),
             which: Which::Final,
+            partial_id: self.partial_id(),
             block,
             len: size,
         })?;
         self.dst.send(Request::HashBlocks {
             path: job.dst.clone(),
             which,
+            partial_id: self.partial_id(),
             block,
             len: size,
         })?;
@@ -1956,10 +2001,48 @@ impl Worker {
             Response::Hashes(h) => h,
             other => bail!("unexpected response {other:?}"),
         };
+        Ok(Self::different_ranges(&sh, &dh, block, size))
+    }
+
+    /// Compare the source with one opened final-file snapshot while the
+    /// receiver seeds this job's sidecar from that exact same inode.
+    fn diff_final_and_seed(&mut self, job: &FileJob) -> Result<Vec<(u64, u64)>> {
+        let block = self.opts.block;
+        let size = job.entry.size;
+        self.src.send(Request::HashBlocks {
+            path: job.src.clone(),
+            which: Which::Final,
+            partial_id: self.partial_id(),
+            block,
+            len: size,
+        })?;
+        self.dst.send(Request::SeedAndHash {
+            path: job.dst.clone(),
+            partial_id: self.partial_id(),
+            block,
+            len: size,
+        })?;
+        let source = match ok(self.src.recv()?, "hash source")? {
+            Response::Hashes(hashes) => hashes,
+            other => bail!("unexpected response {other:?}"),
+        };
+        let destination = match ok(self.dst.recv()?, "seed and hash destination")? {
+            Response::Hashes(hashes) => hashes,
+            other => bail!("unexpected response {other:?}"),
+        };
+        Ok(Self::different_ranges(&source, &destination, block, size))
+    }
+
+    fn different_ranges(
+        source: &[u64],
+        destination: &[u64],
+        block: u64,
+        size: u64,
+    ) -> Vec<(u64, u64)> {
         let n = size.div_ceil(block) as usize;
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for i in 0..n {
-            let same = sh.get(i).is_some() && sh.get(i) == dh.get(i);
+            let same = source.get(i).is_some() && source.get(i) == destination.get(i);
             if same {
                 continue;
             }
@@ -1970,7 +2053,7 @@ impl Worker {
                 _ => ranges.push((off, end)),
             }
         }
-        Ok(ranges)
+        ranges
     }
 
     fn transfer_range(&mut self, h: &RangeHandle) -> Result<()> {
@@ -2015,6 +2098,7 @@ impl Worker {
                 self.limit(n);
                 self.src.send(Request::ReadRange {
                     path: job.src.clone(),
+                    attempt: job.attempts,
                     off,
                     len: n as u32,
                 })?;
@@ -2038,6 +2122,8 @@ impl Worker {
             self.dst.send(Request::WriteRange {
                 path: job.dst.clone(),
                 inplace,
+                partial_id: self.partial_id(),
+                attempt: job.attempts,
                 off,
                 hash,
                 data,
@@ -2093,6 +2179,7 @@ impl Worker {
             self.dst.call(Request::Finalize {
                 path: job.dst.clone(),
                 inplace: job.inplace,
+                partial_id: self.partial_id(),
                 meta,
                 flags,
                 fsync: self.opts.fsync,

@@ -9,6 +9,7 @@ use crate::proto::{flags, Entry, PathBytes};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
@@ -19,7 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
+const IDENTITY_FORMAT: u32 = 1;
 
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -91,14 +93,24 @@ pub fn job_identity(
     dst_root: &str,
     semantic_flags: &str,
 ) -> String {
-    let mut s = format!("format={FORMAT}\nsrc_ep={src_endpoint}\n");
-    for (path, copies_contents) in src_roots {
-        s.push_str(&format!("src={path}\tcontents={copies_contents}\n"));
-    }
-    s.push_str(&format!(
-        "dst_ep={dst_endpoint}\ndst={dst_root}\nopts={semantic_flags}\n"
-    ));
-    s
+    serde_json::json!({
+        "format": IDENTITY_FORMAT,
+        "source_endpoint": src_endpoint,
+        "source_roots": src_roots,
+        "destination_endpoint": dst_endpoint,
+        "destination_root": dst_root,
+        "semantics": semantic_flags,
+    })
+    .to_string()
+}
+
+/// Compact collision-resistant ID used in destination partial names. The full
+/// JSON identity remains in checkpoints where it can be inspected by a user.
+pub fn partial_id(job_identity: &str) -> crate::proto::PartialId {
+    let digest = Sha256::digest(job_identity.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    id
 }
 
 const FLUSH_EVERY: usize = 256;
@@ -390,10 +402,7 @@ impl Checkpoint {
     }
 
     fn sync_parent(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            File::open(parent)?.sync_all()?;
-        }
-        Ok(())
+        crate::fsops::fsync_parent(&self.path)
     }
 }
 
