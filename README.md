@@ -334,7 +334,9 @@ logical commands use different partial names, so concurrent copies into one
 tree produce the union of their files and one whole-file rename wins for any
 path both write. A content-identical comparison applies metadata only through
 the inode it verified, so it cannot mix its metadata with another job's newly
-renamed contents. Starting the same logical command twice at once is
+renamed contents. Quick-check metadata repair likewise verifies the inode
+before changing it, so a concurrent publication wins without mixed metadata.
+Starting the same logical command twice at once is
 unsupported: both invocations intentionally address the same resumable
 sidecars. After a crash, abandoned sidecars may be deleted manually if that
 command will not be resumed.

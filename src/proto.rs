@@ -103,6 +103,15 @@ pub enum Op {
         meta: Meta,
         flags: u8,
     },
+    /// Apply metadata to a regular file only if the path still names the inode
+    /// observed by the planner. A concurrent rename makes this a no-op.
+    SetFileMetaIfSame {
+        path: PathBytes,
+        expected_dev: u64,
+        expected_ino: u64,
+        meta: Meta,
+        flags: u8,
+    },
     Remove {
         path: PathBytes,
     },

@@ -390,7 +390,7 @@ impl FsOps {
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
         // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
-        let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. });
+        let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. });
         let create_idx: Vec<usize> = (0..ops.len()).filter(|&i| !is_meta(&ops[i])).collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
         let mut out: Vec<Option<String>> = vec![None; ops.len()];
@@ -468,13 +468,68 @@ fn apply_one(op: &Op) -> Result<()> {
             Op::SetMeta { path, meta, flags } => {
                 let p = resolve(path);
                 #[cfg(debug_assertions)]
-                if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_SETMETA") {
-                    // Test hook (debug builds only): fail metadata for matching paths.
-                    if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
-                        return Err(anyhow!("set metadata {}: injected failure", p.display()));
+                fail_set_meta_for_test(&p)?;
+                set_meta_path(&p, meta, *flags)
+                    .with_context(|| format!("set metadata {}", p.display()))
+            }
+            Op::SetFileMetaIfSame {
+                path,
+                expected_dev,
+                expected_ino,
+                meta,
+                flags,
+            } => {
+                let p = resolve(path);
+                #[cfg(debug_assertions)]
+                fail_set_meta_for_test(&p)?;
+                #[cfg(debug_assertions)]
+                if let Some(ready) = std::env::var_os("SYQ_TEST_QUICK_META_READY_FILE") {
+                    fs::write(&ready, b"ready").with_context(|| {
+                        format!(
+                            "write quick-metadata-ready signal {}",
+                            Path::new(&ready).display()
+                        )
+                    })?;
+                }
+                #[cfg(debug_assertions)]
+                if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_QUICK_META_MS") {
+                    if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
                     }
                 }
-                set_meta_path(&p, meta, *flags)
+                let file = match OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&p)
+                {
+                    Ok(file) => file,
+                    Err(open_error) => {
+                        // A concurrent publisher may have removed the path or
+                        // replaced the regular file with another object. That
+                        // publisher wins; report an error only if the original
+                        // inode is still there but could not be opened safely.
+                        match fs::symlink_metadata(&p) {
+                            Ok(md)
+                                if md.file_type().is_file()
+                                    && md.dev() == *expected_dev
+                                    && md.ino() == *expected_ino =>
+                            {
+                                return Err(open_error).with_context(|| {
+                                    format!("open {} for metadata repair", p.display())
+                                });
+                            }
+                            _ => return Ok(()),
+                        }
+                    }
+                };
+                let md = file.metadata()?;
+                if !md.file_type().is_file()
+                    || md.dev() != *expected_dev
+                    || md.ino() != *expected_ino
+                {
+                    return Ok(());
+                }
+                set_meta_file(&file, meta, *flags)
                     .with_context(|| format!("set metadata {}", p.display()))
             }
             Op::Rmdir { path } => {
@@ -492,6 +547,16 @@ fn apply_one(op: &Op) -> Result<()> {
             }
         }
     }
+}
+
+#[cfg(debug_assertions)]
+fn fail_set_meta_for_test(p: &Path) -> Result<()> {
+    if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_SETMETA") {
+        if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
+            return Err(anyhow!("set metadata {}: injected failure", p.display()));
+        }
+    }
+    Ok(())
 }
 
 const PAR_THREADS: usize = 32;

@@ -1143,8 +1143,10 @@ impl Planner<'_> {
                             }
                             if ff != 0 {
                                 meta_fixes.push((
-                                    Op::SetMeta {
+                                    Op::SetFileMetaIfSame {
                                         path: dst_path.clone(),
+                                        expected_dev: d.dev,
+                                        expected_ino: d.ino,
                                         meta: e.meta(),
                                         flags: ff,
                                     },

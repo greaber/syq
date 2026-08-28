@@ -2410,6 +2410,51 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     assert!(partial_files(&t.0).is_empty());
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
+    let t = Tmp::new();
+    write(&t.path("basis"), b"aaaa");
+    write(&t.path("first"), b"aaaa");
+    write(&t.path("second"), b"bbbb");
+    fs::set_permissions(t.path("basis"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(t.path("first"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(t.path("second"), fs::Permissions::from_mode(0o640)).unwrap();
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    set_mtime(&t.path("first"), 1_600_000_000);
+    set_mtime(&t.path("second"), 1_600_000_001);
+    let ready = t.path("quick-meta-ready");
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
+        .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_QUICK_META_MS", "2000")
+        .spawn()
+        .unwrap();
+    let held = (0..300).any(|_| {
+        if ready.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(held, "first copy never reached quick-check metadata repair");
+
+    let second = syq(&["-a", &t.s("second"), &t.s("basis")]);
+    assert_output_ok(&second);
+    assert_eq!(read(&t.path("basis")), b"bbbb");
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o640);
+    assert_eq!(published.mtime(), 1_600_000_001);
+
+    assert!(first.wait().unwrap().success());
+    assert_eq!(read(&t.path("basis")), b"bbbb");
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o640);
+    assert_eq!(published.mtime(), 1_600_000_001);
+}
+
 #[test]
 fn checksum_identical_file_preserves_destination_inode() {
     let t = Tmp::new();
