@@ -127,7 +127,7 @@ FAKE_GH
 
 chmod 755 "$fake_bin/dotenvx" "$fake_bin/gh" "$repo/scripts/"*.sh
 git -C "$repo" init -q -b master
-git -C "$repo" remote add origin https://github.com/greaber/pcp.git
+git -C "$repo" remote add origin https://github.com/greaber/not-syq.git
 
 common_env=(
   "PATH=$fake_bin:$PATH"

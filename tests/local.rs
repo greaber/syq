@@ -140,6 +140,7 @@ fn remote_syq(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
             t.path("release-manifest.json.sig"),
         )
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_LEGACY_LOG", t.path("legacy.log"))
         .env("XDG_CONFIG_HOME", t.path("config"));
     if let Ok(key) = fs::read_to_string(t.path("release-public-key")) {
         cmd.env("SYQ_TEST_RELEASE_PUBLIC_KEY", key.trim())
@@ -180,10 +181,45 @@ fn cached_remote_helper(t: &Tmp) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+fn legacy_cached_remote_helpers(t: &Tmp) -> [PathBuf; 2] {
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--remote-helper-id")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let helper_id = String::from_utf8(out.stdout).unwrap();
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "linux-x86_64",
+        "aarch64" => "linux-aarch64",
+        arch => panic!("unsupported test architecture {arch}"),
+    };
+    [
+        t.path(&format!(
+            "remote-home/.cache/syq/helpers/{}/{target}/syq",
+            helper_id.trim()
+        )),
+        t.path(&format!(
+            "remote-home/.cache/pcp/helpers/{}/{target}/pcp",
+            helper_id.trim()
+        )),
+    ]
+}
+
+#[cfg(target_os = "linux")]
 #[test]
-fn remote_helper_download_is_verified_and_cached() {
+fn legacy_remote_helper_is_replaced_by_verified_download_and_cached() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
+    let legacy_helpers = legacy_cached_remote_helpers(&t);
+    for legacy_helper in &legacy_helpers {
+        executable(
+            legacy_helper,
+            br#"#!/bin/sh
+printf 'legacy helper ran\n' >> "$FAKE_LEGACY_LOG"
+exit 99
+"#,
+        );
+    }
     let archive = File::create(t.path("release.gz")).unwrap();
     let status = Command::new("gzip")
         .args(["-9", "-n", "-c", env!("CARGO_BIN_EXE_syq")])
@@ -277,6 +313,8 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
     assert!(cached_remote_helper(&t).is_file());
+    assert!(legacy_helpers.iter().all(|helper| !helper.exists()));
+    assert!(!t.path("legacy.log").exists(), "legacy helper was executed");
     assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
@@ -301,17 +339,22 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
 }
 
 #[test]
-fn remote_helper_falls_back_to_same_platform_upload() {
+fn remote_helper_download_failure_does_not_upload_local_binary() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
 
     write(&t.path("src"), b"offline");
     let remote = format!("fake:{}", t.s("dst"));
     let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
-    assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), b"offline");
-    assert!(cached_remote_helper(&t).is_file());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
+    assert!(!out.status.success(), "bootstrap unexpectedly succeeded");
+    assert!(!t.path("dst").exists());
+    assert!(!t.path("remote-home/.cache/syq/helpers").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("could not install the authorized"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("uploading"), "{stderr}");
     assert!(!t.path("curl.log").exists());
 }
 
@@ -334,6 +377,38 @@ fn no_bootstrap_uses_remote_path_without_managed_cache() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"preinstalled");
     assert!(!t.path("remote-home/.cache/syq/helpers").exists());
+}
+
+#[test]
+fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"tcp default");
+    let remote = format!("127.0.0.1:{}", t.s("dst"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--tcp-plain", "--stats", "-a"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("run syq over TCP through fake remote shell");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"tcp default");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("connections: auto: settled at 16 (path 16, peak 16)"),
+        "{stdout}"
+    );
 }
 
 fn set_mtime(p: &Path, secs: i64) {
@@ -1623,19 +1698,17 @@ fn readonly_root_copies_and_reruns() {
 // The old implicit-marker subsystem is gone. Its former filename is ordinary
 // payload and must not make an otherwise identical second run look interrupted.
 #[test]
-fn legacy_pcp_marker_name_is_ordinary_payload() {
+fn legacy_marker_name_is_ordinary_payload() {
+    const LEGACY_TRANSFER_MARKER: &str = ".pcp-transfer-session.json";
+
     let t = Tmp::new();
-    write(
-        &t.path("src/.pcp-transfer-session.json"),
-        b"ordinary user data",
-    );
+    let src_marker = t.path("src").join(LEGACY_TRANSFER_MARKER);
+    let dst_marker = t.path("dst").join(LEGACY_TRANSFER_MARKER);
+    write(&src_marker, b"ordinary user data");
     write(&t.path("src/file"), b"payload");
 
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(
-        read(&t.path("dst/.pcp-transfer-session.json")),
-        b"ordinary user data"
-    );
+    assert_eq!(read(&dst_marker), b"ordinary user data");
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/file")), b"payload");
 }

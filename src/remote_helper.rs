@@ -3,14 +3,14 @@
 //! The local client always names the exact release/protocol helper it expects.
 //! A cache hit adds no extra ssh round trip: the normal remote command computes
 //! the target name and execs the cached binary directly.  On a miss, `conn`
-//! probes the target, downloads the matching release asset, or uploads the
-//! current executable when it can run on the remote platform.
+//! probes the target and downloads the matching authorized release asset.
 
 use crate::proto::VERSION;
 
 pub const RELEASE_BASE_URL: &str = "https://github.com/greaber/syq/releases/download";
 pub const HELPER_MISSING_EXIT: i32 = 125;
 pub const HELPER_NOT_EXECUTABLE_EXIT: i32 = 126;
+const DOWNLOAD_CACHE_GENERATION: &str = "download-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -57,6 +57,13 @@ pub fn release_key() -> String {
     format!("v{}-p{VERSION}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Keep cache provenance separate from the helper identity recorded in signed
+/// release manifests. The generation suffix invalidates upload-capable caches
+/// without requiring otherwise-identical release assets to be republished.
+fn cache_key() -> String {
+    format!("{}-{DOWNLOAD_CACHE_GENERATION}", release_key())
+}
+
 pub fn probe_command() -> &'static str {
     "sh -c 'printf \"syq-helper-target:%s:%s\\n\" \"$(uname -s)\" \"$(uname -m)\"'"
 }
@@ -76,7 +83,7 @@ esac
 program="$HOME/.cache/syq/helpers/{release}/$target/syq"
 [ -x "$program" ] || exit {HELPER_MISSING_EXIT}
 exec "$program" "$@""#,
-        release = release_key(),
+        release = cache_key(),
     );
     format!(
         "sh -c {} syq {}",
@@ -93,13 +100,19 @@ pub fn download_script(target: Target, expected_sha256: &str) -> String {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
         "trusted release hash must be lowercase SHA-256"
     );
-    let release = release_key();
+    let release = cache_key();
+    let legacy_release = release_key();
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let url = format!("{RELEASE_BASE_URL}/{tag}/{}.gz", target.asset);
     let expected_version = format!("syq {}", env!("CARGO_PKG_VERSION"));
     let expected_helper_id = release_key();
     format!(
         r#"set -eu
+legacy_dir="$HOME/.cache/syq/helpers/{legacy_release}/{target_key}"
+legacy_pcp_dir="$HOME/.cache/pcp/helpers/{legacy_release}/{target_key}"
+rm -f "$legacy_dir/syq" "$legacy_pcp_dir/pcp"
+rmdir "$legacy_dir" "$HOME/.cache/syq/helpers/{legacy_release}" 2>/dev/null || :
+rmdir "$legacy_pcp_dir" "$HOME/.cache/pcp/helpers/{legacy_release}" 2>/dev/null || :
 dir="$HOME/.cache/syq/helpers/{release}/{target_key}"
 program="$dir/syq"
 tmp="$dir/.syq.$$.tmp"
@@ -155,46 +168,9 @@ mv "$tmp" "$program"
 cleanup
 trap - EXIT HUP INT TERM"#,
         target_key = target.key,
+        legacy_release = legacy_release,
         url = shell_words::quote(&url),
         expected_sha256 = shell_words::quote(expected_sha256),
-        expected_version = shell_words::quote(&expected_version),
-        expected_helper_id = shell_words::quote(&expected_helper_id),
-    )
-}
-
-pub fn upload_script(target: Target) -> String {
-    let expected_version = format!("syq {}", env!("CARGO_PKG_VERSION"));
-    let expected_helper_id = release_key();
-    format!(
-        r#"set -eu
-dir="$HOME/.cache/syq/helpers/{release}/{target_key}"
-program="$dir/syq"
-tmp="$dir/.syq.$$.tmp"
-mkdir -p "$dir"
-cleanup() {{ rm -f "$tmp"; }}
-trap cleanup EXIT HUP INT TERM
-cat > "$tmp"
-chmod 700 "$tmp"
-got=$("$tmp" --version 2>/dev/null) || {{
-    echo "syq: uploaded helper cannot run on this host" >&2
-    exit 1
-}}
-[ "$got" = {expected_version} ] || {{
-    echo "syq: uploaded helper has unexpected version: $got" >&2
-    exit 1
-}}
-got_id=$("$tmp" --remote-helper-id 2>/dev/null) || {{
-    echo "syq: uploaded helper does not report a helper identity" >&2
-    exit 1
-}}
-[ "$got_id" = {expected_helper_id} ] || {{
-    echo "syq: uploaded helper has unexpected identity: $got_id" >&2
-    exit 1
-}}
-mv "$tmp" "$program"
-trap - EXIT HUP INT TERM"#,
-        release = release_key(),
-        target_key = target.key,
         expected_version = shell_words::quote(&expected_version),
         expected_helper_id = shell_words::quote(&expected_helper_id),
     )
@@ -224,7 +200,8 @@ mod tests {
     #[test]
     fn launcher_uses_versioned_path_and_quotes_arguments() {
         let command = launcher(&["--server".into(), "argument with spaces".into()]);
-        assert!(command.contains(&release_key()));
+        assert!(command.contains(&cache_key()));
+        assert!(command.contains(DOWNLOAD_CACHE_GENERATION));
         assert!(command.contains("linux-x86_64"));
         assert!(command.contains("'argument with spaces'"));
     }
@@ -240,5 +217,7 @@ mod tests {
         assert!(script.contains("sha256sum"));
         assert!(script.contains("checksum mismatch"));
         assert!(!script.contains(".sha256"));
+        assert!(script.contains(&release_key()));
+        assert!(script.contains("rm -f \"$legacy_dir/syq\" \"$legacy_pcp_dir/pcp\""));
     }
 }

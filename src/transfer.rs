@@ -253,12 +253,16 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
+    // TCP data connections are the default (auto-selecting the fastest reachable
+    // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
+    // Local<->local needs no data plane at all.
+    let use_tcp = !args.no_tcp && (src_ep.is_remote() || dst_ep.is_remote());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
-    // this is only where it starts.
+    // start conservatively until TCP reachability has been established below.
     let autotune = args.connections_default;
     if autotune {
         args.connections = if src_ep.is_remote() || dst_ep.is_remote() {
-            tune::START
+            tune::START_SSH
         } else {
             tune::START_LOCAL
         };
@@ -366,8 +370,8 @@ pub fn run(args: Args) -> Result<i32> {
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
-    let spawn_workers = || {
-        for id in 0..args.connections {
+    let spawn_workers = |initial: usize| {
+        for id in 0..initial {
             spawn_worker(id);
         }
         if autotune {
@@ -377,18 +381,13 @@ pub fn run(args: Args) -> Result<i32> {
                 progress.clone(),
                 spawn_worker.clone(),
             );
-            let n0 = args.connections;
+            let n0 = initial;
             let policy = tune::Policy::new(n0, tune::MIN, tune::MAX);
             *tuner.lock().unwrap() = Some(std::thread::spawn(move || {
                 tune::run(policy, gate, sched, progress, |id| spawn_worker(id), n0)
             }));
         }
     };
-    // TCP data connections are the default (auto-selecting the fastest reachable
-    // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
-    // Local<->local needs no data plane at all.
-    let use_tcp = !args.no_tcp && (src_ep.is_remote() || dst_ep.is_remote());
-
     let t0 = std::time::Instant::now();
     let (mut src_ctl, mut dst_ctl) = {
         let (a, b) = (src_ep.clone(), args.clone());
@@ -441,8 +440,17 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
+    let all_remote_endpoints_use_tcp = use_tcp
+        && [&src_ep, &dst_ep].into_iter().all(|ep| match ep {
+            Endpoint::Local => true,
+            Endpoint::Remote(spec) => spec.tcp.lock().unwrap().is_some(),
+        });
+    if autotune && all_remote_endpoints_use_tcp {
+        args.connections = tune::START_TCP;
+        gate.set_limit(args.connections);
+    }
     if !opts.dry_run {
-        spawn_workers();
+        spawn_workers(args.connections);
     }
 
     let dst_root = dst.path.as_bytes().to_vec();
