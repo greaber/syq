@@ -406,7 +406,9 @@ and later brings back is transferred again rather than assumed complete.
 Like rsync, ordinary SYQ runs do not coordinate with each other. Different
 logical commands use different partial names, so concurrent copies into one
 tree produce the union of their files and one whole-file rename wins for any
-path both write. A content-identical comparison applies metadata only through
+path both write — but do not combine concurrent copies with `--delete`,
+which mirrors *its* source and removes the other command's not-yet-shared
+files and sidecars as extras. A content-identical comparison applies metadata only through
 the inode it verified, so it cannot mix its metadata with another job's newly
 renamed contents. Quick-check metadata repair likewise verifies the inode;
 if a concurrent publication replaced it, the repair reports an error instead
@@ -629,7 +631,10 @@ have is removed. The rules are simpler than rsync's, deliberately:
   consumes it. Everything else matching the pattern — an orphan of this
   command, or any other job id — is an ordinary extra: syq copies such names
   as payload, so the name alone proves nothing, and mirroring the source is
-  what --delete is for.
+  what --delete is for. Note that the job identity includes the command's
+  semantic options: change those (or the source/destination spelling they
+  normalize to) and the previous identity's sidecars become orphans —
+  removed by `--delete`, inert otherwise.
 - `--max-delete N` refuses to delete anything — not the first N — when more
   than N deletions are planned, says so, and exits 25 (rsync's code for it).
 - `-n --delete -v` lists every `deleting path` line a real run would print

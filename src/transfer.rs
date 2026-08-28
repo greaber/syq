@@ -752,7 +752,7 @@ pub fn run(args: Args) -> Result<i32> {
             scan_err = Some(e);
         }
     }
-    if st.source_partials > 0 && !args.quiet {
+    if st.source_partials > 0 && !args.quiet && scan_err.is_none() && !st.collision {
         let count = st.source_partials;
         progress.warning(
             "source_partials",
@@ -854,7 +854,7 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
-    if !args.quiet {
+    if !args.quiet && !aborted {
         if opts.verify_only {
             println!(
                 "syq: verified {} files, {} differ/missing, {} in {}",
@@ -2258,11 +2258,6 @@ impl Planner<'_> {
                 self.opts.ignore.clone()
             };
             let mut found = Deletes::default();
-            let our_id = self
-                .opts
-                .partial_id
-                .get()
-                .map(crate::fsops::partial_id_string);
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
@@ -2304,17 +2299,18 @@ impl Planner<'_> {
                         let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
                         // The only sidecar-patterned files that are not extras
                         // are this job's live ones — exactly those the
-                        // namespace preflight listed (that covers truncated and
-                        // compact names, which can't be read back reliably).
+                        // namespace preflight listed. Membership is the whole
+                        // test: a path is only in that set if the receiver
+                        // generated it for this job, and the compact
+                        // (near-PATH_MAX) form doesn't even embed the job id,
+                        // so there is nothing valid to compare names against.
                         // Anything else matching the pattern is an ordinary
                         // extra: syq itself copies such names as payload now,
                         // so a foreign-looking name proves nothing, and a
                         // --delete run concurrent with another job would be
                         // deleting that job's unclaimed payload anyway.
                         if e.kind == Kind::File
-                            && crate::fsops::partial_job_id(name).is_some()
-                            && crate::fsops::partial_job_id(name)
-                                == our_id.as_ref().map(|s| s.as_bytes())
+                            && crate::fsops::is_partial_name(OsStr::from_bytes(name))
                             && live_sidecars.contains(&full)
                         {
                             // Live resume state of this very command.

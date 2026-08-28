@@ -215,21 +215,6 @@ fn partial_path_with_name_max(
     })
 }
 
-/// The job-id part of a partial file name (see `partial_path`), if it is one.
-pub fn partial_job_id(name: &[u8]) -> Option<&[u8]> {
-    if !is_partial_name(OsStr::from_bytes(name)) {
-        return None;
-    }
-    let pos = name
-        .windows(PARTIAL_MARKER.len())
-        .rposition(|part| part == PARTIAL_MARKER.as_bytes())?;
-    Some(&name[pos + PARTIAL_MARKER.len()..])
-}
-
-pub fn partial_id_string(id: &PartialId) -> String {
-    base32(id)
-}
-
 pub fn is_partial_name(name: &OsStr) -> bool {
     let b = name.as_bytes();
     let valid_id = |id: &[u8], len: usize| {
