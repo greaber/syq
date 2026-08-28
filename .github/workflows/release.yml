@@ -139,7 +139,8 @@ jobs:
           SYQ_RELEASE_SIGNING_KEY_PEM_B64: ${{ secrets.SYQ_RELEASE_SIGNING_KEY_PEM_B64 }}
         run: |
           scripts/sign-release-manifest.sh \
-            dist/syq-release-manifest.json dist/syq-release-manifest.json.sig
+            dist/syq-release-manifest.json dist/syq-release-manifest.json.sig \
+            dist/syq-linux-x86_64
       - name: Verify final release inventory
         shell: bash
         run: |

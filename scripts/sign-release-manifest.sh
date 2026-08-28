@@ -3,14 +3,19 @@
 # matches the public key embedded in official binaries.
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-  echo "usage: $0 MANIFEST SIGNATURE_OUTPUT" >&2
+if [ "$#" -ne 3 ]; then
+  echo "usage: $0 MANIFEST SIGNATURE_OUTPUT SYQ_BINARY" >&2
   exit 2
 fi
 manifest=$1
 output=$2
+canonicalizer=$3
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
   echo "missing regular release manifest: $manifest" >&2
+  exit 1
+fi
+if [ ! -x "$canonicalizer" ]; then
+  echo "missing executable syq canonicalizer: $canonicalizer" >&2
   exit 1
 fi
 test -n "${SYQ_RELEASE_PUBLIC_KEY:-}" || {
@@ -22,6 +27,15 @@ test -n "${SYQ_RELEASE_SIGNING_KEY_PEM_B64:-}" || {
   exit 1
 }
 command -v openssl >/dev/null || { echo 'signing needs openssl' >&2; exit 1; }
+command -v jq >/dev/null || { echo 'signing needs jq' >&2; exit 1; }
+jq -e '
+  type == "object"
+  and .signature_scheme == "ed25519-jcs-v1"
+  and (has("signature") | not)
+' "$manifest" >/dev/null || {
+  echo 'release manifest is not unsigned ed25519-jcs-v1 metadata' >&2
+  exit 1
+}
 
 umask 077
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-sign-release.XXXXXXXX")
@@ -29,7 +43,11 @@ cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
 key="$work/signing.pem"
 public="$work/public.pem"
-signature="$work/manifest.sig"
+payload="$work/manifest.jcs"
+verified_payload="$work/verified-manifest.jcs"
+embedded_signature="$work/embedded.sig"
+signed_manifest="$work/signed-manifest.json"
+detached_signature="$work/detached.sig"
 encoded="$work/manifest.sig.b64"
 configured_public="$work/configured-public-key"
 
@@ -46,10 +64,28 @@ test "$derived" = "$SYQ_RELEASE_PUBLIC_KEY" || {
   exit 1
 }
 
-openssl pkeyutl -sign -rawin -inkey "$key" -in "$manifest" -out "$signature"
+"$canonicalizer" --release-manifest-signing-payload "$manifest" > "$payload"
+openssl pkeyutl -sign -rawin -inkey "$key" -in "$payload" -out "$embedded_signature"
 openssl pkeyutl -verify -rawin -pubin -inkey "$public" \
-  -in "$manifest" -sigfile "$signature" >/dev/null
-openssl base64 -A -in "$signature" -out "$encoded"
+  -in "$payload" -sigfile "$embedded_signature" >/dev/null
+embedded_b64=$(openssl base64 -A -in "$embedded_signature")
+jq --sort-keys --arg signature "$embedded_b64" \
+  '. + {signature:$signature}' "$manifest" > "$signed_manifest"
+"$canonicalizer" --release-manifest-signing-payload "$signed_manifest" > "$verified_payload"
+cmp -s "$payload" "$verified_payload" || {
+  echo 'embedded signature changed the canonical manifest payload' >&2
+  exit 1
+}
+openssl pkeyutl -verify -rawin -pubin -inkey "$public" \
+  -in "$verified_payload" -sigfile "$embedded_signature" >/dev/null
+
+# Updaters through 0.1.1 verify this detached signature over the completed
+# manifest. New updaters verify the embedded JCS signature with one download.
+openssl pkeyutl -sign -rawin -inkey "$key" -in "$signed_manifest" -out "$detached_signature"
+openssl pkeyutl -verify -rawin -pubin -inkey "$public" \
+  -in "$signed_manifest" -sigfile "$detached_signature" >/dev/null
+openssl base64 -A -in "$detached_signature" -out "$encoded"
 printf '\n' >> "$encoded"
-chmod 644 "$encoded"
+chmod 644 "$signed_manifest" "$encoded"
+mv -f "$signed_manifest" "$manifest"
 mv -f "$encoded" "$output"

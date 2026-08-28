@@ -135,10 +135,6 @@ fn remote_syq(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
         .env("FAKE_CURL_LOG", t.path("curl.log"))
         .env("FAKE_LOCAL_CURL_LOG", t.path("local-curl.log"))
         .env("FAKE_RELEASE_MANIFEST", t.path("release-manifest.json"))
-        .env(
-            "FAKE_RELEASE_SIGNATURE",
-            t.path("release-manifest.json.sig"),
-        )
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("FAKE_LEGACY_LOG", t.path("legacy.log"))
         .env("XDG_CONFIG_HOME", t.path("config"));
@@ -256,14 +252,19 @@ exit 99
             }
         },
         "installer": {"name": "install.sh", "sha256": "1".repeat(64), "size": 1},
-        "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1}
+        "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
+        "signature_scheme": "ed25519-jcs-v1"
     });
-    let manifest = serde_json::to_vec_pretty(&manifest).unwrap();
     let signing = SigningKey::from_bytes(&[19; 32]);
+    let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
     let signature =
-        base64::engine::general_purpose::STANDARD.encode(signing.sign(&manifest).to_bytes());
-    write(&t.path("release-manifest.json"), &manifest);
-    write(&t.path("release-manifest.json.sig"), signature.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
+    let mut manifest = manifest;
+    manifest["signature"] = signature.into();
+    write(
+        &t.path("release-manifest.json"),
+        &serde_json::to_vec_pretty(&manifest).unwrap(),
+    );
     write(
         &t.path("release-public-key"),
         base64::engine::general_purpose::STANDARD
@@ -284,7 +285,6 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 case "$url" in
-    *.json.sig) cp "$FAKE_RELEASE_SIGNATURE" "$out" ;;
     *.json) cp "$FAKE_RELEASE_MANIFEST" "$out" ;;
     *) exit 22 ;;
 esac
@@ -314,7 +314,7 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
     assert!(cached_remote_helper(&t).is_file());
     assert!(legacy_helpers.iter().all(|helper| helper.exists()));
     assert!(!t.path("legacy.log").exists(), "legacy helper was executed");
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
+    assert_eq!(read(&t.path("local-curl.log")), b"fetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
     let probes = fs::read_to_string(t.path("rsh.log"))
@@ -328,7 +328,7 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
     let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"second");
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
+    assert_eq!(read(&t.path("local-curl.log")), b"fetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
     let probes = fs::read_to_string(t.path("rsh.log"))
         .unwrap()
