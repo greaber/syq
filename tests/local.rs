@@ -179,6 +179,7 @@ fn remote_syq(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
         .env("XDG_CONFIG_HOME", t.path("config"));
     if let Ok(key) = fs::read_to_string(t.path("release-public-key")) {
         cmd.env("SYQ_TEST_RELEASE_PUBLIC_KEY", key.trim())
+            .env("SYQ_TEST_RELEASE_BUILD", "1")
             .env(
                 "SYQ_TEST_RELEASE_DOWNLOADS",
                 "https://release.invalid/download",
@@ -199,30 +200,28 @@ fn assert_output_ok(out: &Output) {
 }
 
 fn cached_remote_helper(t: &Tmp) -> PathBuf {
-    let root = t.path("remote-home/.cache/syq/helpers");
-    let release = fs::read_dir(&root)
-        .unwrap()
-        .next()
-        .expect("release cache directory")
-        .unwrap()
-        .path();
-    let target = fs::read_dir(release)
-        .unwrap()
-        .next()
-        .expect("target cache directory")
-        .unwrap()
-        .path();
-    target.join("syq")
+    let identity = binary_identity("--build-identity");
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "linux-x86_64",
+        "aarch64" => "linux-aarch64",
+        arch => panic!("unsupported test architecture {arch}"),
+    };
+    t.path(&format!(
+        "remote-home/.cache/syq/helpers/{identity}-release-v1/{target}/syq"
+    ))
+}
+
+fn binary_identity(argument: &str) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg(argument)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 #[cfg(target_os = "linux")]
 fn legacy_cached_remote_helpers(t: &Tmp) -> [PathBuf; 2] {
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .arg("--remote-helper-id")
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let helper_id = String::from_utf8(out.stdout).unwrap();
     let target = match std::env::consts::ARCH {
         "x86_64" => "linux-x86_64",
         "aarch64" => "linux-aarch64",
@@ -230,19 +229,19 @@ fn legacy_cached_remote_helpers(t: &Tmp) -> [PathBuf; 2] {
     };
     [
         t.path(&format!(
-            "remote-home/.cache/syq/helpers/{}/{target}/syq",
-            helper_id.trim()
+            "remote-home/.cache/syq/helpers/v{}-p5-download-v1/{target}/syq",
+            env!("CARGO_PKG_VERSION")
         )),
         t.path(&format!(
-            "remote-home/.cache/syq/helpers/{}/{target}/syq",
-            helper_id.trim()
+            "remote-home/.cache/syq/helpers/v{}-p5/{target}/syq",
+            env!("CARGO_PKG_VERSION")
         )),
     ]
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn legacy_remote_helper_is_replaced_by_verified_download_and_cached() {
+fn release_keyed_remote_helper_ignores_legacy_protocol_caches() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let legacy_helpers = legacy_cached_remote_helpers(&t);
@@ -284,7 +283,7 @@ exit 99
         "repository": "https://github.com/greaber/syq",
         "version": env!("CARGO_PKG_VERSION"),
         "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
-        "helper_id": format!("v{}-p{}", env!("CARGO_PKG_VERSION"), crate_protocol_version()),
+        "helper_id": format!("v{}-p0", env!("CARGO_PKG_VERSION")),
         "artifacts": {
             (target): {
                 "binary": {"name": asset, "sha256": "0".repeat(64), "size": 1},
@@ -348,7 +347,7 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
     assert!(cached_remote_helper(&t).is_file());
-    assert!(legacy_helpers.iter().all(|helper| !helper.exists()));
+    assert!(legacy_helpers.iter().all(|helper| helper.exists()));
     assert!(!t.path("legacy.log").exists(), "legacy helper was executed");
     assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
@@ -374,7 +373,7 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
 }
 
 #[test]
-fn remote_helper_download_failure_does_not_upload_local_binary() {
+fn development_build_refuses_managed_remote_bootstrap() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
 
@@ -386,18 +385,13 @@ fn remote_helper_download_failure_does_not_upload_local_binary() {
     assert!(!t.path("remote-home/.cache/syq/helpers").exists());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("could not install the authorized"),
+        stderr.contains(
+            "managed remote bootstrap is only available from an official syq release build"
+        ),
         "{stderr}"
     );
     assert!(!stderr.contains("uploading"), "{stderr}");
     assert!(!t.path("curl.log").exists());
-}
-
-fn crate_protocol_version() -> u32 {
-    // Kept explicit in this black-box test so the signed helper identity must
-    // move deliberately when the wire protocol changes.
-    // 7: Scan.report_ignored/ScanIgnored, StatMany.follow, Op::Unlink.
-    7
 }
 
 #[test]
@@ -3079,6 +3073,68 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     assert_eq!(read(&t.path("basis")), second_contents);
     assert!(first.wait().unwrap().success());
     assert_eq!(read(&t.path("basis")), first_contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn content_identical_seed_publishes_contents_and_metadata_atomically() {
+    let t = Tmp::new();
+    let first_contents = vec![b'a'; 8 * 1024 * 1024];
+    let second_contents = vec![b'b'; 8 * 1024 * 1024];
+    write(&t.path("basis"), &first_contents);
+    write(&t.path("first"), &first_contents);
+    write(&t.path("second"), &second_contents);
+    fs::set_permissions(t.path("first"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(t.path("second"), fs::Permissions::from_mode(0o640)).unwrap();
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    set_mtime(&t.path("first"), 1_600_000_001);
+    set_mtime(&t.path("second"), 1_600_000_002);
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "-j",
+            "1",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("first"),
+            &t.s("basis"),
+        ])
+        .env("SYQ_TEST_HOLD_AFTER_SEED_MS", "2000")
+        .spawn()
+        .unwrap();
+    let seeded = (0..300).any(|_| {
+        if partial_files(&t.0).len() == 1 {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(seeded, "first copy never seeded its sidecar");
+
+    let second = syq(&[
+        "-a",
+        "-j",
+        "1",
+        "--bwlimit",
+        "1G",
+        &t.s("second"),
+        &t.s("basis"),
+    ]);
+    assert_output_ok(&second);
+    assert_eq!(read(&t.path("basis")), second_contents);
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o640);
+    assert_eq!(published.mtime(), 1_600_000_002);
+
+    assert!(first.wait().unwrap().success());
+    assert_eq!(read(&t.path("basis")), first_contents);
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o600);
+    assert_eq!(published.mtime(), 1_600_000_001);
     assert!(partial_files(&t.0).is_empty());
 }
 
