@@ -685,6 +685,7 @@ pub fn run(args: Args) -> Result<i32> {
         missing_dirs: std::collections::HashSet::new(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
+        live_sidecars: std::collections::HashSet::new(),
         unusable_files: std::collections::HashSet::new(),
         deferred_payloads: Vec::new(),
         source_partials: 0,
@@ -1101,6 +1102,8 @@ struct Planner<'a> {
     /// Ordinary payload names cannot collide and do not need to stay in RAM.
     payload_paths: std::collections::HashMap<PathBytes, String>,
     sidecar_paths: std::collections::HashMap<PathBytes, String>,
+    /// The keys of sidecar_paths, kept past finish_planning only for --delete.
+    live_sidecars: std::collections::HashSet<PathBytes>,
     /// Files whose destination cannot accommodate a safe sidecar name. They
     /// fail individually while the rest of the scan and transfer continue.
     unusable_files: std::collections::HashSet<PathBytes>,
@@ -1480,6 +1483,15 @@ impl Planner<'_> {
     /// what was held back. With several sources that is every batch, after
     /// the cross-source claim check; otherwise only the deferred payloads.
     fn finish_planning(&mut self) -> Result<()> {
+        // The preflight maps are dead now — except the sidecar set, which
+        // --delete needs (only its keys) to tell a live sidecar from an
+        // orphan. On multi-million-file trees these are the difference
+        // between transient and resident gigabytes.
+        self.payload_paths = std::collections::HashMap::new();
+        let sidecars = std::mem::take(&mut self.sidecar_paths);
+        if self.opts.delete {
+            self.live_sidecars = sidecars.into_keys().collect();
+        }
         let deferred = std::mem::take(&mut self.deferred_payloads);
         if let Some(buf) = &mut self.buffer {
             buf.extend(deferred);
@@ -2107,7 +2119,7 @@ impl Planner<'_> {
 
     fn entry_is_payload(&self, entry: &Entry) -> bool {
         match entry.kind {
-            Kind::Dir => self.opts.recursive,
+            Kind::Dir => self.opts.recursive || self.keep_dirs,
             Kind::File => true,
             Kind::Symlink => self.opts.links,
             Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => self.opts.devices,
@@ -2254,11 +2266,8 @@ impl Planner<'_> {
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
-            // Sidecars this run keeps (another job's, or this job's live
-            // ones); their ancestors must stay too, and -n must know.
-            let mut preserved: Vec<PathBytes> = Vec::new();
             let seen = &self.dst_seen;
-            let live_sidecars = &self.sidecar_paths;
+            let live_sidecars = &self.live_sidecars;
             // Destination directories whose path the source claims as a
             // non-directory (a file we chose not to send, a symlink skipped
             // without -l, ...). The source has that path, so syq doesn't touch
@@ -2293,23 +2302,22 @@ impl Planner<'_> {
                         let dst_rel = join(sub.as_bytes(), &e.path);
                         let rel = display(&dst_rel);
                         let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
-                        // Only a regular file can be a sidecar; a directory or
-                        // symlink with that name is an ordinary extra. Another
-                        // job's sidecar is that command's live resume state,
-                        // left alone. One of ours is live exactly when the
-                        // namespace preflight lists its path as a sidecar this
-                        // job may use (that covers truncated and compact names,
-                        // which can't be read back reliably); otherwise it is
-                        // an orphan and an extra. Whatever is kept protects
-                        // its ancestors, so -n and the real run agree.
-                        if e.kind == Kind::File && crate::fsops::partial_job_id(name).is_some() {
-                            let ours = crate::fsops::partial_job_id(name)
-                                == our_id.as_ref().map(|s| s.as_bytes());
-                            if ours && !live_sidecars.contains_key(&full) {
-                                found.leaves.push((full, rel, Vec::new()));
-                            } else {
-                                preserved.push(e.path.clone());
-                            }
+                        // The only sidecar-patterned files that are not extras
+                        // are this job's live ones — exactly those the
+                        // namespace preflight listed (that covers truncated and
+                        // compact names, which can't be read back reliably).
+                        // Anything else matching the pattern is an ordinary
+                        // extra: syq itself copies such names as payload now,
+                        // so a foreign-looking name proves nothing, and a
+                        // --delete run concurrent with another job would be
+                        // deleting that job's unclaimed payload anyway.
+                        if e.kind == Kind::File
+                            && crate::fsops::partial_job_id(name).is_some()
+                            && crate::fsops::partial_job_id(name)
+                                == our_id.as_ref().map(|s| s.as_bytes())
+                            && live_sidecars.contains(&full)
+                        {
+                            // Live resume state of this very command.
                         } else {
                             if e.kind == Kind::Dir {
                                 let depth = full.iter().filter(|&&c| c == b'/').count();
@@ -2339,21 +2347,12 @@ impl Planner<'_> {
                 &mut |w| self.progress.error(&format!("syq: delete: {w}")),
             );
             res?;
-            for p in preserved {
-                // Every ancestor of a kept sidecar is protected.
-                for (i, &c) in p.iter().enumerate() {
-                    if c == b'/' {
-                        protected.insert(join(&root, &p[..i]));
-                    }
-                }
-            }
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
                 for (path, rel) in v {
                     if protected.contains(&path) {
-                        self.progress.eprintln(&format!(
-                            "syq: not deleting {rel}: it holds paths this run keeps"
-                        ));
+                        self.progress
+                            .eprintln(&format!("syq: not deleting {rel}: it holds ignored paths"));
                     } else {
                         self.deletes.dirs.entry(d).or_default().push((path, rel));
                     }

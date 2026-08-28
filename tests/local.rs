@@ -1812,14 +1812,14 @@ fn delete_removes_only_this_jobs_orphaned_sidecars() {
     assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
     assert!(partial.exists());
 
-    // 4. Another job's sidecar (a different id) is that job's live state,
-    //    kept even though its name is an orphan here.
+    // 4. Any other id is an ordinary extra (syq copies such names as
+    //    payload, so the name alone proves nothing).
     let t = Tmp::new();
     write(&t.path("src/a"), b"a");
     let other = format!("dst/.gone.syq-part.{}", "a".repeat(26));
-    write(&t.path(&other), b"someone else's");
+    write(&t.path(&other), b"unclaimed, whoever wrote it");
     run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
-    assert!(t.path(&other).exists());
+    assert!(!t.path(&other).exists());
 }
 
 #[test]
@@ -2151,7 +2151,7 @@ fn existing_leaves_a_file_where_a_source_directory_would_go() {
 }
 
 #[test]
-fn delete_keeps_payload_named_like_sidecars_and_other_jobs_sidecars() {
+fn delete_treats_sidecar_patterned_files_as_ordinary_extras() {
     let t = Tmp::new();
     write(
         &t.path("src/.notes.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -2169,17 +2169,13 @@ fn delete_keeps_payload_named_like_sidecars_and_other_jobs_sidecars() {
     );
     let so = run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
     // The source's sidecar-named file is ordinary payload (copied, and here
-    // already up to date), so the destination copy stays. The odd name is an
-    // ordinary extra; another job's sidecar is that job's, left alone.
+    // already up to date), so the destination copy stays. Everything else
+    // matching the pattern is an ordinary extra, whatever id it carries.
     assert_eq!(
         listing(&t.path("dst")),
-        [
-            ".gone.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ".notes.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "real"
-        ]
+        [".notes.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa", "real"]
     );
-    assert!(so.contains("1 deleted"), "{so}");
+    assert!(so.contains("2 deleted"), "{so}");
 }
 
 #[test]
@@ -4472,24 +4468,15 @@ fn sidecar_whose_target_became_a_directory_is_an_orphan() {
 }
 
 #[test]
-fn kept_sidecars_protect_their_ancestors() {
+fn sidecar_patterned_extras_do_not_block_directory_deletion() {
     let t = Tmp::new();
     write(&t.path("src/a"), b"a");
     let foreign = format!("dst/extra/deep/.f.syq-part.{}", "a".repeat(26));
-    write(&t.path(&foreign), b"another job's");
+    write(&t.path(&foreign), b"unclaimed");
     write(&t.path("dst/extra/gone"), b"an ordinary extra");
-    // Dry run and real run agree: the extras go, the sidecar's directory
-    // chain stays, exit 0 both times.
     let so = run_ok(&["-a", "-n", "-v", "--delete", &t.s("src/"), &t.s("dst")]);
-    assert!(so.contains("deleting extra/gone"), "{so}");
-    assert!(!so.lines().any(|l| l == "deleting extra/"), "{so}");
+    assert!(so.contains("deleting extra/"), "{so}");
     let out = syq(&["-a", "-v", "--delete", &t.s("src/"), &t.s("dst")]);
     assert!(out.status.success(), "{}", stderr_of(&out));
-    assert!(t.path(&foreign).exists());
-    assert!(!t.path("dst/extra/gone").exists());
-    assert!(
-        stderr_of(&out).contains("not deleting extra/"),
-        "{}",
-        stderr_of(&out)
-    );
+    assert_eq!(listing(&t.path("dst")), ["a"]);
 }

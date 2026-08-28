@@ -291,8 +291,9 @@ rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
 semantics and block size, but not operational controls such as checksum
 checking, `-j`, verbosity, progress or bandwidth limiting. Filesystem
 component limits are queried and cached per directory; long basenames are
-deterministically truncated and disambiguated to fit. Exceptionally long full
-paths can still fail with a clear error. SYQ does not `fsync` transfer data;
+deterministically truncated and disambiguated to fit. An exceptionally long
+full path still fails that one file with a clear error (even when it is
+already up to date) while the rest of the transfer continues. SYQ does not `fsync` transfer data;
 atomic sidecar publication provides old-or-new visibility and resumable
 interrupted work, not crash-durability across power loss.
 Small files still use a pipelined whole-file request, but the receiver writes
@@ -587,13 +588,14 @@ have is removed. The rules are simpler than rsync's, deliberately:
   would otherwise look like one whose contents vanished (`source scan reported
   errors; skipping deletions`). An interrupted run therefore never deletes
   anything, and directory mtimes are set after the deletes.
-- **This job's orphaned sidecars count as extras.** A
-  `.name.syq-part.<job-id>` of *this* command whose `name` is no longer in
-  the source is removed. One whose file *is* in the source stays, whatever
-  happened to that file this run (failed, filtered, already up to date): it
-  is resume state, and the next transfer of that file consumes it. Sidecars
-  of *other* jobs (another logical command into the same tree) are never
-  touched: they are that command's live state, not extras.
+- **Sidecar-patterned files are extras unless they are this job's live
+  resume state.** A `.name.syq-part.<job-id>` of *this* command whose `name`
+  is still in the source stays, whatever happened to that file this run
+  (failed, filtered, already up to date): the next transfer of that file
+  consumes it. Everything else matching the pattern — an orphan of this
+  command, or any other job id — is an ordinary extra: syq copies such names
+  as payload, so the name alone proves nothing, and mirroring the source is
+  what --delete is for.
 - `--max-delete N` refuses to delete anything — not the first N — when more
   than N deletions are planned, says so, and exits 25 (rsync's code for it).
 - `-n --delete -v` lists every `deleting path` line a real run would print
