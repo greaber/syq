@@ -29,7 +29,7 @@ release also has an immutable versioned installer, for example
 another directory, download the script and run `sh install.sh --bin-dir DIR`
 (or pipe it to `sh -s -- --bin-dir DIR`). The script detects the target,
 verifies the archive's embedded SHA-256 and size, runs the temporary binary to
-check its version and protocol identity, and then replaces `syq` atomically.
+check its version and release identity, and then replaces `syq` atomically.
 Even with `--bin-dir`, either `HOME` or `XDG_CONFIG_HOME` must be set so every
 successful standalone installation can record its managed-install receipt.
 
@@ -45,6 +45,12 @@ Or build from source with the pinned Rust toolchain:
 cargo build --release          # binary at target/release/syq
 cargo install --locked --path . # or: put it on your PATH
 ```
+
+Source builds carry a Git-derived build identity and deliberately do not claim
+to be an immutable release. Managed remote bootstrap is therefore available
+only in official release binaries. To use a source build remotely, install the
+same build there and pass `--syq-path /path/to/syq` (or put it on the remote
+`PATH` and use `--no-bootstrap`).
 
 Standalone installs check the signed release manifest at most once a day after
 a successful interactive command. They only print an update notice by default:
@@ -63,7 +69,7 @@ browser-oriented distribution would need Apple Developer ID signing and
 notarization in addition to this terminal-first path.
 
 The remote side runs `syq --server`, but it does not need to be installed or
-configured first. syq uses an exact versioned helper under
+configured first. An official syq uses its exact release helper under
 `~/.cache/syq/helpers/`. On first use of a version it detects the remote
 platform, downloads the matching compressed binary from that version's GitHub
 release, verifies its SHA-256 against the separately signed release manifest,
@@ -73,15 +79,17 @@ probe connection.
 The managed cache accepts only the downloaded, verified release binary. If the
 remote cannot download it, bootstrapping fails visibly; install a compatible
 binary yourself and pass `--syq-path /path/to/syq`, or put it on the
-non-interactive remote `PATH` and use `--no-bootstrap`. Helpers cached by an
-older upload-capable version are never executed and are removed when their
-download-only replacement is installed.
+non-interactive remote `PATH` and use `--no-bootstrap`. Helpers cached under an
+older identity or cache layout are never executed; they may be removed with the
+rest of the disposable helper cache.
 
 The local client verifies the Ed25519-signed manifest and passes its trusted
 hash to the remote install script. The remote uses `curl` or `wget`, `gzip`, and
 one of `sha256sum`, `shasum`, or `openssl`. Version directories coexist and the
 helper cache can be removed at any time; syq recreates the helper it needs on
-the next connection.
+the next connection. After launch, both peers require the same build identity:
+the release tag for official binaries, or the Git-derived identity when an
+explicit source-built helper is used.
 
 - **macOS (Apple Silicon / Intel):** build natively on the Mac with
   `cargo build --release` (needs the Xcode command-line tools, `xcode-select

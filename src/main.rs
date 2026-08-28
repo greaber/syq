@@ -5,6 +5,7 @@ mod conn;
 mod crypto;
 mod direct;
 mod fsops;
+mod identity;
 mod progress;
 mod proto;
 mod remote_helper;
@@ -51,8 +52,14 @@ fn main() {
     tune_allocator();
     raise_nofile();
     let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("--build-identity") {
+        println!("{}", identity::build());
+        return;
+    }
+    // Compatibility with the 0.1.0 standalone updater. New code uses the
+    // release/build identity above and never interprets this as a protocol.
     if argv.get(1).map(String::as_str) == Some("--remote-helper-id") {
-        println!("{}", remote_helper::release_key());
+        println!("{}", identity::legacy_helper_id());
         return;
     }
     if argv.get(1).map(String::as_str) == Some("--server") {

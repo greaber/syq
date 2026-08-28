@@ -1,16 +1,15 @@
-//! Versioned remote helper discovery and installation commands.
+//! Release/build-identified remote helper discovery and installation commands.
 //!
-//! The local client always names the exact release/protocol helper it expects.
-//! A cache hit adds no extra ssh round trip: the normal remote command computes
-//! the target name and execs the cached binary directly.  On a miss, `conn`
-//! probes the target and downloads the matching authorized release asset.
-
-use crate::proto::VERSION;
+//! Official clients name their exact release; development clients carry a Git
+//! identity but may not populate the managed cache. A cache hit adds no extra
+//! ssh round trip: the normal remote command computes the target name and execs
+//! the cached binary directly. On a miss, `conn` probes the target and downloads
+//! the matching authorized release asset.
 
 pub const RELEASE_BASE_URL: &str = "https://github.com/greaber/syq/releases/download";
 pub const HELPER_MISSING_EXIT: i32 = 125;
 pub const HELPER_NOT_EXECUTABLE_EXIT: i32 = 126;
-const DOWNLOAD_CACHE_GENERATION: &str = "download-v1";
+const DOWNLOAD_CACHE_GENERATION: &str = "release-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -53,15 +52,15 @@ impl Target {
     }
 }
 
-pub fn release_key() -> String {
-    format!("v{}-p{VERSION}", env!("CARGO_PKG_VERSION"))
+pub fn helper_identity() -> &'static str {
+    crate::identity::build()
 }
 
-/// Keep cache provenance separate from the helper identity recorded in signed
-/// release manifests. The generation suffix invalidates upload-capable caches
-/// without requiring otherwise-identical release assets to be republished.
+/// Keep cache layout separate from peer identity. Changing the generation
+/// prevents older cache formats from being executed without changing which
+/// builds are wire-compatible.
 fn cache_key() -> String {
-    format!("{}-{DOWNLOAD_CACHE_GENERATION}", release_key())
+    format!("{}-{DOWNLOAD_CACHE_GENERATION}", helper_identity())
 }
 
 pub fn probe_command() -> &'static str {
@@ -101,18 +100,12 @@ pub fn download_script(target: Target, expected_sha256: &str) -> String {
         "trusted release hash must be lowercase SHA-256"
     );
     let release = cache_key();
-    let legacy_release = release_key();
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let url = format!("{RELEASE_BASE_URL}/{tag}/{}.gz", target.asset);
     let expected_version = format!("syq {}", env!("CARGO_PKG_VERSION"));
-    let expected_helper_id = release_key();
+    let expected_identity = helper_identity();
     format!(
         r#"set -eu
-legacy_dir="$HOME/.cache/syq/helpers/{legacy_release}/{target_key}"
-legacy_pcp_dir="$HOME/.cache/pcp/helpers/{legacy_release}/{target_key}"
-rm -f "$legacy_dir/syq" "$legacy_pcp_dir/pcp"
-rmdir "$legacy_dir" "$HOME/.cache/syq/helpers/{legacy_release}" 2>/dev/null || :
-rmdir "$legacy_pcp_dir" "$HOME/.cache/pcp/helpers/{legacy_release}" 2>/dev/null || :
 dir="$HOME/.cache/syq/helpers/{release}/{target_key}"
 program="$dir/syq"
 tmp="$dir/.syq.$$.tmp"
@@ -156,11 +149,11 @@ got=$("$tmp" --version 2>/dev/null) || {{
     echo "syq: downloaded helper has unexpected version: $got" >&2
     exit 1
 }}
-got_id=$("$tmp" --remote-helper-id 2>/dev/null) || {{
-    echo "syq: downloaded helper does not report a helper identity" >&2
+got_id=$("$tmp" --build-identity 2>/dev/null) || {{
+    echo "syq: downloaded helper does not report a build identity" >&2
     exit 1
 }}
-[ "$got_id" = {expected_helper_id} ] || {{
+[ "$got_id" = {expected_identity} ] || {{
     echo "syq: downloaded helper has unexpected identity: $got_id" >&2
     exit 1
 }}
@@ -168,11 +161,10 @@ mv "$tmp" "$program"
 cleanup
 trap - EXIT HUP INT TERM"#,
         target_key = target.key,
-        legacy_release = legacy_release,
         url = shell_words::quote(&url),
         expected_sha256 = shell_words::quote(expected_sha256),
         expected_version = shell_words::quote(&expected_version),
-        expected_helper_id = shell_words::quote(&expected_helper_id),
+        expected_identity = shell_words::quote(expected_identity),
     )
 }
 
@@ -217,7 +209,8 @@ mod tests {
         assert!(script.contains("sha256sum"));
         assert!(script.contains("checksum mismatch"));
         assert!(!script.contains(".sha256"));
-        assert!(script.contains(&release_key()));
-        assert!(script.contains("rm -f \"$legacy_dir/syq\" \"$legacy_pcp_dir/pcp\""));
+        assert!(script.contains(helper_identity()));
+        assert!(script.contains("--build-identity"));
+        assert!(!script.contains("--remote-helper-id"));
     }
 }

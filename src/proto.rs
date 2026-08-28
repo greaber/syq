@@ -8,7 +8,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-pub const VERSION: u32 = 6;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 const COMPRESS_MIN: usize = 512;
 
@@ -116,8 +115,7 @@ pub enum Op {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Request {
     Hello {
-        version: u32,
-        release: String,
+        identity: String,
         compress: bool,
         debug: bool,
         token: Vec<u8>,
@@ -239,8 +237,7 @@ pub enum Request {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Response {
     HelloOk {
-        version: u32,
-        release: String,
+        identity: String,
     },
     /// Each advertised data address with its interface link speed in Mbps
     /// (0 = unknown). The address the client's ssh session arrived on is first.
