@@ -299,7 +299,9 @@ checking, `-j`, verbosity, progress or bandwidth limiting. Filesystem
 component limits are queried and cached per directory; long basenames are
 deterministically truncated and disambiguated to fit. An exceptionally long
 full path still fails that one file with a clear error (even when it is
-already up to date) while the rest of the transfer continues. SYQ does not `fsync` transfer data;
+already up to date) while the rest of the transfer continues, and so does a
+destination entry — say, a directory some other tool left — already occupying
+the exact path this job's sidecar for that file needs. SYQ does not `fsync` transfer data;
 atomic sidecar publication provides old-or-new visibility and resumable
 interrupted work, not crash-durability across power loss.
 Small files still use a pipelined whole-file request, but the receiver writes
@@ -639,10 +641,11 @@ have is removed. The rules are simpler than rsync's, deliberately:
   removed by `--delete`, inert otherwise.
 - `--max-delete N` refuses to delete anything — not the first N — when more
   than N deletions are planned, says so, and exits 25 (rsync's code for it).
-- `-n --delete -v` lists every `deleting path` line a real run would print
-  (a stale partial that the real run resumes from and renames away is the one
-  thing `-n` lists that it won't delete separately). The summary reports
-  `N deleted` / `N would be deleted`.
+- `-n --delete -v` lists every `deleting path` line a real run would print.
+  The summary reports `N deleted` / `N would be deleted`. `--delete`
+  conflicts with `--verify-only` (deleting is the opposite of writing
+  nothing) and with `--files-from` (deletion scope under a file list is
+  ambiguous).
 
 Deletion goes through the control connection in batches of 1000 (the
 destination side unlinks each batch in parallel); it isn't spread over the
