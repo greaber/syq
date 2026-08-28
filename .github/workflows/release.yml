@@ -83,7 +83,16 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.flags }}
           SYQ_RELEASE_PUBLIC_KEY: ${{ vars.SYQ_RELEASE_PUBLIC_KEY }}
+          SYQ_RELEASE_BUILD: "1"
         run: cargo build --locked --release --bin syq --target '${{ matrix.target }}'
+      - name: Validate release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          program='target/${{ matrix.target }}/release/syq'
+          test "$("$program" --version)" = "syq ${GITHUB_REF_NAME#v}"
+          test "$("$program" --build-identity)" = "$GITHUB_REF_NAME"
+          test "$("$program" --remote-helper-id)" = "$GITHUB_REF_NAME-p0"
       - name: Stage raw and compressed binaries
         shell: bash
         run: |
