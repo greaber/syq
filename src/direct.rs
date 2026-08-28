@@ -296,6 +296,16 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     match status.code() {
         Some(0) => Ok(0),
+        // 23 (some files failed) and 25 (--max-delete refused) pass through:
+        // they are transfer results, and the remote's stderr was inherited so
+        // its errors are already printed. Exit 1 is also a defined remote
+        // result (fatal), but it is indistinguishable from "hostA cannot
+        // reach the destination", where the --relay hint below is the useful
+        // answer — so 1 keeps the hint. All of this assumes the -e shell
+        // relays the remote exit status (ssh does, using 255 for its own
+        // transport failures); a custom shell that exits 23/25 itself would
+        // be mistaken for the orchestrator.
+        Some(c @ (23 | 25)) => Ok(c),
         Some(c) => {
             bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
         }

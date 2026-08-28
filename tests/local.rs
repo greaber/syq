@@ -4938,3 +4938,187 @@ fn checkpoint_invalidation_survives_trailing_slash_destination() {
     assert_eq!(read(&t.path("dst/f")), b"data");
     assert_eq!(transferred(&so), 1, "{so}");
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn live_sidecar_survives_delete_with_dotted_destination_spelling() {
+    // `dst/.` and `dst//` must produce the same keys as `dst`: the receiver
+    // rebuilds sidecar paths through Path (which normalizes), the delete walk
+    // joins bytes (which doesn't), and a spelling mismatch classified the
+    // job's own live sidecar as an orphan.
+    for spelling in ["/.", "//"] {
+        let t = Tmp::new();
+        write(&t.path("src/f"), &vec![7u8; 8 << 20]);
+        fs::create_dir_all(t.path("dst")).unwrap();
+        let dst = format!("{}{spelling}", t.s("dst"));
+        let partial = interrupted_partial(
+            &["-a", "--bwlimit", "1G", &t.s("src/"), &dst],
+            &t.path("dst"),
+        );
+        // Filtered target: the sidecar is resume state and must survive, in
+        // this spelling and cross-spelling alike.
+        let so = run_ok(&[
+            "-a",
+            "--bwlimit",
+            "1G",
+            "--delete",
+            "--max-size",
+            "10",
+            &t.s("src/"),
+            &dst,
+        ]);
+        assert!(partial.exists(), "{spelling}: {so}");
+        let so = run_ok(&[
+            "-a",
+            "--bwlimit",
+            "1G",
+            "--delete",
+            "--max-size",
+            "10",
+            &t.s("src/"),
+            &t.s("dst"),
+        ]);
+        assert!(partial.exists(), "cross-spelling {spelling}: {so}");
+    }
+}
+
+// ----------------------------------------------------------- review round 12
+
+#[test]
+fn files_from_leaves_unlisted_destination_root_metadata_alone() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o755)).unwrap();
+    write(&t.path("list"), b"a\n");
+    run_ok(&["-a", "--files-from", &t.s("list"), &t.s("src"), &t.s("dst")]);
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(read(&t.path("dst/a")), b"a");
+    assert_eq!(
+        fs::metadata(t.path("dst")).unwrap().mode() & 0o777,
+        0o755,
+        "the unlisted root keeps its own mode"
+    );
+    // An empty list still creates a missing destination (syq's choice:
+    // rsync 3.2.7 creates it only when spelled with a trailing slash).
+    write(&t.path("empty"), b"");
+    run_ok(&[
+        "-a",
+        "--files-from",
+        &t.s("empty"),
+        &t.s("src"),
+        &t.s("dst2"),
+    ]);
+    assert!(t.path("dst2").is_dir());
+}
+
+#[test]
+fn direct_remote_to_remote_passes_through_defined_exit_codes() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("dst/extra1"), b"x");
+    write(&t.path("dst/extra2"), b"y");
+    let src = format!("fake:{}", t.s("src/"));
+    let dst = format!("fake:{}", t.s("dst"));
+    // --max-delete refusal on the remote orchestrator must surface as 25.
+    let out = remote_syq(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--no-bootstrap",
+            "--delete",
+            "--max-delete",
+            "1",
+            &src,
+            &dst,
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(25),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(t.path("dst/extra1").exists() && t.path("dst/extra2").exists());
+    // Partial failure (unreadable source file) must surface as 23.
+    write(&t.path("src/bad"), b"unreadable");
+    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
+    let out = remote_syq(&t, &rsh, &["-a", "--no-bootstrap", &src, &dst]);
+    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ----------------------------------------------------------- review round 13
+
+#[test]
+fn ignore_existing_keeps_a_file_where_a_source_directory_maps() {
+    let t = Tmp::new();
+    write(&t.path("src/d/inner"), b"i");
+    write(&t.path("src/plain"), b"p");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    write(&t.path("dst/d"), b"precious");
+    // Dry run and real run agree; the existing file survives; the rest copies.
+    let so = run_ok(&["-r", "-n", "--ignore-existing", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(transferred(&so), 1, "{so}");
+    let out = syq(&["-r", "--ignore-existing", &t.s("src/"), &t.s("dst")]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("keeping existing"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(read(&t.path("dst/d")), b"precious");
+    assert_eq!(read(&t.path("dst/plain")), b"p");
+    // An existing *directory* is still descended into — the flag stays useful.
+    fs::create_dir_all(t.path("dst2/d")).unwrap();
+    run_ok(&["-r", "--ignore-existing", &t.s("src/"), &t.s("dst2")]);
+    assert_eq!(read(&t.path("dst2/d/inner")), b"i");
+}
+
+#[test]
+fn files_from_empty_list_leaves_an_existing_destination_untouched() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o711)).unwrap();
+    set_mtime(&t.path("dst"), 1_000);
+    set_mtime(&t.path("src"), 2_000);
+    write(&t.path("empty"), b"");
+    run_ok(&[
+        "-a",
+        "--files-from",
+        &t.s("empty"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    let md = fs::metadata(t.path("dst")).unwrap();
+    assert_eq!(md.mode() & 0o777, 0o711);
+    assert_eq!(md.mtime(), 1_000, "nothing created, nothing stamped");
+}
+
+#[test]
+fn files_from_unwritable_destination_root_fails_and_is_left_alone() {
+    // Ordinary copies open up and restore an unwritable root; --files-from
+    // deliberately doesn't (the root isn't listed), so it fails per file.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
+    write(&t.path("list"), b"a\n");
+    let out = syq(&["-a", "--files-from", &t.s("list"), &t.s("src"), &t.s("dst")]);
+    let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert_eq!(mode, 0o500, "the unlisted root keeps its mode");
+    assert!(!t.path("dst/a").exists());
+}

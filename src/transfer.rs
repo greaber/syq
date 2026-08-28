@@ -563,7 +563,13 @@ pub fn run(args: Args) -> Result<i32> {
         spawn_workers(args.connections);
     }
 
-    let dst_root = dst.path.as_bytes().to_vec();
+    // One spelling for the destination root: every derived key — claims,
+    // delete roots, destination-walk paths, receiver-computed sidecar names —
+    // flows from this, and the receiver rebuilds paths through `Path`, which
+    // silently drops `.` components and duplicate slashes. Cleaning here
+    // (lexically only; symlinks stay the self-copy guard's business) keeps
+    // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
+    let dst_root = clean_root(dst.path.as_bytes());
     let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root, false)?;
     // A destination that is a symlink to a directory is that directory (as
     // for rsync). Use the resolved target path for all planning and metadata,
@@ -997,6 +1003,28 @@ fn mkdir_root(conn: &mut dyn Conn, dst_root: &[u8]) -> Result<()> {
     }
 }
 
+/// Lexically canonical spelling of a root path: `.` components and duplicate
+/// or trailing slashes dropped (`dst/.` -> `dst`, `dst//x` -> `dst/x`), the
+/// leading `/` or `~` kept, a path that is nothing but dots left as `.`.
+/// Trailing-slash semantics are read off the Location before this runs.
+fn clean_root(p: &[u8]) -> PathBytes {
+    let absolute = p.starts_with(b"/");
+    let mut out: PathBytes = if absolute { b"/".to_vec() } else { Vec::new() };
+    for comp in p.split(|&b| b == b'/') {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(b"/") {
+            out.push(b'/');
+        }
+        out.extend_from_slice(comp);
+    }
+    if out.is_empty() {
+        out.extend_from_slice(if absolute { b"/" } else { b"." });
+    }
+    out
+}
+
 fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Entry>> {
     Ok(stat_many(conn, vec![path.to_vec()], follow)?
         .pop()
@@ -1100,8 +1128,9 @@ struct Planner<'a> {
     opts: &'a Opts,
     /// Destination paths claimed by source entries (see `Claim`).
     dst_seen: std::collections::HashMap<PathBytes, Claim>,
-    /// --existing: destination directories that don't exist (or aren't
-    /// directories); nothing under them is touched.
+    /// Directories this run will not create — --existing: they don't exist
+    /// (or aren't directories); --ignore-existing: an existing non-directory
+    /// sits at their path. Nothing under them is touched.
     missing_dirs: std::collections::HashSet<PathBytes>,
     completed:
         Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>>,
@@ -1267,16 +1296,18 @@ impl Planner<'_> {
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
         // Through a symlink: `syq --files-from L link dst` should work like `link/`.
-        let root = match stat_one(src, src_root, true)? {
-            Some(e) if e.kind == Kind::Dir => e,
+        // Validate the root but never plan it: it isn't in the list, so an
+        // existing destination is not stamped with source-root metadata
+        // (creation-when-missing happened in run()).
+        match stat_one(src, src_root, true)? {
+            Some(e) if e.kind == Kind::Dir => {}
             Some(_) => bail!(
                 "--files-from: source {} is not a directory",
                 display(src_root)
             ),
             None => bail!("--files-from: source {} does not exist", display(src_root)),
-        };
+        }
         self.progress.scanned.fetch_add(1, Relaxed);
-        self.handle_batch(vec![root], src_root, "", dst_root)?;
 
         // Listed paths are lstat'ed (a listed symlink copies as a symlink).
         // Implied ancestors are stat'ed *through* symlinks and must resolve to
@@ -1307,13 +1338,17 @@ impl Planner<'_> {
         for chunk in lines.chunks(crate::scan::BATCH) {
             let mut want_parents: Vec<PathBytes> = Vec::new();
             let mut want_leaves: Vec<PathBytes> = Vec::new();
+            // Per role: a path may be needed both as a followed ancestor and
+            // as an lstat'ed leaf, with different answers.
+            let mut wanted_parents: HashSet<PathBytes> = HashSet::new();
+            let mut wanted_leaves: HashSet<PathBytes> = HashSet::new();
             for line in chunk {
                 for anc in ancestors(line) {
-                    if !parents.contains_key(&anc) && !want_parents.contains(&anc) {
+                    if !parents.contains_key(&anc) && wanted_parents.insert(anc.clone()) {
                         want_parents.push(anc);
                     }
                 }
-                if !leaves.contains_key(line) && !want_leaves.contains(line) {
+                if !leaves.contains_key(line) && wanted_leaves.insert(line.clone()) {
                     want_leaves.push(line.clone());
                 }
             }
@@ -1674,7 +1709,7 @@ impl Planner<'_> {
         // Directories: one stat pass decides everything about each one, and
         // the same filtered list drives creation, listing and deferred
         // metadata so they can't disagree.
-        let need_stats = opts.verify_only || !opts.dry_run || opts.existing;
+        let need_stats = opts.verify_only || !opts.dry_run || opts.existing || opts.ignore_existing;
         if !dirs.is_empty() && (need_stats || opts.verbose > 0) {
             let stats: Vec<Option<Entry>> = if need_stats {
                 self.stat_many(dirs.iter().map(|(p, _, _)| p.clone()).collect())?
@@ -1699,7 +1734,22 @@ impl Planner<'_> {
                 // replaced, never traversed) counts as missing: we won't
                 // replace it and won't write through it, and since entries
                 // come parent-first, everything below is skipped too.
-                if opts.existing && (!is_dir || self.under_missing_dir(&p, dst_root)) {
+                // --ignore-existing never touches what exists either: an
+                // existing non-directory where a directory maps stays, and the
+                // mapped directory with its whole subtree is skipped, visibly
+                // (rsync would unlink the file; see RSYNC-COMPAT.md).
+                let conflict = opts.ignore_existing && !is_dir && st.is_some();
+                if conflict
+                    || (opts.existing && !is_dir)
+                    || ((opts.existing || opts.ignore_existing)
+                        && self.under_missing_dir(&p, dst_root))
+                {
+                    if conflict && !opts.quiet {
+                        self.progress.eprintln(&format!(
+                            "syq: keeping existing {}; skipping the directory mapped onto it",
+                            display(&p)
+                        ));
+                    }
                     self.missing_dirs.insert(p);
                     continue;
                 }
@@ -1810,7 +1860,9 @@ impl Planner<'_> {
                 e,
                 contested,
             } = p;
-            if opts.existing && self.under_missing_dir(&dst_path, dst_root) {
+            if (opts.existing || opts.ignore_existing)
+                && self.under_missing_dir(&dst_path, dst_root)
+            {
                 // Below a directory we won't create: nothing to do, even if the
                 // destination has something reachable there through a symlink.
                 self.progress.files_excluded.fetch_add(1, Relaxed);
