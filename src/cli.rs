@@ -117,13 +117,8 @@ pub struct Args {
     /// of it changes)
     #[arg(long)]
     pub inplace: bool,
-    /// fsync each file and its parent directory around the rename, so a completed file
-    /// survives a crash; also syncs an explicitly requested checkpoint (slower, especially on NFS)
-    #[arg(long)]
-    pub fsync: bool,
-
-    /// Save completed-file state here; reuse the same file to accelerate a retry. The file is
-    /// retained after interruption or failure and removed after a clean copy.
+    /// Avoid completed-file destination lookups on later runs. Normal reruns and partial-file
+    /// resume do not need this. The file persists and must be outside local source/destination trees.
     #[arg(
         long,
         value_name = "FILE",
@@ -131,7 +126,7 @@ pub struct Args {
     )]
     pub checkpoint: Option<String>,
 
-    /// Remote shell command (default: ssh)
+    /// Remote shell command (default: ssh); controls agent forwarding when set
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
     /// Use this exact syq executable on the remote instead of the managed helper
@@ -159,6 +154,10 @@ pub struct Args {
     /// Remote-to-remote: relay data through this machine instead of running on the source host
     #[arg(long)]
     pub relay: bool,
+    /// Remote-to-remote with the default ssh: disable agent forwarding to the source host; it
+    /// must authenticate to the destination with its own credentials
+    #[arg(long, conflicts_with = "rsh")]
+    pub no_forward_agent: bool,
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
     pub width: Option<usize>,

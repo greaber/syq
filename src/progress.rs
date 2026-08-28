@@ -109,6 +109,24 @@ impl Progress {
         self.eprintln(line);
     }
 
+    pub fn warning(&self, code: &str, count: u64, message: &str) {
+        let mut term = self.term.lock().unwrap();
+        self.erase(&mut term);
+        if self.json {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "type": "warning",
+                    "code": code,
+                    "count": count,
+                    "message": message,
+                })
+            );
+        } else {
+            eprintln!("syq: warning: {message}");
+        }
+    }
+
     fn erase(&self, t: &mut TermState) {
         if t.lines_drawn > 0 {
             eprint!("\r\x1b[{}A\x1b[J", t.lines_drawn);

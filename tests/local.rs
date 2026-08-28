@@ -2,7 +2,7 @@
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -98,6 +98,41 @@ fn read(p: &Path) -> Vec<u8> {
     let mut v = Vec::new();
     File::open(p).unwrap().read_to_end(&mut v).unwrap();
     v
+}
+
+fn partial_files(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".syq-part."))
+        })
+        .collect()
+}
+
+#[cfg(debug_assertions)]
+fn interrupted_partial(args: &[&str], dir: &Path) -> PathBuf {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000")
+        .spawn()
+        .unwrap();
+    let partial = (0..300).find_map(|_| {
+        let mut partials = partial_files(dir);
+        if partials.len() == 1 {
+            partials.pop()
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            None
+        }
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    partial.expect("copy never created its job-scoped partial")
 }
 
 fn executable(p: &Path, body: &[u8]) {
@@ -372,6 +407,34 @@ fn no_bootstrap_uses_remote_path_without_managed_cache() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"preinstalled");
     assert!(!t.path("remote-home/.cache/syq/helpers").exists());
+}
+
+#[test]
+fn remote_retained_basis_handles_matching_and_changed_files() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    let original = vec![b'a'; 5 * 1024 * 1024];
+    let mut changed = original.clone();
+    changed[2 * 1024 * 1024] = b'b';
+    write(&t.path("src"), &original);
+    write(&t.path("dst"), &original);
+    set_mtime(&t.path("src"), 1_600_000_001);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+    let inode = fs::metadata(t.path("dst")).unwrap().ino();
+    let remote = format!("fake:{}", t.s("dst"));
+
+    let matching = remote_syq(&t, &rsh, &["-ac", "--no-bootstrap", &t.s("src"), &remote]);
+    assert_output_ok(&matching);
+    assert_eq!(fs::metadata(t.path("dst")).unwrap().ino(), inode);
+
+    write(&t.path("src"), &changed);
+    set_mtime(&t.path("src"), 1_600_000_002);
+    let repair = remote_syq(&t, &rsh, &["-a", "--no-bootstrap", &t.s("src"), &remote]);
+    assert_output_ok(&repair);
+    assert_eq!(read(&t.path("dst")), changed);
+    assert!(partial_files(&t.0).is_empty());
 }
 
 #[test]
@@ -671,6 +734,7 @@ fn rerun_transfers_nothing() {
     assert_same_tree(&t.path("src"), &t.path("dst"));
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn resume_from_partial() {
     let t = Tmp::new();
@@ -678,25 +742,44 @@ fn resume_from_partial() {
     write(&t.path("src/big.bin"), &data);
     set_mtime(&t.path("src/big.bin"), 1_600_000_000);
     fs::create_dir_all(t.path("dst")).unwrap();
+    let src = t.s("src/big.bin");
+    let dst = t.s("dst/");
+    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
     // Fake an interrupted transfer: first half present, rest preallocated.
-    let partial = t.path("dst/.big.bin.syq-partial");
+    let partial = interrupted_partial(&args, &t.path("dst"));
     {
         let f = File::create(&partial).unwrap();
         (&f).write_all(&data[..data.len() / 2]).unwrap();
         f.set_len(data.len() as u64).unwrap();
     }
-    let out = run_ok(&[
-        "-a",
-        "--block-size",
-        "1M",
-        &t.s("src/big.bin"),
-        &t.s("dst/"),
-    ]);
+    let out = run_ok(&args);
     assert!(read(&t.path("dst/big.bin")) == data);
     assert!(!partial.exists(), "partial should be gone after finalize");
     assert_same_tree(&t.path("src/big.bin"), &t.path("dst/big.bin"));
     // Roughly half should have been reused.
     assert!(out.contains("unchanged"), "{out}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn checksum_toggle_reuses_the_same_partial() {
+    let t = Tmp::new();
+    let data = prng(6 * 1024 * 1024, 43);
+    write(&t.path("src"), &data);
+    set_mtime(&t.path("src"), 1_600_000_000);
+    let src = t.s("src");
+    let dst = t.s("dst");
+    let initial = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let partial = interrupted_partial(&initial, &t.0);
+
+    run_ok(&["-ac", "--block-size", "1M", "--bwlimit", "1G", &src, &dst]);
+
+    assert_eq!(read(&t.path("dst")), data);
+    assert!(
+        !partial.exists(),
+        "changing only -c must not strand the resumable partial"
+    );
+    assert!(partial_files(&t.0).is_empty());
 }
 
 #[test]
@@ -761,6 +844,56 @@ fn verify_only_detects_differences() {
 }
 
 #[test]
+fn hash_errors_do_not_desynchronize_worker_connections() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let t = Tmp::new();
+    write(&t.path("src/bad"), &vec![b'b'; 8192]);
+    write(&t.path("src/good"), &vec![b'g'; 4096]);
+    write(&t.path("dst/bad"), &vec![b'x'; 8192]);
+    write(&t.path("dst/good"), &vec![b'x'; 4096]);
+    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Largest-first scheduling makes the unreadable file fail first. The
+    // receiver still answers its already-issued hash request; that response
+    // must be drained before this worker proceeds to `good`.
+    let copy = syq(&["-a", "-c", "-j", "1", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(copy.status.code(), Some(23));
+    let copy_stderr = String::from_utf8_lossy(&copy.stderr);
+    assert!(
+        !copy_stderr.contains("unexpected response"),
+        "{copy_stderr}"
+    );
+    assert_eq!(read(&t.path("dst/good")), vec![b'g'; 4096]);
+
+    // Verification has the same paired-request shape and must likewise keep
+    // processing the connection after the source-side error.
+    let verify = syq(&[
+        "-a",
+        "--verify-only",
+        "-v",
+        "-j",
+        "1",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(verify.status.code(), Some(23));
+    let verify_stderr = String::from_utf8_lossy(&verify.stderr);
+    assert!(
+        !verify_stderr.contains("unexpected response"),
+        "{verify_stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&verify.stdout).contains("ok      good"),
+        "{}",
+        String::from_utf8_lossy(&verify.stdout)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn large_file_parallel_chunks() {
     let t = Tmp::new();
     let data = prng(200 * 1024 * 1024 + 4321, 99);
@@ -779,15 +912,11 @@ fn large_file_parallel_chunks() {
     ]);
     assert!(read(&t.path("dst/huge.bin")) == data);
     assert_same_tree(&t.path("src/huge.bin"), &t.path("dst/huge.bin"));
-    assert!(!t.path("dst/.huge.bin.syq-partial").exists());
+    assert!(partial_files(&t.path("dst")).is_empty());
     // And partial resume of the same big file with parallel chunks.
-    {
-        let f = File::create(t.path("dst/.huge.bin.syq-partial")).unwrap();
-        (&f).write_all(&data[..50 * 1024 * 1024]).unwrap();
-        f.set_len(data.len() as u64).unwrap();
-    }
-    fs::remove_file(t.path("dst/huge.bin")).unwrap();
-    run_ok(&[
+    let src = t.s("src/");
+    let dst = t.s("dst/");
+    let args = [
         "-a",
         "-j",
         "8",
@@ -795,9 +924,19 @@ fn large_file_parallel_chunks() {
         "1M",
         "--min-split",
         "2M",
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
+        "--bwlimit",
+        "1G",
+        &src,
+        &dst,
+    ];
+    fs::remove_file(t.path("dst/huge.bin")).unwrap();
+    let partial = interrupted_partial(&args, &t.path("dst"));
+    {
+        let f = File::create(&partial).unwrap();
+        (&f).write_all(&data[..50 * 1024 * 1024]).unwrap();
+        f.set_len(data.len() as u64).unwrap();
+    }
+    run_ok(&args);
     assert!(read(&t.path("dst/huge.bin")) == data);
 }
 
@@ -866,14 +1005,14 @@ fn inplace_leaves_no_partial() {
     set_mtime(&t.path("src/f.bin"), 1_600_000_000);
     run_ok(&["-a", "--inplace", &t.s("src/"), &t.s("dst/")]);
     assert!(read(&t.path("dst/f.bin")) == data);
-    assert!(!t.path("dst/.f.bin.syq-partial").exists());
+    assert!(partial_files(&t.path("dst")).is_empty());
     // Update in place when the destination differs.
     let data2 = prng(3 * 1024 * 1024 + 10, 6);
     write(&t.path("src/f.bin"), &data2);
     set_mtime(&t.path("src/f.bin"), 1_600_000_001);
     run_ok(&["-a", "--inplace", &t.s("src/"), &t.s("dst/")]);
     assert!(read(&t.path("dst/f.bin")) == data2);
-    assert!(!t.path("dst/.f.bin.syq-partial").exists());
+    assert!(partial_files(&t.path("dst")).is_empty());
     assert_same_tree(&t.path("src"), &t.path("dst"));
 }
 
@@ -996,6 +1135,47 @@ fn rm_normal_target_works() {
 }
 
 #[test]
+fn quiet_overrides_verbose_and_json_progress_for_rm() {
+    let t = Tmp::new();
+    write(&t.path("killme/sub/f"), b"f");
+
+    let dry = syq(&[
+        "--rm",
+        "--dry-run",
+        "-q",
+        "-v",
+        "--progress-json",
+        &t.s("killme"),
+    ]);
+    assert_output_ok(&dry);
+    assert!(
+        dry.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+    assert!(
+        dry.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(t.path("killme/sub/f").exists());
+
+    let actual = syq(&["--rm", "-q", "-v", "--progress-json", &t.s("killme")]);
+    assert_output_ok(&actual);
+    assert!(
+        actual.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&actual.stdout)
+    );
+    assert!(
+        actual.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert!(!t.path("killme").exists());
+}
+
+#[test]
 fn duplicate_destination_rejected() {
     let t = Tmp::new();
     write(&t.path("a/same"), b"A");
@@ -1075,14 +1255,20 @@ fn archive_into_readonly_dest_dir() {
 
 // ---- Review round 3 ----
 
+#[cfg(debug_assertions)]
 #[test]
 fn partial_symlink_is_not_followed() {
     let t = Tmp::new();
     write(&t.path("src"), &vec![7u8; 5 * 1024 * 1024]);
     write(&t.path("external"), b"EXTERNAL-DO-NOT-TOUCH");
+    let src = t.s("src");
+    let dst = t.s("out");
+    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let partial = interrupted_partial(&args, &t.0);
+    fs::remove_file(&partial).unwrap();
     // A malicious/stale partial symlink pointing outside must not be followed.
-    std::os::unix::fs::symlink("external", t.path(".out.syq-partial")).unwrap();
-    run_ok(&["-a", &t.s("src"), &t.s("out")]);
+    std::os::unix::fs::symlink("external", &partial).unwrap();
+    run_ok(&args);
     assert_eq!(read(&t.path("external")), b"EXTERNAL-DO-NOT-TOUCH");
     assert!(fs::symlink_metadata(t.path("out"))
         .unwrap()
@@ -1160,25 +1346,12 @@ fn small_files_atomic_no_partials() {
     for i in 0..200 {
         write(&t.path(&format!("sm/f{i}")), format!("data-{i}").as_bytes());
     }
-    // A stale sidecar from an earlier interrupted or differently configured
-    // run is overwritten by the atomic small-file path and renamed away.
-    write(&t.path("smd/.f7.syq-partial"), b"stale");
     run_ok(&[
         "-a",
         &format!("{}/", t.s("sm")),
         &format!("{}/", t.s("smd")),
     ]);
-    let partials = fs::read_dir(t.path("smd"))
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".syq-partial")
-        })
-        .count();
-    assert_eq!(partials, 0);
+    assert!(partial_files(&t.path("smd")).is_empty());
     assert_eq!(read(&t.path("smd/f7")), b"data-7");
 }
 
@@ -1197,11 +1370,14 @@ fn small_file_failure_never_publishes_partial_contents() {
         !t.path("dst/f").exists(),
         "the final name must not appear before the atomic rename"
     );
-    assert_eq!(read(&t.path("dst/.f.syq-partial")), b"complete contents");
+    let partials = partial_files(&t.path("dst"));
+    assert_eq!(partials.len(), 1);
+    let partial = &partials[0];
+    assert_eq!(read(partial), b"complete contents");
 
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/f")), b"complete contents");
-    assert!(!t.path("dst/.f.syq-partial").exists());
+    assert!(!partial.exists());
 }
 
 // ---- Review round 4 (integrity) ----
@@ -1285,14 +1461,20 @@ fn rejects_copying_directory_into_itself() {
     assert!(!t.path("src/dst").exists());
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn hardlinked_partial_does_not_corrupt_external_file() {
     let t = Tmp::new();
     write(&t.path("src"), &vec![9u8; 5 * 1024 * 1024]);
     write(&t.path("external"), b"EXTERNAL-DO-NOT-TOUCH");
+    let src = t.s("src");
+    let dst = t.s("out");
+    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let partial = interrupted_partial(&args, &t.0);
+    fs::remove_file(&partial).unwrap();
     // A partial hardlinked to an external file (as a dedup/backup tool might make).
-    fs::hard_link(t.path("external"), t.path(".out.syq-partial")).unwrap();
-    run_ok(&["-a", &t.s("src"), &t.s("out")]);
+    fs::hard_link(t.path("external"), partial).unwrap();
+    run_ok(&args);
     assert_eq!(read(&t.path("external")), b"EXTERNAL-DO-NOT-TOUCH");
     assert_eq!(read(&t.path("out")).len(), 5 * 1024 * 1024);
     // out and external must be different inodes
@@ -1549,6 +1731,48 @@ fn ignore_conflicts_with_rm() {
     assert!(t.path("tree/hello.txt").is_file());
 }
 
+#[test]
+fn checkpoint_conflicts_are_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    for conflicting in ["-c", "--verify-only"] {
+        let out = syq(&[
+            "-a",
+            conflicting,
+            "--checkpoint",
+            &t.s("state"),
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
+        assert!(!out.status.success(), "{conflicting}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("cannot be used with"), "{conflicting}: {err}");
+    }
+    let out = syq(&["--rm", "--checkpoint", &t.s("state"), &t.s("src")]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot be used with"), "{err}");
+    assert!(t.path("src/f").is_file());
+    assert!(!t.path("state").exists());
+}
+
+#[test]
+fn no_forward_agent_conflicts_with_explicit_rsh() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    let out = syq(&[
+        "--no-forward-agent",
+        "-e",
+        "ssh -a",
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot be used with"), "{err}");
+    assert!(!t.path("dst").exists());
+}
+
 // Ordinary copies keep no historical completion state: the current destination
 // determines what a later invocation repairs.
 #[test]
@@ -1626,9 +1850,92 @@ fn checkpoint_is_explicit_retained_and_source_sensitive() {
         0o600
     );
     assert!(
-        !t.path("copy.checkpoint").exists(),
-        "a clean retry removes its checkpoint"
+        t.path("copy.checkpoint").is_file(),
+        "an explicit checkpoint persists after a clean retry"
     );
+}
+
+// A completed checkpoint deliberately trusts destination history, but an
+// ordinary source fingerprint change invalidates the corresponding record.
+#[test]
+fn completed_checkpoint_trusts_destination_and_tracks_source() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"original");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let checkpoint = t.s("copy.checkpoint");
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(t.path("copy.checkpoint").is_file());
+
+    write(&t.path("dst/f"), b"damaged independently");
+    let stdout = run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(transferred(&stdout), 0);
+    assert_eq!(
+        read(&t.path("dst/f")),
+        b"damaged independently",
+        "a matching record intentionally bypasses destination inspection"
+    );
+
+    write(&t.path("src/f"), b"updated source");
+    set_mtime(&t.path("src/f"), 1_600_000_001);
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(read(&t.path("dst/f")), b"updated source");
+    assert!(t.path("copy.checkpoint").is_file());
+}
+
+#[test]
+fn checkpoint_inside_local_source_is_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    let out = syq(&[
+        "-a",
+        "--checkpoint",
+        &t.s("src/state"),
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("must not be inside local source"), "{err}");
+    assert!(!t.path("src/state").exists());
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn checkpoint_inside_local_destination_is_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src/state"), b"payload");
+    let out = syq(&[
+        "-a",
+        "--checkpoint",
+        &t.s("dst/state"),
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("must not be inside local destination"),
+        "{err}"
+    );
+    assert!(!t.path("dst").exists());
 }
 
 // A checkpoint-complete file is still a claimed destination: a second source that
@@ -1706,6 +2013,145 @@ fn legacy_marker_name_is_ordinary_payload() {
     assert_eq!(read(&dst_marker), b"ordinary user data");
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/file")), b"payload");
+}
+
+#[test]
+fn source_partials_are_copied_and_warned_about() {
+    let t = Tmp::new();
+    let id = "a".repeat(26);
+    let file = format!(".payload.syq-part.{id}");
+    let dir = format!(".directory.syq-part.{id}");
+    write(&t.path(&format!("src/{file}")), b"partial payload");
+    write(&t.path(&format!("src/{dir}/child")), b"nested payload");
+    write(
+        &t.path("src/.legacy.syq-partial"),
+        b"legacy-looking payload",
+    );
+
+    let output = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_output_ok(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: source contains 2 recognizable SYQ partial paths"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("they are treated as ordinary payload"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("copying"),
+        "warning must not promise that a dry run, verification, or failed run will copy: {stderr}"
+    );
+    assert_eq!(read(&t.path(&format!("dst/{file}"))), b"partial payload");
+    assert_eq!(
+        read(&t.path(&format!("dst/{dir}/child"))),
+        b"nested payload"
+    );
+    assert_eq!(
+        read(&t.path("dst/.legacy.syq-partial")),
+        b"legacy-looking payload"
+    );
+
+    let output = syq(&["-a", "--progress-json", &t.s("src/"), &t.s("json-dst/")]);
+    assert_output_ok(&output);
+    let warning = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["code"] == "source_partials")
+        .expect("missing structured source-partial warning");
+    assert_eq!(warning["type"], "warning");
+    assert_eq!(warning["count"], 2);
+
+    let quiet = syq(&[
+        "-q",
+        "-v",
+        "-a",
+        "--progress-json",
+        &t.s("src/"),
+        &t.s("quiet-dst/"),
+    ]);
+    assert_output_ok(&quiet);
+    assert!(
+        quiet.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stdout)
+    );
+    assert!(
+        quiet.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert_eq!(
+        read(&t.path(&format!("quiet-dst/{file}"))),
+        b"partial payload"
+    );
+
+    let dry = syq(&["-n", "-a", &t.s("src/"), &t.s("dry-dst/")]);
+    assert_output_ok(&dry);
+    let dry_stderr = String::from_utf8_lossy(&dry.stderr);
+    assert!(
+        dry_stderr.contains("treated as ordinary payload"),
+        "{dry_stderr}"
+    );
+    assert!(!dry_stderr.to_ascii_lowercase().contains("copying"));
+    assert!(!t.path("dry-dst").exists());
+}
+
+#[test]
+fn quiet_suppresses_notices_but_not_errors() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+
+    let notice = syq(&["-q", &t.s("src"), &t.s("dst")]);
+    assert_output_ok(&notice);
+    assert!(
+        notice.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&notice.stdout)
+    );
+    assert!(
+        notice.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&notice.stderr)
+    );
+
+    let error = syq(&["-q", &t.s("missing"), &t.s("dst")]);
+    assert!(!error.status.success());
+    assert!(
+        error.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&error.stdout)
+    );
+    assert!(
+        !error.stderr.is_empty(),
+        "quiet mode must still report errors"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn exact_payload_sidecar_collision_fails_before_publication() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
+    let src = t.s("src/");
+    let dst = t.s("dst/");
+    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let partial = interrupted_partial(&args, &t.path("dst"));
+    let collision_name = partial.file_name().unwrap().to_owned();
+    fs::remove_file(&partial).unwrap();
+    write(
+        &t.path("src").join(&collision_name),
+        b"deliberate collision",
+    );
+
+    let output = syq(&args);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reserved sidecar"), "{stderr}");
+    assert!(!t.path("dst/file").exists());
+    assert!(!t.path("dst").join(collision_name).exists());
 }
 
 // Several content sources map onto the destination root; the last one's
@@ -1808,7 +2254,7 @@ fn checkpoint_records_quick_check_only_after_meta_repair() {
         0o600,
         "the failed repair must not have been checkpointed as complete"
     );
-    assert!(!t.path("copy.checkpoint").exists());
+    assert!(t.path("copy.checkpoint").is_file());
 }
 
 // The read-only modes create nothing, not even the destination directory.
@@ -1840,6 +2286,32 @@ fn readonly_modes_create_nothing() {
         !t.path("dry-run.checkpoint").exists(),
         "--dry-run must not create a checkpoint"
     );
+}
+
+#[test]
+fn dry_run_validates_checkpoint_identity_with_missing_destination() {
+    let t = Tmp::new();
+    write(&t.path("first/f"), b"first");
+    write(&t.path("second/f"), b"second");
+    let checkpoint = t.s("copy.checkpoint");
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("first/"),
+        &t.s("first-dst/"),
+    ]);
+    let out = syq(&[
+        "-an",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("second/"),
+        &t.s("missing/"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("describes a different copy"), "{err}");
+    assert!(!t.path("missing").exists());
 }
 
 // Different spellings of the same local path are one job.
@@ -1879,11 +2351,11 @@ fn checkpoint_identity_is_spelling_independent() {
     );
 }
 
-// A destination removed between attempts makes an explicit checkpoint describe
-// nothing, so the retry resets it and starts over.
+// Existing completion records are never reset automatically. A missing
+// destination is suspicious and requires the user to remove the checkpoint.
 #[cfg(debug_assertions)]
 #[test]
-fn removed_destination_restarts() {
+fn existing_checkpoint_with_missing_destination_fails() {
     let t = Tmp::new();
     write(&t.path("src/a"), b"aaaa");
     write(&t.path("src/fail/secret"), b"secret");
@@ -1902,22 +2374,52 @@ fn removed_destination_restarts() {
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
     assert!(t.path("copy.checkpoint").is_file());
-    run_ok(&["--rm", &t.s("dest")]);
+    fs::remove_dir_all(t.path("dest")).unwrap();
     assert!(!t.path("dest").exists());
-    run_ok(&[
+    let out = syq(&[
         "-a",
         "--checkpoint",
         &checkpoint,
         &t.s("src/"),
         &t.s("dest/"),
     ]);
-    assert_eq!(
-        read(&t.path("dest/a")),
-        b"aaaa",
-        "the reset checkpoint must not skip it"
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("destination") && err.contains("missing"),
+        "{err}"
     );
-    assert_eq!(read(&t.path("dest/fail/secret")), b"secret");
-    assert!(!t.path("copy.checkpoint").exists());
+    assert!(!t.path("dest").exists());
+    assert!(t.path("copy.checkpoint").is_file());
+}
+
+#[test]
+fn existing_checkpoint_with_missing_mapped_source_target_fails() {
+    let t = Tmp::new();
+    write(&t.path("bigdir/f"), b"data");
+    let checkpoint = t.s("copy.checkpoint");
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("bigdir"),
+        &t.s("backups"),
+    ]);
+    fs::remove_dir_all(t.path("backups/bigdir")).unwrap();
+    let out = syq(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("bigdir"),
+        &t.s("backups"),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("destination target") && err.contains("missing"),
+        "{err}"
+    );
+    assert!(!t.path("backups/bigdir").exists());
 }
 
 #[test]
@@ -1965,6 +2467,628 @@ fn concurrent_copies_union() {
     assert_eq!(read(&t.path("dest/a7")), b"a");
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn different_jobs_use_distinct_partial_inodes() {
+    let t = Tmp::new();
+    let first_contents = vec![b'a'; 8 * 1024 * 1024];
+    let second_contents = vec![b'b'; 8 * 1024 * 1024];
+    write(&t.path("first"), &first_contents);
+    write(&t.path("second"), &second_contents);
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "-j",
+            "1",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("first"),
+            &t.s("out"),
+        ])
+        .env("SYQ_TEST_HOLD_PARTIAL_MS", "2000")
+        .spawn()
+        .unwrap();
+    let first_partial = (0..300).find_map(|_| {
+        let mut partials = partial_files(&t.0);
+        if partials.len() == 1 {
+            partials.pop()
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            None
+        }
+    });
+    let first_partial = first_partial.expect("first copy never created its sidecar");
+
+    let second = syq(&[
+        "-a",
+        "-j",
+        "1",
+        "--bwlimit",
+        "1G",
+        &t.s("second"),
+        &t.s("out"),
+    ]);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(read(&t.path("out")), second_contents);
+    assert!(
+        first_partial.exists(),
+        "the second job must not rename the first job's partial"
+    );
+    assert!(first.wait().unwrap().success());
+    assert_eq!(read(&t.path("out")), first_contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn final_hash_and_partial_seed_use_one_inode_snapshot() {
+    let t = Tmp::new();
+    let mut first_contents = vec![0u8; 8 * 1024 * 1024];
+    first_contents[4 * 1024 * 1024..].fill(b'a');
+    let second_contents = vec![b'b'; 8 * 1024 * 1024];
+    write(&t.path("basis"), &vec![0u8; 8 * 1024 * 1024]);
+    write(&t.path("first"), &first_contents);
+    write(&t.path("second"), &second_contents);
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    set_mtime(&t.path("first"), 1_600_000_001);
+    set_mtime(&t.path("second"), 1_600_000_002);
+    let ready = t.path("basis-ready");
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "-j",
+            "1",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("first"),
+            &t.s("basis"),
+        ])
+        .env("SYQ_TEST_BASIS_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .spawn()
+        .unwrap();
+    let held = (0..300).any(|_| {
+        if ready.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(held, "first copy never retained its destination basis");
+    assert!(
+        partial_files(&t.0).is_empty(),
+        "hashing alone must not create a sidecar"
+    );
+
+    let second = syq(&[
+        "-a",
+        "-j",
+        "1",
+        "--bwlimit",
+        "1G",
+        &t.s("second"),
+        &t.s("basis"),
+    ]);
+    assert_output_ok(&second);
+    assert_eq!(read(&t.path("basis")), second_contents);
+    assert!(first.wait().unwrap().success());
+    assert_eq!(read(&t.path("basis")), first_contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn retained_basis_growth_is_not_treated_as_an_exact_match() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 2 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    write(&t.path("basis"), &contents);
+    set_mtime(&t.path("src"), 1_600_000_001);
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    let ready = t.path("basis-ready");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "-j",
+            "1",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("src"),
+            &t.s("basis"),
+        ])
+        .env("SYQ_TEST_BASIS_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .spawn()
+        .unwrap();
+    let held = (0..300).any(|_| {
+        if ready.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(held, "copy never retained its destination basis");
+
+    OpenOptions::new()
+        .append(true)
+        .open(t.path("basis"))
+        .unwrap()
+        .write_all(b"trailing data")
+        .unwrap();
+
+    assert!(child.wait().unwrap().success());
+    assert_eq!(read(&t.path("basis")), contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn content_identical_basis_never_mixes_contents_and_metadata() {
+    let t = Tmp::new();
+    let first_contents = vec![b'a'; 8 * 1024 * 1024];
+    let second_contents = vec![b'b'; 8 * 1024 * 1024];
+    write(&t.path("basis"), &first_contents);
+    write(&t.path("first"), &first_contents);
+    write(&t.path("second"), &second_contents);
+    fs::set_permissions(t.path("first"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(t.path("second"), fs::Permissions::from_mode(0o640)).unwrap();
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    set_mtime(&t.path("first"), 1_600_000_001);
+    set_mtime(&t.path("second"), 1_600_000_002);
+    let ready = t.path("basis-ready");
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "-j",
+            "1",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("first"),
+            &t.s("basis"),
+        ])
+        .env("SYQ_TEST_BASIS_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .spawn()
+        .unwrap();
+    let held = (0..300).any(|_| {
+        if ready.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(held, "first copy never retained its destination basis");
+    assert!(
+        partial_files(&t.0).is_empty(),
+        "content comparison must not allocate a full sidecar"
+    );
+
+    let second = syq(&[
+        "-a",
+        "-j",
+        "1",
+        "--bwlimit",
+        "1G",
+        &t.s("second"),
+        &t.s("basis"),
+    ]);
+    assert_output_ok(&second);
+    assert_eq!(read(&t.path("basis")), second_contents);
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o640);
+    assert_eq!(published.mtime(), 1_600_000_002);
+
+    assert!(first.wait().unwrap().success());
+    // The second job renamed a complete file over the descriptor retained by
+    // the first. Metadata applied through the old descriptor cannot leak onto
+    // the second job's contents, so the second whole-file publication wins.
+    assert_eq!(read(&t.path("basis")), second_contents);
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o640);
+    assert_eq!(published.mtime(), 1_600_000_002);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
+    let t = Tmp::new();
+    write(&t.path("basis"), b"aaaa");
+    write(&t.path("first"), b"aaaa");
+    write(&t.path("second"), b"bbbb");
+    fs::set_permissions(t.path("basis"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(t.path("first"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(t.path("second"), fs::Permissions::from_mode(0o640)).unwrap();
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    set_mtime(&t.path("first"), 1_600_000_000);
+    set_mtime(&t.path("second"), 1_600_000_001);
+    let ready = t.path("quick-meta-ready");
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
+        .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_QUICK_META_MS", "2000")
+        .spawn()
+        .unwrap();
+    let held = (0..300).any(|_| {
+        if ready.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(held, "first copy never reached quick-check metadata repair");
+
+    let second = syq(&["-a", &t.s("second"), &t.s("basis")]);
+    assert_output_ok(&second);
+    assert_eq!(read(&t.path("basis")), b"bbbb");
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o640);
+    assert_eq!(published.mtime(), 1_600_000_001);
+
+    assert_eq!(first.wait().unwrap().code(), Some(23));
+    assert_eq!(read(&t.path("basis")), b"bbbb");
+    let published = fs::metadata(t.path("basis")).unwrap();
+    assert_eq!(published.mode() & 0o777, 0o640);
+    assert_eq!(published.mtime(), 1_600_000_001);
+}
+
+#[test]
+fn quick_check_repairs_mode_without_destination_read_permission() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"same contents");
+    write(&t.path("dst"), b"same contents");
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o000)).unwrap();
+    set_mtime(&t.path("src"), 1_600_000_000);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+
+    let output = run_ok(&["-a", &t.s("src"), &t.s("dst")]);
+
+    assert_eq!(transferred(&output), 0, "{output}");
+    assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(read(&t.path("dst")), b"same contents");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn quick_check_metadata_open_reports_concurrent_fifo_without_blocking() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let t = Tmp::new();
+    write(&t.path("basis"), b"same");
+    write(&t.path("first"), b"same");
+    mkfifo(&t.path("second"));
+    fs::set_permissions(t.path("basis"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(t.path("first"), fs::Permissions::from_mode(0o600)).unwrap();
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    set_mtime(&t.path("first"), 1_600_000_000);
+    let ready = t.path("quick-meta-ready");
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
+        .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_QUICK_META_MS", "1000")
+        .spawn()
+        .unwrap();
+    let held = (0..300).any(|_| {
+        if ready.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(held, "first copy never reached quick-check metadata repair");
+
+    assert_output_ok(&syq(&["-a", &t.s("second"), &t.s("basis")]));
+    let status = (0..300).find_map(|_| {
+        let status = first.try_wait().unwrap();
+        if status.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        status
+    });
+    if status.is_none() {
+        let _ = first.kill();
+        let _ = first.wait();
+        panic!("quick-check repair blocked while opening a concurrently published FIFO");
+    }
+    assert_eq!(status.unwrap().code(), Some(23));
+    assert!(fs::symlink_metadata(t.path("basis"))
+        .unwrap()
+        .file_type()
+        .is_fifo());
+}
+
+#[test]
+fn checksum_identical_file_preserves_destination_inode() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    write(&t.path("dst"), &contents);
+    fs::hard_link(t.path("dst"), t.path("alias")).unwrap();
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o600)).unwrap();
+    set_mtime(&t.path("src"), 1_600_000_001);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+    let before = fs::metadata(t.path("dst")).unwrap();
+
+    let output = run_ok(&["-ac", "--bwlimit", "1G", &t.s("src"), &t.s("dst")]);
+
+    assert_eq!(transferred(&output), 0, "{output}");
+    let after = fs::metadata(t.path("dst")).unwrap();
+    assert_eq!(after.dev(), before.dev());
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(fs::metadata(t.path("alias")).unwrap().ino(), before.ino());
+    assert_eq!(after.mode() & 0o777, 0o600);
+    assert_eq!(after.mtime(), 1_600_000_001);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn unreadable_interrupted_partials_are_reused() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    for (i, mode) in [0o444, 0o000].into_iter().enumerate() {
+        let src = t.s("src");
+        let dst = t.s(&format!("out-{i}"));
+        let args = ["-a", "--bwlimit", "1G", &src, &dst];
+        let partial = interrupted_partial(&args, &t.0);
+        fs::set_permissions(&partial, fs::Permissions::from_mode(mode)).unwrap();
+
+        run_ok(&args);
+        assert_eq!(read(&t.path(&format!("out-{i}"))), contents);
+        assert!(!partial.exists());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn unchmodable_interrupted_partial_is_replaced() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    let src = t.s("src");
+    let dst = t.s("dst");
+    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let partial = interrupted_partial(&args, &t.0);
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_FAIL_PARTIAL_CHMOD", "1")
+        .output()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), contents);
+    assert!(!partial.exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn writable_interrupted_partial_is_made_private_before_reuse() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    let src = t.s("src");
+    let dst = t.s("dst");
+    let args = ["-a", "--bwlimit", "1M", &src, &dst];
+    let partial = interrupted_partial(&args, &t.0);
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000")
+        .spawn()
+        .unwrap();
+    for _ in 0..300 {
+        if fs::metadata(&partial).unwrap().mode() & 0o7777 == 0o600 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(fs::metadata(&partial).unwrap().mode() & 0o7777, 0o600);
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_exdev_fallback_leaves_no_partial() {
+    let t = Tmp::new();
+    let contents = vec![b'x'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    write(&t.path("dst"), &contents);
+    set_mtime(&t.path("src"), 1_600_000_001);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["-a", "-j", "1", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .output()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn long_basename_partial_is_truncated_and_resumed() {
+    let t = Tmp::new();
+    let basename = "n".repeat(240);
+    let contents = vec![b'z'; 5 * 1024 * 1024];
+    write(&t.path(&format!("src/{basename}")), &contents);
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let src = t.s(&format!("src/{basename}"));
+    let dst = t.s("dst/");
+    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let partial = interrupted_partial(&args, &t.path("dst"));
+    assert!(partial.file_name().unwrap().as_encoded_bytes().len() <= 255);
+    assert!(partial
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .contains(".syq-part."));
+
+    run_ok(&args);
+    assert_eq!(read(&t.path(&format!("dst/{basename}"))), contents);
+    assert!(!partial.exists());
+}
+
+#[test]
+fn impossible_sidecar_name_fails_one_file_and_continues() {
+    let t = Tmp::new();
+    let mut deep = PathBuf::new();
+    let target_parent_len = libc::PATH_MAX as usize - 20;
+    loop {
+        let current = t
+            .path("dst")
+            .join(&deep)
+            .as_os_str()
+            .as_encoded_bytes()
+            .len();
+        if current >= target_parent_len {
+            break;
+        }
+        let component_len = (target_parent_len - current - 1).min(200);
+        assert!(component_len > 0);
+        deep.push("d".repeat(component_len));
+    }
+    assert!(
+        t.path("dst")
+            .join(&deep)
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            >= target_parent_len
+    );
+
+    write(&t.path("src/good"), b"copied");
+    write(
+        &t.path("src").join(&deep).join("x"),
+        b"cannot fit a sidecar",
+    );
+
+    let output = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
+
+    assert_eq!(output.status.code(), Some(23));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot create a safe sidecar"), "{stderr}");
+    assert_eq!(read(&t.path("dst/good")), b"copied");
+    assert!(!t.path("dst").join(deep).join("x").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn changed_source_retry_uses_published_file_as_block_basis() {
+    let t = Tmp::new();
+    let original = vec![b'a'; 8 * 1024 * 1024];
+    let mut changed = original.clone();
+    changed[0] = b'b';
+    write(&t.path("src"), &original);
+    set_mtime(&t.path("src"), 1_600_000_000);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "--stats",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
+        .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if t.path("dst").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(t.path("dst").exists(), "first attempt never finalized");
+    write(&t.path("replacement"), &changed);
+    set_mtime(&t.path("replacement"), 1_600_000_001);
+    fs::rename(t.path("replacement"), t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(&t.path("dst")), changed);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("bytes transferred: 12,582,912"),
+        "retry should send one changed 4 MiB block, not the full file: {stdout}"
+    );
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn changed_source_retry_still_uses_copy_file_range() {
+    let t = Tmp::new();
+    let original = vec![b'a'; 8 * 1024 * 1024];
+    let changed = vec![b'b'; 8 * 1024 * 1024];
+    write(&t.path("src"), &original);
+    set_mtime(&t.path("src"), 1_600_000_000);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
+        .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if t.path("dst").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(t.path("dst").exists(), "first attempt never finalized");
+    write(&t.path("replacement"), &changed);
+    set_mtime(&t.path("replacement"), 1_600_000_001);
+    fs::rename(t.path("replacement"), t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(&t.path("dst")), changed);
+}
+
 // A destination given as a symlink to a directory is that directory, whether
 // or not it's spelled with a trailing slash: the link survives, the payload
 // lands in its target.
@@ -1995,6 +3119,44 @@ fn symlink_destination_is_followed() {
         .file_type()
         .is_symlink());
     assert_eq!(read(&t.path("real/src/f")), b"hi");
+}
+
+#[test]
+fn in_tree_destination_symlink_is_replaced_not_followed() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f"), b"payload");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::create_dir_all(t.path("elsewhere")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", t.path("dst/sub")).unwrap();
+
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+
+    assert!(fs::symlink_metadata(t.path("dst/sub")).unwrap().is_dir());
+    assert_eq!(read(&t.path("dst/sub/f")), b"payload");
+    assert!(!t.path("elsewhere/f").exists());
+}
+
+#[test]
+fn destination_root_symlink_preserves_target_metadata_for_both_spellings() {
+    for spelling in ["link", "link/"] {
+        let t = Tmp::new();
+        write(&t.path("src/f"), b"payload");
+        fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o555)).unwrap();
+        set_mtime(&t.path("src"), 1_600_000_000);
+        fs::create_dir_all(t.path("real")).unwrap();
+        std::os::unix::fs::symlink("real", t.path("link")).unwrap();
+
+        run_ok(&["-a", &t.s("src/"), &t.s(spelling)]);
+
+        let metadata = fs::metadata(t.path("real")).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o555, "{spelling}");
+        assert_eq!(metadata.mtime(), 1_600_000_000, "{spelling}");
+        assert_eq!(read(&t.path("real/f")), b"payload", "{spelling}");
+        assert!(fs::symlink_metadata(t.path("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 }
 
 // The copy-into-itself guard resolves paths the way the kernel does: `..`
@@ -2088,6 +3250,17 @@ fn unsupported_rsync_flags_explain_themselves() {
         "bundled -H should be explained: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn removed_fsync_option_is_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    let output = syq(&["--fsync", &t.s("src"), &t.s("dst")]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected argument '--fsync'"), "{stderr}");
+    assert!(!t.path("dst").exists());
 }
 
 // Compatibility no-ops are accepted and change nothing.

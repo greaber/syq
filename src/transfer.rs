@@ -3,12 +3,14 @@
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{parse_rsh, parse_size, Args, Location};
 use crate::conn::{ok, Conn, Endpoint, RemoteSpec};
-use crate::fsops::join;
+use crate::fsops::{is_partial_name, join};
 use crate::progress::{commas, human, Progress, WorkerStatus};
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
 use crate::tune::{self, Gate};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -30,11 +32,12 @@ pub struct Opts {
     pub checksum: bool,
     pub verify_only: bool,
     pub inplace: bool,
-    pub fsync: bool,
     pub same_host: bool,
     pub dry_run: bool,
+    pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
+    pub partial_id: std::sync::OnceLock<PartialId>,
     /// gitignore-style patterns applied to every source (see scan.rs).
     pub ignore: Vec<String>,
 }
@@ -105,17 +108,20 @@ fn canonical_path(ctl: &mut dyn Conn, path: &str, remote: bool) -> Result<std::p
 
 /// Encode the content/metadata-affecting options into the job identity.
 fn semantic_flags(opts: &Opts, args: &Args) -> String {
-    format!(
-        "r={} l={} p={} t={} g={} o={} D={} inplace={}",
-        opts.recursive,
-        opts.links,
-        opts.flags & flags::MODE != 0,
-        opts.flags & flags::TIMES != 0,
-        opts.flags & flags::GROUP != 0,
-        opts.flags & flags::OWNER != 0,
-        opts.devices,
-        args.inplace,
-    )
+    serde_json::json!({
+        "partial_format": 1,
+        "recursive": opts.recursive,
+        "links": opts.links,
+        "perms": opts.flags & flags::MODE != 0,
+        "times": opts.flags & flags::TIMES != 0,
+        "group": opts.flags & flags::GROUP != 0,
+        "owner": opts.flags & flags::OWNER != 0,
+        "devices": opts.devices,
+        "inplace": args.inplace,
+        "block_size": opts.block,
+        "ignore": opts.ignore,
+    })
+    .to_string()
 }
 
 /// The endpoint half of a job identity: `user@host` (the user matters — two
@@ -129,44 +135,55 @@ fn endpoint_identity(l: &Location) -> String {
 }
 
 /// Load and, for a real copy, open the explicitly requested checkpoint.
-fn checkpoint_setup(
+struct DestinationRoot<'a> {
+    path: &'a [u8],
+    existed: bool,
+    is_dir: bool,
+}
+
+fn copy_identity(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
     src_ctl: &mut dyn Conn,
     dst_ctl: &mut dyn Conn,
-    dst_existed: bool,
     opts: &Opts,
-) -> Result<Option<CheckpointState>> {
-    use crate::checkpoint::{Checkpoint, Loaded};
-    let Some(path) = args.checkpoint.as_deref().map(std::path::Path::new) else {
-        return Ok(None);
-    };
+) -> Result<String> {
     let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
-    for l in srcs {
-        let p = canonical_path(src_ctl, &l.path, l.is_remote())?;
-        src_roots.push((p.to_string_lossy().into_owned(), l.copies_contents()));
+    for source in srcs {
+        let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
+        src_roots.push((
+            path.to_string_lossy().into_owned(),
+            source.copies_contents(),
+        ));
     }
-    let dst_norm = canonical_path(dst_ctl, &dst.path, dst.is_remote())?
+    let dst_root = canonical_path(dst_ctl, &dst.path, dst.is_remote())?
         .to_string_lossy()
         .into_owned();
-    let identity = crate::checkpoint::job_identity(
+    Ok(crate::checkpoint::job_identity(
         &endpoint_identity(&srcs[0]),
         &src_roots,
         &endpoint_identity(dst),
-        &dst_norm,
+        &dst_root,
         &semantic_flags(opts, args),
-    );
+    ))
+}
+
+fn checkpoint_setup(
+    args: &Args,
+    srcs: &[Location],
+    dst: DestinationRoot<'_>,
+    dst_ctl: &mut dyn Conn,
+    identity: &str,
+) -> Result<Option<CheckpointState>> {
+    use crate::checkpoint::Checkpoint;
+    let Some(path) = args.checkpoint.as_deref().map(std::path::Path::new) else {
+        return Ok(None);
+    };
     let (checkpoint, loaded) = if args.dry_run {
-        let loaded = if dst_existed {
-            Checkpoint::load(path)?
-        } else {
-            // Nothing at the destination can be described by an old
-            // checkpoint, and a dry run must not touch the unused path.
-            Loaded::empty()
-        };
+        let loaded = Checkpoint::load(path)?;
         if let Some(ex) = &loaded.existing_identity {
-            if *ex != identity {
+            if ex != identity {
                 bail!(
                     "checkpoint {} describes a different copy; choose another path or remove it",
                     path.display()
@@ -175,17 +192,51 @@ fn checkpoint_setup(
         }
         (None, loaded)
     } else {
-        // When the destination disappeared, open and validate the checkpoint
-        // before resetting its locked inode. Never unlink an arbitrary path.
-        let (checkpoint, loaded) = Checkpoint::open(path, &identity, opts.fsync, !dst_existed)?;
-        let checkpoint = std::sync::Arc::new(checkpoint);
-        checkpoint.spawn_flusher();
+        let (checkpoint, loaded) = Checkpoint::open(path, identity)?;
         (Some(checkpoint), loaded)
     };
+    if !loaded.completed.is_empty() {
+        if !dst.existed {
+            bail!(
+                "checkpoint {} records completed files, but destination {} is missing; remove the checkpoint to restart",
+                path.display(),
+                display(dst.path)
+            );
+        }
+        if dst.is_dir {
+            for source in srcs.iter().filter(|source| !source.copies_contents()) {
+                let basename = source.basename();
+                if basename.is_empty() {
+                    continue;
+                }
+                let prefix = basename.as_bytes();
+                let has_completed_path = loaded.completed.keys().any(|completed| {
+                    completed == prefix
+                        || completed
+                            .strip_prefix(prefix)
+                            .is_some_and(|suffix| suffix.starts_with(b"/"))
+                });
+                if has_completed_path {
+                    let target = join(dst.path, prefix);
+                    if stat_one(dst_ctl, &target)?.is_none() {
+                        bail!(
+                            "checkpoint {} records completed files, but destination target {} is missing; remove the checkpoint to restart",
+                            path.display(),
+                            display(&target)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let checkpoint = checkpoint.map(|checkpoint| {
+        let checkpoint = std::sync::Arc::new(checkpoint);
+        checkpoint.spawn_flusher();
+        checkpoint
+    });
     Ok(Some(CheckpointState {
         checkpoint,
         completed: std::sync::Arc::new(loaded.completed),
-        path: path.to_path_buf(),
     }))
 }
 
@@ -193,7 +244,14 @@ fn checkpoint_setup(
 struct CheckpointState {
     checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
     completed: std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>,
-    path: std::path::PathBuf,
+}
+
+impl Drop for CheckpointState {
+    fn drop(&mut self) {
+        if let Some(checkpoint) = &self.checkpoint {
+            let _ = checkpoint.close();
+        }
+    }
 }
 
 /// Shared with workers after checkpoint setup and before planning enqueues work.
@@ -236,6 +294,29 @@ pub fn run(args: Args) -> Result<i32> {
     for s in srcs {
         if !s.same_host(&srcs[0]) {
             bail!("all sources must be on the same host");
+        }
+    }
+    if let Some(checkpoint) = args.checkpoint.as_deref() {
+        let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
+        for source in srcs.iter().filter(|source| !source.is_remote()) {
+            let root = crate::fsops::normalize(&crate::fsops::resolve(source.path.as_bytes()));
+            if checkpoint.starts_with(&root) {
+                bail!(
+                    "checkpoint {} must not be inside local source {}",
+                    checkpoint.display(),
+                    root.display()
+                );
+            }
+        }
+        if !dst.is_remote() {
+            let root = crate::fsops::normalize(&crate::fsops::resolve(dst.path.as_bytes()));
+            if checkpoint.starts_with(&root) {
+                bail!(
+                    "checkpoint {} must not be inside local destination {}",
+                    checkpoint.display(),
+                    root.display()
+                );
+            }
         }
     }
     // Reject up front when two sources would land on the same destination name
@@ -286,11 +367,12 @@ pub fn run(args: Args) -> Result<i32> {
         checksum: args.checksum,
         verify_only: args.verify_only,
         inplace: args.inplace,
-        fsync: args.fsync,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         dry_run: args.dry_run,
-        verbose: args.verbose,
+        quiet: args.quiet,
+        verbose: if args.quiet { 0 } else { args.verbose },
         umask: read_umask(),
+        partial_id: std::sync::OnceLock::new(),
         ignore: args.ignore_lines.clone(),
     });
 
@@ -300,7 +382,7 @@ pub fn run(args: Args) -> Result<i32> {
         show_progress,
         args.progress,
         args.width,
-        args.progress_json,
+        !args.quiet && args.progress_json,
     );
     let sched = Arc::new(Sched::new(block, min_split));
 
@@ -456,8 +538,9 @@ pub fn run(args: Args) -> Result<i32> {
     let dst_root = dst.path.as_bytes().to_vec();
     let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root)?;
     // A destination that is a symlink to a directory is that directory (as
-    // for rsync); a symlink to anything else is replaced like any other file.
-    let dst_root_entry = follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?;
+    // for rsync). Use the resolved target path for all planning and metadata,
+    // so ordinary in-tree symlinks can still be replaced instead of followed.
+    let (dst_root, dst_root_entry) = follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?;
     let dst_existed = dst_root_entry.is_some();
     let dst_is_dir = match &dst_root_entry {
         Some(e) if e.kind == Kind::Dir => true,
@@ -510,6 +593,23 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
+    let identity = copy_identity(&args, srcs, dst, &mut *src_ctl, &mut *dst_ctl, &opts)?;
+    opts.partial_id
+        .set(crate::checkpoint::partial_id(&identity))
+        .expect("partial identity set once");
+
+    let checkpoint_state = checkpoint_setup(
+        &args,
+        srcs,
+        DestinationRoot {
+            path: &dst_root,
+            existed: dst_existed,
+            is_dir: dst_is_dir,
+        },
+        &mut *dst_ctl,
+        &identity,
+    )?;
+
     // Create a missing directory destination — never in the read-only modes.
     if dst_root_entry.is_none() && dst_is_dir && !args.dry_run && !args.verify_only {
         match ok(
@@ -528,15 +628,6 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
-    let checkpoint_state = checkpoint_setup(
-        &args,
-        srcs,
-        dst,
-        &mut *src_ctl,
-        &mut *dst_ctl,
-        dst_existed,
-        &opts,
-    )?;
     let checkpoint_completed = checkpoint_state
         .as_ref()
         .map(|state| state.completed.clone());
@@ -559,6 +650,11 @@ pub fn run(args: Args) -> Result<i32> {
         completed: checkpoint_completed,
         checkpoint: checkpoint_writer,
         dst_seen: std::collections::HashMap::new(),
+        payload_paths: std::collections::HashMap::new(),
+        sidecar_paths: std::collections::HashMap::new(),
+        unusable_files: std::collections::HashSet::new(),
+        deferred_payloads: Vec::new(),
+        source_partials: 0,
         collision: false,
         deferred: Vec::new(),
         dirs_created: 0,
@@ -590,15 +686,34 @@ pub fn run(args: Args) -> Result<i32> {
             break;
         }
     }
+    if scan_err.is_none() && !st.collision {
+        if let Err(error) = st.plan_deferred_payloads() {
+            scan_err = Some(error);
+        }
+    }
+    if st.source_partials > 0 && !args.quiet {
+        let count = st.source_partials;
+        progress.warning(
+            "source_partials",
+            count,
+            &format!(
+                "source contains {count} recognizable SYQ partial path{}; {} treated as ordinary payload",
+                if count == 1 { "" } else { "s" },
+                if count == 1 { "it is" } else { "they are" }
+            ),
+        );
+    }
     let collision = st.collision;
     progress.scan_done.store(true, Relaxed);
-    sched.scan_done();
     if let Some(e) = &scan_err {
         progress.error(&format!("syq: {e:#}"));
         sched.abort();
-    }
-    if collision {
+    } else if collision {
         sched.abort();
+    } else {
+        // Workers have connected in parallel with the scan, but no sidecar is
+        // opened until every payload/sidecar namespace collision is known.
+        sched.scan_done();
     }
 
     // Join workers; the tuner may add more while we do, until it exits.
@@ -644,7 +759,7 @@ pub fn run(args: Args) -> Result<i32> {
     let errors = progress.errors.load(Relaxed);
 
     // Settle an explicit checkpoint. A recording failure only makes a retry
-    // recheck more files; a clean copy removes the no-longer-needed state.
+    // recheck more files. The user-selected state persists until they remove it.
     if let Some(state) = &checkpoint_state {
         let failed = state.checkpoint.as_ref().and_then(|checkpoint| {
             checkpoint
@@ -653,20 +768,10 @@ pub fn run(args: Args) -> Result<i32> {
                 .map(|e| format!("{e:#}"))
                 .or_else(|| checkpoint.take_error())
         });
-        if let Some(e) = failed {
+        if let Some(e) = failed.filter(|_| !args.quiet) {
             eprintln!(
                 "syq: warning: checkpoint recording stopped ({e}); a retry will recheck files completed after that point"
             );
-        }
-        if !opts.dry_run && !aborted && errors == 0 {
-            if let Some(checkpoint) = &state.checkpoint {
-                if let Err(e) = checkpoint.remove() {
-                    eprintln!(
-                        "syq: warning: completed copy but could not remove checkpoint {}: {e:#}",
-                        state.path.display()
-                    );
-                }
-            }
         }
     }
     let elapsed = progress.start.elapsed().as_secs_f64();
@@ -762,14 +867,14 @@ pub(crate) fn stat_one(conn: &mut dyn Conn, path: &[u8]) -> Result<Option<Entry>
 }
 
 /// If `entry` is a symlink whose (possibly chained) target is a directory,
-/// return that directory's entry; otherwise `entry` unchanged.
+/// return the target path and entry; otherwise return the original pair.
 fn follow_dir_symlink(
     conn: &mut dyn Conn,
     path: &[u8],
     entry: Option<Entry>,
-) -> Result<Option<Entry>> {
+) -> Result<(PathBytes, Option<Entry>)> {
     let Some(first) = entry.as_ref().filter(|e| e.kind == Kind::Symlink) else {
-        return Ok(entry);
+        return Ok((path.to_vec(), entry));
     };
     let mut cur_path = path.to_vec();
     let mut cur = first.clone();
@@ -788,7 +893,7 @@ fn follow_dir_symlink(
             join(&parent, &target)
         };
         match stat_one(conn, &next_path)? {
-            Some(e) if e.kind == Kind::Dir => return Ok(Some(e)),
+            Some(e) if e.kind == Kind::Dir => return Ok((next_path, Some(e))),
             Some(e) if e.kind == Kind::Symlink => {
                 cur = e;
                 cur_path = next_path;
@@ -796,15 +901,27 @@ fn follow_dir_symlink(
             _ => break,
         }
     }
-    Ok(entry)
+    Ok((path.to_vec(), entry))
 }
 
 fn display(p: &[u8]) -> String {
     String::from_utf8_lossy(p).into_owned()
 }
 
+fn path_has_partial_component(path: &[u8]) -> bool {
+    path.split(|&byte| byte == b'/')
+        .any(|part| is_partial_name(OsStr::from_bytes(part)))
+}
+
 /// What to checkpoint for a quick-check-identical file once metadata repair succeeds.
 type QuickCheckRecord = (PathBytes, Entry);
+
+struct DeferredPayloadBatch {
+    entries: Vec<Entry>,
+    src_root: PathBytes,
+    sub: String,
+    dst_root: PathBytes,
+}
 
 struct Planner<'a> {
     dst: &'a mut dyn Conn,
@@ -817,6 +934,18 @@ struct Planner<'a> {
     /// Leaf destination paths already claimed, to reject two sources writing one file.
     /// dest path -> is_dir. Two dirs merge; a dir vs a leaf, or two leaves, conflict.
     dst_seen: std::collections::HashMap<PathBytes, bool>,
+    /// Mapped payload paths that look like current sidecars, and every
+    /// sidecar path the current job may use. Their intersection is unsafe.
+    /// Ordinary payload names cannot collide and do not need to stay in RAM.
+    payload_paths: std::collections::HashMap<PathBytes, String>,
+    sidecar_paths: std::collections::HashMap<PathBytes, String>,
+    /// Files whose destination cannot accommodate a safe sidecar name. They
+    /// fail individually while the rest of the scan and transfer continue.
+    unusable_files: std::collections::HashSet<PathBytes>,
+    /// Payload paths inside the reserved-looking namespace are planned only
+    /// after the full collision preflight succeeds.
+    deferred_payloads: Vec<DeferredPayloadBatch>,
+    source_partials: u64,
     collision: bool,
     /// (dst path, meta, flags, depth) for directories, applied deepest-first at the end.
     deferred: Vec<(PathBytes, Meta, u8, usize)>,
@@ -839,10 +968,10 @@ impl Planner<'_> {
         let mut sub = sub.to_string();
         let progress = self.progress;
         let recursive = self.opts.recursive;
+        let quiet = self.opts.quiet;
         src.scan(
             src_root,
             follow,
-            false,
             &self.opts.ignore,
             &mut |batch: Vec<Entry>| {
                 if first {
@@ -852,7 +981,10 @@ impl Planner<'_> {
                             sub = String::new();
                         }
                         if root.kind == Kind::Dir && !recursive {
-                            progress.eprintln(&format!("skipping directory {}", display(src_root)));
+                            if !quiet {
+                                progress
+                                    .eprintln(&format!("skipping directory {}", display(src_root)));
+                            }
                             return Ok(());
                         }
                     }
@@ -864,7 +996,9 @@ impl Planner<'_> {
                 // "skipping …" is a notice (nothing the copy owes is missing);
                 // anything else from the scanner means an entry was lost.
                 if w.starts_with("skipping ") {
-                    progress.eprintln(&format!("syq: {w}"));
+                    if !quiet {
+                        progress.eprintln(&format!("syq: {w}"));
+                    }
                 } else {
                     progress.error(&format!("syq: {w}"));
                 }
@@ -873,6 +1007,44 @@ impl Planner<'_> {
     }
 
     fn handle_batch(
+        &mut self,
+        batch: Vec<Entry>,
+        src_root: &[u8],
+        sub: &str,
+        dst_root: &[u8],
+    ) -> Result<()> {
+        self.register_namespace(&batch, src_root, sub, dst_root)?;
+        if self.collision {
+            return Ok(());
+        }
+        let mut immediate = Vec::with_capacity(batch.len());
+        let mut deferred = Vec::new();
+        for entry in batch {
+            let dst_rel = join(sub.as_bytes(), &entry.path);
+            let reserved_leaf = dst_rel.is_empty()
+                && entry.kind != Kind::Dir
+                && dst_root
+                    .rsplit(|&byte| byte == b'/')
+                    .next()
+                    .is_some_and(|name| is_partial_name(OsStr::from_bytes(name)));
+            if reserved_leaf || path_has_partial_component(&dst_rel) {
+                deferred.push(entry);
+            } else {
+                immediate.push(entry);
+            }
+        }
+        if !deferred.is_empty() {
+            self.deferred_payloads.push(DeferredPayloadBatch {
+                entries: deferred,
+                src_root: src_root.to_vec(),
+                sub: sub.to_string(),
+                dst_root: dst_root.to_vec(),
+            });
+        }
+        self.plan_batch(immediate, src_root, sub, dst_root)
+    }
+
+    fn plan_batch(
         &mut self,
         batch: Vec<Entry>,
         src_root: &[u8],
@@ -907,6 +1079,9 @@ impl Planner<'_> {
                     // a directory from mapping onto the same path.
                     let rel = self.rel_name(src_root, sub_b, &e.path);
                     if !self.claim_dst(&dst_path, &rel, false) {
+                        continue;
+                    }
+                    if self.unusable_files.contains(&dst_path) {
                         continue;
                     }
                 }
@@ -1024,9 +1199,11 @@ impl Planner<'_> {
                             .as_ref()
                             .is_some_and(|d| d.dev == e.dev && d.ino == e.ino)
                     {
-                        self.progress.eprintln(&format!(
-                            "skipping {rel}: source and destination are the same file"
-                        ));
+                        if !opts.quiet {
+                            self.progress.eprintln(&format!(
+                                "skipping {rel}: source and destination are the same file"
+                            ));
+                        }
                         continue;
                     }
                     let same = dst_entry.as_ref().is_some_and(|d| {
@@ -1064,8 +1241,10 @@ impl Planner<'_> {
                             }
                             if ff != 0 {
                                 meta_fixes.push((
-                                    Op::SetMeta {
+                                    Op::SetFileMetaIfSame {
                                         path: dst_path.clone(),
+                                        expected_dev: d.dev,
+                                        expected_ino: d.ino,
                                         meta: e.meta(),
                                         flags: ff,
                                     },
@@ -1221,6 +1400,110 @@ impl Planner<'_> {
         Ok(())
     }
 
+    fn register_namespace(
+        &mut self,
+        batch: &[Entry],
+        src_root: &[u8],
+        sub: &str,
+        dst_root: &[u8],
+    ) -> Result<()> {
+        let sub = sub.as_bytes();
+        let mut files = Vec::new();
+        for entry in batch {
+            if !self.entry_is_payload(entry) {
+                continue;
+            }
+            let source_name = if entry.path.is_empty() {
+                src_root
+                    .rsplit(|&byte| byte == b'/')
+                    .next()
+                    .unwrap_or(src_root)
+            } else {
+                entry
+                    .path
+                    .rsplit(|&byte| byte == b'/')
+                    .next()
+                    .unwrap_or(&entry.path)
+            };
+            if is_partial_name(OsStr::from_bytes(source_name)) {
+                self.source_partials += 1;
+            }
+            let dst_rel = join(sub, &entry.path);
+            let dst_path = join(dst_root, &dst_rel);
+            let rel = self.rel_name(src_root, sub, &entry.path);
+            let reserved_payload = dst_path
+                .rsplit(|&byte| byte == b'/')
+                .next()
+                .is_some_and(|name| is_partial_name(OsStr::from_bytes(name)));
+            if reserved_payload {
+                if let Some(owner) = self.sidecar_paths.get(&dst_path) {
+                    self.progress.error(&format!(
+                        "syq: source payload {rel} maps to {}, which is the reserved sidecar for {owner}",
+                        display(&dst_path)
+                    ));
+                    self.collision = true;
+                }
+                self.payload_paths
+                    .entry(dst_path.clone())
+                    .or_insert(rel.clone());
+            }
+            if entry.kind == Kind::File && !self.opts.inplace && !self.opts.verify_only {
+                files.push((dst_path, rel));
+            }
+        }
+        if files.is_empty() {
+            return Ok(());
+        }
+        let sidecars = self.partial_paths(files.iter().map(|(path, _)| path.clone()).collect())?;
+        for ((dst_path, file_rel), sidecar) in files.into_iter().zip(sidecars) {
+            let sidecar = match sidecar {
+                Ok(sidecar) => sidecar,
+                Err(error) => {
+                    self.progress.error(&format!(
+                        "syq: {file_rel}: cannot create a safe sidecar beside {}: {error}",
+                        display(&dst_path)
+                    ));
+                    self.unusable_files.insert(dst_path);
+                    continue;
+                }
+            };
+            if let Some(payload_rel) = self.payload_paths.get(&sidecar) {
+                self.progress.error(&format!(
+                    "syq: source payload {payload_rel} maps to {}, which is the reserved sidecar for {file_rel}",
+                    display(&sidecar)
+                ));
+                self.collision = true;
+            }
+            if let Some(other) = self.sidecar_paths.insert(sidecar.clone(), file_rel.clone()) {
+                if other != file_rel {
+                    self.progress.error(&format!(
+                        "syq: {other} and {file_rel} require the same sidecar {}",
+                        display(&sidecar)
+                    ));
+                    self.collision = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn entry_is_payload(&self, entry: &Entry) -> bool {
+        match entry.kind {
+            Kind::Dir => self.opts.recursive,
+            Kind::File => true,
+            Kind::Symlink => self.opts.links,
+            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => self.opts.devices,
+            Kind::Other => false,
+        }
+    }
+
+    fn plan_deferred_payloads(&mut self) -> Result<()> {
+        for batch in std::mem::take(&mut self.deferred_payloads) {
+            self.plan_batch(batch.entries, &batch.src_root, &batch.sub, &batch.dst_root)?;
+        }
+        Ok(())
+    }
+
     /// Display name for a source entry: its destination-relative path, or the
     /// source's basename when a single file is copied to an exact destination.
     fn rel_name(&self, src_root: &[u8], sub_b: &[u8], path: &[u8]) -> String {
@@ -1283,6 +1566,26 @@ impl Planner<'_> {
         }
     }
 
+    fn partial_paths(
+        &mut self,
+        paths: Vec<PathBytes>,
+    ) -> Result<Vec<std::result::Result<PathBytes, String>>> {
+        match ok(
+            self.dst.call(Request::PartialPaths {
+                paths,
+                partial_id: *self
+                    .opts
+                    .partial_id
+                    .get()
+                    .expect("partial identity initialized before planning"),
+            })?,
+            "compute sidecar paths",
+        )? {
+            Response::PathResults(paths) => Ok(paths),
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+
     fn apply(&mut self, _on_dst: bool, ops: Vec<Op>) -> Result<Vec<Option<String>>> {
         match ok(self.dst.call(Request::Apply(ops))?, "apply")? {
             Response::Applied(v) => Ok(v),
@@ -1322,6 +1625,11 @@ struct Worker {
     gate: Arc<Gate>,
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
     t: [f64; 4],
+}
+
+struct BlockDiff {
+    ranges: Vec<(u64, u64)>,
+    held_len: Option<u64>,
 }
 
 impl Worker {
@@ -1451,6 +1759,7 @@ impl Worker {
                 self.limit(j.entry.size);
                 self.src.send(Request::ReadRange {
                     path: j.src.clone(),
+                    attempt: j.attempts,
                     off: 0,
                     len: j.entry.size as u32,
                 })?;
@@ -1489,11 +1798,11 @@ impl Worker {
             meta.mode = self.create_mode(j);
             self.dst.send(Request::PutSmall {
                 path: j.dst.clone(),
+                partial_id: self.partial_id(),
                 data: bytes,
                 hash,
                 meta,
                 flags,
-                fsync: self.opts.fsync,
             })?;
             sent.push(true);
         }
@@ -1537,10 +1846,13 @@ impl Worker {
             };
             if changed {
                 if let (Some(e), true) = (now, j.attempts + 1 < MAX_ATTEMPTS) {
-                    self.progress.eprintln(&format!(
-                        "syq: {}: changed during transfer, retrying",
-                        j.rel
-                    ));
+                    if !self.opts.quiet {
+                        self.progress.eprintln(&format!(
+                            "syq: {}: changed during transfer, retrying",
+                            j.rel
+                        ));
+                    }
+                    let published = self.published_entry(j);
                     let mut all = self.sched.jobs.lock().unwrap();
                     let job = &mut all[*idx];
                     self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -1549,8 +1861,7 @@ impl Worker {
                         ..e
                     };
                     job.attempts += 1;
-                    // Keep the original dst_entry so mode is preserved on retry
-                    // without -p (don't adopt the source's mode).
+                    job.dst_entry = Some(published);
                     drop(all);
                     self.sched.requeue(*idx);
                 } else {
@@ -1610,14 +1921,22 @@ impl Worker {
         let partial_size = if inplace {
             None
         } else {
-            match ok(
+            let probed: Result<Option<u64>> = (|| match ok(
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
+                    partial_id: self.partial_id(),
                 })?,
                 "probe partial",
             )? {
-                Response::PartialSize(size) => size,
+                Response::PartialSize(size) => Ok(size),
                 other => bail!("unexpected response {other:?}"),
+            })();
+            match probed {
+                Ok(size) => size,
+                Err(error) => {
+                    self.sched.ranges_ready(idx, vec![]);
+                    return Err(error);
+                }
             }
         };
         // Same-machine copy: let the kernel move the bytes (reflink / NFS
@@ -1642,8 +1961,8 @@ impl Worker {
                 }
             }
         }
-        // bool = this path still needs Finalize (as opposed to content that
-        // matched the existing final file and only needed metadata repair).
+        // bool = a staged or in-place file still needs Finalize. A verified
+        // content match applies metadata through its retained basis fd instead.
         let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
             let final_entry = job.dst_entry.clone();
             if let Some(f) = &final_entry {
@@ -1653,9 +1972,9 @@ impl Worker {
             }
             let final_is_file = final_entry.as_ref().is_some_and(|f| f.kind == Kind::File);
             let full = || if size > 0 { vec![(0, size)] } else { vec![] };
-            // Unless --inplace was explicit, every file is published through
-            // a sidecar + atomic rename. Small new files normally take the
-            // pipelined PutSmall path instead of reaching this worker path.
+            // Unless --inplace was explicit, changed files are published
+            // through a sidecar + atomic rename. Small new files normally take
+            // the pipelined PutSmall path instead of reaching this worker path.
             self.set_inplace(idx, inplace);
 
             if inplace {
@@ -1664,7 +1983,7 @@ impl Worker {
                         path: job.dst.clone(),
                         size,
                         inplace: true,
-                        from_final: false,
+                        partial_id: self.partial_id(),
                         mode: self.create_mode(&job),
                     })?,
                     "prepare",
@@ -1680,7 +1999,7 @@ impl Worker {
                         path: job.dst.clone(),
                         size,
                         inplace: false,
-                        from_final: false,
+                        partial_id: self.partial_id(),
                         mode: self.create_mode(&job),
                     })?,
                     "prepare",
@@ -1690,42 +2009,29 @@ impl Worker {
                 }
                 return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
-            if final_is_file && (size > 0 && final_entry.as_ref().unwrap().size > 0 || size == 0) {
-                let ranges = if size > 0 {
-                    self.diff_blocks(&job, Which::Final)?
-                } else {
-                    vec![]
-                };
-                if ranges.is_empty() && final_entry.as_ref().unwrap().size == size {
-                    // Content identical: just fix up metadata (mode per rsync rules).
+            if final_is_file {
+                let (ranges, basis_len) = self.diff_final_and_hold(&job)?;
+                if ranges.is_empty() && basis_len == size {
                     let mut meta = job.entry.meta();
                     meta.mode = self.create_mode(&job);
-                    let flags = self.opts.flags | flags::MODE;
-                    let errs = match ok(
-                        self.dst.call(Request::Apply(vec![Op::SetMeta {
+                    ok(
+                        self.dst.call(Request::FinishBasis {
                             path: job.dst.clone(),
+                            partial_id: self.partial_id(),
                             meta,
-                            flags,
-                        }]))?,
-                        "setmeta",
-                    )? {
-                        Response::Applied(v) => v,
-                        other => bail!("unexpected response {other:?}"),
-                    };
-                    if let Some(e) = errs.into_iter().flatten().next() {
-                        bail!("{e}");
-                    }
+                            flags: self.opts.flags | flags::MODE,
+                        })?,
+                        "finish content-identical destination",
+                    )?;
                     return Ok((vec![], false));
                 }
                 ok(
-                    self.dst.call(Request::Prepare {
+                    self.dst.call(Request::SeedBasis {
                         path: job.dst.clone(),
-                        size,
-                        inplace: false,
-                        from_final: true,
-                        mode: self.create_mode(&job),
+                        partial_id: self.partial_id(),
+                        len: size,
                     })?,
-                    "prepare",
+                    "seed partial from destination basis",
                 )?;
                 return Ok((ranges, true));
             }
@@ -1734,7 +2040,7 @@ impl Worker {
                     path: job.dst.clone(),
                     size,
                     inplace: false,
-                    from_final: false,
+                    partial_id: self.partial_id(),
                     mode: self.create_mode(&job),
                 })?,
                 "prepare",
@@ -1765,28 +2071,8 @@ impl Worker {
                     self.finish_file(idx)?;
                 }
             }
-            None => {
-                if !needs_finalize {
-                    self.progress.files_total.fetch_sub(1, Relaxed);
-                    self.progress.files_skipped.fetch_add(1, Relaxed);
-                    // Content matched block for block and the metadata is now
-                    // right: complete, so checkpoint it (after the same source
-                    // re-check a transferred file gets) and spare the next
-                    // run the stat and the hashing.
-                    let unchanged = matches!(
-                        stat_one(&mut *self.src, &job.src)?,
-                        Some(ref e) if e.kind == Kind::File
-                            && e.size == job.entry.size
-                            && e.mtime == job.entry.mtime
-                            && e.mtime_nsec == job.entry.mtime_nsec
-                    );
-                    if unchanged {
-                        self.record_done(&job.rel_bytes, &job.entry);
-                    }
-                } else {
-                    self.finish_file(idx)?;
-                }
-            }
+            None if needs_finalize => self.finish_file(idx)?,
+            None => self.finish_matched_file(idx)?,
         }
         Ok(())
     }
@@ -1811,6 +2097,7 @@ impl Worker {
             src: job.src.clone(),
             dst: job.dst.clone(),
             inplace,
+            partial_id: self.partial_id(),
             size: job.entry.size,
             mode,
         })?;
@@ -1849,34 +2136,115 @@ impl Worker {
         }
     }
 
+    fn partial_id(&self) -> PartialId {
+        *self
+            .opts
+            .partial_id
+            .get()
+            .expect("partial identity initialized before planning")
+    }
+
+    /// Metadata for the whole file just atomically published at the
+    /// destination. A retry can use it as a block-diff basis without changing
+    /// the no-`-p` mode chosen for the first attempt.
+    fn published_entry(&self, job: &FileJob) -> Entry {
+        let mut entry = job.entry.clone();
+        entry.path = job.dst.clone();
+        entry.mode = (entry.mode & !0o7777) | self.create_mode(job);
+        entry
+    }
+
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
     fn diff_blocks(&mut self, job: &FileJob, which: Which) -> Result<Vec<(u64, u64)>> {
+        self.diff_with(
+            job,
+            Request::HashBlocks {
+                path: job.dst.clone(),
+                which,
+                partial_id: self.partial_id(),
+                block: self.opts.block,
+                len: job.entry.size,
+            },
+            "hash destination",
+        )
+        .map(|diff| diff.ranges)
+    }
+
+    /// Compare the source with one opened final-file inode retained by the
+    /// receiver for either metadata-only completion or sidecar seeding.
+    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<(Vec<(u64, u64)>, u64)> {
+        let diff = self.diff_with(
+            job,
+            Request::HashAndHold {
+                path: job.dst.clone(),
+                partial_id: self.partial_id(),
+                block: self.opts.block,
+                len: job.entry.size,
+            },
+            "hash and retain destination basis",
+        )?;
+        Ok((
+            diff.ranges,
+            diff.held_len
+                .context("destination did not report its retained basis length")?,
+        ))
+    }
+
+    fn diff_with(
+        &mut self,
+        job: &FileJob,
+        destination_request: Request,
+        destination_label: &str,
+    ) -> Result<BlockDiff> {
         let block = self.opts.block;
         let size = job.entry.size;
         self.src.send(Request::HashBlocks {
             path: job.src.clone(),
             which: Which::Final,
+            partial_id: self.partial_id(),
             block,
             len: size,
         })?;
-        self.dst.send(Request::HashBlocks {
-            path: job.dst.clone(),
-            which,
-            block,
-            len: size,
-        })?;
-        let sh = match ok(self.src.recv()?, "hash source")? {
-            Response::Hashes(h) => h,
+        self.dst.send(destination_request)?;
+        // Both requests are in flight. Always consume both responses before
+        // interpreting either one so an ordinary endpoint error cannot leave
+        // this reusable worker connection one response behind.
+        let source_response = self.src.recv();
+        let destination_response = self.dst.recv();
+        let source = Self::hashes(ok(source_response?, "hash source")?)?;
+        let (destination, held_len) =
+            Self::destination_hashes(ok(destination_response?, destination_label)?)?;
+        Ok(BlockDiff {
+            ranges: Self::different_ranges(&source, &destination, block, size),
+            held_len,
+        })
+    }
+
+    fn hashes(response: Response) -> Result<Vec<u64>> {
+        match response {
+            Response::Hashes(hashes) => Ok(hashes),
             other => bail!("unexpected response {other:?}"),
-        };
-        let dh = match ok(self.dst.recv()?, "hash destination")? {
-            Response::Hashes(h) => h,
+        }
+    }
+
+    fn destination_hashes(response: Response) -> Result<(Vec<u64>, Option<u64>)> {
+        match response {
+            Response::Hashes(hashes) => Ok((hashes, None)),
+            Response::HeldHashes { hashes, len } => Ok((hashes, Some(len))),
             other => bail!("unexpected response {other:?}"),
-        };
+        }
+    }
+
+    fn different_ranges(
+        source: &[u64],
+        destination: &[u64],
+        block: u64,
+        size: u64,
+    ) -> Vec<(u64, u64)> {
         let n = size.div_ceil(block) as usize;
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for i in 0..n {
-            let same = sh.get(i).is_some() && sh.get(i) == dh.get(i);
+            let same = source.get(i).is_some() && source.get(i) == destination.get(i);
             if same {
                 continue;
             }
@@ -1887,7 +2255,7 @@ impl Worker {
                 _ => ranges.push((off, end)),
             }
         }
-        Ok(ranges)
+        ranges
     }
 
     fn transfer_range(&mut self, h: &RangeHandle) -> Result<()> {
@@ -1932,6 +2300,7 @@ impl Worker {
                 self.limit(n);
                 self.src.send(Request::ReadRange {
                     path: job.src.clone(),
+                    attempt: job.attempts,
                     off,
                     len: n as u32,
                 })?;
@@ -1955,6 +2324,8 @@ impl Worker {
             self.dst.send(Request::WriteRange {
                 path: job.dst.clone(),
                 inplace,
+                partial_id: self.partial_id(),
+                attempt: job.attempts,
                 off,
                 hash,
                 data,
@@ -2010,12 +2381,32 @@ impl Worker {
             self.dst.call(Request::Finalize {
                 path: job.dst.clone(),
                 inplace: job.inplace,
+                partial_id: self.partial_id(),
                 meta,
                 flags,
-                fsync: self.opts.fsync,
             })?,
             "finalize destination",
         )?;
+        #[cfg(debug_assertions)]
+        if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_AFTER_FINALIZE_MS") {
+            if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+        self.complete_file(idx, job, false)
+    }
+
+    fn finish_matched_file(&mut self, idx: usize) -> Result<()> {
+        if self.sched.is_failed(idx) {
+            return Ok(());
+        }
+        self.complete_file(idx, self.job(idx), true)
+    }
+
+    /// Recheck the source after either an atomic publication or a verified
+    /// metadata-only completion, and retry from the completed destination when
+    /// the source changed during that work.
+    fn complete_file(&mut self, idx: usize, job: FileJob, matched: bool) -> Result<()> {
         // Did the source change under us?
         let now = stat_one(&mut *self.src, &job.src)?;
         let changed = match &now {
@@ -2030,10 +2421,13 @@ impl Worker {
         if changed {
             if job.attempts + 1 < MAX_ATTEMPTS {
                 if let Some(e) = now {
-                    self.progress.eprintln(&format!(
-                        "syq: {}: changed during transfer, retrying",
-                        job.rel
-                    ));
+                    if !self.opts.quiet {
+                        self.progress.eprintln(&format!(
+                            "syq: {}: changed during transfer, retrying",
+                            job.rel
+                        ));
+                    }
+                    let published = self.published_entry(&job);
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let j = &mut jobs[idx];
                     self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -2042,8 +2436,7 @@ impl Worker {
                         ..e
                     };
                     j.attempts += 1;
-                    // Keep the original dst_entry: it drives mode preservation
-                    // without -p, and re-reading the source must not change it.
+                    j.dst_entry = Some(published);
                     j.done.store(0, Relaxed);
                     drop(jobs);
                     self.sched.requeue(idx);
@@ -2052,9 +2445,14 @@ impl Worker {
             }
             bail!("source changed during transfer (or vanished)");
         }
-        self.progress.files_done.fetch_add(1, Relaxed);
+        if matched {
+            self.progress.files_total.fetch_sub(1, Relaxed);
+            self.progress.files_skipped.fetch_add(1, Relaxed);
+        } else {
+            self.progress.files_done.fetch_add(1, Relaxed);
+        }
         self.record_done(&job.rel_bytes, &job.entry);
-        if self.opts.verbose > 0 {
+        if !matched && self.opts.verbose > 0 {
             self.progress.println(&job.rel);
         }
         Ok(())
@@ -2077,8 +2475,12 @@ impl Worker {
             self.dst.send(Request::FileHash {
                 path: job.dst.clone(),
             })?;
-            let a = ok(self.src.recv()?, "hash source")?;
-            let b = ok(self.dst.recv()?, "hash destination")?;
+            // Keep both reusable connections aligned even if one endpoint
+            // reports an ordinary per-file error.
+            let source_response = self.src.recv();
+            let destination_response = self.dst.recv();
+            let a = ok(source_response?, "hash source")?;
+            let b = ok(destination_response?, "hash destination")?;
             match (a, b) {
                 (
                     Response::FileHash { size: s1, hash: h1 },

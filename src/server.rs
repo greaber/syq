@@ -121,7 +121,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Request::Scan {
                 root,
                 follow_root,
-                all,
                 ignore,
             } => {
                 let root = fsops::resolve(&root);
@@ -132,7 +131,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 let res = crate::scan::scan(
                     &root,
                     follow_root,
-                    all,
                     &ignore,
                     &mut |batch| {
                         let mut w = wref.borrow_mut();
