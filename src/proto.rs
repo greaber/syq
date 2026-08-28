@@ -119,6 +119,11 @@ pub enum Op {
     Rmdir {
         path: PathBytes,
     },
+    /// Remove a non-directory; a directory that has appeared there is an
+    /// error, never recursed into (used by --delete for planned leaves).
+    Unlink {
+        path: PathBytes,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -138,12 +143,18 @@ pub enum Request {
         port_hi: u16,
     },
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
+    /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
     Scan {
         root: PathBytes,
         follow_root: bool,
         ignore: Vec<String>,
+        report_ignored: bool,
     },
-    StatMany(Vec<PathBytes>),
+    /// lstat each path; with `follow`, stat through symlinks instead.
+    StatMany {
+        paths: Vec<PathBytes>,
+        follow: bool,
+    },
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {
         paths: Vec<PathBytes>,
@@ -266,6 +277,8 @@ pub enum Response {
     },
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
+    /// Paths (relative to the root) pruned by the ignore patterns.
+    ScanIgnored(Vec<PathBytes>),
     ScanDone,
     Stats(Vec<Option<Entry>>),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
@@ -301,7 +314,9 @@ impl SizeHint for Request {
         match self {
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
             Request::PutSmall { data, path, .. } => data.len() + path.len() + 96,
-            Request::StatMany(v) => v.iter().map(|p| p.len() + 8).sum::<usize>() + 16,
+            Request::StatMany { paths, .. } => {
+                paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
+            }
             Request::Apply(v) => v.len() * 128 + 16,
             _ => 256,
         }

@@ -153,7 +153,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--progress-json` | One JSON line per second on stderr |
 | `--stats` | Summary counts at the end |
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
-| `--verify-only` | Hash every file on both sides and report differences; write nothing |
+| `--verify-only` | Hash every file in the run's scope on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
 | `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
 | `-e CMD`, `--rsh CMD` | Remote shell command; controls agent forwarding when set (default `ssh`) |
@@ -164,10 +164,19 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
 | `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
+| `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
+| `--delete-excluded` | With `--delete`, also remove destination paths the `-i` patterns exclude |
+| `--max-delete N` | With `--delete`, delete nothing if more than N deletions are planned (exit 25) |
+| `-u`, `--update` | Skip files that are newer on the destination |
+| `--existing` | Only update files that already exist on the destination; create nothing |
+| `--ignore-existing` | Only create files missing on the destination; update nothing |
+| `--max-size SIZE`, `--min-size SIZE` | Don't transfer regular files larger / smaller than SIZE |
+| `--files-from FILE` | Copy only the listed paths (relative to the one source directory; see below) |
+| `--from0` | `--files-from` entries are NUL-separated |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
 | `--no-forward-agent` | Remote-to-remote with default `ssh`: disable agent forwarding (conflicts with `-e`) |
-| `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
+| `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session; prints the follow target even with `-q` |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
@@ -227,7 +236,14 @@ Identical to rsync:
   `.` behave the same way.
 - A single file source goes to `dest/file` if `dest` is an existing directory,
   otherwise `dest` is the new filename.
-- Several sources require (or create) a directory destination.
+- Several sources require (or create) a directory destination. With several
+  sources syq scans them all before writing anything, so two sources mapping
+  onto one destination path is refused before the destination is touched —
+  not even a missing destination directory is created (the transfer starts
+  once the scans finish). Naming the destination file itself as one of the
+  sources doesn't change that: it would be overwritten, so it's a conflict.
+  The price is memory: every scanned entry is held until the scans are
+  validated, roughly a few hundred bytes per entry across all sources.
 - An explicitly supplied destination root that is a symlink to a directory is
   that directory (the link is kept, with or without a trailing slash). A
   symlink encountered below the destination root is payload at that path: it
@@ -283,8 +299,11 @@ rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
 semantics and block size, but not operational controls such as checksum
 checking, `-j`, verbosity, progress or bandwidth limiting. Filesystem
 component limits are queried and cached per directory; long basenames are
-deterministically truncated and disambiguated to fit. Exceptionally long full
-paths can still fail with a clear error. SYQ does not `fsync` transfer data;
+deterministically truncated and disambiguated to fit. An exceptionally long
+full path still fails that one file with a clear error (even when it is
+already up to date) while the rest of the transfer continues, and so does a
+destination entry — say, a directory some other tool left — already occupying
+the exact path this job's sidecar for that file needs. SYQ does not `fsync` transfer data;
 atomic sidecar publication provides old-or-new visibility and resumable
 interrupted work, not crash-durability across power loss.
 Small files still use a pipelined whole-file request, but the receiver writes
@@ -372,7 +391,9 @@ path. Unfinished individual files are never checkpoint-complete; their actual
 
 The checkpoint is flushed about once a second and persists after both failed
 and successful runs until you remove or stop passing it. Losing its last
-buffered records only causes repeated work. If an existing checkpoint has
+buffered records only causes repeated work; if recording stops mid-run the
+copy continues and a warning names the I/O error — printed even under `-q`,
+while the exit code keeps describing the copy itself. If an existing checkpoint has
 completed records but an expected destination root is missing, SYQ fails and
 asks you to remove the checkpoint to restart. The checkpoint must be a regular
 file with exactly one hard link and must be outside local source and
@@ -386,12 +407,16 @@ A checkpoint is an explicit trust decision: SYQ does not inspect a destination
 file covered by a matching record. If another process deleted, replaced, or
 modified that destination after it was recorded, a checkpointed retry will not
 notice. Do not use a checkpoint when the destination may be independently
-modified; omit the option and SYQ remains history-independent.
+modified; omit the option and SYQ remains history-independent. `--delete`
+records what it removes in an active checkpoint, so a file the source drops
+and later brings back is transferred again rather than assumed complete.
 
 Like rsync, ordinary SYQ runs do not coordinate with each other. Different
 logical commands use different partial names, so concurrent copies into one
 tree produce the union of their files and one whole-file rename wins for any
-path both write. A content-identical comparison applies metadata only through
+path both write — but do not combine concurrent copies with `--delete`,
+which mirrors *its* source and removes the other command's not-yet-shared
+files and sidecars as extras. A content-identical comparison applies metadata only through
 the inode it verified, so it cannot mix its metadata with another job's newly
 renamed contents. Quick-check metadata repair likewise verifies the inode;
 if a concurrent publication replaced it, the repair reports an error instead
@@ -439,14 +464,19 @@ Compared with rsync: ordinary content-changing writes use the same
 temporary-file plus atomic rename model; `--inplace` explicitly gives that up.
 Rsync chooses a random temporary suffix, while SYQ uses a deterministic job ID
 so an interrupted command can find its partial again without a local state
-file. The change-during-transfer check is the same idea; deletes and hardlinks
-aren't implemented, so there is no ordering question for them.
+file. The change-during-transfer check is the same idea; `--delete` runs
+strictly after the transfer (see below); hardlinks aren't implemented.
 
 ## Not implemented (on purpose, for now)
 
+`RSYNC-COMPAT.md` tracks rsync compatibility in full: what matches, what
+differs and why, what's missing, and the open issues. The short version:
+
 - rsync filter rules (`--exclude`/`--include`/`--filter`); use `-i` (gitignore
   syntax) instead.
-- `--delete`, `--link-dest`, `-u`/`--update`, `--files-from`.
+- `--link-dest`, `--backup`.
+- `--delete-before`/`--delete-during` and `--force`. syq deletes only after
+  the transfer (`--delete-after`/`--delete-delay` are accepted as synonyms).
 - Hardlinks (`-H`), ACLs and xattrs (`-A`/`-X`).
 - rsync daemon mode / `rsync://`. syq speaks its own protocol; it cannot talk
   to an rsync server.
@@ -578,6 +608,100 @@ ignored: `logs/**` prunes `logs/keep` itself, so `!logs/keep/**` after it has
 nothing to act on. Ignore the siblings instead (`logs/*`, which does not cross
 `/`) and re-include the directory (`!logs/keep/`), as above.
 
+## Deleting extras (`--delete`)
+
+`syq -a --delete src/ host:dst/` makes `dst` look like `src`: after the
+transfer, anything under a destination directory that the source doesn't
+have is removed. The rules are simpler than rsync's, deliberately:
+
+- **Scope.** Only inside directories the sources map onto: `syq --delete a b
+  dst/` cleans `dst/a` and `dst/b`, never `dst/c`. A single-file source deletes
+  nothing.
+- **Ignored means out of scope, on both sides.** The `-i` patterns are applied
+  to the destination walk from the same roots, so an ignored path is neither
+  copied nor deleted, and a directory that holds one is kept (`not deleting
+  keep/: it holds ignored paths`, on stderr, not an error). `--delete-excluded`
+  drops that protection: ignored paths on the destination are extras too.
+- **Anything the source has is safe.** A file skipped by `-u`, `--existing`,
+  `--ignore-existing`, `--max-size` or `--min-size` — or a symlink or special
+  file skipped for lack of `-l`/`-D` — still exists in the source, so its
+  destination copy is left alone, as in rsync. Such files are reported under
+  `files excluded` in `--stats`.
+- With `--delete` the sidecar path of every mapped regular file stays in
+  memory until deletions run (that set is what tells a live sidecar from an
+  orphan); on multi-million-file trees this is the option's main memory cost.
+- **After, not before.** Deletions run once every file has been transferred
+  and only if the whole source scan succeeded: an unreadable source directory
+  would otherwise look like one whose contents vanished (`source scan reported
+  errors; skipping deletions`). The destination walk is held to the same rule:
+  an unreadable directory *there* looks empty and would be removed over its
+  unknown contents, so its errors also skip all deletions. An interrupted run therefore never deletes
+  anything, and directory mtimes are set after the deletes.
+- **Sidecar-patterned files are extras unless they are this job's live
+  resume state.** A `.name.syq-part.<job-id>` of *this* command whose `name`
+  is still in the source stays, whatever happened to that file this run
+  (failed, filtered, already up to date): the next transfer of that file
+  consumes it. Everything else matching the pattern — an orphan of this
+  command, or any other job id — is an ordinary extra: syq copies such names
+  as payload, so the name alone proves nothing, and mirroring the source is
+  what --delete is for. Note that the job identity includes the command's
+  semantic options: change those (or the source/destination spelling they
+  normalize to) and the previous identity's sidecars become orphans —
+  removed by `--delete`, inert otherwise.
+- `--max-delete N` refuses to delete anything — not the first N — when more
+  than N deletions are planned, says so, and exits 25 (rsync's code for it).
+- `-n --delete -v` lists every `deleting path` line a real run would print.
+  The summary reports `N deleted` / `N would be deleted`. `--delete`
+  conflicts with `--verify-only` (deleting is the opposite of writing
+  nothing) and with `--files-from` (deletion scope under a file list is
+  ambiguous).
+
+Deletion goes through the control connection in batches of 1000 (the
+destination side unlinks each batch in parallel); it isn't spread over the
+`-j` data connections like `--rm` is.
+
+## Skipping by state and size
+
+- `-u` / `--update`: a file whose destination copy has a newer mtime is left
+  alone (regular files only). Neither `-u` nor `--ignore-existing` can be
+  combined with `--inplace`: an interrupted in-place write leaves a
+  partially-written final file that looks newer, which those filters would
+  then skip on every retry.
+- `--existing`: never create anything — files, symlinks, specials,
+  directories, *or the destination itself* — that isn't already there;
+  existing files are still updated. `--ignore-existing` is the mirror image: create what's
+  missing, never touch what exists — including an existing file or symlink
+  where the source maps a *directory*: it stays, and that directory with its
+  whole subtree is skipped with a notice (rsync would delete the file to
+  make room). Both apply to every non-directory entry.
+- `--max-size` / `--min-size`: regular files outside the range are not
+  transferred (`4K`, `100M`, `2G`; the same suffixes as `--block-size`).
+  Directories and symlinks are unaffected.
+
+All of these define the scope of the run, so `--verify-only` checks the files
+the same command would transfer and nothing else.
+
+## Copying a list (`--files-from`)
+
+`syq -a --files-from list.txt host:src/ dst/` copies only the paths named in
+`list.txt`, one per line (`--from0`: NUL-separated; `-` reads stdin), each
+relative to the single source directory, to the same relative path under the
+destination. The source is not walked, which is the point on a slow
+filesystem when the list is known. Parent directories of listed paths are
+created (with their metadata). A parent that is a symlink on the source is
+followed — you named a path through it — and becomes a real directory on the
+destination, so nothing is ever written through a destination symlink; a
+parent that resolves to a file or dangles is an error. A listed directory is copied *without*
+its contents unless `-r` is given on the command line itself — `-a` alone
+does not count, as in rsync — so `-a -r --files-from` walks the directories
+the list names (never the implied parents).
+Blank lines are ignored, leading `/` or `./` and trailing `/` are stripped,
+and `..` components or a line that names the root itself are rejected. A listed path that doesn't exist is an
+error (exit 23) and the rest is still copied. The destination must be a directory (an
+existing file there is an error, never replaced). `--files-from` can't be
+combined with `-i`/`--ignore-from` or `--delete`; for a remote-to-remote copy
+it needs `--relay` (the list is read on this machine).
+
 ## Parallel removal (`--rm`)
 
 `syq --rm [-j N] [-n] [-v] PATH...` removes trees the way syq copies them:
@@ -646,4 +770,5 @@ fix for that.
 |---|---|
 | 0 | Everything copied and verified |
 | 23 | Finished, but some files failed (unreadable source, `DIFFERS`, changed during transfer …) — errors are on stderr |
+| 25 | Finished, but `--max-delete` stopped the deletions |
 | 1 | Fatal: bad arguments, couldn't connect, remote `syq` missing, connection lost |

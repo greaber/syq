@@ -211,6 +211,7 @@ pub fn run(args: Args) -> Result<i32> {
             &root,
             false,
             &[],
+            false,
             &mut |entries: Vec<Entry>| {
                 for e in entries {
                     let full = join(&root, &e.path);
@@ -232,6 +233,7 @@ pub fn run(args: Args) -> Result<i32> {
                 }
                 Ok(())
             },
+            &mut |_| Ok(()),
             &mut |w| progress.error(&format!("syq: {w}")),
         );
         pool.submit(batch);

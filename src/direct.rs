@@ -35,6 +35,11 @@ fn direct_command(
 pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     let rsh = parse_rsh(&args.rsh)?;
     let src_host = srcs[0].host.clone().unwrap();
+    // The follow target must reconnect the way we did: keep an explicit user.
+    let src_target = match &srcs[0].user {
+        Some(user) => format!("{user}@{src_host}"),
+        None => src_host.clone(),
+    };
     let spec = crate::conn::RemoteSpec {
         user: srcs[0].user.clone(),
         host: src_host.clone(),
@@ -90,6 +95,30 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     if args.inplace {
         remote.push("--inplace".into());
+    }
+    if args.delete {
+        remote.push("--delete".into());
+    }
+    if args.delete_excluded {
+        remote.push("--delete-excluded".into());
+    }
+    if let Some(n) = args.max_delete {
+        remote.push(format!("--max-delete={n}"));
+    }
+    if args.update {
+        remote.push("--update".into());
+    }
+    if args.ignore_existing {
+        remote.push("--ignore-existing".into());
+    }
+    if args.existing {
+        remote.push("--existing".into());
+    }
+    if let Some(m) = &args.max_size {
+        remote.push(format!("--max-size={m}"));
+    }
+    if let Some(m) = &args.min_size {
+        remote.push(format!("--min-size={m}"));
     }
     if let Some(path) = &args.checkpoint {
         remote.push(format!("--checkpoint={path}"));
@@ -240,9 +269,13 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         if !out.status.success() || log.is_empty() {
             bail!("could not start detached transfer on {src_host}");
         }
-        if !args.quiet {
-            println!("syq: started on {src_host}, log {log}");
-            println!("syq: follow with:  syq --follow {src_host}:{log}");
+        // The handoff is the command's result, not chatter: -q trims it to
+        // the bare follow target rather than suppressing it.
+        if args.quiet {
+            println!("{src_target}:{log}");
+        } else {
+            println!("syq: started on {src_target}, log {log}");
+            println!("syq: follow with:  syq --follow {src_target}:{log}");
         }
         return Ok(0);
     }
@@ -263,6 +296,16 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     match status.code() {
         Some(0) => Ok(0),
+        // 23 (some files failed) and 25 (--max-delete refused) pass through:
+        // they are transfer results, and the remote's stderr was inherited so
+        // its errors are already printed. Exit 1 is also a defined remote
+        // result (fatal), but it is indistinguishable from "hostA cannot
+        // reach the destination", where the --relay hint below is the useful
+        // answer — so 1 keeps the hint. All of this assumes the -e shell
+        // relays the remote exit status (ssh does, using 255 for its own
+        // transport failures); a custom shell that exits 23/25 itself would
+        // be mistaken for the orchestrator.
+        Some(c @ (23 | 25)) => Ok(c),
         Some(c) => {
             bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
         }

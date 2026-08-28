@@ -114,8 +114,9 @@ pub struct Args {
     pub verify_only: bool,
     /// Update files in place instead of writing a partial and renaming. Use this to modify a
     /// large existing file without copying it first (saves time and disk space when only part
-    /// of it changes)
-    #[arg(long)]
+    /// of it changes). Cannot be combined with -u or --ignore-existing: an interrupted
+    /// in-place write leaves a newer-looking final file those filters would then skip forever
+    #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
     /// Avoid completed-file destination lookups on later runs. Normal reruns and partial-file
     /// resume do not need this. The file persists and must be outside local source/destination trees.
@@ -181,8 +182,58 @@ pub struct Args {
     #[arg(skip)]
     pub ignore_lines: Vec<String>,
 
+    /// Delete extraneous files from the destination directories (paths the source does not
+    /// have). Deletion happens after the transfer and is skipped entirely if the source scan
+    /// reported any error. Ignored paths (-i) are protected on both sides. rsync's
+    /// --delete-after and --delete-delay mean the same thing and are accepted
+    #[arg(
+        long,
+        aliases = ["delete-after", "delete-delay"],
+        conflicts_with_all = ["verify_only", "files_from"]
+    )]
+    pub delete: bool,
+    /// With --delete, also remove destination paths that the -i patterns exclude
+    #[arg(long, requires = "delete")]
+    pub delete_excluded: bool,
+    /// With --delete, refuse to delete anything if more than N deletions are planned (exit 25)
+    #[arg(long, value_name = "N", requires = "delete")]
+    pub max_delete: Option<u64>,
+    /// Skip regular files that are newer on the destination (directories,
+    /// symlinks and specials are unaffected)
+    #[arg(short = 'u', long)]
+    pub update: bool,
+    /// Skip updating files that already exist on the destination
+    #[arg(long)]
+    pub ignore_existing: bool,
+    /// Never create anything that doesn't exist yet on the destination — files, symlinks,
+    /// specials, directories, or the destination root itself; existing files are still updated
+    #[arg(long)]
+    pub existing: bool,
+    /// Don't transfer regular files larger than SIZE (e.g. 100M). With --delete the
+    /// destination copy of such a file is left alone
+    #[arg(long, value_name = "SIZE")]
+    pub max_size: Option<String>,
+    /// Don't transfer regular files smaller than SIZE
+    #[arg(long, value_name = "SIZE")]
+    pub min_size: Option<String>,
+    /// Copy only the paths listed in FILE (one per line, relative to the single source
+    /// directory; `-` reads stdin). Listed directories are copied without their contents
+    /// unless -r is given explicitly; missing parent directories are created
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["ignore", "ignore_from"])]
+    pub files_from: Option<String>,
+    /// --files-from entries are NUL-separated instead of one per line
+    #[arg(long, requires = "files_from")]
+    pub from0: bool,
+    /// Paths read from --files-from (filled by parse_args)
+    #[arg(skip)]
+    pub files_from_lines: Vec<Vec<u8>>,
+    /// -r given on the command line itself (not via -a); decides whether --files-from
+    /// directories are copied with their contents
+    #[arg(skip)]
+    pub recursive_explicit: bool,
+
     /// Remove the given paths recursively and in parallel (like rm -rf); honours -j, -n, -v, -q, -e
-    #[arg(long, conflicts_with_all = ["ignore", "ignore_from"])]
+    #[arg(long, conflicts_with_all = ["ignore", "ignore_from", "delete", "files_from"])]
     pub rm: bool,
 
     /// Source(s) and destination (or, with --rm, the paths to remove)
@@ -233,10 +284,27 @@ impl Args {
                 args.ignore_lines.push(v);
             }
         }
+        if let Some(f) = &args.files_from {
+            // Check this before reading the list (it may be stdin) and before
+            // anything connects: the list lives on this machine, but a direct
+            // remote-to-remote copy would run the orchestrator on the source.
+            if !args.rm && !args.follow && !args.relay && args.paths.len() >= 2 {
+                let locs: Vec<Location> = args
+                    .paths
+                    .iter()
+                    .map(|p| Location::parse(p))
+                    .collect::<Result<_>>()?;
+                if locs[0].is_remote() && locs[locs.len() - 1].is_remote() {
+                    bail!("--files-from with a remote-to-remote copy needs --relay");
+                }
+            }
+            args.files_from_lines = read_files_from(f, args.from0)?;
+        }
         Ok(args)
     }
 
     pub fn normalize(&mut self) {
+        self.recursive_explicit = self.recursive;
         if self.archive {
             self.recursive = true;
             self.links = true;
@@ -273,6 +341,60 @@ impl Args {
     }
 }
 
+/// Read a --files-from list: one path per line (or NUL-separated with --from0),
+/// relative to the source root. Blank lines are dropped; `.` and empty
+/// components (so leading `/`, `./`, trailing `/`, `a//b`) are removed; `..`
+/// components and lines naming the root itself are rejected.
+fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    if file == "-" {
+        std::io::stdin().read_to_end(&mut raw)?;
+    } else {
+        raw = std::fs::read(file).map_err(|e| anyhow::anyhow!("--files-from {file}: {e}"))?;
+    }
+    let mut out = Vec::new();
+    let items: Vec<&[u8]> = if nul {
+        raw.split(|&b| b == 0).collect()
+    } else {
+        raw.split(|&b| b == b'\n')
+            .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+            .collect()
+    };
+    for item in items {
+        if item.is_empty() {
+            continue;
+        }
+        if item.contains(&0) {
+            bail!(
+                "--files-from: {:?} contains a NUL byte (is this a --from0 list?)",
+                String::from_utf8_lossy(item)
+            );
+        }
+        let p = item;
+        if p.split(|&b| b == b'/').any(|c| c == b"..") {
+            bail!(
+                "--files-from: {:?} contains a `..` component",
+                String::from_utf8_lossy(item)
+            );
+        }
+        // Drop `.` and empty components (`a/./b`, `a//b` -> `a/b`) so one path
+        // has one spelling and the planner never schedules a file twice.
+        let parts: Vec<&[u8]> = p
+            .split(|&b| b == b'/')
+            .filter(|c| *c != b"." && !c.is_empty())
+            .collect();
+        if parts.is_empty() {
+            bail!(
+                "--files-from: {:?} names the source root itself",
+                String::from_utf8_lossy(item)
+            );
+        }
+        out.push(parts.join(&b'/'));
+    }
+    Ok(out)
+}
+
 /// Common rsync flags syq deliberately doesn't implement get a one-line
 /// explanation instead of clap's generic "unexpected argument", so pasting an
 /// rsync command tells you exactly what to change. Flags syq *does* accept
@@ -289,6 +411,10 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         "--block-size",
         "--min-split",
         "--bwlimit",
+        "--max-size",
+        "--min-size",
+        "--files-from",
+        "--max-delete",
         "--checkpoint",
         "--tcp-ports",
         "--syq-path",
@@ -336,14 +462,17 @@ fn unsupported_message(tok: &str) -> Option<String> {
 }
 
 const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. Use -i/--ignore (or --ignore-from), which takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `-i node_modules`. See the README's \"Ignoring paths\" section.";
-const DELETE_MSG: &str = "syq does not implement --delete; it never removes files from the destination. To delete paths, run `syq --rm PATH...` explicitly.";
+const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 
 fn message_for_long(base: &str) -> Option<&'static str> {
     Some(match base {
         "exclude" | "exclude-from" | "include" | "include-from" | "filter" => FILTER_MSG,
-        "delete" => DELETE_MSG,
-        _ if base.starts_with("delete-") => DELETE_MSG,
-        "update" => "syq does not implement -u/--update (skip files newer on the receiver).",
+        "force" => DELETE_MSG,
+        _ if base.starts_with("delete-")
+            && !matches!(base, "delete-after" | "delete-delay" | "delete-excluded") =>
+        {
+            DELETE_MSG
+        }
         "one-file-system" => "syq does not implement -x/--one-file-system.",
         "sparse" => "syq does not implement -S/--sparse.",
         "hard-links" => "syq does not preserve hard links (-H/--hard-links).",
@@ -352,7 +481,6 @@ fn message_for_long(base: &str) -> Option<&'static str> {
         "copy-links" | "copy-unsafe-links" | "copy-dirlinks" => {
             "syq does not implement -L/--copy-links; it copies symlinks as symlinks (-l)."
         }
-        "files-from" => "syq does not implement --files-from.",
         "link-dest" | "compare-dest" | "copy-dest" => {
             "syq does not implement --link-dest/--compare-dest/--copy-dest."
         }
@@ -362,7 +490,6 @@ fn message_for_long(base: &str) -> Option<&'static str> {
 
 fn message_for_short(c: char) -> Option<&'static str> {
     message_for_long(match c {
-        'u' => "update",
         'H' => "hard-links",
         'A' => "acls",
         'X' => "xattrs",
@@ -389,7 +516,16 @@ pub fn parse_size(s: &str) -> Result<u64> {
         _ => (s, 1),
     };
     let n: f64 = num.parse().map_err(|_| anyhow::anyhow!("bad size {s:?}"))?;
-    Ok((n * mult as f64) as u64)
+    // The float-to-int cast saturates: -1 would silently become 0 (and with
+    // --max-size exclude every non-empty file), NaN 0, inf u64::MAX.
+    if !n.is_finite() || n < 0.0 {
+        bail!("bad size {s:?}");
+    }
+    let scaled = n * mult as f64;
+    if scaled >= u64::MAX as f64 {
+        bail!("size {s:?} is too large");
+    }
+    Ok(scaled as u64)
 }
 
 #[derive(Debug, Clone)]
@@ -449,7 +585,6 @@ impl Location {
         })
     }
 
-    #[allow(dead_code)]
     pub fn is_remote(&self) -> bool {
         self.host.is_some()
     }

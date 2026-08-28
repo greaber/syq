@@ -25,6 +25,9 @@ pub struct Progress {
     pub files_total: AtomicU64,
     pub files_done: AtomicU64,
     pub files_skipped: AtomicU64,
+    /// Source files deliberately not transferred (-u, size limits, --existing,
+    /// symlinks without -l, ...); neither "transferred" nor "unchanged".
+    pub files_excluded: AtomicU64,
     pub scanned: AtomicU64,
     pub scan_done: AtomicBool,
     pub errors: AtomicU64,
@@ -61,6 +64,7 @@ impl Progress {
             files_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
             files_skipped: AtomicU64::new(0),
+            files_excluded: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
             scan_done: AtomicBool::new(false),
             errors: AtomicU64::new(0),
@@ -172,8 +176,9 @@ impl Progress {
             {
                 t.last_json = Some(now);
                 eprintln!(
-                    "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_skipped\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_skipped\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
+                    "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_skipped\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_skipped\":{},\"files_excluded\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
                     self.files_skipped.load(Relaxed),
+                    self.files_excluded.load(Relaxed),
                     self.scanned.load(Relaxed),
                     rate,
                     eta.map_or("null".to_string(), |e| format!("{e:.0}")),

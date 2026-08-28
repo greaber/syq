@@ -23,13 +23,17 @@ pub trait Conn: Send {
     fn is_dead(&self) -> bool {
         false
     }
-    /// Streamed scan; `sink` gets batches, `warn` gets non-fatal messages.
+    /// Streamed scan; `sink` gets batches, `warn` gets non-fatal messages,
+    /// `ignored` gets the paths the patterns pruned (only if `report_ignored`).
+    #[allow(clippy::too_many_arguments)]
     fn scan(
         &mut self,
         root: &[u8],
         follow_root: bool,
         ignore: &[String],
+        report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()>;
 }
@@ -72,10 +76,20 @@ impl Conn for LocalConn {
         root: &[u8],
         follow_root: bool,
         ignore: &[String],
+        report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
-        crate::scan::scan(&fsops::resolve(root), follow_root, ignore, sink, warn)
+        crate::scan::scan(
+            &fsops::resolve(root),
+            follow_root,
+            ignore,
+            report_ignored,
+            sink,
+            ignored,
+            warn,
+        )
     }
 }
 
@@ -181,13 +195,16 @@ impl Conn for RemoteConn {
         root: &[u8],
         follow_root: bool,
         ignore: &[String],
+        report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
         self.send(Request::Scan {
             root: root.to_vec(),
             follow_root,
             ignore: ignore.to_vec(),
+            report_ignored,
         })?;
         let mut saw_root = false;
         loop {
@@ -197,6 +214,7 @@ impl Conn for RemoteConn {
                         .with_context(|| format!("{}: unsafe remote scan", self.label))?;
                     sink(b)?;
                 }
+                Response::ScanIgnored(v) => ignored(v)?,
                 Response::ScanWarn(w) => warn(w),
                 Response::ScanDone if saw_root => return Ok(()),
                 Response::ScanDone => bail!("{}: remote scan returned no root entry", self.label),

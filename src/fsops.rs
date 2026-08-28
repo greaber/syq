@@ -415,8 +415,16 @@ impl FsOps {
 
     /// Batches are statted on several threads: on network filesystems each
     /// lstat is a round trip and the planner would otherwise starve the workers.
-    pub fn stat_many(&mut self, paths: &[PathBytes]) -> Vec<Option<Entry>> {
-        parallel_map(paths, |p| lstat_entry(Vec::new(), &resolve(p)).ok())
+    pub fn stat_many(&mut self, paths: &[PathBytes], follow: bool) -> Vec<Option<Entry>> {
+        parallel_map(paths, |p| {
+            let full = resolve(p);
+            let md = if follow {
+                fs::metadata(&full)
+            } else {
+                fs::symlink_metadata(&full)
+            };
+            md.ok().map(|md| entry_from_meta(Vec::new(), &full, &md))
+        })
     }
 
     pub fn partial_paths(
@@ -583,14 +591,36 @@ fn apply_one(op: &Op) -> Result<()> {
             }
             Op::Rmdir { path } => {
                 let p = resolve(path);
-                fs::remove_dir(&p).with_context(|| format!("rmdir {}", p.display()))
+                match fs::remove_dir(&p) {
+                    // Already gone (a concurrent removal): the desired end state.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                    r => r.with_context(|| format!("rmdir {}", p.display())),
+                }
             }
+            // Remove (for --rm) swallows lstat errors: rm -rf semantics, keep
+            // going. Unlink (below, for --delete) reports them: a mirror that
+            // silently failed to mirror would be worse. Deliberate divergence,
+            // pinned by unlink_never_recurses_into_a_directory.
             Op::Remove { path } => {
                 let p = resolve(path);
                 match fs::symlink_metadata(&p) {
                     Ok(md) if md.is_dir() => fs::remove_dir_all(&p)?,
                     Ok(_) => fs::remove_file(&p)?,
                     Err(_) => {}
+                }
+                Ok(())
+            }
+            Op::Unlink { path } => {
+                let p = resolve(path);
+                match fs::symlink_metadata(&p) {
+                    Ok(md) if md.is_dir() => {
+                        bail!("{}: is now a directory; not deleting it", p.display())
+                    }
+                    Ok(_) => {
+                        fs::remove_file(&p).with_context(|| format!("unlink {}", p.display()))?
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("unlink {}", p.display())),
                 }
                 Ok(())
             }
@@ -1323,7 +1353,9 @@ impl FsOps {
             self.held_basis.take();
         }
         let r: Result<Response> = match req {
-            Request::StatMany(paths) => Ok(Response::Stats(self.stat_many(paths))),
+            Request::StatMany { paths, follow } => {
+                Ok(Response::Stats(self.stat_many(paths, *follow)))
+            }
             Request::PartialPaths { paths, partial_id } => {
                 Ok(Response::PathResults(self.partial_paths(paths, partial_id)))
             }
@@ -1758,6 +1790,33 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
 
         assert!(rejected);
+    }
+
+    #[test]
+    fn unlink_never_recurses_into_a_directory() {
+        let dir = std::env::temp_dir().join(format!("syq-unlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("d/inside")).unwrap();
+        fs::write(dir.join("f"), b"f").unwrap();
+        let mut ops = FsOps::new();
+        let path = |n: &str| path_bytes(&dir.join(n));
+        let errs = ops.apply(&[
+            Op::Unlink { path: path("d") },
+            Op::Unlink { path: path("f") },
+            Op::Unlink {
+                path: path("missing"),
+            },
+        ]);
+        assert!(errs[0]
+            .as_deref()
+            .is_some_and(|e| e.contains("is now a directory")));
+        assert!(
+            dir.join("d/inside").is_dir(),
+            "the directory and its contents survive"
+        );
+        assert!(errs[1].is_none() && !dir.join("f").exists());
+        assert!(errs[2].is_none(), "a vanished leaf is not an error");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

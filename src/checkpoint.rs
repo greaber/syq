@@ -20,7 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const FORMAT: u32 = 2;
+// 3: Deleted invalidation records. An older syq would skip the unparseable
+// lines and trust the Complete records they void; the format check makes it
+// refuse the file instead (restarting a checkpoint is always safe).
+pub const FORMAT: u32 = 3;
 const IDENTITY_FORMAT: u32 = 1;
 
 fn b64(bytes: &[u8]) -> String {
@@ -47,6 +50,10 @@ enum Record {
         uid: u32,
         gid: u32,
         basis: String,
+    },
+    /// --delete removed this path; an earlier completion record is void.
+    Deleted {
+        path_b64: String,
     },
 }
 
@@ -230,6 +237,11 @@ impl Checkpoint {
                         );
                     }
                 }
+                Record::Deleted { path_b64 } => {
+                    if let Some(path) = unb64(&path_b64) {
+                        out.completed.remove(&path);
+                    }
+                }
             }
         }
         if has_data && out.existing_identity.is_none() {
@@ -359,6 +371,34 @@ impl Checkpoint {
         if let Err(e) = result {
             self.note_error(e);
         }
+    }
+
+    /// A mutation is about to make these checkpoint-complete paths missing or
+    /// non-regular: persist the invalidation intents *first* — written and
+    /// flushed, though not fsynced; the checkpoint never promises power-loss
+    /// durability (see README) — so a crash can't leave a stale Complete
+    /// record for a file that is gone. A stale intent (recorded, then the
+    /// mutation failed or never ran) only costs a recheck on retry. An Err
+    /// means the intents did not persist — the caller must not mutate.
+    pub fn record_deleted_batch<'a>(&self, paths: impl Iterator<Item = &'a [u8]>) -> Result<()> {
+        if let Some(error) = self.failed.lock().unwrap().as_ref() {
+            bail!("checkpoint recording already stopped: {error}");
+        }
+        let result = (|| {
+            for path in paths {
+                self.append(&Record::Deleted {
+                    path_b64: b64(path),
+                })?;
+            }
+            let mut writer = self.writer.lock().unwrap();
+            self.flush_locked(&mut writer)
+        })();
+        if let Err(error) = result {
+            let message = format!("{error:#}");
+            self.note_error(error);
+            bail!("{message}");
+        }
+        Ok(())
     }
 
     pub fn take_error(&self) -> Option<String> {
