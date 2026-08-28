@@ -7,7 +7,7 @@ use clap::Parser;
     version,
     about = "Parallel copy with an rsync-shaped interface",
     disable_help_flag = true,
-    override_usage = "syq [OPTIONS] SRC... DEST\n       syq [OPTIONS] [USER@]HOST:SRC... DEST\n       syq [OPTIONS] SRC... [USER@]HOST:DEST\n       syq --self-update\n       syq --enable-auto-update | --disable-auto-update"
+    override_usage = "syq [OPTIONS] SRC... DEST\n       syq [OPTIONS] [USER@]HOST:SRC... DEST\n       syq [OPTIONS] SRC... [USER@]HOST:DEST\n       syq --self-update"
 )]
 pub struct Args {
     /// Print help
@@ -17,12 +17,6 @@ pub struct Args {
     /// Install the newest signed release (standalone installer builds only)
     #[arg(long, exclusive = true)]
     pub self_update: bool,
-    /// Opt in to installing signed updates after successful interactive commands
-    #[arg(long, exclusive = true)]
-    pub enable_auto_update: bool,
-    /// Turn automatic updates off; update notices remain enabled
-    #[arg(long, exclusive = true)]
-    pub disable_auto_update: bool,
     /// Record an installation made by the official standalone installer
     #[arg(long, hide = true, exclusive = true)]
     pub register_standalone_install: bool,
@@ -194,12 +188,7 @@ pub struct Args {
 
     /// Source(s) and destination (or, with --rm, the paths to remove)
     #[arg(
-        required_unless_present_any = [
-            "self_update",
-            "enable_auto_update",
-            "disable_auto_update",
-            "register_standalone_install"
-        ],
+        required_unless_present_any = ["self_update", "register_standalone_install"],
         num_args = 1..,
         value_name = "PATH"
     )]

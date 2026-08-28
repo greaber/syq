@@ -324,19 +324,32 @@ fn receipt_is_bound_to_the_exact_installed_executable() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn auto_update_setting_is_explicit_and_survives_reregistration() {
+fn legacy_auto_update_setting_is_discarded_on_reregistration() {
     let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
     fixture.register();
-    assert_eq!(fixture.receipt()["auto_update"], false);
+    let path = fixture.config.join("syq/install.json");
+    let mut receipt = fixture.receipt();
+    receipt["auto_update"] = true.into();
+    fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
 
-    assert_success(&fixture.command("--enable-auto-update"));
-    assert_eq!(fixture.receipt()["auto_update"], true);
     fixture.register();
-    assert_eq!(fixture.receipt()["auto_update"], true);
-
-    assert_success(&fixture.command("--disable-auto-update"));
-    assert_eq!(fixture.receipt()["auto_update"], false);
+    assert!(fixture.receipt().get("auto_update").is_none());
     assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_update_flags_are_no_longer_supported() {
+    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
+
+    assert_failure_contains(
+        &fixture.command("--enable-auto-update"),
+        "unexpected argument '--enable-auto-update'",
+    );
+    assert_failure_contains(
+        &fixture.command("--disable-auto-update"),
+        "unexpected argument '--disable-auto-update'",
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -346,6 +359,7 @@ fn source_install_cannot_create_or_use_a_standalone_receipt_implicitly() {
 
     let update = fixture.command("--self-update");
     assert_failure_contains(&update, "self-update is only available");
+    assert!(String::from_utf8_lossy(&update.stderr).contains("`brew upgrade syq`"));
     assert!(!fixture.config.join("syq/install.json").exists());
     assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
 }

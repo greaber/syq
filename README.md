@@ -52,14 +52,17 @@ same build there and pass `--syq-path /path/to/syq` (or put it on the remote
 `PATH` and use `--no-bootstrap`).
 
 Standalone installs download and verify one signed release manifest at most
-once a day after a successful interactive command. They only print an update
-notice by default: `syq --self-update` performs the update, and
-`syq --enable-auto-update` opts in to installing a signed update after a
-successful interactive command. Use `syq --disable-auto-update` to opt out
-again. The install receipt lives at
+once a day after a successful interactive command. When a newer release is
+available they print a reminder; updates are never installed as a side effect
+of a copy. Run `syq --self-update` to install the update, or set
+`SYQ_NO_UPDATE_CHECK=1` to disable automatic checks and reminders. Explicit
+`syq --self-update` checks still work when that variable is set. The install
+receipt lives at
 `$XDG_CONFIG_HOME/syq/install.json` (normally `~/.config/syq/install.json`) and
 must name the running executable, so a Homebrew or source build never replaces
-itself. Update Homebrew installs with `brew upgrade syq`.
+itself. Self-update is deliberately limited to standalone installs because a
+package manager must remain the owner of its files. Update Homebrew installs
+with `brew upgrade syq`.
 
 Release binaries are published for Linux x86-64/ARM64 and macOS Apple
 Silicon/Intel. Terminal downloads and Homebrew normally do not attach macOS's
@@ -132,7 +135,6 @@ syq -a --checkpoint ./copy.state src host:dst # retain completed-file state if t
 | Option | Meaning |
 |---|---|
 | `--self-update` | Install the newest signed release (standalone installer builds only) |
-| `--enable-auto-update` / `--disable-auto-update` | Opt in/out of signed updates after successful interactive commands |
 | `-a`, `--archive` | Same as `-rlptgoD` |
 | `-r` `-l` `-p` `-t` `-g` `-o` `-D` | Recursive; symlinks as symlinks; perms; mtimes; group; owner; devices and specials |
 | `-v` | List files as they complete (also new dirs, symlinks) |
