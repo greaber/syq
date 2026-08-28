@@ -38,7 +38,7 @@ pub fn build_ignore(lines: &[String]) -> Result<Option<Gitignore>> {
 }
 
 /// Walk `root`, calling `sink` with batches of entries (root first, as path "").
-/// Every entry is reported, pcp's own `.name.pcp-partial` files included (the
+/// Every entry is reported, syq's own `.name.syq-partial` files included (the
 /// planner decides what they mean). `warn` receives non-fatal errors
 /// (unreadable directories etc.). `ignore` holds gitignore-style patterns
 /// relative to `root`; a matching directory is pruned with its whole subtree.
@@ -89,7 +89,7 @@ pub fn scan(
                     let is_dir = entry.kind == crate::proto::Kind::Dir;
                     if ig.matched(rel, is_dir).is_ignore() {
                         // Pruned: neither listed nor descended into.
-                        child.read_children_path = None;
+                        child.read_children = None;
                         child.client_state = if report_ignored {
                             State::Ignored
                         } else {
@@ -111,7 +111,11 @@ pub fn scan(
         };
         // Check this before skipping the root: an unreadable root is the
         // most important warning there is (--delete relies on it).
-        if let Some(e) = de.read_children_error.take() {
+        if let Some(e) = de
+            .read_children
+            .as_ref()
+            .and_then(|children| children.error())
+        {
             warn(format!("scan: {}: {e}", de.path().display()));
         }
         if de.depth == 0 {

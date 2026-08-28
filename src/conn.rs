@@ -129,7 +129,7 @@ impl RemoteConn {
         if let Some(child) = &mut self.child {
             for _ in 0..20 {
                 if let Ok(Some(status)) = child.try_wait() {
-                    return anyhow!("{}: remote pcp exited ({status})", self.label);
+                    return anyhow!("{}: remote syq exited ({status})", self.label);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -203,7 +203,7 @@ impl Drop for RemoteConn {
 }
 
 /// How many *data* ssh sessions may be establishing at once. Starts high:
-/// on a server tuned for pcp (`MaxStartups 100`) a burst of 32 handshakes
+/// on a server tuned for syq (`MaxStartups 100`) a burst of 32 handshakes
 /// takes 14 s where four rounds of 8 would take 26. sshd's default
 /// `MaxStartups 10:30:100` randomly drops new connections beyond 10
 /// unauthenticated ones, so each failed connect halves the limit (down to
@@ -249,8 +249,8 @@ pub struct RemoteSpec {
     pub user: Option<String>,
     pub host: String,
     pub rsh: Vec<String>,
-    pub pcp_path: Option<String>,
-    /// Install and use the versioned helper rather than resolving `pcp` on PATH.
+    pub syq_path: Option<String>,
+    /// Install and use the versioned helper rather than resolving `syq` on PATH.
     pub auto_helper: bool,
     /// Serializes a first-use install across control and worker clones.
     pub helper_install: std::sync::Arc<std::sync::Mutex<bool>>,
@@ -297,17 +297,17 @@ impl RemoteSpec {
         cmd
     }
 
-    /// A shell command that runs pcp with `args` on this host.  Automatic mode
+    /// A shell command that runs syq with `args` on this host.  Automatic mode
     /// addresses the exact versioned helper; explicit mode preserves the
     /// administrator-provided path; --no-bootstrap uses normal PATH lookup.
     pub fn program_command(&self, args: &[String]) -> String {
-        if let Some(p) = &self.pcp_path {
+        if let Some(p) = &self.syq_path {
             return format!("{} {}", shell_words::quote(p), shell_words::join(args));
         }
         if self.auto_helper {
             return remote_helper::launcher(args);
         }
-        format!("pcp {}", shell_words::join(args))
+        format!("syq {}", shell_words::join(args))
     }
 
     /// Connect, retrying a few times: sshd's MaxStartups (default 10) drops
@@ -372,7 +372,7 @@ impl RemoteSpec {
                     };
                     if crate::transfer::debug() {
                         eprintln!(
-                            "pcp: connect to {} failed (attempt {}): {e:#}{}",
+                            "syq: connect to {} failed (attempt {}): {e:#}{}",
                             self.label(),
                             attempt + 1,
                             limit
@@ -464,7 +464,7 @@ impl RemoteSpec {
         };
         if crate::transfer::debug() {
             eprintln!(
-                "pcp: {}: data paths {:?} (advertised {:?})",
+                "syq: {}: data paths {:?} (advertised {:?})",
                 self.label(),
                 addrs,
                 advertised
@@ -537,7 +537,7 @@ impl RemoteSpec {
                 .map(|a| a.to_string())
                 .unwrap_or_default();
             if crate::transfer::debug() {
-                eprintln!("pcp: {}: data connection via tcp {addr_s}", self.label());
+                eprintln!("syq: {}: data connection via tcp {addr_s}", self.label());
             }
             stream.set_nodelay(true)?;
             let conn_id = TCP_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -662,15 +662,14 @@ fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteC
             }
             Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
             Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
-            Err(e) => bail!("{e}\ncould not start the remote pcp on {}", conn.label),
+            Err(e) => bail!("{e}\ncould not start the remote syq on {}", conn.label),
         }
     }
 }
 
 impl RemoteSpec {
     /// Ensure the exact release/protocol helper exists in the remote cache.
-    /// Release assets are preferred so unlike architectures work without
-    /// crossing the ssh link; uploading this executable is the offline fallback.
+    /// Only authorized release assets may populate the managed helper cache.
     pub fn install_helper(&self) -> Result<()> {
         let mut installed = self.helper_install.lock().unwrap();
         if *installed {
@@ -680,49 +679,22 @@ impl RemoteSpec {
         let target = self.remote_target()?;
         if !self.quiet {
             eprintln!(
-                "pcp: {}: installing {} helper for {}",
+                "syq: {}: installing {} helper for {}",
                 self.label(),
                 remote_helper::release_key(),
                 target.key
             );
         }
-        match self.download_helper(target) {
-            Ok(()) => {
-                *installed = true;
-                Ok(())
-            }
-            Err(download_error) if Target::local() == Some(target) => {
-                if !self.quiet {
-                    eprintln!(
-                        "pcp: {}: release download unavailable; uploading this executable",
-                        self.label()
-                    );
-                }
-                if crate::transfer::debug() {
-                    eprintln!(
-                        "pcp: {}: remote helper download failed: {download_error:#}",
-                        self.label()
-                    );
-                }
-                self.upload_helper(target).with_context(|| {
-                    format!(
-                        "download failed ({download_error:#}); local executable upload also failed"
-                    )
-                })?;
-                *installed = true;
-                Ok(())
-            }
-            Err(download_error) => {
-                let local = Target::local().map_or("unsupported", |t| t.key);
-                bail!(
-                    "could not install {} helper on {} ({}) and cannot upload the local {} executable: {download_error:#}; install a compatible pcp and pass --pcp-path",
-                    remote_helper::release_key(),
-                    self.label(),
-                    target.key,
-                    local
-                );
-            }
-        }
+        self.download_helper(target).with_context(|| {
+            format!(
+                "could not install the authorized {} helper on {} ({}); install a compatible syq and pass --syq-path",
+                remote_helper::release_key(),
+                self.label(),
+                target.key
+            )
+        })?;
+        *installed = true;
+        Ok(())
     }
 
     fn remote_target(&self) -> Result<Target> {
@@ -745,21 +717,23 @@ impl RemoteSpec {
         let text = String::from_utf8_lossy(&out.stdout);
         let value = text
             .lines()
-            .find_map(|line| line.strip_prefix("pcp-helper-target:"))
+            .find_map(|line| line.strip_prefix("syq-helper-target:"))
             .ok_or_else(|| anyhow!("{}: platform probe returned no target", self.label()))?;
         let (os, arch) = value
             .split_once(':')
             .ok_or_else(|| anyhow!("{}: malformed platform response {value:?}", self.label()))?;
         Target::from_uname(os, arch).ok_or_else(|| {
             anyhow!(
-                "{}: automatic remote helpers do not support {os} {arch}; install pcp there and pass --pcp-path",
+                "{}: automatic remote helpers do not support {os} {arch}; install syq there and pass --syq-path",
                 self.label()
             )
         })
     }
 
     fn download_helper(&self, target: Target) -> Result<()> {
-        let script = remote_helper::download_script(target);
+        let expected_sha256 = crate::update::trusted_current_archive_hash(target)
+            .context("verify the signed release manifest")?;
+        let script = remote_helper::download_script(target, &expected_sha256);
         let mut cmd = self.ssh_command();
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::null())
@@ -771,44 +745,6 @@ impl RemoteSpec {
         if !out.status.success() {
             bail!(
                 "remote download exited {}{}",
-                out.status,
-                output_suffix(&out.stderr)
-            );
-        }
-        Ok(())
-    }
-
-    fn upload_helper(&self, target: Target) -> Result<()> {
-        let exe = std::env::current_exe().context("locate current pcp executable")?;
-        let mut input = std::fs::File::open(&exe)
-            .with_context(|| format!("open current executable {}", exe.display()))?;
-        let bytes = input.metadata()?.len();
-        if !self.quiet {
-            eprintln!(
-                "pcp: {}: uploading {:.1} MiB",
-                self.label(),
-                bytes as f64 / (1 << 20) as f64
-            );
-        }
-
-        let script = remote_helper::upload_script(target);
-        let mut cmd = self.ssh_command();
-        cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("start helper upload to {}", self.label()))?;
-        {
-            let mut stdin = child.stdin.take().unwrap();
-            std::io::copy(&mut input, &mut stdin)
-                .with_context(|| format!("upload helper to {}", self.label()))?;
-        }
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
-            bail!(
-                "remote install exited {}{}",
                 out.status,
                 output_suffix(&out.stderr)
             );
@@ -852,7 +788,7 @@ impl Endpoint {
                                 if !i.failed {
                                     i.failed = true;
                                     if !spec.quiet || crate::transfer::debug() {
-                                        eprintln!("pcp: {}: data over ssh (TCP port {} stopped answering: {e:#})", spec.label(), info.port);
+                                        eprintln!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#})", spec.label(), info.port);
                                     }
                                 }
                             }

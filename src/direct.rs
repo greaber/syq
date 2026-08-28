@@ -13,8 +13,8 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         user: srcs[0].user.clone(),
         host: src_host.clone(),
         rsh: rsh.clone(),
-        pcp_path: args.pcp_path.clone(),
-        auto_helper: args.pcp_path.is_none() && !args.no_bootstrap,
+        syq_path: args.syq_path.clone(),
+        auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
         helper_install: Default::default(),
         quiet: args.quiet,
         tcp: Default::default(),
@@ -120,8 +120,8 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         remote.push("--progress".into());
         remote.push(format!("--width={}", crate::progress::term_width()));
     }
-    if let Some(p) = &args.pcp_path {
-        remote.push(format!("--pcp-path={p}"));
+    if let Some(p) = &args.syq_path {
+        remote.push(format!("--syq-path={p}"));
     }
     if let Some(e) = &args.rsh {
         remote.push("-e".into());
@@ -162,14 +162,14 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         remote.insert(0, "--progress-json".into());
         remote.insert(0, "-v".into());
     }
-    // A detached launcher returns before the background pcp execs, so a
+    // A detached launcher returns before the background syq execs, so a
     // missing helper could otherwise look like a successful start.  Validate
     // and, in automatic mode, install it before detaching.
     if args.detach {
         drop(spec.connect(false)?);
     }
     let dbg = if crate::transfer::debug() {
-        "PCP_DEBUG=1 "
+        "SYQ_DEBUG=1 "
     } else {
         ""
     };
@@ -187,7 +187,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             .trim_end_matches('/')
             .rsplit('/')
             .next()
-            .unwrap_or("pcp");
+            .unwrap_or("syq");
         let name: String = raw
             .chars()
             .map(|c| {
@@ -199,12 +199,12 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             })
             .collect();
         let name = if name.trim_matches('.').is_empty() {
-            "pcp".to_string()
+            "syq".to_string()
         } else {
             name
         };
         format!(
-            "mkdir -p \"$HOME/.pcp\" && log=\"$HOME/.pcp/{name}-$(date +%Y%m%d-%H%M%S).log\" && (setsid nohup sh -c {} > \"$log\" 2>&1 < /dev/null &) && echo \"$log\"",
+            "mkdir -p \"$HOME/.syq\" && log=\"$HOME/.syq/{name}-$(date +%Y%m%d-%H%M%S).log\" && (setsid nohup sh -c {} > \"$log\" 2>&1 < /dev/null &) && echo \"$log\"",
             shell_words::quote(&remote_cmd)
         )
     } else {
@@ -244,12 +244,12 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         if !out.status.success() || log.is_empty() {
             bail!("could not start detached transfer on {src_host}");
         }
-        println!("pcp: started on {src_host}, log {log}");
-        println!("pcp: follow with:  pcp --follow {src_host}:{log}");
+        println!("syq: started on {src_host}, log {log}");
+        println!("syq: follow with:  syq --follow {src_host}:{log}");
         return Ok(0);
     }
     if !args.quiet {
-        eprintln!("pcp: remote-to-remote: running on {src_host} (use --relay to route data through this machine)");
+        eprintln!("syq: remote-to-remote: running on {src_host} (use --relay to route data through this machine)");
     }
     let run = || {
         let mut cmd = make_command();
@@ -268,7 +268,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         Some(c) => {
             bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
         }
-        None => bail!("remote pcp on {src_host} killed by signal"),
+        None => bail!("remote syq on {src_host} killed by signal"),
     }
 }
 
@@ -281,16 +281,16 @@ fn helper_missing(code: Option<i32>, automatic: bool) -> bool {
         )
 }
 
-/// `pcp --follow HOST:LOG`: tail a detached transfer's log, rendering the JSON
+/// `syq --follow HOST:LOG`: tail a detached transfer's log, rendering the JSON
 /// progress lines as a status line and passing everything else through.
 pub fn follow(args: &Args) -> Result<i32> {
     let target = args
         .paths
         .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: pcp --follow HOST:LOGFILE"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: syq --follow HOST:LOGFILE"))?;
     let loc = Location::parse(target)?;
     let (Some(host), log) = (&loc.host, &loc.path) else {
-        bail!("usage: pcp --follow HOST:LOGFILE")
+        bail!("usage: syq --follow HOST:LOGFILE")
     };
     let rsh = parse_rsh(&args.rsh)?;
     let mut cmd = Command::new(&rsh[0]);
@@ -348,7 +348,7 @@ pub fn follow(args: &Args) -> Result<i32> {
                 eprint!("\r\x1b[K");
             }
             println!("{line}");
-            if line.starts_with("pcp: transferred") || line.starts_with("pcp: would transfer") {
+            if line.starts_with("syq: transferred") || line.starts_with("syq: would transfer") {
                 let _ = child.kill();
                 return Ok(0);
             }
