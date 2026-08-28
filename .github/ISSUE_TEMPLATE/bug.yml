@@ -1,0 +1,67 @@
+name: Bug report
+description: Report reproducible behavior that looks wrong
+title: ""
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please use disposable test data when possible and remove credentials, private hostnames, and other sensitive information.
+  - type: input
+    id: version
+    attributes:
+      label: syq version
+      description: Paste the output of `syq --version`, or give the commit for a source build.
+      placeholder: syq 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Standalone installer
+        - Homebrew
+        - cargo install
+        - Source build
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the operating system and architecture for each machine involved.
+      placeholder: Local macOS arm64; remote Ubuntu 24.04 x86-64
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Give the smallest safe setup and command that reproduces the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and output
+      description: Include relevant output after removing secrets and private data.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: This report does not contain credentials, private keys, or sensitive user data.
+          required: true
