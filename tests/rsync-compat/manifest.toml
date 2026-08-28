@@ -210,7 +210,7 @@ expect = { default = "pass" }
 platforms = ["linux"]
 tags = ["local", "resume", "partial-files"]
 requirements = ["signals", "bandwidth limiting"]
-note = "An interrupted transfer leaves SYQ's deterministic sidecar and a rerun completes it."
+note = "An interrupted transfer leaves SYQ's job-scoped deterministic sidecar and a rerun completes it."
 
 [[tests]]
 name = "protected-regular"

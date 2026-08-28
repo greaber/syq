@@ -3,18 +3,23 @@
 
 use crate::proto::*;
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
-use std::os::fd::AsRawFd;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64, Xxh3};
 
-pub const PARTIAL_SUFFIX: &str = ".syq-partial";
+pub const PARTIAL_MARKER: &str = ".syq-part.";
 const FD_CACHE_MAX: usize = 16;
+const COMMON_NAME_MAX: usize = 255;
+const COMPACT_HASH_BYTES: usize = 10;
+const NAME_MAX_CACHE_CAP: usize = 1024;
 
 pub fn resolve(p: &[u8]) -> PathBuf {
     if p.is_empty() {
@@ -51,42 +56,155 @@ pub fn join(root: &[u8], rel: &[u8]) -> PathBytes {
     v
 }
 
-pub fn partial_path(final_: &Path) -> PathBuf {
-    let name = final_
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| OsString::from("root"));
-    let mut pn = OsString::from(".");
-    pn.push(&name);
-    pn.push(PARTIAL_SUFFIX);
-    match final_.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(pn),
-        _ => PathBuf::from(pn),
+fn base32(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut out = String::with_capacity((bytes.len() * 8).div_ceil(5));
+    let mut bits = 0u32;
+    let mut nbits = 0u8;
+    for &byte in bytes {
+        bits = (bits << 8) | u32::from(byte);
+        nbits += 8;
+        while nbits >= 5 {
+            nbits -= 5;
+            out.push(ALPHABET[((bits >> nbits) & 31) as usize] as char);
+        }
     }
+    if nbits != 0 {
+        out.push(ALPHABET[((bits << (5 - nbits)) & 31) as usize] as char);
+    }
+    out
 }
 
-/// The final path a partial file `dir/.name.syq-partial` belongs to.
-pub fn partial_target(partial: &[u8]) -> PathBytes {
-    let (dir, name) = match partial.iter().rposition(|&c| c == b'/') {
-        Some(i) => (&partial[..i + 1], &partial[i + 1..]),
-        None => (&partial[..0], partial),
+fn name_max(parent: &Path) -> usize {
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
     };
-    assert!(
-        is_partial_name(OsStr::from_bytes(name)),
-        "partial_target: {name:?} is not a partial name"
-    );
-    let inner = &name[1..name.len() - PARTIAL_SUFFIX.len()];
-    let mut v = dir.to_vec();
-    v.extend_from_slice(inner);
-    v
+    let key = parent.to_path_buf();
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(limit) = cache.lock().unwrap().get(&key).copied() {
+        return limit;
+    }
+    let Ok(c_parent) = cstr(parent) else {
+        return COMMON_NAME_MAX;
+    };
+    let limit = unsafe { libc::pathconf(c_parent.as_ptr(), libc::_PC_NAME_MAX) };
+    let limit = if limit > 0 {
+        limit as usize
+    } else {
+        COMMON_NAME_MAX
+    };
+    let mut cache = cache.lock().unwrap();
+    if cache.len() >= NAME_MAX_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, limit);
+    limit
 }
 
-/// `.name.syq-partial` with a non-empty `name` (a bare `.syq-partial` is not one).
+fn path_component_budget(parent: &Path, component_limit: usize) -> usize {
+    let parent_len = parent.as_os_str().as_bytes().len();
+    let separator = usize::from(
+        !parent.as_os_str().is_empty() && !parent.as_os_str().as_bytes().ends_with(b"/"),
+    );
+    let path_limit = libc::PATH_MAX as usize;
+    let path_budget = path_limit
+        .saturating_sub(1)
+        .saturating_sub(parent_len)
+        .saturating_sub(separator);
+    component_limit.min(path_budget)
+}
+
+/// Adjacent deterministic sidecar for this logical job. The common form keeps
+/// both the destination basename and job ID visible. Long basenames are
+/// truncated and disambiguated; near PATH_MAX a compact combined digest keeps
+/// a little more of rsync's practical path reach.
+pub fn partial_path(final_: &Path, partial_id: &PartialId) -> Result<PathBuf> {
+    let parent = final_.parent().unwrap_or_else(|| Path::new(""));
+    partial_path_with_name_max(final_, partial_id, name_max(parent))
+}
+
+fn partial_path_with_name_max(
+    final_: &Path,
+    partial_id: &PartialId,
+    component_limit: usize,
+) -> Result<PathBuf> {
+    let name = final_.file_name().map(OsStr::as_bytes).unwrap_or(b"root");
+    let job_id = base32(partial_id);
+    let mut normal = Vec::with_capacity(1 + name.len() + PARTIAL_MARKER.len() + job_id.len());
+    normal.push(b'.');
+    normal.extend_from_slice(name);
+    normal.extend_from_slice(PARTIAL_MARKER.as_bytes());
+    normal.extend_from_slice(job_id.as_bytes());
+
+    let parent = final_.parent().unwrap_or_else(|| Path::new(""));
+    let budget = path_component_budget(parent, component_limit);
+    let component = if normal.len() <= budget {
+        normal
+    } else {
+        let basename_hash = Sha256::digest(name);
+        let basename_hash = base32(&basename_hash[..12]);
+        let overhead = 1 + 1 + basename_hash.len() + PARTIAL_MARKER.len() + job_id.len();
+        if budget > overhead {
+            let keep = budget - overhead;
+            let mut shortened = Vec::with_capacity(budget);
+            shortened.push(b'.');
+            shortened.extend_from_slice(&name[..keep]);
+            shortened.push(b'.');
+            shortened.extend_from_slice(basename_hash.as_bytes());
+            shortened.extend_from_slice(PARTIAL_MARKER.as_bytes());
+            shortened.extend_from_slice(job_id.as_bytes());
+            shortened
+        } else {
+            let mut hash = Sha256::new();
+            hash.update(partial_id);
+            hash.update([0]);
+            hash.update(name);
+            let digest = hash.finalize();
+            let compact = format!("{PARTIAL_MARKER}{}", base32(&digest[..COMPACT_HASH_BYTES]));
+            if compact.len() > budget {
+                bail!(
+                    "cannot create a safe partial name beside {}: path is too long",
+                    final_.display()
+                );
+            }
+            compact.into_bytes()
+        }
+    };
+    let component = OsString::from_vec(component);
+    Ok(if parent.as_os_str().is_empty() {
+        PathBuf::from(component)
+    } else {
+        parent.join(component)
+    })
+}
+
+/// Whether `name` is one of SYQ's job-scoped partial names.
 pub fn is_partial_name(name: &OsStr) -> bool {
     let b = name.as_bytes();
-    b.len() > 1 + PARTIAL_SUFFIX.len()
-        && b.starts_with(b".")
-        && b.ends_with(PARTIAL_SUFFIX.as_bytes())
+    let valid_id = |id: &[u8], len: usize| {
+        id.len() == len
+            && id
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'2'..=b'7'))
+    };
+    if !b.starts_with(b".") {
+        return false;
+    }
+    if let Some(pos) = b
+        .windows(PARTIAL_MARKER.len())
+        .rposition(|part| part == PARTIAL_MARKER.as_bytes())
+    {
+        let id = &b[pos + PARTIAL_MARKER.len()..];
+        return if pos == 0 {
+            valid_id(id, 16)
+        } else {
+            valid_id(id, 26)
+        };
+    }
+    false
 }
 
 /// Absolute, normalized form of a path, resolved the way the kernel resolves
@@ -185,18 +303,30 @@ fn is_root() -> bool {
 }
 
 pub struct FsOps {
-    fds: HashMap<PathBuf, File>,
-    fd_order: Vec<PathBuf>,
-    /// Exclusive advisory locks on deterministic partials claimed by this
-    /// connection. The lock stays held until the file is finalized or the
-    /// connection closes, so another syq process cannot write the same inode.
-    partial_leases: HashMap<PathBuf, PartialLease>,
+    fds: HashMap<FdKey, File>,
+    fd_order: Vec<FdKey>,
+    /// One final-file descriptor retained between the hash response and the
+    /// controller's decision to repair or accept that exact inode.
+    held_basis: Option<HeldBasis>,
 }
 
-struct PartialLease {
+struct HeldBasis {
+    path: PathBuf,
+    partial_id: PartialId,
     file: File,
-    /// Size before this transfer claimed the partial; None means we created it.
-    basis_size: Option<u64>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct FdKey {
+    path: PathBuf,
+    /// Source files and partials get a fresh cache entry after a source-change
+    /// retry. An old descriptor may point at an inode that was renamed away.
+    attempt: u32,
+}
+
+struct PartialTarget<'a> {
+    path: &'a [u8],
+    id: &'a PartialId,
 }
 
 impl Default for FsOps {
@@ -210,12 +340,16 @@ impl FsOps {
         FsOps {
             fds: HashMap::new(),
             fd_order: Vec::new(),
-            partial_leases: HashMap::new(),
+            held_basis: None,
         }
     }
 
-    fn cached(&mut self, p: &Path, write: bool) -> Result<&File> {
-        if !self.fds.contains_key(p) {
+    fn cached(&mut self, p: &Path, write: bool, attempt: u32) -> Result<&File> {
+        let key = FdKey {
+            path: p.to_path_buf(),
+            attempt,
+        };
+        if !self.fds.contains_key(&key) {
             if self.fds.len() >= FD_CACHE_MAX {
                 let victim = self.fd_order.remove(0);
                 self.fds.remove(&victim);
@@ -226,15 +360,23 @@ impl FsOps {
                 File::open(p)
             }
             .with_context(|| format!("open {}", p.display()))?;
-            self.fds.insert(p.to_path_buf(), f);
-            self.fd_order.push(p.to_path_buf());
+            self.fds.insert(key.clone(), f);
+            self.fd_order.push(key.clone());
         }
-        Ok(self.fds.get(p).unwrap())
+        Ok(self.fds.get(&key).unwrap())
     }
 
     fn uncache(&mut self, p: &Path) -> Option<File> {
-        self.fd_order.retain(|x| x != p);
-        self.fds.remove(p)
+        let mut removed = None;
+        self.fd_order.retain(|key| {
+            if key.path == p {
+                removed = self.fds.remove(key).or(removed.take());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Batches are statted on several threads: on network filesystems each
@@ -251,13 +393,30 @@ impl FsOps {
         })
     }
 
+    pub fn partial_paths(
+        &mut self,
+        paths: &[PathBytes],
+        partial_id: &PartialId,
+    ) -> Vec<std::result::Result<PathBytes, String>> {
+        parallel_map(paths, |path| {
+            let requested = Path::new(OsStr::from_bytes(path));
+            partial_path(&resolve(path), partial_id)
+                .map(|resolved| {
+                    let name = resolved.file_name().expect("partial always has a name");
+                    let parent = requested.parent().unwrap_or_else(|| Path::new(""));
+                    path_bytes(&parent.join(name))
+                })
+                .map_err(|error| format!("{error:#}"))
+        })
+    }
+
     /// Ops within a batch are independent (the planner orders batches so that
     /// parents come first), so they run in parallel too.
     pub fn apply(&mut self, ops: &[Op]) -> Vec<Option<String>> {
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
         // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
-        let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. });
+        let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. });
         let create_idx: Vec<usize> = (0..ops.len()).filter(|&i| !is_meta(&ops[i])).collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
         let mut out: Vec<Option<String>> = vec![None; ops.len()];
@@ -335,13 +494,64 @@ fn apply_one(op: &Op) -> Result<()> {
             Op::SetMeta { path, meta, flags } => {
                 let p = resolve(path);
                 #[cfg(debug_assertions)]
-                if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_SETMETA") {
-                    // Test hook (debug builds only): fail metadata for matching paths.
-                    if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
-                        return Err(anyhow!("set metadata {}: injected failure", p.display()));
+                fail_set_meta_for_test(&p)?;
+                set_meta_path(&p, meta, *flags)
+                    .with_context(|| format!("set metadata {}", p.display()))
+            }
+            Op::SetFileMetaIfSame {
+                path,
+                expected_dev,
+                expected_ino,
+                meta,
+                flags,
+            } => {
+                let p = resolve(path);
+                #[cfg(debug_assertions)]
+                fail_set_meta_for_test(&p)?;
+                #[cfg(debug_assertions)]
+                if let Some(ready) = std::env::var_os("SYQ_TEST_QUICK_META_READY_FILE") {
+                    fs::write(&ready, b"ready").with_context(|| {
+                        format!(
+                            "write quick-metadata-ready signal {}",
+                            Path::new(&ready).display()
+                        )
+                    })?;
+                }
+                #[cfg(debug_assertions)]
+                if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_QUICK_META_MS") {
+                    if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
                     }
                 }
-                set_meta_path(&p, meta, *flags)
+                let file = match open_metadata_handle(&p) {
+                    Ok(file) => file,
+                    Err(open_error) => {
+                        // A concurrent publisher may have removed the path or
+                        // replaced the regular file with another object. That
+                        // publisher wins; report an error only if the original
+                        // inode is still there but could not be opened safely.
+                        match fs::symlink_metadata(&p) {
+                            Ok(md)
+                                if md.file_type().is_file()
+                                    && md.dev() == *expected_dev
+                                    && md.ino() == *expected_ino =>
+                            {
+                                return Err(open_error).with_context(|| {
+                                    format!("open {} for metadata repair", p.display())
+                                });
+                            }
+                            _ => return Ok(()),
+                        }
+                    }
+                };
+                let md = file.metadata()?;
+                if !md.file_type().is_file()
+                    || md.dev() != *expected_dev
+                    || md.ino() != *expected_ino
+                {
+                    return Ok(());
+                }
+                set_meta_handle(&file, meta, *flags)
                     .with_context(|| format!("set metadata {}", p.display()))
             }
             Op::Rmdir { path } => {
@@ -375,6 +585,97 @@ fn apply_one(op: &Op) -> Result<()> {
     }
 }
 
+/// Open a stable reference suitable for metadata-only repair without reading
+/// file contents. O_NONBLOCK prevents a concurrent FIFO/device replacement
+/// from hanging before fstat can reject it.
+fn open_metadata_handle(path: &Path) -> Result<File> {
+    let path = cstr(path)?;
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn set_meta_handle(file: &File, meta: &Meta, flags: u8) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let empty = c"";
+    // Owner first: chown clears setuid/setgid, so mode must follow it.
+    apply_owner(flags, meta, |uid, gid| {
+        let r = unsafe {
+            libc::fchownat(
+                fd,
+                empty.as_ptr(),
+                uid.unwrap_or(u32::MAX),
+                gid.unwrap_or(u32::MAX),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })?;
+    if flags & flags::MODE != 0 {
+        let current = file.metadata()?.mode() & 0o7777;
+        let wanted = meta.mode & 0o7777;
+        if current != wanted || (flags & (flags::OWNER | flags::GROUP) != 0 && wanted & 0o6000 != 0)
+        {
+            let r = unsafe {
+                libc::fchmodat(
+                    fd,
+                    empty.as_ptr(),
+                    wanted as libc::mode_t,
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            if r != 0 {
+                let error = io::Error::last_os_error();
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+                ) {
+                    return Err(error.into());
+                }
+                // Older libc/kernel combinations do not expose fchmodat2's
+                // AT_EMPTY_PATH support. procfs still resolves this stable
+                // O_PATH descriptor, never the possibly replaced pathname.
+                fs::set_permissions(
+                    PathBuf::from("/proc/self/fd").join(fd.to_string()),
+                    fs::Permissions::from_mode(wanted),
+                )?;
+            }
+        }
+    }
+    if flags & flags::TIMES != 0 {
+        bail!("metadata-only O_PATH repair does not support timestamp changes");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_meta_handle(file: &File, meta: &Meta, flags: u8) -> Result<()> {
+    set_meta_file(file, meta, flags)
+}
+
+#[cfg(debug_assertions)]
+fn fail_set_meta_for_test(p: &Path) -> Result<()> {
+    if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_SETMETA") {
+        if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
+            return Err(anyhow!("set metadata {}: injected failure", p.display()));
+        }
+    }
+    Ok(())
+}
+
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
 
@@ -395,53 +696,57 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
     })
 }
 
+/// Hash exactly `len` bytes in fixed blocks. A short reader contributes the
+/// bytes it has and empty hashes for the missing blocks, matching both source
+/// and destination behavior through one implementation.
+fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<u64>> {
+    let n = len.div_ceil(block) as usize;
+    let mut hashes = Vec::with_capacity(n);
+    let mut buf = vec![0u8; block as usize];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(block) as usize;
+        let mut got = 0;
+        while got < want {
+            let read = reader.read(&mut buf[got..want])?;
+            if read == 0 {
+                break;
+            }
+            got += read;
+        }
+        hashes.push(xxh3_64(&buf[..got]));
+        if got < want {
+            while hashes.len() < n {
+                hashes.push(xxh3_64(&[]));
+            }
+            break;
+        }
+        remaining -= want as u64;
+    }
+    Ok(hashes)
+}
+
 impl FsOps {
-    pub fn probe_partial(&mut self, path: &[u8]) -> Result<Response> {
+    pub fn probe_partial(&mut self, path: &[u8], partial_id: &PartialId) -> Result<Response> {
         let p = resolve(path);
-        let pp = partial_path(&p);
-        // Preserve the cheap, read-only missing-sidecar probe. We only need to
-        // claim an inode that already exists; Prepare/CopyLocal will atomically
-        // create and claim one if this transfer later decides to write.
+        let pp = partial_path(&p, partial_id)?;
         let partial_size = match fs::symlink_metadata(&pp) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => {
-                self.acquire_partial(&pp)?
-            }
+            Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => Some(metadata.len()),
             Ok(_) => None,
             Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
         };
         Ok(Response::PartialSize(partial_size))
     }
 
-    /// Claim a deterministic partial for this transfer. flock is advisory,
-    /// but all syq writers participate; unlike a process-local mutex it also
-    /// coordinates separate local invocations and remote worker processes.
-    fn acquire_partial(&mut self, pp: &Path) -> Result<Option<u64>> {
-        // A different connection may have finalized one of this connection's
-        // partials after range stealing. Its lease fd then names the published
-        // inode, not `pp`; retaining or reusing it can leak descriptors and,
-        // on retry, truncate the final file. Keep only leases whose fd still
-        // names the inode currently present at the partial pathname.
-        self.partial_leases.retain(|path, lease| {
-            let Ok(fd_meta) = lease.file.metadata() else {
-                return false;
-            };
-            let Ok(path_meta) = fs::symlink_metadata(path) else {
-                return false;
-            };
-            path_meta.is_file()
-                && fd_meta.dev() == path_meta.dev()
-                && fd_meta.ino() == path_meta.ino()
-        });
-        if let Some(lease) = self.partial_leases.get(pp) {
-            return Ok(lease.basis_size);
-        }
+    /// Open this job's adjacent sidecar without following symlinks or modifying
+    /// hardlinked files. A crash may leave final metadata (including 0444) on
+    /// the sidecar, so make an owned regular leftover writable before reuse.
+    fn open_private_partial(&mut self, pp: &Path) -> Result<(File, Option<u64>)> {
         self.uncache(pp);
-        loop {
-            // The optional directory guard serializes replacement of an
-            // unsafe sidecar (symlink, hardlink, or special file). Missing and
-            // ordinary private-file claims remain per-path and parallel.
-            let (file, basis_size, claim_guard) = match fs::symlink_metadata(pp) {
+        let mut repaired_permissions = false;
+        for _ in 0..8 {
+            match fs::symlink_metadata(pp) {
                 Ok(md) if md.is_file() && md.nlink() == 1 => {
                     match OpenOptions::new()
                         .read(true)
@@ -459,93 +764,73 @@ impl FsOps {
                             {
                                 continue;
                             }
-                            (file, Some(fd_meta.len()), None)
+                            return Ok((file, Some(fd_meta.len())));
                         }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::PermissionDenied
+                                && !repaired_permissions =>
+                        {
+                            // Open without following and chmod that descriptor,
+                            // not the pathname: a co-writer cannot redirect the
+                            // repair to a symlink target between lstat and chmod.
+                            let readonly = OpenOptions::new()
+                                .read(true)
+                                .custom_flags(libc::O_NOFOLLOW)
+                                .open(pp)
+                                .with_context(|| {
+                                    format!("open {} for permission repair", pp.display())
+                                })?;
+                            let fd_meta = readonly.metadata()?;
+                            if !fd_meta.file_type().is_file()
+                                || fd_meta.nlink() != 1
+                                || fd_meta.dev() != md.dev()
+                                || fd_meta.ino() != md.ino()
+                            {
+                                continue;
+                            }
+                            if fd_meta.uid() != unsafe { libc::geteuid() } && !is_root() {
+                                return Err(error)
+                                    .with_context(|| format!("open {}", pp.display()));
+                            }
+                            readonly
+                                .set_permissions(fs::Permissions::from_mode(0o600))
+                                .with_context(|| {
+                                    format!("make partial writable {}", pp.display())
+                                })?;
+                            repaired_permissions = true;
+                            continue;
+                        }
                         Err(error) => {
                             return Err(error).with_context(|| format!("open {}", pp.display()))
                         }
                     }
                 }
                 Ok(_) => {
-                    let parent = pp
-                        .parent()
-                        .filter(|path| !path.as_os_str().is_empty())
-                        .unwrap_or_else(|| Path::new("."));
-                    let guard =
-                        File::open(parent).with_context(|| format!("open {}", parent.display()))?;
-                    if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                        bail!(
-                            "destination partial {} is being replaced by another syq process: {}",
-                            pp.display(),
-                            io::Error::last_os_error()
-                        );
-                    }
-                    #[cfg(debug_assertions)]
-                    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARTIAL_REPLACE_MS") {
-                        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                            std::thread::sleep(std::time::Duration::from_millis(ms));
-                        }
-                    }
-                    match fs::symlink_metadata(pp) {
-                        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => continue,
-                        Ok(_) => fs::remove_file(pp)
-                            .with_context(|| format!("replace {}", pp.display()))?,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            return Err(error).with_context(|| format!("stat {}", pp.display()))
-                        }
-                    }
-                    let file = match OpenOptions::new()
+                    fs::remove_file(pp).with_context(|| format!("replace {}", pp.display()))?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return match OpenOptions::new()
                         .read(true)
                         .write(true)
                         .create_new(true)
                         .mode(0o600)
                         .open(pp)
                     {
-                        Ok(file) => file,
+                        Ok(file) => Ok((file, None)),
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                         Err(error) => {
-                            return Err(error).with_context(|| format!("create {}", pp.display()))
+                            Err(error).with_context(|| format!("create {}", pp.display()))
                         }
                     };
-                    (file, None, Some(guard))
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    match OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(pp)
-                    {
-                        Ok(file) => (file, None, None),
-                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                        Err(e) => {
-                            return Err(e).with_context(|| format!("create {}", pp.display()))
-                        }
-                    }
-                }
-                Err(e) => return Err(e).with_context(|| format!("stat {}", pp.display())),
-            };
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                let error = io::Error::last_os_error();
-                bail!(
-                    "destination partial {} is in use by another syq process: {error}",
-                    pp.display()
-                );
+                Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
             }
-            self.partial_leases
-                .insert(pp.to_path_buf(), PartialLease { file, basis_size });
-            drop(claim_guard);
-            #[cfg(debug_assertions)]
-            if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARTIAL_MS") {
-                if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                }
-            }
-            return Ok(basis_size);
         }
+        bail!(
+            "partial {} changed repeatedly while opening it",
+            pp.display()
+        )
     }
 
     pub fn prepare(
@@ -553,40 +838,136 @@ impl FsOps {
         path: &[u8],
         size: u64,
         inplace: bool,
-        from_final: bool,
+        partial_id: &PartialId,
         mode: u32,
     ) -> Result<()> {
         let p = resolve(path);
         if inplace {
             self.uncache(&p);
             // A stale partial from an interrupted run would otherwise be orphaned.
-            let _ = fs::remove_file(partial_path(&p));
-            let f = open_regular_write(&p, mode, false)?;
+            if let Ok(pp) = partial_path(&p, partial_id) {
+                let _ = fs::remove_file(pp);
+            }
+            // Don't follow a symlink (or write onto a dir/special): replace it
+            // with a regular file, like rsync does.
+            if let Ok(md) = fs::symlink_metadata(&p) {
+                if !md.is_file() {
+                    if md.is_dir() {
+                        bail!("destination {} is a directory", p.display());
+                    }
+                    fs::remove_file(&p).with_context(|| format!("replace {}", p.display()))?;
+                }
+            }
+            let f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(mode & 0o7777)
+                .open(&p)
+                .with_context(|| format!("open {}", p.display()))?;
+            if !f.metadata()?.file_type().is_file() {
+                bail!("destination {} is not a regular file", p.display());
+            }
             f.set_len(size)?;
             return Ok(());
         }
-        let pp = partial_path(&p);
-        self.acquire_partial(&pp)?;
-        let lease = self
-            .partial_leases
-            .get(&pp)
-            .with_context(|| format!("partial {} was not claimed", pp.display()))?;
-        let f = &lease.file;
-        if from_final {
-            f.set_len(0)?;
-            // Seed the partial with the existing file for block-diff, but never
-            // keep more than `size` bytes (a longer destination must shrink).
-            let mut src =
-                File::open(&p).with_context(|| format!("open {} to seed repair", p.display()))?;
-            let mut dst = f;
-            io::copy(&mut (&mut src).take(size), &mut dst)
-                .with_context(|| format!("seed partial from {}", p.display()))?;
-        } else if lease.basis_size.is_some() {
+        let pp = partial_path(&p, partial_id)?;
+        let (f, basis_size) = self.open_private_partial(&pp)?;
+        if basis_size.is_some() {
             f.set_len(size)?;
             return Ok(());
         }
-        preallocate(f, size)?;
+        preallocate(&f, size)?;
         f.set_len(size)?; // exact length: fallocate never shrinks an already-longer file
+        #[cfg(debug_assertions)]
+        if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARTIAL_MS") {
+            if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn hash_and_hold(
+        &mut self,
+        path: &[u8],
+        partial_id: &PartialId,
+        block: u64,
+        len: u64,
+    ) -> Result<Vec<u64>> {
+        let p = resolve(path);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
+            bail!("injected retained-basis hash failure");
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&p)
+            .with_context(|| format!("open {} as repair basis", p.display()))?;
+        if !file.metadata()?.file_type().is_file() {
+            bail!("destination {} is not a regular file", p.display());
+        }
+        let hashes = hash_reader(&mut file, block, len)?;
+        self.held_basis = Some(HeldBasis {
+            path: p,
+            partial_id: *partial_id,
+            file,
+        });
+        #[cfg(debug_assertions)]
+        if let Some(ready) = std::env::var_os("SYQ_TEST_BASIS_READY_FILE") {
+            fs::write(&ready, b"ready").with_context(|| {
+                format!("write basis-ready signal {}", Path::new(&ready).display())
+            })?;
+        }
+        #[cfg(debug_assertions)]
+        if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_BASIS_MS") {
+            if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+        Ok(hashes)
+    }
+
+    fn take_held_basis(&mut self, path: &[u8], partial_id: &PartialId) -> Result<HeldBasis> {
+        let expected = resolve(path);
+        let held = self
+            .held_basis
+            .take()
+            .context("no retained destination basis")?;
+        if held.path != expected || held.partial_id != *partial_id {
+            bail!("retained destination basis does not match requested file");
+        }
+        Ok(held)
+    }
+
+    pub fn finish_basis(
+        &mut self,
+        path: &[u8],
+        partial_id: &PartialId,
+        meta: &Meta,
+        flags: u8,
+    ) -> Result<()> {
+        let held = self.take_held_basis(path, partial_id)?;
+        set_meta_file(&held.file, meta, flags)
+            .with_context(|| format!("set metadata on basis {}", held.path.display()))?;
+        Ok(())
+    }
+
+    pub fn seed_basis(&mut self, path: &[u8], partial_id: &PartialId, len: u64) -> Result<()> {
+        let mut held = self.take_held_basis(path, partial_id)?;
+        let pp = partial_path(&held.path, partial_id)?;
+        let (dst, _) = self.open_private_partial(&pp)?;
+        dst.set_len(0)?;
+        preallocate(&dst, len)?;
+        dst.set_len(len)?;
+        held.file.seek(SeekFrom::Start(0))?;
+        let mut writer = &dst;
+        writer.seek(SeekFrom::Start(0))?;
+        io::copy(&mut held.file.take(len), &mut writer)
+            .with_context(|| format!("seed partial from {}", held.path.display()))?;
+        dst.set_len(len)?;
         Ok(())
     }
 
@@ -600,6 +981,7 @@ impl FsOps {
         src: &[u8],
         dst: &[u8],
         inplace: bool,
+        partial_id: &PartialId,
         size: u64,
         mode: u32,
     ) -> Result<()> {
@@ -617,7 +999,7 @@ impl FsOps {
         let target = if inplace {
             dp.clone()
         } else {
-            partial_path(&dp)
+            partial_path(&dp, partial_id)?
         };
         self.uncache(&target);
         if let Some(parent) = target.parent() {
@@ -625,16 +1007,19 @@ impl FsOps {
                 fs::create_dir_all(parent).ok();
             }
         }
-        if !inplace {
-            self.acquire_partial(&target)?;
-        }
         let d = if inplace {
             open_regular_write(&target, mode, true)?
         } else {
-            let d = self.partial_leases[&target].file.try_clone()?;
+            let (d, _) = self.open_private_partial(&target)?;
             d.set_len(0)?;
             d
         };
+        #[cfg(debug_assertions)]
+        if !inplace && std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
+            drop(d);
+            fs::remove_file(&target).with_context(|| format!("remove {}", target.display()))?;
+            bail!("EXDEV");
+        }
         let mut off: i64 = 0;
         let mut remaining = size;
         while remaining > 0 {
@@ -662,9 +1047,12 @@ impl FsOps {
                         drop(d);
                         let _ = fs::remove_file(&target);
                     } else {
-                        // Keep the claimed inode and its lock for the normal
-                        // streaming fallback.
-                        d.set_len(0)?;
+                        // The planner probed before this empty sidecar existed.
+                        // A content-identical fallback completes through its
+                        // retained basis fd and would otherwise orphan it.
+                        drop(d);
+                        fs::remove_file(&target)
+                            .with_context(|| format!("remove {}", target.display()))?;
                     }
                     bail!("EXDEV");
                 }
@@ -689,6 +1077,7 @@ impl FsOps {
         _src: &[u8],
         _dst: &[u8],
         _inplace: bool,
+        _partial_id: &PartialId,
         _size: u64,
         _mode: u32,
     ) -> Result<()> {
@@ -698,39 +1087,31 @@ impl FsOps {
     /// Write a whole small file through its deterministic sidecar and atomically
     /// rename it into place. Keeping this as one request preserves pipelining;
     /// unlike an in-place write, no partial final-named file is ever visible.
-    pub fn put_small(
+    fn put_small(
         &mut self,
-        path: &[u8],
+        target: PartialTarget<'_>,
         data: &[u8],
         hash: u64,
         meta: &Meta,
         flags: u8,
-        fsync: bool,
     ) -> Result<()> {
         if xxh3_64(data) != hash {
             bail!("block hash mismatch on receive");
         }
-        let p = resolve(path);
+        let p = resolve(target.path);
         self.uncache(&p);
-        let pp = partial_path(&p);
+        let pp = partial_path(&p, target.id)?;
         self.uncache(&pp);
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 fs::create_dir_all(parent).ok();
             }
         }
-
-        self.acquire_partial(&pp)?;
-        let lease = self.partial_leases.remove(&pp).unwrap();
-        let f = lease.file;
+        let (f, _) = self.open_private_partial(&pp)?;
         f.set_len(0)?;
         f.write_all_at(data, 0)
             .with_context(|| format!("write {}", pp.display()))?;
         set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", pp.display()))?;
-        if fsync {
-            f.sync_all()
-                .with_context(|| format!("fsync {}", pp.display()))?;
-        }
         #[cfg(debug_assertions)]
         if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
             // Test hook (debug builds only): model interruption after the
@@ -742,9 +1123,6 @@ impl FsOps {
         fs::rename(&pp, &p)
             .with_context(|| format!("rename {} to {}", pp.display(), p.display()))?;
         drop(f);
-        if fsync {
-            fsync_parent(&p)?;
-        }
         Ok(())
     }
 
@@ -752,46 +1130,29 @@ impl FsOps {
         &mut self,
         path: &[u8],
         which: Which,
+        partial_id: &PartialId,
         block: u64,
         len: u64,
     ) -> Result<Vec<u64>> {
         let p = resolve(path);
         let p = if which == Which::Partial {
-            partial_path(&p)
+            partial_path(&p, partial_id)?
         } else {
             p
         };
         let mut f = File::open(&p).with_context(|| format!("open {}", p.display()))?;
-        let n = len.div_ceil(block) as usize;
-        let mut out = Vec::with_capacity(n);
-        let mut buf = vec![0u8; block as usize];
-        let mut remaining = len;
-        while remaining > 0 {
-            let want = remaining.min(block) as usize;
-            let mut got = 0;
-            while got < want {
-                let r = f.read(&mut buf[got..want])?;
-                if r == 0 {
-                    break;
-                }
-                got += r;
-            }
-            out.push(xxh3_64(&buf[..got]));
-            if got < want {
-                // Short file: remaining blocks hash as empty (won't match anything real).
-                while out.len() < n {
-                    out.push(xxh3_64(&[]));
-                }
-                break;
-            }
-            remaining -= want as u64;
-        }
-        Ok(out)
+        hash_reader(&mut f, block, len)
     }
 
-    pub fn read_range(&mut self, path: &[u8], off: u64, len: u32) -> Result<Response> {
+    pub fn read_range(
+        &mut self,
+        path: &[u8],
+        attempt: u32,
+        off: u64,
+        len: u32,
+    ) -> Result<Response> {
         let p = resolve(path);
-        let f = self.cached(&p, false)?;
+        let f = self.cached(&p, false, attempt)?;
         let mut data = vec![0u8; len as usize];
         f.read_exact_at(&mut data, off)
             .with_context(|| format!("read {} @{off}+{len}", p.display()))?;
@@ -799,10 +1160,11 @@ impl FsOps {
         Ok(Response::Block { off, hash, data })
     }
 
-    pub fn write_range(
+    fn write_range(
         &mut self,
-        path: &[u8],
+        target: PartialTarget<'_>,
         inplace: bool,
+        attempt: u32,
         off: u64,
         hash: u64,
         data: &[u8],
@@ -810,9 +1172,13 @@ impl FsOps {
         if xxh3_64(data) != hash {
             bail!("block hash mismatch on receive @{off}");
         }
-        let p = resolve(path);
-        let p = if inplace { p } else { partial_path(&p) };
-        let f = self.cached(&p, true)?;
+        let p = resolve(target.path);
+        let p = if inplace {
+            p
+        } else {
+            partial_path(&p, target.id)?
+        };
+        let f = self.cached(&p, true, attempt)?;
         f.write_all_at(data, off)
             .with_context(|| format!("write {} @{off}", p.display()))
     }
@@ -821,27 +1187,25 @@ impl FsOps {
         &mut self,
         path: &[u8],
         inplace: bool,
+        partial_id: &PartialId,
         meta: &Meta,
         flags: u8,
-        fsync: bool,
     ) -> Result<()> {
         let p = resolve(path);
-        let src = if inplace { p.clone() } else { partial_path(&p) };
-        let lease = self.partial_leases.remove(&src).map(|lease| lease.file);
-        let cached = self.uncache(&src);
-        // Prefer the lease descriptor so its lock remains held through rename.
-        let f = lease.or(cached).map(Ok).unwrap_or_else(|| {
+        let src = if inplace {
+            p.clone()
+        } else {
+            partial_path(&p, partial_id)?
+        };
+        let f = self.uncache(&src).map(Ok).unwrap_or_else(|| {
             OpenOptions::new()
                 .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&src)
                 .with_context(|| format!("open {}", src.display()))
         })?;
         set_meta_file(&f, meta, flags)
             .with_context(|| format!("set metadata {}", src.display()))?;
-        if fsync {
-            f.sync_all()
-                .with_context(|| format!("fsync {}", src.display()))?;
-        }
         if !inplace {
             if fs::symlink_metadata(&p).is_ok_and(|metadata| metadata.is_dir()) {
                 bail!("destination {} is a directory", p.display());
@@ -851,10 +1215,6 @@ impl FsOps {
             })?;
         }
         drop(f);
-        if fsync {
-            // Make the rename (or in-place write) itself durable.
-            fsync_parent(&p)?;
-        }
         Ok(())
     }
 
@@ -885,62 +1245,116 @@ impl FsOps {
             Request::StatMany { paths, follow } => {
                 Ok(Response::Stats(self.stat_many(paths, *follow)))
             }
+            Request::PartialPaths { paths, partial_id } => {
+                Ok(Response::PathResults(self.partial_paths(paths, partial_id)))
+            }
             Request::Apply(ops) => Ok(Response::Applied(self.apply(ops))),
-            Request::ProbePartial { path } => self.probe_partial(path),
+            Request::ProbePartial { path, partial_id } => self.probe_partial(path, partial_id),
             Request::Prepare {
                 path,
                 size,
                 inplace,
-                from_final,
+                partial_id,
                 mode,
             } => self
-                .prepare(path, *size, *inplace, *from_final, *mode)
+                .prepare(path, *size, *inplace, partial_id, *mode)
+                .map(|_| Response::Ok),
+            Request::HashAndHold {
+                path,
+                partial_id,
+                block,
+                len,
+            } => self
+                .hash_and_hold(path, partial_id, *block, *len)
+                .map(Response::Hashes),
+            Request::FinishBasis {
+                path,
+                partial_id,
+                meta,
+                flags,
+            } => self
+                .finish_basis(path, partial_id, meta, *flags)
+                .map(|_| Response::Ok),
+            Request::SeedBasis {
+                path,
+                partial_id,
+                len,
+            } => self
+                .seed_basis(path, partial_id, *len)
                 .map(|_| Response::Ok),
             Request::CopyLocal {
                 src,
                 dst,
                 inplace,
+                partial_id,
                 size,
                 mode,
             } => self
-                .copy_local(src, dst, *inplace, *size, *mode)
+                .copy_local(src, dst, *inplace, partial_id, *size, *mode)
                 .map(|_| Response::Ok),
             Request::PutSmall {
                 path,
+                partial_id,
                 data,
                 hash,
                 meta,
                 flags,
-                fsync,
             } => self
-                .put_small(path, data, *hash, meta, *flags, *fsync)
+                .put_small(
+                    PartialTarget {
+                        path,
+                        id: partial_id,
+                    },
+                    data,
+                    *hash,
+                    meta,
+                    *flags,
+                )
                 .map(|_| Response::Ok),
             Request::HashBlocks {
                 path,
                 which,
+                partial_id,
                 block,
                 len,
             } => self
-                .hash_blocks(path, *which, *block, *len)
+                .hash_blocks(path, *which, partial_id, *block, *len)
                 .map(Response::Hashes),
-            Request::ReadRange { path, off, len } => self.read_range(path, *off, *len),
+            Request::ReadRange {
+                path,
+                attempt,
+                off,
+                len,
+            } => self.read_range(path, *attempt, *off, *len),
             Request::WriteRange {
                 path,
                 inplace,
+                partial_id,
+                attempt,
                 off,
                 hash,
                 data,
             } => self
-                .write_range(path, *inplace, *off, *hash, data)
+                .write_range(
+                    PartialTarget {
+                        path,
+                        id: partial_id,
+                    },
+                    *inplace,
+                    *attempt,
+                    *off,
+                    *hash,
+                    data,
+                )
                 .map(|_| Response::Ok),
             Request::Finalize {
                 path,
                 inplace,
+                partial_id,
                 meta,
                 flags,
-                fsync,
             } => self
-                .finalize(path, *inplace, meta, *flags, *fsync)
+                .finalize(path, *inplace, partial_id, meta, *flags)
                 .map(|_| Response::Ok),
             Request::FileHash { path } => self.file_hash(path),
             Request::Canonicalize { path } => {
@@ -961,7 +1375,7 @@ impl FsOps {
 /// Open `target` for writing as a regular file, replacing any existing
 /// symlink/dir/special and refusing to follow a symlink (O_NOFOLLOW), then
 /// verify the opened fd is a regular file. Used for every write target so a
-/// malicious or stale `.syq-partial` symlink can't redirect the write.
+/// malicious or stale `.syq-part` symlink can't redirect the write.
 fn open_regular_write(target: &Path, mode: u32, truncate: bool) -> Result<File> {
     loop {
         match fs::symlink_metadata(target) {
@@ -1053,16 +1467,6 @@ fn preallocate(f: &File, size: u64) -> Result<()> {
     // Portable fallback (also macOS): a sparse file of the right size.
     f.set_len(size)?;
     Ok(())
-}
-
-fn fsync_parent(path: &Path) -> Result<()> {
-    let dir = path
-        .parent()
-        .filter(|directory| !directory.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file = File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
-    file.sync_all()
-        .with_context(|| format!("fsync directory {}", dir.display()))
 }
 
 fn timespec(sec: i64, nsec: u32) -> libc::timespec {
@@ -1163,16 +1567,6 @@ fn apply_owner(
 mod tests {
     use super::*;
 
-    fn test_meta() -> Meta {
-        Meta {
-            mode: 0o600,
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
-            mtime: 1_600_000_000,
-            mtime_nsec: 0,
-        }
-    }
-
     #[test]
     fn unlink_never_recurses_into_a_directory() {
         let dir = std::env::temp_dir().join(format!("syq-unlink-{}", std::process::id()));
@@ -1201,45 +1595,61 @@ mod tests {
     }
 
     #[test]
-    fn cross_connection_finalize_reaps_the_probers_stale_lease() {
-        let dir = std::env::temp_dir().join(format!("syq-partial-lease-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let mut prober = FsOps::new();
-        let mut finalizer = FsOps::new();
+    fn partial_name_keeps_job_id_and_fits_name_max() {
+        let id = [7u8; 16];
+        let short = partial_path(Path::new("file"), &id).unwrap();
+        let short_name = short.file_name().unwrap();
+        assert!(short_name.to_string_lossy().starts_with(".file.syq-part."));
+        assert!(is_partial_name(short_name));
 
-        for i in 0..16 {
-            let path = dir.join(format!("file-{i}"));
-            let path_bytes = path_bytes(&path);
-            let payload = format!("published contents {i}");
-            prober
-                .prepare(&path_bytes, payload.len() as u64, false, false, 0o600)
-                .unwrap();
-            fs::write(partial_path(&path), payload.as_bytes()).unwrap();
-            finalizer
-                .finalize(&path_bytes, false, &test_meta(), 0, false)
-                .unwrap();
-            assert_eq!(fs::read(&path).unwrap(), payload.as_bytes());
+        let long = PathBuf::from("n".repeat(240));
+        let partial = partial_path(&long, &id).unwrap();
+        let name = partial.file_name().unwrap();
+        assert!(name.as_bytes().len() <= COMMON_NAME_MAX);
+        assert!(is_partial_name(name));
+        assert!(name.to_string_lossy().ends_with(&base32(&id)));
+    }
 
-            // Acquiring the next file must reap the lease whose partial was
-            // renamed by `finalizer`, keeping the fd count bounded.
-            assert!(prober.partial_leases.len() <= 1);
-        }
+    #[test]
+    fn partial_name_honors_filesystems_with_smaller_name_max() {
+        let id = [8u8; 16];
+        let final_path = PathBuf::from("dir").join("n".repeat(120));
+        let partial = partial_path_with_name_max(&final_path, &id, 143).unwrap();
+        let name = partial.file_name().unwrap();
+        assert!(name.as_bytes().len() <= 143);
+        assert!(is_partial_name(name));
+        assert!(name.to_string_lossy().ends_with(&base32(&id)));
+    }
 
-        let retry = dir.join("file-15");
-        let retry_bytes = path_bytes(&retry);
-        let expected = fs::read(&retry).unwrap();
-        prober
-            .prepare(&retry_bytes, expected.len() as u64, false, true, 0o600)
-            .unwrap();
+    #[test]
+    fn compact_partial_name_is_recognized() {
+        let name = OsStr::from_bytes(b".syq-part.aaaaaaaaaaaaaaaa");
+        assert!(is_partial_name(name));
+        assert!(!is_partial_name(OsStr::from_bytes(b".syq-part.notes")));
+
+        let id = [9u8; 16];
+        let parent_len = libc::PATH_MAX as usize - 28;
+        let final_path = PathBuf::from("a".repeat(parent_len)).join("x");
+        let partial = partial_path(&final_path, &id).unwrap();
+        assert_eq!(partial.file_name().unwrap().as_bytes().len(), 26);
+        assert!(is_partial_name(partial.file_name().unwrap()));
+
+        let too_deep = PathBuf::from("a".repeat(parent_len + 1)).join("x");
+        assert!(partial_path(&too_deep, &id).is_err());
+    }
+
+    #[test]
+    fn shared_block_hasher_handles_short_readers_consistently() {
+        let data = b"abcdefghij";
+        let hashes = hash_reader(&mut &data[..], 4, 16).unwrap();
         assert_eq!(
-            fs::read(&retry).unwrap(),
-            expected,
-            "a stale lease must never truncate the published inode"
+            hashes,
+            vec![
+                xxh3_64(b"abcd"),
+                xxh3_64(b"efgh"),
+                xxh3_64(b"ij"),
+                xxh3_64(b""),
+            ]
         );
-        assert!(partial_path(&retry).is_file());
-        drop(prober);
-        drop(finalizer);
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -135,14 +135,17 @@ impl Sched {
     }
 
     /// Whether enough work is left for `n` workers to be measurable: the
-    /// scan is still producing, or at least `n` files are queued, or the
-    /// bytes left (queued files and ranges, plus what in-flight ranges have
-    /// not read yet) would keep `n` workers busy past the next window. When
-    /// this is false the transfer is in its tail and throughput says nothing
-    /// about the worker count.
+    /// namespace preflight has finished and at least `n` files are queued, or
+    /// the bytes left (queued files and ranges, plus what in-flight ranges
+    /// have not read yet) would keep `n` workers busy past the next window.
+    /// When this is false the transfer is not moving yet or is in its tail,
+    /// so throughput says nothing about the worker count.
     pub fn work_left_for(&self, n: usize, bytes_per_worker: u64) -> bool {
         let g = self.inner.lock().unwrap();
-        if !g.scan_done || g.files.len() >= n {
+        if !g.scan_done {
+            return false;
+        }
+        if g.files.len() >= n {
             return true;
         }
         let mut bytes: u64 = g.files.iter().map(|(s, _)| *s).sum();
@@ -182,17 +185,19 @@ impl Sched {
             if g.abort {
                 return Item::Exit;
             }
-            if let Some((idx, off, end)) = g.ranges.pop() {
-                let h = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
-                g.inflight.push(h.clone());
-                return Item::Range(h);
-            }
-            if let Some((_, Reverse(idx))) = g.files.pop() {
-                g.probing += 1;
-                return Item::File(idx);
-            }
-            if let Some(h) = self.steal(&mut g) {
-                return Item::Range(h);
+            if g.scan_done {
+                if let Some((idx, off, end)) = g.ranges.pop() {
+                    let h = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
+                    g.inflight.push(h.clone());
+                    return Item::Range(h);
+                }
+                if let Some((_, Reverse(idx))) = g.files.pop() {
+                    g.probing += 1;
+                    return Item::File(idx);
+                }
+                if let Some(h) = self.steal(&mut g) {
+                    return Item::Range(h);
+                }
             }
             if g.scan_done && g.probing == 0 && g.inflight.is_empty() {
                 return Item::Exit;

@@ -81,7 +81,11 @@ pub fn scan(
             for child in children.iter_mut().flatten() {
                 if !all && is_partial_name(&child.file_name) {
                     child.read_children = None;
-                    child.client_state = State::Skipped;
+                    child.client_state = if report_ignored {
+                        State::Ignored
+                    } else {
+                        State::Skipped
+                    };
                     continue;
                 }
                 let full = child.path();

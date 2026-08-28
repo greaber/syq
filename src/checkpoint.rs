@@ -9,17 +9,19 @@ use crate::proto::{flags, Entry, PathBytes};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
+const IDENTITY_FORMAT: u32 = 1;
 
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -95,14 +97,24 @@ pub fn job_identity(
     dst_root: &str,
     semantic_flags: &str,
 ) -> String {
-    let mut s = format!("format={FORMAT}\nsrc_ep={src_endpoint}\n");
-    for (path, copies_contents) in src_roots {
-        s.push_str(&format!("src={path}\tcontents={copies_contents}\n"));
-    }
-    s.push_str(&format!(
-        "dst_ep={dst_endpoint}\ndst={dst_root}\nopts={semantic_flags}\n"
-    ));
-    s
+    serde_json::json!({
+        "format": IDENTITY_FORMAT,
+        "source_endpoint": src_endpoint,
+        "source_roots": src_roots,
+        "destination_endpoint": dst_endpoint,
+        "destination_root": dst_root,
+        "semantics": semantic_flags,
+    })
+    .to_string()
+}
+
+/// Compact collision-resistant ID used in destination partial names. The full
+/// JSON identity remains in checkpoints where it can be inspected by a user.
+pub fn partial_id(job_identity: &str) -> crate::proto::PartialId {
+    let digest = Sha256::digest(job_identity.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    id
 }
 
 const FLUSH_EVERY: usize = 256;
@@ -124,9 +136,7 @@ impl Loaded {
 
 /// Writable half of an enabled checkpoint.
 pub struct Checkpoint {
-    path: PathBuf,
     writer: Mutex<Writer>,
-    fsync: bool,
     failed: Mutex<Option<String>>,
     stop: AtomicBool,
     flusher: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -182,7 +192,7 @@ impl Checkpoint {
                 } => {
                     if format != FORMAT {
                         bail!(
-                            "checkpoint {} has format {format}, but this syq reads format {FORMAT}",
+                            "checkpoint {} has format {format}, but this syq reads format {FORMAT}; remove it to restart (destination partials remain resumable)",
                             path.display()
                         );
                     }
@@ -240,7 +250,7 @@ impl Checkpoint {
         Ok(out)
     }
 
-    pub fn open(path: &Path, job_identity: &str, fsync: bool) -> Result<(Self, Loaded)> {
+    pub fn open(path: &Path, job_identity: &str) -> Result<(Self, Loaded)> {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -256,6 +266,7 @@ impl Checkpoint {
                 std::io::Error::last_os_error()
             );
         }
+        validate_writable_checkpoint(&file, path)?;
         // Validate and load only after locking the same file we will append to.
         let loaded = Self::load_file(&mut file, path)?;
         if let Some(existing) = &loaded.existing_identity {
@@ -266,6 +277,10 @@ impl Checkpoint {
                 );
             }
         }
+        // Loading an existing checkpoint may take time. Recheck immediately
+        // before the first mutation so a link/path swap during parsing is not
+        // trusted merely because the initial post-lock check succeeded.
+        validate_writable_checkpoint(&file, path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         let len = file.metadata()?.len();
         if len > 0 {
@@ -277,14 +292,12 @@ impl Checkpoint {
             }
         }
         let checkpoint = Self {
-            path: path.to_path_buf(),
             writer: Mutex::new(Writer {
                 file,
                 buf: Vec::with_capacity(64 << 10),
                 unflushed: 0,
                 oldest_unflushed: None,
             }),
-            fsync,
             failed: Mutex::new(None),
             stop: AtomicBool::new(false),
             flusher: Mutex::new(None),
@@ -295,9 +308,6 @@ impl Checkpoint {
                 job_identity: job_identity.to_string(),
             })?;
             checkpoint.flush()?;
-            if fsync {
-                checkpoint.sync_parent()?;
-            }
         }
         Ok((checkpoint, loaded))
     }
@@ -416,9 +426,6 @@ impl Checkpoint {
         if !writer.buf.is_empty() {
             writer.file.write_all(&writer.buf)?;
             writer.buf.clear();
-            if self.fsync {
-                writer.file.sync_data()?;
-            }
         }
         writer.unflushed = 0;
         writer.oldest_unflushed = None;
@@ -431,13 +438,31 @@ impl Checkpoint {
             *failed = Some(format!("{error:#}"));
         }
     }
+}
 
-    fn sync_parent(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            File::open(parent)?.sync_all()?;
-        }
-        Ok(())
+fn validate_writable_checkpoint(file: &File, path: &Path) -> Result<()> {
+    let opened = file
+        .metadata()
+        .with_context(|| format!("stat open checkpoint {}", path.display()))?;
+    if !opened.file_type().is_file() {
+        bail!("checkpoint {} is not a regular file", path.display());
     }
+    if opened.nlink() != 1 {
+        bail!(
+            "checkpoint {} must have exactly one hard link (found {})",
+            path.display(),
+            opened.nlink()
+        );
+    }
+    let named = fs::symlink_metadata(path)
+        .with_context(|| format!("stat checkpoint path {}", path.display()))?;
+    if !named.file_type().is_file() || named.dev() != opened.dev() || named.ino() != opened.ino() {
+        bail!(
+            "checkpoint {} changed while it was being opened",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -472,7 +497,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.jsonl");
         let _ = fs::remove_file(&path);
-        let (checkpoint, _) = Checkpoint::open(&path, "identity", false).unwrap();
+        let (checkpoint, _) = Checkpoint::open(&path, "identity").unwrap();
         checkpoint.record_complete(b"a/b", &entry(10, 20, 0o644), "transferred");
         checkpoint.close().unwrap();
         let loaded = Checkpoint::load(&path).unwrap();
@@ -499,12 +524,12 @@ mod tests {
         let path = dir.join("state.jsonl");
         let _ = fs::remove_file(&path);
 
-        let (checkpoint, _) = Checkpoint::open(&path, "identity", false).unwrap();
+        let (checkpoint, _) = Checkpoint::open(&path, "identity").unwrap();
         checkpoint.record_complete(b"a/b", &entry(10, 20, 0o644), "transferred");
         checkpoint.close().unwrap();
         drop(checkpoint);
 
-        let (checkpoint, loaded) = Checkpoint::open(&path, "identity", false).unwrap();
+        let (checkpoint, loaded) = Checkpoint::open(&path, "identity").unwrap();
         assert!(loaded.completed.contains_key(b"a/b".as_slice()));
         checkpoint.record_deletions([b"a/b".as_slice()]).unwrap();
         assert!(
@@ -529,15 +554,33 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.jsonl");
         let _ = fs::remove_file(&path);
-        Checkpoint::open(&path, "A", false)
-            .unwrap()
-            .0
-            .close()
-            .unwrap();
-        assert!(Checkpoint::open(&path, "B", false).is_err());
-        let cleanup = Checkpoint::open(&path, "A", false).unwrap().0;
+        Checkpoint::open(&path, "A").unwrap().0.close().unwrap();
+        assert!(Checkpoint::open(&path, "B").is_err());
+        let cleanup = Checkpoint::open(&path, "A").unwrap().0;
         cleanup.close().unwrap();
         drop(cleanup);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_format_error_explains_safe_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "syq-checkpoint-unit-{}-old-format",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.jsonl");
+        fs::write(
+            &path,
+            b"{\"type\":\"header\",\"format\":1,\"job_identity\":\"old\"}\n",
+        )
+        .unwrap();
+
+        let error = Checkpoint::load(&path).err().unwrap().to_string();
+        assert!(error.contains("remove it to restart"), "{error}");
+        assert!(error.contains("partials remain resumable"), "{error}");
+
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
     }
@@ -549,11 +592,80 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.jsonl");
         let _ = fs::remove_file(&path);
-        let (first, _) = Checkpoint::open(&path, "A", false).unwrap();
-        assert!(Checkpoint::open(&path, "A", false).is_err());
+        let (first, _) = Checkpoint::open(&path, "A").unwrap();
+        assert!(Checkpoint::open(&path, "A").is_err());
         first.close().unwrap();
         drop(first);
         fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn hardlinked_checkpoint_is_rejected_before_chmod_or_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "syq-checkpoint-unit-{}-hardlink",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.jsonl");
+        let alias = dir.join("important");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&alias);
+        fs::write(&alias, b"important").unwrap();
+        fs::set_permissions(&alias, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&alias, &path).unwrap();
+
+        let error = Checkpoint::open(&path, "A").err().unwrap().to_string();
+        assert!(error.contains("exactly one hard link"), "{error}");
+        assert_eq!(fs::read(&alias).unwrap(), b"important");
+        assert_eq!(fs::metadata(&alias).unwrap().mode() & 0o777, 0o644);
+
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&alias).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn orphaned_or_replaced_checkpoint_handle_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "syq-checkpoint-unit-{}-handle-identity",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.jsonl");
+        let moved = dir.join("moved");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&moved);
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        let error = validate_writable_checkpoint(&file, &path)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("changed while"), "{error}");
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&moved).unwrap();
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        let error = validate_writable_checkpoint(&file, &path)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("exactly one hard link"), "{error}");
+        drop(file);
         fs::remove_dir(&dir).unwrap();
     }
 }

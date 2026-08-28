@@ -82,9 +82,9 @@ The harness applies patches to a fresh cached checkout and includes their
 contents in the cache key. Adaptations may change an incidental fixture or
 isolate the supported part of an upstream test that combines several features;
 they must not change the semantics claimed by the resulting test. For example,
-SYQ's partial adaptation recognizes a full-length sparse
-`.name.syq-partial` sidecar instead of rsync's growing destination prefix while
-retaining the same interrupted-transfer-and-successful-resume assertions. The
+SYQ's partial adaptation discovers the full-length sparse
+`.name.syq-part.<job-id>` sidecar instead of rsync's growing destination prefix
+while retaining the same interrupted-transfer-and-successful-resume assertions. The
 manifest's note must identify any omitted unsupported scenario.
 
 Do not adapt a test merely to make it green. If it exercises rsync internals,

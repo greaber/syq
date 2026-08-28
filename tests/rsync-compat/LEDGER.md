@@ -35,7 +35,7 @@ Pinned rsync commit: `7c20b077c980036a19587701cec320cc88e42a4a`.
 | `longdir` | adapted | default: pass | platform=linux; long path components | Copy and delete within a tree containing three 175-character path components. |
 | `metadata-depth` | adapted | default: pass | platform=linux; POSIX modes and mtimes | Preserve modes and mtimes throughout a deep tree; upstream's unsupported --chmod case is omitted. |
 | `nested-socket-specials` | conformance | default: pass | platform=linux; Unix-domain sockets | Archive mode handles a nested socket without losing ordinary files. |
-| `partial` | adapted | default: pass | platform=linux; signals; bandwidth limiting | An interrupted transfer leaves SYQ's deterministic sidecar and a rerun completes it. |
+| `partial` | adapted | default: pass | platform=linux; signals; bandwidth limiting | An interrupted transfer leaves SYQ's job-scoped deterministic sidecar and a rerun completes it. |
 | `protected-regular` | conformance | default: pass | platform=linux; run-as=root; root; Linux fs.protected_regular | --inplace can update a foreign-owned file in a sticky directory when the caller has authority. |
 | `search-only-destination` | conformance | default: pass | platform=linux; Linux search-only directory semantics; setpriv when run as root | Traverse a searchable but unreadable destination parent. |
 | `sender-scan-dir-escape` | conformance | default: pass | platform=linux; symlinks; C compiler; renameat2 | A raced source parent cannot make the copy enumerate outside the source tree. |

@@ -14,6 +14,10 @@ const COMPRESS_MIN: usize = 512;
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
 
+/// Stable identifier for one logical copy command. Destination partial names
+/// include this value so unrelated commands never write the same staged inode.
+pub type PartialId = [u8; 16];
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Dir,
@@ -99,6 +103,15 @@ pub enum Op {
         meta: Meta,
         flags: u8,
     },
+    /// Apply metadata to a regular file only if the path still names the inode
+    /// observed by the planner. A concurrent rename makes this a no-op.
+    SetFileMetaIfSame {
+        path: PathBytes,
+        expected_dev: u64,
+        expected_ino: u64,
+        meta: Meta,
+        flags: u8,
+    },
     Remove {
         path: PathBytes,
     },
@@ -129,12 +142,12 @@ pub enum Request {
         port_lo: u16,
         port_hi: u16,
     },
-    /// `all`: include syq's own partial files (used by --rm).
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
     /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
     Scan {
         root: PathBytes,
         follow_root: bool,
+        /// Include SYQ's own partial files (used by --rm).
         all: bool,
         ignore: Vec<String>,
         report_ignored: bool,
@@ -144,11 +157,17 @@ pub enum Request {
         paths: Vec<PathBytes>,
         follow: bool,
     },
+    /// Compute the exact receiver-side sidecar names for collision preflight.
+    PartialPaths {
+        paths: Vec<PathBytes>,
+        partial_id: PartialId,
+    },
     Apply(Vec<Op>),
     /// Return the size of the deterministic sidecar, if it is a regular file.
     /// The planner has already statted the final path.
     ProbePartial {
         path: PathBytes,
+        partial_id: PartialId,
     },
     /// Create/adjust the write target for `path` with the given final size.
     /// `mode`: create new files with this mode so no separate chmod is needed.
@@ -156,8 +175,31 @@ pub enum Request {
         path: PathBytes,
         size: u64,
         inplace: bool,
-        from_final: bool,
+        partial_id: PartialId,
         mode: u32,
+    },
+    /// Hash an existing final file and retain that open inode as the repair
+    /// basis until FinishBasis or SeedBasis consumes it.
+    HashAndHold {
+        path: PathBytes,
+        partial_id: PartialId,
+        block: u64,
+        len: u64,
+    },
+    /// Apply metadata through the retained basis descriptor. If another job
+    /// renamed over the final path meanwhile, its complete file remains the
+    /// winner and this only touches the now-unlinked old inode.
+    FinishBasis {
+        path: PathBytes,
+        partial_id: PartialId,
+        meta: Meta,
+        flags: u8,
+    },
+    /// Seed this job's sidecar from the retained basis descriptor.
+    SeedBasis {
+        path: PathBytes,
+        partial_id: PartialId,
+        len: u64,
     },
     /// In-kernel copy of a same-machine file (copy_file_range: reflink / NFS
     /// server-side copy when possible). Err("EXDEV") tells the caller to fall
@@ -166,23 +208,28 @@ pub enum Request {
         src: PathBytes,
         dst: PathBytes,
         inplace: bool,
+        partial_id: PartialId,
         size: u64,
         mode: u32,
     },
     HashBlocks {
         path: PathBytes,
         which: Which,
+        partial_id: PartialId,
         block: u64,
         len: u64,
     },
     ReadRange {
         path: PathBytes,
+        attempt: u32,
         off: u64,
         len: u32,
     },
     WriteRange {
         path: PathBytes,
         inplace: bool,
+        partial_id: PartialId,
+        attempt: u32,
         off: u64,
         hash: u64,
         #[serde(with = "serde_bytes")]
@@ -191,21 +238,21 @@ pub enum Request {
     Finalize {
         path: PathBytes,
         inplace: bool,
+        partial_id: PartialId,
         meta: Meta,
         flags: u8,
-        fsync: bool,
     },
     /// Whole small file in one request: verify, write a sidecar, then rename it
     /// atomically over the final path. This preserves small-file pipelining
     /// without exposing partial final-named files.
     PutSmall {
         path: PathBytes,
+        partial_id: PartialId,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         hash: u64,
         meta: Meta,
         flags: u8,
-        fsync: bool,
     },
     FileHash {
         path: PathBytes,
@@ -235,6 +282,7 @@ pub enum Response {
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
     Stats(Vec<Option<Entry>>),
+    PathResults(Vec<std::result::Result<PathBytes, String>>),
     Applied(Vec<Option<String>>),
     PartialSize(Option<u64>),
     Hashes(Vec<u64>),
