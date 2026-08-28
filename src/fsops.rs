@@ -540,27 +540,7 @@ impl FsOps {
             self.uncache(&p);
             // A stale partial from an interrupted run would otherwise be orphaned.
             let _ = fs::remove_file(partial_path(&p));
-            // Don't follow a symlink (or write onto a dir/special): replace it
-            // with a regular file, like rsync does.
-            if let Ok(md) = fs::symlink_metadata(&p) {
-                if !md.is_file() {
-                    if md.is_dir() {
-                        bail!("destination {} is a directory", p.display());
-                    }
-                    fs::remove_file(&p).with_context(|| format!("replace {}", p.display()))?;
-                }
-            }
-            let f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .custom_flags(libc::O_NOFOLLOW)
-                .mode(mode & 0o7777)
-                .open(&p)
-                .with_context(|| format!("open {}", p.display()))?;
-            if !f.metadata()?.file_type().is_file() {
-                bail!("destination {} is not a regular file", p.display());
-            }
+            let f = open_regular_write(&p, mode, false)?;
             f.set_len(size)?;
             return Ok(());
         }
@@ -628,7 +608,7 @@ impl FsOps {
             self.acquire_partial(&target)?;
         }
         let d = if inplace {
-            open_regular_write(&target, mode)?
+            open_regular_write(&target, mode, true)?
         } else {
             let d = self.partial_leases[&target].file.try_clone()?;
             d.set_len(0)?;
@@ -961,28 +941,55 @@ impl FsOps {
 /// symlink/dir/special and refusing to follow a symlink (O_NOFOLLOW), then
 /// verify the opened fd is a regular file. Used for every write target so a
 /// malicious or stale `.syq-partial` symlink can't redirect the write.
-fn open_regular_write(target: &Path, mode: u32) -> Result<File> {
-    if let Ok(md) = fs::symlink_metadata(target) {
-        if !md.is_file() {
-            if md.is_dir() {
-                bail!("destination {} is a directory", target.display());
+fn open_regular_write(target: &Path, mode: u32, truncate: bool) -> Result<File> {
+    loop {
+        match fs::symlink_metadata(target) {
+            Ok(md) if md.is_file() => {
+                // O_CREAT can be rejected for a foreign-owned existing file in
+                // a sticky directory under Linux fs.protected_regular. It is
+                // unnecessary here and weakens the distinction between an
+                // existing destination and a raced replacement.
+                let file = match OpenOptions::new()
+                    .write(true)
+                    .truncate(truncate)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(target)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("open {}", target.display()))
+                    }
+                };
+                if !file.metadata()?.file_type().is_file() {
+                    bail!("{} is not a regular file", target.display());
+                }
+                return Ok(file);
             }
-            fs::remove_file(target).with_context(|| format!("replace {}", target.display()))?;
+            Ok(md) if md.is_dir() => {
+                bail!("destination {} is a directory", target.display())
+            }
+            Ok(_) => {
+                fs::remove_file(target).with_context(|| format!("replace {}", target.display()))?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .mode(mode & 0o7777)
+                    .open(target)
+                {
+                    Ok(file) => return Ok(file),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("create {}", target.display()))
+                    }
+                }
+            }
+            Err(error) => return Err(error).with_context(|| format!("stat {}", target.display())),
         }
     }
-    let f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(mode & 0o7777)
-        .open(target)
-        .with_context(|| format!("create {}", target.display()))?;
-    let md = f.metadata()?;
-    if !md.file_type().is_file() {
-        bail!("{} is not a regular file", target.display());
-    }
-    Ok(f)
 }
 
 fn mkdir(p: &Path, mode: u32) -> io::Result<()> {

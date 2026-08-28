@@ -590,6 +590,9 @@ def main() -> int:
         raise CompatError(f"SYQ binary not found at {syq}")
 
     run_dir = Path(tempfile.mkdtemp(prefix=f"run-{args.profile}-", dir=cache))
+    # Some upstream security tests deliberately drop privileges. They still
+    # need to traverse this directory to execute the generated SYQ wrapper.
+    run_dir.chmod(0o755)
     wrapper = run_dir / "syq-rsync"
     make_wrapper(wrapper, syq, list(profile.get("args", [])))
     expected = run_dir / "expected.txt"
