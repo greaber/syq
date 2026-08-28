@@ -589,7 +589,11 @@ def main() -> int:
     if not syq.is_file():
         raise CompatError(f"SYQ binary not found at {syq}")
 
-    run_dir = Path(tempfile.mkdtemp(prefix=f"run-{args.profile}-", dir=cache))
+    # Root-only upstream tests may execute the wrapper after dropping to a
+    # second uid. CI workspace ancestors are not guaranteed to be traversable
+    # by that uid, so keep root-run scratch space under the shared system tmp.
+    run_parent = Path("/tmp") if running_as() == "root" else cache
+    run_dir = Path(tempfile.mkdtemp(prefix=f"syq-rsync-{args.profile}-", dir=run_parent))
     # Some upstream security tests deliberately drop privileges. They still
     # need to traverse this directory to execute the generated SYQ wrapper.
     run_dir.chmod(0o755)
