@@ -355,7 +355,7 @@ struct FdKey {
     /// Source files and partials get a fresh cache entry after a source-change
     /// retry. An old descriptor may point at an inode that was renamed away.
     attempt: u32,
-    /// Keep a privately-owned sidecar from sharing an unchecked cache entry.
+    /// Keep a validated sidecar from sharing an unchecked cache entry.
     private: bool,
 }
 
@@ -392,7 +392,7 @@ impl FsOps {
             }
             let f = open_existing_regular(p, write)?;
             if private {
-                require_owned_private(&f, p)?;
+                require_safe_partial(&f, p)?;
             }
             self.fds.insert(key.clone(), f);
             self.fd_order.push(key.clone());
@@ -752,7 +752,7 @@ impl FsOps {
         let pp = partial_path(&p, partial_id)?;
         let partial_size = match fs::symlink_metadata(&pp) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Ok(metadata) if is_owned_private(&metadata) => Some(metadata.len()),
+            Ok(metadata) if is_safe_partial(&metadata) => Some(metadata.len()),
             Ok(_) => None,
             Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
         };
@@ -761,13 +761,13 @@ impl FsOps {
 
     /// Open this job's adjacent sidecar without following symlinks or modifying
     /// hardlinked files. A crash may leave final metadata (including 0444) on
-    /// the sidecar, so make an owned regular leftover writable before reuse.
+    /// the sidecar, so make a safe regular leftover writable before reuse.
     fn open_private_partial(&mut self, pp: &Path) -> Result<(File, Option<u64>)> {
         self.uncache(pp);
         let mut repaired_permissions = false;
         for _ in 0..8 {
             match fs::symlink_metadata(pp) {
-                Ok(md) if is_owned_private(&md) => {
+                Ok(md) if is_safe_partial(&md) => {
                     match OpenOptions::new()
                         .read(true)
                         .write(true)
@@ -777,8 +777,8 @@ impl FsOps {
                         Ok(file) => {
                             let fd_meta = file.metadata()?;
                             let path_meta = fs::symlink_metadata(pp)?;
-                            if !is_owned_private(&fd_meta)
-                                || !is_owned_private(&path_meta)
+                            if !is_safe_partial(&fd_meta)
+                                || !is_safe_partial(&path_meta)
                                 || fd_meta.dev() != path_meta.dev()
                                 || fd_meta.ino() != path_meta.ino()
                             {
@@ -806,8 +806,8 @@ impl FsOps {
                             })?;
                             let fd_meta = handle.metadata()?;
                             let path_meta = fs::symlink_metadata(pp)?;
-                            if !is_owned_private(&fd_meta)
-                                || !is_owned_private(&path_meta)
+                            if !is_safe_partial(&fd_meta)
+                                || !is_safe_partial(&path_meta)
                                 || fd_meta.dev() != md.dev()
                                 || fd_meta.ino() != md.ino()
                                 || fd_meta.dev() != path_meta.dev()
@@ -838,7 +838,7 @@ impl FsOps {
                         .open(pp)
                     {
                         Ok(file) => {
-                            require_owned_private(&file, pp)?;
+                            require_safe_partial(&file, pp)?;
                             Ok((file, None))
                         }
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -1169,7 +1169,7 @@ impl FsOps {
         };
         let mut f = open_existing_regular(&p, false)?;
         if which == Which::Partial {
-            require_owned_private(&f, &p)?;
+            require_safe_partial(&f, &p)?;
         }
         hash_reader(&mut f, block, len)
     }
@@ -1236,7 +1236,7 @@ impl FsOps {
                 bail!("destination {} is not a regular file", src.display());
             }
         } else {
-            require_owned_private(&f, &src)?;
+            require_safe_partial(&f, &src)?;
         }
         set_meta_file(&f, meta, flags)
             .with_context(|| format!("set metadata {}", src.display()))?;
@@ -1457,21 +1457,19 @@ fn open_existing_regular(target: &Path, write: bool) -> Result<File> {
     Ok(file)
 }
 
-fn require_owned_private(file: &File, target: &Path) -> Result<()> {
+fn require_safe_partial(file: &File, target: &Path) -> Result<()> {
     let metadata = file.metadata()?;
-    if !is_owned_private(&metadata) {
+    if !is_safe_partial(&metadata) {
         bail!(
-            "partial {} is not an owned, singly-linked regular file",
+            "partial {} is not a singly-linked regular file",
             target.display()
         );
     }
     Ok(())
 }
 
-fn is_owned_private(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_file()
-        && metadata.nlink() == 1
-        && metadata.uid() == unsafe { libc::geteuid() }
+fn is_safe_partial(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file() && metadata.nlink() == 1
 }
 
 fn mkdir(p: &Path, mode: u32) -> io::Result<()> {
@@ -1674,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn private_partial_must_have_one_link() {
+    fn safe_partial_must_have_one_link() {
         let dir = test_dir();
         fs::create_dir(&dir).unwrap();
         let file = dir.join("partial");
@@ -1683,7 +1681,7 @@ mod tests {
         fs::hard_link(&file, &alias).unwrap();
 
         let opened = open_existing_regular(&file, true).unwrap();
-        let rejected = require_owned_private(&opened, &file).is_err();
+        let rejected = require_safe_partial(&opened, &file).is_err();
         drop(opened);
         fs::remove_dir_all(&dir).unwrap();
 
