@@ -109,16 +109,18 @@ impl UpdateFixture {
                 }
             },
             "installer": {"name": "install.sh", "sha256": "1".repeat(64), "size": 1},
-            "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1}
+            "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
+            "signature_scheme": "ed25519-jcs-v1"
         });
-        let manifest = serde_json::to_vec_pretty(&manifest).unwrap();
-        fs::write(temp.path("fixtures/syq-release-manifest.json"), &manifest).unwrap();
         let signing = SigningKey::from_bytes(&[31; 32]);
+        let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
         let signature =
-            base64::engine::general_purpose::STANDARD.encode(signing.sign(&manifest).to_bytes());
+            base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
+        let mut manifest = manifest;
+        manifest["signature"] = signature.into();
         fs::write(
-            temp.path("fixtures/syq-release-manifest.json.sig"),
-            signature,
+            temp.path("fixtures/syq-release-manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
         let public_key =
@@ -237,11 +239,11 @@ fn signed_self_update_replaces_only_the_receipted_copy() {
 fn self_update_rejects_a_tampered_signed_manifest_without_changing_install() {
     let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
     fixture.register();
-    fs::write(
-        fixture.temp.path("fixtures/syq-release-manifest.json"),
-        b"{\"schema\":2}",
-    )
-    .unwrap();
+    let path = fixture.temp.path("fixtures/syq-release-manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["version"] = "9.9.9".into();
+    fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 
     let update = fixture.command("--self-update");
     assert_failure_contains(&update, "signature verification failed");

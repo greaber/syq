@@ -52,11 +52,12 @@ only in official release binaries. To use a source build remotely, install the
 same build there and pass `--syq-path /path/to/syq` (or put it on the remote
 `PATH` and use `--no-bootstrap`).
 
-Standalone installs check the signed release manifest at most once a day after
-a successful interactive command. They only print an update notice by default:
-`syq --self-update` performs the update, and `syq --enable-auto-update` opts in
-to installing a signed update after a successful interactive command. Use
-`syq --disable-auto-update` to opt out again. The install receipt lives at
+Standalone installs download and verify one signed release manifest at most
+once a day after a successful interactive command. They only print an update
+notice by default: `syq --self-update` performs the update, and
+`syq --enable-auto-update` opts in to installing a signed update after a
+successful interactive command. Use `syq --disable-auto-update` to opt out
+again. The install receipt lives at
 `$XDG_CONFIG_HOME/syq/install.json` (normally `~/.config/syq/install.json`) and
 must name the running executable, so a Homebrew or source build never replaces
 itself. Update Homebrew installs with `brew upgrade syq`.
@@ -83,13 +84,14 @@ non-interactive remote `PATH` and use `--no-bootstrap`. Helpers cached under an
 older identity or cache layout are never executed; they may be removed with the
 rest of the disposable helper cache.
 
-The local client verifies the Ed25519-signed manifest and passes its trusted
-hash to the remote install script. The remote uses `curl` or `wget`, `gzip`, and
-one of `sha256sum`, `shasum`, or `openssl`. Version directories coexist and the
-helper cache can be removed at any time; syq recreates the helper it needs on
-the next connection. After launch, both peers require the same build identity:
-the release tag for official binaries, or the Git-derived identity when an
-explicit source-built helper is used.
+The local client verifies the manifest's embedded Ed25519 signature over its
+RFC 8785 canonical JSON and passes its trusted hash to the remote install
+script. The remote uses `curl` or `wget`, `gzip`, and one of `sha256sum`,
+`shasum`, or `openssl`. Version directories coexist and the helper cache can be
+removed at any time; syq recreates the helper it needs on the next connection.
+After launch, both peers require the same build identity: the release tag for
+official binaries, or the Git-derived identity when an explicit source-built
+helper is used.
 
 - **macOS (Apple Silicon / Intel):** build natively on the Mac with
   `cargo build --release` (needs the Xcode command-line tools, `xcode-select
@@ -171,9 +173,14 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--from0` | `--files-from` entries are NUL-separated |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
+| `--no-forward-agent` | Remote-to-remote: disable SSH agent forwarding to the source host |
 | `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
+
+Like rsync, `-q` suppresses non-error output: progress, summaries, warnings,
+notices, and `-v` file listings are hidden. Copy failures are still written to
+stderr and reflected in the exit status.
 
 `--bwlimit` is one approximate limit shared by every `-j` worker, not a
 per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
@@ -192,7 +199,20 @@ own keys). Progress and `-v` output are streamed back. If hostA can't reach
 hostB, `--relay` keeps the orchestrator here and routes every byte A → you → B
 — always works, at half the bandwidth.
 `syq hostA:src hostA:dst` (same host and user on both ends) simply runs a
-local copy on hostA.
+local copy on hostA and disables agent forwarding.
+
+Agent forwarding does not copy private keys to hostA, but a process that can
+access the forwarded socket while the SSH connection is alive can ask the
+agent to authenticate on its behalf. Pass `--no-forward-agent` to use `ssh -a`
+and override any `ForwardAgent yes` in SSH configuration; hostA must then have
+its own credentials for hostB. `--relay` also avoids exposing the agent to
+hostA, at the cost of routing the file data through this machine.
+
+Like rsync, SYQ leaves host-key checking to `ssh` and therefore inherits the
+user's SSH configuration and OpenSSH defaults. First contact therefore fails
+when `ssh` cannot interactively confirm an unknown host. If accepting and
+recording a new host key is appropriate, opt in explicitly with
+`-e 'ssh -o StrictHostKeyChecking=accept-new'`.
 
 Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
 launched it: syq starts it on hostA, returns, and writes progress to a log on
@@ -259,7 +279,9 @@ transfer stays parallel without pre-deciding chunk counts.
 On the receiving side a file that needs content changes is written beside its
 destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
 written with `pwrite` from several workers), given its metadata, and `rename`d
-over the target. When an existing final file is the comparison basis, the
+over the target. Visible sidecars are created mode `0600`, so incomplete data
+is private to the receiving user; final metadata is applied just before
+publication. When an existing final file is the comparison basis, the
 receiver retains that open descriptor while its blocks are hashed. If every
 block matches, metadata is applied through the descriptor without allocating
 or publishing a sidecar; otherwise that exact descriptor seeds the sidecar.
@@ -276,7 +298,10 @@ interrupted work, not crash-durability across power loss.
 Small files still use a pipelined whole-file request, but the receiver writes
 each request through its sidecar and renames it before acknowledging success.
 Thus every non-`--inplace` content change appears atomically complete, while
-a content-identical file keeps its inode and any destination hardlinks.
+an existing file that SYQ compares block by block and finds content-identical
+keeps its inode and any destination hardlinks. The same-host kernel-copy fast
+path may replace a byte-identical destination that failed the quick check,
+because it deliberately avoids that comparison.
 `--inplace` writes every file directly (for example, to update a large file
 without room for a second copy), so readers can observe partially updated
 contents and an interruption leaves the final file unfinished.
@@ -295,8 +320,11 @@ needed for this normal resumption. Resume works at two levels.
 - Files whose size and mtime already match are skipped (the rsync quick check).
 - If this job's range-transfer `.name.syq-part.<job-id>` exists, both sides
   hash it and the source in `--block-size` blocks and only the mismatching
-  blocks are sent. On NFS this requires the receiver to reread the partial;
-  syq deliberately keeps no separate block-completion map.
+  blocks are sent. A leftover is reused only when it is a regular file owned
+  by the receiving process with exactly one hard link; anything else is not
+  reused and is either safely replaced or reported as an error. On NFS this
+  requires the receiver to reread the partial; syq deliberately keeps no
+  separate block-completion map.
   Pipelined small files are rewritten wholesale on retry instead of paying an
   extra partial-file probe.
 - If the destination file exists but differs, its blocks are hashed against
@@ -351,8 +379,9 @@ logical commands use different partial names, so concurrent copies into one
 tree produce the union of their files and one whole-file rename wins for any
 path both write. A content-identical comparison applies metadata only through
 the inode it verified, so it cannot mix its metadata with another job's newly
-renamed contents. Quick-check metadata repair likewise verifies the inode
-before changing it, so a concurrent publication wins without mixed metadata.
+renamed contents. Quick-check metadata repair likewise verifies the inode;
+if a concurrent publication replaced it, the repair reports an error instead
+of mixing metadata with the new contents.
 Starting the same logical command twice at once is
 unsupported: both invocations intentionally address the same resumable
 sidecars. After a crash, abandoned sidecars may be deleted manually if that

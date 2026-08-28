@@ -2,7 +2,7 @@
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -170,10 +170,6 @@ fn remote_syq(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
         .env("FAKE_CURL_LOG", t.path("curl.log"))
         .env("FAKE_LOCAL_CURL_LOG", t.path("local-curl.log"))
         .env("FAKE_RELEASE_MANIFEST", t.path("release-manifest.json"))
-        .env(
-            "FAKE_RELEASE_SIGNATURE",
-            t.path("release-manifest.json.sig"),
-        )
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("FAKE_LEGACY_LOG", t.path("legacy.log"))
         .env("XDG_CONFIG_HOME", t.path("config"));
@@ -291,14 +287,19 @@ exit 99
             }
         },
         "installer": {"name": "install.sh", "sha256": "1".repeat(64), "size": 1},
-        "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1}
+        "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
+        "signature_scheme": "ed25519-jcs-v1"
     });
-    let manifest = serde_json::to_vec_pretty(&manifest).unwrap();
     let signing = SigningKey::from_bytes(&[19; 32]);
+    let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
     let signature =
-        base64::engine::general_purpose::STANDARD.encode(signing.sign(&manifest).to_bytes());
-    write(&t.path("release-manifest.json"), &manifest);
-    write(&t.path("release-manifest.json.sig"), signature.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
+    let mut manifest = manifest;
+    manifest["signature"] = signature.into();
+    write(
+        &t.path("release-manifest.json"),
+        &serde_json::to_vec_pretty(&manifest).unwrap(),
+    );
     write(
         &t.path("release-public-key"),
         base64::engine::general_purpose::STANDARD
@@ -319,7 +320,6 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 case "$url" in
-    *.json.sig) cp "$FAKE_RELEASE_SIGNATURE" "$out" ;;
     *.json) cp "$FAKE_RELEASE_MANIFEST" "$out" ;;
     *) exit 22 ;;
 esac
@@ -349,7 +349,7 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
     assert!(cached_remote_helper(&t).is_file());
     assert!(legacy_helpers.iter().all(|helper| helper.exists()));
     assert!(!t.path("legacy.log").exists(), "legacy helper was executed");
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
+    assert_eq!(read(&t.path("local-curl.log")), b"fetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
     let probes = fs::read_to_string(t.path("rsh.log"))
@@ -363,7 +363,7 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
     let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"second");
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\nfetch\n");
+    assert_eq!(read(&t.path("local-curl.log")), b"fetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
     let probes = fs::read_to_string(t.path("rsh.log"))
         .unwrap()
@@ -841,6 +841,55 @@ fn verify_only_detects_differences() {
     // verify-only must not modify anything
     assert!(read(&t.path("dst/a/med.bin")) == bad);
     assert!(!t.path("dst/hello.txt").exists());
+}
+
+#[test]
+fn hash_errors_do_not_desynchronize_worker_connections() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let t = Tmp::new();
+    write(&t.path("src/bad"), &vec![b'b'; 8192]);
+    write(&t.path("src/good"), &vec![b'g'; 4096]);
+    write(&t.path("dst/bad"), &vec![b'x'; 8192]);
+    write(&t.path("dst/good"), &vec![b'x'; 4096]);
+    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Largest-first scheduling makes the unreadable file fail first. The
+    // receiver still answers its already-issued hash request; that response
+    // must be drained before this worker proceeds to `good`.
+    let copy = syq(&["-a", "-c", "-j", "1", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(copy.status.code(), Some(23));
+    let copy_stderr = String::from_utf8_lossy(&copy.stderr);
+    assert!(
+        !copy_stderr.contains("unexpected response"),
+        "{copy_stderr}"
+    );
+    assert_eq!(read(&t.path("dst/good")), vec![b'g'; 4096]);
+
+    // Verification has the same paired-request shape and must likewise keep
+    // processing the connection after the source-side error.
+    let verify = syq(&[
+        "-a",
+        "--verify-only",
+        "-v",
+        "-j",
+        "1",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(verify.status.code(), Some(23));
+    let verify_stderr = String::from_utf8_lossy(&verify.stderr);
+    assert!(
+        !verify_stderr.contains("unexpected response"),
+        "{verify_stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&verify.stdout).contains("ok      good"),
+        "{}",
+        String::from_utf8_lossy(&verify.stdout)
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -2741,6 +2790,14 @@ fn source_partials_are_copied_and_warned_about() {
         stderr.contains("warning: source contains 2 recognizable SYQ partial paths"),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("they are treated as ordinary payload"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("copying"),
+        "warning must not promise that a dry run, verification, or failed run will copy: {stderr}"
+    );
     assert_eq!(read(&t.path(&format!("dst/{file}"))), b"partial payload");
     assert_eq!(
         read(&t.path(&format!("dst/{dir}/child"))),
@@ -2760,6 +2817,64 @@ fn source_partials_are_copied_and_warned_about() {
         .expect("missing structured source-partial warning");
     assert_eq!(warning["type"], "warning");
     assert_eq!(warning["count"], 2);
+
+    let quiet = syq(&["-q", "-v", "-a", &t.s("src/"), &t.s("quiet-dst/")]);
+    assert_output_ok(&quiet);
+    assert!(
+        quiet.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stdout)
+    );
+    assert!(
+        quiet.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert_eq!(
+        read(&t.path(&format!("quiet-dst/{file}"))),
+        b"partial payload"
+    );
+
+    let dry = syq(&["-n", "-a", &t.s("src/"), &t.s("dry-dst/")]);
+    assert_output_ok(&dry);
+    let dry_stderr = String::from_utf8_lossy(&dry.stderr);
+    assert!(
+        dry_stderr.contains("treated as ordinary payload"),
+        "{dry_stderr}"
+    );
+    assert!(!dry_stderr.to_ascii_lowercase().contains("copying"));
+    assert!(!t.path("dry-dst").exists());
+}
+
+#[test]
+fn quiet_suppresses_notices_but_not_errors() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+
+    let notice = syq(&["-q", &t.s("src"), &t.s("dst")]);
+    assert_output_ok(&notice);
+    assert!(
+        notice.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&notice.stdout)
+    );
+    assert!(
+        notice.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&notice.stderr)
+    );
+
+    let error = syq(&["-q", &t.s("missing"), &t.s("dst")]);
+    assert!(!error.status.success());
+    assert!(
+        error.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&error.stdout)
+    );
+    assert!(
+        !error.stderr.is_empty(),
+        "quiet mode must still report errors"
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -3220,6 +3335,54 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn retained_basis_growth_is_not_treated_as_an_exact_match() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 2 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    write(&t.path("basis"), &contents);
+    set_mtime(&t.path("src"), 1_600_000_001);
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    let ready = t.path("basis-ready");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "-j",
+            "1",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("src"),
+            &t.s("basis"),
+        ])
+        .env("SYQ_TEST_BASIS_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .spawn()
+        .unwrap();
+    let held = (0..300).any(|_| {
+        if ready.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(held, "copy never retained its destination basis");
+
+    OpenOptions::new()
+        .append(true)
+        .open(t.path("basis"))
+        .unwrap()
+        .write_all(b"trailing data")
+        .unwrap();
+
+    assert!(child.wait().unwrap().success());
+    assert_eq!(read(&t.path("basis")), contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn content_identical_basis_never_mixes_contents_and_metadata() {
     let t = Tmp::new();
     let first_contents = vec![b'a'; 8 * 1024 * 1024];
@@ -3327,7 +3490,7 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
     assert_eq!(published.mode() & 0o777, 0o640);
     assert_eq!(published.mtime(), 1_600_000_001);
 
-    assert!(first.wait().unwrap().success());
+    assert_eq!(first.wait().unwrap().code(), Some(23));
     assert_eq!(read(&t.path("basis")), b"bbbb");
     let published = fs::metadata(t.path("basis")).unwrap();
     assert_eq!(published.mode() & 0o777, 0o640);
@@ -3353,7 +3516,7 @@ fn quick_check_repairs_mode_without_destination_read_permission() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn quick_check_metadata_open_does_not_block_on_concurrent_fifo() {
+fn quick_check_metadata_open_reports_concurrent_fifo_without_blocking() {
     use std::os::unix::fs::FileTypeExt;
 
     let t = Tmp::new();
@@ -3395,7 +3558,7 @@ fn quick_check_metadata_open_does_not_block_on_concurrent_fifo() {
         let _ = first.wait();
         panic!("quick-check repair blocked while opening a concurrently published FIFO");
     }
-    assert!(status.unwrap().success());
+    assert_eq!(status.unwrap().code(), Some(23));
     assert!(fs::symlink_metadata(t.path("basis"))
         .unwrap()
         .file_type()
@@ -3428,19 +3591,21 @@ fn checksum_identical_file_preserves_destination_inode() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn readonly_interrupted_partial_is_reused() {
+fn unreadable_interrupted_partials_are_reused() {
     let t = Tmp::new();
     let contents = vec![b'a'; 8 * 1024 * 1024];
     write(&t.path("src"), &contents);
-    let src = t.s("src");
-    let dst = t.s("out");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
-    let partial = interrupted_partial(&args, &t.0);
-    fs::set_permissions(&partial, fs::Permissions::from_mode(0o444)).unwrap();
+    for (i, mode) in [0o444, 0o000].into_iter().enumerate() {
+        let src = t.s("src");
+        let dst = t.s(&format!("out-{i}"));
+        let args = ["-a", "--bwlimit", "1G", &src, &dst];
+        let partial = interrupted_partial(&args, &t.0);
+        fs::set_permissions(&partial, fs::Permissions::from_mode(mode)).unwrap();
 
-    run_ok(&args);
-    assert_eq!(read(&t.path("out")), contents);
-    assert!(!partial.exists());
+        run_ok(&args);
+        assert_eq!(read(&t.path(&format!("out-{i}"))), contents);
+        assert!(!partial.exists());
+    }
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -3485,6 +3650,49 @@ fn long_basename_partial_is_truncated_and_resumed() {
     run_ok(&args);
     assert_eq!(read(&t.path(&format!("dst/{basename}"))), contents);
     assert!(!partial.exists());
+}
+
+#[test]
+fn impossible_sidecar_name_fails_one_file_and_continues() {
+    let t = Tmp::new();
+    let mut deep = PathBuf::new();
+    let target_parent_len = libc::PATH_MAX as usize - 20;
+    loop {
+        let current = t
+            .path("dst")
+            .join(&deep)
+            .as_os_str()
+            .as_encoded_bytes()
+            .len();
+        if current >= target_parent_len {
+            break;
+        }
+        let component_len = (target_parent_len - current - 1).min(200);
+        assert!(component_len > 0);
+        deep.push("d".repeat(component_len));
+    }
+    assert!(
+        t.path("dst")
+            .join(&deep)
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            >= target_parent_len
+    );
+
+    write(&t.path("src/good"), b"copied");
+    write(
+        &t.path("src").join(&deep).join("x"),
+        b"cannot fit a sidecar",
+    );
+
+    let output = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
+
+    assert_eq!(output.status.code(), Some(23));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot create a safe sidecar"), "{stderr}");
+    assert_eq!(read(&t.path("dst/good")), b"copied");
+    assert!(!t.path("dst").join(deep).join("x").exists());
 }
 
 #[cfg(debug_assertions)]
