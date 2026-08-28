@@ -92,12 +92,18 @@ impl UpdateFixture {
                 (target): {
                     "binary": {
                         "name": asset,
-                        "sha256": format!("{:x}", Sha256::digest(replacement)),
+                        "sha256": Sha256::digest(replacement)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>(),
                         "size": replacement.len()
                     },
                     "archive": {
                         "name": format!("{asset}.gz"),
-                        "sha256": format!("{:x}", Sha256::digest(&archive)),
+                        "sha256": Sha256::digest(&archive)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>(),
                         "size": archive.len()
                     }
                 }

@@ -72,7 +72,7 @@ pub fn scan(
         .process_read_dir(move |_depth, _path, _state, children| {
             for child in children.iter_mut().flatten() {
                 if !all && is_partial_name(&child.file_name) {
-                    child.read_children_path = None;
+                    child.read_children = None;
                     child.client_state = State::Skipped;
                     continue;
                 }
@@ -86,7 +86,7 @@ pub fn scan(
                     let is_dir = entry.kind == crate::proto::Kind::Dir;
                     if ig.matched(rel, is_dir).is_ignore() {
                         // Pruned: neither listed nor descended into.
-                        child.read_children_path = None;
+                        child.read_children = None;
                         child.client_state = State::Skipped;
                         continue;
                     }
@@ -105,7 +105,11 @@ pub fn scan(
         if de.depth == 0 {
             continue;
         }
-        if let Some(e) = de.read_children_error.take() {
+        if let Some(e) = de
+            .read_children
+            .as_ref()
+            .and_then(|children| children.error())
+        {
             warn(format!("scan: {}: {e}", de.path().display()));
         }
         let mut entry = match std::mem::take(&mut de.client_state) {
