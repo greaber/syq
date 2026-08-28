@@ -428,12 +428,17 @@ data connections across all of them (multipath) — it keeps only paths within
 link. Single-homed hosts and laptops use the one best path, unchanged. With ufw:
 
 ```sh
-sudo ufw allow from REMOVED/24 to any port 47600:47699 proto tcp   # LAN peers
+sudo ufw allow from 192.0.2.0/24  to any port 47600:47699 proto tcp   # example LAN
 sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specific client
 ```
 
 Remote→remote (`syq hostA:src hostB:dst`) works the same way: the
 orchestrator on hostA connects to hostB's listener.
+
+No special server setup is required. For a measurement-first checklist of
+optional firewall, sshd, TCP, and host-network changes, including their
+trade-offs and rollback considerations, see [Server performance
+tuning](SERVER-TUNING.md).
 
 ## Defaults chosen for network filesystems
 
@@ -519,8 +524,9 @@ fix for that.
   at a time, and if the
   server sheds one — sshd's `MaxStartups` (default 10) randomly rejects
   sessions beyond 10 being set up at once — syq halves that number for the
-  rest of the run and retries. On a server set up for syq (`MaxStartups
-  100`, see `scripts/server-setup.sh`) 32 sessions come up in one round.
+  rest of the run and retries. Raising `MaxStartups` can reduce setup time for
+  ssh data connections, but increases the resources available to
+  unauthenticated clients; see [Server performance tuning](SERVER-TUNING.md).
   Auto-tuning starts at 16 for TCP data, or 8 for ssh data, and only opens more
   once they have been shown to pay.
 - Direct remote→remote with a *forwarded* agent authenticates every session
