@@ -235,8 +235,10 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         if !out.status.success() || log.is_empty() {
             bail!("could not start detached transfer on {src_host}");
         }
-        println!("syq: started on {src_host}, log {log}");
-        println!("syq: follow with:  syq --follow {src_host}:{log}");
+        if !args.quiet {
+            println!("syq: started on {src_host}, log {log}");
+            println!("syq: follow with:  syq --follow {src_host}:{log}");
+        }
         return Ok(0);
     }
     if !args.quiet {

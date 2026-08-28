@@ -2005,8 +2005,13 @@ fn source_partials_are_copied_and_warned_about() {
     assert_eq!(warning["type"], "warning");
     assert_eq!(warning["count"], 2);
 
-    let quiet = syq(&["-q", "-a", &t.s("src/"), &t.s("quiet-dst/")]);
+    let quiet = syq(&["-q", "-v", "-a", &t.s("src/"), &t.s("quiet-dst/")]);
     assert_output_ok(&quiet);
+    assert!(
+        quiet.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stdout)
+    );
     assert!(
         quiet.stderr.is_empty(),
         "{}",
@@ -2026,6 +2031,37 @@ fn source_partials_are_copied_and_warned_about() {
     );
     assert!(!dry_stderr.to_ascii_lowercase().contains("copying"));
     assert!(!t.path("dry-dst").exists());
+}
+
+#[test]
+fn quiet_suppresses_notices_but_not_errors() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+
+    let notice = syq(&["-q", &t.s("src"), &t.s("dst")]);
+    assert_output_ok(&notice);
+    assert!(
+        notice.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&notice.stdout)
+    );
+    assert!(
+        notice.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&notice.stderr)
+    );
+
+    let error = syq(&["-q", &t.s("missing"), &t.s("dst")]);
+    assert!(!error.status.success());
+    assert!(
+        error.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&error.stdout)
+    );
+    assert!(
+        !error.stderr.is_empty(),
+        "quiet mode must still report errors"
+    );
 }
 
 #[cfg(debug_assertions)]

@@ -34,6 +34,7 @@ pub struct Opts {
     pub inplace: bool,
     pub same_host: bool,
     pub dry_run: bool,
+    pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
     pub partial_id: std::sync::OnceLock<PartialId>,
@@ -368,7 +369,8 @@ pub fn run(args: Args) -> Result<i32> {
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         dry_run: args.dry_run,
-        verbose: args.verbose,
+        quiet: args.quiet,
+        verbose: if args.quiet { 0 } else { args.verbose },
         umask: read_umask(),
         partial_id: std::sync::OnceLock::new(),
         ignore: args.ignore_lines.clone(),
@@ -766,7 +768,7 @@ pub fn run(args: Args) -> Result<i32> {
                 .map(|e| format!("{e:#}"))
                 .or_else(|| checkpoint.take_error())
         });
-        if let Some(e) = failed {
+        if let Some(e) = failed.filter(|_| !args.quiet) {
             eprintln!(
                 "syq: warning: checkpoint recording stopped ({e}); a retry will recheck files completed after that point"
             );
@@ -966,6 +968,7 @@ impl Planner<'_> {
         let mut sub = sub.to_string();
         let progress = self.progress;
         let recursive = self.opts.recursive;
+        let quiet = self.opts.quiet;
         src.scan(
             src_root,
             follow,
@@ -978,7 +981,10 @@ impl Planner<'_> {
                             sub = String::new();
                         }
                         if root.kind == Kind::Dir && !recursive {
-                            progress.eprintln(&format!("skipping directory {}", display(src_root)));
+                            if !quiet {
+                                progress
+                                    .eprintln(&format!("skipping directory {}", display(src_root)));
+                            }
                             return Ok(());
                         }
                     }
@@ -990,7 +996,9 @@ impl Planner<'_> {
                 // "skipping …" is a notice (nothing the copy owes is missing);
                 // anything else from the scanner means an entry was lost.
                 if w.starts_with("skipping ") {
-                    progress.eprintln(&format!("syq: {w}"));
+                    if !quiet {
+                        progress.eprintln(&format!("syq: {w}"));
+                    }
                 } else {
                     progress.error(&format!("syq: {w}"));
                 }
@@ -1191,9 +1199,11 @@ impl Planner<'_> {
                             .as_ref()
                             .is_some_and(|d| d.dev == e.dev && d.ino == e.ino)
                     {
-                        self.progress.eprintln(&format!(
-                            "skipping {rel}: source and destination are the same file"
-                        ));
+                        if !opts.quiet {
+                            self.progress.eprintln(&format!(
+                                "skipping {rel}: source and destination are the same file"
+                            ));
+                        }
                         continue;
                     }
                     let same = dst_entry.as_ref().is_some_and(|d| {
@@ -1836,10 +1846,12 @@ impl Worker {
             };
             if changed {
                 if let (Some(e), true) = (now, j.attempts + 1 < MAX_ATTEMPTS) {
-                    self.progress.eprintln(&format!(
-                        "syq: {}: changed during transfer, retrying",
-                        j.rel
-                    ));
+                    if !self.opts.quiet {
+                        self.progress.eprintln(&format!(
+                            "syq: {}: changed during transfer, retrying",
+                            j.rel
+                        ));
+                    }
                     let published = self.published_entry(j);
                     let mut all = self.sched.jobs.lock().unwrap();
                     let job = &mut all[*idx];
@@ -2409,10 +2421,12 @@ impl Worker {
         if changed {
             if job.attempts + 1 < MAX_ATTEMPTS {
                 if let Some(e) = now {
-                    self.progress.eprintln(&format!(
-                        "syq: {}: changed during transfer, retrying",
-                        job.rel
-                    ));
+                    if !self.opts.quiet {
+                        self.progress.eprintln(&format!(
+                            "syq: {}: changed during transfer, retrying",
+                            job.rel
+                        ));
+                    }
                     let published = self.published_entry(&job);
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let j = &mut jobs[idx];
