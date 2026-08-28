@@ -2378,57 +2378,73 @@ impl Planner<'_> {
         }
         let mut n = 0u64;
         let checkpoint = self.checkpoint.clone();
-        let mut run =
-            |me: &mut Self, items: &[(PathBytes, String, PathBytes)], rmdir: bool| -> Result<()> {
-                for chunk in items.chunks(1000) {
-                    if opts.dry_run {
-                        for (_, rel, _) in chunk {
+        // Set when deletion intents could not be made durable: from then on
+        // nothing more is deleted — the checkpoint's stale Complete records
+        // would otherwise outlive the files they describe.
+        let intents_failed = std::cell::Cell::new(false);
+        let mut run = |me: &mut Self,
+                       items: &[(PathBytes, String, PathBytes)],
+                       rmdir: bool|
+         -> Result<()> {
+            for chunk in items.chunks(1000) {
+                if intents_failed.get() {
+                    return Ok(());
+                }
+                if opts.dry_run {
+                    for (_, rel, _) in chunk {
+                        n += 1;
+                        if opts.verbose > 0 {
+                            me.progress.println(&format!("deleting {rel}"));
+                        }
+                    }
+                    continue;
+                }
+                // Write-ahead: the Deleted intents go into the checkpoint,
+                // durably, before anything is unlinked — and gate it: if
+                // they can't be persisted, deleting would leave durable
+                // Complete records for files that are gone.
+                if !rmdir {
+                    if let Some(c) = &checkpoint {
+                        if let Err(e) = c.record_deleted_batch(
+                            chunk
+                                .iter()
+                                .filter(|(_, _, dst_rel)| !dst_rel.is_empty())
+                                .map(|(_, _, dst_rel)| dst_rel.as_slice()),
+                        ) {
+                            me.progress.error(&format!(
+                                    "syq: delete: could not persist deletion intents to the checkpoint ({e:#}); leaving the remaining extras in place"
+                                ));
+                            intents_failed.set(true);
+                            return Ok(());
+                        }
+                    }
+                }
+                let ops: Vec<Op> = chunk
+                    .iter()
+                    .map(|(p, _, _)| {
+                        if rmdir {
+                            Op::Rmdir { path: p.clone() }
+                        } else {
+                            // Never Remove: that recurses into a directory
+                            // that appeared here since the walk.
+                            Op::Unlink { path: p.clone() }
+                        }
+                    })
+                    .collect();
+                for ((_, rel, _), err) in chunk.iter().zip(me.apply(ops)?) {
+                    match err {
+                        None => {
                             n += 1;
                             if opts.verbose > 0 {
                                 me.progress.println(&format!("deleting {rel}"));
                             }
                         }
-                        continue;
-                    }
-                    // Write-ahead: the Deleted intents go into the checkpoint,
-                    // durably, before anything is unlinked (see
-                    // record_deleted_batch for why this order).
-                    if !rmdir {
-                        if let Some(c) = &checkpoint {
-                            c.record_deleted_batch(
-                                chunk
-                                    .iter()
-                                    .filter(|(_, _, dst_rel)| !dst_rel.is_empty())
-                                    .map(|(_, _, dst_rel)| dst_rel.as_slice()),
-                            );
-                        }
-                    }
-                    let ops: Vec<Op> = chunk
-                        .iter()
-                        .map(|(p, _, _)| {
-                            if rmdir {
-                                Op::Rmdir { path: p.clone() }
-                            } else {
-                                // Never Remove: that recurses into a directory
-                                // that appeared here since the walk.
-                                Op::Unlink { path: p.clone() }
-                            }
-                        })
-                        .collect();
-                    for ((_, rel, _), err) in chunk.iter().zip(me.apply(ops)?) {
-                        match err {
-                            None => {
-                                n += 1;
-                                if opts.verbose > 0 {
-                                    me.progress.println(&format!("deleting {rel}"));
-                                }
-                            }
-                            Some(e) => me.progress.error(&format!("syq: delete {rel}: {e}")),
-                        }
+                        Some(e) => me.progress.error(&format!("syq: delete {rel}: {e}")),
                     }
                 }
-                Ok(())
-            };
+            }
+            Ok(())
+        };
         run(self, &leaves, false)?;
         for (_, items) in dirs.iter().rev() {
             let items: Vec<(PathBytes, String, PathBytes)> = items

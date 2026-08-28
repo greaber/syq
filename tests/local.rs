@@ -4664,3 +4664,62 @@ fn delete_records_checkpoint_intent_before_unlinking() {
         "intent must precede the unlink: {state}"
     );
 }
+
+#[test]
+fn delete_halts_when_checkpoint_intents_cannot_be_persisted() {
+    // RLIMIT_FSIZE pins the checkpoint at its current size, so the Deleted
+    // intent cannot be appended. Deletion must then not happen at all:
+    // unlinking would leave a durable Complete record for a missing file.
+    use std::os::unix::process::CommandExt;
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    fs::remove_file(t.path("src/f")).unwrap();
+    let limit = fs::metadata(t.path("state")).unwrap().len();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
+    cmd.args([
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        "--delete",
+        &t.s("src/"),
+        &t.s("dst"),
+        "--no-progress",
+    ]);
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let rl = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &rl) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("could not persist deletion intents"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        t.path("dst/f").exists(),
+        "nothing may be deleted without a durable intent"
+    );
+}

@@ -373,10 +373,11 @@ impl Checkpoint {
     /// --delete is about to unlink these paths: persist the intents *before*
     /// the unlinks, durably, so a crash can never leave a stale Complete
     /// record for a file that is gone. A stale Deleted intent (recorded, then
-    /// the unlink failed or never ran) only costs a recheck on retry.
-    pub fn record_deleted_batch<'a>(&self, paths: impl Iterator<Item = &'a [u8]>) {
-        if self.failed.lock().unwrap().is_some() {
-            return;
+    /// the unlink failed or never ran) only costs a recheck on retry. An Err
+    /// means the intents are NOT durable — the caller must not unlink.
+    pub fn record_deleted_batch<'a>(&self, paths: impl Iterator<Item = &'a [u8]>) -> Result<()> {
+        if let Some(error) = self.failed.lock().unwrap().as_ref() {
+            bail!("checkpoint recording already stopped: {error}");
         }
         let result = (|| {
             for path in paths {
@@ -387,9 +388,12 @@ impl Checkpoint {
             let mut writer = self.writer.lock().unwrap();
             self.flush_locked(&mut writer)
         })();
-        if let Err(e) = result {
-            self.note_error(e);
+        if let Err(error) = result {
+            let message = format!("{error:#}");
+            self.note_error(error);
+            bail!("{message}");
         }
+        Ok(())
     }
 
     pub fn take_error(&self) -> Option<String> {
