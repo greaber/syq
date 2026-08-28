@@ -1,774 +1,203 @@
 # syq
 
-`syq` is a parallel file copier with an rsync-shaped command line. It scans
-source and destination, works out what differs, and moves the data over
-**N independent connections at once** — encrypted TCP by default, authenticated
-over ssh, falling back to ssh's own channels when a direct port can't be
-reached — splitting large files into ranges
-that idle workers steal from each other, so a single huge file at the end of
-a transfer still uses every connection. Throughput is typically several times
-that of a single ssh stream. It also has a progress meter that separates
-transferred bytes from unchanged ones and automatically resumes interrupted
-transfers from partial files without retransmitting their finished blocks. An
-optional checkpoint can avoid repeated destination lookups for exceptionally
-large or failure-prone jobs; it is not required for normal resumption. SYQ can
-also verify that a copy is complete.
+`syq` is a parallel file-tree copier for local filesystems and hosts reachable
+over SSH. It uses an rsync-shaped command line, scans the source and destination
+in parallel, and transfers independent files and ranges of large files over
+multiple connections.
 
-## Install
+It supports local-to-local, local-to-remote, remote-to-local, and direct
+remote-to-remote copies. Release binaries are available for Linux and macOS.
 
-The standalone installer needs no `sudo` and installs the matching Linux or
-macOS binary in `~/.local/bin`:
+## Key properties
 
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
-```
+- Parallel directory scanning and file transfer, with automatic connection
+  tuning or an explicit `-j N`.
+- Large files can be divided into ranges so multiple workers can transfer one
+  file.
+- Interrupted staged transfers resume from deterministic partial files when the
+  same logical command is run again. No checkpoint is needed for ordinary
+  resumption.
+- Content-changing writes are staged beside the destination and published with
+  an atomic rename unless `--inplace` is requested.
+- `--verify-only` compares source and destination content without writing;
+  `-c` compares every regular file block by block and repairs differences.
+- SSH authenticates remote operations. File data uses encrypted TCP connections
+  when they are reachable and otherwise falls back to independent SSH
+  processes.
+- A direct remote-to-remote copy sends data from the source host to the
+  destination host rather than through the invoking machine. `--relay` selects
+  the relayed path explicitly.
 
-To inspect it first, download the same URL without piping it to `sh`. Every
-release also has an immutable versioned installer, for example
-`https://github.com/greaber/syq/releases/download/v0.1.0/install.sh`. To choose
-another directory, download the script and run `sh install.sh --bin-dir DIR`
-(or pipe it to `sh -s -- --bin-dir DIR`). The script detects the target,
-verifies the archive's embedded SHA-256 and size, runs the temporary binary to
-check its version and release identity, and then replaces `syq` atomically.
-Even with `--bin-dir`, either `HOME` or `XDG_CONFIG_HOME` must be set so every
-successful standalone installation can record its managed-install receipt.
+`syq` is not an rsync protocol implementation or a general cloud-storage tool.
+It does not currently preserve hard links, ACLs, or extended attributes, and it
+does not implement rsync's rolling-checksum delta algorithm. See
+[Compatibility and scope](#compatibility-and-scope).
 
-Homebrew is also supported through the project-owned tap:
+## Quick start
 
-```sh
-brew install greaber/tap/syq
-```
-
-Or build from source with the pinned Rust toolchain:
-
-```sh
-cargo build --release          # binary at target/release/syq
-cargo install --locked --path . # or: put it on your PATH
-```
-
-Source builds carry a Git-derived build identity and deliberately do not claim
-to be an immutable release. Managed remote bootstrap is therefore available
-only in official release binaries. To use a source build remotely, install the
-same build there and pass `--syq-path /path/to/syq` (or put it on the remote
-`PATH` and use `--no-bootstrap`).
-
-Standalone installs download and verify one signed release manifest at most
-once a day after a successful interactive command. When a newer release is
-available they print a reminder; updates are never installed as a side effect
-of a copy. Run `syq --self-update` to install the update, or set
-`SYQ_NO_UPDATE_CHECK=1` to disable automatic checks and reminders. Explicit
-`syq --self-update` checks still work when that variable is set. The install
-receipt lives at
-`$XDG_CONFIG_HOME/syq/install.json` (normally `~/.config/syq/install.json`) and
-must name the running executable, so a Homebrew or source build never replaces
-itself. Self-update is deliberately limited to standalone installs because a
-package manager must remain the owner of its files. Update Homebrew installs
-with `brew upgrade syq`.
-
-Release binaries are published for Linux x86-64/ARM64 and macOS Apple
-Silicon/Intel. Terminal downloads and Homebrew normally do not attach macOS's
-quarantine attribute, which is why command-line tools installed this way do not
-usually produce Gatekeeper prompts. A binary downloaded through a browser may;
-browser-oriented distribution would need Apple Developer ID signing and
-notarization in addition to this terminal-first path.
-
-The remote side runs `syq --server`, but it does not need to be installed or
-configured first. An official syq uses its exact release helper under
-`~/.cache/syq/helpers/`. On first use of a version it detects the remote
-platform, downloads the matching compressed binary from that version's GitHub
-release, verifies its SHA-256 against the separately signed release manifest,
-and installs it atomically. Later runs execute that exact path without an extra
-probe connection.
-
-The managed cache accepts only the downloaded, verified release binary. If the
-remote cannot download it, bootstrapping fails visibly; install a compatible
-binary yourself and pass `--syq-path /path/to/syq`, or put it on the
-non-interactive remote `PATH` and use `--no-bootstrap`. Helpers cached under an
-older identity or cache layout are never executed; they may be removed with the
-rest of the disposable helper cache.
-
-The local client verifies the manifest's embedded Ed25519 signature over its
-RFC 8785 canonical JSON and passes its trusted hash to the remote install
-script. The remote uses `curl` or `wget`, `gzip`, and one of `sha256sum`,
-`shasum`, or `openssl`. Version directories coexist and the helper cache can be
-removed at any time; syq recreates the helper it needs on the next connection.
-After launch, both peers require the same build identity: the release tag for
-official binaries, or the Git-derived identity when an explicit source-built
-helper is used.
-
-- **macOS (Apple Silicon / Intel):** build natively on the Mac with
-  `cargo build --release` (needs the Xcode command-line tools, `xcode-select
-  --install`, for the bundled zstd C library). The tool is otherwise pure Rust
-  and uses only POSIX calls; Linux-only optimizations (`fallocate`,
-  glibc `mallopt`) are compiled out automatically. copy_file_range's local
-  fast path is Linux-only; on macOS same-machine copies use the normal path.
-- For a manually installed binary that is portable across distributions (for
-  example, a host with an older glibc), build a static binary:
-  `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
-  (the musl target also works if `musl-gcc` is installed, which `zstd-sys` needs).
-
-## Usage
-
-```
+```text
 syq [OPTIONS] SRC... DEST
 syq [OPTIONS] [USER@]HOST:SRC... DEST
 syq [OPTIONS] SRC... [USER@]HOST:DEST
 ```
 
 ```sh
-syq -avz project/ server:backup/project/      # push
-syq -avz server:data/ ./data/                 # pull
-syq -a /mnt/nfs/tree /local/tree              # local → local (parallel scan and copy)
-syq -a hostA:big/ hostB:big/                  # remote → remote: runs on hostA, data goes A → B directly
-syq -a --relay hostA:big/ hostB:big/          # ...or relay through this machine if A can't reach B
-syq -avz -j 16 bigdir server:dest             # 16 parallel connections
-syq -a --bwlimit 50M src server:dst            # cap all connections at 50 MiB/s total
-syq -a -e 'ssh -p 2222 -i ~/.ssh/other' src host:dst
-syq -a --dry-run -v src host:dst              # show what would be copied
-syq -ac src host:dst                          # skip the quick check; compare blocks, repair differences
-syq -a --verify-only src host:dst             # compare only; transfer nothing
-syq -a src newhost:dst                        # the matching remote helper is automatic
-syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for later runs
+# Push and pull over SSH.
+syq -a project/ server:backup/project/
+syq -a server:data/ ./data/
+
+# Copy between filesystems on this machine. This is useful with NFS and other
+# high-latency filesystems as well as fast local storage.
+syq -a /mnt/nfs/tree/ /local/tree/
+
+# Copy directly from one remote host to another.
+syq -a hostA:dataset/ hostB:dataset/
+
+# Show what would be copied without changing the destination.
+syq -a --dry-run -v project/ server:backup/project/
+
+# Compare every block and repair differing blocks.
+syq -ac project/ server:backup/project/
+
+# Compare content without writing.
+syq -a --verify-only project/ server:backup/project/
 ```
 
-### Options
+Source placement follows rsync's trailing-slash rule:
 
-| Option | Meaning |
-|---|---|
-| `--self-update` | Install the newest signed release (standalone installer builds only) |
-| `-a`, `--archive` | Same as `-rlptgoD` |
-| `-r` `-l` `-p` `-t` `-g` `-o` `-D` | Recursive; symlinks as symlinks; perms; mtimes; group; owner; devices and specials |
-| `-v` | List files as they complete (also new dirs, symlinks) |
-| `-q` | Errors only |
-| `-z`, `--compress` | zstd-compress data in transit (inside syq's protocol, not `ssh -C`) |
-| `-n`, `--dry-run` | Scan and report; change nothing |
-| `-j N`, `--connections N` | Parallel data connections (default: auto-tuned, see below) |
-| `--bwlimit RATE` | Limit aggregate file-data throughput (bare rate is KiB/s; `0` disables) |
-| `--block-size SIZE` | Transfer and hash block size (default 4M) |
-| `--min-split SIZE` | Don't split an in-flight file with less than this left (default 32M) |
-| `--progress` / `--no-progress` | Progress meter (default on when stderr is a terminal) |
-| `-P` | Turns on `--progress` (the `--partial` half is always on; see below) |
-| `--partial` | No-op for rsync compatibility (syq always keeps partial files) |
-| `--numeric-ids` | No-op for rsync compatibility (syq always uses numeric uid/gid) |
-| `--progress-json` | One JSON line per second on stderr |
-| `--stats` | Summary counts at the end |
-| `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
-| `--verify-only` | Hash every file in the run's scope on both sides and report differences; write nothing |
-| `--inplace` | Write directly into destination files (no partial + rename) |
-| `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
-| `-e CMD`, `--rsh CMD` | Remote shell command; controls agent forwarding when set (default `ssh`) |
-| `--syq-path PATH` | Use this exact remote `syq` instead of the managed helper |
-| `--no-bootstrap` | Require `syq` on the remote `PATH`; do not install a managed helper |
-| `--no-tcp` | Send data over the ssh connection instead of separate TCP sockets |
-| `--tcp-plain` | TCP data connections without encryption (trusted networks only) |
-| `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
-| `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
-| `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
-| `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
-| `--delete-excluded` | With `--delete`, also remove destination paths the `-i` patterns exclude |
-| `--max-delete N` | With `--delete`, delete nothing if more than N deletions are planned (exit 25) |
-| `-u`, `--update` | Skip files that are newer on the destination |
-| `--existing` | Only update files that already exist on the destination; create nothing |
-| `--ignore-existing` | Only create files missing on the destination; update nothing |
-| `--max-size SIZE`, `--min-size SIZE` | Don't transfer regular files larger / smaller than SIZE |
-| `--files-from FILE` | Copy only the listed paths (relative to the one source directory; see below) |
-| `--from0` | `--files-from` entries are NUL-separated |
-| `--rm` | Remove the given paths recursively and in parallel (see below) |
-| `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
-| `--no-forward-agent` | Remote-to-remote with default `ssh`: disable agent forwarding (conflicts with `-e`) |
-| `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session; prints the follow target even with `-q` |
-| `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
-| `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
+- `syq -a src dest` copies the directory as `dest/src`.
+- `syq -a src/ dest` copies the contents of `src` into `dest`.
+- A single file is placed inside `dest` when `dest` is an existing directory;
+  otherwise `dest` is the exact output path.
+- Multiple sources require a directory destination.
 
-Like rsync, `-q` suppresses non-error output: progress, summaries, warnings,
-notices, and `-v` file listings are hidden. Copy failures are still written to
-stderr and reflected in the exit status.
+Run `syq --help` for the complete option list. The
+[detailed reference](docs/reference.md) documents placement, filtering,
+deletion, resume, checkpoints, remote-to-remote operation, and all other
+current behavior.
 
-`--bwlimit` is one approximate limit shared by every `-j` worker, not a
-per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
-`M`, `G`, and `MiB` use powers of 1024, a final `+1` or `-1` adjusts the scaled
-value by one byte, and `0` means unlimited. SYQ counts uncompressed file bytes;
-protocol overhead is not counted, and `-z` may make the actual network rate
-lower. Scanning, hashing, and metadata operations are not limited.
+## Install
 
-### Remote-to-remote
-
-`syq hostA:src hostB:dst` starts the orchestrator *on hostA* over `ssh -A`
-(agent forwarding), which then pushes to hostB with N connections, so data
-flows A → B directly. Matching helpers are installed automatically on both
-hosts. HostA must be able to ssh to hostB (with your forwarded agent, or its
-own keys). Progress and `-v` output are streamed back. If hostA can't reach
-hostB, `--relay` keeps the orchestrator here and routes every byte A → you → B
-— always works, at half the bandwidth.
-`syq hostA:src hostA:dst` (same host and user on both ends) simply runs a
-local copy on hostA and disables agent forwarding.
-
-Agent forwarding does not copy private keys to hostA, but a process that can
-access the forwarded socket while the SSH connection is alive can ask the
-agent to authenticate on its behalf. Pass `--no-forward-agent` to use `ssh -a`
-and override any `ForwardAgent yes` in SSH configuration; hostA must then have
-its own credentials for hostB. With an explicit `-e/--rsh`, SYQ adds neither
-`-A` nor `-a`, so include the desired agent-forwarding policy in that command;
-`--no-forward-agent` therefore conflicts with `-e`. `--relay` also avoids
-exposing the agent to hostA, at the cost of routing the file data through this
-machine.
-
-Like rsync, SYQ leaves host-key checking to `ssh` and therefore inherits the
-user's SSH configuration and OpenSSH defaults. First contact therefore fails
-when `ssh` cannot interactively confirm an unknown host. If accepting and
-recording a new host key is appropriate, opt in explicitly with
-`-e 'ssh -o StrictHostKeyChecking=accept-new'`.
-
-Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
-launched it: syq starts it on hostA, returns, and writes progress to a log on
-hostA. Reattach with `syq --follow hostA:LOG` to stream that progress.
-An explicit `--checkpoint` path belongs to the machine running the
-orchestrator: normally the invoking machine, but hostA for a direct or detached
-remote-to-remote copy (`--relay` keeps it local).
-
-## Path semantics
-
-Identical to rsync:
-
-- `syq -a src dest` copies the directory itself → `dest/src`. `dest` is
-  created if missing.
-- `syq -a src/ dest` copies the *contents* of `src` into `dest`. `src/.` and
-  `.` behave the same way.
-- A single file source goes to `dest/file` if `dest` is an existing directory,
-  otherwise `dest` is the new filename.
-- Several sources require (or create) a directory destination. With several
-  sources syq scans them all before writing anything, so two sources mapping
-  onto one destination path is refused before the destination is touched —
-  not even a missing destination directory is created (the transfer starts
-  once the scans finish). Naming the destination file itself as one of the
-  sources doesn't change that: it would be overwritten, so it's a conflict.
-  The price is memory: every scanned entry is held until the scans are
-  validated, roughly a few hundred bytes per entry across all sources.
-- An explicitly supplied destination root that is a symlink to a directory is
-  that directory (the link is kept, with or without a trailing slash). A
-  symlink encountered below the destination root is payload at that path: it
-  is replaced rather than followed, even when it points to a directory.
-- Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
-  payload and produce one warning summary. Before transfer starts, SYQ rejects
-  the exceptional case where a mapped payload path exactly equals a sidecar
-  this job would use for another mapped file.
-- `host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
-  A colon before the first slash means remote; `./x:y` is local. All sources
-  must be on the same host. `host::module` (daemon syntax) is not supported.
-
-### What `-a` does here
-
-`-rlptgoD`: recurse, symlinks as symlinks (targets copied verbatim,
-dangling links included), permissions, mtimes, group, owner, and device /
-fifo / socket nodes via `mknod`. Owner is only set when the *receiving* side
-runs as root; group is attempted for everyone and silently skipped on
-`EPERM`, as rsync does. Without `-p`, new files get the source mode masked
-by the local umask and existing files keep their mode. Without `-t`, every
-file is transferred every time (the quick check needs mtimes).
-
-Directory mtimes are set last, deepest first, so writing children doesn't
-disturb them. A directory syq must write into but can't (no owner write bit)
-is opened up for the duration and gets its own mode back at the end — or the
-source's mode with `-p`.
-
-## How it works
-
-One control connection per endpoint does the scan (a parallel walk on each
-side, streamed in batches), the diff, directory creation and metadata.
-Workers connect while the source is scanned but begin file data only after
-the mapped payload/sidecar namespace preflight completes.
-The data connections — by default separate TCP sockets carrying AES-256-GCM
-records (under `--no-tcp`, separate `ssh` processes instead), each its own flow
-and cipher — carry only "read range" / "write range" requests. Files go
-onto a largest-first queue; when a worker runs dry it steals the back half of
-the remaining range of whichever file has the most left, so the tail of a
-transfer stays parallel without pre-deciding chunk counts.
-
-On the receiving side a file that needs content changes is written beside its
-destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
-written with `pwrite` from several workers), given its metadata, and `rename`d
-over the target. Newly created sidecars are mode `0600`; final metadata is
-applied just before publication. When an existing final file is the comparison
-basis, the receiver retains that open descriptor while its blocks are hashed.
-If every block matches, metadata is applied through the descriptor without
-allocating or publishing a sidecar; otherwise that exact descriptor seeds the
-sidecar.
-The job ID is a 128-bit digest of the normalized source/destination mapping and
-content-affecting options, and is stable when the same logical command is
-rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
-semantics and block size, but not operational controls such as checksum
-checking, `-j`, verbosity, progress or bandwidth limiting. Filesystem
-component limits are queried and cached per directory; long basenames are
-deterministically truncated and disambiguated to fit. An exceptionally long
-full path still fails that one file with a clear error (even when it is
-already up to date) while the rest of the transfer continues, and so does a
-destination entry — say, a directory some other tool left — already occupying
-the exact path this job's sidecar for that file needs. SYQ does not `fsync` transfer data;
-atomic sidecar publication provides old-or-new visibility and resumable
-interrupted work, not crash-durability across power loss.
-Small files still use a pipelined whole-file request, but the receiver writes
-each request through its sidecar and renames it before acknowledging success.
-Thus every non-`--inplace` content change appears atomically complete, while
-an existing file that SYQ compares block by block and finds content-identical
-keeps its inode and any destination hardlinks. The same-host kernel-copy fast
-path may replace a byte-identical destination that failed the quick check,
-because it deliberately avoids that comparison.
-`--inplace` writes every file directly (for example, to update a large file
-without room for a second copy), so readers can observe partially updated
-contents and an interruption leaves the final file unfinished.
-
-Local → local runs the same machinery in-process with N threads, which helps
-on NFS and NVMe.
-
-### Resume and checkpoints
-
-With the default staged write path, Ctrl-C is safe: kill it and rerun the same
-command. `--inplace` deliberately gives up that guarantee. No checkpoint is
-needed for this normal resumption. Resume works at two levels.
-
-**Within a file.** There is no per-file state file — the partial *is* the state:
-
-- Files whose size and mtime already match are skipped (the rsync quick check).
-- If this job's range-transfer `.name.syq-part.<job-id>` exists, both sides
-  hash it and the source in `--block-size` blocks and only the mismatching
-  blocks are sent. A leftover is reused only when it can be safely opened as a
-  singly-linked regular file without following a symlink; numeric ownership is
-  deliberately not required because NFS root squashing and some FUSE/CIFS
-  mounts remap it. A safe leftover that cannot be made mode `0600` is discarded
-  and recreated instead of permanently blocking that file. Anything else is
-  safely replaced or reported as an error.
-  On NFS, reuse requires the receiver to reread the partial; syq deliberately
-  keeps no separate block-completion map.
-  Pipelined small files are rewritten wholesale on retry instead of paying an
-  extra partial-file probe.
-- If the destination file exists but differs, its blocks are hashed against
-  the source too; if all match only metadata is fixed, otherwise the matching
-  blocks are copied locally into a new partial and the rest transferred.
-
-This block-level skip catches appends and in-place modifications (VM images,
-databases, logs). It does **not** catch a byte inserted near the start of a
-file, which rsync's rolling checksum would — for syq's intended use (fresh
-uploads and downloads) that trade was made deliberately.
-
-The partial job ID includes `--block-size` and the ordered ignore rules, so
-changing either starts a separate resumable namespace. Old sidecars are not
-garbage-collected automatically and may be deleted manually when the earlier
-command will not be resumed. Options that do not change the copy itself, such
-as `-c`, `--bwlimit`, and `-j`, do not change the partial ID.
-
-The directory containing a destination sidecar is a trust boundary, as with
-rsync's partial directories. It must not be writable by untrusted users,
-especially when SYQ runs with elevated privileges. A reused sidecar may have a
-filesystem-remapped numeric owner; mode and link-count validation cannot prove
-who originally created a deterministic pathname in a shared writable
-directory.
-
-Versions 0.1.1 and 0.1.2 used `.name.syq-partial`. This version deliberately
-does not recognize or resume that legacy form: remove any such destination
-sidecars manually after an interrupted old-version transfer. A legacy-named
-file in a source tree is copied as ordinary payload without a special warning.
-
-**Across the whole job.** Ordinary copies keep no transfer history, but their
-source and destination scans still skip files already complete. Deleting or
-changing a destination file affects the next run just as it does with rsync.
-
-Only when repeated destination metadata lookups are themselves too expensive
-should you opt in to a checkpoint:
+With Homebrew:
 
 ```sh
-syq -a --checkpoint ./copy.state huge-tree/ host:huge-tree/
-# after an interruption, run the identical command again
+brew install greaber/tap/syq
 ```
 
-The mode-0600 JSONL checkpoint identifies the canonical source, destination,
-and copy semantics. It records regular files only after SYQ established that
-the destination was complete and, for transferred files, rechecked the source.
-On retry, a record whose source fingerprint still matches (size, nanosecond
-mtime, and requested mode/owner/group metadata) skips that destination lookup.
-Everything else follows the normal quick check, partial hashing, and transfer
-path. Unfinished individual files are never checkpoint-complete; their actual
-`.syq-part.<job-id>` contents remain the resume state.
-
-The checkpoint is flushed about once a second and persists after both failed
-and successful runs until you remove or stop passing it. Losing its last
-buffered records only causes repeated work; if recording stops mid-run the
-copy continues and a warning names the I/O error — printed even under `-q`,
-while the exit code keeps describing the copy itself. If an existing checkpoint has
-completed records but an expected destination root is missing, SYQ fails and
-asks you to remove the checkpoint to restart. The checkpoint must be a regular
-file with exactly one hard link and must be outside local source and
-destination trees; a hardlinked checkpoint is refused because appending or
-changing its permissions would also affect its other names. `-n` reads and
-validates existing state but never creates or changes it. `-c`, `--verify-only`,
-and `--rm` conflict with `--checkpoint`. One checkpoint file may be used by
-only one running copy at a time.
-
-A checkpoint is an explicit trust decision: SYQ does not inspect a destination
-file covered by a matching record. If another process deleted, replaced, or
-modified that destination after it was recorded, a checkpointed retry will not
-notice. Do not use a checkpoint when the destination may be independently
-modified; omit the option and SYQ remains history-independent. `--delete`
-records what it removes in an active checkpoint, so a file the source drops
-and later brings back is transferred again rather than assumed complete.
-
-Like rsync, ordinary SYQ runs do not coordinate with each other. Different
-logical commands use different partial names, so concurrent copies into one
-tree produce the union of their files and one whole-file rename wins for any
-path both write — but do not combine concurrent copies with `--delete`,
-which mirrors *its* source and removes the other command's not-yet-shared
-files and sidecars as extras. A content-identical comparison applies metadata only through
-the inode it verified, so it cannot mix its metadata with another job's newly
-renamed contents. Quick-check metadata repair likewise verifies the inode;
-if a concurrent publication replaced it, the repair reports an error instead
-of mixing metadata with the new contents.
-Starting the same logical command twice at once is
-unsupported: both invocations intentionally address the same resumable
-sidecars. After a crash, abandoned sidecars may be deleted manually if that
-command will not be resumed.
-
-These guarantees cover other SYQ jobs, which publish complete files by rename.
-They do not cover another process modifying an existing destination inode in
-place while SYQ is hashing or reusing it. As with rsync, such an external
-writer can invalidate a comparison after it was made; do not independently
-modify destination files during a transfer.
-
-### Verification and consistency
-
-Always:
-
-- Every block carries an xxh3 hash checked on receipt (read side and write
-  side); a mismatch aborts that file with an error (exit 23) rather than
-  silently continuing — it indicates transport corruption, which is rare.
-- After a file completes, the source is re-stat'ed. If its size or mtime
-  changed during the transfer the file is redone (up to three attempts), then
-  reported as an error.
-- Unless `--inplace` was explicit, destination content changes appear
-  atomically via rename, including new small files.
-- Non-zero exit if anything failed.
-
-On request:
-
-- `--verify-only` hashes every file on both sides in parallel and reports
-  `DIFFERS` / `MISSING`.
-- `-c` does the block comparison for every file, not just ones that fail the
-  quick check, and repairs what differs.
-
-Not verified: directory and symlink metadata are set but not read back; a
-source that changes *between* the final re-stat and the next block of another
-file isn't noticed (same as rsync). Two chunks of one file are read at
-different moments, so a file being written while copied may come out mixed —
-the re-stat catches the common case, `--verify-only` afterwards catches the
-rest.
-
-Compared with rsync: ordinary content-changing writes use the same
-temporary-file plus atomic rename model; `--inplace` explicitly gives that up.
-Rsync chooses a random temporary suffix, while SYQ uses a deterministic job ID
-so an interrupted command can find its partial again without a local state
-file. The change-during-transfer check is the same idea; `--delete` runs
-strictly after the transfer (see below); hardlinks aren't implemented.
-
-## Not implemented (on purpose, for now)
-
-`RSYNC-COMPAT.md` tracks rsync compatibility in full: what matches, what
-differs and why, what's missing, and the open issues. The short version:
-
-- rsync filter rules (`--exclude`/`--include`/`--filter`); use `-i` (gitignore
-  syntax) instead.
-- `--link-dest`, `--backup`.
-- `--delete-before`/`--delete-during` and `--force`. syq deletes only after
-  the transfer (`--delete-after`/`--delete-delay` are accepted as synonyms).
-- Hardlinks (`-H`), ACLs and xattrs (`-A`/`-X`).
-- rsync daemon mode / `rsync://`. syq speaks its own protocol; it cannot talk
-  to an rsync server.
-- Rolling-checksum delta transfer (see Resume above).
-- Preserving existing partial files from `rsync --partial`; only syq's own
-  `.syq-part` sidecars for the same logical command are recognised.
-
-## When parallelism helps
-
-- **ssh CPU**: one ssh process tops out at a few hundred MB/s of cipher/MAC
-  work. N processes scale roughly linearly. Multiplexed channels over one
-  connection wouldn't help — same TCP stream, same single encrypting process —
-  so syq passes `-o ControlMaster=no -o ControlPath=none` for its connections
-  on purpose.
-- **WAN**: several TCP flows beat one against per-flow window and loss limits.
-- **High-latency filesystems** (NFS, FUSE, object-backed): many small files
-  are latency-bound; parallel stat and I/O hide it. The scan is parallel too.
-- **NVMe / RAID** on either side.
-- **Not** a single spinning disk: parallel reads of one file there mean seeks.
-  Use `-j 1` or a large `--min-split`.
-
-## How many connections (`-j`)
-
-Without `-j`, syq tunes the number of workers while a copy runs instead of
-guessing (`--rm` keeps a fixed 8, or 32 locally: removal is metadata-bound
-and short). It starts with 16 when every remote endpoint has a reachable TCP
-data path, 8 over ssh, or 32 when both ends are local (threads are free,
-connections are not), and measures: progress (bytes, plus a small credit per
-completed file so small-file trees count) is sampled every 2.5 s, and a count
-has been *measured* only once two consecutive samples agree within 10 % — so a
-burst that gets throttled, or a link still ramping up, is waited out (up to 20
-s) rather than credited to the last change. Each measured count is compared
-with the previous one: it doubles while a doubling gains at least a third of
-what linear scaling would (up to 64); when a doubling doesn't, it goes back to
-the last good count and refines upward in 1.3× steps; when even that buys
-nothing it shrinks by 1.3× as long as that costs less than 5 % (down to 2);
-then it holds. It never stops watching: after every 6 measurements it probes
-one step down (kept if throughput doesn't drop — this is what saves a spinning
-disk from seek thrash) or one step up (the route or a shared NAS may have freed
-up), and a direction that keeps failing is tried progressively less often.
-Surplus workers are parked, not closed: they keep their connections and stop
-taking work, handing back the rest of their range, so un-parking is instant.
-Transfers shorter than a measurement or two just run with the starting count.
-The progress line shows the current count (`16 conn`), and `--stats` reports
-the path it took (`connections: auto: settled at 16 (path 16, peak 16)`).
-
-Measured from a 1 Gbit box in Germany to a host in Japan (265 ms): over TCP
-data connections it settles around 8–13 at line rate; over ssh data
-connections (where each stream is capped by OpenSSH's 2 MB window) it
-reaches line rate (~110 MB/s, where a fixed `-j 8` managed 44) about 30 s
-after the connections are up.
-
-`-j N` fixes the count and disables tuning. Use it when you know better (a
-spinning disk that must not be read in parallel: `-j 1`), or to be polite on
-a shared link.
-
-## TCP data connections
-
-ssh caps every stream at a few hundred MB/s of cipher CPU, and its 2 MB
-per-channel flow-control window caps a stream at roughly `2 MB / RTT` on long
-links (≈7 MB/s at 265 ms). So by default (unless `--no-tcp`) syq keeps ssh for
-authentication and control only and moves the data over separate TCP
-connections: the remote opens a listener on a port from `--tcp-ports` (default
-47600-47699), and the data connections are plain TCP sockets carrying
-AES-256-GCM records keyed by a secret exchanged over the ssh session
-(`--tcp-plain` skips the encryption on trusted networks; `--no-tcp` sends data over the ssh connection instead). If the port can't be
-reached — a firewall, typically — syq says so once and falls back to ssh data
-connections, so the default is always safe.
-
-The remote advertises every address it has (the one your ssh session arrived
-on first, then private LAN, then public, then CGNAT/Tailscale); the client
-adds the name it reached ssh through — the only address that works for a
-host behind NAT or port forwarding — ahead of the overlay ones, tries them
-all, and prefers the best that answers. If none answers it says so and uses
-ssh (silenced by `-q`). When several NICs of
-comparable speed are reachable (e.g. an 8-rail RoCE fabric), syq spreads its
-data connections across all of them (multipath) — it keeps only paths within
-2x of the fastest, so it never drags a fast transfer down by mixing in a slow
-link. Single-homed hosts and laptops use the one best path, unchanged. With ufw:
+The standalone installer selects the matching Linux or macOS release and
+installs it in `~/.local/bin` without `sudo`:
 
 ```sh
-sudo ufw allow from 192.0.2.0/24  to any port 47600:47699 proto tcp   # example LAN
-sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specific client
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/greaber/syq/releases/latest/download/install.sh | sh
 ```
 
-Remote→remote (`syq hostA:src hostB:dst`) works the same way: the
-orchestrator on hostA connects to hostB's listener.
+To inspect the installer first, download the same URL and run the saved script.
+The installer verifies the release archive before replacing an existing managed
+installation. Versioned binaries, checksums, manifests, and installers are
+available on the [releases page](https://github.com/greaber/syq/releases).
 
-No special server setup is required. For a measurement-first checklist of
-optional firewall, sshd, TCP, and host-network changes, including their
-trade-offs and rollback considerations, see [Server performance
-tuning](SERVER-TUNING.md).
-
-## Defaults chosen for network filesystems
-
-Small files are read and written in pipelined batches, but every non-`--inplace`
-write still finishes with an atomic rename. When both ends are local, 32 workers
-are used. This costs one rename per file on NFS, but avoids exposing incomplete
-final-named files. `--inplace` is the explicit space/safety tradeoff.
-
-## Ignoring paths (`-i`, `--ignore-from`)
-
-syq has one filter mechanism instead of rsync's include/exclude/filter rules:
-every `-i PATTERN` is a line of a virtual `.gitignore` anchored at each source
-root, and `--ignore-from FILE` splices in the lines of a file. Patterns from
-both are applied in command-line order with gitignore semantics (last match
-wins, `!` re-includes), so anything you'd write in a `.gitignore` works here:
+To build from source with the pinned Rust toolchain:
 
 ```sh
-syq -a -i node_modules -i .git src/ host:dst/   # a name matches at any depth
-syq -a -i '*.o' -i /build src/ host:dst/         # glob; leading / anchors to the root
-syq -a -i 'logs/*' -i '!logs/keep/' src/ dst/    # everything in logs/ except keep/
-syq -a --ignore-from .gitignore -i '!dist/' repo/ host:repo/
-syq -a -i '*' -i '!*/' -i '!*.jpg' photos/ bak/  # copy only *.jpg
+cargo build --release
+cargo install --locked --path .
 ```
 
-Rules of thumb (they're git's): `foo` matches a file or directory named `foo`
-at any depth; `/foo` only at the source root; `foo/` only a directory; `*`
-doesn't cross `/`, `**` does. An ignored directory is pruned, so nothing inside
-it is transferred or even scanned — which is why "only `*.jpg`" needs the
-`!*/` line to keep descending. Empty directories are copied like any other
-(this is a filter on the walk, not git's notion of what's tracked). The source
-root itself is never ignored; with several sources each is filtered from its
-own root. `-n` previews exactly what a real run would send. `--rm` does not
-take filters (it always removes the whole tree), so `-i` conflicts with it.
+An official release automatically starts its exact matching helper on a remote
+host. On first use of that release, the remote downloads and verifies the
+helper under `~/.cache/syq/helpers/`; subsequent runs reuse it. A remote host
+without access to the release assets needs a manually installed matching
+binary selected with `--syq-path`, or a matching binary on its non-interactive
+`PATH` with `--no-bootstrap`.
 
-As in git, a `!` rule cannot re-include something whose parent directory is
-ignored: `logs/**` prunes `logs/keep` itself, so `!logs/keep/**` after it has
-nothing to act on. Ignore the siblings instead (`logs/*`, which does not cross
-`/`) and re-include the directory (`!logs/keep/`), as above.
+See the [installation reference](docs/reference.md#install) for supported
+platforms, installer verification, self-updates, static builds, and remote
+helper details.
 
-## Deleting extras (`--delete`)
+## Transfer behavior
 
-`syq -a --delete src/ host:dst/` makes `dst` look like `src`: after the
-transfer, anything under a destination directory that the source doesn't
-have is removed. The rules are simpler than rsync's, deliberately:
+With `-t` (included in `-a`), syq uses a size-and-modification-time quick check
+to skip files that appear unchanged. Without `-t`, it transfers every regular
+file. Files that need content changes are written to a sidecar next to the
+destination. Workers may write different ranges concurrently; after the file
+is complete, syq applies the requested metadata and renames the sidecar over
+the destination.
 
-- **Scope.** Only inside directories the sources map onto: `syq --delete a b
-  dst/` cleans `dst/a` and `dst/b`, never `dst/c`. A single-file source deletes
-  nothing.
-- **Ignored means out of scope, on both sides.** The `-i` patterns are applied
-  to the destination walk from the same roots, so an ignored path is neither
-  copied nor deleted, and a directory that holds one is kept (`not deleting
-  keep/: it holds ignored paths`, on stderr, not an error). `--delete-excluded`
-  drops that protection: ignored paths on the destination are extras too.
-- **Anything the source has is safe.** A file skipped by `-u`, `--existing`,
-  `--ignore-existing`, `--max-size` or `--min-size` — or a symlink or special
-  file skipped for lack of `-l`/`-D` — still exists in the source, so its
-  destination copy is left alone, as in rsync. Such files are reported under
-  `files excluded` in `--stats`.
-- With `--delete` the sidecar path of every mapped regular file stays in
-  memory until deletions run (that set is what tells a live sidecar from an
-  orphan); on multi-million-file trees this is the option's main memory cost.
-- **After, not before.** Deletions run once every file has been transferred
-  and only if the whole source scan succeeded: an unreadable source directory
-  would otherwise look like one whose contents vanished (`source scan reported
-  errors; skipping deletions`). The destination walk is held to the same rule:
-  an unreadable directory *there* looks empty and would be removed over its
-  unknown contents, so its errors also skip all deletions. An interrupted run therefore never deletes
-  anything, and directory mtimes are set after the deletes.
-- **Sidecar-patterned files are extras unless they are this job's live
-  resume state.** A `.name.syq-part.<job-id>` of *this* command whose `name`
-  is still in the source stays, whatever happened to that file this run
-  (failed, filtered, already up to date): the next transfer of that file
-  consumes it. Everything else matching the pattern — an orphan of this
-  command, or any other job id — is an ordinary extra: syq copies such names
-  as payload, so the name alone proves nothing, and mirroring the source is
-  what --delete is for. Note that the job identity includes the command's
-  semantic options: change those (or the source/destination spelling they
-  normalize to) and the previous identity's sidecars become orphans —
-  removed by `--delete`, inert otherwise.
-- `--max-delete N` refuses to delete anything — not the first N — when more
-  than N deletions are planned, says so, and exits 25 (rsync's code for it).
-- `-n --delete -v` lists every `deleting path` line a real run would print.
-  The summary reports `N deleted` / `N would be deleted`. `--delete`
-  conflicts with `--verify-only` (deleting is the opposite of writing
-  nothing) and with `--files-from` (deletion scope under a file list is
-  ambiguous).
+Every block sent through syq's data protocol carries a hash checked on receipt.
+Syq also re-stats the source after transfer and retries a file that changed
+while it was being read. These checks do not make a live tree a point-in-time
+snapshot. Use a filesystem or application snapshot when the source requires
+snapshot consistency.
 
-Deletion goes through the control connection in batches of 1000 (the
-destination side unlinks each batch in parallel); it isn't spread over the
-`-j` data connections like `--rm` is.
+The default staging path gives old-or-new visibility and supports interruption
+and retry, but syq does not `fsync` file data. It therefore does not promise
+durability across a power loss. `--inplace` avoids the second copy but permits
+readers to observe partial content and can leave an incomplete destination
+after interruption.
 
-## Skipping by state and size
+`--delete` removes destination-only paths after transfers finish. Source or
+destination scan errors suppress all deletions, and `--max-delete N` refuses
+the entire deletion phase when the limit would be exceeded. Always inspect a
+destructive operation with `--dry-run -v` first.
 
-- `-u` / `--update`: a file whose destination copy has a newer mtime is left
-  alone (regular files only). Neither `-u` nor `--ignore-existing` can be
-  combined with `--inplace`: an interrupted in-place write leaves a
-  partially-written final file that looks newer, which those filters would
-  then skip on every retry.
-- `--existing`: never create anything — files, symlinks, specials,
-  directories, *or the destination itself* — that isn't already there;
-  existing files are still updated. `--ignore-existing` is the mirror image: create what's
-  missing, never touch what exists — including an existing file or symlink
-  where the source maps a *directory*: it stays, and that directory with its
-  whole subtree is skipped with a notice (rsync would delete the file to
-  make room). Both apply to every non-directory entry.
-- `--max-size` / `--min-size`: regular files outside the range are not
-  transferred (`4K`, `100M`, `2G`; the same suffixes as `--block-size`).
-  Directories and symlinks are unaffected.
+For the complete contract, see [Resume and checkpoints](docs/reference.md#resume-and-checkpoints),
+[Verification and consistency](docs/reference.md#verification-and-consistency),
+and [Deleting extras](docs/reference.md#deleting-extras---delete).
 
-All of these define the scope of the run, so `--verify-only` checks the files
-the same command would transfer and nothing else.
+## Where parallelism applies
 
-## Copying a list (`--files-from`)
+Parallelism can help when one SSH process, one network flow, filesystem
+metadata latency, or a single I/O request leaves available capacity unused.
+Typical cases include fast LANs, high-latency WANs, NFS and FUSE filesystems,
+NVMe arrays, and trees containing many independent files.
 
-`syq -a --files-from list.txt host:src/ dst/` copies only the paths named in
-`list.txt`, one per line (`--from0`: NUL-separated; `-` reads stdin), each
-relative to the single source directory, to the same relative path under the
-destination. The source is not walked, which is the point on a slow
-filesystem when the list is known. Parent directories of listed paths are
-created (with their metadata). A parent that is a symlink on the source is
-followed — you named a path through it — and becomes a real directory on the
-destination, so nothing is ever written through a destination symlink; a
-parent that resolves to a file or dangles is an error. A listed directory is copied *without*
-its contents unless `-r` is given on the command line itself — `-a` alone
-does not count, as in rsync — so `-a -r --files-from` walks the directories
-the list names (never the implied parents).
-Blank lines are ignored, leading `/` or `./` and trailing `/` are stripped,
-and `..` components or a line that names the root itself are rejected. A listed path that doesn't exist is an
-error (exit 23) and the rest is still copied. The destination must be a directory (an
-existing file there is an error, never replaced). `--files-from` can't be
-combined with `-i`/`--ignore-from` or `--delete`; for a remote-to-remote copy
-it needs `--relay` (the list is read on this machine).
+It can hurt on a single rotating disk by turning sequential I/O into seeks. Use
+`-j 1` or a larger `--min-split` when the storage device is the limiting
+resource. Short transfers can also spend more time establishing connections
+than they save.
 
-## Parallel removal (`--rm`)
+Syq first tries separate AES-256-GCM-protected TCP data connections whose key is
+exchanged over the authenticated SSH control connection. If the destination's
+TCP port range is unreachable, it reports the fallback and transfers over
+separate SSH processes instead. `--no-tcp` selects the SSH data path directly.
+See [Server performance tuning](SERVER-TUNING.md) for optional, measured changes
+to firewall, SSH, and host configuration.
 
-`syq --rm [-j N] [-n] [-v] PATH...` removes trees the way syq copies them:
-a parallel scan, files unlinked in batches across N workers, directories
-removed deepest-first with each level in parallel. Symlinks are removed, not
-followed. Remote paths (`host:path`) work. It refuses `/`, `.` and `~`. On
-NFS, where every unlink is a round trip, `-j32` removed 20,000 files in 2.5 s
-versus 9.7 s for `rm -rf`; on a local SSD `rm -rf` is already fast and syq is
-no faster.
+The scheduler and connection-tuning behavior are described in the
+[detailed reference](docs/reference.md#how-many-connections--j).
 
-## Same-machine copies (copy_file_range)
+## Compatibility and scope
 
-When source and destination are on the same machine, syq copies each file with
-`copy_file_range(2)` instead of streaming bytes through userspace: the kernel
-does a reflink or a straight in-kernel copy, and on NFS 4.2 the *server* copies
-the file internally (no client round trip). Measured: a single 8 GB file
-/raid→/raid at 24.8 GB/s vs 2.5 GB/s for `cp`; NFS→NFS at 3.3 GB/s vs 0.4.
-Hashing is skipped on this path (there's no wire to corrupt it); `-c`, any
-existing partial, and `--bwlimit` disable this shortcut. Existing partials and
-larger bwlimited files use the hash-resumable streaming path. Small new
-bwlimited files that fit in one paced transfer block retain the `PutSmall`
-exception described above.
+The command line intentionally resembles rsync so common source and destination
+spellings remain familiar. Syq speaks its own peer protocol and cannot connect
+to an rsync daemon. Some rsync options are unsupported, and a few behaviors are
+deliberately different where syq uses a safer or simpler rule.
 
-## NFS
+The [rsync compatibility record](RSYNC-COMPAT.md) states what has been measured,
+what differs, what is not implemented, and which integration test holds each
+claim.
 
-Local↔NFS copies are a local→local syq run (`syq -a -j16 /raid/x /mnt/nfs/x`)
-and benefit from the same parallelism: measured on a 20 Gbit NFSv4.2 mount,
-reads of one 4 GB file 858 MiB/s with `-j8` vs ~400 MB/s for `cp`; 20,000
-small files written in 28 s vs 72 s for `cp -r`. Writes of a *single* file
-were capped at ~250 MB/s regardless of `-j`, while eight files written in
-parallel reached ~650 MB/s: the per-file limit comes from the NFS client's one
-TCP connection and per-inode write serialization. Mounting with
-`nconnect=8` (NFS 4.1+; needs an unmount/mount, not a remount) is the usual
-fix for that.
+Notable current omissions include:
 
-## Performance notes
+- rsync filter rules; syq uses ordered gitignore-style `--ignore` and
+  `--ignore-from` rules;
+- hard-link, ACL, extended-attribute, and sparse-file preservation;
+- `--link-dest`, `--backup`, and rsync daemon mode;
+- rolling-checksum delta transfer for data shifted within an existing file;
+- cloud and object-storage backends.
 
-- syq asks ssh for `aes128-gcm@openssh.com` first (falling back to the usual
-  ciphers). On x86 with AES-NI that is noticeably faster per stream than
-  OpenSSH's default chacha20-poly1305.
-- Each connection costs one ssh handshake (~0.3 s on a LAN, several seconds
-  across continents). The control connections always come up first
-  (everything waits on them; only then do data connections start), up to 32
-  at a time, and if the
-  server sheds one — sshd's `MaxStartups` (default 10) randomly rejects
-  sessions beyond 10 being set up at once — syq halves that number for the
-  rest of the run and retries. Raising `MaxStartups` can reduce setup time for
-  ssh data connections, but increases the resources available to
-  unauthenticated clients; see [Server performance tuning](SERVER-TUNING.md).
-  Auto-tuning starts at 16 for TCP data, or 8 for ssh data, and only opens more
-  once they have been shown to pay.
-- Direct remote→remote with a *forwarded* agent authenticates every session
-  through your machine; over a slow link that dominates setup time. Keys on the
-  source host avoid it.
-- Measured on two 160-core hosts on a 20 Gbit LAN: a single ssh stream tops out
-  around 450–550 MB/s; `syq -j8` into tmpfs reached ~1.2–1.3 GiB/s (the raw
-  multi-stream ssh ceiling), while writes to the destination's ext4 NVMe capped
-  everything, rsync included, at ~600 MB/s. Check the disk before blaming the
-  network.
-- `SYQ_DEBUG=1` prints connect times and where each worker and each remote
-  server spent its time (blocked on reads, pipe writes, acks; waiting, handling).
+Use rsync when those features or exact rsync compatibility matter. Use rclone
+or a backend-specific client for cloud and object storage. Syq's current scope
+is copying filesystem trees between local or SSH-accessible POSIX systems.
 
-## Exit codes
+## Documentation
 
-| Code | Meaning |
-|---|---|
-| 0 | Everything copied and verified |
-| 23 | Finished, but some files failed (unreadable source, `DIFFERS`, changed during transfer …) — errors are on stderr |
-| 25 | Finished, but `--max-delete` stopped the deletions |
-| 1 | Fatal: bad arguments, couldn't connect, remote `syq` missing, connection lost |
+- [Detailed command and behavior reference](docs/reference.md)
+- [Rsync compatibility record](RSYNC-COMPAT.md)
+- [Server performance tuning](SERVER-TUNING.md)
+- [Security policy](SECURITY.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE).

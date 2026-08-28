@@ -16,6 +16,10 @@ include = [
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",
+    "/docs/**",
+    "/RSYNC-COMPAT.md",
+    "/SECURITY.md",
+    "/SERVER-TUNING.md",
     "/LICENSE",
 ]
 
