@@ -625,8 +625,11 @@ have is removed. The rules are simpler than rsync's, deliberately:
 - **Ignored means out of scope, on both sides.** The `-i` patterns are applied
   to the destination walk from the same roots, so an ignored path is neither
   copied nor deleted, and a directory that holds one is kept (`not deleting
-  keep/: it holds ignored paths`, on stderr, not an error). `--delete-excluded`
-  drops that protection: ignored paths on the destination are extras too.
+  keep/: it holds ignored paths`, on stderr, not an error). Protection follows
+  a source path across a type mismatch: if `cache/` is an ignored source
+  directory, a destination file named `cache` is protected too.
+  `--delete-excluded` drops that protection: ignored paths on the destination
+  are extras too.
 - **Anything the source has is safe.** A file skipped by `-u`, `--existing`,
   `--ignore-existing`, `--max-size` or `--min-size` — or a symlink or special
   file skipped for lack of `-l`/`-D` — still exists in the source, so its

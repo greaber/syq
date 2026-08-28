@@ -24,14 +24,14 @@ pub trait Conn: Send {
         false
     }
     /// Streamed scan; `sink` gets batches, `warn` gets non-fatal messages,
-    /// `ignored` gets the paths the patterns pruned (only if `report_ignored`).
+    /// `ignored` gets the subset of pruned paths selected by `report_ignored`.
     #[allow(clippy::too_many_arguments)]
     fn scan(
         &mut self,
         root: &[u8],
         follow_root: bool,
         ignore: &[String],
-        report_ignored: bool,
+        report_ignored: IgnoredReport,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
@@ -76,7 +76,7 @@ impl Conn for LocalConn {
         root: &[u8],
         follow_root: bool,
         ignore: &[String],
-        report_ignored: bool,
+        report_ignored: IgnoredReport,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
@@ -195,7 +195,7 @@ impl Conn for RemoteConn {
         root: &[u8],
         follow_root: bool,
         ignore: &[String],
-        report_ignored: bool,
+        report_ignored: IgnoredReport,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),

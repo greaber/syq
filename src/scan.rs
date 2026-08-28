@@ -1,7 +1,7 @@
 //! Parallel directory walk producing `Entry` batches in parent-before-child order.
 
 use crate::fsops::{lstat_entry, path_bytes};
-use crate::proto::{Entry, PathBytes};
+use crate::proto::{Entry, IgnoredReport, PathBytes};
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use jwalk::WalkDirGeneric;
@@ -42,14 +42,14 @@ pub fn build_ignore(lines: &[String]) -> Result<Option<Gitignore>> {
 /// planner decides what they mean). `warn` receives non-fatal errors
 /// (unreadable directories etc.). `ignore` holds gitignore-style patterns
 /// relative to `root`; a matching directory is pruned with its whole subtree.
-/// The root itself is never ignored. With `report_ignored`, the pruned paths
-/// are handed to `ignored` (in batches).
+/// The root itself is never ignored. `report_ignored` selects which pruned
+/// paths are handed to `ignored` (in batches).
 #[allow(clippy::too_many_arguments)]
 pub fn scan(
     root: &Path,
     follow_root: bool,
     ignore: &[String],
-    report_ignored: bool,
+    report_ignored: IgnoredReport,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
     warn: &mut dyn FnMut(String),
@@ -90,10 +90,15 @@ pub fn scan(
                     if ig.matched(rel, is_dir).is_ignore() {
                         // Pruned: neither listed nor descended into.
                         child.read_children = None;
-                        child.client_state = if report_ignored {
-                            State::Ignored
-                        } else {
-                            State::Skipped
+                        child.client_state = match report_ignored {
+                            IgnoredReport::None => State::Skipped,
+                            IgnoredReport::All => State::Ignored,
+                            IgnoredReport::TypeSensitiveDirs
+                                if is_dir && !ig.matched(rel, false).is_ignore() =>
+                            {
+                                State::Ignored
+                            }
+                            IgnoredReport::TypeSensitiveDirs => State::Skipped,
                         };
                         continue;
                     }

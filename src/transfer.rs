@@ -718,6 +718,7 @@ pub fn run(args: Args) -> Result<i32> {
         },
         keep_dirs: args.files_from.is_some(),
         delete_roots: Vec::new(),
+        source_ignored_dirs: std::collections::HashSet::new(),
         deletes: Deletes::default(),
     };
 
@@ -1040,18 +1041,23 @@ fn scan_into_planner(
     root: &[u8],
     follow_root: bool,
     ignore: &[String],
+    report_ignored: IgnoredReport,
     mut f: impl FnMut(&mut Planner<'_>, Vec<Entry>) -> Result<()>,
-) -> Result<()> {
+) -> Result<Vec<PathBytes>> {
     let progress = pl.progress;
     let quiet = pl.opts.quiet;
     let warned = std::cell::Cell::new(false);
+    let mut ignored_paths = Vec::new();
     let res = src.scan(
         root,
         follow_root,
         ignore,
-        false,
+        report_ignored,
         &mut |batch| f(pl, batch),
-        &mut |_| Ok(()),
+        &mut |paths| {
+            ignored_paths.extend(paths);
+            Ok(())
+        },
         &mut |w| {
             // "skipping …" is a notice (nothing the copy owes is missing);
             // anything else from the scanner means an entry was lost.
@@ -1068,7 +1074,8 @@ fn scan_into_planner(
     if warned.get() {
         pl.scan_warned = true;
     }
-    res
+    res?;
+    Ok(ignored_paths)
 }
 
 /// If `entry` is a symlink whose (possibly chained) target is a directory,
@@ -1178,6 +1185,9 @@ struct Planner<'a> {
     /// (destination directory, its path relative to the transfer root) for every
     /// directory source; --delete removes extras inside these.
     delete_roots: Vec<(PathBytes, String)>,
+    /// Source directories excluded specifically as directories, mapped onto
+    /// their destination names. They protect a same-named destination leaf.
+    source_ignored_dirs: std::collections::HashSet<PathBytes>,
     deletes: Deletes,
 }
 
@@ -1250,33 +1260,53 @@ impl Planner<'_> {
         let mut sub = sub.to_string();
         let mut skip_all = false;
         let ignore = self.opts.ignore.clone();
-        scan_into_planner(self, src, src_root, follow, &ignore, |pl, batch| {
-            if skip_all {
-                return Ok(());
-            }
-            if first {
-                first = false;
-                if let Some(root) = batch.first() {
-                    if root.kind != Kind::Dir && !dst_is_dir {
-                        sub = String::new();
-                    }
-                    if root.kind == Kind::Dir && !pl.opts.recursive {
-                        if !pl.opts.quiet {
-                            pl.progress
-                                .eprintln(&format!("skipping directory {}", display(src_root)));
+        let report_ignored = if self.opts.delete && !self.opts.delete_excluded {
+            IgnoredReport::TypeSensitiveDirs
+        } else {
+            IgnoredReport::None
+        };
+        let ignored_dirs = scan_into_planner(
+            self,
+            src,
+            src_root,
+            follow,
+            &ignore,
+            report_ignored,
+            |pl, batch| {
+                if skip_all {
+                    return Ok(());
+                }
+                if first {
+                    first = false;
+                    if let Some(root) = batch.first() {
+                        if root.kind != Kind::Dir && !dst_is_dir {
+                            sub = String::new();
                         }
-                        skip_all = true;
-                        return Ok(());
-                    }
-                    if root.kind == Kind::Dir {
-                        pl.delete_roots
-                            .push((join(dst_root, sub.as_bytes()), sub.clone()));
+                        if root.kind == Kind::Dir && !pl.opts.recursive {
+                            if !pl.opts.quiet {
+                                pl.progress
+                                    .eprintln(&format!("skipping directory {}", display(src_root)));
+                            }
+                            skip_all = true;
+                            return Ok(());
+                        }
+                        if root.kind == Kind::Dir {
+                            pl.delete_roots
+                                .push((join(dst_root, sub.as_bytes()), sub.clone()));
+                        }
                     }
                 }
-            }
-            pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            pl.handle_batch(batch, src_root, &sub, dst_root)
-        })
+                pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                pl.handle_batch(batch, src_root, &sub, dst_root)
+            },
+        )?;
+        let protection_root = join(dst_root, sub.as_bytes());
+        self.source_ignored_dirs.extend(
+            ignored_dirs
+                .into_iter()
+                .map(|path| join(&protection_root, &path)),
+        );
+        Ok(())
     }
 
     /// --files-from: instead of walking the source, stat each listed path (and
@@ -1466,26 +1496,35 @@ impl Planner<'_> {
         dst_root: &[u8],
         emitted: &mut std::collections::HashMap<PathBytes, Kind>,
     ) -> Result<()> {
-        scan_into_planner(self, src, &join(src_root, rel), false, &[], |pl, batch| {
-            let batch: Vec<Entry> = batch
-                .into_iter()
-                .filter(|e| !e.path.is_empty())
-                .map(|mut e| {
-                    e.path = join(rel, &e.path);
-                    e
-                })
-                .filter(|e| {
-                    if emitted.contains_key(&e.path) {
-                        false
-                    } else {
-                        emitted.insert(e.path.clone(), e.kind);
-                        true
-                    }
-                })
-                .collect();
-            pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            pl.handle_batch(batch, src_root, "", dst_root)
-        })
+        scan_into_planner(
+            self,
+            src,
+            &join(src_root, rel),
+            false,
+            &[],
+            IgnoredReport::None,
+            |pl, batch| {
+                let batch: Vec<Entry> = batch
+                    .into_iter()
+                    .filter(|e| !e.path.is_empty())
+                    .map(|mut e| {
+                        e.path = join(rel, &e.path);
+                        e
+                    })
+                    .filter(|e| {
+                        if emitted.contains_key(&e.path) {
+                            false
+                        } else {
+                            emitted.insert(e.path.clone(), e.kind);
+                            true
+                        }
+                    })
+                    .collect();
+                pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                pl.handle_batch(batch, src_root, "", dst_root)
+            },
+        )?;
+        Ok(())
     }
 
     fn handle_batch(
@@ -2367,6 +2406,7 @@ impl Planner<'_> {
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
             let seen = &self.dst_seen;
+            let source_ignored_dirs = &self.source_ignored_dirs;
             let live_sidecars = &self.live_sidecars;
             // Destination directories whose path the source claims as a
             // non-directory (a file we chose not to send, a symlink skipped
@@ -2378,7 +2418,7 @@ impl Planner<'_> {
                 &root,
                 false,
                 &ignore,
-                true,
+                IgnoredReport::All,
                 &mut |batch: Vec<Entry>| {
                     for e in batch {
                         if e.path.is_empty() {
@@ -2388,6 +2428,9 @@ impl Planner<'_> {
                         if nested.iter().any(|n| *n == full || inside(&full, n))
                             || Planner::under_any(&shielded, &full, &root)
                         {
+                            continue;
+                        }
+                        if source_ignored_dirs.contains(&full) {
                             continue;
                         }
                         match seen.get(&full) {

@@ -30,6 +30,16 @@ pub enum Kind {
     Other,
 }
 
+/// Which ignored paths a scan should report to its caller.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IgnoredReport {
+    None,
+    All,
+    /// Ignored directories that would not be ignored if a non-directory
+    /// occupied the same relative path.
+    TypeSensitiveDirs,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Entry {
     /// Relative to the scan root; empty means the root itself.
@@ -143,12 +153,12 @@ pub enum Request {
         port_hi: u16,
     },
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
-    /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
+    /// `report_ignored`: which paths pruned by the patterns to send as ScanIgnored.
     Scan {
         root: PathBytes,
         follow_root: bool,
         ignore: Vec<String>,
-        report_ignored: bool,
+        report_ignored: IgnoredReport,
     },
     /// lstat each path; with `follow`, stat through symlinks instead.
     StatMany {

@@ -74,7 +74,7 @@ behavior; an entry without one is only believed, not held.
 | Path rules: `src` copies the directory, `src/` its contents; a single file lands as `dest/file` when `dest` is a directory; several sources need a directory destination | measured | `trailing_slash_copies_contents`, `dir_into_existing_dir`, `dir_into_missing_dest_creates_basename`, `single_file_into_existing_dir`, `single_file_to_new_name`, `multiple_sources_require_dir_dest` |
 | Quick check: size + mtime; without `-t` every file is re-sent | measured | `updates_changed_file_and_skips_symlink_only_when_same`, `skip_reconciles_mode` |
 | `--delete` scope: only inside the directories being synced; a single-file source deletes nothing | measured | `delete_only_inside_directories_the_sources_map_onto`, `delete_with_nested_roots_deletes_once` |
-| Ignored/excluded paths are protected from deletion by default; `--delete-excluded` lifts that | measured | `delete_removes_extras_and_protects_ignored`, `delete_nested_roots_keep_their_own_anchored_ignores`, `delete_excluded_removes_ignored_destination_paths` |
+| Ignored/excluded paths are protected from deletion by default; `--delete-excluded` lifts that | measured; see "Incompatible on purpose" 6 for a type-mismatch safety extension | `delete_removes_extras_and_protects_ignored`, `delete_nested_roots_keep_their_own_anchored_ignores`, `delete_excluded_removes_ignored_destination_paths`, `delete_protects_an_ignored_source_directory_across_a_type_change` |
 | A directory that can't be emptied because of protected content is reported and left (rsync: `cannot delete non-empty directory`; syq: `not deleting keep/: it holds ignored paths`) | measured | `delete_removes_extras_and_protects_ignored` |
 | Deletion is skipped when listing the source hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; see "Different" 2 for the transfer-time case | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
 | Files the source has but a rule skips — `-u`, `--existing`, `--ignore-existing`, `--max-size`/`--min-size`, symlinks without `-l`, specials without `-D` — are not deleted, even when the destination entry is a non-empty directory | measured on 3.2.7 and 3.5.0 (an earlier README claim that rsync deletes a `--max-size` casualty was wrong) | `delete_never_removes_paths_the_source_has_but_skips`, `delete_leaves_directory_contents_under_a_skipped_source_path`, `size_limits_filter_files_and_protect_them_from_delete`, `delete_keeps_partials_of_filtered_files` |
@@ -142,6 +142,16 @@ item.
    "what exists is authoritative", that is unrecoverable data loss; syq keeps
    the file and skips the mapped directory with its subtree, with a notice.
    *Test: `ignore_existing_keeps_a_file_where_a_source_directory_maps`.*
+
+6. **A directory-only ignore protects the mapped destination name even when
+   a non-directory occupies it.** rsync evaluates `cache/` against the
+   destination object's current type, so an ignored source directory named
+   `cache` does not protect a destination file of that name from `--delete`.
+   syq treats the source's ignored pathname as out of scope regardless of a
+   destination type mismatch; deleting it would violate the documented
+   protection promise. A destination-only file still does not match `cache/`,
+   and `--delete-excluded` deliberately drops the protection. *Test:
+   `delete_protects_an_ignored_source_directory_across_a_type_change`.*
 
 ## Different, no claim of better
 

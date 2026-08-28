@@ -1805,6 +1805,44 @@ fn delete_removes_extras_and_protects_ignored() {
     assert!(se.contains("not deleting keep/"), "{se}");
 }
 
+#[test]
+fn delete_protects_an_ignored_source_directory_across_a_type_change() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src/x")).unwrap();
+    write(&t.path("dst/x"), b"precious");
+    write(&t.path("dst/destination-only"), b"extra");
+
+    run_ok(&[
+        "-a",
+        "--delete",
+        "-i",
+        "x/",
+        "-i",
+        "destination-only/",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/x")), b"precious");
+    assert!(
+        !t.path("dst/destination-only").exists(),
+        "a directory-only rule does not blanket-protect a destination-only file"
+    );
+
+    run_ok(&[
+        "-a",
+        "--delete",
+        "--delete-excluded",
+        "-i",
+        "x/",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(
+        !t.path("dst/x").exists(),
+        "--delete-excluded deliberately drops ignored-path protection"
+    );
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn delete_removes_only_this_jobs_orphaned_sidecars() {

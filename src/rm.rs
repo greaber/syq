@@ -211,7 +211,7 @@ pub fn run(args: Args) -> Result<i32> {
             &root,
             false,
             &[],
-            false,
+            IgnoredReport::None,
             &mut |entries: Vec<Entry>| {
                 for e in entries {
                     let full = join(&root, &e.path);
