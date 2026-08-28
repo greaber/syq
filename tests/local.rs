@@ -1623,19 +1623,17 @@ fn readonly_root_copies_and_reruns() {
 // The old implicit-marker subsystem is gone. Its former filename is ordinary
 // payload and must not make an otherwise identical second run look interrupted.
 #[test]
-fn legacy_pcp_marker_name_is_ordinary_payload() {
+fn legacy_marker_name_is_ordinary_payload() {
+    const LEGACY_TRANSFER_MARKER: &str = ".pcp-transfer-session.json";
+
     let t = Tmp::new();
-    write(
-        &t.path("src/.pcp-transfer-session.json"),
-        b"ordinary user data",
-    );
+    let src_marker = t.path("src").join(LEGACY_TRANSFER_MARKER);
+    let dst_marker = t.path("dst").join(LEGACY_TRANSFER_MARKER);
+    write(&src_marker, b"ordinary user data");
     write(&t.path("src/file"), b"payload");
 
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(
-        read(&t.path("dst/.pcp-transfer-session.json")),
-        b"ordinary user data"
-    );
+    assert_eq!(read(&dst_marker), b"ordinary user data");
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/file")), b"payload");
 }
