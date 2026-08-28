@@ -3521,3 +3521,33 @@ impl Worker {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_root_pins_the_edge_cases() {
+        for (given, want) in [
+            ("/", "/"),
+            ("//", "/"),
+            ("/.", "/"),
+            (".", "."),
+            ("./", "."),
+            ("././//", "."),
+            ("dst", "dst"),
+            ("dst/", "dst"),
+            ("dst/.", "dst"),
+            ("dst//x", "dst/x"),
+            ("./dst/./x/", "dst/x"),
+            ("~/x//y/.", "~/x/y"),
+            ("/a//b/./c", "/a/b/c"),
+        ] {
+            assert_eq!(
+                clean_root(given.as_bytes()),
+                want.as_bytes(),
+                "clean_root({given:?})"
+            );
+        }
+    }
+}
