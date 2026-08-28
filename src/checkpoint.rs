@@ -20,7 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const FORMAT: u32 = 2;
+// 3: Deleted invalidation records. An older syq would skip the unparseable
+// lines and trust the Complete records they void; the format check makes it
+// refuse the file instead (restarting a checkpoint is always safe).
+pub const FORMAT: u32 = 3;
 const IDENTITY_FORMAT: u32 = 1;
 
 fn b64(bytes: &[u8]) -> String {
@@ -370,34 +373,32 @@ impl Checkpoint {
         }
     }
 
-    /// Persist tombstones before --delete removes the corresponding paths.
-    /// A failed deletion may then cause a harmless future recheck; the reverse
-    /// order could leave a stale completion record for a now-missing file.
-    pub fn record_deletions<'a>(&self, paths: impl IntoIterator<Item = &'a [u8]>) -> Result<()> {
-        if let Some(error) = self.failed.lock().unwrap().clone() {
-            bail!("checkpoint recording previously failed: {error}");
+    /// A mutation is about to make these checkpoint-complete paths missing or
+    /// non-regular: persist the invalidation intents *first* — written and
+    /// flushed, though not fsynced; the checkpoint never promises power-loss
+    /// durability (see README) — so a crash can't leave a stale Complete
+    /// record for a file that is gone. A stale intent (recorded, then the
+    /// mutation failed or never ran) only costs a recheck on retry. An Err
+    /// means the intents did not persist — the caller must not mutate.
+    pub fn record_deleted_batch<'a>(&self, paths: impl Iterator<Item = &'a [u8]>) -> Result<()> {
+        if let Some(error) = self.failed.lock().unwrap().as_ref() {
+            bail!("checkpoint recording already stopped: {error}");
         }
         let result = (|| {
-            let mut writer = self.writer.lock().unwrap();
-            let mut appended = false;
             for path in paths {
-                Self::append_locked(
-                    &mut writer,
-                    &Record::Deleted {
-                        path_b64: b64(path),
-                    },
-                )?;
-                appended = true;
+                self.append(&Record::Deleted {
+                    path_b64: b64(path),
+                })?;
             }
-            if appended {
-                self.flush_locked(&mut writer)?;
-            }
-            Ok(())
+            let mut writer = self.writer.lock().unwrap();
+            self.flush_locked(&mut writer)
         })();
-        if let Err(error) = &result {
-            self.note_error(anyhow::anyhow!("{error:#}"));
+        if let Err(error) = result {
+            let message = format!("{error:#}");
+            self.note_error(error);
+            bail!("{message}");
         }
-        result
+        Ok(())
     }
 
     pub fn take_error(&self) -> Option<String> {
@@ -406,10 +407,6 @@ impl Checkpoint {
 
     fn append(&self, record: &Record) -> Result<()> {
         let mut writer = self.writer.lock().unwrap();
-        Self::append_locked(&mut writer, record)
-    }
-
-    fn append_locked(writer: &mut Writer, record: &Record) -> Result<()> {
         serde_json::to_writer(&mut writer.buf, record)?;
         writer.buf.push(b'\n');
         writer.unflushed += 1;
@@ -531,7 +528,9 @@ mod tests {
 
         let (checkpoint, loaded) = Checkpoint::open(&path, "identity").unwrap();
         assert!(loaded.completed.contains_key(b"a/b".as_slice()));
-        checkpoint.record_deletions([b"a/b".as_slice()]).unwrap();
+        checkpoint
+            .record_deleted_batch([b"a/b".as_slice()].into_iter())
+            .unwrap();
         assert!(
             !Checkpoint::load(&path)
                 .unwrap()

@@ -38,7 +38,7 @@ pub fn build_ignore(lines: &[String]) -> Result<Option<Gitignore>> {
 }
 
 /// Walk `root`, calling `sink` with batches of entries (root first, as path "").
-/// Every entry is reported, syq's own `.name.syq-partial` files included (the
+/// Every entry is reported, syq's own `.name.syq-part.<job-id>` sidecars included (the
 /// planner decides what they mean). `warn` receives non-fatal errors
 /// (unreadable directories etc.). `ignore` holds gitignore-style patterns
 /// relative to `root`; a matching directory is pruned with its whole subtree.

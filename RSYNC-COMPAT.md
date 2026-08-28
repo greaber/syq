@@ -96,12 +96,14 @@ and syq deliberately does otherwise. If the reasoning stops holding, move the
 item.
 
 1. **`--delete` runs after the transfer, always; no `--delete-before` /
-   `--delete-during`.** rsync defaults to delete-during. syq's rule means an
-   interrupted run never deletes anything, and deletion is computed against a
-   quiescent destination (no races with partial renames or in-place replaces).
-   The cost is that space is never freed before writing. We consider "an
-   aborted `--delete` run deleted half the tree" a worse outcome than "ran out
-   of space." *Tests: `delete_with_inplace_replacing_many_symlinks`,
+   `--delete-during`.** rsync defaults to delete-during. syq's rule means a run
+   interrupted or failed during scanning or transfer never starts deletion,
+   and deletion is computed against a quiescent destination (no races with
+   partial renames or in-place replaces). Interruption after deletion starts
+   can still leave some planned extras removed. The cost is that space is never
+   freed before writing. We consider "the transfer failed after it already
+   deleted destination-only files" a worse outcome than "ran out of space."
+   *Tests: `delete_with_inplace_replacing_many_symlinks`,
    `delete_removes_only_this_jobs_orphaned_sidecars`.*
 2. **`--max-delete N` deletes *nothing* past the limit.** rsync deletes the
    first N and then stops. A safety cap that leaves the destination in a

@@ -176,8 +176,9 @@ impl Progress {
             {
                 t.last_json = Some(now);
                 eprintln!(
-                    "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_skipped\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_skipped\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
+                    "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_skipped\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_skipped\":{},\"files_excluded\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
                     self.files_skipped.load(Relaxed),
+                    self.files_excluded.load(Relaxed),
                     self.scanned.load(Relaxed),
                     rate,
                     eta.map_or("null".to_string(), |e| format!("{e:.0}")),

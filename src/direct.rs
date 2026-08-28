@@ -35,6 +35,11 @@ fn direct_command(
 pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     let rsh = parse_rsh(&args.rsh)?;
     let src_host = srcs[0].host.clone().unwrap();
+    // The follow target must reconnect the way we did: keep an explicit user.
+    let src_target = match &srcs[0].user {
+        Some(user) => format!("{user}@{src_host}"),
+        None => src_host.clone(),
+    };
     let spec = crate::conn::RemoteSpec {
         user: srcs[0].user.clone(),
         host: src_host.clone(),
@@ -264,9 +269,13 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         if !out.status.success() || log.is_empty() {
             bail!("could not start detached transfer on {src_host}");
         }
-        if !args.quiet {
-            println!("syq: started on {src_host}, log {log}");
-            println!("syq: follow with:  syq --follow {src_host}:{log}");
+        // The handoff is the command's result, not chatter: -q trims it to
+        // the bare follow target rather than suppressing it.
+        if args.quiet {
+            println!("{src_target}:{log}");
+        } else {
+            println!("syq: started on {src_target}, log {log}");
+            println!("syq: follow with:  syq --follow {src_target}:{log}");
         }
         return Ok(0);
     }

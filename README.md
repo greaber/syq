@@ -176,7 +176,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
 | `--no-forward-agent` | Remote-to-remote with default `ssh`: disable agent forwarding (conflicts with `-e`) |
-| `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
+| `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session; prints the follow target even with `-q` |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
@@ -242,6 +242,8 @@ Identical to rsync:
   not even a missing destination directory is created (the transfer starts
   once the scans finish). Naming the destination file itself as one of the
   sources doesn't change that: it would be overwritten, so it's a conflict.
+  The price is memory: every scanned entry is held until the scans are
+  validated, roughly a few hundred bytes per entry across all sources.
 - An explicitly supplied destination root that is a symlink to a directory is
   that directory (the link is kept, with or without a trailing slash). A
   symlink encountered below the destination root is payload at that path: it
@@ -299,7 +301,9 @@ checking, `-j`, verbosity, progress or bandwidth limiting. Filesystem
 component limits are queried and cached per directory; long basenames are
 deterministically truncated and disambiguated to fit. An exceptionally long
 full path still fails that one file with a clear error (even when it is
-already up to date) while the rest of the transfer continues. SYQ does not `fsync` transfer data;
+already up to date) while the rest of the transfer continues, and so does a
+destination entry — say, a directory some other tool left — already occupying
+the exact path this job's sidecar for that file needs. SYQ does not `fsync` transfer data;
 atomic sidecar publication provides old-or-new visibility and resumable
 interrupted work, not crash-durability across power loss.
 Small files still use a pipelined whole-file request, but the receiver writes
@@ -387,15 +391,19 @@ path. Unfinished individual files are never checkpoint-complete; their actual
 
 The checkpoint is flushed about once a second and persists after both failed
 and successful runs until you remove or stop passing it. Losing its last
-buffered records only causes repeated work. If an existing checkpoint has
-completed records but an expected destination root is missing, SYQ fails and
-asks you to remove the checkpoint to restart. The checkpoint must be a regular
-file with exactly one hard link and must be outside local source and
-destination trees; a hardlinked checkpoint is refused because appending or
-changing its permissions would also affect its other names. `-n` reads and
-validates existing state but never creates or changes it. `-c`, `--verify-only`,
-and `--rm` conflict with `--checkpoint`. One checkpoint file may be used by
-only one running copy at a time.
+buffered records only causes repeated work; if recording stops mid-run the
+copy continues and a warning names the I/O error — printed even under `-q`,
+while the exit code keeps describing the copy itself. Invalidation records are
+flushed before a checkpoint-covered destination is removed or changes type,
+but the checkpoint is not `fsync`ed and does not promise recovery across power
+loss. If an existing checkpoint has completed records but an expected
+destination root is missing, SYQ fails and asks you to remove the checkpoint to
+restart. The checkpoint must be a regular file with exactly one hard link and
+must be outside local source and destination trees; a hardlinked checkpoint is
+refused because appending or changing its permissions would also affect its
+other names. `-n` reads and validates existing state but never creates or
+changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`. One
+checkpoint file may be used by only one running copy at a time.
 
 A checkpoint is an explicit trust decision: SYQ does not inspect a destination
 file covered by a matching record. If another process deleted, replaced, or
@@ -622,11 +630,18 @@ have is removed. The rules are simpler than rsync's, deliberately:
   file skipped for lack of `-l`/`-D` — still exists in the source, so its
   destination copy is left alone, as in rsync. Such files are reported under
   `files excluded` in `--stats`.
+- With `--delete` the sidecar path of every mapped regular file stays in
+  memory until deletions run (that set is what tells a live sidecar from an
+  orphan); on multi-million-file trees this is the option's main memory cost.
 - **After, not before.** Deletions run once every file has been transferred
   and only if the whole source scan succeeded: an unreadable source directory
   would otherwise look like one whose contents vanished (`source scan reported
-  errors; skipping deletions`). An interrupted run therefore never deletes
-  anything, and directory mtimes are set after the deletes.
+  errors; skipping deletions`). The destination walk is held to the same rule:
+  an unreadable directory *there* looks empty and would be removed over its
+  unknown contents, so its errors also skip all deletions. A run interrupted
+  during scanning or transfer therefore never starts deletion. Once deletion
+  has begun, interruption can leave some planned extras removed; rerunning
+  finishes the mirror. Directory mtimes are set after the deletes.
 - **Sidecar-patterned files are extras unless they are this job's live
   resume state.** A `.name.syq-part.<job-id>` of *this* command whose `name`
   is still in the source stays, whatever happened to that file this run
@@ -640,10 +655,11 @@ have is removed. The rules are simpler than rsync's, deliberately:
   removed by `--delete`, inert otherwise.
 - `--max-delete N` refuses to delete anything — not the first N — when more
   than N deletions are planned, says so, and exits 25 (rsync's code for it).
-- `-n --delete -v` lists every `deleting path` line a real run would print
-  (a stale partial that the real run resumes from and renames away is the one
-  thing `-n` lists that it won't delete separately). The summary reports
-  `N deleted` / `N would be deleted`.
+- `-n --delete -v` lists every `deleting path` line a real run would print.
+  The summary reports `N deleted` / `N would be deleted`. `--delete`
+  conflicts with `--verify-only` (deleting is the opposite of writing
+  nothing) and with `--files-from` (deletion scope under a file list is
+  ambiguous).
 
 Deletion goes through the control connection in batches of 1000 (the
 destination side unlinks each batch in parallel); it isn't spread over the
@@ -652,7 +668,10 @@ destination side unlinks each batch in parallel); it isn't spread over the
 ## Skipping by state and size
 
 - `-u` / `--update`: a file whose destination copy has a newer mtime is left
-  alone (regular files only).
+  alone (regular files only). Neither `-u` nor `--ignore-existing` can be
+  combined with `--inplace`: an interrupted in-place write leaves a
+  partially-written final file that looks newer, which those filters would
+  then skip on every retry.
 - `--existing`: never create anything — files, symlinks, specials,
   directories, *or the destination itself* — that isn't already there;
   existing files are still updated. `--ignore-existing` is the mirror image: create what's

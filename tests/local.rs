@@ -4657,3 +4657,251 @@ fn sidecar_patterned_extras_do_not_block_directory_deletion() {
     assert!(out.status.success(), "{}", stderr_of(&out));
     assert_eq!(listing(&t.path("dst")), ["a"]);
 }
+
+// ----------------------------------------------------------- review round 10
+
+#[test]
+fn size_arguments_reject_negative_nan_and_overflow() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    for (flag, bad) in [
+        ("--max-size", "-1"),
+        ("--max-size", "-1K"),
+        ("--min-size", "nan"),
+        ("--max-size", "inf"),
+        ("--max-size", "1e30"),
+        ("--block-size", "-4M"),
+    ] {
+        let arg = format!("{flag}={bad}");
+        let out = syq(&["-a", &arg, &t.s("src/"), &t.s("dst")]);
+        assert!(!out.status.success(), "{arg}");
+        assert!(
+            stderr_of(&out).to_lowercase().contains("size"),
+            "{arg}: {}",
+            stderr_of(&out)
+        );
+        assert!(!t.path("dst/f").exists(), "{arg}: nothing may be copied");
+    }
+    // Fractional sizes keep working.
+    let so = run_ok(&["-a", "--max-size", "1.5K", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(transferred(&so), 1);
+}
+
+#[test]
+fn delete_records_checkpoint_intent_before_unlinking() {
+    // A file the checkpoint recorded as complete leaves the source; --delete
+    // tries to remove it but the unlink fails (read-only extra directory —
+    // claimed directories get opened up, extras don't). The Deleted intent
+    // must already be durable in the checkpoint — written before the unlink —
+    // so a later restore with the same fingerprint is rechecked, not assumed.
+    let t = Tmp::new();
+    write(&t.path("src/sub/f"), b"data");
+    set_mtime(&t.path("src/sub/f"), 1_600_000_000);
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    fs::remove_dir_all(t.path("src/sub")).unwrap();
+    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+    let out = syq(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        "--delete",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(t.path("dst/sub/f").exists(), "unlink really failed");
+    let state = String::from_utf8_lossy(&read(&t.path("state"))).into_owned();
+    assert!(
+        state.contains("\"deleted\""),
+        "intent must precede the unlink: {state}"
+    );
+}
+
+#[test]
+fn delete_halts_when_checkpoint_intents_cannot_be_persisted() {
+    // RLIMIT_FSIZE pins the checkpoint at its current size, so the Deleted
+    // intent cannot be appended. Deletion must then not happen at all:
+    // unlinking would leave a durable Complete record for a missing file.
+    use std::os::unix::process::CommandExt;
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    fs::remove_file(t.path("src/f")).unwrap();
+    let limit = fs::metadata(t.path("state")).unwrap().len();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
+    cmd.args([
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        "--delete",
+        &t.s("src/"),
+        &t.s("dst"),
+        "--no-progress",
+    ]);
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let rl = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &rl) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("could not persist deletion intents"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        t.path("dst/f").exists(),
+        "nothing may be deleted without a durable intent"
+    );
+}
+
+// ----------------------------------------------------------- review round 11
+
+#[test]
+fn inplace_conflicts_with_receiver_state_filters() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    for filter in ["-u", "--ignore-existing"] {
+        let out = syq(&["-a", "--inplace", filter, &t.s("src/"), &t.s("dst")]);
+        assert!(!out.status.success(), "{filter}");
+        assert!(
+            stderr_of(&out).contains("cannot be used with"),
+            "{filter}: {}",
+            stderr_of(&out)
+        );
+    }
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn checkpoint_invalidated_on_type_change_and_directory_removal() {
+    // f completes as a file; the source turns f into a directory (type-change
+    // invalidation), then drops it (--delete rmdir), then restores the
+    // original file with an identical fingerprint. The checkpointed run must
+    // transfer it — a stale Complete record would report "unchanged" while
+    // the destination has nothing.
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    fs::remove_file(t.path("src/f")).unwrap();
+    write(&t.path("src/f/child"), b"c");
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(t.path("dst/f").is_dir());
+    fs::remove_dir_all(t.path("src/f")).unwrap();
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        "--delete",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(!t.path("dst/f").exists());
+    write(&t.path("src/f"), b"data");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let so = run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/f")), b"data", "{so}");
+    assert_eq!(transferred(&so), 1, "{so}");
+}
+
+#[test]
+fn files_from_self_copy_through_symlinked_root_is_rejected() {
+    let t = Tmp::new();
+    write(&t.path("real/a"), b"a");
+    fs::create_dir_all(t.path("real/dstdir")).unwrap();
+    std::os::unix::fs::symlink(t.path("real"), t.path("link")).unwrap();
+    write(&t.path("list"), b"a\n");
+    let out = syq(&[
+        "-a",
+        "-r",
+        "--files-from",
+        &t.s("list"),
+        &t.s("link"),
+        &t.s("real/dstdir"),
+    ]);
+    assert!(!out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("maps inside source")
+            || stderr_of(&out).contains("same directory"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(listing(&t.path("real")), ["a", "dstdir"], "nothing copied");
+}
+
+#[test]
+fn destination_walk_errors_disable_deletion() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("dst/gone"), b"an ordinary extra");
+    write(&t.path("dst/dark/inside"), b"unknown contents");
+    fs::set_permissions(t.path("dst/dark"), fs::Permissions::from_mode(0o000)).unwrap();
+    let src_arg = t.s("src/");
+    let dst_arg = t.s("dst");
+    for flags in [vec!["-rt", "-n"], vec!["-rt"]] {
+        let mut args = flags.clone();
+        args.extend(["--delete", &src_arg, &dst_arg]);
+        let out = syq(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(23),
+            "{flags:?}: {}",
+            stderr_of(&out)
+        );
+        assert!(
+            stderr_of(&out).contains("destination walk reported errors; skipping deletions"),
+            "{flags:?}: {}",
+            stderr_of(&out)
+        );
+    }
+    fs::set_permissions(t.path("dst/dark"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(t.path("dst/gone").exists(), "nothing may be deleted");
+    assert!(t.path("dst/dark/inside").exists());
+}
