@@ -784,6 +784,12 @@ impl FsOps {
                             {
                                 continue;
                             }
+                            if fd_meta.mode() & 0o7777 != 0o600 {
+                                file.set_permissions(fs::Permissions::from_mode(0o600))
+                                    .with_context(|| {
+                                        format!("make partial private {}", pp.display())
+                                    })?;
+                            }
                             return Ok((file, Some(fd_meta.len())));
                         }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => continue,

@@ -223,9 +223,10 @@ Identical to rsync:
 - A single file source goes to `dest/file` if `dest` is an existing directory,
   otherwise `dest` is the new filename.
 - Several sources require (or create) a directory destination.
-- A destination that is a symlink to a directory is that directory (the link
-  is kept, with or without a trailing slash); a symlink to anything else is
-  replaced like a file.
+- An explicitly supplied destination root that is a symlink to a directory is
+  that directory (the link is kept, with or without a trailing slash). A
+  symlink encountered below the destination root is payload at that path: it
+  is replaced rather than followed, even when it points to a directory.
 - Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
   payload and produce one warning summary. Before transfer starts, SYQ rejects
   the exceptional case where a mapped payload path exactly equals a sidecar
@@ -347,10 +348,13 @@ The checkpoint is flushed about once a second and persists after both failed
 and successful runs until you remove or stop passing it. Losing its last
 buffered records only causes repeated work. If an existing checkpoint has
 completed records but an expected destination root is missing, SYQ fails and
-asks you to remove the checkpoint to restart. The checkpoint must be outside
-local source and destination trees. `-n` reads and validates existing state but
-never creates or changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`.
-One checkpoint file may be used by only one running copy at a time.
+asks you to remove the checkpoint to restart. The checkpoint must be a regular
+file with exactly one hard link and must be outside local source and
+destination trees; a hardlinked checkpoint is refused because appending or
+changing its permissions would also affect its other names. `-n` reads and
+validates existing state but never creates or changes it. `-c`, `--verify-only`,
+and `--rm` conflict with `--checkpoint`. One checkpoint file may be used by
+only one running copy at a time.
 
 A checkpoint is an explicit trust decision: SYQ does not inspect a destination
 file covered by a matching record. If another process deleted, replaced, or

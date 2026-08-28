@@ -1135,6 +1135,47 @@ fn rm_normal_target_works() {
 }
 
 #[test]
+fn quiet_overrides_verbose_and_json_progress_for_rm() {
+    let t = Tmp::new();
+    write(&t.path("killme/sub/f"), b"f");
+
+    let dry = syq(&[
+        "--rm",
+        "--dry-run",
+        "-q",
+        "-v",
+        "--progress-json",
+        &t.s("killme"),
+    ]);
+    assert_output_ok(&dry);
+    assert!(
+        dry.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+    assert!(
+        dry.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(t.path("killme/sub/f").exists());
+
+    let actual = syq(&["--rm", "-q", "-v", "--progress-json", &t.s("killme")]);
+    assert_output_ok(&actual);
+    assert!(
+        actual.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&actual.stdout)
+    );
+    assert!(
+        actual.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert!(!t.path("killme").exists());
+}
+
+#[test]
 fn duplicate_destination_rejected() {
     let t = Tmp::new();
     write(&t.path("a/same"), b"A");
@@ -2005,7 +2046,14 @@ fn source_partials_are_copied_and_warned_about() {
     assert_eq!(warning["type"], "warning");
     assert_eq!(warning["count"], 2);
 
-    let quiet = syq(&["-q", "-v", "-a", &t.s("src/"), &t.s("quiet-dst/")]);
+    let quiet = syq(&[
+        "-q",
+        "-v",
+        "-a",
+        "--progress-json",
+        &t.s("src/"),
+        &t.s("quiet-dst/"),
+    ]);
     assert_output_ok(&quiet);
     assert!(
         quiet.stdout.is_empty(),
@@ -2793,6 +2841,35 @@ fn unreadable_interrupted_partials_are_reused() {
         assert_eq!(read(&t.path(&format!("out-{i}"))), contents);
         assert!(!partial.exists());
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn writable_interrupted_partial_is_made_private_before_reuse() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    let src = t.s("src");
+    let dst = t.s("dst");
+    let args = ["-a", "--bwlimit", "1M", &src, &dst];
+    let partial = interrupted_partial(&args, &t.0);
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000")
+        .spawn()
+        .unwrap();
+    for _ in 0..300 {
+        if fs::metadata(&partial).unwrap().mode() & 0o7777 == 0o600 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(fs::metadata(&partial).unwrap().mode() & 0o7777, 0o600);
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]

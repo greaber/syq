@@ -160,12 +160,13 @@ pub fn run(args: Args) -> Result<i32> {
     let mut ctl = connect_ctl(&ep, &args)?;
 
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
+    let verbose = !args.quiet && args.verbose > 0;
     let progress = Progress::new(
         args.connections,
         show_progress,
         args.progress,
         args.width,
-        args.progress_json,
+        !args.quiet && args.progress_json,
     );
     // Safety: Progress is behind an Arc we just created; set the mode before anyone reads it.
     let progress = {
@@ -183,7 +184,7 @@ pub fn run(args: Args) -> Result<i32> {
         pending: Mutex::new(0),
         cv: Condvar::new(),
         progress: progress.clone(),
-        verbose: args.verbose > 0,
+        verbose,
         aborted: std::sync::atomic::AtomicBool::new(false),
     });
     let mut workers = Vec::new();
@@ -219,7 +220,7 @@ pub fn run(args: Args) -> Result<i32> {
                         dirs.entry(depth).or_default().push(full);
                     } else if args.dry_run {
                         progress.files_done.fetch_add(1, Relaxed);
-                        if args.verbose > 0 {
+                        if verbose {
                             println!("{}", String::from_utf8_lossy(&full));
                         }
                     } else {
@@ -245,7 +246,7 @@ pub fn run(args: Args) -> Result<i32> {
     for (_, paths) in dirs.iter().rev() {
         if args.dry_run {
             progress.files_done.fetch_add(paths.len() as u64, Relaxed);
-            if args.verbose > 0 {
+            if verbose {
                 for p in paths {
                     println!("{}/", String::from_utf8_lossy(p));
                 }

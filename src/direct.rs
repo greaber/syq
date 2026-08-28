@@ -102,7 +102,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         remote.push("--tcp-plain".into());
     }
     remote.push(format!("--tcp-ports={}", args.tcp_ports));
-    if args.progress_json {
+    if args.progress_json && !args.quiet {
         remote.push("--progress-json".into());
     }
     // --ignore-from files were read locally; forward the merged lines.
