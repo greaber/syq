@@ -30,8 +30,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let debug;
     match r.read_msg::<Request>()? {
         Request::Hello {
-            version,
-            release,
+            identity,
             compress,
             debug: d,
             token,
@@ -43,28 +42,21 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
             }
             // The token is the credential: once it matches, the peer is
-            // authenticated. Mark it now so a later failure (version mismatch,
-            // a failed HelloOk write) can't free the connection id for replay.
+            // authenticated. Mark it now so a later failure (identity mismatch
+            // or a failed HelloOk write) can't free the connection id for replay.
             if let Some(a) = authed {
                 a.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            if version != VERSION {
+            let expected_identity = crate::identity::build();
+            if identity != expected_identity {
                 w.write_msg(&Response::Err(format!(
-                    "protocol version mismatch (remote {VERSION}, client {version})"
+                    "build identity mismatch (remote {expected_identity}, client {identity})"
                 )))?;
-                bail!("protocol version mismatch");
-            }
-            let expected_release = env!("CARGO_PKG_VERSION");
-            if release != expected_release {
-                w.write_msg(&Response::Err(format!(
-                    "release mismatch (remote {expected_release}, client {release})"
-                )))?;
-                bail!("release mismatch");
+                bail!("build identity mismatch");
             }
             w.compress = compress;
             w.write_msg(&Response::HelloOk {
-                version: VERSION,
-                release: expected_release.to_string(),
+                identity: expected_identity.to_string(),
             })?;
         }
         _ => bail!("expected Hello"),

@@ -57,7 +57,7 @@ struct UpdateFixture {
 
 #[cfg(target_os = "linux")]
 impl UpdateFixture {
-    fn new(release_version: &str, release_helper: &str, executable_helper: &str) -> Self {
+    fn new(release_version: &str, executable_identity: &str) -> Self {
         let temp = TempDir::new();
         let installed = temp.path("bin/syq");
         fs::create_dir_all(installed.parent().unwrap()).unwrap();
@@ -72,7 +72,7 @@ impl UpdateFixture {
         };
         let asset = format!("syq-{target}");
         let replacement = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {release_version}' ;;\n  --remote-helper-id) echo '{executable_helper}' ;;\n  *) exit 2 ;;\nesac\n"
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {release_version}' ;;\n  --build-identity) echo '{executable_identity}' ;;\n  --remote-helper-id) echo 'v{release_version}-p0' ;;\n  *) exit 2 ;;\nesac\n"
         );
         let replacement = replacement.as_bytes();
         let archive_path = temp.path(&format!("fixtures/{asset}.gz"));
@@ -87,7 +87,7 @@ impl UpdateFixture {
             "repository": "https://github.com/greaber/syq",
             "version": release_version,
             "tag": format!("v{release_version}"),
-            "helper_id": release_helper,
+            "helper_id": format!("v{release_version}-p0"),
             "artifacts": {
                 (target): {
                     "binary": {
@@ -217,7 +217,7 @@ fn assert_failure_contains(output: &Output, expected: &str) {
 #[cfg(target_os = "linux")]
 #[test]
 fn signed_self_update_replaces_only_the_receipted_copy() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0-p4", "v0.2.0-p4");
+    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
     fixture.register();
 
     let update = fixture.command("--self-update");
@@ -235,7 +235,7 @@ fn signed_self_update_replaces_only_the_receipted_copy() {
 #[cfg(target_os = "linux")]
 #[test]
 fn self_update_rejects_a_tampered_signed_manifest_without_changing_install() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0-p4", "v0.2.0-p4");
+    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
     fixture.register();
     fs::write(
         fixture.temp.path("fixtures/syq-release-manifest.json"),
@@ -251,7 +251,7 @@ fn self_update_rejects_a_tampered_signed_manifest_without_changing_install() {
 #[cfg(target_os = "linux")]
 #[test]
 fn self_update_rejects_a_tampered_archive_without_changing_install() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0-p4", "v0.2.0-p4");
+    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
     fixture.register();
     let target = if cfg!(target_arch = "x86_64") {
         "linux-x86_64"
@@ -273,12 +273,12 @@ fn self_update_rejects_a_tampered_archive_without_changing_install() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn self_update_rejects_an_executable_with_the_wrong_identity() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0-p4", "v0.2.0-p999");
+fn self_update_rejects_an_executable_with_the_wrong_build_identity() {
+    let fixture = UpdateFixture::new("0.2.0", "v0.2.0+dev.wrong");
     fixture.register();
 
     let update = fixture.command("--self-update");
-    assert_failure_contains(&update, "unexpected helper identity");
+    assert_failure_contains(&update, "unexpected build identity");
     fixture.assert_original_unchanged();
 }
 
@@ -295,8 +295,8 @@ fn self_update_refuses_a_signed_downgrade() {
         );
         Version::new(current.major, current.minor - 1, 0)
     };
-    let helper = format!("v{older}-p4");
-    let fixture = UpdateFixture::new(&older.to_string(), &helper, &helper);
+    let identity = format!("v{older}");
+    let fixture = UpdateFixture::new(&older.to_string(), &identity);
     fixture.register();
 
     let update = fixture.command("--self-update");
@@ -307,7 +307,7 @@ fn self_update_refuses_a_signed_downgrade() {
 #[cfg(target_os = "linux")]
 #[test]
 fn receipt_is_bound_to_the_exact_installed_executable() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0-p4", "v0.2.0-p4");
+    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
     fixture.register();
     let other = fixture.temp.path("other/syq");
     fs::create_dir_all(other.parent().unwrap()).unwrap();
@@ -323,7 +323,7 @@ fn receipt_is_bound_to_the_exact_installed_executable() {
 #[cfg(target_os = "linux")]
 #[test]
 fn auto_update_setting_is_explicit_and_survives_reregistration() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0-p4", "v0.2.0-p4");
+    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
     fixture.register();
     assert_eq!(fixture.receipt()["auto_update"], false);
 
@@ -340,7 +340,7 @@ fn auto_update_setting_is_explicit_and_survives_reregistration() {
 #[cfg(target_os = "linux")]
 #[test]
 fn source_install_cannot_create_or_use_a_standalone_receipt_implicitly() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0-p4", "v0.2.0-p4");
+    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
 
     let update = fixture.command("--self-update");
     assert_failure_contains(&update, "self-update is only available");

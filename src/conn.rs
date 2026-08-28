@@ -303,7 +303,7 @@ impl RemoteSpec {
     }
 
     /// A shell command that runs syq with `args` on this host.  Automatic mode
-    /// addresses the exact versioned helper; explicit mode preserves the
+    /// addresses the exact release/build-identified helper; explicit mode preserves the
     /// administrator-provided path; --no-bootstrap uses normal PATH lookup.
     pub fn program_command(&self, args: &[String]) -> String {
         if let Some(p) = &self.syq_path {
@@ -324,8 +324,8 @@ impl RemoteSpec {
 
     /// `limited`: take a connect slot (data connections). The control
     /// connection passes false: everything waits on it, so it must never
-    /// queue behind workers. Either way the versioned helper is installed on
-    /// first use if the remote lacks it.
+    /// queue behind workers. In managed mode the release helper is installed
+    /// on first use if the remote lacks it.
     pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
         let first = self.connect_retried(compress, limited);
         let Err(first_error) = first else {
@@ -339,7 +339,7 @@ impl RemoteSpec {
         self.connect_retried(compress, limited).with_context(|| {
             format!(
                 "could not start the {} helper installed on {}",
-                remote_helper::release_key(),
+                remote_helper::helper_identity(),
                 self.label()
             )
         })
@@ -352,11 +352,11 @@ impl RemoteSpec {
             let _slot = limited.then(connect_slot);
             match self.connect_once(compress) {
                 Ok(c) => return Ok(c),
-                // Don't retry what won't change: missing binary (127) or a version mismatch.
+                // Don't retry what won't change: a missing binary (127) or a
+                // build identity mismatch.
                 Err(e)
                     if attempt == 5
-                        || e.to_string().contains("version mismatch")
-                        || e.to_string().contains("release mismatch")
+                        || e.to_string().contains("build identity mismatch")
                         || e.to_string().contains("exit status: 127")
                         || e.to_string().contains(&format!(
                             "exit status: {}",
@@ -577,8 +577,7 @@ fn helper_needs_install(e: &anyhow::Error) -> bool {
     )) || message.contains(&format!(
         "exit status: {}",
         remote_helper::HELPER_NOT_EXECUTABLE_EXIT
-    )) || message.contains("version mismatch")
-        || message.contains("release mismatch")
+    )) || message.contains("build identity mismatch")
 }
 
 /// Concurrently probe which (addr, speed) entries accept a TCP connection on
@@ -640,29 +639,18 @@ impl std::fmt::Debug for TcpInfo {
 fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteConn> {
     {
         conn.send(Request::Hello {
-            version: VERSION,
-            release: env!("CARGO_PKG_VERSION").to_string(),
+            identity: crate::identity::build().to_string(),
             compress,
             debug: crate::transfer::debug(),
             token,
         })?;
         match conn.recv() {
-            Ok(Response::HelloOk { version, release })
-                if version == VERSION && release == env!("CARGO_PKG_VERSION") =>
-            {
-                Ok(conn)
-            }
-            Ok(Response::HelloOk { version, release }) => {
-                if release != env!("CARGO_PKG_VERSION") {
-                    bail!(
-                        "{}: release mismatch (remote {release}, local {})",
-                        conn.label,
-                        env!("CARGO_PKG_VERSION")
-                    );
-                }
+            Ok(Response::HelloOk { identity }) if identity == crate::identity::build() => Ok(conn),
+            Ok(Response::HelloOk { identity }) => {
                 bail!(
-                    "{}: protocol version mismatch (remote {version}, local {VERSION})",
-                    conn.label
+                    "{}: build identity mismatch (remote {identity}, local {})",
+                    conn.label,
+                    crate::identity::build()
                 )
             }
             Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
@@ -673,9 +661,10 @@ fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteC
 }
 
 impl RemoteSpec {
-    /// Ensure the exact release/protocol helper exists in the remote cache.
+    /// Ensure the exact release helper exists in the remote cache.
     /// Only authorized release assets may populate the managed helper cache.
     pub fn install_helper(&self) -> Result<()> {
+        crate::identity::require_release_build()?;
         let mut installed = self.helper_install.lock().unwrap();
         if *installed {
             return Ok(());
@@ -686,14 +675,14 @@ impl RemoteSpec {
             eprintln!(
                 "syq: {}: installing {} helper for {}",
                 self.label(),
-                remote_helper::release_key(),
+                remote_helper::helper_identity(),
                 target.key
             );
         }
         self.download_helper(target).with_context(|| {
             format!(
                 "could not install the authorized {} helper on {} ({}); install a compatible syq and pass --syq-path",
-                remote_helper::release_key(),
+                remote_helper::helper_identity(),
                 self.label(),
                 target.key
             )
