@@ -162,6 +162,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
+| `--no-forward-agent` | Remote-to-remote: disable SSH agent forwarding to the source host |
 | `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
@@ -183,7 +184,18 @@ own keys). Progress and `-v` output are streamed back. If hostA can't reach
 hostB, `--relay` keeps the orchestrator here and routes every byte A → you → B
 — always works, at half the bandwidth.
 `syq hostA:src hostA:dst` (same host and user on both ends) simply runs a
-local copy on hostA.
+local copy on hostA and disables agent forwarding.
+
+Agent forwarding does not copy private keys to hostA, but a process that can
+access the forwarded socket while the SSH connection is alive can ask the
+agent to authenticate on its behalf. Pass `--no-forward-agent` to use `ssh -a`
+and override any `ForwardAgent yes` in SSH configuration; hostA must then have
+its own credentials for hostB. `--relay` also avoids exposing the agent to
+hostA, at the cost of routing the file data through this machine.
+
+Like rsync, SYQ leaves host-key checking to `ssh` and therefore inherits the
+user's SSH configuration and OpenSSH defaults. An `-e` command can supply a
+different policy when needed.
 
 Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
 launched it: syq starts it on hostA, returns, and writes progress to a log on
@@ -281,8 +293,11 @@ needed for this normal resumption. Resume works at two levels.
 - Files whose size and mtime already match are skipped (the rsync quick check).
 - If this job's range-transfer `.name.syq-part.<job-id>` exists, both sides
   hash it and the source in `--block-size` blocks and only the mismatching
-  blocks are sent. On NFS this requires the receiver to reread the partial;
-  syq deliberately keeps no separate block-completion map.
+  blocks are sent. A leftover is reused only when it is a regular file owned
+  by the receiving process with exactly one hard link; anything else is not
+  reused and is either safely replaced or reported as an error. On NFS this
+  requires the receiver to reread the partial; syq deliberately keeps no
+  separate block-completion map.
   Pipelined small files are rewritten wholesale on retry instead of paying an
   extra partial-file probe.
 - If the destination file exists but differs, its blocks are hashed against

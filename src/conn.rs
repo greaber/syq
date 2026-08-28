@@ -108,6 +108,34 @@ fn spawn_reader(
     rx
 }
 
+fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()> {
+    for entry in batch {
+        if !*saw_root {
+            if !entry.path.is_empty() {
+                bail!("scan response did not begin with the root entry");
+            }
+            *saw_root = true;
+            continue;
+        }
+        if entry.path.is_empty() {
+            bail!("scan response contained the root entry more than once");
+        }
+        if entry.path.starts_with(b"/")
+            || entry.path.contains(&0)
+            || entry
+                .path
+                .split(|byte| *byte == b'/')
+                .any(|part| part.is_empty() || part == b"." || part == b"..")
+        {
+            bail!(
+                "scan response contained unsafe relative path {:?}",
+                String::from_utf8_lossy(&entry.path)
+            );
+        }
+    }
+    Ok(())
+}
+
 impl RemoteConn {
     fn io_err(&mut self, e: anyhow::Error) -> anyhow::Error {
         self.dead = true;
@@ -161,11 +189,17 @@ impl Conn for RemoteConn {
             follow_root,
             ignore: ignore.to_vec(),
         })?;
+        let mut saw_root = false;
         loop {
             match self.recv()? {
-                Response::ScanBatch(b) => sink(b)?,
+                Response::ScanBatch(b) => {
+                    validate_remote_scan_batch(&b, &mut saw_root)
+                        .with_context(|| format!("{}: unsafe remote scan", self.label))?;
+                    sink(b)?;
+                }
                 Response::ScanWarn(w) => warn(w),
-                Response::ScanDone => return Ok(()),
+                Response::ScanDone if saw_root => return Ok(()),
+                Response::ScanDone => bail!("{}: remote scan returned no root entry", self.label),
                 Response::Err(e) => bail!("{}: scan: {e}", self.label),
                 other => bail!("{}: unexpected response during scan: {other:?}", self.label),
             }
@@ -263,8 +297,6 @@ impl RemoteSpec {
                 "ControlMaster=no",
                 "-o",
                 "ControlPath=none",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
                 "-o",
                 CIPHERS,
             ]);
@@ -769,5 +801,86 @@ impl Endpoint {
                 Ok(Box::new(spec.connect(compress)?))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn entry(path: &[u8]) -> Entry {
+        Entry {
+            path: path.to_vec(),
+            kind: Kind::File,
+            size: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            dev: 0,
+            ino: 0,
+            link: None,
+        }
+    }
+
+    #[test]
+    fn remote_scan_paths_are_rooted_and_normalized() {
+        let mut saw_root = false;
+        validate_remote_scan_batch(&[entry(b""), entry(b"dir/file")], &mut saw_root).unwrap();
+        assert!(saw_root);
+
+        for bad in [
+            &b"/absolute"[..],
+            &b"../escape"[..],
+            &b"dir/../escape"[..],
+            &b"dir/./file"[..],
+            &b"dir//file"[..],
+            &b"dir/"[..],
+            &b"nul\0byte"[..],
+        ] {
+            let mut saw_root = true;
+            assert!(validate_remote_scan_batch(&[entry(bad)], &mut saw_root).is_err());
+        }
+    }
+
+    #[test]
+    fn remote_scan_requires_exactly_one_leading_root() {
+        let mut saw_root = false;
+        assert!(validate_remote_scan_batch(&[entry(b"file")], &mut saw_root).is_err());
+
+        let mut saw_root = true;
+        assert!(validate_remote_scan_batch(&[entry(b"")], &mut saw_root).is_err());
+    }
+
+    #[test]
+    fn ssh_inherits_host_key_policy() {
+        let spec = RemoteSpec {
+            user: None,
+            host: "example".to_string(),
+            rsh: vec!["ssh".to_string()],
+            syq_path: None,
+            auto_helper: false,
+            helper_install: Default::default(),
+            quiet: false,
+            tcp: Default::default(),
+        };
+        let command = spec.ssh_command();
+        assert!(!command
+            .get_args()
+            .any(|arg| arg.to_string_lossy().starts_with("StrictHostKeyChecking=")));
+
+        let mut configured = spec;
+        configured.rsh = vec![
+            "ssh".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=yes".to_string(),
+        ];
+        assert!(configured
+            .ssh_command()
+            .get_args()
+            .any(|arg| arg == OsStr::new("StrictHostKeyChecking=yes")));
     }
 }

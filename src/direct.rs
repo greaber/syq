@@ -6,6 +6,30 @@ use anyhow::{bail, Context, Result};
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 
+fn direct_command(
+    rsh: &[String],
+    user: Option<&str>,
+    host: &str,
+    remote_cmd: &str,
+    forward_agent: bool,
+) -> Command {
+    let mut cmd = Command::new(&rsh[0]);
+    cmd.args(&rsh[1..]);
+    if rsh[0].ends_with("ssh") {
+        // Pass an explicit setting in both directions so ~/.ssh/config cannot
+        // silently override --no-forward-agent (or same-host suppression).
+        cmd.arg(if forward_agent { "-A" } else { "-a" });
+        if let Some(user) = user {
+            cmd.args(["-l", user]);
+        }
+        cmd.arg("--");
+    } else if let Some(user) = user {
+        cmd.args(["-l", user]);
+    }
+    cmd.arg(host).arg(remote_cmd);
+    cmd
+}
+
 pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     let rsh = parse_rsh(&args.rsh)?;
     let src_host = srcs[0].host.clone().unwrap();
@@ -150,9 +174,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
 
     let remote_cmd = if args.detach {
         // Survive the loss of this ssh session: new session, no controlling
-        // terminal, everything to a log file. The transfer itself still needs
-        // the forwarded agent only for its initial connections, so hostA must
-        // be able to reach hostB with its own credentials for a long run.
+        // terminal, everything to a log file. A forwarded agent disappears
+        // when the launcher session ends, so hostA needs its own credentials
+        // for a detached transfer to hostB.
         // The basename is interpolated into a remote shell command; allow only
         // safe characters so a crafted filename can't inject commands.
         let raw = srcs[0]
@@ -184,21 +208,15 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         remote_cmd
     };
 
+    let forward_agent = !args.no_forward_agent && !srcs[0].same_host(dst);
     let make_command = || {
-        let mut cmd = Command::new(&rsh[0]);
-        cmd.args(&rsh[1..]);
-        if rsh[0].ends_with("ssh") {
-            // Agent forwarding so the source host can authenticate to the destination.
-            cmd.arg("-A");
-            if let Some(u) = &srcs[0].user {
-                cmd.args(["-l", u]);
-            }
-            cmd.arg("--");
-        } else if let Some(u) = &srcs[0].user {
-            cmd.args(["-l", u]);
-        }
-        cmd.arg(&src_host).arg(&remote_cmd);
-        cmd
+        direct_command(
+            &rsh,
+            srcs[0].user.as_deref(),
+            &src_host,
+            &remote_cmd,
+            forward_agent,
+        )
     };
     if args.detach {
         let run = || {
@@ -331,4 +349,37 @@ pub fn follow(args: &Args) -> Result<i32> {
         eprintln!();
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn args(command: &Command) -> Vec<&OsStr> {
+        command.get_args().collect()
+    }
+
+    #[test]
+    fn direct_ssh_controls_agent_forwarding_explicitly() {
+        let rsh = vec!["ssh".to_string(), "-p".to_string(), "2222".to_string()];
+        let forwarded = direct_command(&rsh, Some("alice"), "source", "syq ...", true);
+        let forwarded = args(&forwarded);
+        assert!(forwarded.contains(&OsStr::new("-A")));
+        assert!(!forwarded.contains(&OsStr::new("-a")));
+
+        let disabled = direct_command(&rsh, Some("alice"), "source", "syq ...", false);
+        let disabled = args(&disabled);
+        assert!(disabled.contains(&OsStr::new("-a")));
+        assert!(!disabled.contains(&OsStr::new("-A")));
+    }
+
+    #[test]
+    fn custom_remote_shell_does_not_get_ssh_agent_flags() {
+        let rsh = vec!["custom-rsh".to_string()];
+        let command = direct_command(&rsh, None, "source", "syq ...", false);
+        let args = args(&command);
+        assert!(!args.contains(&OsStr::new("-a")));
+        assert!(!args.contains(&OsStr::new("-A")));
+    }
 }

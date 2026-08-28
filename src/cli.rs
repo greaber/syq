@@ -160,6 +160,10 @@ pub struct Args {
     /// Remote-to-remote: relay data through this machine instead of running on the source host
     #[arg(long)]
     pub relay: bool,
+    /// Remote-to-remote: disable SSH agent forwarding to the source host; it must authenticate
+    /// to the destination with its own credentials
+    #[arg(long)]
+    pub no_forward_agent: bool,
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
     pub width: Option<usize>,

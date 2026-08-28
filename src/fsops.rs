@@ -321,6 +321,8 @@ struct FdKey {
     /// Source files and partials get a fresh cache entry after a source-change
     /// retry. An old descriptor may point at an inode that was renamed away.
     attempt: u32,
+    /// Keep a privately-owned sidecar from sharing an unchecked cache entry.
+    private: bool,
 }
 
 struct PartialTarget<'a> {
@@ -343,22 +345,21 @@ impl FsOps {
         }
     }
 
-    fn cached(&mut self, p: &Path, write: bool, attempt: u32) -> Result<&File> {
+    fn cached(&mut self, p: &Path, write: bool, attempt: u32, private: bool) -> Result<&File> {
         let key = FdKey {
             path: p.to_path_buf(),
             attempt,
+            private,
         };
         if !self.fds.contains_key(&key) {
             if self.fds.len() >= FD_CACHE_MAX {
                 let victim = self.fd_order.remove(0);
                 self.fds.remove(&victim);
             }
-            let f = if write {
-                OpenOptions::new().write(true).open(p)
-            } else {
-                File::open(p)
+            let f = open_existing_regular(p, write)?;
+            if private {
+                require_owned_private(&f, p)?;
             }
-            .with_context(|| format!("open {}", p.display()))?;
             self.fds.insert(key.clone(), f);
             self.fd_order.push(key.clone());
         }
@@ -709,7 +710,13 @@ impl FsOps {
         let pp = partial_path(&p, partial_id)?;
         let partial_size = match fs::symlink_metadata(&pp) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => Some(metadata.len()),
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.nlink() == 1
+                    && metadata.uid() == unsafe { libc::geteuid() } =>
+            {
+                Some(metadata.len())
+            }
             Ok(_) => None,
             Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
         };
@@ -724,7 +731,11 @@ impl FsOps {
         let mut repaired_permissions = false;
         for _ in 0..8 {
             match fs::symlink_metadata(pp) {
-                Ok(md) if md.is_file() && md.nlink() == 1 => {
+                Ok(md)
+                    if md.is_file()
+                        && md.nlink() == 1
+                        && md.uid() == unsafe { libc::geteuid() } =>
+                {
                     match OpenOptions::new()
                         .read(true)
                         .write(true)
@@ -736,6 +747,7 @@ impl FsOps {
                             let path_meta = fs::symlink_metadata(pp)?;
                             if !fd_meta.file_type().is_file()
                                 || fd_meta.nlink() != 1
+                                || fd_meta.uid() != unsafe { libc::geteuid() }
                                 || fd_meta.dev() != path_meta.dev()
                                 || fd_meta.ino() != path_meta.ino()
                             {
@@ -761,14 +773,11 @@ impl FsOps {
                             let fd_meta = readonly.metadata()?;
                             if !fd_meta.file_type().is_file()
                                 || fd_meta.nlink() != 1
+                                || fd_meta.uid() != unsafe { libc::geteuid() }
                                 || fd_meta.dev() != md.dev()
                                 || fd_meta.ino() != md.ino()
                             {
                                 continue;
-                            }
-                            if fd_meta.uid() != unsafe { libc::geteuid() } && !is_root() {
-                                return Err(error)
-                                    .with_context(|| format!("open {}", pp.display()));
                             }
                             readonly
                                 .set_permissions(fs::Permissions::from_mode(0o600))
@@ -794,7 +803,10 @@ impl FsOps {
                         .mode(0o600)
                         .open(pp)
                     {
-                        Ok(file) => Ok((file, None)),
+                        Ok(file) => {
+                            require_owned_private(&file, pp)?;
+                            Ok((file, None))
+                        }
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                         Err(error) => {
                             Err(error).with_context(|| format!("create {}", pp.display()))
@@ -963,7 +975,7 @@ impl FsOps {
         mode: u32,
     ) -> Result<()> {
         let sp = resolve(src);
-        let s = File::open(&sp).with_context(|| format!("open {}", sp.display()))?;
+        let s = open_existing_regular(&sp, false)?;
         let dp = resolve(dst);
         // Never truncate the source: if the destination resolves to the same
         // file (same path, a hardlink, or a symlink pointing back), refuse.
@@ -1117,7 +1129,10 @@ impl FsOps {
         } else {
             p
         };
-        let mut f = File::open(&p).with_context(|| format!("open {}", p.display()))?;
+        let mut f = open_existing_regular(&p, false)?;
+        if which == Which::Partial {
+            require_owned_private(&f, &p)?;
+        }
         hash_reader(&mut f, block, len)
     }
 
@@ -1129,7 +1144,7 @@ impl FsOps {
         len: u32,
     ) -> Result<Response> {
         let p = resolve(path);
-        let f = self.cached(&p, false, attempt)?;
+        let f = self.cached(&p, false, attempt, false)?;
         let mut data = vec![0u8; len as usize];
         f.read_exact_at(&mut data, off)
             .with_context(|| format!("read {} @{off}+{len}", p.display()))?;
@@ -1155,7 +1170,7 @@ impl FsOps {
         } else {
             partial_path(&p, target.id)?
         };
-        let f = self.cached(&p, true, attempt)?;
+        let f = self.cached(&p, true, attempt, !inplace)?;
         f.write_all_at(data, off)
             .with_context(|| format!("write {} @{off}", p.display()))
     }
@@ -1174,13 +1189,17 @@ impl FsOps {
         } else {
             partial_path(&p, partial_id)?
         };
-        let f = self.uncache(&src).map(Ok).unwrap_or_else(|| {
-            OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&src)
-                .with_context(|| format!("open {}", src.display()))
-        })?;
+        let f = self
+            .uncache(&src)
+            .map(Ok)
+            .unwrap_or_else(|| open_existing_regular(&src, true))?;
+        if inplace {
+            if !f.metadata()?.file_type().is_file() {
+                bail!("destination {} is not a regular file", src.display());
+            }
+        } else {
+            require_owned_private(&f, &src)?;
+        }
         set_meta_file(&f, meta, flags)
             .with_context(|| format!("set metadata {}", src.display()))?;
         if !inplace {
@@ -1197,7 +1216,7 @@ impl FsOps {
 
     pub fn file_hash(&mut self, path: &[u8]) -> Result<Response> {
         let p = resolve(path);
-        let mut f = File::open(&p).with_context(|| format!("open {}", p.display()))?;
+        let mut f = open_existing_regular(&p, false)?;
         let mut h = Xxh3::new();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
@@ -1375,6 +1394,37 @@ fn open_regular_write(target: &Path, mode: u32) -> Result<File> {
     Ok(f)
 }
 
+/// Open an existing leaf without following a last-component symlink. Parent
+/// component confinement is a separate, root-fd-based design problem.
+fn open_existing_regular(target: &Path, write: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(!write)
+        .write(write)
+        .custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(target)
+        .with_context(|| format!("open {}", target.display()))?;
+    if !file.metadata()?.file_type().is_file() {
+        bail!("{} is not a regular file", target.display());
+    }
+    Ok(file)
+}
+
+fn require_owned_private(file: &File, target: &Path) -> Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        bail!(
+            "partial {} is not an owned, singly-linked regular file",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
 fn mkdir(p: &Path, mode: u32) -> io::Result<()> {
     std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), (mode & 0o7777) | 0o700)
         .create(p)
@@ -1524,6 +1574,51 @@ fn apply_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_dir() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "syq-fsops-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn existing_regular_open_does_not_follow_leaf_symlinks() {
+        let dir = test_dir();
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("file");
+        let link = dir.join("link");
+        fs::write(&file, b"data").unwrap();
+        symlink(&file, &link).unwrap();
+
+        let regular_opened = open_existing_regular(&file, false).is_ok();
+        let link_rejected = open_existing_regular(&link, false).is_err();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(regular_opened);
+        assert!(link_rejected);
+    }
+
+    #[test]
+    fn private_partial_must_have_one_link() {
+        let dir = test_dir();
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("partial");
+        let alias = dir.join("alias");
+        fs::write(&file, b"data").unwrap();
+        fs::hard_link(&file, &alias).unwrap();
+
+        let opened = open_existing_regular(&file, true).unwrap();
+        let rejected = require_owned_private(&opened, &file).is_err();
+        drop(opened);
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(rejected);
+    }
 
     #[test]
     fn partial_name_keeps_job_id_and_fits_name_max() {
