@@ -4598,3 +4598,69 @@ fn sidecar_patterned_extras_do_not_block_directory_deletion() {
     assert!(out.status.success(), "{}", stderr_of(&out));
     assert_eq!(listing(&t.path("dst")), ["a"]);
 }
+
+// ----------------------------------------------------------- review round 10
+
+#[test]
+fn size_arguments_reject_negative_nan_and_overflow() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    for (flag, bad) in [
+        ("--max-size", "-1"),
+        ("--max-size", "-1K"),
+        ("--min-size", "nan"),
+        ("--max-size", "inf"),
+        ("--max-size", "1e30"),
+        ("--block-size", "-4M"),
+    ] {
+        let arg = format!("{flag}={bad}");
+        let out = syq(&["-a", &arg, &t.s("src/"), &t.s("dst")]);
+        assert!(!out.status.success(), "{arg}");
+        assert!(
+            stderr_of(&out).to_lowercase().contains("size"),
+            "{arg}: {}",
+            stderr_of(&out)
+        );
+        assert!(!t.path("dst/f").exists(), "{arg}: nothing may be copied");
+    }
+    // Fractional sizes keep working.
+    let so = run_ok(&["-a", "--max-size", "1.5K", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(transferred(&so), 1);
+}
+
+#[test]
+fn delete_records_checkpoint_intent_before_unlinking() {
+    // A file the checkpoint recorded as complete leaves the source; --delete
+    // tries to remove it but the unlink fails (read-only extra directory —
+    // claimed directories get opened up, extras don't). The Deleted intent
+    // must already be durable in the checkpoint — written before the unlink —
+    // so a later restore with the same fingerprint is rechecked, not assumed.
+    let t = Tmp::new();
+    write(&t.path("src/sub/f"), b"data");
+    set_mtime(&t.path("src/sub/f"), 1_600_000_000);
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    fs::remove_dir_all(t.path("src/sub")).unwrap();
+    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+    let out = syq(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        "--delete",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(t.path("dst/sub/f").exists(), "unlink really failed");
+    let state = String::from_utf8_lossy(&read(&t.path("state"))).into_owned();
+    assert!(
+        state.contains("\"deleted\""),
+        "intent must precede the unlink: {state}"
+    );
+}

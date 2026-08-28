@@ -2390,6 +2390,19 @@ impl Planner<'_> {
                         }
                         continue;
                     }
+                    // Write-ahead: the Deleted intents go into the checkpoint,
+                    // durably, before anything is unlinked (see
+                    // record_deleted_batch for why this order).
+                    if !rmdir {
+                        if let Some(c) = &checkpoint {
+                            c.record_deleted_batch(
+                                chunk
+                                    .iter()
+                                    .filter(|(_, _, dst_rel)| !dst_rel.is_empty())
+                                    .map(|(_, _, dst_rel)| dst_rel.as_slice()),
+                            );
+                        }
+                    }
                     let ops: Vec<Op> = chunk
                         .iter()
                         .map(|(p, _, _)| {
@@ -2402,18 +2415,12 @@ impl Planner<'_> {
                             }
                         })
                         .collect();
-                    for ((_, rel, dst_rel), err) in chunk.iter().zip(me.apply(ops)?) {
+                    for ((_, rel, _), err) in chunk.iter().zip(me.apply(ops)?) {
                         match err {
                             None => {
                                 n += 1;
                                 if opts.verbose > 0 {
                                     me.progress.println(&format!("deleting {rel}"));
-                                }
-                                // Forget any completion record: if the source ever
-                                // brings this path back with the same fingerprint,
-                                // it must be transferred, not assumed present.
-                                if let (Some(c), false) = (&checkpoint, dst_rel.is_empty()) {
-                                    c.record_deleted(dst_rel);
                                 }
                             }
                             Some(e) => me.progress.error(&format!("syq: delete {rel}: {e}")),

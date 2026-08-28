@@ -507,7 +507,16 @@ pub fn parse_size(s: &str) -> Result<u64> {
         _ => (s, 1),
     };
     let n: f64 = num.parse().map_err(|_| anyhow::anyhow!("bad size {s:?}"))?;
-    Ok((n * mult as f64) as u64)
+    // The float-to-int cast saturates: -1 would silently become 0 (and with
+    // --max-size exclude every non-empty file), NaN 0, inf u64::MAX.
+    if !n.is_finite() || n < 0.0 {
+        bail!("bad size {s:?}");
+    }
+    let scaled = n * mult as f64;
+    if scaled >= u64::MAX as f64 {
+        bail!("size {s:?} is too large");
+    }
+    Ok(scaled as u64)
 }
 
 #[derive(Debug, Clone)]

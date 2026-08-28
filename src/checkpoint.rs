@@ -370,15 +370,24 @@ impl Checkpoint {
         }
     }
 
-    /// --delete removed `path`: forget its completion record, so a retry
-    /// never assumes it present if the source brings it back unchanged.
-    pub fn record_deleted(&self, path: &[u8]) {
+    /// --delete is about to unlink these paths: persist the intents *before*
+    /// the unlinks, durably, so a crash can never leave a stale Complete
+    /// record for a file that is gone. A stale Deleted intent (recorded, then
+    /// the unlink failed or never ran) only costs a recheck on retry.
+    pub fn record_deleted_batch<'a>(&self, paths: impl Iterator<Item = &'a [u8]>) {
         if self.failed.lock().unwrap().is_some() {
             return;
         }
-        if let Err(e) = self.append(&Record::Deleted {
-            path_b64: b64(path),
-        }) {
+        let result = (|| {
+            for path in paths {
+                self.append(&Record::Deleted {
+                    path_b64: b64(path),
+                })?;
+            }
+            let mut writer = self.writer.lock().unwrap();
+            self.flush_locked(&mut writer)
+        })();
+        if let Err(e) = result {
             self.note_error(e);
         }
     }
