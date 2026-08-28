@@ -43,7 +43,12 @@ SSH authentication is broken, restore those variables in the same shell
 that will run `ssh`:
 
 ```bash
-eval "$(tmux show-env -s | grep '^SSH_')"
+_syq_tmux_env="$(tmux show-env -s)" &&
+  _syq_tmux_ssh_env="$(
+    grep -E '^(SSH_|unset SSH_)' <<<"$_syq_tmux_env"
+  )" &&
+  eval "$_syq_tmux_ssh_env" &&
+  unset _syq_tmux_env _syq_tmux_ssh_env
 ```
 
 Each agent tool command starts a new shell, so prefix the relevant SSH
@@ -109,10 +114,11 @@ outlive its premise and steer later work in the wrong direction.
 
 ## PR review freshness
 
-- For any GitHub PR review or re-review, never assume the current checkout `HEAD` is the latest PR code. Resolve the PR's `headRefName` and GitHub `headRefOid` first.
-- In this repo's multi-worktree review workflow, also resolve the local branch ref for that same `headRefName`. A detached review worktree can stay pinned to an old commit even when the branch ref has moved.
-- Choose the review target from the named branch ref / GitHub head comparison, not from the current worktree `HEAD`. If local and GitHub match, review that SHA.
-- If the local branch is ahead of GitHub, do not silently review the stale GitHub PR head. Tell the user GitHub is stale and either review the local branch tip explicitly or wait for the fixes to be pushed.
+- For any GitHub PR review or re-review, never assume the current checkout `HEAD` is the latest PR code. Resolve the PR's `headRefName`, `headRefOid`, and head-repository identity (owner and repository) first. Treat the GitHub `headRefOid` as authoritative unless a fresher local commit is verified as described below.
+- In this repo's multi-worktree review workflow, also resolve the local branch ref for the PR's `headRefName`. A detached review worktree can stay pinned to an old commit even when the branch ref has moved.
+- A matching branch name is not proof that a local ref belongs to the PR, especially for fork PRs. Treat a local ref as PR code only when its worktree ownership is explicit and its repository identity and ancestry relative to `headRefOid` have been verified.
+- If the local ref is missing, behind the GitHub head, divergent from it, or cannot be tied unambiguously to the PR's head repository, review the GitHub `headRefOid`. Fetch that exact head into a dedicated review ref or worktree when necessary, without overwriting an unrelated local branch, and report the discrepancy.
+- If local and GitHub refs match, review that SHA. If the local ref is ahead, use it only when the worktree belongs to the task and the GitHub `headRefOid` is its ancestor; tell the user that GitHub is stale and either review the unpushed local tip explicitly or wait for it to be pushed.
 - If the chosen review target SHA matches the last SHA already reviewed, stop immediately and report that the PR is unchanged instead of producing another review.
 - Always state the exact reviewed SHA and whether it came from the local branch tip or the GitHub PR head.
 
@@ -155,7 +161,7 @@ every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
 
 ## Verification
 
-**Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, install it yourself and retry. Do not silently skip the step. If you can't fix the problem (e.g., sudo required, credentials missing), ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
+**Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
 
 Run checks proportionate to the change. The normal Rust checks are:
 
