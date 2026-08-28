@@ -37,7 +37,7 @@ behavior; an entry without one is only believed, not held.
 | `--delete` scope: only inside the directories being synced; a single-file source deletes nothing | measured | `delete_only_inside_directories_the_sources_map_onto`, `delete_with_nested_roots_deletes_once` |
 | Ignored/excluded paths are protected from deletion by default; `--delete-excluded` lifts that | measured | `delete_removes_extras_and_protects_ignored`, `delete_nested_roots_keep_their_own_anchored_ignores`, `delete_excluded_removes_ignored_destination_paths` |
 | A directory that can't be emptied because of protected content is reported and left (rsync: `cannot delete non-empty directory`; pcp: `not deleting keep/: it holds ignored paths`) | measured | `delete_removes_extras_and_protects_ignored` |
-| Deletion is skipped when the source scan hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; pcp is stricter, see "Different" | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
+| Deletion is skipped when listing the source hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; see "Different" 2 for the transfer-time case | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
 | Files the source has but a rule skips — `-u`, `--existing`, `--ignore-existing`, `--max-size`/`--min-size`, symlinks without `-l`, specials without `-D` — are not deleted, even when the destination entry is a non-empty directory | measured on 3.2.7 and 3.5.0 (an earlier README claim that rsync deletes a `--max-size` casualty was wrong) | `delete_never_removes_paths_the_source_has_but_skips`, `delete_leaves_directory_contents_under_a_skipped_source_path`, `size_limits_filter_files_and_protect_them_from_delete`, `delete_keeps_partials_of_filtered_files` |
 | `-u`/`--update`: a destination regular file with a newer mtime is left alone | measured for regular files; see "Different" for symlinks/devices | `update_skips_files_newer_on_the_destination` |
 | `--existing` / `--ignore-existing`, including `--existing` covering directories | measured | `ignore_existing_and_existing`, `existing_never_creates_the_destination_root`, `existing_leaves_a_file_where_a_source_directory_would_go`, `existing_dry_run_lists_no_missing_directories`, `existing_opens_up_readonly_dirs_even_after_a_symlinked_dir` |
@@ -61,11 +61,12 @@ item.
    quiescent destination (no races with partial renames or in-place replaces).
    The cost is that space is never freed before writing. We consider "an
    aborted `--delete` run deleted half the tree" a worse outcome than "ran out
-   of space."
+   of space." *Test: `delete_with_inplace_replacing_many_symlinks`,
+   `delete_removes_only_this_jobs_orphaned_sidecars`.*
 2. **`--max-delete N` deletes *nothing* past the limit.** rsync deletes the
    first N and then stops. A safety cap that leaves the destination in a
    partially-deleted state is not much of a safety cap; pcp refuses outright,
-   says so, and exits 25 like rsync.
+   says so, and exits 25 like rsync. *Test: `max_delete_refuses_everything_past_the_limit`.*
 3. **`--files-from` follows symlinked implied parents and creates them as real
    directories on the destination**, and refuses a listed symlink together with
    a path through it. rsync's behavior here is version-sensitive (measured:
@@ -74,12 +75,20 @@ item.
    parent as a symlink would make a later write go *through* a destination
    symlink to wherever it points, which is how a file list could redirect
    writes outside the destination. Listing `data/foo` means "I want `foo`
-   under `data`"; pcp does that and nothing else.
+   under `data`"; pcp does that and nothing else. *Test:
+   `files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs`,
+   `files_from_leaves_no_ancestors_behind_on_a_bad_chain`,
+   `files_from_symlink_conflict_is_order_independent`.*
 4. **Two distinct sources mapping onto one destination file is an error.**
    Measured rsync silently keeps the first. Silent last-writer-wins (or
    first-writer-wins) on a collision is data loss with no message; pcp refuses
    and names both. *Identical* repeated sources should be deduplicated instead
-   — open issue 3. *Test: `delete_with_inplace_replacing_many_symlinks`, `delete_cleans_stale_partials_but_keeps_resume_state_of_failed_files`.* *Test: `max_delete_refuses_everything_past_the_limit`.* *Test: `files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs`, `files_from_leaves_no_ancestors_behind_on_a_bad_chain`.* *Test: `duplicate_destination_rejected`, `dir_vs_file_destination_collision_rejected`, `copy_onto_itself_among_sources_is_order_independent`.*
+   — open issue 3. Naming the destination file itself as one of the sources
+   is a conflict too, not a licence for the other source to overwrite it.
+   *Test: `duplicate_destination_rejected`, `dir_vs_file_destination_collision_rejected`,
+   `cross_source_collision_is_detected_before_any_change`,
+   `copy_onto_itself_among_sources_is_order_independent`,
+   `three_claimants_are_validated_as_a_group`.*
 
 ## Different, no claim of better
 
@@ -91,29 +100,41 @@ item.
    per-directory merge files. gitignore is what most users already know; the
    trade is that rsync filter files can't be reused. (The short `-i` alias is a
    separate CLI problem — open issue 1.)
-2. **Any source-scan warning disables deletion**, not just I/O errors on the
-   file list. Stricter than rsync; a directory we couldn't read would
-   otherwise look like one whose contents vanished.
+2. **Any error while listing the source disables deletion** — the same idea
+   as rsync's file-list I/O check. A directory we couldn't read would
+   otherwise look like one whose contents vanished. A read failure *during
+   transfer* does not disable deletion: the failed file is still claimed, so
+   it is never an extra, and the extras set is unaffected. *Test:
+   `unreadable_source_root_disables_delete`,
+   `delete_is_skipped_when_the_source_scan_has_errors`.*
 3. **`-u` applies to regular files only.** rsync also compares mtimes for
    symlinks and devices (believed, not measured). Low impact; could be
    aligned.
 4. **`--files-from` cannot combine with `--ignore`/`--ignore-from` or
    `--delete`, and direct remote→remote needs `--relay`** (the list is read
    on the invoking machine). rsync allows all three. Restrictions rather than
-   differences: you get a clear usage error. Filters over a file list is a
+   differences: you get a clear usage error. *Test:
+   `files_from_rejections_and_stdin`.* Filters over a file list is a
    plausible later addition; deletion scope under a file list is genuinely
    ambiguous and rsync's semantics for it are murky.
 5. **`--verify-only` checks the run's scope.** `-u`, size limits,
    `--existing`, `--ignore-existing` narrow what a run would transfer, and
    `--verify-only` verifies exactly that set. rsync has no `--verify-only`.
-6. **Source files named `.name.pcp-partial` are never copied.** rsync copies
-   them. The name is pcp's in-flight file for `name` in the same directory;
-   copying both would collide. The destination copy of such a file is still
-   protected from `--delete`. Open issue 4 is about changing this.
+   *Test: `verify_only_checks_the_filtered_scope`.*
+6. **Source entries named like sidecars (`.name.syq-part.<id>`) are never
+   copied**, whatever kind of entry carries the name (a directory so named is
+   left out with its contents). rsync copies them. The name is pcp's in-flight
+   file for `name` in the same directory; copying it would collide with, or
+   wedge, later transfers of `name`. The destination copy of such an entry is
+   still protected from `--delete`. Open issue 4 is about changing this.
+   *Test: `delete_keeps_user_files_named_like_partials_and_other_jobs_sidecars`,
+   `partial_named_symlink_is_a_symlink_not_a_leftover`,
+   `delete_treats_partial_named_directory_as_ordinary_extra`,
+   `sidecar_named_source_directory_is_not_copied`.*
 7. **Deletions are executed over the control connection** in batches of 1000
    (the receiving side unlinks a batch in parallel), not spread over the `-j`
    data connections. rsync has one connection anyway; this is a note about
-   pcp's own model. *Test: `unreadable_source_root_disables_delete`.* *Test: `verify_only_checks_the_filtered_scope`.* *Test: `delete_keeps_user_files_named_like_partials_and_survives_bare_suffix`, `partial_named_symlink_is_a_symlink_not_a_leftover`, `delete_treats_partial_named_directory_as_ordinary_extra`.*
+   pcp's own model.
 
 ## Not implemented
 

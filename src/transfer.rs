@@ -578,6 +578,15 @@ pub fn run(args: Args) -> Result<i32> {
         Some(_) => false,
         None => srcs.len() > 1 || dst.copies_contents() || args.files_from.is_some(),
     };
+    if args.files_from.is_some() {
+        if let Some(e) = dst_root_entry.as_ref().filter(|e| e.kind != Kind::Dir) {
+            bail!(
+                "--files-from needs a directory destination; {} is a {:?}",
+                display(&dst_root),
+                e.kind
+            );
+        }
+    }
 
     // Reject copying a directory into itself: if the effective destination
     // resolves to (or inside) a source directory, the scanner would discover
@@ -674,6 +683,7 @@ pub fn run(args: Args) -> Result<i32> {
         checkpoint: checkpoint_writer,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
+        pruned: std::collections::HashSet::new(),
         collision: false,
         deferred: Vec::new(),
         dirs_created: 0,
@@ -1057,6 +1067,9 @@ struct Planner<'a> {
     /// --existing: destination directories that don't exist (or aren't
     /// directories); nothing under them is touched.
     missing_dirs: std::collections::HashSet<PathBytes>,
+    /// Source directories that are never copied (sidecar-named); nothing
+    /// under them is either.
+    pruned: std::collections::HashSet<PathBytes>,
     completed:
         Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>>,
     checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
@@ -1182,9 +1195,9 @@ impl Planner<'_> {
 
     /// --files-from: instead of walking the source, stat each listed path (and
     /// the directories leading to it) and feed them to the planner as if a scan
-    /// had produced them. Every ancestor must be a real directory: a symlink in
-    /// the middle of a listed path would let the copy read outside the source
-    /// root (and, mirrored on the destination, write outside it). Listed
+    /// had produced them. Implied parents are stat'ed through symlinks and must
+    /// resolve to directories; they become real directories on the destination,
+    /// so nothing is ever written through a destination symlink. Listed
     /// directories — only those, not implied parents — are walked with an
     /// explicit -r.
     fn scan_files_from(
@@ -1424,12 +1437,14 @@ impl Planner<'_> {
             // path, and it is what makes --delete safe — whatever happens
             // below (skip, filter, unsupported type, resumed from a journal),
             // a path the source has is never an extra.
-            let partial_named = e.kind == Kind::File
-                && crate::fsops::is_partial_name(std::ffi::OsStr::from_bytes(
-                    e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path),
-                ));
+            // Names reserved for sidecars are never payload, whatever kind of
+            // entry carries them: a directory called `.x.syq-part.<id>` in the
+            // destination would wedge every later transfer of `x` there.
+            let partial_named = crate::fsops::is_partial_name(std::ffi::OsStr::from_bytes(
+                e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path),
+            ));
             let claim = match e.kind {
-                Kind::Dir => Claim::Dir,
+                Kind::Dir if !partial_named => Claim::Dir,
                 Kind::File if !partial_named => Claim::File {
                     dev: e.dev,
                     ino: e.ino,
@@ -1448,7 +1463,12 @@ impl Planner<'_> {
                 Claim::Dir => dirs.push((dst, e)),
                 Claim::Weak if partial_named || e.kind == Kind::Other => {
                     // Never transferred: syq's own leftovers, unknown types.
-                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    if e.kind == Kind::Dir {
+                        // ...and nothing below such a directory either.
+                        self.pruned.insert(dst);
+                    } else {
+                        self.progress.files_excluded.fetch_add(1, Relaxed);
+                    }
                 }
                 Claim::Weak => {
                     // Symlink without -l, special without -D.
@@ -1506,14 +1526,18 @@ impl Planner<'_> {
             let stats = self.stat_many(true, groups.keys().cloned().collect())?;
             for ((dst, (rel, ids)), st) in groups.into_iter().zip(stats) {
                 let dst_id = st.filter(|_| self.opts.same_host).map(|d| (d.dev, d.ino));
+                // Every claimant must be the destination file itself (a copy
+                // onto itself, written by nobody). One claimant being that
+                // file does not license another to overwrite it: the user
+                // named it as a source, and it would be lost.
+                let total = ids.len();
                 let mut distinct: Vec<(u64, u64)> =
                     ids.into_iter().filter(|id| Some(*id) != dst_id).collect();
                 distinct.sort_unstable();
                 distinct.dedup();
-                if distinct.len() > 1 {
+                if !distinct.is_empty() {
                     self.progress.error(&format!(
-                        "syq: {rel}: {} sources map to the same destination {} — refusing to clobber it",
-                        distinct.len(),
+                        "syq: {rel}: {total} sources map to the same destination {} — refusing to clobber it",
                         display(&dst)
                     ));
                     self.collision = true;
@@ -1562,6 +1586,9 @@ impl Planner<'_> {
             };
             let mut planned: Vec<(PathBytes, Entry, Option<Entry>)> = Vec::new();
             for ((p, e), st) in dirs.into_iter().zip(stats) {
+                if self.under_pruned(&p, dst_root) {
+                    continue;
+                }
                 let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
                 if opts.verify_only {
                     if !is_dir {
@@ -1686,7 +1713,9 @@ impl Planner<'_> {
                 e,
                 contested,
             } = p;
-            if opts.existing && self.under_missing_dir(&dst_path, dst_root) {
+            if self.under_pruned(&dst_path, dst_root)
+                || (opts.existing && self.under_missing_dir(&dst_path, dst_root))
+            {
                 // Below a directory we won't create: nothing to do, even if the
                 // destination has something reachable there through a symlink.
                 self.progress.files_excluded.fetch_add(1, Relaxed);
@@ -1959,12 +1988,21 @@ impl Planner<'_> {
     /// --existing: is some directory between the destination root and `dst`
     /// one we decided not to create?
     fn under_missing_dir(&self, dst: &[u8], dst_root: &[u8]) -> bool {
-        if self.missing_dirs.is_empty() {
+        Self::under_any(&self.missing_dirs, dst, dst_root)
+    }
+
+    fn under_pruned(&self, dst: &[u8], dst_root: &[u8]) -> bool {
+        Self::under_any(&self.pruned, dst, dst_root)
+    }
+
+    /// Is `dst`, or a directory between the destination root and it, in `set`?
+    fn under_any(set: &std::collections::HashSet<PathBytes>, dst: &[u8], dst_root: &[u8]) -> bool {
+        if set.is_empty() {
             return false;
         }
         // The root itself may be the missing one (e.g. a symlink to a
         // directory elsewhere, which we must neither replace nor write through).
-        if self.missing_dirs.contains(dst_root) {
+        if set.contains(dst_root) {
             return true;
         }
         let mut end = dst.len();
@@ -1972,7 +2010,7 @@ impl Planner<'_> {
             if i <= dst_root.len() {
                 break;
             }
-            if self.missing_dirs.contains(&dst[..i]) {
+            if set.contains(&dst[..i]) {
                 return true;
             }
             end = i;

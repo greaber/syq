@@ -214,15 +214,17 @@ Identical to rsync:
   otherwise `dest` is the new filename.
 - Several sources require (or create) a directory destination. With several
   sources syq scans them all before writing anything, so two sources mapping
-  onto one destination path with different contents is refused before the
-  destination is touched — not even a missing destination directory is
-  created (the transfer starts once the scans finish).
+  onto one destination path is refused before the destination is touched —
+  not even a missing destination directory is created (the transfer starts
+  once the scans finish). Naming the destination file itself as one of the
+  sources doesn't change that: it would be overwritten, so it's a conflict.
 - A destination that is a symlink to a directory is that directory (the link
   is kept, with or without a trailing slash); a symlink to anything else is
   replaced like a file.
 - syq's own bookkeeping is never payload (as rsync excludes its
   `--partial-dir`): names reserved for `.syq-part` sidecars are silently left
-  out. Everything else is copied.
+  out, whatever kind of entry carries them (a directory so named is left out
+  with its contents). Everything else is copied.
 - `host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
   A colon before the first slash means remote; `./x:y` is local. All sources
   must be on the same host. `host::module` (daemon syntax) is not supported.
@@ -599,9 +601,10 @@ does not count, as in rsync — so `-a -r --files-from` walks the directories
 the list names (never the implied parents).
 Blank lines are ignored, leading `/` or `./` and trailing `/` are stripped,
 and `..` components or a line that names the root itself are rejected. A listed path that doesn't exist is an
-error (exit 23) and the rest is still copied. `--files-from` can't be combined
-with `-i`/`--ignore-from` or `--delete`; for a remote-to-remote copy it needs
-`--relay` (the list is read on this machine).
+error (exit 23) and the rest is still copied. The destination must be a directory (an
+existing file there is an error, never replaced). `--files-from` can't be
+combined with `-i`/`--ignore-from` or `--delete`; for a remote-to-remote copy
+it needs `--relay` (the list is read on this machine).
 
 ## Parallel removal (`--rm`)
 

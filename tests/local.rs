@@ -1674,7 +1674,11 @@ fn delete_removes_only_this_jobs_orphaned_sidecars() {
     //    is resume state and stays.
     let t = Tmp::new();
     write(&t.path("src/ok"), &vec![7u8; 8 << 20]);
-    let partial = interrupted_partial(&["-a", &t.s("src/"), &t.s("dst")], &t.path("dst"));
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let partial = interrupted_partial(
+        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &t.path("dst"),
+    );
     assert!(partial.exists());
     fs::copy(t.path("src/ok"), t.path("dst/ok")).unwrap();
     set_mtime(&t.path("src/ok"), 1_600_000_000);
@@ -1686,7 +1690,11 @@ fn delete_removes_only_this_jobs_orphaned_sidecars() {
     // 2. Orphan: the source file is gone, so its sidecar is an extra.
     let t = Tmp::new();
     write(&t.path("src/gone"), &vec![7u8; 8 << 20]);
-    let partial = interrupted_partial(&["-a", &t.s("src/"), &t.s("dst")], &t.path("dst"));
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let partial = interrupted_partial(
+        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &t.path("dst"),
+    );
     fs::remove_file(t.path("src/gone")).unwrap();
     let so = run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
     assert!(!partial.exists());
@@ -1695,7 +1703,11 @@ fn delete_removes_only_this_jobs_orphaned_sidecars() {
     // 3. Failed this run: still in the source, kept.
     let t = Tmp::new();
     write(&t.path("src/bad"), &vec![7u8; 8 << 20]);
-    let partial = interrupted_partial(&["-a", &t.s("src/"), &t.s("dst")], &t.path("dst"));
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let partial = interrupted_partial(
+        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &t.path("dst"),
+    );
     fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
     let out = syq(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
     assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
@@ -2247,7 +2259,11 @@ fn delete_keeps_partials_of_filtered_files() {
     // it is the resume state of a transfer that hasn't happened yet.
     let t = Tmp::new();
     write(&t.path("src/big"), &vec![7u8; 8 << 20]);
-    let partial = interrupted_partial(&["-a", &t.s("src/"), &t.s("dst")], &t.path("dst"));
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let partial = interrupted_partial(
+        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &t.path("dst"),
+    );
     run_ok(&[
         "-a",
         "--delete",
@@ -2261,7 +2277,11 @@ fn delete_keeps_partials_of_filtered_files() {
     // Same for -u.
     let t = Tmp::new();
     write(&t.path("src/f"), &vec![7u8; 8 << 20]);
-    let partial = interrupted_partial(&["-a", &t.s("src/"), &t.s("dst")], &t.path("dst"));
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let partial = interrupted_partial(
+        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &t.path("dst"),
+    );
     write(&t.path("dst/f"), b"newer on dst");
     set_mtime(&t.path("src/f"), 1000);
     set_mtime(&t.path("dst/f"), 2000);
@@ -3483,10 +3503,21 @@ fn copy_onto_itself_among_sources_is_order_independent() {
     let t = Tmp::new();
     write(&t.path("src/a"), b"a");
     write(&t.path("dst/a"), b"a");
-    let so = run_ok(&["-r", &t.s("src/"), &t.s("dst/a"), &t.s("dst/")]);
-    assert!(!so.contains("errors"), "{so}");
-    let so = run_ok(&["-r", &t.s("dst/a"), &t.s("src/"), &t.s("dst/")]);
-    assert!(!so.contains("errors"), "{so}");
+    // Naming the destination file as a source, together with a different file
+    // for the same path, is a conflict in either order: dst/a would be lost.
+    write(&t.path("src/a"), b"changed");
+    for args in [
+        [&t.s("src/"), &t.s("dst/a"), &t.s("dst/")],
+        [&t.s("dst/a"), &t.s("src/"), &t.s("dst/")],
+    ] {
+        let out = syq(&["-r", args[0], args[1], args[2]]);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+        assert_eq!(read(&t.path("dst/a")), b"a", "untouched");
+    }
+    // The destination file alone, given twice over two sources, is a no-op.
+    fs::create_dir_all(t.path("h")).unwrap();
+    fs::hard_link(t.path("dst/a"), t.path("h/a")).unwrap();
+    run_ok(&["-r", &t.s("dst/a"), &t.s("h/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/a")), b"a");
     // Two different files onto one destination is still a collision.
     write(&t.path("src2/a"), b"different");
@@ -3714,11 +3745,12 @@ fn three_claimants_are_validated_as_a_group() {
     // a/x is the destination file; b/x and c/x are two different contents.
     let out = syq(&["-r", &t.s("a/"), &t.s("b/"), &t.s("c/"), &t.s("dst")]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
-    assert!(stderr_of(&out).contains("2 sources map to the same destination"));
+    assert!(stderr_of(&out).contains("3 sources map to the same destination"));
     assert_eq!(read(&t.path("dst/x")), b"dest content");
-    // With only one other content it is fine, in any position.
-    run_ok(&["-r", &t.s("b/"), &t.s("a/"), &t.s("dst")]);
-    assert_eq!(read(&t.path("dst/x")), b"from b");
+    // Even one other content is a conflict: dst/x was named as a source.
+    let out = syq(&["-r", &t.s("b/"), &t.s("a/"), &t.s("dst")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(read(&t.path("dst/x")), b"dest content");
 }
 
 #[test]
@@ -3733,4 +3765,99 @@ fn conflicting_sources_leave_no_destination_behind() {
     write(&t.path("c/y"), b"3");
     run_ok(&["-r", &t.s("a/"), &t.s("c/"), &t.s("dst2/")]);
     assert_eq!(listing(&t.path("dst2")), ["x", "y"]);
+}
+
+// ------------------------------------------------------------ review round 8
+
+#[test]
+fn files_from_onto_a_file_destination_is_refused() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("list"), b"a\n");
+    write(&t.path("dst"), b"a precious file");
+    let out = syq(&["-a", "--files-from", &t.s("list"), &t.s("src"), &t.s("dst")]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("needs a directory destination"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(read(&t.path("dst")), b"a precious file");
+}
+
+#[test]
+fn sidecar_named_source_directory_is_not_copied() {
+    let t = Tmp::new();
+    let sidecar_dir = format!("src/.name.syq-part.{}", "a".repeat(26));
+    write(&t.path(&format!("{sidecar_dir}/inside")), b"i");
+    write(&t.path("src/name"), b"v1");
+    let so = run_ok(&["-a", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(listing(&t.path("dst")), ["name"], "{so}");
+    // And later updates of `name` are not wedged by a directory in the
+    // sidecar's place.
+    write(&t.path("src/name"), &vec![7u8; 8 << 20]);
+    run_ok(&["-a", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(read(&t.path("dst/name")), vec![7u8; 8 << 20]);
+    assert_eq!(listing(&t.path("dst")), ["name"]);
+}
+
+#[test]
+fn files_from_rejections_and_stdin() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("src/b"), b"b");
+    write(&t.path("list"), b"a\n");
+    // `-` reads the list from stdin.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "--files-from",
+            "-",
+            "--no-progress",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"b\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(listing(&t.path("dst")), ["b"]);
+    // Cannot combine with -i / --ignore-from / --delete (clap-level errors).
+    for extra in [["-i", "x"], ["--ignore-from", "list"], ["--delete", "-v"]] {
+        let out = syq(&[
+            "-a",
+            "--files-from",
+            &t.s("list"),
+            extra[0],
+            extra[1],
+            &t.s("src"),
+            &t.s("dst2"),
+        ]);
+        assert!(!out.status.success(), "{extra:?}");
+        assert!(
+            stderr_of(&out).contains("cannot be used with"),
+            "{extra:?}: {}",
+            stderr_of(&out)
+        );
+    }
+    assert!(!t.path("dst2").exists());
+    // Direct remote-to-remote needs --relay; refused before anything connects.
+    let t0 = std::time::Instant::now();
+    let out = syq(&[
+        "-a",
+        "--files-from",
+        &t.s("list"),
+        "nohost-a.invalid:x",
+        "nohost-b.invalid:y",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("needs --relay"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(t0.elapsed() < std::time::Duration::from_secs(2));
 }
