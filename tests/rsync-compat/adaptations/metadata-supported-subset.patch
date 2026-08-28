@@ -1,0 +1,25 @@
+diff --git a/testsuite/metadata-depth_test.py b/testsuite/metadata-depth_test.py
+index f8ba7a0..e8b5ac0 100644
+--- a/testsuite/metadata-depth_test.py
++++ b/testsuite/metadata-depth_test.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""Coverage of -p (perms), -t (times) and --chmod at depth.
++"""Coverage of -p (perms) and -t (times) at depth.
+
+ Each attribute is set distinctively on a file AND a directory at every level of
+ a >=3-deep tree, then checked per entry after the transfer -- the metadata is
+@@ -46,12 +46,4 @@ for f in walk_files(src):
+     rel = f.relative_to(src)
+     assert_mtime_close(TODIR / rel, f.stat().st_mtime, label=f'-t {rel}')
+
+-# --- --chmod rewrites modes at every level ----------------------------------
+-seed()
+-run_rsync('-a', '--chmod=D710,F600', f'{src}/', f'{TODIR}/')
+-for f in walk_files(src):
+-    assert_mode(TODIR / f.relative_to(src), 0o600, label=f'--chmod file {f.name}')
+-for d in walk_dirs(src):
+-    assert_mode(TODIR / d.relative_to(src), 0o710, label=f'--chmod dir {d.name}')
+-
+-print("metadata-depth: -p / -t / --chmod verified per entry at depth")
++print("metadata-depth: -p / -t verified per entry at depth")

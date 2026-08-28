@@ -1,0 +1,44 @@
+diff --git a/testsuite/update_test.py b/testsuite/update_test.py
+index 2be222a..917d4fe 100644
+--- a/testsuite/update_test.py
++++ b/testsuite/update_test.py
+@@ -1,10 +1,9 @@
+ #!/usr/bin/env python3
+-"""Coverage of -u (--update) and --force at depth.
++"""Coverage of -u (--update) at depth.
+
+--u skips any destination file that is newer than the source. --force lets rsync
+-delete a non-empty destination directory when it must be replaced by a
+-non-directory. Both decide a per-entry action on a name whose parent chain the
+-resolver restructure rewrites, so check them several levels deep.
++-u skips any destination file that is newer than the source. It decides a
++per-entry action on a name whose parent chain the resolver restructure rewrites,
++so check it several levels deep.
+ """
+
+ import os
+@@ -56,23 +55,4 @@ if os.path.islink(TODIR / 'foo'):
+ assert_same(TODIR / 'foo', src / 'foo',
+             label='-u replaced a newer dest symlink with a regular file')
+
+-# --- --force replaces a non-empty dest directory with a file at depth -------
+-rmtree(src)
+-rmtree(TODIR)
+-makepath(src / 'd1' / 'd2' / 'd3')
+-(src / deep).write_text("now a regular file\n")        # src: d1/d2/d3/f3 = file
+-makepath(TODIR / 'd1' / 'd2' / 'd3' / 'f3')             # dest: f3 = non-empty dir
+-(TODIR / 'd1' / 'd2' / 'd3' / 'f3' / 'occupant').write_text("blocker\n")
+-
+-# Without --force the non-empty directory can't be replaced.
+-proc = run_rsync('-a', f'{src}/', f'{TODIR}/', check=False)
+-if proc.returncode == 0 and (TODIR / deep).is_file():
+-    test_fail("a non-empty directory was replaced by a file without --force")
+-
+-# With --force the directory is removed and the file takes its place.
+-run_rsync('-a', '--force', f'{src}/', f'{TODIR}/')
+-if not (TODIR / deep).is_file():
+-    test_fail("--force did not replace the directory with the file at depth")
+-assert_same(TODIR / deep, src / deep, label='--force replacement content')
+-
+-print("update: -u keeps newer dest / updates older; --force replaces a dir at depth")
++print("update: -u keeps newer dest / updates older and replaces type mismatches")

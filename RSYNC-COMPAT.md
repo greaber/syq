@@ -10,8 +10,8 @@ Each entry says whether it was **measured** (run against upstream rsync —
 **believed** (from documentation or memory, not yet exercised). A raw run of
 the upstream rsync test suite is not a compatibility score: most of its
 failures come from unsupported options, protocol internals, daemon mode, or
-its harness. A ten-test subset using only pcp-supported options passed eight;
-the two useful failures are open issues 2 and 3 below.
+its harness. The classified non-root Linux subset currently passes 20 of 22
+tests; the two known failures are open issues 2 and 3 below.
 
 Categories:
 
@@ -24,6 +24,45 @@ Categories:
 - **Open issues** — known gaps we intend to close, or decisions still to make.
 - **Resolved** — a log of items that moved between categories, with the
   commit or PR.
+
+## Automated upstream test ledger
+
+`tests/rsync-compat/` turns the upstream audit into a repeatable CI check:
+
+```sh
+python3 scripts/rsync-compat.py
+```
+
+The manifest pins rsync commit `7c20b077`, records normal and future strict
+profiles, and gives every runnable test an expected result plus platform and
+environment requirements. `inventory.tsv` names all 351 tests at that commit;
+changing the pin without classifying every added or removed test is an error.
+The classifications deliberately distinguish:
+
+- relevant unmodified and adapted conformance tests;
+- user-visible features pcp does not implement;
+- rsync daemon, wire-protocol, restricted-wrapper, build, and internal tests
+  that pcp does not need to pass; and
+- an explicit unassessed category for future pin updates (currently empty).
+
+The upstream runner's expected-result mode is the oracle. A known failure is
+green, while both a regression and an unexpected pass fail CI until the ledger
+is updated. All 351 pinned tests are classified: 26 are runnable conformance
+tests, 141 require unsupported user-facing features, and 184 exercise rsync's
+own internals, protocol, daemon, or restricted wrapper. There are no unassessed
+tests. The normal non-root Linux run selects 22 of the 26 and currently records
+20 passes and 2 known failures; CI also runs the four root-only circumstances.
+That pass rate covers the selected conformance subset, not an overall
+percentage of rsync compatibility.
+
+The generated `tests/rsync-compat/LEDGER.md` is the readable per-test record;
+CI rejects it if it drifts from the manifest and inventory. An adapted test
+names a patch under `tests/rsync-compat/adaptations/`. Patches may translate an
+incidental implementation detail, such as PCP's partial-file layout, or isolate
+a supported scenario from an aggregate upstream test, but must preserve the
+claimed behavioral oracle. The future `strict` profile is recorded but disabled
+until its CLI flag exists; the harness will inject that flag without changing
+upstream test invocations.
 
 ## Compatible
 
@@ -45,7 +84,7 @@ behavior; an entry without one is only believed, not held.
 | `--files-from` baseline: paths relative to one source; implied parents created; a plain listed directory is copied without its contents unless `-r` is given explicitly (`-a` doesn't count); `--from0`; `-` reads stdin; blank entries dropped | measured; entry *parsing* has gaps, open issue 2 | `files_from_copies_listed_paths_with_their_parents`, `files_from_creates_listed_and_implied_dirs_without_r`, `files_from_repeats_and_late_listed_dirs_across_chunks`, `files_from_root_may_be_a_symlink_and_root_lines_are_rejected` |
 | `--delete-after` / `--delete-delay` accepted as synonyms of `--delete` (they describe what pcp does) | by construction | `delete_after_and_delay_are_synonyms` |
 | `--max-delete N` exists and exits 25 when it trips | believed (exit code matches rsync); see "Different" for the cap semantics | `max_delete_refuses_everything_past_the_limit` |
-| A destination *argument* that is a symlink to a directory is that directory | measured | `symlink_destination_is_followed`, `destination_root_symlink_preserves_target_metadata_for_both_spellings`, `existing_updates_through_a_destination_root_symlink_to_a_dir` |
+| A normal operator-owned destination *argument* that is a symlink to a directory is that directory | measured; see open issue 7 for a root/cross-uid case | `symlink_destination_is_followed`, `destination_root_symlink_preserves_target_metadata_for_both_spellings`, `existing_updates_through_a_destination_root_symlink_to_a_dir` |
 | A symlink to a directory found *inside* the destination tree is replaced with a real directory; only the argument itself is followed (rsync without `-K`) | measured | `in_tree_destination_symlink_is_replaced_not_followed`, `existing_does_not_write_through_a_destination_symlink_dir` |
 | `-P`, `-h`, `--partial`, `--numeric-ids`, `-V` accepted as no-ops/aliases; common unsupported flags are rejected with an explanation | by construction | `rsync_compat_noops_are_accepted`, `unsupported_rsync_flags_explain_themselves` |
 
@@ -165,6 +204,15 @@ command says what to change.
 5. **`-h` alone should print help**, as rsync does, while staying
    `--human-readable` inside a cluster (`-avh`). Essentially free.
 6. **`-u` for symlinks/devices** — measure rsync, then align or record.
+7. **Cross-uid symlinks in an operator-named destination path.** Current rsync
+   refuses an absolute or relative destination component owned by another uid
+   when root runs the copy, preventing an unprivileged user from redirecting a
+   privileged copy outside the intended tree. pcp currently follows it just as
+   it follows an ordinary destination-argument symlink. The root-only upstream
+   `symlink-race-dest` and `symlink-race-relative-dest` tests record this as a
+   known failure. This is a strong default-alignment candidate because it closes
+   a privilege-boundary write redirection without changing the normal
+   same-owner symlink behavior.
 
 ## Resolved
 

@@ -1,0 +1,57 @@
+name: rsync compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: target/cargo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install rsync test-build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake build-essential
+      - name: Cache pinned rsync source and helpers
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/rsync-compat/sources
+            target/rsync-compat/suites
+          key: rsync-compat-${{ runner.os }}-${{ hashFiles('scripts/rsync-compat.py', 'tests/rsync-compat/manifest.toml', 'tests/rsync-compat/inventory.tsv', 'tests/rsync-compat/adaptations/*.patch') }}
+      - name: Cache Cargo dependencies and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/cargo
+          key: cargo-rsync-compat-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-rsync-compat-${{ runner.os }}-
+      - name: Run classified upstream tests
+        run: python3 scripts/rsync-compat.py --profile default -j 4
+      - name: Run root-only circumstances
+        run: |
+          sudo env \
+            PATH="$PATH" \
+            CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+            GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            python3 scripts/rsync-compat.py --profile default --report-label root \
+              --no-build-pcp --pcp-bin "$PWD/target/cargo/debug/pcp" -j 4
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsync-compatibility
+          path: target/rsync-compat/reports/
+          if-no-files-found: warn
