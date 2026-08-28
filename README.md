@@ -382,6 +382,12 @@ unsupported: both invocations intentionally address the same resumable
 sidecars. After a crash, abandoned sidecars may be deleted manually if that
 command will not be resumed.
 
+These guarantees cover other SYQ jobs, which publish complete files by rename.
+They do not cover another process modifying an existing destination inode in
+place while SYQ is hashing or reusing it. As with rsync, such an external
+writer can invalidate a comparison after it was made; do not independently
+modify destination files during a transfer.
+
 ### Verification and consistency
 
 Always:
