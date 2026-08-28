@@ -597,8 +597,13 @@ def main() -> int:
     # Some upstream security tests deliberately drop privileges. They still
     # need to traverse this directory to execute the generated SYQ wrapper.
     run_dir.chmod(0o755)
+    run_binary = syq
+    if running_as() == "root":
+        run_binary = run_dir / "syq"
+        shutil.copy2(syq, run_binary)
+        run_binary.chmod(0o755)
     wrapper = run_dir / "syq-rsync"
-    make_wrapper(wrapper, syq, list(profile.get("args", [])))
+    make_wrapper(wrapper, run_binary, list(profile.get("args", [])))
     expected = run_dir / "expected.txt"
     expected.write_text(
         "".join(f"{test['name']} {test['expect'][args.profile]}\n" for test in selected)
