@@ -8,7 +8,7 @@ use crate::progress::{commas, human, Progress, WorkerStatus};
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
 use crate::tune::{self, Gate};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -688,15 +688,15 @@ pub fn run(args: Args) -> Result<i32> {
             scan_err = Some(error);
         }
     }
-    if st.source_partials > 0 {
+    if st.source_partials > 0 && !args.quiet {
         let count = st.source_partials;
         progress.warning(
             "source_partials",
             count,
             &format!(
-                "source contains {count} recognizable SYQ partial path{}; copying {} as ordinary payload",
+                "source contains {count} recognizable SYQ partial path{}; {} treated as ordinary payload",
                 if count == 1 { "" } else { "s" },
-                if count == 1 { "it" } else { "them" }
+                if count == 1 { "it is" } else { "they are" }
             ),
         );
     }
@@ -1600,6 +1600,11 @@ struct Worker {
     t: [f64; 4],
 }
 
+struct BlockDiff {
+    ranges: Vec<(u64, u64)>,
+    held_len: Option<u64>,
+}
+
 impl Worker {
     fn run(&mut self) -> Result<()> {
         let r = self.run_inner();
@@ -1976,8 +1981,8 @@ impl Worker {
                 return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
             if final_is_file {
-                let ranges = self.diff_final_and_hold(&job)?;
-                if ranges.is_empty() && final_entry.as_ref().unwrap().size == size {
+                let (ranges, basis_len) = self.diff_final_and_hold(&job)?;
+                if ranges.is_empty() && basis_len == size {
                     let mut meta = job.entry.meta();
                     meta.mode = self.create_mode(&job);
                     ok(
@@ -2133,12 +2138,13 @@ impl Worker {
             },
             "hash destination",
         )
+        .map(|diff| diff.ranges)
     }
 
     /// Compare the source with one opened final-file inode retained by the
     /// receiver for either metadata-only completion or sidecar seeding.
-    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<Vec<(u64, u64)>> {
-        self.diff_with(
+    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<(Vec<(u64, u64)>, u64)> {
+        let diff = self.diff_with(
             job,
             Request::HashAndHold {
                 path: job.dst.clone(),
@@ -2147,7 +2153,12 @@ impl Worker {
                 len: job.entry.size,
             },
             "hash and retain destination basis",
-        )
+        )?;
+        Ok((
+            diff.ranges,
+            diff.held_len
+                .context("destination did not report its retained basis length")?,
+        ))
     }
 
     fn diff_with(
@@ -2155,7 +2166,7 @@ impl Worker {
         job: &FileJob,
         destination_request: Request,
         destination_label: &str,
-    ) -> Result<Vec<(u64, u64)>> {
+    ) -> Result<BlockDiff> {
         let block = self.opts.block;
         let size = job.entry.size;
         self.src.send(Request::HashBlocks {
@@ -2166,14 +2177,31 @@ impl Worker {
             len: size,
         })?;
         self.dst.send(destination_request)?;
-        let source = Self::hashes(ok(self.src.recv()?, "hash source")?)?;
-        let destination = Self::hashes(ok(self.dst.recv()?, destination_label)?)?;
-        Ok(Self::different_ranges(&source, &destination, block, size))
+        // Both requests are in flight. Always consume both responses before
+        // interpreting either one so an ordinary endpoint error cannot leave
+        // this reusable worker connection one response behind.
+        let source_response = self.src.recv();
+        let destination_response = self.dst.recv();
+        let source = Self::hashes(ok(source_response?, "hash source")?)?;
+        let (destination, held_len) =
+            Self::destination_hashes(ok(destination_response?, destination_label)?)?;
+        Ok(BlockDiff {
+            ranges: Self::different_ranges(&source, &destination, block, size),
+            held_len,
+        })
     }
 
     fn hashes(response: Response) -> Result<Vec<u64>> {
         match response {
             Response::Hashes(hashes) => Ok(hashes),
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+
+    fn destination_hashes(response: Response) -> Result<(Vec<u64>, Option<u64>)> {
+        match response {
+            Response::Hashes(hashes) => Ok((hashes, None)),
+            Response::HeldHashes { hashes, len } => Ok((hashes, Some(len))),
             other => bail!("unexpected response {other:?}"),
         }
     }
@@ -2416,8 +2444,12 @@ impl Worker {
             self.dst.send(Request::FileHash {
                 path: job.dst.clone(),
             })?;
-            let a = ok(self.src.recv()?, "hash source")?;
-            let b = ok(self.dst.recv()?, "hash destination")?;
+            // Keep both reusable connections aligned even if one endpoint
+            // reports an ordinary per-file error.
+            let source_response = self.src.recv();
+            let destination_response = self.dst.recv();
+            let a = ok(source_response?, "hash source")?;
+            let b = ok(destination_response?, "hash destination")?;
             match (a, b) {
                 (
                     Response::FileHash { size: s1, hash: h1 },

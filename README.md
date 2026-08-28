@@ -257,7 +257,9 @@ transfer stays parallel without pre-deciding chunk counts.
 On the receiving side a file that needs content changes is written beside its
 destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
 written with `pwrite` from several workers), given its metadata, and `rename`d
-over the target. When an existing final file is the comparison basis, the
+over the target. Visible sidecars are created mode `0600`, so incomplete data
+is private to the receiving user; final metadata is applied just before
+publication. When an existing final file is the comparison basis, the
 receiver retains that open descriptor while its blocks are hashed. If every
 block matches, metadata is applied through the descriptor without allocating
 or publishing a sidecar; otherwise that exact descriptor seeds the sidecar.
@@ -274,7 +276,10 @@ interrupted work, not crash-durability across power loss.
 Small files still use a pipelined whole-file request, but the receiver writes
 each request through its sidecar and renames it before acknowledging success.
 Thus every non-`--inplace` content change appears atomically complete, while
-a content-identical file keeps its inode and any destination hardlinks.
+an existing file that SYQ compares block by block and finds content-identical
+keeps its inode and any destination hardlinks. The same-host kernel-copy fast
+path may replace a byte-identical destination that failed the quick check,
+because it deliberately avoids that comparison.
 `--inplace` writes every file directly (for example, to update a large file
 without room for a second copy), so readers can observe partially updated
 contents and an interruption leaves the final file unfinished.

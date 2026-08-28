@@ -87,7 +87,12 @@ fn name_max(parent: &Path) -> usize {
     if let Some(limit) = cache.lock().unwrap().get(&key).copied() {
         return limit;
     }
-    let Ok(c_parent) = cstr(parent) else {
+    // Preflight often runs before mapped destination subdirectories have been
+    // created. Query the nearest existing directory on the same path instead
+    // of silently assuming 255; absent a concurrent mount change, descendants
+    // inherit that filesystem's component limit.
+    let query_parent = nearest_existing_directory(parent);
+    let Ok(c_parent) = cstr(&query_parent) else {
         return COMMON_NAME_MAX;
     };
     let limit = unsafe { libc::pathconf(c_parent.as_ptr(), libc::_PC_NAME_MAX) };
@@ -102,6 +107,32 @@ fn name_max(parent: &Path) -> usize {
     }
     cache.insert(key, limit);
     limit
+}
+
+fn nearest_existing_directory(path: &Path) -> PathBuf {
+    let mut candidate = if path.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        path.to_path_buf()
+    };
+    loop {
+        if fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_dir()) {
+            return candidate;
+        }
+        if !candidate.pop() || candidate.as_os_str().is_empty() {
+            return PathBuf::from(".");
+        }
+    }
+}
+
+fn safe_prefix_len(name: &[u8], requested: usize) -> usize {
+    let mut keep = requested.min(name.len());
+    if let Ok(name) = std::str::from_utf8(name) {
+        while !name.is_char_boundary(keep) {
+            keep -= 1;
+        }
+    }
+    keep
 }
 
 fn path_component_budget(parent: &Path, component_limit: usize) -> usize {
@@ -148,7 +179,7 @@ fn partial_path_with_name_max(
         let basename_hash = base32(&basename_hash[..12]);
         let overhead = 1 + 1 + basename_hash.len() + PARTIAL_MARKER.len() + job_id.len();
         if budget > overhead {
-            let keep = budget - overhead;
+            let keep = safe_prefix_len(name, budget - overhead);
             let mut shortened = Vec::with_capacity(budget);
             shortened.push(b'.');
             shortened.extend_from_slice(&name[..keep]);
@@ -884,7 +915,7 @@ impl FsOps {
         partial_id: &PartialId,
         block: u64,
         len: u64,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<(Vec<u64>, u64)> {
         let p = resolve(path);
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
@@ -895,7 +926,8 @@ impl FsOps {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&p)
             .with_context(|| format!("open {} as repair basis", p.display()))?;
-        if !file.metadata()?.file_type().is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
             bail!("destination {} is not a regular file", p.display());
         }
         let hashes = hash_reader(&mut file, block, len)?;
@@ -916,7 +948,17 @@ impl FsOps {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
         }
-        Ok(hashes)
+        // Hashing is intentionally limited to the source length. Report the
+        // retained inode's length afterward so a file that grew since the
+        // planner's stat cannot be mistaken for an exact content match.
+        let held_len = self
+            .held_basis
+            .as_ref()
+            .expect("basis retained above")
+            .file
+            .metadata()?
+            .len();
+        Ok((hashes, held_len))
     }
 
     fn take_held_basis(&mut self, path: &[u8], partial_id: &PartialId) -> Result<HeldBasis> {
@@ -1237,6 +1279,12 @@ impl FsOps {
 
     /// Dispatch a request that has a single response (everything except Scan).
     pub fn handle(&mut self, req: &Request) -> Response {
+        // HashAndHold's next request must consume the retained descriptor.
+        // Any other request means the controller abandoned that comparison
+        // (for example because the source hash failed), so release it here.
+        if !matches!(req, Request::FinishBasis { .. } | Request::SeedBasis { .. }) {
+            self.held_basis.take();
+        }
         let r: Result<Response> = match req {
             Request::StatMany(paths) => Ok(Response::Stats(self.stat_many(paths))),
             Request::PartialPaths { paths, partial_id } => {
@@ -1260,7 +1308,7 @@ impl FsOps {
                 len,
             } => self
                 .hash_and_hold(path, partial_id, *block, *len)
-                .map(Response::Hashes),
+                .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
             Request::FinishBasis {
                 path,
                 partial_id,
@@ -1401,7 +1449,9 @@ fn open_existing_regular(target: &Path, write: bool) -> Result<File> {
     options
         .read(!write)
         .write(write)
-        .custom_flags(libc::O_NOFOLLOW);
+        // Validate the opened type below. O_NONBLOCK ensures a concurrent FIFO
+        // or device replacement cannot hang us before that validation.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options
         .open(target)
         .with_context(|| format!("open {}", target.display()))?;
@@ -1604,6 +1654,25 @@ mod tests {
     }
 
     #[test]
+    fn existing_regular_open_does_not_block_on_fifo() {
+        let dir = test_dir();
+        fs::create_dir(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let fifo_c = cstr(&fifo).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let started = std::time::Instant::now();
+        let result = open_existing_regular(&fifo, true);
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "opening a FIFO must not wait for a reader"
+        );
+    }
+
+    #[test]
     fn private_partial_must_have_one_link() {
         let dir = test_dir();
         fs::create_dir(&dir).unwrap();
@@ -1645,6 +1714,29 @@ mod tests {
         assert!(name.as_bytes().len() <= 143);
         assert!(is_partial_name(name));
         assert!(name.to_string_lossy().ends_with(&base32(&id)));
+    }
+
+    #[test]
+    fn shortened_partial_name_preserves_utf8_boundaries() {
+        let id = [10u8; 16];
+        let final_path = PathBuf::from("dir").join("界".repeat(80));
+        let partial = partial_path_with_name_max(&final_path, &id, 143).unwrap();
+        let name = partial.file_name().unwrap();
+
+        assert!(name.as_bytes().len() <= 143);
+        assert!(name.to_str().is_some());
+        assert!(is_partial_name(name));
+    }
+
+    #[test]
+    fn name_limit_uses_nearest_existing_ancestor() {
+        let dir = test_dir();
+        fs::create_dir(&dir).unwrap();
+        let missing = dir.join("not-yet-created/deeper");
+
+        assert_eq!(nearest_existing_directory(&missing), dir);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

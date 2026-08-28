@@ -2,7 +2,7 @@
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -841,6 +841,55 @@ fn verify_only_detects_differences() {
     // verify-only must not modify anything
     assert!(read(&t.path("dst/a/med.bin")) == bad);
     assert!(!t.path("dst/hello.txt").exists());
+}
+
+#[test]
+fn hash_errors_do_not_desynchronize_worker_connections() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let t = Tmp::new();
+    write(&t.path("src/bad"), &vec![b'b'; 8192]);
+    write(&t.path("src/good"), &vec![b'g'; 4096]);
+    write(&t.path("dst/bad"), &vec![b'x'; 8192]);
+    write(&t.path("dst/good"), &vec![b'x'; 4096]);
+    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Largest-first scheduling makes the unreadable file fail first. The
+    // receiver still answers its already-issued hash request; that response
+    // must be drained before this worker proceeds to `good`.
+    let copy = syq(&["-a", "-c", "-j", "1", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(copy.status.code(), Some(23));
+    let copy_stderr = String::from_utf8_lossy(&copy.stderr);
+    assert!(
+        !copy_stderr.contains("unexpected response"),
+        "{copy_stderr}"
+    );
+    assert_eq!(read(&t.path("dst/good")), vec![b'g'; 4096]);
+
+    // Verification has the same paired-request shape and must likewise keep
+    // processing the connection after the source-side error.
+    let verify = syq(&[
+        "-a",
+        "--verify-only",
+        "-v",
+        "-j",
+        "1",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(verify.status.code(), Some(23));
+    let verify_stderr = String::from_utf8_lossy(&verify.stderr);
+    assert!(
+        !verify_stderr.contains("unexpected response"),
+        "{verify_stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&verify.stdout).contains("ok      good"),
+        "{}",
+        String::from_utf8_lossy(&verify.stdout)
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -1928,6 +1977,14 @@ fn source_partials_are_copied_and_warned_about() {
         stderr.contains("warning: source contains 2 recognizable SYQ partial paths"),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("they are treated as ordinary payload"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("copying"),
+        "warning must not promise that a dry run, verification, or failed run will copy: {stderr}"
+    );
     assert_eq!(read(&t.path(&format!("dst/{file}"))), b"partial payload");
     assert_eq!(
         read(&t.path(&format!("dst/{dir}/child"))),
@@ -1947,6 +2004,28 @@ fn source_partials_are_copied_and_warned_about() {
         .expect("missing structured source-partial warning");
     assert_eq!(warning["type"], "warning");
     assert_eq!(warning["count"], 2);
+
+    let quiet = syq(&["-q", "-a", &t.s("src/"), &t.s("quiet-dst/")]);
+    assert_output_ok(&quiet);
+    assert!(
+        quiet.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert_eq!(
+        read(&t.path(&format!("quiet-dst/{file}"))),
+        b"partial payload"
+    );
+
+    let dry = syq(&["-n", "-a", &t.s("src/"), &t.s("dry-dst/")]);
+    assert_output_ok(&dry);
+    let dry_stderr = String::from_utf8_lossy(&dry.stderr);
+    assert!(
+        dry_stderr.contains("treated as ordinary payload"),
+        "{dry_stderr}"
+    );
+    assert!(!dry_stderr.to_ascii_lowercase().contains("copying"));
+    assert!(!t.path("dry-dst").exists());
 }
 
 #[cfg(debug_assertions)]
@@ -2402,6 +2481,54 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     assert_eq!(read(&t.path("basis")), second_contents);
     assert!(first.wait().unwrap().success());
     assert_eq!(read(&t.path("basis")), first_contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn retained_basis_growth_is_not_treated_as_an_exact_match() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 2 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    write(&t.path("basis"), &contents);
+    set_mtime(&t.path("src"), 1_600_000_001);
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    let ready = t.path("basis-ready");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "-j",
+            "1",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("src"),
+            &t.s("basis"),
+        ])
+        .env("SYQ_TEST_BASIS_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .spawn()
+        .unwrap();
+    let held = (0..300).any(|_| {
+        if ready.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(held, "copy never retained its destination basis");
+
+    OpenOptions::new()
+        .append(true)
+        .open(t.path("basis"))
+        .unwrap()
+        .write_all(b"trailing data")
+        .unwrap();
+
+    assert!(child.wait().unwrap().success());
+    assert_eq!(read(&t.path("basis")), contents);
     assert!(partial_files(&t.0).is_empty());
 }
 
