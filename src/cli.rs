@@ -3,16 +3,29 @@ use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "pcp",
+    name = "syq",
     version,
     about = "Parallel copy with an rsync-shaped interface",
     disable_help_flag = true,
-    override_usage = "pcp [OPTIONS] SRC... DEST\n       pcp [OPTIONS] [USER@]HOST:SRC... DEST\n       pcp [OPTIONS] SRC... [USER@]HOST:DEST"
+    override_usage = "syq [OPTIONS] SRC... DEST\n       syq [OPTIONS] [USER@]HOST:SRC... DEST\n       syq [OPTIONS] SRC... [USER@]HOST:DEST\n       syq --self-update\n       syq --enable-auto-update | --disable-auto-update"
 )]
 pub struct Args {
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
+
+    /// Install the newest signed release (standalone installer builds only)
+    #[arg(long, exclusive = true)]
+    pub self_update: bool,
+    /// Opt in to installing signed updates after successful interactive commands
+    #[arg(long, exclusive = true)]
+    pub enable_auto_update: bool,
+    /// Turn automatic updates off; update notices remain enabled
+    #[arg(long, exclusive = true)]
+    pub disable_auto_update: bool,
+    /// Record an installation made by the official standalone installer
+    #[arg(long, hide = true, exclusive = true)]
+    pub register_standalone_install: bool,
 
     /// Archive mode; same as -rlptgoD
     #[arg(short = 'a', long)]
@@ -54,7 +67,7 @@ pub struct Args {
     /// No-op accepted for rsync compatibility (sizes are always human-readable)
     #[arg(short = 'h', long)]
     pub human_readable: bool,
-    /// No-op accepted for rsync compatibility (pcp always uses numeric uid/gid)
+    /// No-op accepted for rsync compatibility (syq always uses numeric uid/gid)
     #[arg(long)]
     pub numeric_ids: bool,
 
@@ -62,7 +75,7 @@ pub struct Args {
     /// over TCP, 8 over ssh, or 32 when local; grows while throughput improves and
     /// shrinks when that costs nothing. Give a number to fix it. --rm uses a fixed
     /// 8 (32 when local).
-    #[arg(short = 'j', long, value_name = "N")]
+    #[arg(short = 'j', long = "connections", value_name = "N")]
     pub connections_opt: Option<usize>,
     #[arg(skip)]
     pub connections: usize,
@@ -89,7 +102,7 @@ pub struct Args {
     /// Same as --progress --partial
     #[arg(short = 'P')]
     pub p_flag: bool,
-    /// No-op accepted for rsync compatibility (pcp always keeps partial files)
+    /// No-op accepted for rsync compatibility (syq always keeps partial files)
     #[arg(long)]
     pub partial: bool,
     /// Emit machine-readable progress lines (JSON) on stderr
@@ -127,10 +140,10 @@ pub struct Args {
     /// Remote shell command (default: ssh)
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
-    /// Use this exact pcp executable on the remote instead of the managed helper
+    /// Use this exact syq executable on the remote instead of the managed helper
     #[arg(long, value_name = "PATH")]
-    pub pcp_path: Option<String>,
-    /// Require pcp on the remote PATH instead of installing a versioned helper
+    pub syq_path: Option<String>,
+    /// Require syq on the remote PATH instead of installing a versioned helper
     #[arg(long)]
     pub no_bootstrap: bool,
     /// Use TCP data connections without encryption (trusted networks only)
@@ -146,7 +159,7 @@ pub struct Args {
     /// ssh session) and return; progress goes to a log you can watch with --follow
     #[arg(long)]
     pub detach: bool,
-    /// Follow a detached transfer: pcp --follow HOST:LOGFILE
+    /// Follow a detached transfer: syq --follow HOST:LOGFILE
     #[arg(long)]
     pub follow: bool,
     /// Remote-to-remote: relay data through this machine instead of running on the source host
@@ -180,7 +193,16 @@ pub struct Args {
     pub rm: bool,
 
     /// Source(s) and destination (or, with --rm, the paths to remove)
-    #[arg(required = true, num_args = 1.., value_name = "PATH")]
+    #[arg(
+        required_unless_present_any = [
+            "self_update",
+            "enable_auto_update",
+            "disable_auto_update",
+            "register_standalone_install"
+        ],
+        num_args = 1..,
+        value_name = "PATH"
+    )]
     pub paths: Vec<String>,
 }
 
@@ -263,9 +285,9 @@ impl Args {
     }
 }
 
-/// Common rsync flags pcp deliberately doesn't implement get a one-line
+/// Common rsync flags syq deliberately doesn't implement get a one-line
 /// explanation instead of clap's generic "unexpected argument", so pasting an
-/// rsync command tells you exactly what to change. Flags pcp *does* accept
+/// rsync command tells you exactly what to change. Flags syq *does* accept
 /// (including the compatibility no-ops) are not listed here; genuinely unknown
 /// flags fall through to clap. No translation is performed.
 fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
@@ -281,7 +303,7 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         "--bwlimit",
         "--checkpoint",
         "--tcp-ports",
-        "--pcp-path",
+        "--syq-path",
         "--width",
     ];
     let mut skip_next = false;
@@ -325,26 +347,26 @@ fn unsupported_message(tok: &str) -> Option<String> {
     None
 }
 
-const FILTER_MSG: &str = "pcp has no --exclude/--include/--filter. Use -i/--ignore (or --ignore-from), which takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `-i node_modules`. See the README's \"Ignoring paths\" section.";
-const DELETE_MSG: &str = "pcp does not implement --delete; it never removes files from the destination. To delete paths, run `pcp --rm PATH...` explicitly.";
+const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. Use -i/--ignore (or --ignore-from), which takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `-i node_modules`. See the README's \"Ignoring paths\" section.";
+const DELETE_MSG: &str = "syq does not implement --delete; it never removes files from the destination. To delete paths, run `syq --rm PATH...` explicitly.";
 
 fn message_for_long(base: &str) -> Option<&'static str> {
     Some(match base {
         "exclude" | "exclude-from" | "include" | "include-from" | "filter" => FILTER_MSG,
         "delete" => DELETE_MSG,
         _ if base.starts_with("delete-") => DELETE_MSG,
-        "update" => "pcp does not implement -u/--update (skip files newer on the receiver).",
-        "one-file-system" => "pcp does not implement -x/--one-file-system.",
-        "sparse" => "pcp does not implement -S/--sparse.",
-        "hard-links" => "pcp does not preserve hard links (-H/--hard-links).",
-        "acls" => "pcp does not preserve ACLs (-A/--acls).",
-        "xattrs" => "pcp does not preserve extended attributes (-X/--xattrs).",
+        "update" => "syq does not implement -u/--update (skip files newer on the receiver).",
+        "one-file-system" => "syq does not implement -x/--one-file-system.",
+        "sparse" => "syq does not implement -S/--sparse.",
+        "hard-links" => "syq does not preserve hard links (-H/--hard-links).",
+        "acls" => "syq does not preserve ACLs (-A/--acls).",
+        "xattrs" => "syq does not preserve extended attributes (-X/--xattrs).",
         "copy-links" | "copy-unsafe-links" | "copy-dirlinks" => {
-            "pcp does not implement -L/--copy-links; it copies symlinks as symlinks (-l)."
+            "syq does not implement -L/--copy-links; it copies symlinks as symlinks (-l)."
         }
-        "files-from" => "pcp does not implement --files-from.",
+        "files-from" => "syq does not implement --files-from.",
         "link-dest" | "compare-dest" | "copy-dest" => {
-            "pcp does not implement --link-dest/--compare-dest/--copy-dest."
+            "syq does not implement --link-dest/--compare-dest/--copy-dest."
         }
         _ => return None,
     })
