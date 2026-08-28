@@ -1,39 +1,80 @@
 # syq
 
-`syq` is a parallel file-tree copier for local filesystems and hosts reachable
-over SSH. It uses an rsync-shaped command line, scans the source and destination
-in parallel, and transfers independent files and ranges of large files over
-multiple connections.
+`syq` copies file trees between local filesystems and hosts reachable over SSH.
+It uses rsync-style source and destination arguments, but scans directories and
+transfers independent files and ranges of large files in parallel. The number
+of active connections is tuned automatically unless `-j N` is given.
 
-It supports local-to-local, local-to-remote, remote-to-local, and direct
+Syq supports local-to-local, local-to-remote, remote-to-local, and direct
 remote-to-remote copies. Release binaries are available for Linux and macOS.
 
-## Key properties
+## Compared with rsync
 
-- Parallel directory scanning and file transfer, with automatic connection
-  tuning or an explicit `-j N`.
-- Large files can be divided into ranges so multiple workers can transfer one
-  file.
-- Interrupted staged transfers resume from deterministic partial files when the
-  same logical command is run again. No checkpoint is needed for ordinary
-  resumption.
-- Content-changing writes are staged beside the destination and published with
-  an atomic rename unless `--inplace` is requested.
-- `--verify-only` compares source and destination content without writing;
-  `-c` compares every regular file block by block and repairs differences.
-- SSH authenticates remote operations. File data uses encrypted TCP connections
-  when they are reachable and otherwise falls back to independent SSH
-  processes.
-- A direct remote-to-remote copy sends data from the source host to the
-  destination host rather than through the invoking machine. `--relay` selects
-  the relayed path explicitly.
+Syq keeps the familiar rsync workflow and many common options, but it is not an
+rsync protocol implementation or a drop-in replacement. Its main additions and
+deliberate differences are:
 
-`syq` is not an rsync protocol implementation or a general cloud-storage tool.
-It does not currently preserve hard links, ACLs, or extended attributes, and it
-does not implement rsync's rolling-checksum delta algorithm. See
-[Compatibility and scope](#compatibility-and-scope).
+- **Parallel work.** Directory scanning, separate files, and ranges of one
+  large file can run concurrently. Rsync transfers file data in one stream.
+- **Automatic resume.** Syq always stages normal writes in deterministic
+  partial files. Run the same logical command again and it reuses matching
+  blocks when possible; no checkpoint or `--partial` option is required.
+- **Direct remote-to-remote copies.** `syq hostA:src/ hostB:dst/` sends data
+  from host A to host B. Rsync does not accept two remote endpoints. Syq can
+  also relay through the invoking machine when requested.
+- **Explicit verification.** `--verify-only` compares source and destination
+  content without writing. `-c` compares every regular file block by block and
+  repairs differences.
+- **One filter language.** `--ignore` and `--ignore-from` use ordered
+  gitignore syntax instead of rsync's include, exclude, and filter rule
+  language.
+- **An all-or-nothing deletion cap.** Syq always runs `--delete` after copying,
+  skips all deletion after a source or destination scan error, and makes
+  `--max-delete` all-or-nothing. If the cap is exceeded, it deletes nothing.
+- **Ambiguous source mappings are errors.** If distinct sources would write the
+  same destination path, syq refuses the command before changing the
+  destination. Rsync silently keeps the first source.
 
-## Quick start
+Syq does not yet implement several rsync features, including rolling-checksum
+delta transfer for shifted data, hard-link preservation, ACLs, extended
+attributes, sparse-file preservation, `--link-dest`, and backup directories.
+See [Compatibility and limitations](#compatibility-and-limitations).
+
+## Install
+
+With Homebrew:
+
+```sh
+brew install greaber/tap/syq
+```
+
+Or install the matching Linux or macOS release in `~/.local/bin` without
+`sudo`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/greaber/syq/releases/latest/download/install.sh | sh
+```
+
+Other release files are available on the
+[releases page](https://github.com/greaber/syq/releases). To build from source
+with the pinned Rust toolchain:
+
+```sh
+cargo build --release
+cargo install --locked --path .
+```
+
+An official release automatically starts its exact matching helper on a remote
+host. On first use, the remote downloads and caches that helper. A host without
+access to the release files needs a matching binary installed manually; select
+it with `--syq-path`, or put it on the non-interactive `PATH` and use
+`--no-bootstrap`.
+
+The [installation reference](docs/reference.md#install) covers supported
+platforms, self-updates, source builds, and remote helper verification.
+
+## Usage
 
 ```text
 syq [OPTIONS] SRC... DEST
@@ -46,21 +87,19 @@ syq [OPTIONS] SRC... [USER@]HOST:DEST
 syq -a project/ server:backup/project/
 syq -a server:data/ ./data/
 
-# Copy between filesystems on this machine. This is useful with NFS and other
-# high-latency filesystems as well as fast local storage.
+# Copy between filesystems on this machine, including mounted NFS filesystems.
 syq -a /mnt/nfs/tree/ /local/tree/
 
 # Copy directly from one remote host to another.
 syq -a hostA:dataset/ hostB:dataset/
 
-# Show what would be copied without changing the destination.
-syq -a --dry-run -v project/ server:backup/project/
+# Use gitignore-style filters.
+syq -a --ignore node_modules --ignore .git project/ server:project/
 
-# Compare every block and repair differing blocks.
-syq -ac project/ server:backup/project/
-
-# Compare content without writing.
-syq -a --verify-only project/ server:backup/project/
+# Preview a copy, repair content differences, or only verify them.
+syq -a --dry-run -v project/ server:project/
+syq -ac project/ server:project/
+syq -a --verify-only project/ server:project/
 ```
 
 Source placement follows rsync's trailing-slash rule:
@@ -71,125 +110,54 @@ Source placement follows rsync's trailing-slash rule:
   otherwise `dest` is the exact output path.
 - Multiple sources require a directory destination.
 
-Run `syq --help` for the complete option list. The
-[detailed reference](docs/reference.md) documents placement, filtering,
-deletion, resume, checkpoints, remote-to-remote operation, and all other
-current behavior.
+Run `syq --help` for all options. The
+[detailed reference](docs/reference.md) documents filtering, deletion, resume,
+checkpoints, remote-to-remote operation, and the complete path rules.
 
-## Install
+## Resume, verification, and deletion
 
-With Homebrew:
+With `-t` (included in `-a`), syq uses the same size-and-modification-time quick
+check as rsync. Files that need content changes are normally written beside the
+destination and renamed into place when complete, so an interrupted update does
+not expose a partially written final file. The partial is retained for the next
+run. Use `--inplace` only when avoiding the time or free space for a staged
+replacement of a large existing file is more important than atomic publication
+and safe interruption.
 
-```sh
-brew install greaber/tap/syq
-```
+Every block sent through syq's data protocol is checked on receipt. Syq also
+retries a file whose size or modification time changes while it is being read.
+These checks do not make a changing tree a point-in-time snapshot; use a
+filesystem or application snapshot when that consistency is required.
 
-The standalone installer selects the matching Linux or macOS release and
-installs it in `~/.local/bin` without `sudo`:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/greaber/syq/releases/latest/download/install.sh | sh
-```
-
-To inspect the installer first, download the same URL and run the saved script.
-The installer verifies the release archive before replacing an existing managed
-installation. Versioned binaries, checksums, manifests, and installers are
-available on the [releases page](https://github.com/greaber/syq/releases).
-
-To build from source with the pinned Rust toolchain:
-
-```sh
-cargo build --release
-cargo install --locked --path .
-```
-
-An official release automatically starts its exact matching helper on a remote
-host. On first use of that release, the remote downloads and verifies the
-helper under `~/.cache/syq/helpers/`; subsequent runs reuse it. A remote host
-without access to the release assets needs a manually installed matching
-binary selected with `--syq-path`, or a matching binary on its non-interactive
-`PATH` with `--no-bootstrap`.
-
-See the [installation reference](docs/reference.md#install) for supported
-platforms, installer verification, self-updates, static builds, and remote
-helper details.
-
-## Transfer behavior
-
-With `-t` (included in `-a`), syq uses a size-and-modification-time quick check
-to skip files that appear unchanged. Without `-t`, it transfers every regular
-file. Files that need content changes are written to a sidecar next to the
-destination. Workers may write different ranges concurrently; after the file
-is complete, syq applies the requested metadata and renames the sidecar over
-the destination.
-
-Every block sent through syq's data protocol carries a hash checked on receipt.
-Syq also re-stats the source after transfer and retries a file that changed
-while it was being read. These checks do not make a live tree a point-in-time
-snapshot. Use a filesystem or application snapshot when the source requires
-snapshot consistency.
-
-The default staging path gives old-or-new visibility and supports interruption
-and retry, but syq does not `fsync` file data. It therefore does not promise
-durability across a power loss. `--inplace` avoids the second copy but permits
-readers to observe partial content and can leave an incomplete destination
-after interruption.
-
-`--delete` removes destination-only paths after transfers finish. Source or
-destination scan errors suppress all deletions, and `--max-delete N` refuses
-the entire deletion phase when the limit would be exceeded. Always inspect a
+`--delete` removes destination-only paths after copying finishes. Source or
+destination scan errors suppress all deletion, and `--max-delete N` refuses
+the entire deletion phase when the limit would be exceeded. Inspect a
 destructive operation with `--dry-run -v` first.
 
-For the complete contract, see [Resume and checkpoints](docs/reference.md#resume-and-checkpoints),
-[Verification and consistency](docs/reference.md#verification-and-consistency),
-and [Deleting extras](docs/reference.md#deleting-extras---delete).
+## When parallelism applies
 
-## Where parallelism applies
+Parallelism helps when a single SSH process, network flow, or serial filesystem
+operation leaves available capacity unused. Syq adjusts its active connection
+count while a copy runs, so most users do not need to choose `-j`. It may offer
+little benefit for short copies or when one operation already saturates the
+limiting storage device.
 
-Parallelism can help when one SSH process, one network flow, filesystem
-metadata latency, or a single I/O request leaves available capacity unused.
-Typical cases include fast LANs, high-latency WANs, NFS and FUSE filesystems,
-NVMe arrays, and trees containing many independent files.
+SSH authenticates remote operations. Syq uses separate encrypted TCP data
+connections when they are reachable and falls back to separate SSH processes
+when they are not; the fallback requires no firewall changes. See
+[Server performance tuning](SERVER-TUNING.md) for optional configuration.
 
-It can hurt on a single rotating disk by turning sequential I/O into seeks. Use
-`-j 1` or a larger `--min-split` when the storage device is the limiting
-resource. Short transfers can also spend more time establishing connections
-than they save.
+## Compatibility and limitations
 
-Syq first tries separate AES-256-GCM-protected TCP data connections whose key is
-exchanged over the authenticated SSH control connection. If the destination's
-TCP port range is unreachable, it reports the fallback and transfers over
-separate SSH processes instead. `--no-tcp` selects the SSH data path directly.
-See [Server performance tuning](SERVER-TUNING.md) for optional, measured changes
-to firewall, SSH, and host configuration.
+The current CLI follows rsync's source placement rules and supports a useful
+subset of its options. Syq speaks its own peer protocol and cannot connect to
+an rsync daemon. Unsupported common rsync flags are rejected with an
+explanation rather than silently ignored.
 
-The scheduler and connection-tuning behavior are described in the
-[detailed reference](docs/reference.md#how-many-connections--j).
-
-## Compatibility and scope
-
-The command line intentionally resembles rsync so common source and destination
-spellings remain familiar. Syq speaks its own peer protocol and cannot connect
-to an rsync daemon. Some rsync options are unsupported, and a few behaviors are
-deliberately different where syq uses a safer or simpler rule.
-
-The [rsync compatibility record](RSYNC-COMPAT.md) states what has been measured,
-what differs, what is not implemented, and which integration test holds each
-claim.
-
-Notable current omissions include:
-
-- rsync filter rules; syq uses ordered gitignore-style `--ignore` and
-  `--ignore-from` rules;
-- hard-link, ACL, extended-attribute, and sparse-file preservation;
-- `--link-dest`, `--backup`, and rsync daemon mode;
-- rolling-checksum delta transfer for data shifted within an existing file;
-- cloud and object-storage backends.
-
-Use rsync when those features or exact rsync compatibility matter. Use rclone
-or a backend-specific client for cloud and object storage. Syq's current scope
-is copying filesystem trees between local or SSH-accessible POSIX systems.
+The [rsync compatibility record](RSYNC-COMPAT.md) states which behavior has
+been measured, what differs deliberately, and what is not implemented. The
+README describes the current interface; compatibility means the documented
+behavior, not that every rsync command will work unchanged.
 
 ## Documentation
 
