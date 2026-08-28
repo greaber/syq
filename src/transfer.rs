@@ -846,7 +846,9 @@ pub fn run(args: Args) -> Result<i32> {
                 .map(|e| format!("{e:#}"))
                 .or_else(|| checkpoint.take_error())
         });
-        if let Some(e) = failed.filter(|_| !args.quiet) {
+        // Error-class output: a real I/O failure that -q must not swallow,
+        // even though the exit code still describes the (complete) copy.
+        if let Some(e) = failed {
             eprintln!(
                 "syq: warning: checkpoint recording stopped ({e}); a retry will recheck files completed after that point"
             );

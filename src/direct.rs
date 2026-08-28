@@ -264,7 +264,11 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         if !out.status.success() || log.is_empty() {
             bail!("could not start detached transfer on {src_host}");
         }
-        if !args.quiet {
+        // The handoff is the command's result, not chatter: -q trims it to
+        // the bare follow target rather than suppressing it.
+        if args.quiet {
+            println!("{src_host}:{log}");
+        } else {
             println!("syq: started on {src_host}, log {log}");
             println!("syq: follow with:  syq --follow {src_host}:{log}");
         }

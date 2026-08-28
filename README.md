@@ -176,7 +176,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
 | `--no-forward-agent` | Remote-to-remote with default `ssh`: disable agent forwarding (conflicts with `-e`) |
-| `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session |
+| `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session; prints the follow target even with `-q` |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
@@ -389,7 +389,9 @@ path. Unfinished individual files are never checkpoint-complete; their actual
 
 The checkpoint is flushed about once a second and persists after both failed
 and successful runs until you remove or stop passing it. Losing its last
-buffered records only causes repeated work. If an existing checkpoint has
+buffered records only causes repeated work; if recording stops mid-run the
+copy continues and a warning names the I/O error — printed even under `-q`,
+while the exit code keeps describing the copy itself. If an existing checkpoint has
 completed records but an expected destination root is missing, SYQ fails and
 asks you to remove the checkpoint to restart. The checkpoint must be a regular
 file with exactly one hard link and must be outside local source and
