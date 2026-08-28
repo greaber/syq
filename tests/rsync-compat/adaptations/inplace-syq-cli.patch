@@ -1,0 +1,22 @@
+diff --git a/testsuite/inplace_test.py b/testsuite/inplace_test.py
+index e0c2079..5ed5db4 100644
+--- a/testsuite/inplace_test.py
++++ b/testsuite/inplace_test.py
+@@ -50,7 +50,7 @@ run_rsync('-a', f'{src}/', f'{TODIR}/')
+ ino_before = inode(TODIR / deep)
+
+ modify_deep()
+-run_rsync('-a', '--inplace', '--no-whole-file', f'{src}/', f'{TODIR}/')
++run_rsync('-a', '--inplace', f'{src}/', f'{TODIR}/')
+ assert_same(TODIR / deep, src / deep, label='inplace content')
+ if inode(TODIR / deep) != ino_before:
+     test_fail("--inplace changed the destination inode at depth "
+@@ -62,7 +62,7 @@ run_rsync('-a', f'{src}/', f'{TODIR}/')
+ ino_before = inode(TODIR / deep)
+
+ modify_deep()
+-run_rsync('-a', '--no-whole-file', f'{src}/', f'{TODIR}/')
++run_rsync('-a', f'{src}/', f'{TODIR}/')
+ assert_same(TODIR / deep, src / deep, label='default content')
+ if inode(TODIR / deep) == ino_before:
+     test_fail("default (non-inplace) delta update unexpectedly kept the "

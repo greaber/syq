@@ -1,0 +1,19 @@
+diff --git a/testsuite/chown_test.py b/testsuite/chown_test.py
+index 116b97e..bfeb62d 100644
+--- a/testsuite/chown_test.py
++++ b/testsuite/chown_test.py
+@@ -39,8 +39,6 @@ if fake_variant:
+         xattr_set(f'{RSYNC_PREFIX}.%stat', f"{mode:o} 0,0 {uid}:{gid}", path)
+         return True
+ else:
+-    rsyncfns.RSYNC = rsyncfns.RSYNC + ' --super'
+-
+     my_uid = os.getuid()
+     if my_uid != 0:
+         # If a fakeroot binary is in the environment, re-exec ourselves
+@@ -70,4 +68,4 @@ if not chown_or_fake(name2, 5001, 5003):
+     test_skipped("Can't chown (probably need root)")
+
+ os.chdir(FROMDIR.parent)
+-checkit(['-aHvv', 'from/', 'to/'], FROMDIR, TODIR)
++checkit(['-avv', 'from/', 'to/'], FROMDIR, TODIR)

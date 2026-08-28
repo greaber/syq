@@ -1,0 +1,20 @@
+diff --git a/testsuite/longdir_test.py b/testsuite/longdir_test.py
+index 4676c3f..c5a7302 100644
+--- a/testsuite/longdir_test.py
++++ b/testsuite/longdir_test.py
+@@ -4,7 +4,8 @@
+ # Regression test for a 2.0.11 bug: rsync used to mishandle paths nested
+ # inside a stupidly-long directory name. We build a three-deep nest of
+ # 175-char directory names, drop a couple of files in the leaf, and
+-# verify that --delete -avH still produces an identical destination.
++# verify that --delete -av still produces an identical destination. Hard-link
++# preservation is a separate unsupported SYQ feature.
+
+ from rsyncfns import (FROMDIR, TODIR, checkit, hands_setup, make_text_file,
+                       test_skipped)
+@@ -31,4 +32,4 @@ except OSError:
+ make_text_file(longdir / '1', 50)
+ make_text_file(longdir / '2', 100)
+
+-checkit(['--delete', '-avH', f'{FROMDIR}/', str(TODIR)], FROMDIR, TODIR)
++checkit(['--delete', '-av', f'{FROMDIR}/', str(TODIR)], FROMDIR, TODIR)

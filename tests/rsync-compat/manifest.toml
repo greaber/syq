@@ -1,0 +1,281 @@
+schema = 1
+
+[upstream]
+repository = "https://github.com/RsyncProject/rsync.git"
+commit = "7c20b077c980036a19587701cec320cc88e42a4a"
+configure_args = ["--disable-md2man", "--disable-xxhash", "--disable-zstd", "--disable-lz4", "--disable-idn"]
+helpers = ["tls", "trimslash", "t_unsafe", "t_chmod_secure", "t_secure_relpath", "wildtest", "getgroups", "getfsdev"]
+
+[profiles.default]
+enabled = true
+args = []
+description = "SYQ's normal command-line semantics"
+
+[profiles.strict]
+enabled = false
+args = ["--rsync-compat"]
+description = "Reserved for a strict compatibility flag that is not implemented yet"
+
+[reasons]
+rsync-internal = "Exercises rsync's implementation, build, helper programs, or test harness rather than command-line filesystem semantics."
+rsync-wire = "Exercises rsync's sender/receiver protocol or a malicious/legacy rsync peer; SYQ intentionally speaks a different protocol."
+rsync-daemon = "Exercises rsync daemon configuration, modules, authentication, or daemon transport; SYQ has no rsync daemon mode."
+rrsync = "Exercises rrsync, rsync's restricted-command wrapper, rather than the copy command's filesystem semantics."
+unsupported-acls = "Requires rsync ACL behavior, which SYQ does not implement."
+unsupported-alt-dest = "Requires rsync backup, link-dest, compare-dest, copy-dest, or alternate-basis behavior, which SYQ does not implement."
+unsupported-batch = "Requires rsync batch-file behavior, which SYQ does not implement."
+unsupported-filters = "Requires rsync's filter language; SYQ currently exposes gitignore-style filters instead."
+unsupported-hardlinks = "Requires hard-link preservation, which SYQ does not implement."
+unsupported-metadata = "Requires an rsync metadata option that SYQ does not implement yet."
+unsupported-relative = "Requires rsync --relative/-R behavior, which SYQ does not implement."
+unsupported-transfer-mode = "Requires an rsync transfer mode or output option that SYQ does not implement."
+unsupported-xattrs = "Requires extended-attribute behavior, which SYQ does not implement."
+
+[[tests]]
+name = "chgrp"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "metadata", "groups"]
+requirements = ["POSIX groups", "chgrp"]
+note = "Preserve a supplementary group with -g."
+
+[[tests]]
+name = "dest-symlinked-dir"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "paths", "symlinks"]
+requirements = ["symlinks"]
+note = "Follow an operator-named destination symlink to a directory."
+
+[[tests]]
+name = "dir-sgid"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "metadata", "setgid"]
+requirements = ["POSIX modes"]
+note = "Honor setgid inheritance when creating destination directories."
+
+[[tests]]
+name = "duplicates"
+classification = "conformance"
+expect = { default = "fail" }
+platforms = ["linux"]
+tags = ["local", "sources", "known-gap"]
+requirements = ["symlinks"]
+note = "SYQ still treats repeated identical sources as destination collisions."
+
+[[tests]]
+name = "files-from-path-clamp"
+classification = "conformance"
+expect = { default = "fail" }
+platforms = ["linux"]
+tags = ["local", "files-from", "known-gap"]
+requirements = []
+note = "SYQ rejects parent components instead of clamping them at the source root."
+
+[[tests]]
+name = "highfd-hang"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "robustness", "file-descriptors"]
+requirements = ["C compiler", "soft fd limit above FD_SETSIZE"]
+note = "An ordinary transfer completes when the child inherits high-numbered descriptors."
+
+[[tests]]
+name = "nested-socket-specials"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "special-files", "sockets"]
+requirements = ["Unix-domain sockets"]
+note = "Archive mode handles a nested socket without losing ordinary files."
+
+[[tests]]
+name = "search-only-destination"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "permissions", "paths"]
+requirements = ["Linux search-only directory semantics", "setpriv when run as root"]
+note = "Traverse a searchable but unreadable destination parent."
+
+[[tests]]
+name = "size-filter"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "size-filters"]
+requirements = []
+note = "Apply --min-size and --max-size throughout a deep tree."
+
+[[tests]]
+name = "symlink-ignore"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "symlinks"]
+requirements = ["symlinks"]
+note = "Without -l/-L/-a, omit symlinks while copying referent files."
+
+[[tests]]
+name = "change-shrink"
+classification = "adapted"
+adaptation = "source-mutation-cli"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "robustness", "concurrent-source-change"]
+requirements = ["threads", "bandwidth limiting"]
+note = "Continue a transfer when a source file shrinks after the source scan."
+
+[[tests]]
+name = "change-vanish"
+classification = "adapted"
+adaptation = "source-mutation-cli"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "robustness", "concurrent-source-change"]
+requirements = ["threads", "bandwidth limiting"]
+note = "Continue a transfer when a source file vanishes after the source scan."
+
+[[tests]]
+name = "chown"
+classification = "adapted"
+adaptation = "chown-syq-cli"
+expect = { default = "pass" }
+platforms = ["linux"]
+run_as = "root"
+tags = ["local", "metadata", "ownership"]
+requirements = ["root", "chown"]
+note = "Archive mode preserves numeric owners and groups; rsync-only --super and -H are removed."
+
+[[tests]]
+name = "deep-path"
+classification = "adapted"
+adaptation = "deep-path-local"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "paths", "depth"]
+requirements = ["paths deeper than 64 components"]
+note = "Copy a 70-level local tree; the rsync-daemon half is outside SYQ's scope."
+
+[[tests]]
+name = "growing-file"
+classification = "adapted"
+adaptation = "source-mutation-cli"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "robustness", "concurrent-source-change"]
+requirements = ["threads", "bandwidth limiting"]
+note = "Copy the final contents of a file that grows after the source scan."
+
+[[tests]]
+name = "inplace"
+classification = "adapted"
+adaptation = "inplace-syq-cli"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "inplace", "inode"]
+requirements = ["stable inode numbers"]
+note = "--inplace retains the destination inode while the default atomic path replaces it."
+
+[[tests]]
+name = "longdir"
+classification = "adapted"
+adaptation = "longdir-no-hardlinks"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "paths", "long-names"]
+requirements = ["long path components"]
+note = "Copy and delete within a tree containing three 175-character path components."
+
+[[tests]]
+name = "metadata-depth"
+classification = "adapted"
+adaptation = "metadata-supported-subset"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "metadata", "depth"]
+requirements = ["POSIX modes and mtimes"]
+note = "Preserve modes and mtimes throughout a deep tree; upstream's unsupported --chmod case is omitted."
+
+[[tests]]
+name = "partial"
+classification = "adapted"
+adaptation = "syq-partial-layout"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "resume", "partial-files"]
+requirements = ["signals", "bandwidth limiting"]
+note = "An interrupted transfer leaves SYQ's job-scoped deterministic sidecar and a rerun completes it."
+
+[[tests]]
+name = "protected-regular"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+run_as = "root"
+tags = ["local", "inplace", "permissions"]
+requirements = ["root", "Linux fs.protected_regular"]
+note = "--inplace can update a foreign-owned file in a sticky directory when the caller has authority."
+
+[[tests]]
+name = "sender-scan-dir-escape"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "security", "source-race"]
+requirements = ["symlinks", "C compiler", "renameat2"]
+note = "A raced source parent cannot make the copy enumerate outside the source tree."
+
+[[tests]]
+name = "ssh-basic"
+classification = "adapted"
+adaptation = "ssh-syq-path"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["remote", "ssh", "delete"]
+requirements = ["rsync lsh test helper"]
+note = "Remote-shell copy and follow-up deletion using SYQ's remote executable option."
+
+[[tests]]
+name = "symlink-race-dest"
+classification = "conformance"
+expect = { default = "fail" }
+platforms = ["linux"]
+run_as = "root"
+tags = ["local", "security", "destination-symlink", "known-gap"]
+requirements = ["root", "a second uid", "symlinks"]
+note = "SYQ follows an attacker-owned symlink in an operator-named absolute destination path."
+
+[[tests]]
+name = "symlink-race-relative-dest"
+classification = "conformance"
+expect = { default = "fail" }
+platforms = ["linux"]
+run_as = "root"
+tags = ["local", "security", "destination-symlink", "known-gap"]
+requirements = ["root", "a second uid", "symlinks"]
+note = "SYQ follows an attacker-owned symlink in an operator-named relative destination path."
+
+[[tests]]
+name = "symlink-race-source"
+classification = "conformance"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "security", "source-race"]
+requirements = ["symlinks", "C compiler", "renameat2"]
+note = "A raced source parent cannot make SYQ read file contents from outside the source tree."
+
+[[tests]]
+name = "update"
+classification = "adapted"
+adaptation = "update-supported-subset"
+expect = { default = "pass" }
+platforms = ["linux"]
+tags = ["local", "update", "depth"]
+requirements = ["symlinks"]
+note = "-u skips a newer deep destination, updates an older one, and still replaces a type mismatch."

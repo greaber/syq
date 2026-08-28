@@ -393,15 +393,19 @@ The checkpoint is flushed about once a second and persists after both failed
 and successful runs until you remove or stop passing it. Losing its last
 buffered records only causes repeated work; if recording stops mid-run the
 copy continues and a warning names the I/O error — printed even under `-q`,
-while the exit code keeps describing the copy itself. If an existing checkpoint has
-completed records but an expected destination root is missing, SYQ fails and
-asks you to remove the checkpoint to restart. The checkpoint must be a regular
-file with exactly one hard link and must be outside local source and
-destination trees; a hardlinked checkpoint is refused because appending or
-changing its permissions would also affect its other names. `-n` reads and
-validates existing state but never creates or changes it. `-c`, `--verify-only`,
-and `--rm` conflict with `--checkpoint`. One checkpoint file may be used by
-only one running copy at a time.
+while the exit code keeps describing the copy itself. Invalidation records are
+flushed before a checkpoint-covered destination is removed or changes type,
+but the checkpoint is not `fsync`ed and does not promise recovery across power
+loss. If an existing checkpoint has completed records but an expected
+destination root is missing, SYQ fails and asks you to remove the checkpoint to
+restart. The checkpoint must be a regular file with exactly one hard link and
+must be outside local source and destination trees; a hardlinked checkpoint is
+refused because appending or changing its permissions would also affect its
+other names. `-n` reads and validates existing state but never creates or
+changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`. One
+checkpoint file may be used by only one running copy at a time. Its filesystem
+must support advisory file locking; SYQ fails rather than write checkpoint
+state without single-writer exclusion.
 
 A checkpoint is an explicit trust decision: SYQ does not inspect a destination
 file covered by a matching record. If another process deleted, replaced, or
@@ -481,8 +485,9 @@ differs and why, what's missing, and the open issues. The short version:
 - rsync daemon mode / `rsync://`. syq speaks its own protocol; it cannot talk
   to an rsync server.
 - Rolling-checksum delta transfer (see Resume above).
-- Preserving existing partial files from `rsync --partial`; only syq's own
-  `.syq-part` sidecars for the same logical command are recognised.
+- Preserving existing partial files from `rsync --partial`; only SYQ's own
+  `.name.syq-part.<job-id>` sidecars for the same logical command are
+  recognised.
 
 ## When parallelism helps
 
@@ -635,8 +640,10 @@ have is removed. The rules are simpler than rsync's, deliberately:
   would otherwise look like one whose contents vanished (`source scan reported
   errors; skipping deletions`). The destination walk is held to the same rule:
   an unreadable directory *there* looks empty and would be removed over its
-  unknown contents, so its errors also skip all deletions. An interrupted run therefore never deletes
-  anything, and directory mtimes are set after the deletes.
+  unknown contents, so its errors also skip all deletions. A run interrupted
+  during scanning or transfer therefore never starts deletion. Once deletion
+  has begun, interruption can leave some planned extras removed; rerunning
+  finishes the mirror. Directory mtimes are set after the deletes.
 - **Sidecar-patterned files are extras unless they are this job's live
   resume state.** A `.name.syq-part.<job-id>` of *this* command whose `name`
   is still in the source stays, whatever happened to that file this run

@@ -1,0 +1,36 @@
+diff --git a/testsuite/growing-file_test.py b/testsuite/growing-file_test.py
+index 572e512..4d5c746 100644
+--- a/testsuite/growing-file_test.py
++++ b/testsuite/growing-file_test.py
+@@ -38,8 +38,7 @@ src.mkdir(parents=True)
+ dst.mkdir(parents=True)
+
+ # 'aaa_big' sorts first and is sent first; --bwlimit throttles it so the append
+-# to the later file lands well after the flist is built (--no-inc-recursive
+-# forces the whole flist up front) but well before that file is sent.
++# to the later file lands well after the source scan but before that file is sent.
+ make_data_file(src / 'aaa_big', 6 * 1024 * 1024)
+
+ grow = src / 'zzz_grow'
+@@ -63,7 +62,7 @@ t = threading.Thread(target=appender)
+ t.start()
+
+ proc = subprocess.run(
+-    rsync_argv('-a', '--no-inc-recursive', '--bwlimit=1500', f'{src}/', f'{dst}/'),
++    rsync_argv('-a', '-j', '1', '--bwlimit=1500', f'{src}/', f'{dst}/'),
+     capture_output=True, text=True)
+
+ t.join()
+diff --git a/testsuite/mutatefns.py b/testsuite/mutatefns.py
+index 3f2735b..5760e97 100644
+--- a/testsuite/mutatefns.py
++++ b/testsuite/mutatefns.py
+@@ -59,7 +59,7 @@ def run_mutating_transfer(setup, mutate, *, extra_rsync=('-a',),
+     t = threading.Thread(target=worker)
+     t.start()
+     proc = subprocess.run(
+-        rsync_argv(*extra_rsync, '--no-inc-recursive', f'--bwlimit={bwlimit}',
++        rsync_argv(*extra_rsync, '-j', '1', f'--bwlimit={bwlimit}',
+                    f'{src}/', f'{dst}/'),
+         capture_output=True, text=True)
+     t.join()

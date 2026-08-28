@@ -1,0 +1,16 @@
+diff --git a/testsuite/ssh-basic_test.py b/testsuite/ssh-basic_test.py
+index a02d55e..bf97067 100644
+--- a/testsuite/ssh-basic_test.py
++++ b/testsuite/ssh-basic_test.py
+@@ -42,2 +42,2 @@ hands_setup()
+-# RSYNC may be a multi-word command line; pass it through --rsync-path.
++# Pass the selected SYQ executable through SYQ's remote-path option.
+ from rsyncfns import RSYNC, RSYNC_PEER
+@@ -47,2 +47,2 @@ def _basic():
+-    checkit(['-avH', '-e', SSH, f'--rsync-path={rsync_path_arg()}',
++    checkit(['-av', '-e', SSH, f'--syq-path={rsync_path_arg()}',
+              f'{FROMDIR}/', f'localhost:{TODIR}'], FROMDIR, TODIR)
+@@ -54,2 +54,2 @@ def _delete_after_rename():
+-    checkit(['--delete', '-avH', '-e', SSH, f'--rsync-path={rsync_path_arg()}',
++    checkit(['--delete', '-av', '-e', SSH, f'--syq-path={rsync_path_arg()}',
+              f'{FROMDIR}/', f'localhost:{TODIR}'], FROMDIR, TODIR)

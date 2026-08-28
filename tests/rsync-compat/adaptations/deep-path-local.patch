@@ -1,0 +1,41 @@
+diff --git a/testsuite/deep-path_test.py b/testsuite/deep-path_test.py
+index 817524d..7b75556 100644
+--- a/testsuite/deep-path_test.py
++++ b/testsuite/deep-path_test.py
+@@ -12,17 +12,16 @@
+ # both within the cache (<=64 components, fast path) and beyond it (>64, the
+ # fallback) are transferred in one run, exercising the fast-path -> fallback
+ # handoff on the sender AND the receiver (whose caches are independent).
+-# Plain local transfer + a no-chroot daemon push; no root required.
++# SYQ adaptation: exercise the portable local transfer; rsync daemon mode is
++# outside SYQ's compatibility scope.
+
+ import os
+
+ from rsyncfns import (
+-    SCRATCHDIR, checkit, make_tree, rmtree, start_test_daemon, test_fail,
+-    test_skipped, walk_files, write_daemon_conf,
++    SCRATCHDIR, checkit, make_tree, rmtree, test_fail, test_skipped, walk_files,
+ )
+
+ DEPTH = 70            # > DPC_MAXDEPTH (64): the deepest files use the fallback
+-DAEMON_PORT = 12905
+
+ base = SCRATCHDIR / 'deep-path'
+ src = base / 'src'
+@@ -46,14 +45,4 @@ if parent_components <= 64:
+ dest = base / 'dest'
+ checkit(['-a', f'{src}/', str(dest)], src, dest)
+
+-# --- daemon push: the daemon receiver uses the confined resolver ------------
+-mod = base / 'module'
+-mod.mkdir(parents=True, exist_ok=True)
+-conf = write_daemon_conf([
+-    ('deep', {'path': str(mod), 'use chroot': 'no', 'read only': 'no'}),
+-])
+-daemon_url = start_test_daemon(conf, DAEMON_PORT).rstrip('/')
+-checkit(['-a', f'{src}/', f'{daemon_url}/deep/'], src, mod, allowed_codes=(0, 23))
+-
+-print(f"deep-path: {DEPTH}-deep tree round-trips past the dir-fd cache cap "
+-      "(local + daemon)")
++print(f"deep-path: {DEPTH}-deep tree round-trips locally")

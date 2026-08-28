@@ -2709,6 +2709,67 @@ fn completed_checkpoint_trusts_destination_and_tracks_source() {
     assert!(t.path("copy.checkpoint").is_file());
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn checkpoint_tombstone_precedes_destination_deletion() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"same source fingerprint");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let checkpoint = t.s("copy.checkpoint");
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+
+    fs::remove_file(t.path("src/f")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "-a",
+            "--delete",
+            "--no-progress",
+            "--checkpoint",
+            &checkpoint,
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_TEST_HOLD_AFTER_DELETE_MS", "10000")
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if !t.path("dst/f").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let deletion_observed = !t.path("dst/f").exists();
+    let kill_result = child.kill();
+    let wait_result = child.wait();
+    assert!(
+        deletion_observed,
+        "delete attempt did not reach the interruption window"
+    );
+    kill_result.unwrap();
+    wait_result.unwrap();
+
+    // Recreate precisely the fingerprint stored by the first run. Without a
+    // durable pre-delete tombstone, the checkpoint would skip this file while
+    // leaving its destination missing.
+    write(&t.path("src/f"), b"same source fingerprint");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let stdout = run_ok(&[
+        "-a",
+        "--checkpoint",
+        &checkpoint,
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    assert_eq!(transferred(&stdout), 1, "{stdout}");
+    assert_eq!(read(&t.path("dst/f")), b"same source fingerprint");
+}
+
 #[test]
 fn checkpoint_inside_local_source_is_rejected() {
     let t = Tmp::new();
@@ -4174,17 +4235,18 @@ fn copy_onto_itself_among_sources_is_order_independent() {
 
 #[test]
 fn bad_size_limits_fail_before_anything_connects() {
-    let t0 = std::time::Instant::now();
-    let out = syq(&[
-        "-a",
-        "--max-size",
-        "12Q",
-        "nohost-a.invalid:x",
-        "nohost-b.invalid:y",
-    ]);
-    assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("bad size"), "{}", stderr_of(&out));
-    assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+    for value in ["12Q", "-1", "18446744073709551616", "1e999"] {
+        let t0 = std::time::Instant::now();
+        let max_size = format!("--max-size={value}");
+        let out = syq(&["-a", &max_size, "nohost-a.invalid:x", "nohost-b.invalid:y"]);
+        assert!(!out.status.success(), "accepted {value:?}");
+        assert!(
+            stderr_of(&out).contains("bad size"),
+            "{value:?}: {}",
+            stderr_of(&out)
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+    }
 }
 
 #[test]

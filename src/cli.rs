@@ -185,7 +185,8 @@ pub struct Args {
     /// Delete extraneous files from the destination directories (paths the source does not
     /// have). Deletion happens after the transfer and is skipped entirely if the source scan
     /// reported any error. Ignored paths (-i) are protected on both sides. rsync's
-    /// --delete-after and --delete-delay mean the same thing and are accepted
+    /// --delete-after and --delete-delay mean the same thing and are accepted. Cannot be combined
+    /// with --verify-only or --files-from
     #[arg(
         long,
         aliases = ["delete-after", "delete-delay"],
@@ -515,17 +516,40 @@ pub fn parse_size(s: &str) -> Result<u64> {
         }
         _ => (s, 1),
     };
+    // Keep integral inputs exact, both to catch suffix multiplication
+    // overflow and to allow the largest valid u64 without routing it through
+    // f64 (which rounds u64::MAX up to 2^64).
+    if !num.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+        let n: u64 = num.parse().map_err(|_| anyhow::anyhow!("bad size {s:?}"))?;
+        return n
+            .checked_mul(mult)
+            .ok_or_else(|| anyhow::anyhow!("bad size {s:?}: value is too large"));
+    }
     let n: f64 = num.parse().map_err(|_| anyhow::anyhow!("bad size {s:?}"))?;
-    // The float-to-int cast saturates: -1 would silently become 0 (and with
-    // --max-size exclude every non-empty file), NaN 0, inf u64::MAX.
-    if !n.is_finite() || n < 0.0 {
+    if !n.is_finite() || n.is_sign_negative() {
         bail!("bad size {s:?}");
     }
-    let scaled = n * mult as f64;
-    if scaled >= u64::MAX as f64 {
-        bail!("size {s:?} is too large");
+    let bytes = n * mult as f64;
+    // Integer casts saturate in Rust, so check the exclusive upper bound
+    // explicitly instead of turning an overflow into u64::MAX.
+    if !bytes.is_finite() || bytes >= u64::MAX as f64 {
+        bail!("bad size {s:?}: value is too large");
     }
-    Ok(scaled as u64)
+    Ok(bytes as u64)
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::parse_size;
+
+    #[test]
+    fn size_parser_checks_sign_and_range() {
+        assert_eq!(parse_size("1.5K").unwrap(), 1536);
+        assert_eq!(parse_size("18446744073709551615").unwrap(), u64::MAX);
+        for value in ["-1", "18446744073709551616", "16777216T", "1e999"] {
+            assert!(parse_size(value).is_err(), "accepted {value:?}");
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

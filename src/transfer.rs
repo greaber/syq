@@ -2499,6 +2499,8 @@ impl Planner<'_> {
         // nothing more is deleted — the checkpoint's stale Complete records
         // would otherwise outlive the files they describe.
         let intents_failed = std::cell::Cell::new(false);
+        #[cfg(debug_assertions)]
+        let mut held_after_delete = false;
         let mut run = |me: &mut Self,
                        items: &[(PathBytes, String, PathBytes)],
                        rmdir: bool|
@@ -2550,7 +2552,17 @@ impl Planner<'_> {
                         }
                     })
                     .collect();
-                for ((_, rel, _), err) in chunk.iter().zip(me.apply(ops)?) {
+                let errs = me.apply(ops)?;
+                #[cfg(debug_assertions)]
+                if !held_after_delete {
+                    held_after_delete = true;
+                    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_AFTER_DELETE_MS") {
+                        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                        }
+                    }
+                }
+                for ((_, rel, _), err) in chunk.iter().zip(errs) {
                     match err {
                         None => {
                             n += 1;
