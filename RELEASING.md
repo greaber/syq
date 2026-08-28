@@ -135,10 +135,9 @@ connection, so enable it only for a trusted release host rather than globally.
    directly targets the workflow commit, and that this commit is reachable
    from protected `master`. It then builds static GNU Linux x86-64/ARM64
    binaries and native macOS Apple Silicon/Intel binaries, embeds an Ed25519
-   signature over the manifest's RFC 8785 canonical JSON, retains a detached
-   signature for updaters through 0.1.1, verifies the exact asset inventory,
-   creates provenance attestations, uploads a draft, checks every uploaded
-   byte, publishes it, and finally updates the tap.
+   signature over the manifest's RFC 8785 canonical JSON, verifies the exact
+   asset inventory, creates provenance attestations, uploads a draft, checks
+   every uploaded byte, publishes it, and finally updates the tap.
 4. Verify one or more downloaded artifacts and exercise both install paths:
 
    ```sh
