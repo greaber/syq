@@ -518,8 +518,40 @@ pub fn parse_size(s: &str) -> Result<u64> {
         }
         _ => (s, 1),
     };
+    // Keep integral inputs exact, both to catch suffix multiplication
+    // overflow and to allow the largest valid u64 without routing it through
+    // f64 (which rounds u64::MAX up to 2^64).
+    if !num.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+        let n: u64 = num.parse().map_err(|_| anyhow::anyhow!("bad size {s:?}"))?;
+        return n
+            .checked_mul(mult)
+            .ok_or_else(|| anyhow::anyhow!("bad size {s:?}: value is too large"));
+    }
     let n: f64 = num.parse().map_err(|_| anyhow::anyhow!("bad size {s:?}"))?;
-    Ok((n * mult as f64) as u64)
+    if !n.is_finite() || n.is_sign_negative() {
+        bail!("bad size {s:?}");
+    }
+    let bytes = n * mult as f64;
+    // Integer casts saturate in Rust, so check the exclusive upper bound
+    // explicitly instead of turning an overflow into u64::MAX.
+    if !bytes.is_finite() || bytes >= u64::MAX as f64 {
+        bail!("bad size {s:?}: value is too large");
+    }
+    Ok(bytes as u64)
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::parse_size;
+
+    #[test]
+    fn size_parser_checks_sign_and_range() {
+        assert_eq!(parse_size("1.5K").unwrap(), 1536);
+        assert_eq!(parse_size("18446744073709551615").unwrap(), u64::MAX);
+        for value in ["-1", "18446744073709551616", "16777216T", "1e999"] {
+            assert!(parse_size(value).is_err(), "accepted {value:?}");
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -89,6 +89,11 @@ negative: the next attempt repeats a destination check. Records are flushed
 after 256 additions or about one second; `--fsync` also syncs those flushes.
 Malformed or crash-torn records are ignored.
 
+Before `--delete` dispatches a batch, it records and flushes tombstones for
+any completed-file keys in that batch. If deletion then fails or the process
+is interrupted, a later attempt conservatively rechecks those paths; it can
+never trust a stale completion record for a file deletion already performed.
+
 ## Using and retiring a checkpoint
 
 The source is scanned on every attempt. For each regular file, SYQ first claims

@@ -264,6 +264,24 @@ pub fn debug() -> bool {
     std::env::var_os("SYQ_DEBUG").is_some()
 }
 
+fn create_destination_dir(dst: &mut dyn Conn, path: &[u8]) -> Result<()> {
+    match ok(
+        dst.call(Request::Apply(vec![Op::Mkdir {
+            path: path.to_vec(),
+            mode: 0o755,
+        }]))?,
+        "mkdir",
+    )? {
+        Response::Applied(errs) => {
+            if let Some(error) = errs.into_iter().flatten().next() {
+                bail!("{error}");
+            }
+        }
+        other => bail!("unexpected response {other:?}"),
+    }
+    Ok(())
+}
+
 fn read_umask() -> u32 {
     unsafe {
         let m = libc::umask(0o022);
@@ -618,28 +636,15 @@ pub fn run(args: Args) -> Result<i32> {
         &opts,
     )?;
 
-    // Create a missing directory destination — never in the read-only modes,
-    // and never under --existing.
-    if dst_root_entry.is_none()
+    // A multi-source plan is validated in full before its missing destination
+    // is created. Single-source copies can keep streaming immediately.
+    let create_dst_root = dst_root_entry.is_none()
         && dst_is_dir
         && !args.dry_run
         && !args.verify_only
-        && !args.existing
-    {
-        match ok(
-            dst_ctl.call(Request::Apply(vec![Op::Mkdir {
-                path: dst_root.clone(),
-                mode: 0o755,
-            }]))?,
-            "mkdir",
-        )? {
-            Response::Applied(errs) => {
-                if let Some(e) = errs.into_iter().flatten().next() {
-                    bail!("{e}");
-                }
-            }
-            other => bail!("unexpected response {other:?}"),
-        }
+        && !args.existing;
+    if create_dst_root && srcs.len() == 1 {
+        create_destination_dir(&mut *dst_ctl, &dst_root)?;
     }
 
     let checkpoint_completed = checkpoint_state
@@ -720,8 +725,20 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     if scan_err.is_none() && !st.collision {
-        if let Err(e) = st.replay_buffered() {
+        if let Err(e) = st.validate_buffered() {
             scan_err = Some(e);
+        }
+    }
+    if scan_err.is_none() && !st.collision {
+        if create_dst_root && srcs.len() > 1 {
+            if let Err(e) = create_destination_dir(st.dst, &dst_root) {
+                scan_err = Some(e);
+            }
+        }
+        if scan_err.is_none() {
+            if let Err(e) = st.replay_buffered() {
+                scan_err = Some(e);
+            }
         }
     }
     let collision = st.collision;
@@ -1448,12 +1465,10 @@ impl Planner<'_> {
         }
     }
 
-    /// Several sources: every batch has been mapped and claimed, nothing
-    /// applied. Contested claims (two sources naming one regular file) are
-    /// fine only when one of them *is* the destination file; settle those
-    /// with one stat pass, then apply everything if there was no conflict.
-    fn replay_buffered(&mut self) -> Result<()> {
-        let Some(mut buffered) = self.buffer.take() else {
+    /// Settle claims that require a destination stat while leaving every
+    /// buffered operation unapplied.
+    fn validate_buffered(&mut self) -> Result<()> {
+        let Some(buffered) = self.buffer.as_ref() else {
             return Ok(());
         };
         // (destination, first claimant's identity, this claimant's identity, name)
@@ -1484,9 +1499,15 @@ impl Planner<'_> {
                 }
             }
         }
-        if self.collision {
+        Ok(())
+    }
+
+    /// Apply a multi-source plan only after every collision has been settled.
+    fn replay_buffered(&mut self) -> Result<()> {
+        let Some(mut buffered) = self.buffer.take() else {
             return Ok(());
-        }
+        };
+        debug_assert!(!self.collision);
         // Validated: from here on they are ordinary entries (the one that is
         // the destination file skips itself; the other is written).
         for m in &mut buffered {
@@ -2140,6 +2161,15 @@ impl Planner<'_> {
                         }
                         continue;
                     }
+                    // The checkpoint is allowed to bypass destination stats,
+                    // so invalidate any old completion records durably before
+                    // making their destination files disappear. If unlinking
+                    // then fails, a later recheck is conservative and safe.
+                    if let Some(c) = &checkpoint {
+                        c.record_deletions(chunk.iter().filter_map(|(_, _, dst_rel)| {
+                            (!dst_rel.is_empty()).then_some(dst_rel.as_slice())
+                        }))?;
+                    }
                     let ops: Vec<Op> = chunk
                         .iter()
                         .map(|(p, _, _)| {
@@ -2152,18 +2182,19 @@ impl Planner<'_> {
                             }
                         })
                         .collect();
-                    for ((_, rel, dst_rel), err) in chunk.iter().zip(me.apply(true, ops)?) {
+                    let errs = me.apply(true, ops)?;
+                    #[cfg(debug_assertions)]
+                    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_AFTER_DELETE_MS") {
+                        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                        }
+                    }
+                    for ((_, rel, _), err) in chunk.iter().zip(errs) {
                         match err {
                             None => {
                                 n += 1;
                                 if opts.verbose > 0 {
                                     me.progress.println(&format!("deleting {rel}"));
-                                }
-                                // Forget any completion record: if the source ever
-                                // brings this path back with the same fingerprint,
-                                // it must be transferred, not assumed present.
-                                if let (Some(c), false) = (&checkpoint, dst_rel.is_empty()) {
-                                    c.record_deleted(dst_rel);
                                 }
                             }
                             Some(e) => me.progress.error(&format!("syq: delete {rel}: {e}")),

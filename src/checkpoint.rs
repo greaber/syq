@@ -360,17 +360,34 @@ impl Checkpoint {
         }
     }
 
-    /// --delete removed `path`: forget its completion record, so a retry
-    /// never assumes it present if the source brings it back unchanged.
-    pub fn record_deleted(&self, path: &[u8]) {
-        if self.failed.lock().unwrap().is_some() {
-            return;
+    /// Persist tombstones before --delete removes the corresponding paths.
+    /// A failed deletion may then cause a harmless future recheck; the reverse
+    /// order could leave a stale completion record for a now-missing file.
+    pub fn record_deletions<'a>(&self, paths: impl IntoIterator<Item = &'a [u8]>) -> Result<()> {
+        if let Some(error) = self.failed.lock().unwrap().clone() {
+            bail!("checkpoint recording previously failed: {error}");
         }
-        if let Err(e) = self.append(&Record::Deleted {
-            path_b64: b64(path),
-        }) {
-            self.note_error(e);
+        let result = (|| {
+            let mut writer = self.writer.lock().unwrap();
+            let mut appended = false;
+            for path in paths {
+                Self::append_locked(
+                    &mut writer,
+                    &Record::Deleted {
+                        path_b64: b64(path),
+                    },
+                )?;
+                appended = true;
+            }
+            if appended {
+                self.flush_locked(&mut writer)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            self.note_error(anyhow::anyhow!("{error:#}"));
         }
+        result
     }
 
     pub fn take_error(&self) -> Option<String> {
@@ -379,6 +396,10 @@ impl Checkpoint {
 
     fn append(&self, record: &Record) -> Result<()> {
         let mut writer = self.writer.lock().unwrap();
+        Self::append_locked(&mut writer, record)
+    }
+
+    fn append_locked(writer: &mut Writer, record: &Record) -> Result<()> {
         serde_json::to_writer(&mut writer.buf, record)?;
         writer.buf.push(b'\n');
         writer.unflushed += 1;
@@ -463,6 +484,37 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        drop(checkpoint);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn deletion_tombstones_are_flushed_immediately() {
+        let dir = std::env::temp_dir().join(format!(
+            "syq-checkpoint-unit-{}-deleted",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.jsonl");
+        let _ = fs::remove_file(&path);
+
+        let (checkpoint, _) = Checkpoint::open(&path, "identity", false).unwrap();
+        checkpoint.record_complete(b"a/b", &entry(10, 20, 0o644), "transferred");
+        checkpoint.close().unwrap();
+        drop(checkpoint);
+
+        let (checkpoint, loaded) = Checkpoint::open(&path, "identity", false).unwrap();
+        assert!(loaded.completed.contains_key(b"a/b".as_slice()));
+        checkpoint.record_deletions([b"a/b".as_slice()]).unwrap();
+        assert!(
+            !Checkpoint::load(&path)
+                .unwrap()
+                .completed
+                .contains_key(b"a/b".as_slice()),
+            "the tombstone must be visible before close"
+        );
+        checkpoint.close().unwrap();
         drop(checkpoint);
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
