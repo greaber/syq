@@ -139,6 +139,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.progress_json && !args.quiet {
         remote.push("--progress-json".into());
     }
+    if args.dry_run {
+        remote.push(format!("--plan-source-host={src_target}"));
+    }
     // --ignore-from files were read locally; forward the merged lines.
     for l in &args.ignore_lines {
         // One argument, so a pattern starting with '-' can't be taken for a flag.

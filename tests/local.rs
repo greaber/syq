@@ -960,6 +960,29 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     write(&t.path("src"), b"tcp default");
     let remote = format!("127.0.0.1:{}", t.s("dst"));
 
+    let dry = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--dry-run", "-a"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("dry-run syq over encrypted TCP through fake remote shell");
+    assert_output_ok(&dry);
+    assert!(!t.path("dst").exists());
+    let stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        stdout.contains("route: encrypted TCP to 127.0.0.1; 16 initial connections (auto-tuned)"),
+        "{stdout}"
+    );
+
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .arg("-e")
         .arg(&rsh)
@@ -1520,6 +1543,92 @@ fn dry_run_creates_nothing() {
     );
     assert!(out.contains("would transfer"), "{out}");
     assert!(transferred(&out) > 0);
+}
+
+#[test]
+fn dry_run_reports_concrete_plan() {
+    let t = Tmp::new();
+    write(&t.path("src/send"), b"new");
+    write(&t.path("src/same"), b"same");
+    write(&t.path("src/too-big"), b"123456");
+    write(&t.path("src/skip.log"), b"ignored");
+    write(&t.path("dst/same"), b"same");
+    write(&t.path("dst/extra"), b"delete me");
+    set_mtime(&t.path("src/same"), 1_600_000_000);
+    set_mtime(&t.path("dst/same"), 1_600_000_000);
+
+    let out = run_ok(&[
+        "-an",
+        "--delete",
+        "--max-size",
+        "5",
+        "-i",
+        "*.log",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(out.contains("syq: dry-run plan"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "mapping: {} -> {} (directory contents)",
+            t.s("src/"),
+            t.s("dst")
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("plan: 1 file, 3 B to transfer; 1 file, 4 B unchanged"),
+        "{out}"
+    );
+    assert!(
+        out.contains("exclusions: 1 path/subtree pruned by ignore rules; 1 other entry"),
+        "{out}"
+    );
+    assert!(
+        out.contains("deletions: 1 entry planned after a successful copy"),
+        "{out}"
+    );
+    assert!(
+        out.contains("route: local filesystem; 32 initial workers (auto-tuned)"),
+        "{out}"
+    );
+    assert!(t.path("dst/extra").exists());
+}
+
+#[test]
+fn dry_run_plan_resolves_path_semantics() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"data");
+
+    let child = run_ok(&["-an", &t.s("src"), &t.s("child-target")]);
+    assert!(
+        child.contains(&format!(
+            "mapping: {} -> {} (directory as child)",
+            t.s("src"),
+            t.s("child-target/src")
+        )),
+        "{child}"
+    );
+
+    let contents = run_ok(&["-an", &t.s("src/"), &t.s("contents-target/")]);
+    assert!(
+        contents.contains(&format!(
+            "mapping: {} -> {} (directory contents)",
+            t.s("src/"),
+            t.s("contents-target")
+        )),
+        "{contents}"
+    );
+
+    let exact = run_ok(&["-an", &t.s("src/file"), &t.s("exact-target")]);
+    assert!(
+        exact.contains(&format!(
+            "mapping: {} -> {} (exact destination path)",
+            t.s("src/file"),
+            t.s("exact-target")
+        )),
+        "{exact}"
+    );
 }
 
 #[test]
@@ -4879,6 +4988,26 @@ fn max_delete_refuses_everything_past_the_limit() {
     for i in 0..5 {
         write(&t.path(&format!("dst/extra{i}")), b"x");
     }
+    let dry = syq(&[
+        "-an",
+        "--delete",
+        "--max-delete",
+        "3",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(dry.status.code(), Some(25), "{}", stderr_of(&dry));
+    let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_stdout.contains("deletions: 5 entries planned; blocked by --max-delete 3"),
+        "{dry_stdout}"
+    );
+    assert!(
+        dry_stdout.contains("5 planned for deletion (blocked by --max-delete 3)"),
+        "{dry_stdout}"
+    );
+    assert_eq!(listing(&t.path("dst")).len(), 5, "dry run changed files");
+
     let out = syq(&[
         "-a",
         "--delete",
@@ -5601,6 +5730,21 @@ fn direct_remote_to_remote_passes_through_defined_exit_codes() {
     write(&t.path("dst/extra2"), b"y");
     let src = format!("fake:{}", t.s("src/"));
     let dst = format!("fake:{}", t.s("dst"));
+    let dry = remote_syq(&t, &rsh, &["-an", "--no-bootstrap", &src, &dst]);
+    assert_output_ok(&dry);
+    let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_stdout.contains(&format!(
+            "mapping: fake:{} -> fake:{} (directory contents)",
+            t.s("src/"),
+            t.s("dst")
+        )),
+        "{dry_stdout}"
+    );
+    assert!(
+        dry_stdout.contains("route: local filesystem on fake; 1 worker (fixed)"),
+        "{dry_stdout}"
+    );
     // --max-delete refusal on the remote orchestrator must surface as 25.
     let out = remote_syq(
         &t,

@@ -892,16 +892,21 @@ pub fn run(args: Args) -> Result<i32> {
     };
 
     let mut scan_err = None;
+    let mut dry_run_mappings = Vec::with_capacity(srcs.len());
     if args.files_from.is_some() {
         let src = &srcs[0];
-        if let Err(e) = st.scan_files_from(
+        match st.scan_files_from(
             &mut *src_ctl,
             src.path.as_bytes(),
             &dst_root,
             &args.files_from_lines,
             args.recursive_explicit,
         ) {
-            scan_err = Some(e);
+            Ok(()) => dry_run_mappings.push(DryRunMapping {
+                target: dst_root.clone(),
+                semantics: "paths selected by --files-from",
+            }),
+            Err(e) => scan_err = Some(e),
         }
     }
     for src in srcs.iter().filter(|_| args.files_from.is_none()) {
@@ -915,7 +920,7 @@ pub fn run(args: Args) -> Result<i32> {
         } else {
             src.basename()
         };
-        if let Err(e) = st.scan_source(
+        match st.scan_source(
             &mut *src_ctl,
             &src_root,
             follow,
@@ -923,8 +928,11 @@ pub fn run(args: Args) -> Result<i32> {
             &dst_root,
             dst_is_dir,
         ) {
-            scan_err = Some(e);
-            break;
+            Ok(mapping) => dry_run_mappings.push(mapping),
+            Err(e) => {
+                scan_err = Some(e);
+                break;
+            }
         }
     }
     if scan_err.is_none() && !st.collision {
@@ -987,6 +995,11 @@ pub fn run(args: Args) -> Result<i32> {
 
     let aborted = sched.is_aborted();
     let mut deleted = 0u64;
+    let mut delete_plan = if opts.delete {
+        DeletePlan::Skipped("the copy plan did not complete")
+    } else {
+        DeletePlan::Disabled
+    };
     // --delete runs once the workers are done, so the destination walk sees a
     // quiescent tree (no partials being renamed, no entries being replaced),
     // and before apply_deferred, since unlinking bumps directory mtimes. Any
@@ -994,14 +1007,22 @@ pub fn run(args: Args) -> Result<i32> {
     // read would otherwise look like one whose contents vanished.
     if !aborted && opts.delete && scan_err.is_none() && !collision {
         if st.scan_warned {
+            delete_plan = DeletePlan::Skipped("source scan errors");
             progress.eprintln("syq: source scan reported errors; skipping deletions");
         } else {
             match st.plan_deletes() {
                 Ok(()) if st.delete_walk_failed => {
+                    delete_plan = DeletePlan::Skipped("destination walk errors");
                     progress.eprintln("syq: destination walk reported errors; skipping deletions")
                 }
-                Ok(()) => deleted = st.run_deletes()?,
-                Err(e) => progress.error(&format!("syq: delete: {e:#}")),
+                Ok(()) => {
+                    delete_plan = DeletePlan::Planned(st.deletes.len());
+                    deleted = st.run_deletes()?;
+                }
+                Err(e) => {
+                    delete_plan = DeletePlan::Skipped("destination planning failed");
+                    progress.error(&format!("syq: delete: {e:#}"));
+                }
             }
         }
     }
@@ -1040,6 +1061,19 @@ pub fn run(args: Args) -> Result<i32> {
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
     if !args.quiet && !aborted {
+        if opts.dry_run {
+            print_dry_run_plan(
+                srcs,
+                dst,
+                &dry_run_mappings,
+                &src_ep,
+                &dst_ep,
+                &args,
+                &opts,
+                &progress,
+                delete_plan,
+            );
+        }
         if opts.verify_only {
             println!(
                 "syq: verified {} files, {} differ/missing, {} in {}",
@@ -1066,19 +1100,7 @@ pub fn run(args: Args) -> Result<i32> {
                 human(progress.bytes_skipped.load(Relaxed)),
                 commas(progress.files_skipped.load(Relaxed)),
                 commas(st_dirs(&progress)),
-                if opts.delete {
-                    format!(
-                        ", {} {}",
-                        commas(deleted),
-                        if opts.dry_run {
-                            "would be deleted"
-                        } else {
-                            "deleted"
-                        }
-                    )
-                } else {
-                    String::new()
-                },
+                deletion_summary(delete_plan, deleted, opts.dry_run, opts.max_delete),
                 if opts.dry_run {
                     String::new()
                 } else {
@@ -1214,14 +1236,20 @@ fn scan_into_planner(
 ) -> Result<()> {
     let progress = pl.progress;
     let quiet = pl.opts.quiet;
+    let report_ignored = pl.opts.dry_run;
     let warned = std::cell::Cell::new(false);
     let res = src.scan(
         root,
         follow_root,
         ignore,
-        false,
+        report_ignored,
         &mut |batch| f(pl, batch),
-        &mut |_| Ok(()),
+        &mut |paths| {
+            progress
+                .paths_ignored
+                .fetch_add(paths.len() as u64, Relaxed);
+            Ok(())
+        },
         &mut |w| {
             // "skipping …" is a notice (nothing the copy owes is missing);
             // anything else from the scanner means an entry was lost.
@@ -1281,6 +1309,207 @@ fn follow_dir_symlink(
 
 fn display(p: &[u8]) -> String {
     String::from_utf8_lossy(p).into_owned()
+}
+
+fn display_location(loc: &Location, path: &[u8]) -> String {
+    let path = display(path);
+    let Some(host) = &loc.host else {
+        return path;
+    };
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    match &loc.user {
+        Some(user) => format!("{user}@{host}:{path}"),
+        None => format!("{host}:{path}"),
+    }
+}
+
+fn display_plan_source(loc: &Location, args: &Args) -> String {
+    if !loc.is_remote() {
+        if let Some(host) = &args.plan_source_host {
+            return format!("{host}:{}", display(loc.path.as_bytes()));
+        }
+    }
+    display_location(loc, loc.path.as_bytes())
+}
+
+fn display_plan_target(loc: &Location, path: &[u8], args: &Args) -> String {
+    if !loc.is_remote() {
+        if let Some(host) = &args.plan_source_host {
+            return format!("{host}:{}", display(path));
+        }
+    }
+    display_location(loc, path)
+}
+
+fn remote_data_transport(spec: &RemoteSpec) -> &'static str {
+    match spec.tcp.lock().unwrap().as_ref() {
+        Some(info) if info.key.is_some() => "encrypted TCP",
+        Some(_) => "plaintext TCP",
+        None => "ssh",
+    }
+}
+
+fn selected_route(src: &Endpoint, dst: &Endpoint, args: &Args) -> String {
+    let route = match (src, dst) {
+        (Endpoint::Local, Endpoint::Local) => args.plan_source_host.as_ref().map_or_else(
+            || "local filesystem".to_string(),
+            |host| format!("local filesystem on {host}"),
+        ),
+        (Endpoint::Local, Endpoint::Remote(spec)) => match &args.plan_source_host {
+            Some(source) => format!(
+                "{} from {source} to {}",
+                remote_data_transport(spec),
+                spec.label()
+            ),
+            None => format!("{} to {}", remote_data_transport(spec), spec.label()),
+        },
+        (Endpoint::Remote(spec), Endpoint::Local) => {
+            format!("{} from {}", remote_data_transport(spec), spec.label())
+        }
+        (Endpoint::Remote(source), Endpoint::Remote(target)) => format!(
+            "{} from {} through this machine, {} to {}",
+            remote_data_transport(source),
+            source.label(),
+            remote_data_transport(target),
+            target.label()
+        ),
+    };
+    let remote = src.is_remote() || dst.is_remote();
+    let unit = |n: usize| match (remote, n) {
+        (true, 1) => "connection",
+        (true, _) => "connections",
+        (false, 1) => "worker",
+        (false, _) => "workers",
+    };
+    let concurrency = if args.connections_default {
+        format!(
+            "{} initial {} (auto-tuned)",
+            args.connections,
+            unit(args.connections)
+        )
+    } else {
+        format!("{} {} (fixed)", args.connections, unit(args.connections))
+    };
+    format!("{route}; {concurrency}")
+}
+
+struct DryRunMapping {
+    target: PathBytes,
+    semantics: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum DeletePlan {
+    Disabled,
+    Planned(u64),
+    Skipped(&'static str),
+}
+
+fn count_label(n: u64, singular: &str, plural: &str) -> String {
+    format!("{} {}", commas(n), if n == 1 { singular } else { plural })
+}
+
+fn deletion_summary(plan: DeletePlan, deleted: u64, dry_run: bool, max: Option<u64>) -> String {
+    match plan {
+        DeletePlan::Disabled => String::new(),
+        DeletePlan::Planned(n) => {
+            if let Some(limit) = max.filter(|limit| n > *limit) {
+                format!(
+                    ", {} planned for deletion (blocked by --max-delete {limit})",
+                    commas(n)
+                )
+            } else {
+                format!(
+                    ", {} {}",
+                    commas(deleted),
+                    if dry_run {
+                        "would be deleted"
+                    } else {
+                        "deleted"
+                    }
+                )
+            }
+        }
+        DeletePlan::Skipped(reason) => format!(", deletions skipped ({reason})"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_dry_run_plan(
+    srcs: &[Location],
+    dst: &Location,
+    mappings: &[DryRunMapping],
+    src_ep: &Endpoint,
+    dst_ep: &Endpoint,
+    args: &Args,
+    opts: &Opts,
+    progress: &Progress,
+    deletes: DeletePlan,
+) {
+    println!("syq: dry-run plan");
+    for (source, mapping) in srcs.iter().zip(mappings) {
+        println!(
+            "  mapping: {} -> {} ({})",
+            display_plan_source(source, args),
+            display_plan_target(dst, &mapping.target, args),
+            mapping.semantics
+        );
+    }
+    println!(
+        "  plan: {}, {} to transfer; {}, {} unchanged",
+        count_label(progress.files_total.load(Relaxed), "file", "files"),
+        human(progress.bytes_total.load(Relaxed)),
+        count_label(progress.files_skipped.load(Relaxed), "file", "files"),
+        human(progress.bytes_skipped.load(Relaxed))
+    );
+
+    let ignored = progress.paths_ignored.load(Relaxed);
+    let other = progress.files_excluded.load(Relaxed);
+    let mut exclusions = Vec::new();
+    if ignored > 0 {
+        exclusions.push(format!(
+            "{} pruned by ignore rules",
+            count_label(ignored, "path/subtree", "paths/subtrees")
+        ));
+    }
+    if other > 0 {
+        exclusions.push(count_label(other, "other entry", "other entries"));
+    }
+    println!(
+        "  exclusions: {}",
+        if exclusions.is_empty() {
+            if opts.ignore.is_empty() {
+                "none".to_string()
+            } else {
+                "none matched (ignore rules active)".to_string()
+            }
+        } else {
+            exclusions.join("; ")
+        }
+    );
+
+    match deletes {
+        DeletePlan::Disabled => println!("  deletions: disabled"),
+        DeletePlan::Planned(n) => {
+            if let Some(limit) = opts.max_delete.filter(|limit| n > *limit) {
+                println!(
+                    "  deletions: {} planned; blocked by --max-delete {limit}",
+                    count_label(n, "entry", "entries")
+                );
+            } else {
+                println!(
+                    "  deletions: {} planned after a successful copy",
+                    count_label(n, "entry", "entries")
+                );
+            }
+        }
+        DeletePlan::Skipped(reason) => println!("  deletions: skipped ({reason})"),
+    }
+    println!("  route: {}", selected_route(src_ep, dst_ep, args));
 }
 
 fn path_has_partial_component(path: &[u8]) -> bool {
@@ -1406,6 +1635,17 @@ struct Deletes {
     dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String, PathBytes)>>,
 }
 
+impl Deletes {
+    fn len(&self) -> u64 {
+        self.leaves.len() as u64
+            + self
+                .dirs
+                .values()
+                .map(|items| items.len() as u64)
+                .sum::<u64>()
+    }
+}
+
 impl Planner<'_> {
     fn scan_source(
         &mut self,
@@ -1415,10 +1655,11 @@ impl Planner<'_> {
         sub: &str,
         dst_root: &[u8],
         dst_is_dir: bool,
-    ) -> Result<()> {
+    ) -> Result<DryRunMapping> {
         let mut first = true;
         let mut sub = sub.to_string();
         let mut skip_all = false;
+        let mut mapping = None;
         let ignore = self.opts.ignore.clone();
         scan_into_planner(self, src, src_root, follow, &ignore, |pl, batch| {
             if skip_all {
@@ -1430,6 +1671,15 @@ impl Planner<'_> {
                     if root.kind != Kind::Dir && !dst_is_dir {
                         sub = String::new();
                     }
+                    mapping = Some(DryRunMapping {
+                        target: join(dst_root, sub.as_bytes()),
+                        semantics: match (root.kind, follow, dst_is_dir) {
+                            (Kind::Dir, true, _) => "directory contents",
+                            (Kind::Dir, false, _) => "directory as child",
+                            (_, _, true) => "entry inside destination directory",
+                            _ => "exact destination path",
+                        },
+                    });
                     if root.kind == Kind::Dir && !pl.opts.recursive {
                         if !pl.opts.quiet {
                             pl.progress
@@ -1446,7 +1696,8 @@ impl Planner<'_> {
             }
             pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
             pl.handle_batch(batch, src_root, &sub, dst_root)
-        })
+        })?;
+        mapping.ok_or_else(|| anyhow::anyhow!("source scan returned no root entry"))
     }
 
     /// --files-from: instead of walking the source, stat each listed path (and

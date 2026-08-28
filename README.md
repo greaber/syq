@@ -161,7 +161,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `-v`, `-vv` | `-v` lists files as they complete; for copies, `-vv` also explains remote helpers, candidate TCP addresses, the planned transport, and initial concurrency |
 | `-q` | Errors only |
 | `-z`, `--compress` / `--no-compress` | Enable (the default) or disable zstd compression in syq's protocol; this is not `ssh -C` |
-| `-n`, `--dry-run` | Scan and report; change nothing |
+| `-n`, `--dry-run` | Resolve mappings and transport, estimate transfers/exclusions/deletions; change nothing |
 | `-j N`, `--connections N` | Parallel data connections (default: auto-tuned, see below) |
 | `--bwlimit RATE` | Limit aggregate file-data throughput (bare rate is KiB/s; `0` disables) |
 | `--block-size SIZE` | Transfer and hash block size (default 4M) |
@@ -282,6 +282,37 @@ Identical to rsync:
 - `host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
   A colon before the first slash means remote; `./x:y` is local. All sources
   must be on the same host. `host::module` (daemon syntax) is not supported.
+
+### Previewing the concrete copy plan
+
+`-n` / `--dry-run` connects to the endpoints and scans both sides, but creates,
+updates, and deletes nothing. Its plan makes path placement and the selected
+data route explicit before a real copy:
+
+```text
+syq: dry-run plan
+  mapping: ./dataset/ -> gpu01:/scratch/run42 (directory contents)
+  plan: 82,411 files, 1.70 TiB to transfer; 18,204 files, 340 GiB unchanged
+  exclusions: 3 paths/subtrees pruned by ignore rules; 12 other entries
+  deletions: 7 entries planned after a successful copy
+  route: encrypted TCP to gpu01; 16 initial connections (auto-tuned)
+```
+
+Each source gets its own `mapping` line. The annotation distinguishes directory
+contents, a directory copied as a child, a file placed inside a directory, and
+an exact destination path. `--files-from` is identified as a selected-path
+mapping. A destination-root symlink is shown as the effective directory it
+resolves to.
+
+The transfer byte total is an estimate based on the files that fail the
+planning-time metadata check, using their full logical sizes. Block reuse from
+an existing partial or a content comparison can make the real wire-byte count
+smaller. An ignored directory is pruned without scanning its descendants, so
+the exclusions line counts that directory as one `path/subtree`; it does not
+invent a descendant count. Other exclusions cover state and size options and
+unsupported entry types. With `--delete`, the destination is walked and the
+exact deletion count is shown; scan errors and `--max-delete` guards are shown
+as skipped or blocked rather than as a misleading zero.
 
 ### What `-a` does here
 
