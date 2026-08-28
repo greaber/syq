@@ -591,8 +591,16 @@ fn apply_one(op: &Op) -> Result<()> {
             }
             Op::Rmdir { path } => {
                 let p = resolve(path);
-                fs::remove_dir(&p).with_context(|| format!("rmdir {}", p.display()))
+                match fs::remove_dir(&p) {
+                    // Already gone (a concurrent removal): the desired end state.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                    r => r.with_context(|| format!("rmdir {}", p.display())),
+                }
             }
+            // Remove (for --rm) swallows lstat errors: rm -rf semantics, keep
+            // going. Unlink (below, for --delete) reports them: a mirror that
+            // silently failed to mirror would be worse. Deliberate divergence,
+            // pinned by unlink_never_recurses_into_a_directory.
             Op::Remove { path } => {
                 let p = resolve(path);
                 match fs::symlink_metadata(&p) {

@@ -198,13 +198,15 @@ pub struct Args {
     /// With --delete, refuse to delete anything if more than N deletions are planned (exit 25)
     #[arg(long, value_name = "N", requires = "delete")]
     pub max_delete: Option<u64>,
-    /// Skip files that are newer on the destination
+    /// Skip regular files that are newer on the destination (directories,
+    /// symlinks and specials are unaffected)
     #[arg(short = 'u', long)]
     pub update: bool,
     /// Skip updating files that already exist on the destination
     #[arg(long)]
     pub ignore_existing: bool,
-    /// Skip creating files and directories that don't exist yet on the destination
+    /// Never create anything that doesn't exist yet on the destination — files, symlinks,
+    /// specials, directories, or the destination root itself; existing files are still updated
     #[arg(long)]
     pub existing: bool,
     /// Don't transfer regular files larger than SIZE (e.g. 100M). With --delete the
@@ -362,6 +364,12 @@ fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
     for item in items {
         if item.is_empty() {
             continue;
+        }
+        if item.contains(&0) {
+            bail!(
+                "--files-from: {:?} contains a NUL byte (is this a --from0 list?)",
+                String::from_utf8_lossy(item)
+            );
         }
         let p = item;
         if p.split(|&b| b == b'/').any(|c| c == b"..") {

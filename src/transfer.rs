@@ -1337,13 +1337,17 @@ impl Planner<'_> {
         for chunk in lines.chunks(crate::scan::BATCH) {
             let mut want_parents: Vec<PathBytes> = Vec::new();
             let mut want_leaves: Vec<PathBytes> = Vec::new();
+            // Per role: a path may be needed both as a followed ancestor and
+            // as an lstat'ed leaf, with different answers.
+            let mut wanted_parents: HashSet<PathBytes> = HashSet::new();
+            let mut wanted_leaves: HashSet<PathBytes> = HashSet::new();
             for line in chunk {
                 for anc in ancestors(line) {
-                    if !parents.contains_key(&anc) && !want_parents.contains(&anc) {
+                    if !parents.contains_key(&anc) && wanted_parents.insert(anc.clone()) {
                         want_parents.push(anc);
                     }
                 }
-                if !leaves.contains_key(line) && !want_leaves.contains(line) {
+                if !leaves.contains_key(line) && wanted_leaves.insert(line.clone()) {
                     want_leaves.push(line.clone());
                 }
             }
