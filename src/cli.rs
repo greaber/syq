@@ -114,8 +114,9 @@ pub struct Args {
     pub verify_only: bool,
     /// Update files in place instead of writing a partial and renaming. Use this to modify a
     /// large existing file without copying it first (saves time and disk space when only part
-    /// of it changes)
-    #[arg(long)]
+    /// of it changes). Cannot be combined with -u or --ignore-existing: an interrupted
+    /// in-place write leaves a newer-looking final file those filters would then skip forever
+    #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
     /// Avoid completed-file destination lookups on later runs. Normal reruns and partial-file
     /// resume do not need this. The file persists and must be outside local source/destination trees.

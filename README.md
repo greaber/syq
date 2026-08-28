@@ -656,7 +656,10 @@ destination side unlinks each batch in parallel); it isn't spread over the
 ## Skipping by state and size
 
 - `-u` / `--update`: a file whose destination copy has a newer mtime is left
-  alone (regular files only).
+  alone (regular files only). Neither `-u` nor `--ignore-existing` can be
+  combined with `--inplace`: an interrupted in-place write leaves a
+  partially-written final file that looks newer, which those filters would
+  then skip on every retry.
 - `--existing`: never create anything — files, symlinks, specials,
   directories, *or the destination itself* — that isn't already there;
   existing files are still updated. `--ignore-existing` is the mirror image: create what's

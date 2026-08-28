@@ -4723,3 +4723,96 @@ fn delete_halts_when_checkpoint_intents_cannot_be_persisted() {
         "nothing may be deleted without a durable intent"
     );
 }
+
+// ----------------------------------------------------------- review round 11
+
+#[test]
+fn inplace_conflicts_with_receiver_state_filters() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    for filter in ["-u", "--ignore-existing"] {
+        let out = syq(&["-a", "--inplace", filter, &t.s("src/"), &t.s("dst")]);
+        assert!(!out.status.success(), "{filter}");
+        assert!(
+            stderr_of(&out).contains("cannot be used with"),
+            "{filter}: {}",
+            stderr_of(&out)
+        );
+    }
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn checkpoint_invalidated_on_type_change_and_directory_removal() {
+    // f completes as a file; the source turns f into a directory (type-change
+    // invalidation), then drops it (--delete rmdir), then restores the
+    // original file with an identical fingerprint. The checkpointed run must
+    // transfer it — a stale Complete record would report "unchanged" while
+    // the destination has nothing.
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    fs::remove_file(t.path("src/f")).unwrap();
+    write(&t.path("src/f/child"), b"c");
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(t.path("dst/f").is_dir());
+    fs::remove_dir_all(t.path("src/f")).unwrap();
+    run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        "--delete",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(!t.path("dst/f").exists());
+    write(&t.path("src/f"), b"data");
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    let so = run_ok(&[
+        "-a",
+        "--checkpoint",
+        &t.s("state"),
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/f")), b"data", "{so}");
+    assert_eq!(transferred(&so), 1, "{so}");
+}
+
+#[test]
+fn files_from_self_copy_through_symlinked_root_is_rejected() {
+    let t = Tmp::new();
+    write(&t.path("real/a"), b"a");
+    fs::create_dir_all(t.path("real/dstdir")).unwrap();
+    std::os::unix::fs::symlink(t.path("real"), t.path("link")).unwrap();
+    write(&t.path("list"), b"a\n");
+    let out = syq(&[
+        "-a",
+        "-r",
+        "--files-from",
+        &t.s("list"),
+        &t.s("link"),
+        &t.s("real/dstdir"),
+    ]);
+    assert!(!out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("maps inside source")
+            || stderr_of(&out).contains("same directory"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(listing(&t.path("real")), ["a", "dstdir"], "nothing copied");
+}

@@ -601,7 +601,10 @@ pub fn run(args: Args) -> Result<i32> {
         let remote = dst.is_remote();
         for s in srcs {
             // Only a directory source can trigger the recurse-into-itself trap.
-            let src_is_dir = matches!(stat_one(&mut *src_ctl, s.path.as_bytes(), false)?, Some(ref e) if e.kind == Kind::Dir);
+            // Judge the source the way the scan will: --files-from and
+            // trailing-slash sources are followed through a symlinked root.
+            let follow_root = args.files_from.is_some() || s.copies_contents();
+            let src_is_dir = matches!(stat_one(&mut *src_ctl, s.path.as_bytes(), follow_root)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
             }
@@ -610,7 +613,7 @@ pub fn run(args: Args) -> Result<i32> {
             // destination/basename only when the destination is really an
             // existing directory (so a bare source lands inside it).
             let mut effs = vec![canonical_path(&mut *src_ctl, &dst.path, remote)?];
-            if dst_is_dir && !s.copies_contents() {
+            if dst_is_dir && !s.copies_contents() && args.files_from.is_none() {
                 let base = s.basename();
                 if !base.is_empty() {
                     let joined = format!("{}/{}", dst.path.trim_end_matches('/'), base);
@@ -1189,8 +1192,9 @@ struct Deletes {
     /// (path, display name, destination-relative path) of files, symlinks and
     /// specials to unlink; the relative path is the journal's key.
     leaves: Vec<(PathBytes, String, PathBytes)>,
-    /// Directories by depth, removed deepest-first once they are empty.
-    dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String)>>,
+    /// Directories by depth, removed deepest-first once they are empty; the
+    /// relative path is the journal's key, as for leaves.
+    dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String, PathBytes)>>,
 }
 
 impl Planner<'_> {
@@ -1696,6 +1700,17 @@ impl Planner<'_> {
                     }
                 }
             } else if !opts.verify_only {
+                // A directory about to occupy a checkpoint-complete file's
+                // path needs a write-ahead invalidation (see the fn).
+                let dst_root_len = dst_root.len();
+                planned.retain(|(p, _, _)| {
+                    let dst_rel = if p.len() > dst_root_len + 1 {
+                        &p[dst_root_len + 1..]
+                    } else {
+                        &[][..]
+                    };
+                    self.invalidate_completion(dst_rel)
+                });
                 // Create new dirs; also "create" existing ones we can't yet
                 // write into (0o700 not set) so apply() opens them up.
                 let new_dirs: Vec<Op> = planned
@@ -1949,6 +1964,9 @@ impl Planner<'_> {
                         }
                         continue;
                     }
+                    if !self.invalidate_completion(&dst_rel) {
+                        continue;
+                    }
                     op_names.push(format!("{rel} -> {}", display(&target)));
                     ops.push(Op::Symlink {
                         path: dst_path.clone(),
@@ -1984,6 +2002,9 @@ impl Planner<'_> {
                         if opts.dry_run && !same && opts.verbose > 0 {
                             self.progress.println(&rel);
                         }
+                        continue;
+                    }
+                    if !self.invalidate_completion(&dst_rel) {
                         continue;
                     }
                     op_names.push(rel);
@@ -2219,6 +2240,32 @@ impl Planner<'_> {
         });
     }
 
+    /// Write-ahead invalidation for a transfer-time type change: something
+    /// non-regular is about to occupy a path the checkpoint recorded as a
+    /// complete file. False = the intent could not be persisted; the caller
+    /// must not create the entry (a checkpointed retry would otherwise trust
+    /// the stale Complete record).
+    fn invalidate_completion(&self, dst_rel: &[u8]) -> bool {
+        let (Some(completed), Some(checkpoint)) = (&self.completed, &self.checkpoint) else {
+            return true;
+        };
+        if dst_rel.is_empty() || !completed.contains_key(dst_rel) {
+            return true;
+        }
+        if checkpoint
+            .record_deleted_batch(std::iter::once(dst_rel))
+            .is_ok()
+        {
+            true
+        } else {
+            self.progress.error(&format!(
+                "syq: {}: cannot persist checkpoint invalidation; not replacing it",
+                display(dst_rel)
+            ));
+            false
+        }
+    }
+
     /// --ignore-existing / --existing for a leaf, given what's on the destination.
     fn skip_existing(&self, dst_entry: &Option<Entry>) -> bool {
         (self.opts.ignore_existing && dst_entry.is_some())
@@ -2319,11 +2366,11 @@ impl Planner<'_> {
                         } else {
                             if e.kind == Kind::Dir {
                                 let depth = full.iter().filter(|&&c| c == b'/').count();
-                                found
-                                    .dirs
-                                    .entry(depth)
-                                    .or_default()
-                                    .push((full, format!("{rel}/")));
+                                found.dirs.entry(depth).or_default().push((
+                                    full,
+                                    format!("{rel}/"),
+                                    dst_rel,
+                                ));
                             } else {
                                 found.leaves.push((full, rel, dst_rel));
                             }
@@ -2347,12 +2394,16 @@ impl Planner<'_> {
             res?;
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
-                for (path, rel) in v {
+                for (path, rel, dst_rel) in v {
                     if protected.contains(&path) {
                         self.progress
                             .eprintln(&format!("syq: not deleting {rel}: it holds ignored paths"));
                     } else {
-                        self.deletes.dirs.entry(d).or_default().push((path, rel));
+                        self.deletes
+                            .dirs
+                            .entry(d)
+                            .or_default()
+                            .push((path, rel, dst_rel));
                     }
                 }
             }
@@ -2378,6 +2429,12 @@ impl Planner<'_> {
         }
         let mut n = 0u64;
         let checkpoint = self.checkpoint.clone();
+        let completed = self.completed.clone();
+        let completion_recorded = move |dst_rel: &PathBytes| {
+            completed
+                .as_ref()
+                .is_some_and(|map| map.contains_key(dst_rel))
+        };
         // Set when deletion intents could not be made durable: from then on
         // nothing more is deleted — the checkpoint's stale Complete records
         // would otherwise outlive the files they describe.
@@ -2399,16 +2456,18 @@ impl Planner<'_> {
                     }
                     continue;
                 }
-                // Write-ahead: the Deleted intents go into the checkpoint,
-                // durably, before anything is unlinked — and gate it: if
-                // they can't be persisted, deleting would leave durable
-                // Complete records for files that are gone.
-                if !rmdir {
+                // Write-ahead: the invalidation intents go into the checkpoint
+                // before anything is removed — leaves and rmdirs alike (a dir
+                // may sit where a complete file was recorded) — and gate it:
+                // without a persisted intent the mutation must not happen.
+                {
                     if let Some(c) = &checkpoint {
                         if let Err(e) = c.record_deleted_batch(
                             chunk
                                 .iter()
-                                .filter(|(_, _, dst_rel)| !dst_rel.is_empty())
+                                .filter(|(_, _, dst_rel)| {
+                                    !dst_rel.is_empty() && completion_recorded(dst_rel)
+                                })
                                 .map(|(_, _, dst_rel)| dst_rel.as_slice()),
                         ) {
                             me.progress.error(&format!(
@@ -2447,11 +2506,7 @@ impl Planner<'_> {
         };
         run(self, &leaves, false)?;
         for (_, items) in dirs.iter().rev() {
-            let items: Vec<(PathBytes, String, PathBytes)> = items
-                .iter()
-                .map(|(p, r)| (p.clone(), r.clone(), Vec::new()))
-                .collect();
-            run(self, &items, true)?;
+            run(self, items, true)?;
         }
         Ok(n)
     }
