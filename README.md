@@ -14,11 +14,27 @@ Syq keeps the familiar rsync workflow and many common options, but it is not an
 rsync protocol implementation or a drop-in replacement. Its main additions and
 deliberate differences are:
 
-- **Parallel work.** Directory scanning, separate files, and ranges of one
-  large file can run concurrently. Rsync transfers file data in one stream.
-- **Automatic resume.** Syq always stages normal writes in deterministic
-  partial files. Run the same logical command again and it reuses matching
-  blocks when possible; no checkpoint or `--partial` option is required.
+- **Parallel metadata and data work.** Directory scanning, separate files, and
+  ranges of one large file can run concurrently. This hides metadata latency
+  as well as keeping multiple storage and network operations in flight. Rsync
+  transfers file data in one stream.
+- **Direct data paths and multiple interfaces.** SSH handles authentication and
+  control; by default, separately encrypted TCP connections carry the file data
+  when reachable, without SSH's per-channel window or single cipher process.
+  Syq probes the remote host's advertised addresses and can use a fast data
+  interface even when SSH arrived over another one, or spread connections
+  across comparable interfaces. This includes IP interfaces backed by an
+  already configured RoCE fabric; syq itself uses TCP, not RDMA. It falls back
+  to separate SSH processes when TCP is unreachable.
+- **Kernel and server-side local copies.** On Linux, same-machine copies use
+  `copy_file_range(2)`. The kernel can turn this into a reflink or, on a
+  supporting NFS server, copy the data without sending it through the client.
+- **Automatic resume and optional lookup avoidance.** Syq always stages normal
+  writes in deterministic partial files. Run the same logical command again
+  and it reuses matching blocks when possible; no checkpoint or `--partial`
+  option is required. For unusually large repeated jobs, an explicit
+  checkpoint can also skip completed-file destination lookups when the
+  destination is not independently modified.
 - **Direct remote-to-remote copies.** `syq hostA:src/ hostB:dst/` sends data
   from host A to host B. Rsync does not accept two remote endpoints. Syq can
   also relay through the invoking machine when requested.
@@ -28,12 +44,11 @@ deliberate differences are:
 - **One filter language.** `--ignore` and `--ignore-from` use ordered
   gitignore syntax instead of rsync's include, exclude, and filter rule
   language.
-- **An all-or-nothing deletion cap.** Syq always runs `--delete` after copying,
-  skips all deletion after a source or destination scan error, and makes
-  `--max-delete` all-or-nothing. If the cap is exceeded, it deletes nothing.
-- **Ambiguous source mappings are errors.** If distinct sources would write the
-  same destination path, syq refuses the command before changing the
-  destination. Rsync silently keeps the first source.
+- **Guarded planning and deletion.** If distinct sources would write the same
+  destination path, syq refuses the command before changing the destination;
+  rsync silently keeps the first source. Syq always runs `--delete` after
+  copying, skips all deletion after a source or destination scan error, and
+  makes `--max-delete` all-or-nothing.
 
 Syq does not yet implement several rsync features, including rolling-checksum
 delta transfer for shifted data, hard-link preservation, ACLs, extended
@@ -142,10 +157,8 @@ count while a copy runs, so most users do not need to choose `-j`. It may offer
 little benefit for short copies or when one operation already saturates the
 limiting storage device.
 
-SSH authenticates remote operations. Syq uses separate encrypted TCP data
-connections when they are reachable and falls back to separate SSH processes
-when they are not; the fallback requires no firewall changes. See
-[Server performance tuning](SERVER-TUNING.md) for optional configuration.
+The TCP data path, interface selection, and optional host configuration are
+described in [Server performance tuning](SERVER-TUNING.md).
 
 ## Compatibility and limitations
 
