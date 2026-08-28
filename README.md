@@ -51,11 +51,12 @@ only in official release binaries. To use a source build remotely, install the
 same build there and pass `--syq-path /path/to/syq` (or put it on the remote
 `PATH` and use `--no-bootstrap`).
 
-Standalone installs check the signed release manifest at most once a day after
-a successful interactive command. They only print an update notice by default:
-`syq --self-update` performs the update, and `syq --enable-auto-update` opts in
-to installing a signed update after a successful interactive command. Use
-`syq --disable-auto-update` to opt out again. The install receipt lives at
+Standalone installs download and verify one signed release manifest at most
+once a day after a successful interactive command. They only print an update
+notice by default: `syq --self-update` performs the update, and
+`syq --enable-auto-update` opts in to installing a signed update after a
+successful interactive command. Use `syq --disable-auto-update` to opt out
+again. The install receipt lives at
 `$XDG_CONFIG_HOME/syq/install.json` (normally `~/.config/syq/install.json`) and
 must name the running executable, so a Homebrew or source build never replaces
 itself. Update Homebrew installs with `brew upgrade syq`.
@@ -82,13 +83,14 @@ non-interactive remote `PATH` and use `--no-bootstrap`. Helpers cached under an
 older identity or cache layout are never executed; they may be removed with the
 rest of the disposable helper cache.
 
-The local client verifies the Ed25519-signed manifest and passes its trusted
-hash to the remote install script. The remote uses `curl` or `wget`, `gzip`, and
-one of `sha256sum`, `shasum`, or `openssl`. Version directories coexist and the
-helper cache can be removed at any time; syq recreates the helper it needs on
-the next connection. After launch, both peers require the same build identity:
-the release tag for official binaries, or the Git-derived identity when an
-explicit source-built helper is used.
+The local client verifies the manifest's embedded Ed25519 signature over its
+RFC 8785 canonical JSON and passes its trusted hash to the remote install
+script. The remote uses `curl` or `wget`, `gzip`, and one of `sha256sum`,
+`shasum`, or `openssl`. Version directories coexist and the helper cache can be
+removed at any time; syq recreates the helper it needs on the next connection.
+After launch, both peers require the same build identity: the release tag for
+official binaries, or the Git-derived identity when an explicit source-built
+helper is used.
 
 - **macOS (Apple Silicon / Intel):** build natively on the Mac with
   `cargo build --release` (needs the Xcode command-line tools, `xcode-select

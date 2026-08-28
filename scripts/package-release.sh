@@ -78,7 +78,8 @@ jq --sort-keys \
   --arg formula_sha "$formula_hash" --argjson formula_size "$formula_size" \
   '. + {
     installer:{name:"install.sh",sha256:$installer_sha,size:$installer_size},
-    homebrew_formula:{name:"syq.rb",sha256:$formula_sha,size:$formula_size}
+    homebrew_formula:{name:"syq.rb",sha256:$formula_sha,size:$formula_size},
+    signature_scheme:"ed25519-jcs-v1"
   }' "$manifest_core" > "$dist/syq-release-manifest.json"
 rm -f "$manifest_core"
 

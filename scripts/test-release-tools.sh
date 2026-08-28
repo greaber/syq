@@ -11,6 +11,10 @@ trap cleanup EXIT HUP INT TERM
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_dir/Cargo.toml" | head -1)
 tag="v$version"
+cargo build --locked --manifest-path "$repo_dir/Cargo.toml" --bin syq
+target_dir=$(cargo metadata --no-deps --format-version 1 \
+  --manifest-path "$repo_dir/Cargo.toml" | jq -r .target_directory)
+canonicalizer="$target_dir/debug/syq"
 
 prepare_dist() {
   local dist=$1 asset
@@ -55,6 +59,8 @@ jq -e \
     and .installer.sha256 == $installer_sha
     and .homebrew_formula.name == "syq.rb"
     and .homebrew_formula.sha256 == $formula_sha
+    and .signature_scheme == "ed25519-jcs-v1"
+    and (has("signature") | not)
   ' "$first/syq-release-manifest.json" >/dev/null
 sh -n "$first/install.sh"
 grep -q '^class Syq < Formula$' "$first/syq.rb"
@@ -90,7 +96,14 @@ key_b64=$(openssl base64 -A -in "$key")
 public_b64=$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | openssl base64 -A)
 SYQ_RELEASE_SIGNING_KEY_PEM_B64="$key_b64" SYQ_RELEASE_PUBLIC_KEY="$public_b64" \
   "$script_dir/sign-release-manifest.sh" \
-  "$first/syq-release-manifest.json" "$first/syq-release-manifest.json.sig"
+  "$first/syq-release-manifest.json" "$first/syq-release-manifest.json.sig" \
+  "$canonicalizer"
+embedded_b64=$(jq -er '.signature' "$first/syq-release-manifest.json")
+printf '%s' "$embedded_b64" | openssl base64 -d -A > "$work/embedded-signature.raw"
+"$canonicalizer" --release-manifest-signing-payload \
+  "$first/syq-release-manifest.json" > "$work/manifest.jcs"
+openssl pkeyutl -verify -rawin -pubin -inkey "$public" \
+  -in "$work/manifest.jcs" -sigfile "$work/embedded-signature.raw" >/dev/null
 openssl base64 -d -A -in "$first/syq-release-manifest.json.sig" \
   -out "$work/signature.raw"
 openssl pkeyutl -verify -rawin -pubin -inkey "$public" \
@@ -104,7 +117,7 @@ mismatch_output="$work/mismatched.sig"
 expect_failure 'does not match SYQ_RELEASE_PUBLIC_KEY' env \
   SYQ_RELEASE_SIGNING_KEY_PEM_B64="$key_b64" SYQ_RELEASE_PUBLIC_KEY="$other_public_b64" \
   "$script_dir/sign-release-manifest.sh" \
-  "$first/syq-release-manifest.json" "$mismatch_output"
+  "$second/syq-release-manifest.json" "$mismatch_output" "$canonicalizer"
 test ! -e "$mismatch_output"
 
 # Verify the workflow's GitHub tag checks against controlled API responses.
