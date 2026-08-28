@@ -4197,3 +4197,91 @@ fn files_from_rejections_and_stdin() {
     );
     assert!(t0.elapsed() < std::time::Duration::from_secs(2));
 }
+
+// ------------------------------------------------------------ review round 9
+
+#[cfg(debug_assertions)]
+#[test]
+fn truncated_sidecar_of_a_filtered_file_survives_delete() {
+    // A 240-character basename forces the truncated sidecar form, whose name
+    // cannot be read back to its target; liveness must come from the
+    // preflight's sidecar set, not from parsing.
+    let t = Tmp::new();
+    let long = "n".repeat(240);
+    write(&t.path(&format!("src/{long}")), &vec![7u8; 8 << 20]);
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let partial = interrupted_partial(
+        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &t.path("dst"),
+    );
+    let so = run_ok(&[
+        "-a",
+        "--bwlimit",
+        "1G",
+        "--delete",
+        "--max-size",
+        "1K",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(partial.exists(), "{so}");
+    assert!(so.contains("0 deleted"), "{so}");
+    // Once the file leaves the source, the same sidecar is an orphan.
+    fs::remove_file(t.path(&format!("src/{long}"))).unwrap();
+    run_ok(&[
+        "-a",
+        "--bwlimit",
+        "1G",
+        "--delete",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(!partial.exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn sidecar_whose_target_became_a_directory_is_an_orphan() {
+    let t = Tmp::new();
+    write(&t.path("src/x"), &vec![7u8; 8 << 20]);
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let partial = interrupted_partial(
+        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &t.path("dst"),
+    );
+    fs::remove_file(t.path("src/x")).unwrap();
+    write(&t.path("src/x/inside"), b"now a directory");
+    run_ok(&[
+        "-a",
+        "--bwlimit",
+        "1G",
+        "--delete",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(!partial.exists(), "no file transfer will ever consume it");
+    assert_eq!(read(&t.path("dst/x/inside")), b"now a directory");
+}
+
+#[test]
+fn kept_sidecars_protect_their_ancestors() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    let foreign = format!("dst/extra/deep/.f.syq-part.{}", "a".repeat(26));
+    write(&t.path(&foreign), b"another job's");
+    write(&t.path("dst/extra/gone"), b"an ordinary extra");
+    // Dry run and real run agree: the extras go, the sidecar's directory
+    // chain stays, exit 0 both times.
+    let so = run_ok(&["-a", "-n", "-v", "--delete", &t.s("src/"), &t.s("dst")]);
+    assert!(so.contains("deleting extra/gone"), "{so}");
+    assert!(!so.lines().any(|l| l == "deleting extra/"), "{so}");
+    let out = syq(&["-a", "-v", "--delete", &t.s("src/"), &t.s("dst")]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(t.path(&foreign).exists());
+    assert!(!t.path("dst/extra/gone").exists());
+    assert!(
+        stderr_of(&out).contains("not deleting extra/"),
+        "{}",
+        stderr_of(&out)
+    );
+}

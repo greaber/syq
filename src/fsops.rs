@@ -196,26 +196,6 @@ pub fn partial_id_string(id: &PartialId) -> String {
     base32(id)
 }
 
-/// The final path a common-form sidecar name suggests
-/// (`dir/.name.syq-part.<id>` -> `dir/name`). Only a suggestion: truncated and
-/// compact forms yield something else or nothing, so callers confirm it by
-/// regenerating the sidecar name for the candidate on the receiver.
-pub fn partial_target_candidate(partial: &[u8]) -> Option<PathBytes> {
-    let (dir, name) = match partial.iter().rposition(|&c| c == b'/') {
-        Some(i) => (&partial[..i + 1], &partial[i + 1..]),
-        None => (&partial[..0], partial),
-    };
-    let pos = name
-        .windows(PARTIAL_MARKER.len())
-        .rposition(|part| part == PARTIAL_MARKER.as_bytes())?;
-    if pos < 2 || !name.starts_with(b".") {
-        return None;
-    }
-    let mut target = dir.to_vec();
-    target.extend_from_slice(&name[1..pos]);
-    Some(target)
-}
-
 pub fn is_partial_name(name: &OsStr) -> bool {
     let b = name.as_bytes();
     let valid_id = |id: &[u8], len: usize| {

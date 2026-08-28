@@ -1579,7 +1579,7 @@ impl Planner<'_> {
             g.1.push((p.e.dev, p.e.ino));
         }
         if !groups.is_empty() {
-            let stats = self.stat_many(true, groups.keys().cloned().collect())?;
+            let stats = self.stat_many(groups.keys().cloned().collect())?;
             for ((dst, (rel, ids)), st) in groups.into_iter().zip(stats) {
                 let dst_id = st.filter(|_| self.opts.same_host).map(|d| (d.dev, d.ino));
                 // Every claimant must be the destination file itself (a copy
@@ -1636,7 +1636,7 @@ impl Planner<'_> {
         let need_stats = opts.verify_only || !opts.dry_run || opts.existing;
         if !dirs.is_empty() && (need_stats || opts.verbose > 0) {
             let stats: Vec<Option<Entry>> = if need_stats {
-                self.stat_many(true, dirs.iter().map(|(p, _)| p.clone()).collect())?
+                self.stat_many(dirs.iter().map(|(p, _)| p.clone()).collect())?
             } else {
                 vec![None; dirs.len()]
             };
@@ -1692,7 +1692,7 @@ impl Planner<'_> {
                             _ => unreachable!(),
                         })
                         .collect();
-                    let errs = self.apply(true, new_dirs)?;
+                    let errs = self.apply(new_dirs)?;
                     let mut failed = 0;
                     for (name, err) in names.iter().zip(errs) {
                         if let Some(err) = err {
@@ -1751,7 +1751,7 @@ impl Planner<'_> {
             }
             others = kept;
         }
-        let stats = self.stat_many(true, others.iter().map(|p| p.dst.clone()).collect())?;
+        let stats = self.stat_many(others.iter().map(|p| p.dst.clone()).collect())?;
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<String> = Vec::new();
         // Metadata repairs for quick-check-identical files, each with the
@@ -1973,7 +1973,7 @@ impl Planner<'_> {
         }
         if !meta_fixes.is_empty() {
             let (ops, records): (Vec<Op>, Vec<_>) = meta_fixes.into_iter().unzip();
-            for (err, rec) in self.apply(true, ops)?.into_iter().zip(records) {
+            for (err, rec) in self.apply(ops)?.into_iter().zip(records) {
                 match err {
                     Some(err) => self.progress.error(&format!("syq: {err}")),
                     None => {
@@ -1986,7 +1986,7 @@ impl Planner<'_> {
             }
         }
         if !ops.is_empty() {
-            let errs = self.apply(true, ops)?;
+            let errs = self.apply(ops)?;
             // Two ops per item: creation then metadata.
             for (i, name) in op_names.iter().enumerate() {
                 let e1 = errs.get(2 * i).cloned().flatten();
@@ -2224,13 +2224,14 @@ impl Planner<'_> {
                 .partial_id
                 .get()
                 .map(crate::fsops::partial_id_string);
-            // (sidecar path, the final path its name suggests, display name);
-            // confirmed below by asking the receiver what sidecar it would use.
-            let mut candidates: Vec<(PathBytes, PathBytes, String)> = Vec::new();
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
+            // Sidecars this run keeps (another job's, or this job's live
+            // ones); their ancestors must stay too, and -n must know.
+            let mut preserved: Vec<PathBytes> = Vec::new();
             let seen = &self.dst_seen;
+            let live_sidecars = &self.sidecar_paths;
             // Destination directories whose path the source claims as a
             // non-directory (a file we chose not to send, a symlink skipped
             // without -l, ...). The source has that path, so syq doesn't touch
@@ -2266,26 +2267,21 @@ impl Planner<'_> {
                         let rel = display(&dst_rel);
                         let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
                         // Only a regular file can be a sidecar; a directory or
-                        // symlink with that name is an ordinary extra. And only
-                        // *this job's* sidecars are ours to judge: another
-                        // job's is that command's live resume state, left alone.
-                        // A truncated/compact name whose target can't be read
-                        // back is left alone too.
+                        // symlink with that name is an ordinary extra. Another
+                        // job's sidecar is that command's live resume state,
+                        // left alone. One of ours is live exactly when the
+                        // namespace preflight lists its path as a sidecar this
+                        // job may use (that covers truncated and compact names,
+                        // which can't be read back reliably); otherwise it is
+                        // an orphan and an extra. Whatever is kept protects
+                        // its ancestors, so -n and the real run agree.
                         if e.kind == Kind::File && crate::fsops::partial_job_id(name).is_some() {
-                            // Ours: an extra only if its target is not in the
-                            // source at all (orphan). A sidecar for a claimed
-                            // target — whether that file failed, was filtered,
-                            // or is already up to date — is resume state and
-                            // stays until a transfer of that file consumes it.
-                            if crate::fsops::partial_job_id(name)
-                                == our_id.as_ref().map(|s| s.as_bytes())
-                            {
-                                if let Some(target) = crate::fsops::partial_target_candidate(&full)
-                                {
-                                    if !seen.contains_key(&target) {
-                                        candidates.push((full, target, rel));
-                                    }
-                                }
+                            let ours = crate::fsops::partial_job_id(name)
+                                == our_id.as_ref().map(|s| s.as_bytes());
+                            if ours && !live_sidecars.contains_key(&full) {
+                                found.leaves.push((full, rel, Vec::new()));
+                            } else {
+                                preserved.push(e.path.clone());
                             }
                         } else {
                             if e.kind == Kind::Dir {
@@ -2316,15 +2312,11 @@ impl Planner<'_> {
                 &mut |w| self.progress.error(&format!("syq: delete: {w}")),
             );
             res?;
-            // A truncated or compact sidecar name doesn't read back to its
-            // target; only names the receiver would generate for the candidate
-            // are ours to delete.
-            if !candidates.is_empty() {
-                let expected =
-                    self.partial_paths(candidates.iter().map(|c| c.1.clone()).collect())?;
-                for ((full, _, rel), exp) in candidates.into_iter().zip(expected) {
-                    if exp.is_ok_and(|p| p == full) {
-                        found.leaves.push((full, rel, Vec::new()));
+            for p in preserved {
+                // Every ancestor of a kept sidecar is protected.
+                for (i, &c) in p.iter().enumerate() {
+                    if c == b'/' {
+                        protected.insert(join(&root, &p[..i]));
                     }
                 }
             }
@@ -2332,8 +2324,9 @@ impl Planner<'_> {
             for (d, v) in found.dirs {
                 for (path, rel) in v {
                     if protected.contains(&path) {
-                        self.progress
-                            .eprintln(&format!("syq: not deleting {rel}: it holds ignored paths"));
+                        self.progress.eprintln(&format!(
+                            "syq: not deleting {rel}: it holds paths this run keeps"
+                        ));
                     } else {
                         self.deletes.dirs.entry(d).or_default().push((path, rel));
                     }
@@ -2385,7 +2378,7 @@ impl Planner<'_> {
                             }
                         })
                         .collect();
-                    for ((_, rel, dst_rel), err) in chunk.iter().zip(me.apply(true, ops)?) {
+                    for ((_, rel, dst_rel), err) in chunk.iter().zip(me.apply(ops)?) {
                         match err {
                             None => {
                                 n += 1;
@@ -2416,7 +2409,7 @@ impl Planner<'_> {
         Ok(n)
     }
 
-    fn stat_many(&mut self, _on_dst: bool, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
+    fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
         stat_many(self.dst, paths, false)
     }
 
@@ -2440,7 +2433,7 @@ impl Planner<'_> {
         }
     }
 
-    fn apply(&mut self, _on_dst: bool, ops: Vec<Op>) -> Result<Vec<Option<String>>> {
+    fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<String>>> {
         match ok(self.dst.call(Request::Apply(ops))?, "apply")? {
             Response::Applied(v) => Ok(v),
             other => bail!("unexpected response {other:?}"),
@@ -2459,7 +2452,7 @@ impl Planner<'_> {
                     flags: *f,
                 })
                 .collect();
-            for err in self.apply(true, ops)?.into_iter().flatten() {
+            for err in self.apply(ops)?.into_iter().flatten() {
                 self.progress.error(&format!("syq: {err}"));
             }
         }
@@ -2669,16 +2662,7 @@ impl Worker {
         }
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
-        let now = match ok(
-            self.src.call(Request::StatMany {
-                paths,
-                follow: false,
-            })?,
-            "stat",
-        )? {
-            Response::Stats(v) => v,
-            other => bail!("unexpected response {other:?}"),
-        };
+        let now = stat_many(&mut *self.src, paths, false)?;
         for ((idx, j), (res, now)) in batch
             .iter()
             .zip(jobs.iter())
