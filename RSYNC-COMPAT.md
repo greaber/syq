@@ -119,7 +119,11 @@ item.
    `delete_is_skipped_when_the_source_scan_has_errors`.*
 3. **`-u` applies to regular files only.** rsync also compares mtimes for
    symlinks and devices (believed, not measured). Low impact; could be
-   aligned.
+   aligned. Deliberately, a *type change* replaces regardless of mtimes —
+   a source directory still replaces a newer destination file (as in
+   rsync): `-u` is about not regressing newer file content, not about
+   protecting whatever exists; that stronger promise is
+   `--ignore-existing`'s (see "Incompatible on purpose" 5).
 4. **`--files-from` cannot combine with `--ignore`/`--ignore-from` or
    `--delete`, and direct remote→remote needs `--relay`** (the list is read
    on the invoking machine). rsync allows all three. Restrictions rather than
