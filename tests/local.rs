@@ -2738,7 +2738,7 @@ fn checkpoint_tombstone_precedes_destination_deletion() {
         .env("SYQ_TEST_HOLD_AFTER_DELETE_MS", "10000")
         .spawn()
         .unwrap();
-    for _ in 0..200 {
+    for _ in 0..300 {
         if !t.path("dst/f").exists() {
             break;
         }

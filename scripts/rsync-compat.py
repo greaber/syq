@@ -103,6 +103,11 @@ def upstream_test_names(source: Path) -> set[str]:
 def validate_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]], source: Path) -> None:
     reasons = manifest.get("reasons", {})
     tests = manifest.get("tests", [])
+    enabled_profiles = {
+        name
+        for name, profile in manifest.get("profiles", {}).items()
+        if profile.get("enabled", False)
+    }
     configured: dict[str, dict] = {}
     for test in tests:
         name = test.get("name")
@@ -114,7 +119,13 @@ def validate_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]
             raise CompatError(f"{MANIFEST_PATH}: {name}: runnable test has bad classification")
         if name not in inventory or inventory[name][0] != classification:
             raise CompatError(f"{MANIFEST_PATH}: {name}: manifest and inventory disagree")
-        for profile_name, expected in test.get("expect", {}).items():
+        expectations = test.get("expect", {})
+        missing_profiles = sorted(enabled_profiles - expectations.keys())
+        if missing_profiles:
+            raise CompatError(
+                f"{MANIFEST_PATH}: {name}: no expectation for {missing_profiles[0]!r}"
+            )
+        for profile_name, expected in expectations.items():
             if profile_name not in manifest.get("profiles", {}):
                 raise CompatError(f"{MANIFEST_PATH}: {name}: unknown profile {profile_name!r}")
             if expected not in VALID_OUTCOMES:
@@ -180,6 +191,71 @@ def helpers_ready(source: Path, helpers: list[str]) -> bool:
     )
 
 
+def patch_header_path(raw: str, *, git_prefix: bool) -> str | None:
+    raw = raw.split("\t", 1)[0]
+    if raw.startswith('"'):
+        try:
+            fields = shlex.split(raw)
+        except ValueError as error:
+            raise CompatError(f"malformed quoted patch path: {raw!r}") from error
+        if len(fields) != 1:
+            raise CompatError(f"malformed quoted patch path: {raw!r}")
+        raw = fields[0]
+    if raw == "/dev/null":
+        return None
+    if git_prefix:
+        if not raw.startswith(("a/", "b/")):
+            raise CompatError(f"malformed git patch path: {raw!r}")
+        raw = raw[2:]
+    return raw
+
+
+def validate_adaptation_patch(adaptation: str, patch_text: str) -> None:
+    paths: list[str] = []
+    inside_hunk = False
+    for line in patch_text.splitlines():
+        if line.startswith("diff --git "):
+            inside_hunk = False
+            try:
+                fields = shlex.split(line)
+            except ValueError as error:
+                raise CompatError(
+                    f"adaptation {adaptation!r} has a malformed diff header"
+                ) from error
+            if len(fields) != 4:
+                raise CompatError(
+                    f"adaptation {adaptation!r} has a malformed diff header"
+                )
+            for raw in fields[2:]:
+                path = patch_header_path(raw, git_prefix=True)
+                if path is not None:
+                    paths.append(path)
+            continue
+        if line.startswith("@@ "):
+            inside_hunk = True
+            continue
+        if inside_hunk:
+            continue
+        for prefix, git_prefix in (
+            ("--- ", True),
+            ("+++ ", True),
+            ("rename from ", False),
+            ("rename to ", False),
+        ):
+            if line.startswith(prefix):
+                path = patch_header_path(line[len(prefix) :], git_prefix=git_prefix)
+                if path is not None:
+                    paths.append(path)
+                break
+
+    if not paths or any(
+        not path.startswith("testsuite/") or ".." in Path(path).parts for path in paths
+    ):
+        raise CompatError(
+            f"adaptation {adaptation!r} must change only upstream testsuite files"
+        )
+
+
 def suite_key(manifest: dict, commit: str, adaptations: list[str]) -> str:
     digest = hashlib.sha256()
     digest.update(commit.encode())
@@ -189,17 +265,7 @@ def suite_key(manifest: dict, commit: str, adaptations: list[str]) -> str:
         patch = COMPAT_DIR / "adaptations" / f"{adaptation}.patch"
         if not patch.is_file():
             raise CompatError(f"adaptation {adaptation!r} has no patch at {patch}")
-        changed_paths = [
-            line[6:]
-            for line in patch.read_text().splitlines()
-            if line.startswith("+++ b/")
-        ]
-        if not changed_paths or any(
-            not path.startswith("testsuite/") for path in changed_paths
-        ):
-            raise CompatError(
-                f"adaptation {adaptation!r} must change only upstream testsuite files"
-            )
+        validate_adaptation_patch(adaptation, patch.read_text())
         digest.update(adaptation.encode())
         digest.update(patch.read_bytes())
     return digest.hexdigest()[:20]
@@ -503,11 +569,27 @@ def outcome_class(outcome: str) -> str:
 
 
 def markdown_report(report: dict) -> str:
+    harness_ok = report["runner_exit_code"] == 0 and not report["parser_errors"]
+    if harness_ok:
+        harness_status = (
+            "Harness status: **healthy** — runner exit code `0`; "
+            "no runner-output errors."
+        )
+    else:
+        details = []
+        if report["runner_exit_code"] != 0:
+            details.append(f"runner exit code `{report['runner_exit_code']}`")
+        if report["parser_errors"]:
+            count = len(report["parser_errors"])
+            details.append(f"{count} runner-output error{'s' if count != 1 else ''}")
+        harness_status = "Harness status: **FAILED** — " + "; ".join(details) + "."
     lines = [
         "## rsync compatibility",
         "",
         f"Pinned upstream: `{report['upstream_commit']}` · profile: `{report['profile']}` "
         f"· platform: `{report['platform']}` · run as: `{report['run_as']}`",
+        "",
+        harness_status,
         "",
         "| Measure | Count |",
         "|---|---:|",
@@ -519,10 +601,25 @@ def markdown_report(report: dict) -> str:
         f"| Out of scope (ledger) | {report['ledger']['out-of-scope']} |",
         f"| Unsupported feature (ledger) | {report['ledger']['unsupported']} |",
         f"| Not yet assessed (ledger) | {report['ledger']['unassessed']} |",
-        "",
-        f"Classified runnable-test pass rate: **{report['passing']}/{report['applicable']} "
-        f"({report['score_percent']:.1f}%)**.",
     ]
+    if harness_ok:
+        lines.extend(
+            [
+                "",
+                f"Classified runnable-test pass rate: **{report['passing']}/{report['applicable']} "
+                f"({report['score_percent']:.1f}%)**.",
+            ]
+        )
+    else:
+        notrun = sum(test["actual"] == "notrun" for test in report["tests"])
+        lines.extend(
+            [
+                f"| Unreported after runner failure | {notrun} |",
+                "",
+                "Compatibility score is unavailable; the counts above are partial "
+                "diagnostic observations, not a conformance result.",
+            ]
+        )
     gaps = [test for test in report["tests"] if test["actual"] in {"fail", "xfail"}]
     if gaps:
         lines.extend(["", "Known gaps:", ""])
@@ -530,9 +627,14 @@ def markdown_report(report: dict) -> str:
             f"- `{test['name']}` ({', '.join(test['tags']) or 'untagged'}): {test['note']}"
             for test in gaps
         )
-    mismatches = [test for test in report["tests"] if not test["matches"]]
+    mismatches = [
+        test
+        for test in report["tests"]
+        if not test["matches"] and test["actual"] != "notrun"
+    ]
     if mismatches:
-        lines.extend(["", "Expectation mismatches:", ""])
+        title = "Expectation mismatches:" if harness_ok else "Observed expectation mismatches:"
+        lines.extend(["", title, ""])
         lines.extend(
             f"- `{test['name']}`: expected {test['expected']}, got {test['actual']}"
             for test in mismatches
@@ -560,6 +662,13 @@ def parse_args() -> argparse.Namespace:
         "--cache-dir", type=Path, default=ROOT / "target" / "rsync-compat"
     )
     parser.add_argument("-j", "--jobs", type=int, default=min(os.cpu_count() or 1, 8))
+    parser.add_argument(
+        "--test-timeout",
+        type=int,
+        default=300,
+        metavar="SECONDS",
+        help="per-test timeout passed to the upstream runner (default: 300)",
+    )
     parser.add_argument("--preserve-scratch", action="store_true")
     parser.add_argument("--ledger-only", action="store_true")
     parser.add_argument("--update-ledger", action="store_true")
@@ -581,6 +690,8 @@ def main() -> int:
     args = parse_args()
     if args.jobs < 1:
         raise CompatError("--jobs must be positive")
+    if args.test_timeout < 1:
+        raise CompatError("--test-timeout must be positive")
     if args.report_label and not re.fullmatch(r"[A-Za-z0-9_-]+", args.report_label):
         raise CompatError("--report-label may contain only letters, digits, _ and -")
     manifest = load_manifest()
@@ -653,6 +764,8 @@ def main() -> int:
         str(suite),
         "--expect-result",
         str(expected),
+        "--timeout",
+        str(args.test_timeout),
         "--timing",
         "-j",
         str(args.jobs),
@@ -690,6 +803,7 @@ def main() -> int:
     known_failures = sum(test["actual"] in {"fail", "xfail"} for test in test_results)
     skipped = sum(test["actual"] == "skip" for test in test_results)
     applicable = len(test_results)
+    harness_ok = returncode == 0 and not parser_errors
     report = {
         "schema": 1,
         "upstream_repository": upstream["repository"],
@@ -704,11 +818,14 @@ def main() -> int:
         "skipped": skipped,
         "adapted": sum(test["classification"] == "adapted" for test in test_results),
         "environment_excluded": [test["name"] for test in environment_excluded],
-        "score_percent": (passing * 100.0 / applicable) if applicable else 0.0,
+        "score_percent": (
+            passing * 100.0 / applicable if harness_ok and applicable else None
+        ),
         "ledger": {key: ledger_counts[key] for key in sorted(VALID_CLASSES)},
         "tests": test_results,
         "runner_exit_code": returncode,
         "parser_errors": parser_errors,
+        "harness_ok": harness_ok,
     }
     reports = cache / "reports"
     reports.mkdir(exist_ok=True)

@@ -29,9 +29,14 @@ until the rsync pin, helper configuration, or adaptation patches change. Cargo
 also performs its normal incremental build. CI caches both sets of artifacts,
 so routine jobs normally pay only an incremental SYQ build and the test run.
 All adapted suites are copied from one configured base, so adding or changing
-a testsuite-only adaptation does not rebuild rsync's C helpers. Fresh runners
-still install the rsync build prerequisites. To manage the SYQ build separately,
-use `--no-build-syq --syq-bin PATH`.
+a testsuite-only adaptation does not rebuild rsync's C helpers. CI installs the
+rsync build prerequisites only on a suite-cache miss. To manage the SYQ build
+separately, use `--no-build-syq --syq-bin PATH`.
+
+The upstream runner gives each test a 300-second deadline by default; override
+it with `--test-timeout SECONDS`. CI uses 120 seconds per test and also caps the
+whole conformance job at 30 minutes. A per-test timeout is reported normally so
+the JSON, Markdown, and raw-log artifacts are still written.
 
 The harness requires Python 3.11 or newer. Preparing a fresh checkout also
 requires Git, a C toolchain, Make, Autoconf, and Automake. The CI workflow
