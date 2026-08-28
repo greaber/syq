@@ -410,7 +410,7 @@ pub fn run(args: Args) -> Result<i32> {
         show_progress,
         args.progress,
         args.width,
-        args.progress_json,
+        !args.quiet && args.progress_json,
     );
     let sched = Arc::new(Sched::new(block, min_split));
 

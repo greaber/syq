@@ -237,9 +237,10 @@ Identical to rsync:
   not even a missing destination directory is created (the transfer starts
   once the scans finish). Naming the destination file itself as one of the
   sources doesn't change that: it would be overwritten, so it's a conflict.
-- A destination that is a symlink to a directory is that directory (the link
-  is kept, with or without a trailing slash); a symlink to anything else is
-  replaced like a file.
+- An explicitly supplied destination root that is a symlink to a directory is
+  that directory (the link is kept, with or without a trailing slash). A
+  symlink encountered below the destination root is payload at that path: it
+  is replaced rather than followed, even when it points to a directory.
 - Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
   payload and produce one warning summary. Before transfer starts, SYQ rejects
   the exceptional case where a mapped payload path exactly equals a sidecar
@@ -321,11 +322,12 @@ needed for this normal resumption. Resume works at two levels.
 - Files whose size and mtime already match are skipped (the rsync quick check).
 - If this job's range-transfer `.name.syq-part.<job-id>` exists, both sides
   hash it and the source in `--block-size` blocks and only the mismatching
-  blocks are sent. A leftover is reused only when it is a regular file owned
-  by the receiving process with exactly one hard link; anything else is not
-  reused and is either safely replaced or reported as an error. On NFS this
-  requires the receiver to reread the partial; syq deliberately keeps no
-  separate block-completion map.
+  blocks are sent. A leftover is reused only when it can be safely opened as a
+  singly-linked regular file without following a symlink; numeric ownership is
+  deliberately not required because NFS root squashing and some FUSE/CIFS
+  mounts remap it. Anything else is safely replaced or reported as an error.
+  On NFS, reuse requires the receiver to reread the partial; syq deliberately
+  keeps no separate block-completion map.
   Pipelined small files are rewritten wholesale on retry instead of paying an
   extra partial-file probe.
 - If the destination file exists but differs, its blocks are hashed against
@@ -336,6 +338,12 @@ This block-level skip catches appends and in-place modifications (VM images,
 databases, logs). It does **not** catch a byte inserted near the start of a
 file, which rsync's rolling checksum would — for syq's intended use (fresh
 uploads and downloads) that trade was made deliberately.
+
+The partial job ID includes `--block-size` and the ordered ignore rules, so
+changing either starts a separate resumable namespace. Old sidecars are not
+garbage-collected automatically and may be deleted manually when the earlier
+command will not be resumed. Options that do not change the copy itself, such
+as `-c`, `--bwlimit`, and `-j`, do not change the partial ID.
 
 **Across the whole job.** Ordinary copies keep no transfer history, but their
 source and destination scans still skip files already complete. Deleting or
@@ -362,10 +370,13 @@ The checkpoint is flushed about once a second and persists after both failed
 and successful runs until you remove or stop passing it. Losing its last
 buffered records only causes repeated work. If an existing checkpoint has
 completed records but an expected destination root is missing, SYQ fails and
-asks you to remove the checkpoint to restart. The checkpoint must be outside
-local source and destination trees. `-n` reads and validates existing state but
-never creates or changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`.
-One checkpoint file may be used by only one running copy at a time.
+asks you to remove the checkpoint to restart. The checkpoint must be a regular
+file with exactly one hard link and must be outside local source and
+destination trees; a hardlinked checkpoint is refused because appending or
+changing its permissions would also affect its other names. `-n` reads and
+validates existing state but never creates or changes it. `-c`, `--verify-only`,
+and `--rm` conflict with `--checkpoint`. One checkpoint file may be used by
+only one running copy at a time.
 
 A checkpoint is an explicit trust decision: SYQ does not inspect a destination
 file covered by a matching record. If another process deleted, replaced, or
@@ -387,6 +398,12 @@ Starting the same logical command twice at once is
 unsupported: both invocations intentionally address the same resumable
 sidecars. After a crash, abandoned sidecars may be deleted manually if that
 command will not be resumed.
+
+These guarantees cover other SYQ jobs, which publish complete files by rename.
+They do not cover another process modifying an existing destination inode in
+place while SYQ is hashing or reusing it. As with rsync, such an external
+writer can invalidate a comparison after it was made; do not independently
+modify destination files during a transfer.
 
 ### Verification and consistency
 
