@@ -151,7 +151,6 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
 | `--verify-only` | Hash every file on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
-| `--fsync` | fsync each file, rename, and explicit checkpoint state (crash-durable; slower) |
 | `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
 | `-e CMD`, `--rsh CMD` | Remote shell command (default `ssh`) |
 | `--syq-path PATH` | Use this exact remote `syq` instead of the managed helper |
@@ -207,9 +206,10 @@ Identical to rsync:
 - A destination that is a symlink to a directory is that directory (the link
   is kept, with or without a trailing slash); a symlink to anything else is
   replaced like a file.
-- syq's own bookkeeping is never payload (as rsync excludes its
-  `--partial-dir`): names reserved for `.syq-part` sidecars are silently left
-  out. Everything else is copied.
+- Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
+  payload and produce one warning summary. Before transfer starts, SYQ rejects
+  the exceptional case where a mapped payload path exactly equals a sidecar
+  this job would use for another mapped file.
 - `host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
   A colon before the first slash means remote; `./x:y` is local. All sources
   must be on the same host. `host::module` (daemon syntax) is not supported.
@@ -233,6 +233,8 @@ source's mode with `-p`.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.
+Workers connect while the source is scanned but begin file data only after
+the mapped payload/sidecar namespace preflight completes.
 The data connections — by default separate TCP sockets carrying AES-256-GCM
 records (under `--no-tcp`, separate `ssh` processes instead), each its own flow
 and cipher — carry only "read range" / "write range" requests. Files go
@@ -254,9 +256,9 @@ semantics and block size, but not operational controls such as checksum
 checking, `-j`, verbosity, progress or bandwidth limiting. Filesystem
 component limits are queried and cached per directory; long basenames are
 deterministically truncated and disambiguated to fit. Exceptionally long full
-paths can still fail with a clear error. By default syq does not `fsync` each
-file (the rename still orders correctly, and per-file fsync is costly on NFS);
-pass `--fsync` to force each completed file durable for crash safety.
+paths can still fail with a clear error. SYQ does not `fsync` transfer data;
+atomic sidecar publication provides old-or-new visibility and resumable
+interrupted work, not crash-durability across power loss.
 Small files still use a pipelined whole-file request, but the receiver writes
 each request through its sidecar and renames it before acknowledging success.
 Thus every non-`--inplace` content change appears atomically complete, while
@@ -315,12 +317,11 @@ path. Unfinished individual files are never checkpoint-complete; their actual
 
 The checkpoint is flushed about once a second and persists after both failed
 and successful runs until you remove or stop passing it. Losing its last
-buffered records only causes repeated work; `--fsync` makes each flush and the
-initial header durable. If an existing checkpoint has completed records but an
-expected destination root is missing, SYQ fails and asks you to remove the
-checkpoint to restart. The checkpoint must be outside local source and
-destination trees. `-n` reads and validates existing state but never creates or
-changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`.
+buffered records only causes repeated work. If an existing checkpoint has
+completed records but an expected destination root is missing, SYQ fails and
+asks you to remove the checkpoint to restart. The checkpoint must be outside
+local source and destination trees. `-n` reads and validates existing state but
+never creates or changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`.
 One checkpoint file may be used by only one running copy at a time.
 
 A checkpoint is an explicit trust decision: SYQ does not inspect a destination

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -384,6 +384,23 @@ impl FsOps {
         parallel_map(paths, |p| lstat_entry(Vec::new(), &resolve(p)).ok())
     }
 
+    pub fn partial_paths(
+        &mut self,
+        paths: &[PathBytes],
+        partial_id: &PartialId,
+    ) -> Vec<std::result::Result<PathBytes, String>> {
+        parallel_map(paths, |path| {
+            let requested = Path::new(OsStr::from_bytes(path));
+            partial_path(&resolve(path), partial_id)
+                .map(|resolved| {
+                    let name = resolved.file_name().expect("partial always has a name");
+                    let parent = requested.parent().unwrap_or_else(|| Path::new(""));
+                    path_bytes(&parent.join(name))
+                })
+                .map_err(|error| format!("{error:#}"))
+        })
+    }
+
     /// Ops within a batch are independent (the planner orders batches so that
     /// parents come first), so they run in parallel too.
     pub fn apply(&mut self, ops: &[Op]) -> Vec<Option<String>> {
@@ -497,11 +514,7 @@ fn apply_one(op: &Op) -> Result<()> {
                         std::thread::sleep(std::time::Duration::from_millis(ms));
                     }
                 }
-                let file = match OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&p)
-                {
+                let file = match open_metadata_handle(&p) {
                     Ok(file) => file,
                     Err(open_error) => {
                         // A concurrent publisher may have removed the path or
@@ -529,7 +542,7 @@ fn apply_one(op: &Op) -> Result<()> {
                 {
                     return Ok(());
                 }
-                set_meta_file(&file, meta, *flags)
+                set_meta_handle(&file, meta, *flags)
                     .with_context(|| format!("set metadata {}", p.display()))
             }
             Op::Rmdir { path } => {
@@ -547,6 +560,87 @@ fn apply_one(op: &Op) -> Result<()> {
             }
         }
     }
+}
+
+/// Open a stable reference suitable for metadata-only repair without reading
+/// file contents. O_NONBLOCK prevents a concurrent FIFO/device replacement
+/// from hanging before fstat can reject it.
+fn open_metadata_handle(path: &Path) -> Result<File> {
+    let path = cstr(path)?;
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn set_meta_handle(file: &File, meta: &Meta, flags: u8) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let empty = c"";
+    // Owner first: chown clears setuid/setgid, so mode must follow it.
+    apply_owner(flags, meta, |uid, gid| {
+        let r = unsafe {
+            libc::fchownat(
+                fd,
+                empty.as_ptr(),
+                uid.unwrap_or(u32::MAX),
+                gid.unwrap_or(u32::MAX),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })?;
+    if flags & flags::MODE != 0 {
+        let current = file.metadata()?.mode() & 0o7777;
+        let wanted = meta.mode & 0o7777;
+        if current != wanted || (flags & (flags::OWNER | flags::GROUP) != 0 && wanted & 0o6000 != 0)
+        {
+            let r = unsafe {
+                libc::fchmodat(
+                    fd,
+                    empty.as_ptr(),
+                    wanted as libc::mode_t,
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            if r != 0 {
+                let error = io::Error::last_os_error();
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+                ) {
+                    return Err(error.into());
+                }
+                // Older libc/kernel combinations do not expose fchmodat2's
+                // AT_EMPTY_PATH support. procfs still resolves this stable
+                // O_PATH descriptor, never the possibly replaced pathname.
+                fs::set_permissions(
+                    PathBuf::from("/proc/self/fd").join(fd.to_string()),
+                    fs::Permissions::from_mode(wanted),
+                )?;
+            }
+        }
+    }
+    if flags & flags::TIMES != 0 {
+        bail!("metadata-only O_PATH repair does not support timestamp changes");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_meta_handle(file: &File, meta: &Meta, flags: u8) -> Result<()> {
+    set_meta_file(file, meta, flags)
 }
 
 #[cfg(debug_assertions)]
@@ -831,16 +925,10 @@ impl FsOps {
         partial_id: &PartialId,
         meta: &Meta,
         flags: u8,
-        fsync: bool,
     ) -> Result<()> {
         let held = self.take_held_basis(path, partial_id)?;
         set_meta_file(&held.file, meta, flags)
             .with_context(|| format!("set metadata on basis {}", held.path.display()))?;
-        if fsync {
-            held.file
-                .sync_all()
-                .with_context(|| format!("fsync basis {}", held.path.display()))?;
-        }
         Ok(())
     }
 
@@ -983,7 +1071,6 @@ impl FsOps {
         hash: u64,
         meta: &Meta,
         flags: u8,
-        fsync: bool,
     ) -> Result<()> {
         if xxh3_64(data) != hash {
             bail!("block hash mismatch on receive");
@@ -1002,10 +1089,6 @@ impl FsOps {
         f.write_all_at(data, 0)
             .with_context(|| format!("write {}", pp.display()))?;
         set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", pp.display()))?;
-        if fsync {
-            f.sync_all()
-                .with_context(|| format!("fsync {}", pp.display()))?;
-        }
         #[cfg(debug_assertions)]
         if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
             // Test hook (debug builds only): model interruption after the
@@ -1017,9 +1100,6 @@ impl FsOps {
         fs::rename(&pp, &p)
             .with_context(|| format!("rename {} to {}", pp.display(), p.display()))?;
         drop(f);
-        if fsync {
-            fsync_parent(&p)?;
-        }
         Ok(())
     }
 
@@ -1087,7 +1167,6 @@ impl FsOps {
         partial_id: &PartialId,
         meta: &Meta,
         flags: u8,
-        fsync: bool,
     ) -> Result<()> {
         let p = resolve(path);
         let src = if inplace {
@@ -1104,10 +1183,6 @@ impl FsOps {
         })?;
         set_meta_file(&f, meta, flags)
             .with_context(|| format!("set metadata {}", src.display()))?;
-        if fsync {
-            f.sync_all()
-                .with_context(|| format!("fsync {}", src.display()))?;
-        }
         if !inplace {
             if fs::symlink_metadata(&p).is_ok_and(|metadata| metadata.is_dir()) {
                 bail!("destination {} is a directory", p.display());
@@ -1117,10 +1192,6 @@ impl FsOps {
             })?;
         }
         drop(f);
-        if fsync {
-            // Make the rename (or in-place write) itself durable.
-            fsync_parent(&p)?;
-        }
         Ok(())
     }
 
@@ -1149,6 +1220,9 @@ impl FsOps {
     pub fn handle(&mut self, req: &Request) -> Response {
         let r: Result<Response> = match req {
             Request::StatMany(paths) => Ok(Response::Stats(self.stat_many(paths))),
+            Request::PartialPaths { paths, partial_id } => {
+                Ok(Response::PathResults(self.partial_paths(paths, partial_id)))
+            }
             Request::Apply(ops) => Ok(Response::Applied(self.apply(ops))),
             Request::ProbePartial { path, partial_id } => self.probe_partial(path, partial_id),
             Request::Prepare {
@@ -1173,9 +1247,8 @@ impl FsOps {
                 partial_id,
                 meta,
                 flags,
-                fsync,
             } => self
-                .finish_basis(path, partial_id, meta, *flags, *fsync)
+                .finish_basis(path, partial_id, meta, *flags)
                 .map(|_| Response::Ok),
             Request::SeedBasis {
                 path,
@@ -1201,7 +1274,6 @@ impl FsOps {
                 hash,
                 meta,
                 flags,
-                fsync,
             } => self
                 .put_small(
                     PartialTarget {
@@ -1212,7 +1284,6 @@ impl FsOps {
                     *hash,
                     meta,
                     *flags,
-                    *fsync,
                 )
                 .map(|_| Response::Ok),
             Request::HashBlocks {
@@ -1257,9 +1328,8 @@ impl FsOps {
                 partial_id,
                 meta,
                 flags,
-                fsync,
             } => self
-                .finalize(path, *inplace, partial_id, meta, *flags, *fsync)
+                .finalize(path, *inplace, partial_id, meta, *flags)
                 .map(|_| Response::Ok),
             Request::FileHash { path } => self.file_hash(path),
             Request::Canonicalize { path } => {
@@ -1355,16 +1425,6 @@ fn preallocate(f: &File, size: u64) -> Result<()> {
     // Portable fallback (also macOS): a sparse file of the right size.
     f.set_len(size)?;
     Ok(())
-}
-
-pub(crate) fn fsync_parent(path: &Path) -> Result<()> {
-    let dir = path
-        .parent()
-        .filter(|directory| !directory.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file = File::open(dir).with_context(|| format!("open {} for fsync", dir.display()))?;
-    file.sync_all()
-        .with_context(|| format!("fsync directory {}", dir.display()))
 }
 
 fn timespec(sec: i64, nsec: u32) -> libc::timespec {
@@ -1507,11 +1567,6 @@ mod tests {
 
         let too_deep = PathBuf::from("a".repeat(parent_len + 1)).join("x");
         assert!(partial_path(&too_deep, &id).is_err());
-    }
-
-    #[test]
-    fn fsync_parent_handles_a_relative_leaf() {
-        fsync_parent(Path::new("state.jsonl")).unwrap();
     }
 
     #[test]

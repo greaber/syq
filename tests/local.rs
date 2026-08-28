@@ -1908,6 +1908,72 @@ fn legacy_marker_name_is_ordinary_payload() {
     assert_eq!(read(&t.path("dst/file")), b"payload");
 }
 
+#[test]
+fn source_partials_are_copied_and_warned_about() {
+    let t = Tmp::new();
+    let id = "a".repeat(26);
+    let file = format!(".payload.syq-part.{id}");
+    let dir = format!(".directory.syq-part.{id}");
+    write(&t.path(&format!("src/{file}")), b"partial payload");
+    write(&t.path(&format!("src/{dir}/child")), b"nested payload");
+    write(
+        &t.path("src/.legacy.syq-partial"),
+        b"legacy-looking payload",
+    );
+
+    let output = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_output_ok(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: source contains 2 recognizable SYQ partial paths"),
+        "{stderr}"
+    );
+    assert_eq!(read(&t.path(&format!("dst/{file}"))), b"partial payload");
+    assert_eq!(
+        read(&t.path(&format!("dst/{dir}/child"))),
+        b"nested payload"
+    );
+    assert_eq!(
+        read(&t.path("dst/.legacy.syq-partial")),
+        b"legacy-looking payload"
+    );
+
+    let output = syq(&["-a", "--progress-json", &t.s("src/"), &t.s("json-dst/")]);
+    assert_output_ok(&output);
+    let warning = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["code"] == "source_partials")
+        .expect("missing structured source-partial warning");
+    assert_eq!(warning["type"], "warning");
+    assert_eq!(warning["count"], 2);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn exact_payload_sidecar_collision_fails_before_publication() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
+    let src = t.s("src/");
+    let dst = t.s("dst/");
+    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let partial = interrupted_partial(&args, &t.path("dst"));
+    let collision_name = partial.file_name().unwrap().to_owned();
+    fs::remove_file(&partial).unwrap();
+    write(
+        &t.path("src").join(&collision_name),
+        b"deliberate collision",
+    );
+
+    let output = syq(&args);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reserved sidecar"), "{stderr}");
+    assert!(!t.path("dst/file").exists());
+    assert!(!t.path("dst").join(collision_name).exists());
+}
+
 // Several content sources map onto the destination root; the last one's
 // metadata wins, as for any other directory.
 #[test]
@@ -2456,6 +2522,74 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
 }
 
 #[test]
+fn quick_check_repairs_mode_without_destination_read_permission() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"same contents");
+    write(&t.path("dst"), b"same contents");
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o000)).unwrap();
+    set_mtime(&t.path("src"), 1_600_000_000);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+
+    let output = run_ok(&["-a", &t.s("src"), &t.s("dst")]);
+
+    assert_eq!(transferred(&output), 0, "{output}");
+    assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(read(&t.path("dst")), b"same contents");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn quick_check_metadata_open_does_not_block_on_concurrent_fifo() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let t = Tmp::new();
+    write(&t.path("basis"), b"same");
+    write(&t.path("first"), b"same");
+    mkfifo(&t.path("second"));
+    fs::set_permissions(t.path("basis"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(t.path("first"), fs::Permissions::from_mode(0o600)).unwrap();
+    set_mtime(&t.path("basis"), 1_600_000_000);
+    set_mtime(&t.path("first"), 1_600_000_000);
+    let ready = t.path("quick-meta-ready");
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
+        .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_QUICK_META_MS", "1000")
+        .spawn()
+        .unwrap();
+    let held = (0..300).any(|_| {
+        if ready.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(held, "first copy never reached quick-check metadata repair");
+
+    assert_output_ok(&syq(&["-a", &t.s("second"), &t.s("basis")]));
+    let status = (0..300).find_map(|_| {
+        let status = first.try_wait().unwrap();
+        if status.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        status
+    });
+    if status.is_none() {
+        let _ = first.kill();
+        let _ = first.wait();
+        panic!("quick-check repair blocked while opening a concurrently published FIFO");
+    }
+    assert!(status.unwrap().success());
+    assert!(fs::symlink_metadata(t.path("basis"))
+        .unwrap()
+        .file_type()
+        .is_fifo());
+}
+
+#[test]
 fn checksum_identical_file_preserves_destination_inode() {
     let t = Tmp::new();
     let contents = vec![b'a'; 8 * 1024 * 1024];
@@ -2790,6 +2924,17 @@ fn unsupported_rsync_flags_explain_themselves() {
         "bundled -H should be explained: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn removed_fsync_option_is_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    let output = syq(&["--fsync", &t.s("src"), &t.s("dst")]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected argument '--fsync'"), "{stderr}");
+    assert!(!t.path("dst").exists());
 }
 
 // Compatibility no-ops are accepted and change nothing.

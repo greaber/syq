@@ -209,7 +209,6 @@ pub fn run(args: Args) -> Result<i32> {
         let res = ctl.scan(
             &root,
             false,
-            true,
             &[],
             &mut |entries: Vec<Entry>| {
                 for e in entries {

@@ -137,15 +137,18 @@ pub enum Request {
         port_lo: u16,
         port_hi: u16,
     },
-    /// `all`: include syq's own partial files (used by --rm).
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
     Scan {
         root: PathBytes,
         follow_root: bool,
-        all: bool,
         ignore: Vec<String>,
     },
     StatMany(Vec<PathBytes>),
+    /// Compute the exact receiver-side sidecar names for collision preflight.
+    PartialPaths {
+        paths: Vec<PathBytes>,
+        partial_id: PartialId,
+    },
     Apply(Vec<Op>),
     /// Return the size of the deterministic sidecar, if it is a regular file.
     /// The planner has already statted the final path.
@@ -178,7 +181,6 @@ pub enum Request {
         partial_id: PartialId,
         meta: Meta,
         flags: u8,
-        fsync: bool,
     },
     /// Seed this job's sidecar from the retained basis descriptor.
     SeedBasis {
@@ -226,7 +228,6 @@ pub enum Request {
         partial_id: PartialId,
         meta: Meta,
         flags: u8,
-        fsync: bool,
     },
     /// Whole small file in one request: verify, write a sidecar, then rename it
     /// atomically over the final path. This preserves small-file pipelining
@@ -239,7 +240,6 @@ pub enum Request {
         hash: u64,
         meta: Meta,
         flags: u8,
-        fsync: bool,
     },
     FileHash {
         path: PathBytes,
@@ -267,6 +267,7 @@ pub enum Response {
     ScanWarn(String),
     ScanDone,
     Stats(Vec<Option<Entry>>),
+    PathResults(Vec<std::result::Result<PathBytes, String>>),
     Applied(Vec<Option<String>>),
     PartialSize(Option<u64>),
     Hashes(Vec<u64>),

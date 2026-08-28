@@ -123,11 +123,6 @@ pub struct Args {
     /// of it changes)
     #[arg(long)]
     pub inplace: bool,
-    /// fsync each file and parent directory around the rename, and sync an explicitly requested
-    /// checkpoint; makes acknowledged state crash-durable (slower, especially on NFS)
-    #[arg(long)]
-    pub fsync: bool,
-
     /// Avoid completed-file destination lookups on later runs. Normal reruns and partial-file
     /// resume do not need this. The file persists and must be outside local source/destination trees.
     #[arg(

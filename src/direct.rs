@@ -65,9 +65,6 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.inplace {
         remote.push("--inplace".into());
     }
-    if args.fsync {
-        remote.push("--fsync".into());
-    }
     if let Some(path) = &args.checkpoint {
         remote.push(format!("--checkpoint={path}"));
     }
