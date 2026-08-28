@@ -240,25 +240,30 @@ onto a largest-first queue; when a worker runs dry it steals the back half of
 the remaining range of whichever file has the most left, so the tail of a
 transfer stays parallel without pre-deciding chunk counts.
 
-On the receiving side each file is written beside its destination as
-`.name.syq-part.<job-id>` (preallocated with `fallocate`, written with `pwrite`
-from several workers), given its metadata, and `rename`d over the target. The
-job ID is a 128-bit digest of the normalized source/destination mapping and
+On the receiving side a file that needs content changes is written beside its
+destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
+written with `pwrite` from several workers), given its metadata, and `rename`d
+over the target. When an existing final file is the comparison basis, the
+receiver retains that open descriptor while its blocks are hashed. If every
+block matches, metadata is applied through the descriptor without allocating
+or publishing a sidecar; otherwise that exact descriptor seeds the sidecar.
+The job ID is a 128-bit digest of the normalized source/destination mapping and
 content-affecting options, and is stable when the same logical command is
-rerun. It includes trailing-slash mapping, filters, metadata semantics and
-block size, but not operational controls such as `-j`, verbosity, progress or
-bandwidth limiting. Long basenames are deterministically truncated and
-disambiguated to fit the usual filesystem component limit; exceptionally long
-full paths can still fail with a clear error. By default syq does not `fsync`
-each file (the rename still orders correctly, and per-file fsync is costly on
-NFS); pass `--fsync` to force each file durable before the rename for crash
-safety.
+rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
+semantics and block size, but not operational controls such as checksum
+checking, `-j`, verbosity, progress or bandwidth limiting. Filesystem
+component limits are queried and cached per directory; long basenames are
+deterministically truncated and disambiguated to fit. Exceptionally long full
+paths can still fail with a clear error. By default syq does not `fsync` each
+file (the rename still orders correctly, and per-file fsync is costly on NFS);
+pass `--fsync` to force each completed file durable for crash safety.
 Small files still use a pipelined whole-file request, but the receiver writes
 each request through its sidecar and renames it before acknowledging success.
-Thus every non-`--inplace` final name appears atomically complete. `--inplace`
-writes every file directly (for example, to update a large file without room
-for a second copy), so readers can observe partially updated contents and an
-interruption leaves the final file unfinished.
+Thus every non-`--inplace` content change appears atomically complete, while
+a content-identical file keeps its inode and any destination hardlinks.
+`--inplace` writes every file directly (for example, to update a large file
+without room for a second copy), so readers can observe partially updated
+contents and an interruption leaves the final file unfinished.
 
 Local → local runs the same machinery in-process with N threads, which helps
 on NFS and NVMe.
@@ -327,10 +332,12 @@ modified; omit the option and SYQ remains history-independent.
 Like rsync, ordinary SYQ runs do not coordinate with each other. Different
 logical commands use different partial names, so concurrent copies into one
 tree produce the union of their files and one whole-file rename wins for any
-path both write. Starting the same logical command twice at once is unsupported:
-both invocations intentionally address the same resumable sidecars. After a
-crash, abandoned sidecars may be deleted manually if that command will not be
-resumed.
+path both write. A content-identical comparison applies metadata only through
+the inode it verified, so it cannot mix its metadata with another job's newly
+renamed contents. Starting the same logical command twice at once is
+unsupported: both invocations intentionally address the same resumable
+sidecars. After a crash, abandoned sidecars may be deleted manually if that
+command will not be resumed.
 
 ### Verification and consistency
 
@@ -342,8 +349,8 @@ Always:
 - After a file completes, the source is re-stat'ed. If its size or mtime
   changed during the transfer the file is redone (up to three attempts), then
   reported as an error.
-- Unless `--inplace` was explicit, destination files appear atomically via
-  rename, including new small files.
+- Unless `--inplace` was explicit, destination content changes appear
+  atomically via rename, including new small files.
 - Non-zero exit if anything failed.
 
 On request:
@@ -360,12 +367,12 @@ different moments, so a file being written while copied may come out mixed —
 the re-stat catches the common case, `--verify-only` afterwards catches the
 rest.
 
-Compared with rsync: ordinary writes use the same temporary-file plus atomic
-rename model; `--inplace` explicitly gives that up. Rsync chooses a random
-temporary suffix, while SYQ uses a deterministic job ID so an interrupted
-command can find its partial again without a local state file. The
-change-during-transfer check is the same idea; deletes and hardlinks aren't
-implemented, so there is no ordering question for them.
+Compared with rsync: ordinary content-changing writes use the same
+temporary-file plus atomic rename model; `--inplace` explicitly gives that up.
+Rsync chooses a random temporary suffix, while SYQ uses a deterministic job ID
+so an interrupted command can find its partial again without a local state
+file. The change-during-transfer check is the same idea; deletes and hardlinks
+aren't implemented, so there is no ordering question for them.
 
 ## Not implemented (on purpose, for now)
 

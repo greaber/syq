@@ -115,7 +115,6 @@ fn semantic_flags(opts: &Opts, args: &Args) -> String {
         "group": opts.flags & flags::GROUP != 0,
         "owner": opts.flags & flags::OWNER != 0,
         "devices": opts.devices,
-        "checksum": opts.checksum,
         "inplace": args.inplace,
         "block_size": opts.block,
         "ignore": opts.ignore,
@@ -1719,7 +1718,6 @@ impl Worker {
             && self.bwlimit.is_none()
             && job.entry.size > 0
             && partial_size.is_none()
-            && job.attempts == 0
         {
             match self.try_copy_local(idx, &job) {
                 Ok(true) => {
@@ -1733,7 +1731,9 @@ impl Worker {
                 }
             }
         }
-        let planned: Result<Vec<(u64, u64)>> = (|| {
+        // bool = a staged or in-place file still needs Finalize. A verified
+        // content match applies metadata through its retained basis fd instead.
+        let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
             let final_entry = job.dst_entry.clone();
             if let Some(f) = &final_entry {
                 if f.kind == Kind::Dir {
@@ -1742,9 +1742,9 @@ impl Worker {
             }
             let final_is_file = final_entry.as_ref().is_some_and(|f| f.kind == Kind::File);
             let full = || if size > 0 { vec![(0, size)] } else { vec![] };
-            // Unless --inplace was explicit, every file is published through
-            // a sidecar + atomic rename. Small new files normally take the
-            // pipelined PutSmall path instead of reaching this worker path.
+            // Unless --inplace was explicit, changed files are published
+            // through a sidecar + atomic rename. Small new files normally take
+            // the pipelined PutSmall path instead of reaching this worker path.
             self.set_inplace(idx, inplace);
 
             if inplace {
@@ -1759,9 +1759,9 @@ impl Worker {
                     "prepare",
                 )?;
                 if final_is_file && size > 0 {
-                    return self.diff_blocks(&job, Which::Final);
+                    return Ok((self.diff_blocks(&job, Which::Final)?, true));
                 }
-                return Ok(full());
+                return Ok((full(), true));
             }
             if partial_size.is_some() {
                 ok(
@@ -1775,30 +1775,36 @@ impl Worker {
                     "prepare",
                 )?;
                 if size == 0 {
-                    return Ok(vec![]);
+                    return Ok((vec![], true));
                 }
-                return self.diff_blocks(&job, Which::Partial);
+                return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
-            if final_is_file && (size > 0 && final_entry.as_ref().unwrap().size > 0 || size == 0) {
-                if size == 0 {
+            if final_is_file {
+                let ranges = self.diff_final_and_hold(&job)?;
+                if ranges.is_empty() && final_entry.as_ref().unwrap().size == size {
+                    let mut meta = job.entry.meta();
+                    meta.mode = self.create_mode(&job);
                     ok(
-                        self.dst.call(Request::Prepare {
+                        self.dst.call(Request::FinishBasis {
                             path: job.dst.clone(),
-                            size,
-                            inplace: false,
                             partial_id: self.partial_id(),
-                            mode: self.create_mode(&job),
+                            meta,
+                            flags: self.opts.flags | flags::MODE,
+                            fsync: self.opts.fsync,
                         })?,
-                        "prepare",
+                        "finish content-identical destination",
                     )?;
-                    return Ok(vec![]);
+                    return Ok((vec![], false));
                 }
-                // SeedAndHash made a complete snapshot of the final file.
-                // Publish it even when every block matched: applying metadata
-                // to the live path could otherwise race with another job's
-                // rename and produce one job's contents with the other's
-                // metadata.
-                return self.diff_final_and_seed(&job);
+                ok(
+                    self.dst.call(Request::SeedBasis {
+                        path: job.dst.clone(),
+                        partial_id: self.partial_id(),
+                        len: size,
+                    })?,
+                    "seed partial from destination basis",
+                )?;
+                return Ok((ranges, true));
             }
             ok(
                 self.dst.call(Request::Prepare {
@@ -1810,10 +1816,10 @@ impl Worker {
                 })?,
                 "prepare",
             )?;
-            Ok(full())
+            Ok((full(), true))
         })();
 
-        let ranges = match planned {
+        let (ranges, needs_finalize) = match planned {
             Ok(result) => result,
             Err(e) => {
                 self.sched.ranges_ready(idx, vec![]);
@@ -1836,7 +1842,8 @@ impl Worker {
                     self.finish_file(idx)?;
                 }
             }
-            None => self.finish_file(idx)?,
+            None if needs_finalize => self.finish_file(idx)?,
+            None => self.finish_matched_file(idx)?,
         }
         Ok(())
     }
@@ -1920,36 +1927,40 @@ impl Worker {
 
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
     fn diff_blocks(&mut self, job: &FileJob, which: Which) -> Result<Vec<(u64, u64)>> {
-        let block = self.opts.block;
-        let size = job.entry.size;
-        self.src.send(Request::HashBlocks {
-            path: job.src.clone(),
-            which: Which::Final,
-            partial_id: self.partial_id(),
-            block,
-            len: size,
-        })?;
-        self.dst.send(Request::HashBlocks {
-            path: job.dst.clone(),
-            which,
-            partial_id: self.partial_id(),
-            block,
-            len: size,
-        })?;
-        let sh = match ok(self.src.recv()?, "hash source")? {
-            Response::Hashes(h) => h,
-            other => bail!("unexpected response {other:?}"),
-        };
-        let dh = match ok(self.dst.recv()?, "hash destination")? {
-            Response::Hashes(h) => h,
-            other => bail!("unexpected response {other:?}"),
-        };
-        Ok(Self::different_ranges(&sh, &dh, block, size))
+        self.diff_with(
+            job,
+            Request::HashBlocks {
+                path: job.dst.clone(),
+                which,
+                partial_id: self.partial_id(),
+                block: self.opts.block,
+                len: job.entry.size,
+            },
+            "hash destination",
+        )
     }
 
-    /// Compare the source with one opened final-file snapshot while the
-    /// receiver seeds this job's sidecar from that exact same inode.
-    fn diff_final_and_seed(&mut self, job: &FileJob) -> Result<Vec<(u64, u64)>> {
+    /// Compare the source with one opened final-file inode retained by the
+    /// receiver for either metadata-only completion or sidecar seeding.
+    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<Vec<(u64, u64)>> {
+        self.diff_with(
+            job,
+            Request::HashAndHold {
+                path: job.dst.clone(),
+                partial_id: self.partial_id(),
+                block: self.opts.block,
+                len: job.entry.size,
+            },
+            "hash and retain destination basis",
+        )
+    }
+
+    fn diff_with(
+        &mut self,
+        job: &FileJob,
+        destination_request: Request,
+        destination_label: &str,
+    ) -> Result<Vec<(u64, u64)>> {
         let block = self.opts.block;
         let size = job.entry.size;
         self.src.send(Request::HashBlocks {
@@ -1959,21 +1970,17 @@ impl Worker {
             block,
             len: size,
         })?;
-        self.dst.send(Request::SeedAndHash {
-            path: job.dst.clone(),
-            partial_id: self.partial_id(),
-            block,
-            len: size,
-        })?;
-        let source = match ok(self.src.recv()?, "hash source")? {
-            Response::Hashes(hashes) => hashes,
-            other => bail!("unexpected response {other:?}"),
-        };
-        let destination = match ok(self.dst.recv()?, "seed and hash destination")? {
-            Response::Hashes(hashes) => hashes,
-            other => bail!("unexpected response {other:?}"),
-        };
+        self.dst.send(destination_request)?;
+        let source = Self::hashes(ok(self.src.recv()?, "hash source")?)?;
+        let destination = Self::hashes(ok(self.dst.recv()?, destination_label)?)?;
         Ok(Self::different_ranges(&source, &destination, block, size))
+    }
+
+    fn hashes(response: Response) -> Result<Vec<u64>> {
+        match response {
+            Response::Hashes(hashes) => Ok(hashes),
+            other => bail!("unexpected response {other:?}"),
+        }
     }
 
     fn different_ranges(
@@ -2135,6 +2142,20 @@ impl Worker {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
         }
+        self.complete_file(idx, job, false)
+    }
+
+    fn finish_matched_file(&mut self, idx: usize) -> Result<()> {
+        if self.sched.is_failed(idx) {
+            return Ok(());
+        }
+        self.complete_file(idx, self.job(idx), true)
+    }
+
+    /// Recheck the source after either an atomic publication or a verified
+    /// metadata-only completion, and retry from the completed destination when
+    /// the source changed during that work.
+    fn complete_file(&mut self, idx: usize, job: FileJob, matched: bool) -> Result<()> {
         // Did the source change under us?
         let now = stat_one(&mut *self.src, &job.src)?;
         let changed = match &now {
@@ -2171,9 +2192,14 @@ impl Worker {
             }
             bail!("source changed during transfer (or vanished)");
         }
-        self.progress.files_done.fetch_add(1, Relaxed);
+        if matched {
+            self.progress.files_total.fetch_sub(1, Relaxed);
+            self.progress.files_skipped.fetch_add(1, Relaxed);
+        } else {
+            self.progress.files_done.fetch_add(1, Relaxed);
+        }
         self.record_done(&job.rel_bytes, &job.entry);
-        if self.opts.verbose > 0 {
+        if !matched && self.opts.verbose > 0 {
             self.progress.println(&job.rel);
         }
         Ok(())

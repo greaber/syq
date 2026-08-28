@@ -153,20 +153,29 @@ pub enum Request {
         partial_id: PartialId,
         mode: u32,
     },
-    /// Hash an existing final file while copying bytes from that same open
-    /// inode into this job's partial. This makes the hash basis and staged
-    /// basis one atomic snapshot even if another command publishes meanwhile.
-    SeedAndHash {
+    /// Hash an existing final file and retain that open inode as the repair
+    /// basis until FinishBasis or SeedBasis consumes it.
+    HashAndHold {
         path: PathBytes,
         partial_id: PartialId,
         block: u64,
         len: u64,
     },
-    /// Remove this job's unused staged copy after the existing final proved
-    /// content-identical.
-    DiscardPartial {
+    /// Apply metadata through the retained basis descriptor. If another job
+    /// renamed over the final path meanwhile, its complete file remains the
+    /// winner and this only touches the now-unlinked old inode.
+    FinishBasis {
         path: PathBytes,
         partial_id: PartialId,
+        meta: Meta,
+        flags: u8,
+        fsync: bool,
+    },
+    /// Seed this job's sidecar from the retained basis descriptor.
+    SeedBasis {
+        path: PathBytes,
+        partial_id: PartialId,
+        len: u64,
     },
     /// In-kernel copy of a same-machine file (copy_file_range: reflink / NFS
     /// server-side copy when possible). Err("EXDEV") tells the caller to fall

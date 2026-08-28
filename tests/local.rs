@@ -410,6 +410,34 @@ fn no_bootstrap_uses_remote_path_without_managed_cache() {
 }
 
 #[test]
+fn remote_retained_basis_handles_matching_and_changed_files() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    let original = vec![b'a'; 5 * 1024 * 1024];
+    let mut changed = original.clone();
+    changed[2 * 1024 * 1024] = b'b';
+    write(&t.path("src"), &original);
+    write(&t.path("dst"), &original);
+    set_mtime(&t.path("src"), 1_600_000_001);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+    let inode = fs::metadata(t.path("dst")).unwrap().ino();
+    let remote = format!("fake:{}", t.s("dst"));
+
+    let matching = remote_syq(&t, &rsh, &["-ac", "--no-bootstrap", &t.s("src"), &remote]);
+    assert_output_ok(&matching);
+    assert_eq!(fs::metadata(t.path("dst")).unwrap().ino(), inode);
+
+    write(&t.path("src"), &changed);
+    set_mtime(&t.path("src"), 1_600_000_002);
+    let repair = remote_syq(&t, &rsh, &["-a", "--no-bootstrap", &t.s("src"), &remote]);
+    assert_output_ok(&repair);
+    assert_eq!(read(&t.path("dst")), changed);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[test]
 fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
@@ -730,6 +758,28 @@ fn resume_from_partial() {
     assert_same_tree(&t.path("src/big.bin"), &t.path("dst/big.bin"));
     // Roughly half should have been reused.
     assert!(out.contains("unchanged"), "{out}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn checksum_toggle_reuses_the_same_partial() {
+    let t = Tmp::new();
+    let data = prng(6 * 1024 * 1024, 43);
+    write(&t.path("src"), &data);
+    set_mtime(&t.path("src"), 1_600_000_000);
+    let src = t.s("src");
+    let dst = t.s("dst");
+    let initial = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let partial = interrupted_partial(&initial, &t.0);
+
+    run_ok(&["-ac", "--block-size", "1M", "--bwlimit", "1G", &src, &dst]);
+
+    assert_eq!(read(&t.path("dst")), data);
+    assert!(
+        !partial.exists(),
+        "changing only -c must not strand the resumable partial"
+    );
+    assert!(partial_files(&t.0).is_empty());
 }
 
 #[test]
@@ -2242,6 +2292,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     set_mtime(&t.path("basis"), 1_600_000_000);
     set_mtime(&t.path("first"), 1_600_000_001);
     set_mtime(&t.path("second"), 1_600_000_002);
+    let ready = t.path("basis-ready");
 
     let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -2254,18 +2305,23 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
             &t.s("first"),
             &t.s("basis"),
         ])
-        .env("SYQ_TEST_HOLD_AFTER_SEED_MS", "2000")
+        .env("SYQ_TEST_BASIS_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
         .spawn()
         .unwrap();
-    let seeded = (0..300).any(|_| {
-        if partial_files(&t.0).len() == 1 {
+    let held = (0..300).any(|_| {
+        if ready.exists() {
             true
         } else {
             std::thread::sleep(std::time::Duration::from_millis(10));
             false
         }
     });
-    assert!(seeded, "first copy never seeded its sidecar");
+    assert!(held, "first copy never retained its destination basis");
+    assert!(
+        partial_files(&t.0).is_empty(),
+        "hashing alone must not create a sidecar"
+    );
 
     let second = syq(&[
         "-a",
@@ -2285,7 +2341,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn content_identical_seed_publishes_contents_and_metadata_atomically() {
+fn content_identical_basis_never_mixes_contents_and_metadata() {
     let t = Tmp::new();
     let first_contents = vec![b'a'; 8 * 1024 * 1024];
     let second_contents = vec![b'b'; 8 * 1024 * 1024];
@@ -2297,6 +2353,7 @@ fn content_identical_seed_publishes_contents_and_metadata_atomically() {
     set_mtime(&t.path("basis"), 1_600_000_000);
     set_mtime(&t.path("first"), 1_600_000_001);
     set_mtime(&t.path("second"), 1_600_000_002);
+    let ready = t.path("basis-ready");
 
     let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -2309,18 +2366,23 @@ fn content_identical_seed_publishes_contents_and_metadata_atomically() {
             &t.s("first"),
             &t.s("basis"),
         ])
-        .env("SYQ_TEST_HOLD_AFTER_SEED_MS", "2000")
+        .env("SYQ_TEST_BASIS_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
         .spawn()
         .unwrap();
-    let seeded = (0..300).any(|_| {
-        if partial_files(&t.0).len() == 1 {
+    let held = (0..300).any(|_| {
+        if ready.exists() {
             true
         } else {
             std::thread::sleep(std::time::Duration::from_millis(10));
             false
         }
     });
-    assert!(seeded, "first copy never seeded its sidecar");
+    assert!(held, "first copy never retained its destination basis");
+    assert!(
+        partial_files(&t.0).is_empty(),
+        "content comparison must not allocate a full sidecar"
+    );
 
     let second = syq(&[
         "-a",
@@ -2338,10 +2400,37 @@ fn content_identical_seed_publishes_contents_and_metadata_atomically() {
     assert_eq!(published.mtime(), 1_600_000_002);
 
     assert!(first.wait().unwrap().success());
-    assert_eq!(read(&t.path("basis")), first_contents);
+    // The second job renamed a complete file over the descriptor retained by
+    // the first. Metadata applied through the old descriptor cannot leak onto
+    // the second job's contents, so the second whole-file publication wins.
+    assert_eq!(read(&t.path("basis")), second_contents);
     let published = fs::metadata(t.path("basis")).unwrap();
-    assert_eq!(published.mode() & 0o777, 0o600);
-    assert_eq!(published.mtime(), 1_600_000_001);
+    assert_eq!(published.mode() & 0o777, 0o640);
+    assert_eq!(published.mtime(), 1_600_000_002);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[test]
+fn checksum_identical_file_preserves_destination_inode() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    write(&t.path("dst"), &contents);
+    fs::hard_link(t.path("dst"), t.path("alias")).unwrap();
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o600)).unwrap();
+    set_mtime(&t.path("src"), 1_600_000_001);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+    let before = fs::metadata(t.path("dst")).unwrap();
+
+    let output = run_ok(&["-ac", "--bwlimit", "1G", &t.s("src"), &t.s("dst")]);
+
+    assert_eq!(transferred(&output), 0, "{output}");
+    let after = fs::metadata(t.path("dst")).unwrap();
+    assert_eq!(after.dev(), before.dev());
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(fs::metadata(t.path("alias")).unwrap().ino(), before.ino());
+    assert_eq!(after.mode() & 0o777, 0o600);
+    assert_eq!(after.mtime(), 1_600_000_001);
     assert!(partial_files(&t.0).is_empty());
 }
 
@@ -2417,7 +2506,15 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
     set_mtime(&t.path("src"), 1_600_000_000);
 
     let child = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")])
+        .args([
+            "-a",
+            "--stats",
+            "--bwlimit",
+            "1G",
+            "--no-progress",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
         .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2447,6 +2544,44 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
         stdout.contains("bytes transferred: 12,582,912"),
         "retry should send one changed 4 MiB block, not the full file: {stdout}"
     );
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn changed_source_retry_still_uses_copy_file_range() {
+    let t = Tmp::new();
+    let original = vec![b'a'; 8 * 1024 * 1024];
+    let changed = vec![b'b'; 8 * 1024 * 1024];
+    write(&t.path("src"), &original);
+    set_mtime(&t.path("src"), 1_600_000_000);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
+        .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if t.path("dst").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(t.path("dst").exists(), "first attempt never finalized");
+    write(&t.path("replacement"), &changed);
+    set_mtime(&t.path("replacement"), 1_600_000_001);
+    fs::rename(t.path("replacement"), t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(&t.path("dst")), changed);
 }
 
 // A destination given as a symlink to a directory is that directory, whether

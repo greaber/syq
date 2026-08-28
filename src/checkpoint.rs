@@ -190,7 +190,7 @@ impl Checkpoint {
                 } => {
                     if format != FORMAT {
                         bail!(
-                            "checkpoint {} has format {format}, but this syq reads format {FORMAT}",
+                            "checkpoint {} has format {format}, but this syq reads format {FORMAT}; remove it to restart (destination partials remain resumable)",
                             path.display()
                         );
                     }
@@ -473,6 +473,28 @@ mod tests {
         let cleanup = Checkpoint::open(&path, "A", false).unwrap().0;
         cleanup.close().unwrap();
         drop(cleanup);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_format_error_explains_safe_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "syq-checkpoint-unit-{}-old-format",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.jsonl");
+        fs::write(
+            &path,
+            b"{\"type\":\"header\",\"format\":1,\"job_identity\":\"old\"}\n",
+        )
+        .unwrap();
+
+        let error = Checkpoint::load(&path).err().unwrap().to_string();
+        assert!(error.contains("remove it to restart"), "{error}");
+        assert!(error.contains("partials remain resumable"), "{error}");
+
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
     }

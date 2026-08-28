@@ -7,17 +7,19 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64, Xxh3};
 
 pub const PARTIAL_MARKER: &str = ".syq-part.";
 const FD_CACHE_MAX: usize = 16;
 const COMMON_NAME_MAX: usize = 255;
 const COMPACT_HASH_BYTES: usize = 10;
+const NAME_MAX_CACHE_CAP: usize = 1024;
 
 pub fn resolve(p: &[u8]) -> PathBuf {
     if p.is_empty() {
@@ -79,23 +81,30 @@ fn name_max(parent: &Path) -> usize {
     } else {
         parent
     };
-    let Ok(parent) = cstr(parent) else {
+    let key = parent.to_path_buf();
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(limit) = cache.lock().unwrap().get(&key).copied() {
+        return limit;
+    }
+    let Ok(c_parent) = cstr(parent) else {
         return COMMON_NAME_MAX;
     };
-    let limit = unsafe { libc::pathconf(parent.as_ptr(), libc::_PC_NAME_MAX) };
-    if limit > 0 {
+    let limit = unsafe { libc::pathconf(c_parent.as_ptr(), libc::_PC_NAME_MAX) };
+    let limit = if limit > 0 {
         limit as usize
     } else {
         COMMON_NAME_MAX
+    };
+    let mut cache = cache.lock().unwrap();
+    if cache.len() >= NAME_MAX_CACHE_CAP {
+        cache.clear();
     }
+    cache.insert(key, limit);
+    limit
 }
 
-fn path_component_budget(parent: &Path, normal_len: usize) -> usize {
-    let component_limit = if normal_len <= COMMON_NAME_MAX {
-        COMMON_NAME_MAX
-    } else {
-        name_max(parent)
-    };
+fn path_component_budget(parent: &Path, component_limit: usize) -> usize {
     let parent_len = parent.as_os_str().as_bytes().len();
     let separator = usize::from(
         !parent.as_os_str().is_empty() && !parent.as_os_str().as_bytes().ends_with(b"/"),
@@ -113,6 +122,15 @@ fn path_component_budget(parent: &Path, normal_len: usize) -> usize {
 /// truncated and disambiguated; near PATH_MAX a compact combined digest keeps
 /// a little more of rsync's practical path reach.
 pub fn partial_path(final_: &Path, partial_id: &PartialId) -> Result<PathBuf> {
+    let parent = final_.parent().unwrap_or_else(|| Path::new(""));
+    partial_path_with_name_max(final_, partial_id, name_max(parent))
+}
+
+fn partial_path_with_name_max(
+    final_: &Path,
+    partial_id: &PartialId,
+    component_limit: usize,
+) -> Result<PathBuf> {
     let name = final_.file_name().map(OsStr::as_bytes).unwrap_or(b"root");
     let job_id = base32(partial_id);
     let mut normal = Vec::with_capacity(1 + name.len() + PARTIAL_MARKER.len() + job_id.len());
@@ -122,7 +140,7 @@ pub fn partial_path(final_: &Path, partial_id: &PartialId) -> Result<PathBuf> {
     normal.extend_from_slice(job_id.as_bytes());
 
     let parent = final_.parent().unwrap_or_else(|| Path::new(""));
-    let budget = path_component_budget(parent, normal.len());
+    let budget = path_component_budget(parent, component_limit);
     let component = if normal.len() <= budget {
         normal
     } else {
@@ -286,6 +304,15 @@ fn is_root() -> bool {
 pub struct FsOps {
     fds: HashMap<FdKey, File>,
     fd_order: Vec<FdKey>,
+    /// One final-file descriptor retained between the hash response and the
+    /// controller's decision to repair or accept that exact inode.
+    held_basis: Option<HeldBasis>,
+}
+
+struct HeldBasis {
+    path: PathBuf,
+    partial_id: PartialId,
+    file: File,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -312,6 +339,7 @@ impl FsOps {
         FsOps {
             fds: HashMap::new(),
             fd_order: Vec::new(),
+            held_basis: None,
         }
     }
 
@@ -486,6 +514,36 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
     })
 }
 
+/// Hash exactly `len` bytes in fixed blocks. A short reader contributes the
+/// bytes it has and empty hashes for the missing blocks, matching both source
+/// and destination behavior through one implementation.
+fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<u64>> {
+    let n = len.div_ceil(block) as usize;
+    let mut hashes = Vec::with_capacity(n);
+    let mut buf = vec![0u8; block as usize];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(block) as usize;
+        let mut got = 0;
+        while got < want {
+            let read = reader.read(&mut buf[got..want])?;
+            if read == 0 {
+                break;
+            }
+            got += read;
+        }
+        hashes.push(xxh3_64(&buf[..got]));
+        if got < want {
+            while hashes.len() < n {
+                hashes.push(xxh3_64(&[]));
+            }
+            break;
+        }
+        remaining -= want as u64;
+    }
+    Ok(hashes)
+}
+
 impl FsOps {
     pub fn probe_partial(&mut self, path: &[u8], partial_id: &PartialId) -> Result<Response> {
         let p = resolve(path);
@@ -504,7 +562,8 @@ impl FsOps {
     /// the sidecar, so make an owned regular leftover writable before reuse.
     fn open_private_partial(&mut self, pp: &Path) -> Result<(File, Option<u64>)> {
         self.uncache(pp);
-        loop {
+        let mut repaired_permissions = false;
+        for _ in 0..8 {
             match fs::symlink_metadata(pp) {
                 Ok(md) if md.is_file() && md.nlink() == 1 => {
                     match OpenOptions::new()
@@ -528,12 +587,36 @@ impl FsOps {
                         Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                         Err(error)
                             if error.kind() == io::ErrorKind::PermissionDenied
-                                && (md.uid() == unsafe { libc::geteuid() } || is_root()) =>
+                                && !repaired_permissions =>
                         {
-                            fs::set_permissions(pp, fs::Permissions::from_mode(0o600))
+                            // Open without following and chmod that descriptor,
+                            // not the pathname: a co-writer cannot redirect the
+                            // repair to a symlink target between lstat and chmod.
+                            let readonly = OpenOptions::new()
+                                .read(true)
+                                .custom_flags(libc::O_NOFOLLOW)
+                                .open(pp)
+                                .with_context(|| {
+                                    format!("open {} for permission repair", pp.display())
+                                })?;
+                            let fd_meta = readonly.metadata()?;
+                            if !fd_meta.file_type().is_file()
+                                || fd_meta.nlink() != 1
+                                || fd_meta.dev() != md.dev()
+                                || fd_meta.ino() != md.ino()
+                            {
+                                continue;
+                            }
+                            if fd_meta.uid() != unsafe { libc::geteuid() } && !is_root() {
+                                return Err(error)
+                                    .with_context(|| format!("open {}", pp.display()));
+                            }
+                            readonly
+                                .set_permissions(fs::Permissions::from_mode(0o600))
                                 .with_context(|| {
                                     format!("make partial writable {}", pp.display())
                                 })?;
+                            repaired_permissions = true;
                             continue;
                         }
                         Err(error) => {
@@ -562,6 +645,10 @@ impl FsOps {
                 Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
             }
         }
+        bail!(
+            "partial {} changed repeatedly while opening it",
+            pp.display()
+        )
     }
 
     pub fn prepare(
@@ -620,7 +707,7 @@ impl FsOps {
         Ok(())
     }
 
-    pub fn seed_and_hash(
+    pub fn hash_and_hold(
         &mut self,
         path: &[u8],
         partial_id: &PartialId,
@@ -628,48 +715,32 @@ impl FsOps {
         len: u64,
     ) -> Result<Vec<u64>> {
         let p = resolve(path);
-        let mut src =
-            File::open(&p).with_context(|| format!("open {} as repair basis", p.display()))?;
-        if !src.metadata()?.file_type().is_file() {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
+            bail!("injected retained-basis hash failure");
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&p)
+            .with_context(|| format!("open {} as repair basis", p.display()))?;
+        if !file.metadata()?.file_type().is_file() {
             bail!("destination {} is not a regular file", p.display());
         }
-        let pp = partial_path(&p, partial_id)?;
-        let (dst, _) = self.open_private_partial(&pp)?;
-        dst.set_len(0)?;
-        preallocate(&dst, len)?;
-        dst.set_len(len)?;
-
-        let n = len.div_ceil(block) as usize;
-        let mut hashes = Vec::with_capacity(n);
-        let mut buf = vec![0u8; block as usize];
-        let mut remaining = len;
-        let mut off = 0u64;
-        while remaining > 0 {
-            let want = remaining.min(block) as usize;
-            let mut got = 0;
-            while got < want {
-                let read = src.read(&mut buf[got..want])?;
-                if read == 0 {
-                    break;
-                }
-                got += read;
-            }
-            if got != 0 {
-                dst.write_all_at(&buf[..got], off)
-                    .with_context(|| format!("seed partial from {}", p.display()))?;
-            }
-            hashes.push(xxh3_64(&buf[..got]));
-            if got < want {
-                while hashes.len() < n {
-                    hashes.push(xxh3_64(&[]));
-                }
-                break;
-            }
-            off += got as u64;
-            remaining -= want as u64;
+        let hashes = hash_reader(&mut file, block, len)?;
+        self.held_basis = Some(HeldBasis {
+            path: p,
+            partial_id: *partial_id,
+            file,
+        });
+        #[cfg(debug_assertions)]
+        if let Some(ready) = std::env::var_os("SYQ_TEST_BASIS_READY_FILE") {
+            fs::write(&ready, b"ready").with_context(|| {
+                format!("write basis-ready signal {}", Path::new(&ready).display())
+            })?;
         }
         #[cfg(debug_assertions)]
-        if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_AFTER_SEED_MS") {
+        if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_BASIS_MS") {
             if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
@@ -677,14 +748,51 @@ impl FsOps {
         Ok(hashes)
     }
 
-    pub fn discard_partial(&mut self, path: &[u8], partial_id: &PartialId) -> Result<()> {
-        let pp = partial_path(&resolve(path), partial_id)?;
-        self.uncache(&pp);
-        match fs::remove_file(&pp) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| format!("remove {}", pp.display())),
+    fn take_held_basis(&mut self, path: &[u8], partial_id: &PartialId) -> Result<HeldBasis> {
+        let expected = resolve(path);
+        let held = self
+            .held_basis
+            .take()
+            .context("no retained destination basis")?;
+        if held.path != expected || held.partial_id != *partial_id {
+            bail!("retained destination basis does not match requested file");
         }
+        Ok(held)
+    }
+
+    pub fn finish_basis(
+        &mut self,
+        path: &[u8],
+        partial_id: &PartialId,
+        meta: &Meta,
+        flags: u8,
+        fsync: bool,
+    ) -> Result<()> {
+        let held = self.take_held_basis(path, partial_id)?;
+        set_meta_file(&held.file, meta, flags)
+            .with_context(|| format!("set metadata on basis {}", held.path.display()))?;
+        if fsync {
+            held.file
+                .sync_all()
+                .with_context(|| format!("fsync basis {}", held.path.display()))?;
+        }
+        Ok(())
+    }
+
+    pub fn seed_basis(&mut self, path: &[u8], partial_id: &PartialId, len: u64) -> Result<()> {
+        let mut held = self.take_held_basis(path, partial_id)?;
+        let pp = partial_path(&held.path, partial_id)?;
+        let (dst, _) = self.open_private_partial(&pp)?;
+        dst.set_len(0)?;
+        preallocate(&dst, len)?;
+        dst.set_len(len)?;
+        held.file.seek(SeekFrom::Start(0))?;
+        let mut writer = &dst;
+        writer.seek(SeekFrom::Start(0))?;
+        io::copy(&mut held.file.take(len), &mut writer)
+            .with_context(|| format!("seed partial from {}", held.path.display()))?;
+        dst.set_len(len)?;
+        Ok(())
     }
 
     /// Copy a whole file in the kernel via copy_file_range. Falls back with a
@@ -764,8 +872,8 @@ impl FsOps {
                         let _ = fs::remove_file(&target);
                     } else {
                         // The planner probed before this empty sidecar existed.
-                        // Remove it so a content-identical final-file fallback
-                        // cannot leave an orphan hidden by the quick check.
+                        // A content-identical fallback completes through its
+                        // retained basis fd and would otherwise orphan it.
                         drop(d);
                         fs::remove_file(&target)
                             .with_context(|| format!("remove {}", target.display()))?;
@@ -865,31 +973,7 @@ impl FsOps {
             p
         };
         let mut f = File::open(&p).with_context(|| format!("open {}", p.display()))?;
-        let n = len.div_ceil(block) as usize;
-        let mut out = Vec::with_capacity(n);
-        let mut buf = vec![0u8; block as usize];
-        let mut remaining = len;
-        while remaining > 0 {
-            let want = remaining.min(block) as usize;
-            let mut got = 0;
-            while got < want {
-                let r = f.read(&mut buf[got..want])?;
-                if r == 0 {
-                    break;
-                }
-                got += r;
-            }
-            out.push(xxh3_64(&buf[..got]));
-            if got < want {
-                // Short file: remaining blocks hash as empty (won't match anything real).
-                while out.len() < n {
-                    out.push(xxh3_64(&[]));
-                }
-                break;
-            }
-            remaining -= want as u64;
-        }
-        Ok(out)
+        hash_reader(&mut f, block, len)
     }
 
     pub fn read_range(
@@ -1011,17 +1095,30 @@ impl FsOps {
             } => self
                 .prepare(path, *size, *inplace, partial_id, *mode)
                 .map(|_| Response::Ok),
-            Request::SeedAndHash {
+            Request::HashAndHold {
                 path,
                 partial_id,
                 block,
                 len,
             } => self
-                .seed_and_hash(path, partial_id, *block, *len)
+                .hash_and_hold(path, partial_id, *block, *len)
                 .map(Response::Hashes),
-            Request::DiscardPartial { path, partial_id } => {
-                self.discard_partial(path, partial_id).map(|_| Response::Ok)
-            }
+            Request::FinishBasis {
+                path,
+                partial_id,
+                meta,
+                flags,
+                fsync,
+            } => self
+                .finish_basis(path, partial_id, meta, *flags, *fsync)
+                .map(|_| Response::Ok),
+            Request::SeedBasis {
+                path,
+                partial_id,
+                len,
+            } => self
+                .seed_basis(path, partial_id, *len)
+                .map(|_| Response::Ok),
             Request::CopyLocal {
                 src,
                 dst,
@@ -1320,6 +1417,17 @@ mod tests {
     }
 
     #[test]
+    fn partial_name_honors_filesystems_with_smaller_name_max() {
+        let id = [8u8; 16];
+        let final_path = PathBuf::from("dir").join("n".repeat(120));
+        let partial = partial_path_with_name_max(&final_path, &id, 143).unwrap();
+        let name = partial.file_name().unwrap();
+        assert!(name.as_bytes().len() <= 143);
+        assert!(is_partial_name(name));
+        assert!(name.to_string_lossy().ends_with(&base32(&id)));
+    }
+
+    #[test]
     fn compact_partial_name_is_recognized() {
         let name = OsStr::from_bytes(b".syq-part.aaaaaaaaaaaaaaaa");
         assert!(is_partial_name(name));
@@ -1339,5 +1447,20 @@ mod tests {
     #[test]
     fn fsync_parent_handles_a_relative_leaf() {
         fsync_parent(Path::new("state.jsonl")).unwrap();
+    }
+
+    #[test]
+    fn shared_block_hasher_handles_short_readers_consistently() {
+        let data = b"abcdefghij";
+        let hashes = hash_reader(&mut &data[..], 4, 16).unwrap();
+        assert_eq!(
+            hashes,
+            vec![
+                xxh3_64(b"abcd"),
+                xxh3_64(b"efgh"),
+                xxh3_64(b"ij"),
+                xxh3_64(b""),
+            ]
+        );
     }
 }
