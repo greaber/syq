@@ -121,7 +121,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Request::Scan {
                 root,
                 follow_root,
-                all,
                 ignore,
                 report_ignored,
             } => {
@@ -133,7 +132,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 let res = crate::scan::scan(
                     &root,
                     follow_root,
-                    all,
                     &ignore,
                     report_ignored,
                     &mut |batch| {

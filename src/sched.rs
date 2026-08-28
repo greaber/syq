@@ -117,13 +117,6 @@ impl Sched {
         self.inner.lock().unwrap().failed.contains(&idx)
     }
 
-    /// Destination paths of every file that failed this run.
-    pub fn failed_dsts(&self) -> Vec<PathBytes> {
-        let g = self.inner.lock().unwrap();
-        let jobs = self.jobs.lock().unwrap();
-        g.failed.iter().map(|&i| jobs[i].dst.clone()).collect()
-    }
-
     /// All work handed out and finished (what makes `next` return Exit).
     pub fn finished(&self) -> bool {
         let g = self.inner.lock().unwrap();

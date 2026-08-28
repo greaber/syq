@@ -8,7 +8,7 @@ use crate::progress::{commas, human, Progress, WorkerStatus};
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
 use crate::tune::{self, Gate};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -34,6 +34,7 @@ pub struct Opts {
     pub inplace: bool,
     pub same_host: bool,
     pub dry_run: bool,
+    pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
     pub partial_id: std::sync::OnceLock<PartialId>,
@@ -279,24 +280,6 @@ pub fn debug() -> bool {
     std::env::var_os("SYQ_DEBUG").is_some()
 }
 
-fn create_destination_dir(dst: &mut dyn Conn, path: &[u8]) -> Result<()> {
-    match ok(
-        dst.call(Request::Apply(vec![Op::Mkdir {
-            path: path.to_vec(),
-            mode: 0o755,
-        }]))?,
-        "mkdir",
-    )? {
-        Response::Applied(errs) => {
-            if let Some(error) = errs.into_iter().flatten().next() {
-                bail!("{error}");
-            }
-        }
-        other => bail!("unexpected response {other:?}"),
-    }
-    Ok(())
-}
-
 fn read_umask() -> u32 {
     unsafe {
         let m = libc::umask(0o022);
@@ -403,7 +386,8 @@ pub fn run(args: Args) -> Result<i32> {
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         dry_run: args.dry_run,
-        verbose: args.verbose,
+        quiet: args.quiet,
+        verbose: if args.quiet { 0 } else { args.verbose },
         umask: read_umask(),
         partial_id: std::sync::OnceLock::new(),
         ignore: args.ignore_lines.clone(),
@@ -426,7 +410,7 @@ pub fn run(args: Args) -> Result<i32> {
         show_progress,
         args.progress,
         args.width,
-        args.progress_json,
+        !args.quiet && args.progress_json,
     );
     let sched = Arc::new(Sched::new(block, min_split));
 
@@ -588,17 +572,21 @@ pub fn run(args: Args) -> Result<i32> {
     let dst_existed = dst_root_entry.is_some();
     let dst_is_dir = match &dst_root_entry {
         Some(e) if e.kind == Kind::Dir => true,
-        Some(_)
-            if srcs.len() > 1
-                || args.files_from.is_some()
-                || srcs[0].copies_contents()
-                || dst.copies_contents() =>
-        {
-            bail!("destination must be a directory for this copy")
+        Some(_) if srcs.len() > 1 => {
+            bail!("destination must be a directory when copying multiple sources")
         }
         Some(_) => false,
         None => srcs.len() > 1 || dst.copies_contents() || args.files_from.is_some(),
     };
+    if args.files_from.is_some() {
+        if let Some(e) = dst_root_entry.as_ref().filter(|e| e.kind != Kind::Dir) {
+            bail!(
+                "--files-from needs a directory destination; {} is a {:?}",
+                display(&dst_root),
+                e.kind
+            );
+        }
+    }
 
     // Reject copying a directory into itself: if the effective destination
     // resolves to (or inside) a source directory, the scanner would discover
@@ -659,15 +647,17 @@ pub fn run(args: Args) -> Result<i32> {
         &identity,
     )?;
 
-    // A multi-source plan is validated in full before its missing destination
-    // is created. Single-source copies can keep streaming immediately.
-    let create_dst_root = dst_root_entry.is_none()
+    // Create a missing directory destination — never in the read-only modes,
+    // and never under --existing. With several sources this waits until
+    // their scans have been checked against each other, so a conflicting
+    // command leaves nothing behind.
+    let create_root = dst_root_entry.is_none()
         && dst_is_dir
         && !args.dry_run
         && !args.verify_only
         && !args.existing;
-    if create_dst_root && srcs.len() == 1 {
-        create_destination_dir(&mut *dst_ctl, &dst_root)?;
+    if create_root && srcs.len() == 1 {
+        mkdir_root(&mut *dst_ctl, &dst_root)?;
     }
 
     let checkpoint_completed = checkpoint_state
@@ -695,6 +685,8 @@ pub fn run(args: Args) -> Result<i32> {
         missing_dirs: std::collections::HashSet::new(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
+        live_sidecars: std::collections::HashSet::new(),
+        unusable_files: std::collections::HashSet::new(),
         deferred_payloads: Vec::new(),
         source_partials: 0,
         collision: false,
@@ -706,6 +698,11 @@ pub fn run(args: Args) -> Result<i32> {
         max_delete_hit: false,
         buffer: if srcs.len() > 1 {
             Some(Vec::new())
+        } else {
+            None
+        },
+        create_root: if create_root && srcs.len() > 1 {
+            Some(dst_root.clone())
         } else {
             None
         },
@@ -751,36 +748,19 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     if scan_err.is_none() && !st.collision {
-        if let Err(e) = st.plan_deferred_payloads() {
+        if let Err(e) = st.finish_planning() {
             scan_err = Some(e);
         }
     }
-    if scan_err.is_none() && !st.collision {
-        if let Err(e) = st.validate_buffered() {
-            scan_err = Some(e);
-        }
-    }
-    if scan_err.is_none() && !st.collision {
-        if create_dst_root && srcs.len() > 1 {
-            if let Err(e) = create_destination_dir(st.dst, &dst_root) {
-                scan_err = Some(e);
-            }
-        }
-        if scan_err.is_none() {
-            if let Err(e) = st.replay_buffered() {
-                scan_err = Some(e);
-            }
-        }
-    }
-    if st.source_partials > 0 {
+    if st.source_partials > 0 && !args.quiet {
         let count = st.source_partials;
         progress.warning(
             "source_partials",
             count,
             &format!(
-                "source contains {count} recognizable SYQ partial path{}; ignoring {}",
+                "source contains {count} recognizable SYQ partial path{}; {} treated as ordinary payload",
                 if count == 1 { "" } else { "s" },
-                if count == 1 { "it" } else { "them" }
+                if count == 1 { "it is" } else { "they are" }
             ),
         );
     }
@@ -837,7 +817,7 @@ pub fn run(args: Args) -> Result<i32> {
             progress.eprintln("syq: source scan reported errors; skipping deletions");
         } else {
             match st.plan_deletes() {
-                Ok(()) => deleted = st.run_deletes(&sched.failed_dsts())?,
+                Ok(()) => deleted = st.run_deletes()?,
                 Err(e) => progress.error(&format!("syq: delete: {e:#}")),
             }
         }
@@ -866,7 +846,7 @@ pub fn run(args: Args) -> Result<i32> {
                 .map(|e| format!("{e:#}"))
                 .or_else(|| checkpoint.take_error())
         });
-        if let Some(e) = failed {
+        if let Some(e) = failed.filter(|_| !args.quiet) {
             eprintln!(
                 "syq: warning: checkpoint recording stopped ({e}); a retry will recheck files completed after that point"
             );
@@ -990,6 +970,24 @@ fn stat_many(
     }
 }
 
+fn mkdir_root(conn: &mut dyn Conn, dst_root: &[u8]) -> Result<()> {
+    match ok(
+        conn.call(Request::Apply(vec![Op::Mkdir {
+            path: dst_root.to_vec(),
+            mode: 0o755,
+        }]))?,
+        "mkdir",
+    )? {
+        Response::Applied(errs) => {
+            if let Some(e) = errs.into_iter().flatten().next() {
+                bail!("{e}");
+            }
+            Ok(())
+        }
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
 fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Entry>> {
     Ok(stat_many(conn, vec![path.to_vec()], follow)?
         .pop()
@@ -1008,11 +1006,11 @@ fn scan_into_planner(
     mut f: impl FnMut(&mut Planner<'_>, Vec<Entry>) -> Result<()>,
 ) -> Result<()> {
     let progress = pl.progress;
+    let quiet = pl.opts.quiet;
     let warned = std::cell::Cell::new(false);
     let res = src.scan(
         root,
         follow_root,
-        false,
         ignore,
         false,
         &mut |batch| f(pl, batch),
@@ -1021,7 +1019,9 @@ fn scan_into_planner(
             // "skipping …" is a notice (nothing the copy owes is missing);
             // anything else from the scanner means an entry was lost.
             if w.starts_with("skipping ") {
-                progress.eprintln(&format!("syq: {w}"));
+                if !quiet {
+                    progress.eprintln(&format!("syq: {w}"));
+                }
             } else {
                 warned.set(true);
                 progress.error(&format!("syq: {w}"));
@@ -1084,13 +1084,6 @@ fn path_has_partial_component(path: &[u8]) -> bool {
 /// What to checkpoint for a quick-check-identical file once metadata repair succeeds.
 type QuickCheckRecord = (PathBytes, Entry);
 
-struct DeferredPayloadBatch {
-    entries: Vec<Entry>,
-    src_root: PathBytes,
-    sub: String,
-    dst_root: PathBytes,
-}
-
 struct Planner<'a> {
     dst: &'a mut dyn Conn,
     sched: &'a Sched,
@@ -1109,9 +1102,15 @@ struct Planner<'a> {
     /// Ordinary payload names cannot collide and do not need to stay in RAM.
     payload_paths: std::collections::HashMap<PathBytes, String>,
     sidecar_paths: std::collections::HashMap<PathBytes, String>,
-    /// Payload paths inside the reserved-looking namespace are planned only
-    /// after the full collision preflight succeeds.
-    deferred_payloads: Vec<DeferredPayloadBatch>,
+    /// The keys of sidecar_paths, kept past finish_planning only for --delete.
+    live_sidecars: std::collections::HashSet<PathBytes>,
+    /// Files whose destination cannot accommodate a safe sidecar name. They
+    /// fail individually while the rest of the scan and transfer continue.
+    unusable_files: std::collections::HashSet<PathBytes>,
+    /// Payload paths inside the sidecar-looking namespace, mapped and claimed
+    /// like everything else but applied only after the collision preflight
+    /// over every source has passed (see finish_planning).
+    deferred_payloads: Vec<Mapped>,
     source_partials: u64,
     collision: bool,
     /// (dst path, meta, flags, depth) for directories, applied deepest-first at the end.
@@ -1126,6 +1125,9 @@ struct Planner<'a> {
     /// Several sources: mapped batches waiting for all scans to finish
     /// (see `Mapped`). None with a single source, where batches stream.
     buffer: Option<Vec<Mapped>>,
+    /// Several sources into a destination that doesn't exist yet: create it
+    /// only once the scans have been validated against each other.
+    create_root: Option<PathBytes>,
     /// --files-from: listed directories are created even without -r (which
     /// then only decides whether their contents are walked).
     keep_dirs: bool,
@@ -1214,8 +1216,10 @@ impl Planner<'_> {
                         sub = String::new();
                     }
                     if root.kind == Kind::Dir && !pl.opts.recursive {
-                        pl.progress
-                            .eprintln(&format!("skipping directory {}", display(src_root)));
+                        if !pl.opts.quiet {
+                            pl.progress
+                                .eprintln(&format!("skipping directory {}", display(src_root)));
+                        }
                         skip_all = true;
                         return Ok(());
                     }
@@ -1232,9 +1236,9 @@ impl Planner<'_> {
 
     /// --files-from: instead of walking the source, stat each listed path (and
     /// the directories leading to it) and feed them to the planner as if a scan
-    /// had produced them. Every ancestor must be a real directory: a symlink in
-    /// the middle of a listed path would let the copy read outside the source
-    /// root (and, mirrored on the destination, write outside it). Listed
+    /// had produced them. Implied parents are stat'ed through symlinks and must
+    /// resolve to directories; they become real directories on the destination,
+    /// so nothing is ever written through a destination symlink. Listed
     /// directories — only those, not implied parents — are walked with an
     /// explicit -r.
     fn scan_files_from(
@@ -1444,6 +1448,9 @@ impl Planner<'_> {
         if self.collision {
             return Ok(());
         }
+        // Payloads inside the sidecar-looking namespace are mapped and claimed
+        // now, like everything else, but applied only once the preflight over
+        // every source has passed.
         let mut immediate = Vec::with_capacity(batch.len());
         let mut deferred = Vec::new();
         for entry in batch {
@@ -1460,32 +1467,40 @@ impl Planner<'_> {
                 immediate.push(entry);
             }
         }
-        if !deferred.is_empty() {
-            self.deferred_payloads.push(DeferredPayloadBatch {
-                entries: deferred,
-                src_root: src_root.to_vec(),
-                sub: sub.to_string(),
-                dst_root: dst_root.to_vec(),
-            });
+        let mapped = self.map_batch(immediate, src_root, sub, dst_root);
+        match &mut self.buffer {
+            Some(buf) => buf.push(mapped),
+            None => self.apply_mapped(mapped)?,
         }
-        self.plan_batch(immediate, src_root, sub, dst_root)
+        if !deferred.is_empty() {
+            let mapped = self.map_batch(deferred, src_root, sub, dst_root);
+            self.deferred_payloads.push(mapped);
+        }
+        Ok(())
     }
 
-    fn plan_batch(
-        &mut self,
-        batch: Vec<Entry>,
-        src_root: &[u8],
-        sub: &str,
-        dst_root: &[u8],
-    ) -> Result<()> {
-        let mapped = self.map_batch(batch, src_root, sub, dst_root);
-        match &mut self.buffer {
-            Some(buf) => {
-                buf.push(mapped);
-                Ok(())
-            }
-            None => self.apply_mapped(mapped),
+    /// All sources scanned and the sidecar namespace preflight passed: apply
+    /// what was held back. With several sources that is every batch, after
+    /// the cross-source claim check; otherwise only the deferred payloads.
+    fn finish_planning(&mut self) -> Result<()> {
+        // The preflight maps are dead now — except the sidecar set, which
+        // --delete needs (only its keys) to tell a live sidecar from an
+        // orphan. On multi-million-file trees these are the difference
+        // between transient and resident gigabytes.
+        self.payload_paths = std::collections::HashMap::new();
+        let sidecars = std::mem::take(&mut self.sidecar_paths);
+        if self.opts.delete {
+            self.live_sidecars = sidecars.into_keys().collect();
         }
+        let deferred = std::mem::take(&mut self.deferred_payloads);
+        if let Some(buf) = &mut self.buffer {
+            buf.extend(deferred);
+            return self.replay_buffered();
+        }
+        for m in deferred {
+            self.apply_mapped(m)?;
+        }
+        Ok(())
     }
 
     /// The mapping loop: decide and claim everything about each entry.
@@ -1512,14 +1527,7 @@ impl Planner<'_> {
             // path, and it is what makes --delete safe — whatever happens
             // below (skip, filter, unsupported type, resumed from a journal),
             // a path the source has is never an extra.
-            let source_name = if e.path.is_empty() {
-                src_root.rsplit(|&c| c == b'/').next().unwrap_or(src_root)
-            } else {
-                e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path)
-            };
-            let partial_named = crate::fsops::is_partial_name(OsStr::from_bytes(source_name));
             let claim = match e.kind {
-                _ if partial_named => Claim::Weak,
                 Kind::Dir => Claim::Dir,
                 Kind::File => Claim::File {
                     dev: e.dev,
@@ -1537,8 +1545,8 @@ impl Planner<'_> {
             let src = join(src_root, &e.path);
             match claim {
                 Claim::Dir => dirs.push((dst, e)),
-                Claim::Weak if partial_named || e.kind == Kind::Other => {
-                    // Never transferred: syq's own leftovers, unknown types.
+                Claim::Weak if e.kind == Kind::Other => {
+                    // Unknown type: never transferred.
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                 }
                 Claim::Weak => {
@@ -1566,49 +1574,61 @@ impl Planner<'_> {
         }
     }
 
-    /// Settle claims that require a destination stat while leaving every
-    /// buffered operation unapplied.
-    fn validate_buffered(&mut self) -> Result<()> {
-        let Some(buffered) = self.buffer.as_ref() else {
+    /// Several sources: every batch has been mapped and claimed, nothing
+    /// applied. Contested claims (two sources naming one regular file) are
+    /// fine only when one of them *is* the destination file; settle those
+    /// with one stat pass, then apply everything if there was no conflict.
+    fn replay_buffered(&mut self) -> Result<()> {
+        let Some(mut buffered) = self.buffer.take() else {
             return Ok(());
         };
-        // (destination, first claimant's identity, this claimant's identity, name)
-        type Contested = (PathBytes, (u64, u64), (u64, u64), String);
-        let contested: Vec<Contested> = buffered
+        // Every claimant of each contested destination, as a group: the first
+        // (from dst_seen) plus all the contested ones. The group is fine only
+        // if at most one *distinct* file among them is not the destination
+        // file itself — otherwise two different contents want one path.
+        let mut groups: std::collections::BTreeMap<PathBytes, (String, Vec<(u64, u64)>)> =
+            std::collections::BTreeMap::new();
+        for p in buffered
             .iter()
             .flat_map(|m| m.others.iter().filter(|p| p.contested))
-            .map(|p| {
+        {
+            let g = groups.entry(p.dst.clone()).or_insert_with(|| {
                 let first = match self.dst_seen.get(&p.dst) {
-                    Some(Claim::File { dev, ino }) => (*dev, *ino),
-                    _ => (0, 0),
+                    Some(Claim::File { dev, ino }) => vec![(*dev, *ino)],
+                    _ => Vec::new(),
                 };
-                (p.dst.clone(), first, (p.e.dev, p.e.ino), p.rel.clone())
-            })
-            .collect();
-        if !contested.is_empty() {
-            let stats = self.stat_many(true, contested.iter().map(|c| c.0.clone()).collect())?;
-            for ((dst, first, second, rel), st) in contested.into_iter().zip(stats) {
-                let is_dst = |(dev, ino): (u64, u64)| {
-                    self.opts.same_host && st.as_ref().is_some_and(|d| d.dev == dev && d.ino == ino)
-                };
-                if !is_dst(first) && !is_dst(second) {
+                (p.rel.clone(), first)
+            });
+            g.1.push((p.e.dev, p.e.ino));
+        }
+        if !groups.is_empty() {
+            let stats = self.stat_many(groups.keys().cloned().collect())?;
+            for ((dst, (rel, ids)), st) in groups.into_iter().zip(stats) {
+                let dst_id = st.filter(|_| self.opts.same_host).map(|d| (d.dev, d.ino));
+                // Every claimant must be the destination file itself (a copy
+                // onto itself, written by nobody). One claimant being that
+                // file does not license another to overwrite it: the user
+                // named it as a source, and it would be lost.
+                let total = ids.len();
+                let mut distinct: Vec<(u64, u64)> =
+                    ids.into_iter().filter(|id| Some(*id) != dst_id).collect();
+                distinct.sort_unstable();
+                distinct.dedup();
+                if !distinct.is_empty() {
                     self.progress.error(&format!(
-                        "syq: {rel}: two sources map to the same destination {} — refusing to clobber it",
+                        "syq: {rel}: {total} sources map to the same destination {} — refusing to clobber it",
                         display(&dst)
                     ));
                     self.collision = true;
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Apply a multi-source plan only after every collision has been settled.
-    fn replay_buffered(&mut self) -> Result<()> {
-        let Some(mut buffered) = self.buffer.take() else {
+        if self.collision {
             return Ok(());
-        };
-        debug_assert!(!self.collision);
+        }
+        if let Some(root) = self.create_root.take() {
+            mkdir_root(self.dst, &root)?;
+        }
         // Validated: from here on they are ordinary entries (the one that is
         // the destination file skips itself; the other is written).
         for m in &mut buffered {
@@ -1639,7 +1659,7 @@ impl Planner<'_> {
         let need_stats = opts.verify_only || !opts.dry_run || opts.existing;
         if !dirs.is_empty() && (need_stats || opts.verbose > 0) {
             let stats: Vec<Option<Entry>> = if need_stats {
-                self.stat_many(true, dirs.iter().map(|(p, _)| p.clone()).collect())?
+                self.stat_many(dirs.iter().map(|(p, _)| p.clone()).collect())?
             } else {
                 vec![None; dirs.len()]
             };
@@ -1695,7 +1715,7 @@ impl Planner<'_> {
                             _ => unreachable!(),
                         })
                         .collect();
-                    let errs = self.apply(true, new_dirs)?;
+                    let errs = self.apply(new_dirs)?;
                     let mut failed = 0;
                     for (name, err) in names.iter().zip(errs) {
                         if let Some(err) = err {
@@ -1754,7 +1774,7 @@ impl Planner<'_> {
             }
             others = kept;
         }
-        let stats = self.stat_many(true, others.iter().map(|p| p.dst.clone()).collect())?;
+        let stats = self.stat_many(others.iter().map(|p| p.dst.clone()).collect())?;
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<String> = Vec::new();
         // Metadata repairs for quick-check-identical files, each with the
@@ -1777,6 +1797,10 @@ impl Planner<'_> {
             }
             match e.kind {
                 Kind::File => {
+                    if self.unusable_files.contains(&dst_path) {
+                        // register_namespace reported it; nothing can stage here.
+                        continue;
+                    }
                     // Never copy a file onto itself (same path, hardlink, or a
                     // symlinked alias) — with --inplace that would truncate the
                     // source. Only possible when both ends are the same machine.
@@ -1788,9 +1812,11 @@ impl Planner<'_> {
                             .as_ref()
                             .is_some_and(|d| d.dev == e.dev && d.ino == e.ino);
                     if same_file {
-                        self.progress.eprintln(&format!(
-                            "skipping {rel}: source and destination are the same file"
-                        ));
+                        if !opts.quiet {
+                            self.progress.eprintln(&format!(
+                                "skipping {rel}: source and destination are the same file"
+                            ));
+                        }
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         if !contested {
                             // Nothing will be written here; let another source have it.
@@ -1976,7 +2002,7 @@ impl Planner<'_> {
         }
         if !meta_fixes.is_empty() {
             let (ops, records): (Vec<Op>, Vec<_>) = meta_fixes.into_iter().unzip();
-            for (err, rec) in self.apply(true, ops)?.into_iter().zip(records) {
+            for (err, rec) in self.apply(ops)?.into_iter().zip(records) {
                 match err {
                     Some(err) => self.progress.error(&format!("syq: {err}")),
                     None => {
@@ -1989,7 +2015,7 @@ impl Planner<'_> {
             }
         }
         if !ops.is_empty() {
-            let errs = self.apply(true, ops)?;
+            let errs = self.apply(ops)?;
             // Two ops per item: creation then metadata.
             for (i, name) in op_names.iter().enumerate() {
                 let e1 = errs.get(2 * i).cloned().flatten();
@@ -2031,7 +2057,6 @@ impl Planner<'_> {
             };
             if is_partial_name(OsStr::from_bytes(source_name)) {
                 self.source_partials += 1;
-                continue;
             }
             let dst_rel = join(sub, &entry.path);
             let dst_path = join(dst_root, &dst_rel);
@@ -2060,8 +2085,18 @@ impl Planner<'_> {
             return Ok(());
         }
         let sidecars = self.partial_paths(files.iter().map(|(path, _)| path.clone()).collect())?;
-        for ((_, file_rel), sidecar) in files.into_iter().zip(sidecars) {
-            let sidecar = sidecar.map_err(anyhow::Error::msg)?;
+        for ((dst_path, file_rel), sidecar) in files.into_iter().zip(sidecars) {
+            let sidecar = match sidecar {
+                Ok(sidecar) => sidecar,
+                Err(error) => {
+                    self.progress.error(&format!(
+                        "syq: {file_rel}: cannot create a safe sidecar beside {}: {error}",
+                        display(&dst_path)
+                    ));
+                    self.unusable_files.insert(dst_path);
+                    continue;
+                }
+            };
             if let Some(payload_rel) = self.payload_paths.get(&sidecar) {
                 self.progress.error(&format!(
                     "syq: source payload {payload_rel} maps to {}, which is the reserved sidecar for {file_rel}",
@@ -2084,19 +2119,12 @@ impl Planner<'_> {
 
     fn entry_is_payload(&self, entry: &Entry) -> bool {
         match entry.kind {
-            Kind::Dir => self.opts.recursive,
+            Kind::Dir => self.opts.recursive || self.keep_dirs,
             Kind::File => true,
             Kind::Symlink => self.opts.links,
             Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => self.opts.devices,
             Kind::Other => false,
         }
-    }
-
-    fn plan_deferred_payloads(&mut self) -> Result<()> {
-        for batch in std::mem::take(&mut self.deferred_payloads) {
-            self.plan_batch(batch.entries, &batch.src_root, &batch.sub, &batch.dst_root)?;
-        }
-        Ok(())
     }
 
     /// Display name for a source entry: its destination-relative path, or the
@@ -2139,12 +2167,17 @@ impl Planner<'_> {
     /// --existing: is some directory between the destination root and `dst`
     /// one we decided not to create?
     fn under_missing_dir(&self, dst: &[u8], dst_root: &[u8]) -> bool {
-        if self.missing_dirs.is_empty() {
+        Self::under_any(&self.missing_dirs, dst, dst_root)
+    }
+
+    /// Is `dst`, or a directory between the destination root and it, in `set`?
+    fn under_any(set: &std::collections::HashSet<PathBytes>, dst: &[u8], dst_root: &[u8]) -> bool {
+        if set.is_empty() {
             return false;
         }
         // The root itself may be the missing one (e.g. a symlink to a
         // directory elsewhere, which we must neither replace nor write through).
-        if self.missing_dirs.contains(dst_root) {
+        if set.contains(dst_root) {
             return true;
         }
         let mut end = dst.len();
@@ -2152,7 +2185,7 @@ impl Planner<'_> {
             if i <= dst_root.len() {
                 break;
             }
-            if self.missing_dirs.contains(&dst[..i]) {
+            if set.contains(&dst[..i]) {
                 return true;
             }
             end = i;
@@ -2195,8 +2228,8 @@ impl Planner<'_> {
     /// anchored at the same roots, so an ignored path is out of scope on both
     /// sides and never deleted — and a directory holding one can't be deleted
     /// either, which is decided here (not by a failing rmdir) so -n and the
-    /// real run agree. SYQ's own job-scoped partials are always ignored and
-    /// protect their ancestor directories in the same way.
+    /// real run agree. Partials are recorded separately: whether one is
+    /// garbage depends on how its file fares this run.
     fn plan_deletes(&mut self) -> Result<()> {
         let mut roots = std::mem::take(&mut self.delete_roots);
         roots.sort();
@@ -2217,18 +2250,24 @@ impl Planner<'_> {
             if stat_one(self.dst, &root, false)?.is_none() {
                 continue;
             }
-            // --delete-excluded: walk without the user patterns, so paths they
-            // excluded are ordinary extras. SYQ partials remain protected.
+            // --delete-excluded: walk without the patterns, so ignored paths
+            // are ordinary unclaimed extras (and nothing is protected).
             let ignore = if self.opts.delete_excluded {
                 Vec::new()
             } else {
                 self.opts.ignore.clone()
             };
             let mut found = Deletes::default();
+            let our_id = self
+                .opts
+                .partial_id
+                .get()
+                .map(crate::fsops::partial_id_string);
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
             let seen = &self.dst_seen;
+            let live_sidecars = &self.live_sidecars;
             // Destination directories whose path the source claims as a
             // non-directory (a file we chose not to send, a symlink skipped
             // without -l, ...). The source has that path, so syq doesn't touch
@@ -2236,7 +2275,6 @@ impl Planner<'_> {
             let mut shielded: Vec<PathBytes> = Vec::new();
             let res = self.dst.scan(
                 &root,
-                false,
                 false,
                 &ignore,
                 true,
@@ -2263,15 +2301,34 @@ impl Planner<'_> {
                         }
                         let dst_rel = join(sub.as_bytes(), &e.path);
                         let rel = display(&dst_rel);
-                        if e.kind == Kind::Dir {
-                            let depth = full.iter().filter(|&&c| c == b'/').count();
-                            found
-                                .dirs
-                                .entry(depth)
-                                .or_default()
-                                .push((full, format!("{rel}/")));
+                        let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
+                        // The only sidecar-patterned files that are not extras
+                        // are this job's live ones — exactly those the
+                        // namespace preflight listed (that covers truncated and
+                        // compact names, which can't be read back reliably).
+                        // Anything else matching the pattern is an ordinary
+                        // extra: syq itself copies such names as payload now,
+                        // so a foreign-looking name proves nothing, and a
+                        // --delete run concurrent with another job would be
+                        // deleting that job's unclaimed payload anyway.
+                        if e.kind == Kind::File
+                            && crate::fsops::partial_job_id(name).is_some()
+                            && crate::fsops::partial_job_id(name)
+                                == our_id.as_ref().map(|s| s.as_bytes())
+                            && live_sidecars.contains(&full)
+                        {
+                            // Live resume state of this very command.
                         } else {
-                            found.leaves.push((full, rel, dst_rel));
+                            if e.kind == Kind::Dir {
+                                let depth = full.iter().filter(|&&c| c == b'/').count();
+                                found
+                                    .dirs
+                                    .entry(depth)
+                                    .or_default()
+                                    .push((full, format!("{rel}/")));
+                            } else {
+                                found.leaves.push((full, rel, dst_rel));
+                            }
                         }
                     }
                     Ok(())
@@ -2307,7 +2364,7 @@ impl Planner<'_> {
 
     /// Remove what plan_deletes found: leaves first, then directories deepest
     /// first. Returns the number of entries removed (or that would be, with -n).
-    fn run_deletes(&mut self, _failed: &[PathBytes]) -> Result<u64> {
+    fn run_deletes(&mut self) -> Result<u64> {
         let opts = self.opts;
         let leaves = std::mem::take(&mut self.deletes.leaves);
         let dirs = std::mem::take(&mut self.deletes.dirs);
@@ -2335,10 +2392,11 @@ impl Planner<'_> {
                         }
                         continue;
                     }
-                    // The checkpoint is allowed to bypass destination stats,
-                    // so invalidate any old completion records durably before
-                    // making their destination files disappear. If unlinking
-                    // then fails, a later recheck is conservative and safe.
+                    // A checkpoint may bypass destination stats. Persist its
+                    // tombstones before unlinking so an interrupted delete
+                    // cannot leave a stale completion record for a missing
+                    // destination. A failed unlink merely causes a safe
+                    // destination recheck on the next run.
                     if let Some(c) = &checkpoint {
                         c.record_deletions(chunk.iter().filter_map(|(_, _, dst_rel)| {
                             (!dst_rel.is_empty()).then_some(dst_rel.as_slice())
@@ -2356,7 +2414,7 @@ impl Planner<'_> {
                             }
                         })
                         .collect();
-                    let errs = me.apply(true, ops)?;
+                    let errs = me.apply(ops)?;
                     #[cfg(debug_assertions)]
                     if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_AFTER_DELETE_MS") {
                         if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
@@ -2388,7 +2446,7 @@ impl Planner<'_> {
         Ok(n)
     }
 
-    fn stat_many(&mut self, _on_dst: bool, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
+    fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
         stat_many(self.dst, paths, false)
     }
 
@@ -2412,7 +2470,7 @@ impl Planner<'_> {
         }
     }
 
-    fn apply(&mut self, _on_dst: bool, ops: Vec<Op>) -> Result<Vec<Option<String>>> {
+    fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<String>>> {
         match ok(self.dst.call(Request::Apply(ops))?, "apply")? {
             Response::Applied(v) => Ok(v),
             other => bail!("unexpected response {other:?}"),
@@ -2431,7 +2489,7 @@ impl Planner<'_> {
                     flags: *f,
                 })
                 .collect();
-            for err in self.apply(true, ops)?.into_iter().flatten() {
+            for err in self.apply(ops)?.into_iter().flatten() {
                 self.progress.error(&format!("syq: {err}"));
             }
         }
@@ -2451,6 +2509,11 @@ struct Worker {
     gate: Arc<Gate>,
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
     t: [f64; 4],
+}
+
+struct BlockDiff {
+    ranges: Vec<(u64, u64)>,
+    held_len: Option<u64>,
 }
 
 impl Worker {
@@ -2641,16 +2704,7 @@ impl Worker {
         }
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
-        let now = match ok(
-            self.src.call(Request::StatMany {
-                paths,
-                follow: false,
-            })?,
-            "stat",
-        )? {
-            Response::Stats(v) => v,
-            other => bail!("unexpected response {other:?}"),
-        };
+        let now = stat_many(&mut *self.src, paths, false)?;
         for ((idx, j), (res, now)) in batch
             .iter()
             .zip(jobs.iter())
@@ -2673,10 +2727,12 @@ impl Worker {
             };
             if changed {
                 if let (Some(e), true) = (now, j.attempts + 1 < MAX_ATTEMPTS) {
-                    self.progress.eprintln(&format!(
-                        "syq: {}: changed during transfer, retrying",
-                        j.rel
-                    ));
+                    if !self.opts.quiet {
+                        self.progress.eprintln(&format!(
+                            "syq: {}: changed during transfer, retrying",
+                            j.rel
+                        ));
+                    }
                     let published = self.published_entry(j);
                     let mut all = self.sched.jobs.lock().unwrap();
                     let job = &mut all[*idx];
@@ -2835,8 +2891,8 @@ impl Worker {
                 return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
             if final_is_file {
-                let ranges = self.diff_final_and_hold(&job)?;
-                if ranges.is_empty() && final_entry.as_ref().unwrap().size == size {
+                let (ranges, basis_len) = self.diff_final_and_hold(&job)?;
+                if ranges.is_empty() && basis_len == size {
                     let mut meta = job.entry.meta();
                     meta.mode = self.create_mode(&job);
                     ok(
@@ -2992,12 +3048,13 @@ impl Worker {
             },
             "hash destination",
         )
+        .map(|diff| diff.ranges)
     }
 
     /// Compare the source with one opened final-file inode retained by the
     /// receiver for either metadata-only completion or sidecar seeding.
-    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<Vec<(u64, u64)>> {
-        self.diff_with(
+    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<(Vec<(u64, u64)>, u64)> {
+        let diff = self.diff_with(
             job,
             Request::HashAndHold {
                 path: job.dst.clone(),
@@ -3006,7 +3063,12 @@ impl Worker {
                 len: job.entry.size,
             },
             "hash and retain destination basis",
-        )
+        )?;
+        Ok((
+            diff.ranges,
+            diff.held_len
+                .context("destination did not report its retained basis length")?,
+        ))
     }
 
     fn diff_with(
@@ -3014,7 +3076,7 @@ impl Worker {
         job: &FileJob,
         destination_request: Request,
         destination_label: &str,
-    ) -> Result<Vec<(u64, u64)>> {
+    ) -> Result<BlockDiff> {
         let block = self.opts.block;
         let size = job.entry.size;
         self.src.send(Request::HashBlocks {
@@ -3025,14 +3087,31 @@ impl Worker {
             len: size,
         })?;
         self.dst.send(destination_request)?;
-        let source = Self::hashes(ok(self.src.recv()?, "hash source")?)?;
-        let destination = Self::hashes(ok(self.dst.recv()?, destination_label)?)?;
-        Ok(Self::different_ranges(&source, &destination, block, size))
+        // Both requests are in flight. Always consume both responses before
+        // interpreting either one so an ordinary endpoint error cannot leave
+        // this reusable worker connection one response behind.
+        let source_response = self.src.recv();
+        let destination_response = self.dst.recv();
+        let source = Self::hashes(ok(source_response?, "hash source")?)?;
+        let (destination, held_len) =
+            Self::destination_hashes(ok(destination_response?, destination_label)?)?;
+        Ok(BlockDiff {
+            ranges: Self::different_ranges(&source, &destination, block, size),
+            held_len,
+        })
     }
 
     fn hashes(response: Response) -> Result<Vec<u64>> {
         match response {
             Response::Hashes(hashes) => Ok(hashes),
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+
+    fn destination_hashes(response: Response) -> Result<(Vec<u64>, Option<u64>)> {
+        match response {
+            Response::Hashes(hashes) => Ok((hashes, None)),
+            Response::HeldHashes { hashes, len } => Ok((hashes, Some(len))),
             other => bail!("unexpected response {other:?}"),
         }
     }
@@ -3223,10 +3302,12 @@ impl Worker {
         if changed {
             if job.attempts + 1 < MAX_ATTEMPTS {
                 if let Some(e) = now {
-                    self.progress.eprintln(&format!(
-                        "syq: {}: changed during transfer, retrying",
-                        job.rel
-                    ));
+                    if !self.opts.quiet {
+                        self.progress.eprintln(&format!(
+                            "syq: {}: changed during transfer, retrying",
+                            job.rel
+                        ));
+                    }
                     let published = self.published_entry(&job);
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let j = &mut jobs[idx];
@@ -3275,8 +3356,12 @@ impl Worker {
             self.dst.send(Request::FileHash {
                 path: job.dst.clone(),
             })?;
-            let a = ok(self.src.recv()?, "hash source")?;
-            let b = ok(self.dst.recv()?, "hash destination")?;
+            // Keep both reusable connections aligned even if one endpoint
+            // reports an ordinary per-file error.
+            let source_response = self.src.recv();
+            let destination_response = self.dst.recv();
+            let a = ok(source_response?, "hash source")?;
+            let b = ok(destination_response?, "hash destination")?;
             match (a, b) {
                 (
                     Response::FileHash { size: s1, hash: h1 },

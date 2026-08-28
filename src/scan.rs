@@ -1,6 +1,6 @@
 //! Parallel directory walk producing `Entry` batches in parent-before-child order.
 
-use crate::fsops::{is_partial_name, lstat_entry, path_bytes};
+use crate::fsops::{lstat_entry, path_bytes};
 use crate::proto::{Entry, PathBytes};
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -13,7 +13,7 @@ pub const BATCH: usize = 1000;
 /// Per-entry result of the parallel read_dir hook.
 #[derive(Clone, Default, Debug)]
 enum State {
-    /// lstat failed (warned about).
+    /// lstat failed and will be warned about.
     #[default]
     Failed,
     /// Ignored path: silently dropped, subtree pruned.
@@ -38,7 +38,8 @@ pub fn build_ignore(lines: &[String]) -> Result<Option<Gitignore>> {
 }
 
 /// Walk `root`, calling `sink` with batches of entries (root first, as path "").
-/// SYQ's own partial files are skipped unless `all` is true. `warn` receives non-fatal errors
+/// Every entry is reported, syq's own `.name.syq-partial` files included (the
+/// planner decides what they mean). `warn` receives non-fatal errors
 /// (unreadable directories etc.). `ignore` holds gitignore-style patterns
 /// relative to `root`; a matching directory is pruned with its whole subtree.
 /// The root itself is never ignored. With `report_ignored`, the pruned paths
@@ -47,7 +48,6 @@ pub fn build_ignore(lines: &[String]) -> Result<Option<Gitignore>> {
 pub fn scan(
     root: &Path,
     follow_root: bool,
-    all: bool,
     ignore: &[String],
     report_ignored: bool,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
@@ -79,15 +79,6 @@ pub fn scan(
         .skip_hidden(false)
         .process_read_dir(move |_depth, _path, _state, children| {
             for child in children.iter_mut().flatten() {
-                if !all && is_partial_name(&child.file_name) {
-                    child.read_children = None;
-                    child.client_state = if report_ignored {
-                        State::Ignored
-                    } else {
-                        State::Skipped
-                    };
-                    continue;
-                }
                 let full = child.path();
                 let Ok(entry) = lstat_entry(Vec::new(), &full) else {
                     child.client_state = State::Failed;

@@ -147,8 +147,6 @@ pub enum Request {
     Scan {
         root: PathBytes,
         follow_root: bool,
-        /// Include SYQ's own partial files (used by --rm).
-        all: bool,
         ignore: Vec<String>,
         report_ignored: bool,
     },
@@ -170,7 +168,8 @@ pub enum Request {
         partial_id: PartialId,
     },
     /// Create/adjust the write target for `path` with the given final size.
-    /// `mode`: create new files with this mode so no separate chmod is needed.
+    /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
+    /// private until final metadata is applied immediately before publication.
     Prepare {
         path: PathBytes,
         size: u64,
@@ -286,6 +285,10 @@ pub enum Response {
     Applied(Vec<Option<String>>),
     PartialSize(Option<u64>),
     Hashes(Vec<u64>),
+    HeldHashes {
+        hashes: Vec<u64>,
+        len: u64,
+    },
     Block {
         off: u64,
         hash: u64,
@@ -326,7 +329,7 @@ impl SizeHint for Response {
             Response::Block { data, .. } => data.len() + 64,
             Response::ScanBatch(v) => v.len() * 160 + 16,
             Response::Stats(v) => v.len() * 96 + 16,
-            Response::Hashes(v) => v.len() * 9 + 16,
+            Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 9 + 24,
             _ => 256,
         }
     }
