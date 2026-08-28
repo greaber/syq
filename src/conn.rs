@@ -38,6 +38,12 @@ pub trait Conn: Send {
     ) -> Result<()>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub identity: String,
+    pub platform: String,
+}
+
 /// Turn an `Err` response into an error, otherwise pass through.
 pub fn ok(resp: Response, what: &str) -> Result<Response> {
     match resp {
@@ -101,6 +107,7 @@ pub struct RemoteConn {
     rx: std::sync::mpsc::Receiver<std::io::Result<Response>>,
     label: String,
     dead: bool,
+    peer: Option<PeerInfo>,
 }
 
 const READ_AHEAD: usize = 4;
@@ -278,6 +285,44 @@ impl Drop for ConnectSlot {
 
 pub const CIPHERS: &str = "Ciphers=aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataAddressSource {
+    RemoteInterface,
+    SshTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TcpCandidate {
+    pub address: String,
+    pub speed_mbps: u32,
+    pub source: DataAddressSource,
+    pub reachable: bool,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TcpProbe {
+    pub port: u16,
+    pub encrypted: bool,
+    pub candidates: Vec<TcpCandidate>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RemoteDiagnostics {
+    pub peer: Option<PeerInfo>,
+    pub tcp_probe: Option<TcpProbe>,
+    pub tcp_setup_error: Option<String>,
+    pub data_connection_verified: bool,
+    pub data_connection_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataTransport {
+    Ssh,
+    EncryptedTcp,
+    PlaintextTcp,
+}
+
 #[derive(Clone, Debug)]
 pub struct RemoteSpec {
     pub user: Option<String>,
@@ -292,6 +337,8 @@ pub struct RemoteSpec {
     pub quiet: bool,
     /// Shared across clones so workers see the TCP setup done on the control connection.
     pub tcp: std::sync::Arc<std::sync::Mutex<Option<TcpInfo>>>,
+    /// User-facing facts gathered by the same connection path the transfer uses.
+    pub diagnostics: std::sync::Arc<std::sync::Mutex<RemoteDiagnostics>>,
 }
 
 impl RemoteSpec {
@@ -299,6 +346,40 @@ impl RemoteSpec {
         match &self.user {
             Some(u) => format!("{u}@{}", self.host),
             None => self.host.clone(),
+        }
+    }
+
+    pub fn diagnostics(&self) -> RemoteDiagnostics {
+        self.diagnostics.lock().unwrap().clone()
+    }
+
+    pub fn data_transport(&self) -> DataTransport {
+        match self.tcp.lock().unwrap().as_ref() {
+            Some(info) if !info.failed && info.key.is_some() => DataTransport::EncryptedTcp,
+            Some(info) if !info.failed => DataTransport::PlaintextTcp,
+            _ => DataTransport::Ssh,
+        }
+    }
+
+    pub fn remote_shell_name(&self) -> String {
+        std::path::Path::new(&self.rsh[0])
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new(&self.rsh[0]))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn record_data_connection_check(&self, result: &Result<()>) {
+        let mut diagnostics = self.diagnostics.lock().unwrap();
+        match result {
+            Ok(()) => diagnostics.data_connection_verified = true,
+            Err(error) => diagnostics.data_connection_error = Some(format!("{error:#}")),
+        }
+    }
+
+    fn record_peer(&self, conn: &RemoteConn) {
+        if let Some(peer) = &conn.peer {
+            self.diagnostics.lock().unwrap().peer = Some(peer.clone());
         }
     }
 
@@ -438,13 +519,30 @@ impl RemoteSpec {
             rx: spawn_reader(Box::new(stdout)),
             label: self.label(),
             dead: false,
+            peer: None,
         };
-        hello(conn, compress, Vec::new())
+        let conn = hello(conn, compress, Vec::new())?;
+        self.record_peer(&conn);
+        Ok(conn)
     }
 
     /// Ask the remote (over the control connection) to accept TCP data
     /// connections; records how to reach it for later `connect` calls.
     pub fn setup_tcp(&self, ctl: &mut dyn Conn, plain: bool, ports: (u16, u16)) -> Result<()> {
+        *self.tcp.lock().unwrap() = None;
+        {
+            let mut diagnostics = self.diagnostics.lock().unwrap();
+            diagnostics.tcp_probe = None;
+            diagnostics.tcp_setup_error = None;
+        }
+        let result = self.setup_tcp_inner(ctl, plain, ports);
+        if let Err(error) = &result {
+            self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
+        }
+        result
+    }
+
+    fn setup_tcp_inner(&self, ctl: &mut dyn Conn, plain: bool, ports: (u16, u16)) -> Result<()> {
         let key = if plain {
             None
         } else {
@@ -457,10 +555,20 @@ impl RemoteSpec {
             port_lo: ports.0,
             port_hi: ports.1,
         })?;
-        let (port, mut advertised) = match ok(resp, "tcp listen")? {
+        let (port, advertised) = match ok(resp, "tcp listen")? {
             Response::TcpListening { port, addrs } => (port, addrs),
             other => bail!("unexpected response {other:?}"),
         };
+        let mut candidates: Vec<TcpCandidate> = advertised
+            .into_iter()
+            .map(|(address, speed_mbps)| TcpCandidate {
+                address,
+                speed_mbps,
+                source: DataAddressSource::RemoteInterface,
+                reachable: false,
+                selected: false,
+            })
+            .collect();
         // Always also try the name we reached ssh through: a server behind
         // NAT / port forwarding advertises only its private addresses, which
         // are unreachable from outside, while its public address is exactly
@@ -468,38 +576,65 @@ impl RemoteSpec {
         // (better when reachable) but before CGNAT / Tailscale ones, which
         // are overlay paths and must not win over the direct public address.
         if let Some(h) = self.resolved_hostname() {
-            if !advertised.iter().any(|(a, _)| *a == h) {
-                let at = advertised
+            if !candidates.iter().any(|candidate| candidate.address == h) {
+                let at = candidates
                     .iter()
-                    .position(|(a, _)| a.starts_with("100."))
-                    .unwrap_or(advertised.len());
-                advertised.insert(at, (h, 0));
+                    .position(|candidate| candidate.address.starts_with("100."))
+                    .unwrap_or(candidates.len());
+                candidates.insert(
+                    at,
+                    TcpCandidate {
+                        address: h,
+                        speed_mbps: 0,
+                        source: DataAddressSource::SshTarget,
+                        reachable: false,
+                        selected: false,
+                    },
+                );
             }
         }
         // Probe which advertised addresses this client can actually reach.
-        let reachable = probe_reachable(&advertised, port);
-        if reachable.is_empty() {
-            bail!("no advertised data address is reachable");
-        }
+        probe_reachable(&mut candidates, port);
         // Multipath only across comparable-speed NICs: keep those within 2x of
         // the fastest reachable one. Mixing a fast and a slow path (a rail and
         // Tailscale, say) would drag the transfer down, so we don't.
-        let fastest = reachable.iter().map(|(_, s)| *s).max().unwrap_or(0);
-        let addrs: Vec<String> = if fastest > 0 {
-            reachable
-                .iter()
-                .filter(|(_, s)| *s * 2 >= fastest)
-                .map(|(a, _)| a.clone())
-                .collect()
-        } else {
-            vec![reachable[0].0.clone()]
-        };
+        let fastest = candidates
+            .iter()
+            .filter(|candidate| candidate.reachable)
+            .map(|candidate| candidate.speed_mbps)
+            .max()
+            .unwrap_or(0);
+        let mut selected_unknown = false;
+        for candidate in &mut candidates {
+            candidate.selected = candidate.reachable
+                && if fastest > 0 {
+                    candidate.speed_mbps.saturating_mul(2) >= fastest
+                } else if selected_unknown {
+                    false
+                } else {
+                    selected_unknown = true;
+                    true
+                };
+        }
+        self.diagnostics.lock().unwrap().tcp_probe = Some(TcpProbe {
+            port,
+            encrypted: key.is_some(),
+            candidates: candidates.clone(),
+        });
+        let addrs: Vec<String> = candidates
+            .iter()
+            .filter(|candidate| candidate.selected)
+            .map(|candidate| candidate.address.clone())
+            .collect();
+        if addrs.is_empty() {
+            bail!("no advertised data address is reachable");
+        }
         if crate::transfer::debug() {
             eprintln!(
                 "syq: {}: data paths {:?} (advertised {:?})",
                 self.label(),
                 addrs,
-                advertised
+                candidates
             );
         }
         *self.tcp.lock().unwrap() = Some(TcpInfo {
@@ -508,6 +643,8 @@ impl RemoteSpec {
             key,
             token,
             failed: false,
+            failure: None,
+            verified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         Ok(())
@@ -589,8 +726,13 @@ impl RemoteSpec {
                 rx: spawn_reader(Box::new(reader)),
                 label: format!("{} (tcp {addr_s})", self.label()),
                 dead: false,
+                peer: None,
             };
-            return hello(conn, compress, info.token.clone());
+            let conn = hello(conn, compress, info.token.clone())?;
+            info.verified
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.record_peer(&conn);
+            return Ok(conn);
         }
         Err(last)
     }
@@ -609,10 +751,11 @@ fn helper_needs_install(e: &anyhow::Error) -> bool {
 
 /// Concurrently probe which (addr, speed) entries accept a TCP connection on
 /// `port`, preserving the server's priority order. Used once per endpoint.
-fn probe_reachable(advertised: &[(String, u32)], port: u16) -> Vec<(String, u32)> {
+fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
     let (tx, rx) = std::sync::mpsc::channel();
-    for (i, (addr, speed)) in advertised.iter().cloned().enumerate() {
+    for (i, candidate) in candidates.iter().enumerate() {
         let tx = tx.clone();
+        let addr = candidate.address.clone();
         std::thread::spawn(move || {
             // Try every resolved address (a dual-stack name may return IPv6
             // first while the listener is IPv4-only): reachable if any connects.
@@ -625,17 +768,13 @@ fn probe_reachable(advertised: &[(String, u32)], port: u16) -> Vec<(String, u32)
                     })
                 })
                 .unwrap_or(false);
-            let _ = tx.send((i, addr, speed, ok));
+            let _ = tx.send((i, ok));
         });
     }
     drop(tx);
-    let mut hits: Vec<(usize, String, u32)> = rx
-        .iter()
-        .filter(|(_, _, _, ok)| *ok)
-        .map(|(i, a, s, _)| (i, a, s))
-        .collect();
-    hits.sort_by_key(|(i, _, _)| *i);
-    hits.into_iter().map(|(_, a, s)| (a, s)).collect()
+    for (i, reachable) in rx {
+        candidates[i].reachable = reachable;
+    }
 }
 
 static TCP_CONN_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
@@ -649,6 +788,10 @@ pub struct TcpInfo {
     pub token: Vec<u8>,
     /// Set once a connect attempt failed; later connections use ssh.
     pub failed: bool,
+    pub failure: Option<String>,
+    /// Shared across snapshots so diagnostics can distinguish a socket probe
+    /// from a complete authenticated syq handshake.
+    pub verified: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Round-robin cursor so successive data connections use different addresses.
     pub next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -672,8 +815,13 @@ fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteC
             token,
         })?;
         match conn.recv() {
-            Ok(Response::HelloOk { identity }) if identity == crate::identity::build() => Ok(conn),
-            Ok(Response::HelloOk { identity }) => {
+            Ok(Response::HelloOk { identity, platform })
+                if identity == crate::identity::build() =>
+            {
+                conn.peer = Some(PeerInfo { identity, platform });
+                Ok(conn)
+            }
+            Ok(Response::HelloOk { identity, .. }) => {
                 bail!(
                     "{}: build identity mismatch (remote {identity}, local {})",
                     conn.label,
@@ -808,6 +956,7 @@ impl Endpoint {
                             if let Some(i) = g.as_mut() {
                                 if !i.failed {
                                     i.failed = true;
+                                    i.failure = Some(format!("{e:#}"));
                                     if !spec.quiet || crate::transfer::debug() {
                                         eprintln!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#})", spec.label(), info.port);
                                     }
@@ -884,6 +1033,7 @@ mod tests {
             helper_install: Default::default(),
             quiet: false,
             tcp: Default::default(),
+            diagnostics: Default::default(),
         };
         let command = spec.ssh_command();
         assert!(!command

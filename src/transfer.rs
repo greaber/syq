@@ -2,7 +2,7 @@
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{parse_rsh, parse_size, Args, Location};
-use crate::conn::{ok, Conn, Endpoint, RemoteSpec};
+use crate::conn::{ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, TcpCandidate};
 use crate::fsops::{is_partial_name, join};
 use crate::progress::{commas, human, Progress, WorkerStatus};
 use crate::proto::*;
@@ -69,6 +69,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             helper_install: Default::default(),
             quiet: args.quiet,
             tcp: Default::default(),
+            diagnostics: Default::default(),
         }),
     })
 }
@@ -98,6 +99,210 @@ fn parse_ports(s: &str) -> Result<(u16, u16)> {
         bail!("bad port range {s:?}");
     }
     Ok((lo, hi))
+}
+
+fn data_address(address: &str, port: u16) -> String {
+    if address.contains(':') {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{address}:{port}")
+    }
+}
+
+fn link_speed(speed_mbps: u32) -> String {
+    if speed_mbps == 0 {
+        "link speed unknown".to_string()
+    } else if speed_mbps.is_multiple_of(1000) {
+        format!("{} Gbit/s advertised", speed_mbps / 1000)
+    } else {
+        format!("{speed_mbps} Mbit/s advertised")
+    }
+}
+
+fn candidate_status(candidate: &TcpCandidate, fastest: u32) -> String {
+    if !candidate.reachable {
+        return "not reachable".to_string();
+    }
+    let speed = link_speed(candidate.speed_mbps);
+    if candidate.selected {
+        return format!("reachable, {speed}, selected");
+    }
+    let reason = if fastest == 0 {
+        "link speeds unknown; first reachable path preferred"
+    } else if candidate.speed_mbps == 0 {
+        "a faster advertised path was available"
+    } else {
+        "less than half the fastest advertised link speed"
+    };
+    format!("reachable, {speed}, not selected ({reason})")
+}
+
+fn one_line(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
+    let diagnostics = spec.diagnostics();
+    eprintln!("syq: {}:", spec.label());
+    if let Some(peer) = &diagnostics.peer {
+        eprintln!(
+            "  control: connected via {}; remote {}",
+            spec.remote_shell_name(),
+            peer.platform
+        );
+        let helper_mode = if spec.auto_helper {
+            if *spec.helper_install.lock().unwrap() {
+                "managed; installed now"
+            } else {
+                "managed helper cache"
+            }
+        } else if spec.syq_path.is_some() {
+            "--syq-path"
+        } else {
+            "remote PATH (--no-bootstrap)"
+        };
+        eprintln!("  helper: {} ({helper_mode})", peer.identity);
+    }
+
+    if let Some(probe) = &diagnostics.tcp_probe {
+        let fastest = probe
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.reachable)
+            .map(|candidate| candidate.speed_mbps)
+            .max()
+            .unwrap_or(0);
+        for candidate in &probe.candidates {
+            let source = if candidate.source == DataAddressSource::SshTarget {
+                " (SSH target)"
+            } else {
+                ""
+            };
+            eprintln!(
+                "  TCP {}{source}: {}",
+                data_address(&candidate.address, probe.port),
+                candidate_status(candidate, fastest)
+            );
+        }
+    }
+
+    let verified = args.dry_run && diagnostics.data_connection_verified;
+    let transport = spec.data_transport();
+    match transport {
+        DataTransport::EncryptedTcp | DataTransport::PlaintextTcp => {
+            let name = if transport == DataTransport::EncryptedTcp {
+                "encrypted TCP"
+            } else {
+                "plaintext TCP"
+            };
+            if verified {
+                eprintln!("  transport: {name} verified by a dry-run data connection");
+            } else {
+                eprintln!("  transport: {name} selected");
+            }
+        }
+        DataTransport::Ssh => {
+            let tcp_failure = spec
+                .tcp
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|info| info.failure.clone())
+                .or(diagnostics.tcp_setup_error.clone());
+            if args.no_tcp {
+                if verified {
+                    eprintln!("  transport: SSH data connection verified (--no-tcp)");
+                } else {
+                    eprintln!("  transport: SSH (--no-tcp)");
+                }
+            } else if let Some(error) = tcp_failure {
+                if verified {
+                    eprintln!(
+                        "  transport: SSH fallback verified by a dry-run data connection (TCP unavailable: {})",
+                        one_line(&error)
+                    );
+                } else {
+                    eprintln!(
+                        "  transport: SSH fallback (TCP unavailable: {})",
+                        one_line(&error)
+                    );
+                }
+            } else if verified {
+                eprintln!("  transport: SSH data connection verified");
+            } else {
+                eprintln!("  transport: SSH selected");
+            }
+        }
+    }
+    if let Some(error) = &diagnostics.data_connection_error {
+        eprintln!("  dry-run data connection: failed ({})", one_line(error));
+    }
+}
+
+fn print_transport_diagnostics(args: &Args, src: &Endpoint, dst: &Endpoint) {
+    if args.quiet || args.verbose < 2 {
+        return;
+    }
+    for endpoint in [src, dst] {
+        if let Endpoint::Remote(spec) = endpoint {
+            print_remote_diagnostics(spec, args);
+        }
+    }
+    let remote = src.is_remote() || dst.is_remote();
+    let unit = match (remote, args.connections) {
+        (true, 1) => "connection",
+        (true, _) => "connections",
+        (false, 1) => "worker",
+        (false, _) => "workers",
+    };
+    let policy = if args.connections_default {
+        "auto-tuned"
+    } else {
+        "fixed"
+    };
+    if !remote {
+        eprintln!("syq: transport: local filesystem");
+    }
+    if args.dry_run {
+        eprintln!(
+            "syq: concurrency: a real transfer would start with {} {unit} ({policy}); dry-run starts no workers",
+            args.connections
+        );
+    } else {
+        eprintln!(
+            "syq: concurrency: starting with {} {unit} ({policy})",
+            args.connections
+        );
+    }
+}
+
+fn verify_dry_run_data_connections(
+    args: &Args,
+    src: &Endpoint,
+    dst: &Endpoint,
+) -> Option<anyhow::Error> {
+    if !args.dry_run || args.quiet || args.verbose < 2 {
+        return None;
+    }
+    let mut first_error = None;
+    for endpoint in [src, dst] {
+        let Endpoint::Remote(spec) = endpoint else {
+            continue;
+        };
+        let result = endpoint
+            .connect(args.compress)
+            .map(drop)
+            .with_context(|| format!("verify data connection to {} during dry-run", spec.label()));
+        spec.record_data_connection_check(&result);
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error
 }
 
 /// The canonical form of a path (symlinks and `..` resolved the way the kernel
@@ -550,14 +755,30 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
+    // Dry-run normally needs only the control connections. At -vv it also
+    // authenticates one disposable data connection per remote endpoint so the
+    // transport report can distinguish a reachable socket from a working syq
+    // data path. No filesystem request is sent over this connection.
+    let dry_run_connection_error = verify_dry_run_data_connections(&args, &src_ep, &dst_ep);
     let all_remote_endpoints_use_tcp = use_tcp
         && [&src_ep, &dst_ep].into_iter().all(|ep| match ep {
             Endpoint::Local => true,
-            Endpoint::Remote(spec) => spec.tcp.lock().unwrap().is_some(),
+            Endpoint::Remote(spec) => spec
+                .tcp
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|info| !info.failed),
         });
     if autotune && all_remote_endpoints_use_tcp {
         args.connections = tune::START_TCP;
         gate.set_limit(args.connections);
+    }
+    print_transport_diagnostics(&args, &src_ep, &dst_ep);
+    if let Some(error) = dry_run_connection_error {
+        sched.abort();
+        progress.stop();
+        return Err(error);
     }
     if !opts.dry_run {
         spawn_workers(args.connections);

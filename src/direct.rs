@@ -49,6 +49,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         helper_install: Default::default(),
         quiet: args.quiet,
         tcp: Default::default(),
+        diagnostics: Default::default(),
     };
 
     // Rebuild the option list for the remote orchestrator.

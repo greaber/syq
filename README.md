@@ -138,7 +138,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--self-update` | Install the newest signed release (standalone installer builds only) |
 | `-a`, `--archive` | Same as `-rlptgoD` |
 | `-r` `-l` `-p` `-t` `-g` `-o` `-D` | Recursive; symlinks as symlinks; perms; mtimes; group; owner; devices and specials |
-| `-v` | List files as they complete (also new dirs, symlinks) |
+| `-v`, `-vv` | `-v` lists files as they complete; for copies, `-vv` also explains remote helpers, candidate TCP addresses, the selected transport, and initial concurrency |
 | `-q` | Errors only |
 | `-z`, `--compress` | zstd-compress data in transit (inside syq's protocol, not `ssh -C`) |
 | `-n`, `--dry-run` | Scan and report; change nothing |
@@ -566,6 +566,20 @@ link. Single-homed hosts and laptops use the one best path, unchanged. With ufw:
 sudo ufw allow from 192.0.2.0/24  to any port 47600:47699 proto tcp   # example LAN
 sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specific client
 ```
+
+Use `-vv` to see the decision made for the real transfer. For each remote it
+reports the authenticated helper identity and platform, every TCP address syq
+considered, reachability and advertised link speed, why a reachable address
+was or was not selected, the resulting TCP/ssh transport, and the initial
+connection count. `-v` alone keeps its existing file-listing behavior.
+
+With `-vv --dry-run`, syq opens and authenticates one disposable data
+connection to each remote after the ordinary control and reachability checks.
+It sends no filesystem request on that connection and closes it immediately.
+The report therefore distinguishes a TCP socket that merely answered from a
+complete syq data handshake, while making clear that dry-run starts no transfer
+workers and creates, updates, or removes no destination paths. If TCP cannot be
+used, the same check verifies the ssh data fallback.
 
 Remote→remote (`syq hostA:src hostB:dst`) works the same way: the
 orchestrator on hostA connects to hostB's listener.

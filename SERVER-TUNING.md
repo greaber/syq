@@ -18,15 +18,17 @@ exercise the network and storage bandwidth; a tree of small files exercises
 latency and metadata performance.
 
 ```sh
-syq -a --stats SOURCE HOST:DESTINATION
+syq -avv --stats SOURCE HOST:DESTINATION
 SYQ_DEBUG=1 syq -a --stats SOURCE HOST:DESTINATION
 ```
 
-`--stats` reports the connection count syq chose. `SYQ_DEBUG=1` also reports
-connection setup time, whether TCP data paths were usable, and where workers
-spent their time. Check CPU, disk, and network utilization on both endpoints
-at the same time. More network tuning cannot fix a saturated disk, one busy CPU
-core, or a slow destination filesystem.
+`-vv` reports the remote helper and platform, candidate TCP addresses, the
+selected data transport, and the initial connection count; `--stats` reports
+where automatic connection tuning settled. `SYQ_DEBUG=1` adds engineering
+timings showing connection setup and where workers spent their time. Check CPU,
+disk, and network utilization on both endpoints at the same time. More network
+tuning cannot fix a saturated disk, one busy CPU core, or a slow destination
+filesystem.
 
 Change one thing at a time and repeat the same transfer. Record the original
 value, the reason for the change, and the before/after result. If the result is

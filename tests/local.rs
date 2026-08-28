@@ -343,7 +343,7 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
 
     write(&t.path("src"), b"first");
     let remote = format!("fake:{}", t.s("dst"));
-    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
     assert!(cached_remote_helper(&t).is_file());
@@ -352,6 +352,14 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
     assert_eq!(read(&t.path("local-curl.log")), b"fetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!(
+            "helper: {} (managed; installed now)",
+            binary_identity("--build-identity")
+        )),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let probes = fs::read_to_string(t.path("rsh.log"))
         .unwrap()
         .matches("syq-helper-target:")
@@ -360,11 +368,19 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
 
     // A cache hit goes straight to the helper: no platform probe or download.
     write(&t.path("src"), b"second");
-    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"second");
     assert_eq!(read(&t.path("local-curl.log")), b"fetch\n");
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!(
+            "helper: {} (managed helper cache)",
+            binary_identity("--build-identity")
+        )),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let probes = fs::read_to_string(t.path("rsh.log"))
         .unwrap()
         .matches("syq-helper-target:")
@@ -438,6 +454,136 @@ fn remote_retained_basis_handles_matching_and_changed_files() {
 }
 
 #[test]
+fn double_verbose_dry_run_verifies_tcp_without_writing() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"diagnose");
+    let remote = format!("127.0.0.1:{}", t.s("dst"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--dry-run", "-vv", "-a"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("run double-verbose dry-run over TCP");
+
+    assert_output_ok(&out);
+    assert!(!t.path("dst").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("control: connected via fake-rsh; remote linux-"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "helper: {} (--syq-path)",
+            binary_identity("--build-identity")
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("TCP ") && stderr.contains(": reachable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("transport: encrypted TCP verified by a dry-run data connection"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "a real transfer would start with 16 connections (auto-tuned); dry-run starts no workers"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn double_verbose_dry_run_explains_ssh_fallback() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    executable(
+        &t.path("remote-bin/ip"),
+        b"#!/bin/sh\nprintf '2: eth9 inet 192.0.2.1/24 scope global eth9\\n'\n",
+    );
+    write(&t.path("src"), b"fallback");
+    let remote = format!("diagnostic.invalid:{}", t.s("dst"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--dry-run", "-vv", "-a"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("run double-verbose dry-run with TCP fallback");
+
+    assert_output_ok(&out);
+    assert!(!t.path("dst").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("TCP 192.0.2.1:") && stderr.contains("not reachable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("transport: SSH fallback verified by a dry-run data connection"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "a real transfer would start with 8 connections (auto-tuned); dry-run starts no workers"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn single_verbose_keeps_file_listing_semantics() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"listed");
+    let remote = format!("fake:{}", t.s("dst"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--no-tcp", "-v", "-a", "-j", "1"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("run single-verbose remote copy");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"listed");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("src"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("  control:"), "{stderr}");
+    assert!(!stderr.contains("syq: concurrency:"), "{stderr}");
+}
+
+#[test]
 fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
@@ -449,7 +595,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         .arg(&rsh)
         .arg("--syq-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--tcp-plain", "--stats", "-a"])
+        .args(["--tcp-plain", "--stats", "-avv"])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -466,6 +612,15 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     assert!(
         stdout.contains("connections: auto: settled at 16 (path 16, peak 16)"),
         "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("transport: plaintext TCP selected"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("concurrency: starting with 16 connections (auto-tuned)"),
+        "{stderr}"
     );
 }
 
