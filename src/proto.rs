@@ -10,6 +10,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 const COMPRESS_MIN: usize = 512;
+const COMPRESS_LEVEL: i32 = 1;
 
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
@@ -354,7 +355,7 @@ impl<W: Write> FrameWriter<W> {
         let mut flag = 0u8;
         let mut body = payload;
         if self.compress && body.len() > COMPRESS_MIN {
-            if let Ok(c) = zstd::bulk::compress(&body, 3) {
+            if let Ok(c) = zstd::bulk::compress(&body, COMPRESS_LEVEL) {
                 if c.len() < body.len() {
                     body = c;
                     flag = 1;
@@ -414,5 +415,61 @@ impl<R: Read> FrameReader<R> {
             body
         };
         postcard::from_bytes(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_frame(data: Vec<u8>, compress: bool) -> Vec<u8> {
+        let mut frame = Vec::new();
+        FrameWriter::new(&mut frame, compress)
+            .write_msg(&Response::Block {
+                off: 7,
+                hash: 11,
+                data,
+            })
+            .unwrap();
+        frame
+    }
+
+    #[test]
+    fn compression_is_per_frame_and_never_expands_the_wire_payload() {
+        let data = vec![b'a'; 64 * 1024];
+        let compressed = block_frame(data.clone(), true);
+        assert_eq!(compressed[4], 1, "compressible frame was not compressed");
+
+        let decoded = FrameReader::new(compressed.as_slice())
+            .read_msg::<Response>()
+            .unwrap();
+        match decoded {
+            Response::Block {
+                off,
+                hash,
+                data: decoded,
+            } => {
+                assert_eq!((off, hash), (7, 11));
+                assert_eq!(decoded, data);
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+
+        let disabled = block_frame(data, false);
+        assert_eq!(disabled[4], 0, "disabled compression changed the frame");
+
+        let mut random = vec![0u8; 64 * 1024];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for byte in &mut random {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        let incompressible = block_frame(random, true);
+        assert_eq!(
+            incompressible[4], 0,
+            "an expanded compressed representation was selected"
+        );
     }
 }

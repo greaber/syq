@@ -5061,6 +5061,31 @@ fn direct_remote_to_remote_passes_through_defined_exit_codes() {
     );
 }
 
+#[test]
+fn direct_remote_to_remote_forwards_compression_opt_out() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    write(&t.path("src"), b"payload");
+    let src = format!("fake:{}", t.s("src"));
+    let dst = format!("fake:{}", t.s("dst"));
+
+    let out = remote_syq(
+        &t,
+        &rsh,
+        &["-a", "--no-bootstrap", "--no-compress", &src, &dst],
+    );
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"payload");
+    assert!(
+        fs::read_to_string(t.path("rsh.log"))
+            .unwrap()
+            .contains("--no-compress"),
+        "the source-side orchestrator silently reverted to default compression"
+    );
+}
+
 // ----------------------------------------------------------- review round 13
 
 #[test]

@@ -116,12 +116,12 @@ syq [OPTIONS] SRC... [USER@]HOST:DEST
 ```
 
 ```sh
-syq -avz project/ server:backup/project/      # push
-syq -avz server:data/ ./data/                 # pull
+syq -av project/ server:backup/project/       # push
+syq -av server:data/ ./data/                  # pull
 syq -a /mnt/nfs/tree /local/tree              # local → local (parallel scan and copy)
 syq -a hostA:big/ hostB:big/                  # remote → remote: runs on hostA, data goes A → B directly
 syq -a --relay hostA:big/ hostB:big/          # ...or relay through this machine if A can't reach B
-syq -avz -j 16 bigdir server:dest             # 16 parallel connections
+syq -av -j 16 bigdir server:dest              # 16 parallel connections
 syq -a --bwlimit 50M src server:dst            # cap all connections at 50 MiB/s total
 syq -a -e 'ssh -p 2222 -i ~/.ssh/other' src host:dst
 syq -a --dry-run -v src host:dst              # show what would be copied
@@ -140,7 +140,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `-r` `-l` `-p` `-t` `-g` `-o` `-D` | Recursive; symlinks as symlinks; perms; mtimes; group; owner; devices and specials |
 | `-v` | List files as they complete (also new dirs, symlinks) |
 | `-q` | Errors only |
-| `-z`, `--compress` | zstd-compress data in transit (inside syq's protocol, not `ssh -C`) |
+| `-z`, `--compress` / `--no-compress` | Enable (the default) or disable zstd compression in syq's protocol; this is not `ssh -C` |
 | `-n`, `--dry-run` | Scan and report; change nothing |
 | `-j N`, `--connections N` | Parallel data connections (default: auto-tuned, see below) |
 | `--bwlimit RATE` | Limit aggregate file-data throughput (bare rate is KiB/s; `0` disables) |
@@ -188,8 +188,15 @@ stderr and reflected in the exit status.
 per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
 `M`, `G`, and `MiB` use powers of 1024, a final `+1` or `-1` adjusts the scaled
 value by one byte, and `0` means unlimited. SYQ counts uncompressed file bytes;
-protocol overhead is not counted, and `-z` may make the actual network rate
-lower. Scanning, hashing, and metadata operations are not limited.
+protocol overhead is not counted, and transport compression may make the actual
+network rate lower. Scanning, hashing, and metadata operations are not limited.
+
+Remote transfers use fast zstd level-1 compression by default. Each protocol
+frame is sent compressed only when that representation is smaller, so archives,
+media, and encrypted data do not expand on the wire. They still cost a fast
+compression attempt; use `--no-compress` when CPU is scarcer than network
+bandwidth, particularly on a very fast LAN. Compression is transport-only and
+does not change file contents, hashes, resume offsets, or `--bwlimit` accounting.
 
 ### Remote-to-remote
 
