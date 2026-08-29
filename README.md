@@ -623,10 +623,15 @@ have is removed. The rules are simpler than rsync's, deliberately:
   dst/` cleans `dst/a` and `dst/b`, never `dst/c`. A single-file source deletes
   nothing.
 - **Ignored means out of scope, on both sides.** The `-i` patterns are applied
-  to the destination walk from the same roots, so an ignored path is neither
+  to the destination walk from the same roots, so an ignored entry is neither
   copied nor deleted, and a directory that holds one is kept (`not deleting
-  keep/: it holds ignored paths`, on stderr, not an error). `--delete-excluded`
-  drops that protection: ignored paths on the destination are extras too.
+  keep/: it holds ignored paths`, on stderr, not an error). Patterns are
+  matched against each side's actual entry, with gitignore's one type
+  distinction: `cache/` matches only directories, so it protects a destination
+  directory named `cache` but not a destination *file* of that name, which is
+  an ordinary extra (rsync behaves the same). Write `cache` without the slash
+  to cover both. `--delete-excluded` drops that protection: ignored paths on
+  the destination are extras too.
 - **Anything the source has is safe.** A file skipped by `-u`, `--existing`,
   `--ignore-existing`, `--max-size` or `--min-size` — or a symlink or special
   file skipped for lack of `-l`/`-D` — still exists in the source, so its
