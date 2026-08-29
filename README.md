@@ -161,7 +161,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `-v`, `-vv` | `-v` lists files as they complete; for copies, `-vv` also explains remote helpers, candidate TCP addresses, the planned transport, and initial concurrency |
 | `-q` | Errors only |
 | `-z`, `--compress` / `--no-compress` | Enable (the default) or disable zstd compression in syq's protocol; this is not `ssh -C` |
-| `-n`, `--dry-run` | Scan and report; change nothing |
+| `-n`, `--dry-run` | Resolve mappings and transport, estimate transfers/exclusions/deletions; change nothing |
 | `-j N`, `--connections N` | Parallel data connections (default: auto-tuned, see below) |
 | `--bwlimit RATE` | Limit aggregate file-data throughput (bare rate is KiB/s; `0` disables) |
 | `--block-size SIZE` | Transfer and hash block size (default 4M) |
@@ -259,6 +259,10 @@ Identical to rsync:
 
 - `syq -a src dest` copies the directory itself → `dest/src`. `dest` is
   created if missing.
+- An existing non-directory `dest` cannot be the parent of that `dest/src`
+  mapping; dry-run rejects it instead of presenting an impossible summary.
+  With `--existing`, both dry-run and the real command skip the whole mapping
+  as a no-op because creating `dest/src` is outside the selected scope.
 - `syq -a src/ dest` copies the *contents* of `src` into `dest`. `src/.` and
   `.` behave the same way.
 - A single file source goes to `dest/file` if `dest` is an existing directory,
@@ -282,6 +286,51 @@ Identical to rsync:
 - `host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
   A colon before the first slash means remote; `./x:y` is local. All sources
   must be on the same host. `host::module` (daemon syntax) is not supported.
+
+### Previewing a copy
+
+`-n` / `--dry-run` connects to the endpoints and scans both sides, but creates,
+updates, and deletes nothing. Its concise preflight summary makes path
+placement, intended changes, logical work, and the selected data route explicit
+before a real copy:
+
+```text
+syq: dry-run summary
+  mapping: ./dataset/ -> gpu01:/scratch/run42 (directory contents)
+  changes: 82,411 regular files; 96 directories; 14 symlinks; 3 metadata-only entries; 2 type replacements among them
+  deletions: 7 entries planned after a successful copy
+  logical data: 1.70 TiB in 82,411 files needing content work (upper bound); 340 GiB in 18,204 files with unchanged content
+  exclusions: 3 paths/subtrees pruned by ignore rules; 12 other entries
+  route: encrypted TCP to gpu01; 16 initial connections (auto-tuned)
+```
+
+Each source gets its own `mapping` line. The annotation distinguishes directory
+contents, a directory copied as a child, a file placed inside a directory, and
+an exact destination path. `--files-from` is identified as a selected-path
+mapping. A destination-root symlink is shown as the effective directory it
+resolves to. The `changes` line separately accounts for regular files,
+directories, symlinks, special files, and metadata-only updates; type
+replacements are called out as an overlapping subset. This is a current
+preflight assessment, not a frozen mutation ledger that can later be executed
+unchanged. When a destination leaf will be replaced by a directory, descendants
+are assessed against that post-replacement directory rather than through the
+old leaf (including an old symlink).
+
+The logical-data upper bound is the full size of regular files that fail the
+planning-time metadata check. Resume state, block reuse, reflinks, compression,
+server-side copying, or a content comparison can make the real I/O or wire-byte
+count smaller. An ignored directory is pruned without scanning its descendants,
+so the exclusions line counts that directory as one `path/subtree`; it does not
+invent a descendant count. Other exclusions cover state and size options and
+unsupported entry types. With `--delete`, the destination is walked and the
+exact deletion count is shown; scan errors and `--max-delete` guards are shown
+as skipped or blocked rather than as a misleading zero.
+
+Add `-v` for a typed explanation of each intended change, for example `create
+file PATH (destination missing)`, `replace with symlink PATH -> TARGET
+(destination is regular file)`, `update metadata PATH (requested file metadata
+differs)`, or `delete PATH (destination only)`. The default stays compact for
+large trees.
 
 ### What `-a` does here
 
@@ -652,7 +701,7 @@ it is transferred or even scanned — which is why "only `*.jpg`" needs the
 `!*/` line to keep descending. Empty directories are copied like any other
 (this is a filter on the walk, not git's notion of what's tracked). The source
 root itself is never ignored; with several sources each is filtered from its
-own root. `-n` previews exactly what a real run would send. `--rm` does not
+own root. `-n` previews the selected scope and intended changes. `--rm` does not
 take filters (it always removes the whole tree), so `-i` conflicts with it.
 
 As in git, a `!` rule cannot re-include something whose parent directory is
@@ -709,8 +758,9 @@ have is removed. The rules are simpler than rsync's, deliberately:
   removed by `--delete`, inert otherwise.
 - `--max-delete N` refuses to delete anything — not the first N — when more
   than N deletions are planned, says so, and exits 25 (rsync's code for it).
-- `-n --delete -v` lists every `deleting path` line a real run would print.
-  The summary reports `N deleted` / `N would be deleted`. `--delete`
+- `-n --delete -v` lists every intended removal as `delete path (destination
+  only)`. The preflight summary reports the number planned; a real run reports
+  the number deleted. `--delete`
   conflicts with `--verify-only` (deleting is the opposite of writing
   nothing) and with `--files-from` (deletion scope under a file list is
   ambiguous).

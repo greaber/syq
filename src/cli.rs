@@ -63,7 +63,8 @@ pub struct Args {
     /// Disable transport compression
     #[arg(long, overrides_with = "compress")]
     pub no_compress: bool,
-    /// Show what would be transferred without doing it
+    /// Resolve mappings and transport, then estimate transfers, exclusions, and deletions;
+    /// change nothing
     #[arg(short = 'n', long)]
     pub dry_run: bool,
     /// No-op accepted for rsync compatibility (sizes are always human-readable)
@@ -170,6 +171,9 @@ pub struct Args {
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
     pub width: Option<usize>,
+    /// Original source endpoint for a remotely orchestrated dry-run summary
+    #[arg(long, hide = true)]
+    pub plan_source_host: Option<String>,
 
     /// Skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
     /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together
