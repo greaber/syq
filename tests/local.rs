@@ -2,6 +2,8 @@
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -150,7 +152,11 @@ fn fake_rsh(t: &Tmp) -> PathBuf {
         br#"#!/bin/sh
 shift
 HOME="$FAKE_REMOTE_HOME"
-PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
+if [ -n "${FAKE_REMOTE_PATH:-}" ]; then
+    PATH="$FAKE_REMOTE_PATH"
+else
+    PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
+fi
 export HOME PATH
 printf '%s\n' "$1" >> "$FAKE_RSH_LOG"
 exec /bin/sh -c "$1"
@@ -159,20 +165,23 @@ exec /bin/sh -c "$1"
     path
 }
 
-fn remote_syq(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
+fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
     cmd.args(["-e", rsh.to_str().unwrap(), "--no-tcp", "-j", "1"])
         .args(args)
         .arg("--no-progress")
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_RELEASE_ARCHIVE", t.path("release.gz"))
+        .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("release.gz"))
         .env("FAKE_CURL_LOG", t.path("curl.log"))
-        .env("FAKE_LOCAL_CURL_LOG", t.path("local-curl.log"))
-        .env("FAKE_RELEASE_MANIFEST", t.path("release-manifest.json"))
+        .env(
+            "FAKE_REMOTE_RELEASE_MANIFEST",
+            t.path("release-manifest.json"),
+        )
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("FAKE_LEGACY_LOG", t.path("legacy.log"))
-        .env("XDG_CONFIG_HOME", t.path("config"));
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"));
     if let Ok(key) = fs::read_to_string(t.path("release-public-key")) {
         cmd.env("SYQ_TEST_RELEASE_PUBLIC_KEY", key.trim())
             .env("SYQ_TEST_RELEASE_BUILD", "1")
@@ -180,9 +189,15 @@ fn remote_syq(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
                 "SYQ_TEST_RELEASE_DOWNLOADS",
                 "https://release.invalid/download",
             )
-            .env("PATH", format!("{}:/usr/bin:/bin", t.s("local-bin")));
+            .env("SYQ_TEST_FIXTURES", &t.0);
     }
-    cmd.output().expect("run syq through fake remote shell")
+    cmd
+}
+
+fn remote_syq(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
+    remote_syq_command(t, rsh, args)
+        .output()
+        .expect("run syq through fake remote shell")
 }
 
 fn assert_output_ok(out: &Output) {
@@ -204,6 +219,18 @@ fn cached_remote_helper(t: &Tmp) -> PathBuf {
     };
     t.path(&format!(
         "remote-home/.cache/syq/helpers/{identity}-release-v1/{target}/syq"
+    ))
+}
+
+fn cached_local_helper(t: &Tmp) -> PathBuf {
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "linux-x86_64",
+        "aarch64" => "linux-aarch64",
+        arch => panic!("unsupported test architecture {arch}"),
+    };
+    t.path(&format!(
+        "cache/syq/helpers/v{}/{target}/syq",
+        env!("CARGO_PKG_VERSION")
     ))
 }
 
@@ -236,6 +263,107 @@ fn legacy_cached_remote_helpers(t: &Tmp) -> [PathBuf; 2] {
 }
 
 #[cfg(target_os = "linux")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn setup_release_bootstrap(t: &Tmp) {
+    let binary_bytes = fs::read(env!("CARGO_BIN_EXE_syq")).unwrap();
+    let mut encoder = GzEncoder::new(
+        File::create(t.path("release.gz")).unwrap(),
+        Compression::best(),
+    );
+    encoder.write_all(&binary_bytes).unwrap();
+    encoder.finish().unwrap();
+    let archive_bytes = fs::read(t.path("release.gz")).unwrap();
+    let (target, asset) = match std::env::consts::ARCH {
+        "x86_64" => ("linux-x86_64", "syq-linux-x86_64"),
+        "aarch64" => ("linux-aarch64", "syq-linux-aarch64"),
+        arch => panic!("unsupported test architecture {arch}"),
+    };
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "repository": "https://github.com/greaber/syq",
+        "version": env!("CARGO_PKG_VERSION"),
+        "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+        "helper_id": format!("v{}-p0", env!("CARGO_PKG_VERSION")),
+        "artifacts": {
+            (target): {
+                "binary": {
+                    "name": asset,
+                    "sha256": sha256_hex(&binary_bytes),
+                    "size": binary_bytes.len()
+                },
+                "archive": {
+                    "name": format!("{asset}.gz"),
+                    "sha256": sha256_hex(&archive_bytes),
+                    "size": archive_bytes.len()
+                }
+            }
+        },
+        "installer": {"name": "install.sh", "sha256": "1".repeat(64), "size": 1},
+        "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
+        "signature_scheme": "ed25519-jcs-v1"
+    });
+    let signing = SigningKey::from_bytes(&[19; 32]);
+    let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
+    let signature =
+        base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
+    let mut manifest = manifest;
+    manifest["signature"] = signature.into();
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    write(&t.path("syq-release-manifest.json"), &manifest_bytes);
+    write(&t.path("release-manifest.json"), &manifest_bytes);
+    write(
+        &t.path("release-public-key"),
+        base64::engine::general_purpose::STANDARD
+            .encode(signing.verifying_key().to_bytes())
+            .as_bytes(),
+    );
+    fs::copy(t.path("release.gz"), t.path(&format!("{asset}.gz"))).unwrap();
+
+    executable(
+        &t.path("remote-bin/curl"),
+        br#"#!/bin/sh
+printf 'fetch\n' >> "$FAKE_CURL_LOG"
+out=
+url=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output) out=$2; shift 2 ;;
+        *) url=$1; shift ;;
+    esac
+done
+case "$url" in
+    *.json) cp "$FAKE_REMOTE_RELEASE_MANIFEST" "$out" ;;
+    *.gz) cp "$FAKE_REMOTE_RELEASE_ARCHIVE" "$out" ;;
+    *) exit 22 ;;
+esac
+"#,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn add_remote_tool(t: &Tmp, name: &str) {
+    let destination = t.path(&format!("remote-bin/{name}"));
+    if destination.exists() {
+        return;
+    }
+    let source = [
+        Path::new("/usr/bin").join(name),
+        Path::new("/bin").join(name),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+    .unwrap_or_else(|| panic!("test host has no {name}"));
+    std::os::unix::fs::symlink(source, destination).unwrap();
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn release_keyed_remote_helper_ignores_legacy_protocol_caches() {
     let t = Tmp::new();
@@ -250,96 +378,7 @@ exit 99
 "#,
         );
     }
-    let archive = File::create(t.path("release.gz")).unwrap();
-    let status = Command::new("gzip")
-        .args(["-9", "-n", "-c", env!("CARGO_BIN_EXE_syq")])
-        .stdout(Stdio::from(archive))
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let sum = Command::new("sha256sum")
-        .arg(t.path("release.gz"))
-        .output()
-        .unwrap();
-    assert!(sum.status.success());
-    let digest = String::from_utf8(sum.stdout)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_string();
-    let archive_size = fs::metadata(t.path("release.gz")).unwrap().len();
-    let (target, asset) = match std::env::consts::ARCH {
-        "x86_64" => ("linux-x86_64", "syq-linux-x86_64"),
-        "aarch64" => ("linux-aarch64", "syq-linux-aarch64"),
-        arch => panic!("unsupported test architecture {arch}"),
-    };
-    let manifest = serde_json::json!({
-        "schema": 1,
-        "repository": "https://github.com/greaber/syq",
-        "version": env!("CARGO_PKG_VERSION"),
-        "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
-        "helper_id": format!("v{}-p0", env!("CARGO_PKG_VERSION")),
-        "artifacts": {
-            (target): {
-                "binary": {"name": asset, "sha256": "0".repeat(64), "size": 1},
-                "archive": {"name": format!("{asset}.gz"), "sha256": digest, "size": archive_size}
-            }
-        },
-        "installer": {"name": "install.sh", "sha256": "1".repeat(64), "size": 1},
-        "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
-        "signature_scheme": "ed25519-jcs-v1"
-    });
-    let signing = SigningKey::from_bytes(&[19; 32]);
-    let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
-    let signature =
-        base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
-    let mut manifest = manifest;
-    manifest["signature"] = signature.into();
-    write(
-        &t.path("release-manifest.json"),
-        &serde_json::to_vec_pretty(&manifest).unwrap(),
-    );
-    write(
-        &t.path("release-public-key"),
-        base64::engine::general_purpose::STANDARD
-            .encode(signing.verifying_key().to_bytes())
-            .as_bytes(),
-    );
-
-    executable(
-        &t.path("local-bin/curl"),
-        br#"#!/bin/sh
-printf 'fetch\n' >> "$FAKE_LOCAL_CURL_LOG"
-out=
-url=
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --output) out=$2; shift 2 ;;
-        *) url=$1; shift ;;
-    esac
-done
-case "$url" in
-    *.json) cp "$FAKE_RELEASE_MANIFEST" "$out" ;;
-    *) exit 22 ;;
-esac
-"#,
-    );
-
-    executable(
-        &t.path("remote-bin/curl"),
-        br#"#!/bin/sh
-printf 'fetch\n' >> "$FAKE_CURL_LOG"
-out=
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --output) out=$2; shift 2 ;;
-        *) shift ;;
-    esac
-done
-cp "$FAKE_RELEASE_ARCHIVE" "$out"
-"#,
-    );
+    setup_release_bootstrap(&t);
 
     write(&t.path("src"), b"first");
     let remote = format!("fake:{}", t.s("dst"));
@@ -349,8 +388,7 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
     assert!(cached_remote_helper(&t).is_file());
     assert!(legacy_helpers.iter().all(|helper| helper.exists()));
     assert!(!t.path("legacy.log").exists(), "legacy helper was executed");
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\n");
-    assert_eq!(read(&t.path("curl.log")), b"fetch\n");
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!(
@@ -371,8 +409,7 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
     let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"second");
-    assert_eq!(read(&t.path("local-curl.log")), b"fetch\n");
-    assert_eq!(read(&t.path("curl.log")), b"fetch\n");
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!(
             "helper: {} (managed helper cache)",
@@ -386,6 +423,322 @@ cp "$FAKE_RELEASE_ARCHIVE" "$out"
         .matches("syq-helper-target:")
         .count();
     assert_eq!(probes, 1, "cache hit should not probe the platform again");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    let mut corrupt = read(&t.path("release.gz"));
+    let middle = corrupt.len() / 2;
+    corrupt[middle] ^= 1;
+    write(&t.path("corrupt-release.gz"), &corrupt);
+    let corrupt_digest = sha256_hex(&corrupt);
+
+    write(&t.path("src"), b"integrity fallback");
+    let remote = format!("fake:{}", t.s("dst"));
+    let mut cmd = remote_syq_command(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
+    let out = cmd
+        .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("corrupt-release.gz"))
+        .output()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"integrity fallback");
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    assert_eq!(
+        read(&cached_local_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote helper download failed integrity verification"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("expected SHA-256"), "{stderr}");
+    assert!(stderr.contains(&corrupt_digest), "{stderr}");
+    assert!(
+        stderr.contains("uploading the verified helper over SSH"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("checksum mismatch"), "{stderr}");
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
+    let cache_entries: Vec<_> = fs::read_dir(cached_remote_helper(&t).parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(cache_entries, ["syq"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_manifest_cannot_inject_digest_protocol_framing() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+
+    let archive = read(&t.path("release.gz"));
+    let expected_digest = sha256_hex(&archive);
+    let mut alternate_archive = archive;
+    alternate_archive[4] ^= 1;
+    let mut decoded = Vec::new();
+    GzDecoder::new(alternate_archive.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, read(Path::new(env!("CARGO_BIN_EXE_syq"))));
+    write(&t.path("alternate-release.gz"), &alternate_archive);
+
+    let mut injected_manifest = read(&t.path("release-manifest.json"));
+    injected_manifest.extend_from_slice(
+        format!("\nsyq-helper-manifest-end\nsyq-helper-sha256:{expected_digest}\n").as_bytes(),
+    );
+    write(&t.path("injected-manifest.json"), &injected_manifest);
+
+    write(&t.path("src"), b"framing fallback");
+    let remote = format!("fake:{}", t.s("dst"));
+    let mut cmd = remote_syq_command(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
+    let out = cmd
+        .env(
+            "FAKE_REMOTE_RELEASE_MANIFEST",
+            t.path("injected-manifest.json"),
+        )
+        .env(
+            "FAKE_REMOTE_RELEASE_ARCHIVE",
+            t.path("alternate-release.gz"),
+        )
+        .output()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"framing fallback");
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    assert_eq!(
+        read(&cached_local_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote release manifest failed integrity verification or validation"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("uploading the verified helper over SSH"),
+        "{stderr}"
+    );
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&read(&t.path("release-manifest.json"))).unwrap();
+    manifest["repository"] = "https://attacker.invalid/syq".into();
+    write(
+        &t.path("tampered-remote-manifest.json"),
+        &serde_json::to_vec_pretty(&manifest).unwrap(),
+    );
+
+    write(&t.path("src"), b"manifest fallback");
+    let remote = format!("fake:{}", t.s("dst"));
+    let mut cmd = remote_syq_command(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
+    let out = cmd
+        .env(
+            "FAKE_REMOTE_RELEASE_MANIFEST",
+            t.path("tampered-remote-manifest.json"),
+        )
+        .output()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"manifest fallback");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote release manifest failed integrity verification or validation"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("signature verification failed"), "{stderr}");
+    assert!(
+        stderr.contains("uploading the verified helper over SSH"),
+        "{stderr}"
+    );
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_remote_download_falls_back_to_verified_upload() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    executable(
+        &t.path("remote-bin/curl"),
+        br#"#!/bin/sh
+printf 'fetch\n' >> "$FAKE_CURL_LOG"
+exit 22
+"#,
+    );
+
+    write(&t.path("src"), b"download fallback");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"download fallback");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("remote download unavailable"), "{stderr}");
+    assert!(
+        stderr.contains("uploading the verified helper over SSH"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("warning:"), "{stderr}");
+    assert_eq!(read(&t.path("curl.log")), b"fetch\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    for tool in ["sh", "uname", "mkdir", "rm", "cat", "chmod", "mv", "gzip"] {
+        add_remote_tool(&t, tool);
+    }
+
+    write(&t.path("src"), b"capability fallback");
+    let remote = format!("fake:{}", t.s("dst"));
+    let mut cmd = remote_syq_command(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    let out = cmd
+        .env("FAKE_REMOTE_PATH", t.path("remote-bin"))
+        .output()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"capability fallback");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote download prerequisites unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("uploading the verified helper over SSH"),
+        "{stderr}"
+    );
+    assert!(!t.path("curl.log").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn broken_remote_hasher_falls_back_to_verified_upload() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    executable(
+        &t.path("remote-bin/sha256sum"),
+        br#"#!/bin/sh
+exit 1
+"#,
+    );
+
+    write(&t.path("src"), b"hasher fallback");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"hasher fallback");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote helper hashing with sha256sum failed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("uploading the verified helper over SSH"),
+        "{stderr}"
+    );
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn corrupted_local_helper_cache_is_discarded_and_refetched() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    executable(
+        &t.path("remote-bin/curl"),
+        br#"#!/bin/sh
+exit 22
+"#,
+    );
+    let mut corrupt = read(Path::new(env!("CARGO_BIN_EXE_syq")));
+    let middle = corrupt.len() / 2;
+    corrupt[middle] ^= 1;
+    fs::create_dir_all(cached_local_helper(&t).parent().unwrap()).unwrap();
+    write(&cached_local_helper(&t), &corrupt);
+
+    write(&t.path("src"), b"local cache repair");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"local cache repair");
+    assert_eq!(
+        read(&cached_local_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cached remote helper failed integrity verification"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("discarding it"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_download_write_failure_does_not_retry_with_upload() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    executable(
+        &t.path("remote-bin/curl"),
+        br#"#!/bin/sh
+printf 'fetch\n' >> "$FAKE_CURL_LOG"
+exit 23
+"#,
+    );
+
+    write(&t.path("src"), b"must fail");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+
+    assert!(
+        !out.status.success(),
+        "remote write failure unexpectedly succeeded"
+    );
+    assert!(!t.path("dst").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote helper download could not write its temporary file"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("uploading the verified helper"),
+        "{stderr}"
+    );
+    assert_eq!(read(&t.path("curl.log")), b"fetch\n");
+    assert!(!cached_local_helper(&t).exists());
 }
 
 #[test]
@@ -407,7 +760,6 @@ fn development_build_refuses_managed_remote_bootstrap() {
         "{stderr}"
     );
     assert!(!stderr.contains("uploading"), "{stderr}");
-    assert!(!t.path("curl.log").exists());
 }
 
 #[test]

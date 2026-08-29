@@ -1,4 +1,4 @@
-//! Signed standalone release updates.
+//! Signed standalone release updates and remote-helper artifact verification.
 //!
 //! Package-manager and source installs deliberately have no install receipt,
 //! so this module will never replace them. Official release builds embed the
@@ -74,6 +74,22 @@ struct ReleaseFile {
 struct VerifiedRelease {
     manifest: ReleaseManifest,
     version: Version,
+}
+
+/// Target-specific release metadata whose manifest signature has been checked
+/// by the running client. It can authorize either a remote download or a
+/// locally downloaded helper uploaded over SSH.
+pub(crate) struct TrustedCurrentHelper {
+    tag: String,
+    target: Target,
+    binary: ReleaseFile,
+    archive: ReleaseFile,
+}
+
+impl TrustedCurrentHelper {
+    pub fn archive_sha256(&self) -> &str {
+        &self.archive.sha256
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -172,16 +188,37 @@ fn should_check_for_updates(quiet: bool, stderr_is_terminal: bool, disabled: boo
     !quiet && stderr_is_terminal && !disabled
 }
 
-/// Return the archive hash for this exact release after verifying its signed
-/// manifest. Remote bootstrap passes this trusted value to the remote shell;
-/// it never trusts a checksum downloaded beside the executable.
-pub fn trusted_current_archive_hash(target: Target) -> Result<String> {
+/// Return the artifact metadata for this exact release after verifying its
+/// signed manifest. Remote bootstrap never trusts metadata downloaded by the
+/// remote host itself.
+pub(crate) fn trusted_current_helper(target: Target) -> Result<TrustedCurrentHelper> {
     crate::identity::require_release_build()?;
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let release = fetch_verified(
         &format!("{}/{tag}", release_downloads()),
         FetchMode::Interactive,
     )?;
+    current_helper_from_release(target, release)
+}
+
+/// Verify a manifest relayed by the remote host and return its target metadata.
+/// Only the signed contents are trusted; SSH transport does not authorize
+/// release metadata by itself.
+pub(crate) fn trusted_current_helper_from_manifest(
+    target: Target,
+    manifest_bytes: &[u8],
+) -> Result<TrustedCurrentHelper> {
+    crate::identity::require_release_build()?;
+    let key = embedded_public_key()?;
+    let manifest = verified_manifest(manifest_bytes, key.as_ref())?;
+    let version = validate_manifest(&manifest)?;
+    current_helper_from_release(target, VerifiedRelease { manifest, version })
+}
+
+fn current_helper_from_release(
+    target: Target,
+    release: VerifiedRelease,
+) -> Result<TrustedCurrentHelper> {
     if release.version != current_version()? {
         bail!("signed release manifest does not describe this syq build");
     }
@@ -193,7 +230,79 @@ pub fn trusted_current_archive_hash(target: Target) -> Result<String> {
     if artifact.binary.name != target.asset {
         bail!("release artifact name does not match target {}", target.key);
     }
-    Ok(artifact.archive.sha256.clone())
+    Ok(TrustedCurrentHelper {
+        tag: release.manifest.tag,
+        target,
+        binary: artifact.binary.clone(),
+        archive: artifact.archive.clone(),
+    })
+}
+
+/// Return a locally cached, verified, uncompressed helper. The archive and
+/// binary hashes both come from the signed manifest, so this is safe for a
+/// different target from the client and never uploads the running executable.
+pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
+    let cache_path = helper_cache_path(helper)?;
+    if cache_path.is_file() {
+        match verify_file_as(&cache_path, &helper.binary, "cached remote helper") {
+            Ok(()) => {
+                return fs::read(&cache_path).with_context(|| {
+                    format!("read cached remote helper {}", cache_path.display())
+                });
+            }
+            Err(error) => {
+                eprintln!(
+                    "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
+                );
+                fs::remove_file(&cache_path).with_context(|| {
+                    format!("remove invalid cached helper {}", cache_path.display())
+                })?;
+            }
+        }
+    }
+
+    let parent = cache_path
+        .parent()
+        .ok_or_else(|| anyhow!("the remote helper cache path has no parent directory"))?;
+    create_private_dir(parent)?;
+    let archive = TempFile::new(parent, ".gz")?;
+    let binary = TempFile::new(parent, ".bin")?;
+    let url = format!(
+        "{}/{}/{}",
+        release_downloads(),
+        helper.tag,
+        helper.archive.name
+    );
+    fetch(&url, archive.path(), FetchMode::Interactive)?;
+    verify_file_as(
+        archive.path(),
+        &helper.archive,
+        "downloaded remote helper archive",
+    )?;
+
+    let input = File::open(archive.path()).context("open downloaded remote helper archive")?;
+    let decoder = GzDecoder::new(BufReader::new(input));
+    let output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(binary.path())
+        .context("open temporary remote helper")?;
+    let mut output = BufWriter::new(output);
+    std::io::copy(&mut decoder.take(helper.binary.size + 1), &mut output)
+        .context("decompress the remote helper")?;
+    output.flush().context("flush the remote helper")?;
+    output
+        .get_ref()
+        .sync_all()
+        .context("sync the remote helper")?;
+    drop(output);
+    verify_file_as(binary.path(), &helper.binary, "downloaded remote helper")?;
+    set_executable(binary.path())?;
+    fs::rename(binary.path(), &cache_path)
+        .with_context(|| format!("cache verified remote helper at {}", cache_path.display()))?;
+    sync_parent(parent)?;
+    fs::read(&cache_path)
+        .with_context(|| format!("read cached remote helper {}", cache_path.display()))
 }
 
 fn current_version() -> Result<Version> {
@@ -363,29 +472,7 @@ fn install_release(release: &VerifiedRelease, receipt: &mut InstallReceipt) -> R
     let parent = executable
         .parent()
         .ok_or_else(|| anyhow!("the syq executable has no parent directory"))?;
-    let archive = TempFile::new(parent, ".gz")?;
-    let binary = TempFile::new(parent, ".bin")?;
-    let url = format!(
-        "{}/{}/{}",
-        release_downloads(),
-        release.manifest.tag,
-        artifact.archive.name
-    );
-    fetch(&url, archive.path(), FetchMode::Interactive)?;
-    verify_file(archive.path(), &artifact.archive)?;
-
-    let input = File::open(archive.path()).context("open downloaded release archive")?;
-    let mut decoder = GzDecoder::new(BufReader::new(input));
-    let output = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(binary.path())
-        .context("open temporary update executable")?;
-    let mut output = BufWriter::new(output);
-    std::io::copy(&mut decoder, &mut output).context("decompress the syq update")?;
-    output.flush().context("flush the syq update")?;
-    output.get_ref().sync_all().context("sync the syq update")?;
-    drop(output);
+    let binary = download_artifact(release, artifact, parent)?;
     set_executable(binary.path())?;
     verify_executable(binary.path(), release)?;
 
@@ -441,20 +528,68 @@ pub fn write_manifest_signing_payload(path: &Path) -> Result<()> {
         .context("write release manifest signing payload")
 }
 
-fn verify_file(path: &Path, expected: &ReleaseFile) -> Result<()> {
-    let metadata = fs::metadata(path).context("stat downloaded release archive")?;
+fn download_artifact(
+    release: &VerifiedRelease,
+    artifact: &ReleaseArtifact,
+    parent: &Path,
+) -> Result<TempFile> {
+    let archive = TempFile::new(parent, ".gz")?;
+    let binary = TempFile::new(parent, ".bin")?;
+    let url = format!(
+        "{}/{}/{}",
+        release_downloads(),
+        release.manifest.tag,
+        artifact.archive.name
+    );
+    fetch(&url, archive.path(), FetchMode::Interactive)?;
+    verify_file_as(
+        archive.path(),
+        &artifact.archive,
+        "downloaded release archive",
+    )?;
+
+    let input = File::open(archive.path()).context("open downloaded release archive")?;
+    let decoder = GzDecoder::new(BufReader::new(input));
+    let output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(binary.path())
+        .context("open temporary release executable")?;
+    let mut output = BufWriter::new(output);
+    std::io::copy(&mut decoder.take(artifact.binary.size + 1), &mut output)
+        .context("decompress the syq release executable")?;
+    output.flush().context("flush the syq release executable")?;
+    output
+        .get_ref()
+        .sync_all()
+        .context("sync the syq release executable")?;
+    drop(output);
+    verify_file_as(
+        binary.path(),
+        &artifact.binary,
+        "downloaded release executable",
+    )?;
+    Ok(binary)
+}
+
+fn verify_file_as(path: &Path, expected: &ReleaseFile, description: &str) -> Result<()> {
+    let metadata = fs::metadata(path).with_context(|| format!("stat {description}"))?;
     if metadata.len() != expected.size {
         bail!(
-            "downloaded release archive has size {}, expected {}",
+            "{description} has size {}, expected {}",
             metadata.len(),
             expected.size
         );
     }
-    let mut input = BufReader::new(File::open(path).context("open release archive for hashing")?);
+    let mut input = BufReader::new(
+        File::open(path).with_context(|| format!("open {description} for hashing"))?,
+    );
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 128 * 1024];
     loop {
-        let count = input.read(&mut buffer).context("hash release archive")?;
+        let count = input
+            .read(&mut buffer)
+            .with_context(|| format!("hash {description}"))?;
         if count == 0 {
             break;
         }
@@ -466,7 +601,7 @@ fn verify_file(path: &Path, expected: &ReleaseFile) -> Result<()> {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     if actual != expected.sha256 {
-        bail!("downloaded release archive failed SHA-256 verification");
+        bail!("{description} failed SHA-256 verification");
     }
     Ok(())
 }
@@ -496,53 +631,66 @@ fn verify_executable(path: &Path, release: &VerifiedRelease) -> Result<()> {
 }
 
 fn fetch(url: &str, destination: &Path, mode: FetchMode) -> Result<()> {
-    let mut curl = Command::new("curl");
-    curl.args([
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--location",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
-        "--connect-timeout",
-    ]);
-    match mode {
-        FetchMode::Interactive => {
-            curl.args(["10", "--retry", "2"]);
-        }
-        FetchMode::BackgroundCheck => {
-            curl.args(["2", "--max-time", "5"]);
-        }
-    }
-    curl.arg("--output").arg(destination).arg(url);
-    match curl.stdin(Stdio::null()).status() {
-        Ok(status) if status.success() => return Ok(()),
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("run curl"),
+    #[cfg(debug_assertions)]
+    if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty()) {
+        let name = url
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty() && !matches!(*name, "." | ".."))
+            .ok_or_else(|| anyhow!("test release URL has no fixture name"))?;
+        fs::copy(PathBuf::from(root).join(name), destination)
+            .with_context(|| format!("copy test release fixture {name}"))?;
+        return Ok(());
     }
 
-    let mut wget = Command::new("wget");
-    wget.args(["--quiet", "--https-only"]);
-    match mode {
-        FetchMode::Interactive => {
-            wget.args(["--timeout=10", "--tries=3"]);
-        }
-        FetchMode::BackgroundCheck => {
-            wget.args(["--timeout=5", "--tries=1"]);
+    let (connect_timeout, global_timeout, attempts) = match mode {
+        FetchMode::Interactive => (Duration::from_secs(10), None, 3),
+        FetchMode::BackgroundCheck => (Duration::from_secs(2), Some(Duration::from_secs(5)), 1),
+    };
+    let agent = ureq::Agent::config_builder()
+        .https_only(true)
+        .timeout_connect(Some(connect_timeout))
+        .timeout_global(global_timeout)
+        .user_agent(concat!("syq/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .new_agent();
+
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        let result = (|| -> Result<()> {
+            let mut response = agent
+                .get(url)
+                .call()
+                .with_context(|| format!("request {url}"))?;
+            let file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(destination)
+                .with_context(|| format!("open {} for download", destination.display()))?;
+            let mut file = BufWriter::new(file);
+            std::io::copy(&mut response.body_mut().as_reader(), &mut file)
+                .with_context(|| format!("download {url}"))?;
+            file.flush()
+                .with_context(|| format!("flush downloaded file {}", destination.display()))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let retryable = !matches!(
+                    error.downcast_ref::<ureq::Error>(),
+                    Some(ureq::Error::StatusCode(code))
+                        if *code < 500 && !matches!(*code, 408 | 429)
+                );
+                last_error = Some(error);
+                if !retryable || attempt + 1 == attempts {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+            }
         }
     }
-    wget.arg("-O").arg(destination).arg(url);
-    match wget.stdin(Stdio::null()).status() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => bail!("download {url} failed ({status})"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("downloading updates requires curl or wget")
-        }
-        Err(e) => Err(e).context("run wget"),
-    }
+    Err(last_error.unwrap()).with_context(|| format!("download {url}"))
 }
 
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
@@ -606,6 +754,24 @@ fn config_dir() -> Result<PathBuf> {
             anyhow!("HOME is not set, so the standalone install receipt cannot be located")
         })?;
     Ok(PathBuf::from(home).join(".config/syq"))
+}
+
+fn helper_cache_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
+    let base = if let Some(base) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(base)
+    } else {
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow!("HOME is not set, so the remote helper cache cannot be located")
+            })?;
+        PathBuf::from(home).join(".cache")
+    };
+    Ok(base
+        .join("syq/helpers")
+        .join(&helper.tag)
+        .join(helper.target.key)
+        .join("syq"))
 }
 
 fn canonical_current_exe() -> Result<PathBuf> {
@@ -821,5 +987,21 @@ mod tests {
         assert!(!should_check_for_updates(true, true, false));
         assert!(!should_check_for_updates(false, false, false));
         assert!(!should_check_for_updates(false, true, true));
+    }
+
+    #[test]
+    fn release_fetches_reject_plain_http() {
+        let parent = std::env::temp_dir();
+        let destination = TempFile::new(&parent, ".http-test").unwrap();
+        let error = fetch(
+            "http://127.0.0.1:1/release",
+            destination.path(),
+            FetchMode::BackgroundCheck,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::RequireHttpsOnly(_))
+        ));
     }
 }
