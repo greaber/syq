@@ -202,10 +202,11 @@ if [ "${{#actual}}" -ne 64 ]; then
 fi
 printf 'syq-helper-manifest-begin\n'
 while IFS= read -r line || [ -n "$line" ]; do
-    printf '%s\n' "$line"
+    printf 'syq-helper-manifest-data:%s\n' "$line"
 done < "$manifest"
 printf 'syq-helper-manifest-end\n'
 printf 'syq-helper-sha256:%s\n' "$actual"
+printf 'syq-helper-report-end\n'
 if ! IFS= read -r decision; then
     echo "syq: local client did not authorize the remote helper download" >&2
     exit {direct_fallback_exit}
@@ -355,7 +356,9 @@ mod tests {
         assert!(script.contains("sha256sum"));
         assert!(script.contains("local integrity verification"));
         assert!(script.contains("syq-helper-manifest-begin"));
+        assert!(script.contains("syq-helper-manifest-data:%s"));
         assert!(script.contains("syq-helper-sha256:"));
+        assert!(script.contains("syq-helper-report-end"));
         assert!(script.contains("read -r decision"));
         assert!(!script.contains(".sha256"));
         assert!(script.contains(helper_identity()));

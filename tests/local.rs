@@ -2,7 +2,7 @@
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
-use flate2::{write::GzEncoder, Compression};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -473,6 +473,67 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(cache_entries, ["syq"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_manifest_cannot_inject_digest_protocol_framing() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+
+    let archive = read(&t.path("release.gz"));
+    let expected_digest = sha256_hex(&archive);
+    let mut alternate_archive = archive;
+    alternate_archive[4] ^= 1;
+    let mut decoded = Vec::new();
+    GzDecoder::new(alternate_archive.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, read(Path::new(env!("CARGO_BIN_EXE_syq"))));
+    write(&t.path("alternate-release.gz"), &alternate_archive);
+
+    let mut injected_manifest = read(&t.path("release-manifest.json"));
+    injected_manifest.extend_from_slice(
+        format!("\nsyq-helper-manifest-end\nsyq-helper-sha256:{expected_digest}\n").as_bytes(),
+    );
+    write(&t.path("injected-manifest.json"), &injected_manifest);
+
+    write(&t.path("src"), b"framing fallback");
+    let remote = format!("fake:{}", t.s("dst"));
+    let mut cmd = remote_syq_command(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
+    let out = cmd
+        .env(
+            "FAKE_REMOTE_RELEASE_MANIFEST",
+            t.path("injected-manifest.json"),
+        )
+        .env(
+            "FAKE_REMOTE_RELEASE_ARCHIVE",
+            t.path("alternate-release.gz"),
+        )
+        .output()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"framing fallback");
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    assert_eq!(
+        read(&cached_local_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote release manifest failed integrity verification or validation"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("uploading the verified helper over SSH"),
+        "{stderr}"
+    );
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
 #[cfg(target_os = "linux")]

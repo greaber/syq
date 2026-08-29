@@ -1134,16 +1134,26 @@ fn read_direct_report(reader: &mut impl BufRead) -> std::io::Result<Option<Direc
                 "remote manifest was not terminated",
             ));
         }
-        if protocol_line(&line) == b"syq-helper-manifest-end" {
+        let framed = protocol_line(&line);
+        if framed == b"syq-helper-manifest-end" {
             break;
         }
-        if manifest.len().saturating_add(line.len()) > MAX_MANIFEST_SIZE {
+        let data = framed
+            .strip_prefix(b"syq-helper-manifest-data:")
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "remote manifest contained unframed protocol data",
+                )
+            })?;
+        if manifest.len().saturating_add(data.len() + 1) > MAX_MANIFEST_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "remote manifest exceeded 1 MiB",
             ));
         }
-        manifest.extend_from_slice(&line);
+        manifest.extend_from_slice(data);
+        manifest.push(b'\n');
     }
 
     line.clear();
@@ -1161,10 +1171,21 @@ fn read_direct_report(reader: &mut impl BufRead) -> std::io::Result<Option<Direc
                 "remote helper digest marker was missing",
             )
         })?;
-    Ok(Some(DirectReport {
-        manifest,
-        sha256: String::from_utf8_lossy(digest).into_owned(),
-    }))
+    let sha256 = String::from_utf8_lossy(digest).into_owned();
+    line.clear();
+    if reader.read_until(b'\n', &mut line)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "remote helper report was not terminated",
+        ));
+    }
+    if protocol_line(&line) != b"syq-helper-report-end" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote helper report contained trailing or malformed protocol data",
+        ));
+    }
+    Ok(Some(DirectReport { manifest, sha256 }))
 }
 
 fn protocol_line(mut line: &[u8]) -> &[u8] {
@@ -1301,7 +1322,7 @@ mod tests {
     fn direct_download_report_frames_manifest_and_digest() {
         let digest = "a".repeat(64);
         let bytes = format!(
-            "syq-helper-manifest-begin\n{{\n  \"schema\": 1\n}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\n"
+            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\nsyq-helper-manifest-data:  \"schema\": 1\nsyq-helper-manifest-data:}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
         );
         let report = read_direct_report(&mut bytes.as_bytes()).unwrap().unwrap();
         assert_eq!(report.manifest, b"{\n  \"schema\": 1\n}\n");
@@ -1310,10 +1331,40 @@ mod tests {
 
     #[test]
     fn direct_download_report_rejects_unterminated_manifest() {
-        let error =
-            read_direct_report(&mut b"syq-helper-manifest-begin\n{\"schema\":1}\n".as_slice())
-                .unwrap_err();
+        let error = read_direct_report(
+            &mut b"syq-helper-manifest-begin\nsyq-helper-manifest-data:{\"schema\":1}\n".as_slice(),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn direct_download_report_keeps_injected_markers_inside_the_manifest() {
+        let spoofed = "a".repeat(64);
+        let actual = "b".repeat(64);
+        let bytes = format!(
+            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"schema\":1}}\nsyq-helper-manifest-data:syq-helper-manifest-end\nsyq-helper-manifest-data:syq-helper-sha256:{spoofed}\nsyq-helper-manifest-end\nsyq-helper-sha256:{actual}\nsyq-helper-report-end\n"
+        );
+        let report = read_direct_report(&mut bytes.as_bytes()).unwrap().unwrap();
+        assert_eq!(report.sha256, actual);
+        assert!(report
+            .manifest
+            .windows(b"syq-helper-manifest-end".len())
+            .any(|window| window == b"syq-helper-manifest-end"));
+        assert!(report
+            .manifest
+            .windows(spoofed.len())
+            .any(|window| { window == spoofed.as_bytes() }));
+    }
+
+    #[test]
+    fn direct_download_report_rejects_data_after_the_digest() {
+        let digest = "a".repeat(64);
+        let bytes = format!(
+            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nunexpected\nsyq-helper-report-end\n"
+        );
+        let error = read_direct_report(&mut bytes.as_bytes()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
