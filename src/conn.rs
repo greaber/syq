@@ -8,7 +8,7 @@ use crate::proto::*;
 use crate::remote_helper::{self, Target};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
 
@@ -829,7 +829,8 @@ impl RemoteSpec {
             return Ok(());
         }
 
-        let target = self.remote_target()?;
+        let bootstrap = self.remote_bootstrap()?;
+        let target = bootstrap.target;
         if !self.quiet {
             eprintln!(
                 "syq: {}: installing {} helper for {}",
@@ -838,7 +839,7 @@ impl RemoteSpec {
                 target.key
             );
         }
-        self.download_helper(target).with_context(|| {
+        self.bootstrap_helper(bootstrap).with_context(|| {
             format!(
                 "could not install the authorized {} helper on {} ({}); install a compatible syq and pass --syq-path",
                 remote_helper::helper_identity(),
@@ -850,7 +851,7 @@ impl RemoteSpec {
         Ok(())
     }
 
-    fn remote_target(&self) -> Result<Target> {
+    fn remote_bootstrap(&self) -> Result<RemoteBootstrap> {
         let mut cmd = self.ssh_command();
         cmd.arg(remote_helper::probe_command())
             .stdin(Stdio::null())
@@ -875,45 +876,335 @@ impl RemoteSpec {
         let (os, arch) = value
             .split_once(':')
             .ok_or_else(|| anyhow!("{}: malformed platform response {value:?}", self.label()))?;
-        Target::from_uname(os, arch).ok_or_else(|| {
+        let target = Target::from_uname(os, arch).ok_or_else(|| {
             anyhow!(
                 "{}: automatic remote helpers do not support {os} {arch}; install syq there and pass --syq-path",
                 self.label()
             )
+        })?;
+        let direct_download = text
+            .lines()
+            .find_map(|line| line.strip_prefix("syq-helper-tools:"))
+            .is_some_and(|tools| {
+                let mut tools = tools.split(':');
+                tools.next().is_some_and(|tool| !tool.is_empty())
+                    && tools.next().is_some_and(|tool| !tool.is_empty())
+                    && tools.next().is_some_and(|tool| !tool.is_empty())
+                    && tools.next().is_none()
+            });
+        Ok(RemoteBootstrap {
+            target,
+            direct_download,
         })
     }
 
-    fn download_helper(&self, target: Target) -> Result<()> {
-        let expected_sha256 = crate::update::trusted_current_archive_hash(target)
-            .context("verify the signed release manifest")?;
-        let script = remote_helper::download_script(target, &expected_sha256);
+    fn bootstrap_helper(&self, bootstrap: RemoteBootstrap) -> Result<()> {
+        let mut trusted = None;
+        if bootstrap.direct_download {
+            match self.try_direct_helper(bootstrap.target)? {
+                DirectHelper::Installed => return Ok(()),
+                DirectHelper::Fallback { detail, helper } => {
+                    trusted = helper;
+                    if !self.quiet {
+                        eprintln!(
+                            "syq: {}: remote download unavailable{}; uploading the verified helper over SSH",
+                            self.label(),
+                            parenthesized_detail(&detail)
+                        );
+                    }
+                }
+                DirectHelper::Integrity { warning, helper } => {
+                    trusted = helper;
+                    eprintln!(
+                        "syq: warning: {}: {}; the remote download was discarded; uploading the verified helper over SSH",
+                        self.label(),
+                        warning
+                    );
+                }
+            }
+        } else if !self.quiet {
+            eprintln!(
+                "syq: {}: remote download prerequisites unavailable; uploading the verified helper over SSH",
+                self.label()
+            );
+        }
+
+        let helper = match trusted {
+            Some(helper) => helper,
+            None => crate::update::trusted_current_helper(bootstrap.target)
+                .context("download and verify the signed release manifest")?,
+        };
+        let binary = crate::update::verified_current_helper(&helper)
+            .context("download and verify the helper for SSH upload")?;
+        self.upload_helper(bootstrap.target, &binary)
+    }
+
+    fn try_direct_helper(&self, target: Target) -> Result<DirectHelper> {
+        let script = remote_helper::download_script(target);
         let mut cmd = self.ssh_command();
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("download helper on {}", self.label()))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("start helper download on {}", self.label()))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("remote helper download stdin was not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("remote helper download stdout was not piped"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("remote helper download stderr was not piped"))?;
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        });
+
+        let report = read_direct_report(&mut BufReader::new(stdout));
+        let mut helper = None;
+        let mut integrity_warning = None;
+        let mut protocol_detail = None;
+        let mut authorized = false;
+        match report {
+            Ok(Some(report)) if valid_sha256(&report.sha256) => {
+                match crate::update::trusted_current_helper_from_manifest(target, &report.manifest)
+                {
+                    Ok(trusted) => {
+                        if report.sha256 == trusted.archive_sha256() {
+                            authorized = true;
+                        } else {
+                            integrity_warning = Some(format!(
+                                "remote helper download failed integrity verification (expected SHA-256 {}, got {})",
+                                trusted.archive_sha256(),
+                                report.sha256
+                            ));
+                        }
+                        helper = Some(trusted);
+                    }
+                    Err(error) => {
+                        integrity_warning = Some(format!(
+                            "remote release manifest failed integrity verification or validation ({error})"
+                        ));
+                    }
+                }
+            }
+            Ok(Some(_)) => {
+                protocol_detail = Some("the remote hasher returned no valid digest".into());
+            }
+            Ok(None) => {
+                protocol_detail =
+                    Some("the remote returned no download verification report".into());
+            }
+            Err(error) => {
+                protocol_detail = Some(format!(
+                    "could not read the remote verification report: {error}"
+                ));
+            }
+        }
+        let decision = if authorized {
+            b"install\n"
+        } else {
+            b"discard\n"
+        };
+        let write_result = stdin.write_all(decision);
+        drop(stdin);
+
+        let status = child
+            .wait()
+            .with_context(|| format!("wait for helper download on {}", self.label()))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow!("remote helper stderr reader panicked"))?;
+        let detail = output_message(&stderr);
+        if status.success() {
+            write_result.context("authorize the verified remote helper")?;
+            return if authorized {
+                Ok(DirectHelper::Installed)
+            } else {
+                Ok(DirectHelper::Fallback {
+                    detail: protocol_detail
+                        .unwrap_or_else(|| "the remote ignored a discard decision".into()),
+                    helper,
+                })
+            };
+        }
+        match status.code() {
+            Some(remote_helper::DIRECT_FALLBACK_EXIT) => Ok(DirectHelper::Fallback {
+                detail: if detail.is_empty() {
+                    protocol_detail.unwrap_or_default()
+                } else {
+                    detail
+                },
+                helper,
+            }),
+            Some(remote_helper::DIRECT_INTEGRITY_EXIT) => match integrity_warning {
+                Some(warning) => Ok(DirectHelper::Integrity { warning, helper }),
+                None => Ok(DirectHelper::Fallback {
+                    detail: protocol_detail.unwrap_or(detail),
+                    helper,
+                }),
+            },
+            _ => {
+                bail!(
+                    "remote download exited {}{}",
+                    status,
+                    output_suffix(&stderr)
+                );
+            }
+        }
+    }
+
+    fn upload_helper(&self, target: Target, binary: &[u8]) -> Result<()> {
+        let script = remote_helper::upload_script(target);
+        let mut cmd = self.ssh_command();
+        cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("start helper upload to {}", self.label()))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("helper upload stdin was not piped"))?;
+        let write_result = stdin.write_all(binary);
+        drop(stdin);
+        let out = child
+            .wait_with_output()
+            .with_context(|| format!("wait for helper upload to {}", self.label()))?;
         if !out.status.success() {
             bail!(
-                "remote download exited {}{}",
+                "remote helper upload exited {}{}",
                 out.status,
                 output_suffix(&out.stderr)
             );
         }
-        Ok(())
+        write_result.with_context(|| format!("upload helper to {}", self.label()))
     }
 }
 
+#[derive(Clone, Copy)]
+struct RemoteBootstrap {
+    target: Target,
+    direct_download: bool,
+}
+
+enum DirectHelper {
+    Installed,
+    Fallback {
+        detail: String,
+        helper: Option<crate::update::TrustedCurrentHelper>,
+    },
+    Integrity {
+        warning: String,
+        helper: Option<crate::update::TrustedCurrentHelper>,
+    },
+}
+
+#[derive(Debug)]
+struct DirectReport {
+    manifest: Vec<u8>,
+    sha256: String,
+}
+
+fn read_direct_report(reader: &mut impl BufRead) -> std::io::Result<Option<DirectReport>> {
+    const MAX_MANIFEST_SIZE: usize = 1024 * 1024;
+    let mut line = Vec::new();
+    if reader.read_until(b'\n', &mut line)? == 0 {
+        return Ok(None);
+    }
+    if protocol_line(&line) != b"syq-helper-manifest-begin" {
+        return Ok(None);
+    }
+
+    let mut manifest = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "remote manifest was not terminated",
+            ));
+        }
+        if protocol_line(&line) == b"syq-helper-manifest-end" {
+            break;
+        }
+        if manifest.len().saturating_add(line.len()) > MAX_MANIFEST_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "remote manifest exceeded 1 MiB",
+            ));
+        }
+        manifest.extend_from_slice(&line);
+    }
+
+    line.clear();
+    if reader.read_until(b'\n', &mut line)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "remote helper digest was missing",
+        ));
+    }
+    let digest = protocol_line(&line)
+        .strip_prefix(b"syq-helper-sha256:")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "remote helper digest marker was missing",
+            )
+        })?;
+    Ok(Some(DirectReport {
+        manifest,
+        sha256: String::from_utf8_lossy(digest).into_owned(),
+    }))
+}
+
+fn protocol_line(mut line: &[u8]) -> &[u8] {
+    if let Some(value) = line.strip_suffix(b"\n") {
+        line = value;
+    }
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
 fn output_suffix(stderr: &[u8]) -> String {
-    let message = String::from_utf8_lossy(stderr);
-    let message = message.trim();
+    let message = output_message(stderr);
     if message.is_empty() {
         String::new()
     } else {
         format!(": {message}")
     }
+}
+
+fn output_message(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr);
+    message
+        .trim()
+        .strip_prefix("syq: ")
+        .unwrap_or_else(|| message.trim())
+        .to_owned()
+}
+
+fn parenthesized_detail(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[derive(Clone, Debug)]
@@ -1004,6 +1295,25 @@ mod tests {
 
         let mut saw_root = true;
         assert!(validate_remote_scan_batch(&[entry(b"")], &mut saw_root).is_err());
+    }
+
+    #[test]
+    fn direct_download_report_frames_manifest_and_digest() {
+        let digest = "a".repeat(64);
+        let bytes = format!(
+            "syq-helper-manifest-begin\n{{\n  \"schema\": 1\n}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\n"
+        );
+        let report = read_direct_report(&mut bytes.as_bytes()).unwrap().unwrap();
+        assert_eq!(report.manifest, b"{\n  \"schema\": 1\n}\n");
+        assert_eq!(report.sha256, digest);
+    }
+
+    #[test]
+    fn direct_download_report_rejects_unterminated_manifest() {
+        let error =
+            read_direct_report(&mut b"syq-helper-manifest-begin\n{\"schema\":1}\n".as_slice())
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

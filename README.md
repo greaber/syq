@@ -75,26 +75,41 @@ notarization in addition to this terminal-first path.
 The remote side runs `syq --server`, but it does not need to be installed or
 configured first. An official syq uses its exact release helper under
 `~/.cache/syq/helpers/`. On first use of a version it detects the remote
-platform, downloads the matching compressed binary from that version's GitHub
-release, verifies its SHA-256 against the separately signed release manifest,
-and installs it atomically. Later runs execute that exact path without an extra
-probe connection.
+platform and checks for a downloader, SHA-256 implementation, and `gzip`. When
+that complete toolchain is available, the remote downloads the matching
+compressed binary and signed manifest from that version's GitHub release. It
+relays the manifest and computed digest over SSH, then waits while the local
+client verifies the manifest signature and compares its expected digest. Only
+an explicit approval from the client lets the remote install the helper
+atomically. This path therefore works even when the local machine cannot reach
+the release host. Later runs execute that exact path without an extra probe
+connection.
 
-The managed cache accepts only the downloaded, verified release binary. If the
-remote cannot download it, bootstrapping fails visibly; install a compatible
-binary yourself and pass `--syq-path /path/to/syq`, or put it on the
-non-interactive remote `PATH` and use `--no-bootstrap`. Helpers cached under an
-older identity or cache layout are never executed; they may be removed with the
-rest of the disposable helper cache.
+If the remote toolchain is unavailable, a tool fails, or the download times
+out or otherwise fails, the local client downloads the target-specific archive
+instead. It verifies both the archive and decompressed binary, caches the
+verified binary under `$XDG_CACHE_HOME/syq/helpers/` (normally
+`~/.cache/syq/helpers/`), and uploads it through the configured SSH command.
+This fallback does not require a remote downloader, hasher, or decompressor.
+Remote filesystem and installation errors fail immediately because uploading
+the same helper cannot fix them. A completed download with the wrong digest is
+discarded and produces an integrity warning even if the verified upload then
+succeeds.
+
+The managed cache accepts only a verified release binary. Helpers cached under
+an older identity or cache layout are never executed; they may be removed with
+the rest of the disposable helper cache. To opt out of managed bootstrap,
+install a compatible binary yourself and pass `--syq-path /path/to/syq`, or put
+it on the non-interactive remote `PATH` and use `--no-bootstrap`.
 
 The local client verifies the manifest's embedded Ed25519 signature over its
-RFC 8785 canonical JSON and passes its trusted hash to the remote install
-script. The remote uses `curl` or `wget`, `gzip`, and one of `sha256sum`,
-`shasum`, or `openssl`. Version directories coexist and the helper cache can be
-removed at any time; syq recreates the helper it needs on the next connection.
-After launch, both peers require the same build identity: the release tag for
-official binaries, or the Git-derived identity when an explicit source-built
-helper is used.
+RFC 8785 canonical JSON. Direct remote download uses `curl` or `wget`, `gzip`,
+and one of `sha256sum`, `shasum`, or `openssl`; those programs are optional
+because missing or unusable tools select verified SSH upload instead. Version
+directories coexist and either helper cache can be removed at any time; syq
+recreates the helper it needs on the next connection. After launch, both peers
+require the same build identity: the release tag for official binaries, or the
+Git-derived identity when an explicit source-built helper is used.
 
 - **macOS (Apple Silicon / Intel):** build natively on the Mac with
   `cargo build --release` (needs the Xcode command-line tools, `xcode-select

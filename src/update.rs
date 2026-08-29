@@ -1,4 +1,4 @@
-//! Signed standalone release updates.
+//! Signed standalone release updates and remote-helper artifact verification.
 //!
 //! Package-manager and source installs deliberately have no install receipt,
 //! so this module will never replace them. Official release builds embed the
@@ -74,6 +74,22 @@ struct ReleaseFile {
 struct VerifiedRelease {
     manifest: ReleaseManifest,
     version: Version,
+}
+
+/// Target-specific release metadata whose manifest signature has been checked
+/// by the running client. It can authorize either a remote download or a
+/// locally downloaded helper uploaded over SSH.
+pub(crate) struct TrustedCurrentHelper {
+    tag: String,
+    target: Target,
+    binary: ReleaseFile,
+    archive: ReleaseFile,
+}
+
+impl TrustedCurrentHelper {
+    pub fn archive_sha256(&self) -> &str {
+        &self.archive.sha256
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -172,16 +188,37 @@ fn should_check_for_updates(quiet: bool, stderr_is_terminal: bool, disabled: boo
     !quiet && stderr_is_terminal && !disabled
 }
 
-/// Return the archive hash for this exact release after verifying its signed
-/// manifest. Remote bootstrap passes this trusted value to the remote shell;
-/// it never trusts a checksum downloaded beside the executable.
-pub fn trusted_current_archive_hash(target: Target) -> Result<String> {
+/// Return the artifact metadata for this exact release after verifying its
+/// signed manifest. Remote bootstrap never trusts metadata downloaded by the
+/// remote host itself.
+pub(crate) fn trusted_current_helper(target: Target) -> Result<TrustedCurrentHelper> {
     crate::identity::require_release_build()?;
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let release = fetch_verified(
         &format!("{}/{tag}", release_downloads()),
         FetchMode::Interactive,
     )?;
+    current_helper_from_release(target, release)
+}
+
+/// Verify a manifest relayed by the remote host and return its target metadata.
+/// Only the signed contents are trusted; SSH transport does not authorize
+/// release metadata by itself.
+pub(crate) fn trusted_current_helper_from_manifest(
+    target: Target,
+    manifest_bytes: &[u8],
+) -> Result<TrustedCurrentHelper> {
+    crate::identity::require_release_build()?;
+    let key = embedded_public_key()?;
+    let manifest = verified_manifest(manifest_bytes, key.as_ref())?;
+    let version = validate_manifest(&manifest)?;
+    current_helper_from_release(target, VerifiedRelease { manifest, version })
+}
+
+fn current_helper_from_release(
+    target: Target,
+    release: VerifiedRelease,
+) -> Result<TrustedCurrentHelper> {
     if release.version != current_version()? {
         bail!("signed release manifest does not describe this syq build");
     }
@@ -193,7 +230,74 @@ pub fn trusted_current_archive_hash(target: Target) -> Result<String> {
     if artifact.binary.name != target.asset {
         bail!("release artifact name does not match target {}", target.key);
     }
-    Ok(artifact.archive.sha256.clone())
+    Ok(TrustedCurrentHelper {
+        tag: release.manifest.tag,
+        target,
+        binary: artifact.binary.clone(),
+        archive: artifact.archive.clone(),
+    })
+}
+
+/// Return a locally cached, verified, uncompressed helper. The archive and
+/// binary hashes both come from the signed manifest, so this is safe for a
+/// different target from the client and never uploads the running executable.
+pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
+    let cache_path = helper_cache_path(helper)?;
+    if cache_path.is_file() {
+        match verify_file_as(&cache_path, &helper.binary, "cached remote helper") {
+            Ok(()) => {
+                return fs::read(&cache_path).with_context(|| {
+                    format!("read cached remote helper {}", cache_path.display())
+                });
+            }
+            Err(error) => {
+                eprintln!(
+                    "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
+                );
+                fs::remove_file(&cache_path).with_context(|| {
+                    format!("remove invalid cached helper {}", cache_path.display())
+                })?;
+            }
+        }
+    }
+
+    let parent = cache_path
+        .parent()
+        .ok_or_else(|| anyhow!("the remote helper cache path has no parent directory"))?;
+    create_private_dir(parent)?;
+    let archive = TempFile::new(parent, ".gz")?;
+    let binary = TempFile::new(parent, ".bin")?;
+    let url = format!(
+        "{}/{}/{}",
+        release_downloads(),
+        helper.tag,
+        helper.archive.name
+    );
+    fetch(&url, archive.path(), FetchMode::Interactive)?;
+    verify_file(archive.path(), &helper.archive)?;
+
+    let input = File::open(archive.path()).context("open downloaded remote helper archive")?;
+    let mut decoder = GzDecoder::new(BufReader::new(input));
+    let output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(binary.path())
+        .context("open temporary remote helper")?;
+    let mut output = BufWriter::new(output);
+    std::io::copy(&mut decoder, &mut output).context("decompress the remote helper")?;
+    output.flush().context("flush the remote helper")?;
+    output
+        .get_ref()
+        .sync_all()
+        .context("sync the remote helper")?;
+    drop(output);
+    verify_file_as(binary.path(), &helper.binary, "downloaded remote helper")?;
+    set_executable(binary.path())?;
+    fs::rename(binary.path(), &cache_path)
+        .with_context(|| format!("cache verified remote helper at {}", cache_path.display()))?;
+    sync_parent(parent)?;
+    fs::read(&cache_path)
+        .with_context(|| format!("read cached remote helper {}", cache_path.display()))
 }
 
 fn current_version() -> Result<Version> {
@@ -442,10 +546,14 @@ pub fn write_manifest_signing_payload(path: &Path) -> Result<()> {
 }
 
 fn verify_file(path: &Path, expected: &ReleaseFile) -> Result<()> {
+    verify_file_as(path, expected, "downloaded release archive")
+}
+
+fn verify_file_as(path: &Path, expected: &ReleaseFile, description: &str) -> Result<()> {
     let metadata = fs::metadata(path).context("stat downloaded release archive")?;
     if metadata.len() != expected.size {
         bail!(
-            "downloaded release archive has size {}, expected {}",
+            "{description} has size {}, expected {}",
             metadata.len(),
             expected.size
         );
@@ -466,7 +574,7 @@ fn verify_file(path: &Path, expected: &ReleaseFile) -> Result<()> {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     if actual != expected.sha256 {
-        bail!("downloaded release archive failed SHA-256 verification");
+        bail!("{description} failed SHA-256 verification");
     }
     Ok(())
 }
@@ -606,6 +714,24 @@ fn config_dir() -> Result<PathBuf> {
             anyhow!("HOME is not set, so the standalone install receipt cannot be located")
         })?;
     Ok(PathBuf::from(home).join(".config/syq"))
+}
+
+fn helper_cache_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
+    let base = if let Some(base) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(base)
+    } else {
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow!("HOME is not set, so the remote helper cache cannot be located")
+            })?;
+        PathBuf::from(home).join(".cache")
+    };
+    Ok(base
+        .join("syq/helpers")
+        .join(&helper.tag)
+        .join(helper.target.key)
+        .join("syq"))
 }
 
 fn canonical_current_exe() -> Result<PathBuf> {
