@@ -131,19 +131,14 @@ impl Sched {
             && g.finishes.is_empty()
     }
 
-    /// Whether enough work is left for `n` workers to be measurable: the
-    /// namespace preflight has finished and at least `n` files are queued, or
-    /// the bytes left (queued files and ranges, plus what in-flight ranges
-    /// have not read yet) would keep `n` workers busy past the next window.
-    /// When this is false the transfer is not moving yet or is in its tail,
-    /// so throughput says nothing about the worker count.
-    pub fn work_left_for(&self, n: usize, bytes_per_worker: u64) -> bool {
+    /// Whether enough splittable activity remains to measure `n` workers.
+    /// `minimum_activity` is derived from the observed aggregate rate and the
+    /// time needed for a complete sampling window; queued files add the same
+    /// completion credit the tuner uses for small-file workloads.
+    pub fn work_left_for(&self, n: usize, minimum_activity: u64, file_credit: u64) -> bool {
         let g = self.inner.lock().unwrap();
         if !g.scan_done {
             return false;
-        }
-        if g.files.len() >= n {
-            return true;
         }
         let mut bytes: u64 = g.files.iter().map(|(s, _)| *s).sum();
         bytes += g.ranges.iter().map(|(_, o, e)| e - o).sum::<u64>();
@@ -155,7 +150,10 @@ impl Sched {
                 r.end.saturating_sub(r.pos)
             })
             .sum::<u64>();
-        bytes >= n as u64 * bytes_per_worker
+        let activity = bytes.saturating_add((g.files.len() as u64).saturating_mul(file_credit));
+        let work_units = g.files.len() + g.ranges.len() + g.inflight.len();
+        let parallel = work_units >= n || bytes >= (n as u64).saturating_mul(self.min_split);
+        parallel && activity >= minimum_activity
     }
 
     /// Hand the unread remainder of an in-flight range back to the queue (a
@@ -327,6 +325,20 @@ impl Sched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_gate_combines_bytes_file_credit_and_duration_requirement() {
+        let sched = Sched::new(64, 128);
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            inner.scan_done = true;
+            inner.files.push((100, Reverse(0)));
+            inner.files.push((100, Reverse(1)));
+        }
+        assert!(sched.work_left_for(2, 1_200, 512));
+        assert!(!sched.work_left_for(2, 1_300, 512));
+        assert!(!sched.work_left_for(3, 1_000, 512));
+    }
 
     #[test]
     fn retry_range_replaces_the_failed_inflight_share() {

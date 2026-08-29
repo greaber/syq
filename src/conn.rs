@@ -209,7 +209,8 @@ pub struct RemoteConn {
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
-    rx: std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    rx: Option<std::sync::mpsc::Receiver<std::io::Result<Response>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
     label: String,
     dead: bool,
     peer: Option<PeerInfo>,
@@ -221,9 +222,12 @@ const TRANSPORT_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 fn spawn_reader(
     input: Box<dyn Read + Send>,
-) -> std::sync::mpsc::Receiver<std::io::Result<Response>> {
+) -> (
+    std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    std::thread::JoinHandle<()>,
+) {
     let (tx, rx) = std::sync::mpsc::sync_channel(READ_AHEAD);
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
         loop {
             let msg = r.read_msg::<Response>();
@@ -233,7 +237,7 @@ fn spawn_reader(
             }
         }
     });
-    rx
+    (rx, reader)
 }
 
 fn receive_transport_stats(
@@ -275,6 +279,28 @@ fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()
 }
 
 impl RemoteConn {
+    fn transport_stats_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Option<TcpPairStats> {
+        let socket = self.tcp_socket.as_ref()?.try_clone().ok()?;
+        let local = tcp_socket_stats(&socket);
+        // Changing SO_RCVTIMEO cannot wake a reader already blocked on another
+        // clone. Bound the actual response wait instead. This connection is
+        // retired immediately after collection, so a late reply cannot become
+        // a response to a later request.
+        let peer = if self.dead || self.send(Request::TransportStats).is_err() {
+            None
+        } else {
+            receive_transport_stats(self.rx.as_ref().expect("reader receiver present"), timeout)
+        };
+        (local.is_some() || peer.is_some()).then(|| TcpPairStats {
+            label: self.label.clone(),
+            local,
+            peer,
+        })
+    }
+
     fn io_err(&mut self, e: anyhow::Error) -> anyhow::Error {
         self.dead = true;
         // If the child has exited (or does so shortly), that's the more useful error.
@@ -303,7 +329,7 @@ impl Conn for RemoteConn {
         self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))
     }
     fn recv(&mut self) -> Result<Response> {
-        match self.rx.recv() {
+        match self.rx.as_ref().expect("reader receiver present").recv() {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => Err(self.io_err(e.into())),
             Err(_) => Err(self.io_err(
@@ -315,22 +341,7 @@ impl Conn for RemoteConn {
         self.dead
     }
     fn transport_stats(&mut self) -> Option<TcpPairStats> {
-        let socket = self.tcp_socket.as_ref()?.try_clone().ok()?;
-        let local = tcp_socket_stats(&socket);
-        // Changing SO_RCVTIMEO cannot wake a reader already blocked on another
-        // clone. Bound the actual response wait instead. This connection is
-        // retired immediately after collection, so a late reply cannot become
-        // a response to a later request.
-        let peer = if self.dead || self.send(Request::TransportStats).is_err() {
-            None
-        } else {
-            receive_transport_stats(&self.rx, TRANSPORT_STATS_TIMEOUT)
-        };
-        (local.is_some() || peer.is_some()).then(|| TcpPairStats {
-            label: self.label.clone(),
-            local,
-            peer,
-        })
+        self.transport_stats_with_timeout(TRANSPORT_STATS_TIMEOUT)
     }
     fn scan(
         &mut self,
@@ -372,8 +383,20 @@ impl Drop for RemoteConn {
         if !self.dead {
             let _ = self.w.write_msg(&Request::Shutdown);
         }
+        // Sending Shutdown asks for an orderly peer exit; shutting down the
+        // retained TCP descriptor also wakes our reader clone and the peer's
+        // request reader if either side is wedged or the diagnostic reply
+        // timed out. Drop the receiver before joining so a reader blocked on a
+        // full response channel can exit as well.
+        if let Some(socket) = &self.tcp_socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        self.rx.take();
         if let Some(child) = &mut self.child {
             let _ = child.wait();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
         }
     }
 }
@@ -638,10 +661,12 @@ impl RemoteSpec {
             .with_context(|| format!("spawn {:?}", self.rsh[0]))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let (rx, reader) = spawn_reader(Box::new(stdout));
         let conn = RemoteConn {
             child: Some(child),
             w: FrameWriter::new(Box::new(stdin), compress),
-            rx: spawn_reader(Box::new(stdout)),
+            rx: Some(rx),
+            reader: Some(reader),
             label: self.label(),
             dead: false,
             peer: None,
@@ -846,10 +871,12 @@ impl RemoteSpec {
             let writer = RecordWriter::new(stream.try_clone()?, wc);
             let tcp_socket = stream.try_clone()?;
             let reader = RecordReader::new(stream, rc);
+            let (rx, reader) = spawn_reader(Box::new(reader));
             let conn = RemoteConn {
                 child: None,
                 w: FrameWriter::new(Box::new(writer), compress),
-                rx: spawn_reader(Box::new(reader)),
+                rx: Some(rx),
+                reader: Some(reader),
                 label: format!("{} (tcp {addr_s})", self.label()),
                 dead: false,
                 peer: None,
@@ -1410,6 +1437,24 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
+    struct ExitObserved<R> {
+        inner: R,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<R: Read> Read for ExitObserved<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl<R> Drop for ExitObserved<R> {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn kernel_tcp_stats_are_available_for_a_live_socket() {
@@ -1447,6 +1492,51 @@ mod tests {
         assert!(receive_transport_stats(&receiver, timeout).is_none());
         assert!(start.elapsed() >= timeout);
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn repeatedly_retiring_timed_out_tcp_connections_joins_their_readers() {
+        const CONNECTIONS: usize = 32;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..CONNECTIONS {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request_bytes = Vec::new();
+                socket.read_to_end(&mut request_bytes).unwrap();
+                assert!(!request_bytes.is_empty());
+            }
+        });
+
+        for _ in 0..CONNECTIONS {
+            let socket = TcpStream::connect(address).unwrap();
+            let writer = socket.try_clone().unwrap();
+            let tcp_socket = socket.try_clone().unwrap();
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let input = ExitObserved {
+                inner: socket,
+                dropped: dropped.clone(),
+            };
+            let (rx, reader) = spawn_reader(Box::new(input));
+            let mut connection = RemoteConn {
+                child: None,
+                w: FrameWriter::new(Box::new(writer), false),
+                rx: Some(rx),
+                reader: Some(reader),
+                label: "test tcp".into(),
+                dead: false,
+                peer: None,
+                tcp_socket: Some(tcp_socket),
+            };
+            let timeout = std::time::Duration::from_millis(5);
+            let start = std::time::Instant::now();
+            let _ = connection.transport_stats_with_timeout(timeout);
+            assert!(start.elapsed() >= timeout);
+            drop(connection);
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(std::sync::Arc::strong_count(&dropped), 1);
+        }
+        server.join().unwrap();
     }
 
     fn entry(path: &[u8]) -> Entry {

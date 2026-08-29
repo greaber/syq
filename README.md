@@ -600,8 +600,10 @@ that compare no counts, failed/aborted copies, and runs whose TCP path falls
 back to ssh after workers start do not update it; the last case may contain
 mixed-transport measurements that are not representative of either pure path.
 
-Progress (bytes, plus a small credit per completed file so small-file trees
-count) is sampled every 2.5 s. A count has been *measured* only once two
+Useful progress (the high-water mark of logically completed bytes, plus a small
+credit per completed file so small-file trees count) is sampled every 2.5 s.
+Recovery can retract uncertain bytes, and retransmitting those same bytes does
+not inflate the tuning rate. A count has been *measured* only once two
 consecutive samples agree within 10 %, so a burst that gets throttled or a link
 still ramping up is waited out (up to 20 s) rather than credited to the last
 change. The first probe is a 1.3× step up — 8→10, not 8→16. A step up is kept
@@ -624,13 +626,17 @@ is a prior, not a rule — measured collapse aborts a probe early, and independe
 backoff lets downward evidence win.
 
 Upward candidates connect in the background while the settled workers keep
-copying; connection setup time is not scored as throughput. After a decision,
-surplus connections are closed instead of retaining the largest pool ever
-tried. At one active connection syq keeps exactly one ready spare so the
-important 1→2 probe remains cheap. A dropped data connection is reopened with
-bounded exponential backoff; ranges with uncertain acknowledgements and final
-publication are safely requeued. Transfers shorter than a measurement or two
-just run with the starting count. The progress line shows the current count
+copying; their stable rate refreshes the comparison baseline, while connection
+setup time itself is not scored. A probe starts only when the activity remaining
+at the observed rate is estimated to last through a complete measurement, so a
+slow path is not rejected by a fixed byte threshold and a very fast tail is not
+mistaken for evidence. After a decision, surplus connections and their reader
+threads are closed instead of retaining the largest pool ever tried. At one
+active connection syq keeps exactly one ready spare so the important 1→2 probe
+remains cheap. A dropped data connection is reopened with bounded exponential
+backoff; ranges with uncertain acknowledgements and final publication are
+safely requeued. Transfers shorter than a measurement or two just run with the
+starting count. The progress line shows the current count
 (`16 conn`), and `--stats` reports the path it took
 (`connections: auto: settled at 16 (path 16, peak 16)`).
 

@@ -65,16 +65,46 @@ const PROBE_BACKOFF_MAX: u32 = 3;
 const EVIDENCE_MAX_AGE: usize = PROBE_EVERY * 4;
 /// How often progress is sampled.
 pub const SAMPLE: Duration = Duration::from_millis(2500);
+/// One discarded warm-up interval plus the two samples needed for stability.
+const MEASUREMENT_SAMPLES: f64 = 3.0;
 /// Two consecutive samples this close count as a stable rate.
 const STABLE_WITHIN: f64 = 0.10;
 /// Give up waiting for stability after this many samples and use what we have.
 const MAX_SAMPLES: usize = 8;
-/// Don't judge a worker count unless each worker has at least this much left
-/// to do: in the tail of a transfer, idle workers say nothing about the path.
-const TAIL_BYTES_PER_WORKER: u64 = 64 << 20;
+/// Conservative requirement before the first rate sample. Every real probe is
+/// based on a measured duration estimate; this is only a startup fallback.
+const TAIL_FALLBACK_BYTES_PER_WORKER: u64 = 64 << 20;
 /// A completed file counts as this many bytes, so small-file transfers
 /// (where bytes are negligible) still produce a usable signal.
 pub const FILE_CREDIT: u64 = 512 * 1024;
+
+fn sample_interval() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(milliseconds) = std::env::var_os("SYQ_TEST_TUNE_SAMPLE_MS")
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    SAMPLE
+}
+
+fn required_remaining_activity(rate: Option<f64>, workers: usize, sample: Duration) -> u64 {
+    match rate.filter(|rate| rate.is_finite() && *rate >= 0.0) {
+        Some(rate) => (rate * sample.as_secs_f64() * MEASUREMENT_SAMPLES)
+            .ceil()
+            .clamp(0.0, u64::MAX as f64) as u64,
+        None => (workers as u64).saturating_mul(TAIL_FALLBACK_BYTES_PER_WORKER),
+    }
+}
+
+fn enough_work(sched: &Sched, workers: usize, rate: Option<f64>, sample: Duration) -> bool {
+    sched.work_left_for(
+        workers,
+        required_remaining_activity(rate, workers, sample),
+        FILE_CREDIT,
+    )
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TuningCache {
@@ -290,7 +320,8 @@ impl Direction {
 enum State {
     /// Waiting for the starting count's first useful measurement.
     Initial,
-    /// Measuring `n` against the last accepted count and its frozen score.
+    /// Measuring `n` against the last accepted count and its baseline score.
+    /// An upward baseline may refresh while candidate workers are warming.
     Explore {
         from: usize,
         base: f64,
@@ -383,6 +414,35 @@ impl Policy {
         match self.state {
             State::Explore { base, .. } => Some(base),
             _ => None,
+        }
+    }
+
+    /// Refresh an upward probe's comparison while its extra workers warm. The
+    /// settled count remains active, so this is baseline evidence rather than
+    /// a new policy tick or worker-count comparison.
+    fn refresh_warming_baseline(&mut self, score: f64) -> bool {
+        let from = match &mut self.state {
+            State::Explore {
+                from,
+                base,
+                direction: Direction::Up,
+            } if *from == self.active => {
+                *base = score;
+                Some(*from)
+            }
+            _ => None,
+        };
+        if let Some(from) = from {
+            self.points.insert(
+                from,
+                Point {
+                    score,
+                    measured_at: self.tick,
+                },
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -561,10 +621,7 @@ impl Policy {
                     // Keep the larger count only when it is near-best and the
                     // smaller baseline is not. If both qualify, the objective
                     // explicitly prefers the smaller one.
-                    Direction::Up => {
-                        let from_score = self.points.get(&from).map_or(base, |point| point.score);
-                        score >= floor && from_score < floor
-                    }
+                    Direction::Up => score >= floor && base < floor,
                     Direction::Down => score >= floor,
                 };
                 self.comparisons += 1;
@@ -780,9 +837,12 @@ pub fn run(
     let mut sample_start = std::time::Instant::now();
     let mut active = policy.active();
     let mut collapse_samples = 0;
+    let sample = sample_interval();
+    let poll = Duration::from_millis(250).min(sample);
+    let mut last_rate = None;
     meter.set_active(policy.n);
     loop {
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(poll);
         if sched.is_aborted() || sched.finished() {
             break;
         }
@@ -809,7 +869,7 @@ pub fn run(
             continue;
         }
         if policy.n > active {
-            if !sched.work_left_for(policy.n, TAIL_BYTES_PER_WORKER) {
+            if !enough_work(&sched, policy.n, last_rate, sample) {
                 policy.cancel_unapplied();
                 gate.set_retain(if active == 1 { 2 } else { active });
                 continue;
@@ -846,8 +906,45 @@ pub fn run(
                         policy.state
                     );
                 }
+                continue;
             }
-            // Provisioning time is not a throughput measurement.
+
+            // The settled workers keep providing a fresh comparison while an
+            // upward candidate connects. This prevents handshake delay from
+            // turning unrelated path drift into an apparent candidate effect.
+            if sample_start.elapsed() >= sample {
+                let now = (meter.bytes(), meter.files());
+                let secs = sample_start.elapsed().as_secs_f64();
+                sample_start = std::time::Instant::now();
+                if !gate.ready_through(active) {
+                    last = now;
+                    sampler.reset();
+                    continue;
+                }
+                let Some(rate) = activity_rate(last, now, secs) else {
+                    last = now;
+                    sampler.reset();
+                    continue;
+                };
+                last = now;
+                last_rate = Some(rate);
+                if !enough_work(&sched, policy.n, last_rate, sample) {
+                    policy.cancel_unapplied();
+                    gate.set_retain(if active == 1 { 2 } else { active });
+                    sampler.reset();
+                    continue;
+                }
+                if let Some(score) = sampler.push(rate) {
+                    policy.refresh_warming_baseline(score);
+                    if crate::transfer::debug() {
+                        eprintln!(
+                            "syq: tune: refreshed {active}-worker baseline to {:.1} MB/s while {} workers warm",
+                            score / 1e6,
+                            policy.n
+                        );
+                    }
+                }
+            }
             continue;
         }
 
@@ -862,16 +959,15 @@ pub fn run(
             sched.abort();
             break;
         }
-        if sample_start.elapsed() < SAMPLE {
+        if sample_start.elapsed() < sample {
             continue;
         }
         let now = (meter.bytes(), meter.files());
         let secs = sample_start.elapsed().as_secs_f64();
         sample_start = std::time::Instant::now();
         // Only judge a configuration once every requested worker is actually
-        // connected (ssh sessions can take seconds each), and only while there
-        // is enough work left — in the tail, idle workers say nothing.
-        if !gate.ready_through(active) || !sched.work_left_for(active, TAIL_BYTES_PER_WORKER) {
+        // connected (ssh sessions can take seconds each).
+        if !gate.ready_through(active) {
             last = now;
             sampler.reset();
             continue;
@@ -888,6 +984,15 @@ pub fn run(
             continue;
         };
         last = now;
+        last_rate = Some(rate);
+        // Estimate the time left at the rate just observed. In the tail, idle
+        // workers say nothing; unlike a fixed byte threshold this remains
+        // useful on both very slow and very fast paths.
+        if !enough_work(&sched, active, last_rate, sample) {
+            sampler.reset();
+            collapse_samples = 0;
+            continue;
+        }
         if policy
             .probe_base()
             .is_some_and(|base| base > 0.0 && rate < 0.5 * base)
@@ -1019,6 +1124,32 @@ mod tests {
             activity_rate((100, 2), (110, 3), 2.0),
             Some((10.0 + FILE_CREDIT as f64) / 2.0)
         );
+    }
+
+    #[test]
+    fn remaining_work_requirement_scales_with_rate_not_worker_count() {
+        let slow = required_remaining_activity(Some(1_000_000.0), 8, SAMPLE);
+        let fast = required_remaining_activity(Some(1_000_000_000.0), 8, SAMPLE);
+        assert_eq!(slow, 7_500_000);
+        assert_eq!(fast, 7_500_000_000);
+        assert_eq!(
+            required_remaining_activity(None, 8, SAMPLE),
+            8 * TAIL_FALLBACK_BYTES_PER_WORKER
+        );
+    }
+
+    #[test]
+    fn upward_probe_refreshes_its_baseline_while_warming() {
+        let mut policy = Policy::new(10, MIN, MAX);
+        policy.observe(100.0);
+        assert_eq!(policy.active(), 10);
+        assert_eq!(policy.n, 13);
+        assert!(policy.refresh_warming_baseline(70.0));
+        assert_eq!(policy.probe_base(), Some(70.0));
+
+        policy.activated();
+        policy.observe(75.0);
+        assert_eq!(policy.settled(), 13);
     }
 
     #[test]

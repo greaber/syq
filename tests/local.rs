@@ -1123,6 +1123,82 @@ fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    let data: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|offset| (offset % 251) as u8)
+        .collect();
+    fs::create_dir_all(t.path("src")).unwrap();
+    for index in 0..10 {
+        write(&t.path(&format!("src/file-{index}")), &data);
+    }
+    let remote = format!("fake:{}", t.s("dst"));
+    let marker = t.path("drop-after-samples");
+    let cache = t.path("tuning.json");
+    write(
+        &cache,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "paths": { "v1|local>fake|ssh": 2 }
+        }))
+        .unwrap()
+        .as_bytes(),
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .args([
+            "--no-tcp",
+            "-a",
+            "--no-bootstrap",
+            "--block-size=64K",
+            "--bwlimit=4M",
+            "--stats",
+            &t.s("src/"),
+            &remote,
+            "--no-progress",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("SYQ_TUNING_CACHE", &cache)
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
+        .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
+        .env("SYQ_TEST_DROP_AFTER_N_REQUESTS", "32")
+        .env("SYQ_TEST_DROP_MARKER", &marker)
+        .output()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert!(marker.exists());
+    for index in 0..10 {
+        assert_eq!(read(&t.path(&format!("dst/file-{index}"))), data);
+    }
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("connection dropped; reopening"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("2 -> 3 workers (candidate ready"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("3 -> 2 workers"), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("connections: auto:"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn lost_finalize_response_is_verified_after_reconnect() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
