@@ -864,6 +864,7 @@ pub fn run(args: Args) -> Result<i32> {
         checkpoint: checkpoint_writer,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
+        dry_run_replaced_dirs: std::collections::HashSet::new(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
         live_sidecars: Vec::new(),
@@ -934,8 +935,11 @@ pub fn run(args: Args) -> Result<i32> {
             &src_root,
             follow,
             &sub,
-            &dst_root,
-            dst_is_dir,
+            DestinationRoot {
+                path: &dst_root,
+                existed: dst_existed,
+                is_dir: dst_is_dir,
+            },
         ) {
             Ok(mapping) => dry_run_mappings.push(mapping),
             Err(e) => {
@@ -1628,6 +1632,10 @@ struct Planner<'a> {
     /// (or aren't directories); --ignore-existing: an existing non-directory
     /// sits at their path. Nothing under them is touched.
     missing_dirs: std::collections::HashSet<PathBytes>,
+    /// Directories that a dry run would create over destination leaves. Until
+    /// that virtual replacement exists, lstat would follow an old in-tree
+    /// symlink in an intermediate component and inspect the wrong subtree.
+    dry_run_replaced_dirs: std::collections::HashSet<PathBytes>,
     completed:
         Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>>,
     checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
@@ -1751,9 +1759,11 @@ impl Planner<'_> {
         src_root: &[u8],
         follow: bool,
         sub: &str,
-        dst_root: &[u8],
-        dst_is_dir: bool,
+        destination: DestinationRoot<'_>,
     ) -> Result<DryRunMapping> {
+        let dst_root = destination.path;
+        let dst_is_dir = destination.is_dir;
+        let dst_existed = destination.existed;
         let mut first = true;
         let mut sub = sub.to_string();
         let mut skip_all = false;
@@ -1766,6 +1776,19 @@ impl Planner<'_> {
             if first {
                 first = false;
                 if let Some(root) = batch.first() {
+                    if pl.opts.dry_run
+                        && root.kind == Kind::Dir
+                        && !follow
+                        && pl.opts.recursive
+                        && dst_existed
+                        && !dst_is_dir
+                    {
+                        bail!(
+                            "destination {} is not a directory; cannot place directory {} inside it",
+                            display(dst_root),
+                            display(src_root)
+                        );
+                    }
                     if root.kind != Kind::Dir && !dst_is_dir {
                         sub = String::new();
                     }
@@ -2229,9 +2252,15 @@ impl Planner<'_> {
         // the same filtered list drives creation, listing and deferred
         // metadata so they can't disagree.
         if !dirs.is_empty() {
-            let stats = self.stat_many(dirs.iter().map(|(p, _, _)| p.clone()).collect())?;
+            let stats = self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?;
             let mut planned: Vec<(PathBytes, PathBytes, Entry, Option<Entry>)> = Vec::new();
-            for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
+            for ((p, dst_rel, e), mut st) in dirs.into_iter().zip(stats) {
+                // Keep the parent-first overlay invariant explicit here too:
+                // a directory below a replacement is missing in the virtual
+                // destination tree.
+                if opts.dry_run && Self::under_any(&self.dry_run_replaced_dirs, &p, dst_root) {
+                    st = None;
+                }
                 let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
                 if opts.verify_only {
                     if !is_dir {
@@ -2266,6 +2295,9 @@ impl Planner<'_> {
                     }
                     self.missing_dirs.insert(p);
                     continue;
+                }
+                if opts.dry_run && st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
+                    self.dry_run_replaced_dirs.insert(p.clone());
                 }
                 planned.push((p, dst_rel, e, st));
             }
@@ -2380,7 +2412,9 @@ impl Planner<'_> {
             let completed = self.completed.clone().unwrap();
             let mut kept = Vec::with_capacity(others.len());
             for p in others.into_iter() {
-                if p.e.kind == Kind::File {
+                let virtually_missing =
+                    opts.dry_run && Self::under_any(&self.dry_run_replaced_dirs, &p.dst, dst_root);
+                if p.e.kind == Kind::File && !virtually_missing {
                     if let Some(c) = completed.get(&p.dst_rel) {
                         if c.matches(&p.e, opts.flags) {
                             self.progress.files_skipped.fetch_add(1, Relaxed);
@@ -2393,7 +2427,10 @@ impl Planner<'_> {
             }
             others = kept;
         }
-        let stats = self.stat_many(others.iter().map(|p| p.dst.clone()).collect())?;
+        let stats = self.stat_many_with_dry_run_overlay(
+            others.iter().map(|p| p.dst.clone()).collect(),
+            dst_root,
+        )?;
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<String> = Vec::new();
         // Metadata repairs for quick-check-identical files, each with the
@@ -3212,6 +3249,95 @@ impl Planner<'_> {
 
     fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
         stat_many(self.dst, paths, false)
+    }
+
+    /// lstat paths that remain reachable after the directory replacements a
+    /// dry run has already planned. Descendants of those replacements are
+    /// virtually missing; querying them would follow the old intermediate
+    /// leaf that the real run removes first.
+    fn stat_many_with_dry_run_overlay(
+        &mut self,
+        paths: Vec<PathBytes>,
+        dst_root: &[u8],
+    ) -> Result<Vec<Option<Entry>>> {
+        if !self.opts.dry_run || self.dry_run_replaced_dirs.is_empty() {
+            return self.stat_many(paths);
+        }
+        let mut visible = Vec::new();
+        let mut indexes = Vec::new();
+        let mut results = vec![None; paths.len()];
+        for (index, path) in paths.into_iter().enumerate() {
+            if !Self::under_any(&self.dry_run_replaced_dirs, &path, dst_root) {
+                indexes.push(index);
+                visible.push(path);
+            }
+        }
+        for (index, entry) in indexes.into_iter().zip(self.stat_many(visible)?) {
+            results[index] = entry;
+        }
+        Ok(results)
+    }
+
+    /// Stat dry-run directories parent-depth first. Discovering a destination
+    /// leaf at one depth makes its whole source-directory subtree virtually
+    /// missing at deeper levels, so no request traverses the leaf that the
+    /// real run would already have replaced.
+    fn stat_directories_with_dry_run_overlay(
+        &mut self,
+        dirs: &[(PathBytes, PathBytes, Entry)],
+        dst_root: &[u8],
+    ) -> Result<Vec<Option<Entry>>> {
+        if !self.opts.dry_run {
+            return self.stat_many(dirs.iter().map(|(path, _, _)| path.clone()).collect());
+        }
+        let existing = self.opts.existing;
+        let ignore_existing = self.opts.ignore_existing;
+        let mut replaced = self.dry_run_replaced_dirs.clone();
+        let mut missing = self.missing_dirs.clone();
+        let mut by_depth: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, (_, dst_rel, _)) in dirs.iter().enumerate() {
+            let depth = if dst_rel.is_empty() {
+                0
+            } else {
+                1 + dst_rel.iter().filter(|&&byte| byte == b'/').count()
+            };
+            by_depth.entry(depth).or_default().push(index);
+        }
+
+        let mut results = vec![None; dirs.len()];
+        for indexes in by_depth.into_values() {
+            let mut visible = Vec::new();
+            let mut visible_indexes = Vec::new();
+            for &index in &indexes {
+                let path = &dirs[index].0;
+                let hidden_by_replacement = Self::under_any(&replaced, path, dst_root);
+                let hidden_by_option =
+                    (existing || ignore_existing) && Self::under_any(&missing, path, dst_root);
+                if !hidden_by_replacement && !hidden_by_option {
+                    visible_indexes.push(index);
+                    visible.push(path.clone());
+                }
+            }
+            for (index, entry) in visible_indexes.into_iter().zip(self.stat_many(visible)?) {
+                results[index] = entry;
+            }
+            for index in indexes {
+                let path = &dirs[index].0;
+                let entry = &results[index];
+                let is_dir = entry.as_ref().is_some_and(|item| item.kind == Kind::Dir);
+                let conflict = ignore_existing && !is_dir && entry.is_some();
+                if conflict
+                    || (existing && !is_dir)
+                    || ((existing || ignore_existing) && Self::under_any(&missing, path, dst_root))
+                {
+                    missing.insert(path.clone());
+                } else if entry.as_ref().is_some_and(|item| item.kind != Kind::Dir) {
+                    replaced.insert(path.clone());
+                }
+            }
+        }
+        Ok(results)
     }
 
     fn partial_paths(

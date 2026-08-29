@@ -259,6 +259,8 @@ Identical to rsync:
 
 - `syq -a src dest` copies the directory itself → `dest/src`. `dest` is
   created if missing.
+- An existing non-directory `dest` cannot be the parent of that `dest/src`
+  mapping; dry-run rejects it instead of presenting an impossible summary.
 - `syq -a src/ dest` copies the *contents* of `src` into `dest`. `src/.` and
   `.` behave the same way.
 - A single file source goes to `dest/file` if `dest` is an existing directory,
@@ -308,7 +310,9 @@ resolves to. The `changes` line separately accounts for regular files,
 directories, symlinks, special files, and metadata-only updates; type
 replacements are called out as an overlapping subset. This is a current
 preflight assessment, not a frozen mutation ledger that can later be executed
-unchanged.
+unchanged. When a destination leaf will be replaced by a directory, descendants
+are assessed against that post-replacement directory rather than through the
+old leaf (including an old symlink).
 
 The logical-data upper bound is the full size of regular files that fail the
 planning-time metadata check. Resume state, block reuse, reflinks, compression,

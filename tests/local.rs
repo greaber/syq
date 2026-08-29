@@ -1726,6 +1726,91 @@ fn dry_run_accounts_for_changed_symlinks_and_type_replacements() {
 }
 
 #[test]
+fn dry_run_directory_replacement_makes_descendants_virtually_missing() {
+    let t = Tmp::new();
+    write(&t.path("src/d/f"), b"same");
+    write(&t.path("outside/f"), b"same");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("dst/d")).unwrap();
+    set_mtime(&t.path("src/d/f"), 1_600_000_000);
+    set_mtime(&t.path("outside/f"), 1_600_000_000);
+    set_mtime(&t.path("src"), 1_600_000_100);
+    set_mtime(&t.path("dst"), 1_600_000_100);
+
+    let out = run_ok(&["-anv", &t.s("src/"), &t.s("dst")]);
+    let changes = out
+        .lines()
+        .find(|line| line.starts_with("  changes:"))
+        .unwrap_or_else(|| panic!("missing changes line in {out}"));
+    assert!(changes.contains("1 regular file"), "{out}");
+    assert!(changes.contains("1 directory"), "{out}");
+    assert!(changes.contains("1 type replacement among them"), "{out}");
+    assert!(
+        out.contains("4 B in 1 file needing content work (upper bound)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("0 B in 0 files with unchanged content"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "replace with directory {}/ (destination is symlink)",
+            t.s("dst/d")
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "create file {} (destination missing)",
+            t.s("dst/d/f")
+        )),
+        "{out}"
+    );
+    assert!(t.path("dst/d").symlink_metadata().unwrap().is_symlink());
+    assert_eq!(read(&t.path("outside/f")), b"same");
+
+    let actual = run_ok(&["-a", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(transferred(&actual), 1, "{actual}");
+    assert!(t.path("dst/d").is_dir());
+    assert_eq!(read(&t.path("dst/d/f")), b"same");
+    assert_eq!(read(&t.path("outside/f")), b"same");
+}
+
+#[test]
+fn dry_run_rejects_bare_directory_into_existing_file() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"source");
+    write(&t.path("destination"), b"keep me");
+
+    let skipped = syq(&["-n", &t.s("src"), &t.s("destination")]);
+    assert!(skipped.status.success(), "{}", stderr_of(&skipped));
+    assert!(stderr_of(&skipped).contains("skipping directory"));
+
+    let dry = syq(&["-an", &t.s("src"), &t.s("destination")]);
+    assert!(!dry.status.success());
+    assert!(
+        stderr_of(&dry).contains(&format!(
+            "destination {} is not a directory; cannot place directory {} inside it",
+            t.s("destination"),
+            t.s("src")
+        )),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&dry.stdout),
+        stderr_of(&dry)
+    );
+    assert!(
+        !String::from_utf8_lossy(&dry.stdout).contains("syq: dry-run summary"),
+        "a rejected mapping must not print a successful summary"
+    );
+    assert_eq!(read(&t.path("destination")), b"keep me");
+
+    let actual = syq(&["-a", &t.s("src"), &t.s("destination")]);
+    assert_eq!(actual.status.code(), Some(23), "{}", stderr_of(&actual));
+    assert_eq!(read(&t.path("destination")), b"keep me");
+}
+
+#[test]
 fn inplace_leaves_no_partial() {
     let t = Tmp::new();
     let data = prng(3 * 1024 * 1024, 5);
