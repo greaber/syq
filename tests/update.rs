@@ -317,11 +317,11 @@ fn automatic_update_flags_are_no_longer_supported() {
 
     assert_failure_contains(
         &fixture.command("--enable-auto-update"),
-        "unexpected argument '--enable-auto-update'",
+        "expected a command",
     );
     assert_failure_contains(
         &fixture.command("--disable-auto-update"),
-        "unexpected argument '--disable-auto-update'",
+        "expected a command",
     );
 }
 

@@ -10,10 +10,9 @@ Run it from the repository root:
 python3 scripts/rsync-compat.py
 ```
 
-The manifest currently routes upstream invocations to native `syq`, because the
-dedicated command does not exist yet. When `syq rsync` lands, changing
-`target.args` from `[]` to `["rsync"]` switches the whole suite without patching
-upstream tests or adding a second harness mode.
+The manifest routes upstream invocations to `syq rsync`, keeping compatibility
+coverage separate from the native command grammar without patching upstream
+tests or adding a second harness mode.
 
 The first run fetches the commit pinned in `manifest.toml`, prepares rsync's
 test helpers under `target/rsync-compat/`, builds SYQ, and runs the applicable
