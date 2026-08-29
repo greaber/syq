@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import collections
 import hashlib
+from html import escape
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,28 @@ INVENTORY_PATH = COMPAT_DIR / "inventory.tsv"
 LEDGER_PATH = COMPAT_DIR / "LEDGER.md"
 VALID_CLASSES = {"conformance", "adapted", "unsupported", "out-of-scope", "unassessed"}
 VALID_OUTCOMES = {"pass", "fail", "skip", "xfail"}
+VALID_POSITIONS = {
+    "compatible",
+    "unimplemented",
+    "intentional-divergence",
+    "policy-open",
+    "test-unresolved",
+}
+POSITION_LABELS = {
+    "compatible": "Compatible",
+    "unimplemented": "Unimplemented",
+    "intentional-divergence": "Intentional divergence",
+    "policy-open": "Policy open",
+    "test-unresolved": "Test unresolved",
+}
+POSITION_DESCRIPTIONS = {
+    "compatible": "The exercised behavior currently agrees with the reviewed rsync behavior.",
+    "unimplemented": "Relevant behavior that SYQ does not currently implement.",
+    "intentional-divergence": "SYQ deliberately uses different behavior for this scenario.",
+    "policy-open": "SYQ differs and the desired compatibility policy is not decided.",
+    "test-unresolved": "The observation may reflect the fixture, harness, or an unclear test claim.",
+}
+VALID_ADAPTATION_KINDS = {"invocation", "fixture", "subset"}
 RESULT_RE = re.compile(r"^(PASS|FAIL|SKIP|XFAIL)\s+([^\s(]+)")
 
 
@@ -62,7 +85,7 @@ def output(argv: list[str], *, cwd: Path | None = None) -> str:
 def load_manifest() -> dict:
     with MANIFEST_PATH.open("rb") as handle:
         data = tomllib.load(handle)
-    if data.get("schema") != 1:
+    if data.get("schema") != 2:
         raise CompatError(f"{MANIFEST_PATH}: unsupported schema {data.get('schema')!r}")
     return data
 
@@ -103,11 +126,13 @@ def upstream_test_names(source: Path) -> set[str]:
 def validate_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]], source: Path) -> None:
     reasons = manifest.get("reasons", {})
     tests = manifest.get("tests", [])
-    enabled_profiles = {
-        name
-        for name, profile in manifest.get("profiles", {}).items()
-        if profile.get("enabled", False)
-    }
+    target = manifest.get("target", {})
+    if (
+        not re.fullmatch(r"[a-z0-9][a-z0-9-]*", target.get("name", ""))
+        or not isinstance(target.get("args"), list)
+        or not all(isinstance(arg, str) for arg in target.get("args", []))
+    ):
+        raise CompatError(f"{MANIFEST_PATH}: target requires a name and string args")
     configured: dict[str, dict] = {}
     for test in tests:
         name = test.get("name")
@@ -119,19 +144,19 @@ def validate_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]
             raise CompatError(f"{MANIFEST_PATH}: {name}: runnable test has bad classification")
         if name not in inventory or inventory[name][0] != classification:
             raise CompatError(f"{MANIFEST_PATH}: {name}: manifest and inventory disagree")
-        expectations = test.get("expect", {})
-        missing_profiles = sorted(enabled_profiles - expectations.keys())
-        if missing_profiles:
-            raise CompatError(
-                f"{MANIFEST_PATH}: {name}: no expectation for {missing_profiles[0]!r}"
-            )
-        for profile_name, expected in expectations.items():
-            if profile_name not in manifest.get("profiles", {}):
-                raise CompatError(f"{MANIFEST_PATH}: {name}: unknown profile {profile_name!r}")
-            if expected not in VALID_OUTCOMES:
-                raise CompatError(f"{MANIFEST_PATH}: {name}: bad expected outcome {expected!r}")
-        if classification == "adapted" and not test.get("adaptation"):
-            raise CompatError(f"{MANIFEST_PATH}: {name}: adapted test has no adaptation id")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", test.get("area", "")):
+            raise CompatError(f"{MANIFEST_PATH}: {name}: missing or invalid area")
+        if test.get("position") not in VALID_POSITIONS:
+            raise CompatError(f"{MANIFEST_PATH}: {name}: invalid product position")
+        if test.get("baseline") not in VALID_OUTCOMES:
+            raise CompatError(f"{MANIFEST_PATH}: {name}: invalid observation baseline")
+        if classification == "adapted":
+            if not test.get("adaptation"):
+                raise CompatError(f"{MANIFEST_PATH}: {name}: adapted test has no adaptation id")
+            if test.get("adaptation_kind") not in VALID_ADAPTATION_KINDS:
+                raise CompatError(f"{MANIFEST_PATH}: {name}: invalid adaptation kind")
+        elif test.get("adaptation") or test.get("adaptation_kind"):
+            raise CompatError(f"{MANIFEST_PATH}: {name}: unmodified test names an adaptation")
 
     for name, (classification, reason) in inventory.items():
         if classification in {"conformance", "adapted"} and name not in configured:
@@ -191,83 +216,66 @@ def helpers_ready(source: Path, helpers: list[str]) -> bool:
     )
 
 
-def patch_header_path(raw: str, *, git_prefix: bool) -> str | None:
-    raw = raw.split("\t", 1)[0]
-    if raw.startswith('"'):
-        try:
-            fields = shlex.split(raw)
-        except ValueError as error:
-            raise CompatError(f"malformed quoted patch path: {raw!r}") from error
-        if len(fields) != 1:
-            raise CompatError(f"malformed quoted patch path: {raw!r}")
-        raw = fields[0]
-    if raw == "/dev/null":
-        return None
-    if git_prefix:
-        if not raw.startswith(("a/", "b/")):
-            raise CompatError(f"malformed git patch path: {raw!r}")
-        raw = raw[2:]
-    return raw
+def git_patch_paths(adaptation: str, patch: bytes, *, reverse: bool) -> set[bytes]:
+    argv = ["git", "apply"]
+    if reverse:
+        argv.append("-R")
+    argv.extend(["--numstat", "-z", "-"])
+    result = subprocess.run(
+        argv,
+        cwd=ROOT,
+        input=patch,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise CompatError(f"adaptation {adaptation!r} is not a valid patch: {detail}")
+    paths: set[bytes] = set()
+    for record in result.stdout.split(b"\0"):
+        if not record:
+            continue
+        fields = record.split(b"\t", 2)
+        if len(fields) != 3 or not fields[2]:
+            raise CompatError(f"adaptation {adaptation!r} has malformed git numstat output")
+        paths.add(fields[2])
+    return paths
 
 
-def validate_adaptation_patch(adaptation: str, patch_text: str) -> None:
-    paths: list[str] = []
-    inside_hunk = False
-    for line in patch_text.splitlines():
-        if line.startswith("diff --git "):
-            inside_hunk = False
-            try:
-                fields = shlex.split(line)
-            except ValueError as error:
-                raise CompatError(
-                    f"adaptation {adaptation!r} has a malformed diff header"
-                ) from error
-            if len(fields) != 4:
-                raise CompatError(
-                    f"adaptation {adaptation!r} has a malformed diff header"
-                )
-            for raw in fields[2:]:
-                path = patch_header_path(raw, git_prefix=True)
-                if path is not None:
-                    paths.append(path)
-            continue
-        if line.startswith("@@ "):
-            inside_hunk = True
-            continue
-        if inside_hunk:
-            continue
-        for prefix, git_prefix in (
-            ("--- ", True),
-            ("+++ ", True),
-            ("rename from ", False),
-            ("rename to ", False),
-        ):
-            if line.startswith(prefix):
-                path = patch_header_path(line[len(prefix) :], git_prefix=git_prefix)
-                if path is not None:
-                    paths.append(path)
-                break
-
+def validate_adaptation_patch(adaptation: str, patch: bytes) -> None:
+    # Forward numstat exposes destinations; reverse numstat exposes rename and
+    # copy sources. Git is also the parser that will apply these exact bytes.
+    paths = git_patch_paths(adaptation, patch, reverse=False)
+    paths.update(git_patch_paths(adaptation, patch, reverse=True))
     if not paths or any(
-        not path.startswith("testsuite/") or ".." in Path(path).parts for path in paths
+        not path.startswith(b"testsuite/") or b".." in path.split(b"/")
+        for path in paths
     ):
         raise CompatError(
             f"adaptation {adaptation!r} must change only upstream testsuite files"
         )
 
 
-def suite_key(manifest: dict, commit: str, adaptations: list[str]) -> str:
+def load_adaptations(adaptations: list[str]) -> dict[str, bytes]:
+    loaded: dict[str, bytes] = {}
+    for adaptation in adaptations:
+        path = COMPAT_DIR / "adaptations" / f"{adaptation}.patch"
+        if not path.is_file():
+            raise CompatError(f"adaptation {adaptation!r} has no patch at {path}")
+        patch = path.read_bytes()
+        validate_adaptation_patch(adaptation, patch)
+        loaded[adaptation] = patch
+    return loaded
+
+
+def suite_key(manifest: dict, commit: str, adaptations: dict[str, bytes]) -> str:
     digest = hashlib.sha256()
     digest.update(commit.encode())
     digest.update(json.dumps(manifest["upstream"]["configure_args"]).encode())
     digest.update(json.dumps(manifest["upstream"]["helpers"]).encode())
-    for adaptation in adaptations:
-        patch = COMPAT_DIR / "adaptations" / f"{adaptation}.patch"
-        if not patch.is_file():
-            raise CompatError(f"adaptation {adaptation!r} has no patch at {patch}")
-        validate_adaptation_patch(adaptation, patch.read_text())
+    for adaptation, patch in adaptations.items():
         digest.update(adaptation.encode())
-        digest.update(patch.read_bytes())
+        digest.update(patch)
     return digest.hexdigest()[:20]
 
 
@@ -282,7 +290,7 @@ def prepare_base_suite(
     if source_was_explicit and helpers_ready(source, helpers):
         return source
 
-    key = suite_key(manifest, manifest["upstream"]["commit"], [])
+    key = suite_key(manifest, manifest["upstream"]["commit"], {})
     suites = cache / "suites"
     suites.mkdir(parents=True, exist_ok=True)
     destination = suites / key
@@ -327,7 +335,7 @@ def prepare_suite(
     source: Path,
     cache: Path,
     manifest: dict,
-    adaptations: list[str],
+    adaptations: dict[str, bytes],
     jobs: int,
     source_was_explicit: bool,
 ) -> Path:
@@ -356,14 +364,19 @@ def prepare_suite(
             symlinks=True,
             ignore=shutil.ignore_patterns("testtmp", "__pycache__"),
         )
-        for adaptation in adaptations:
-            patch = COMPAT_DIR / "adaptations" / f"{adaptation}.patch"
-            run(["git", "apply", "--whitespace=nowarn", str(patch)], cwd=temporary)
+        for adaptation, patch in adaptations.items():
+            print(f"+ git apply --whitespace=nowarn {adaptation}.patch", flush=True)
+            subprocess.run(
+                ["git", "apply", "--whitespace=nowarn", "-"],
+                cwd=temporary,
+                input=patch,
+                check=True,
+            )
         (temporary / marker.name).write_text(
             json.dumps(
                 {
                     "commit": manifest["upstream"]["commit"],
-                    "adaptations": adaptations,
+                    "adaptations": list(adaptations),
                 },
                 sort_keys=True,
             )
@@ -385,7 +398,7 @@ def running_as() -> str:
     return "root" if hasattr(os, "geteuid") and os.geteuid() == 0 else "non-root"
 
 
-def select_tests(manifest: dict, profile: str) -> tuple[list[dict], list[dict]]:
+def select_tests(manifest: dict) -> tuple[list[dict], list[dict]]:
     selected: list[dict] = []
     environment_excluded: list[dict] = []
     current_platform = platform_name()
@@ -398,14 +411,18 @@ def select_tests(manifest: dict, profile: str) -> tuple[list[dict], list[dict]]:
         if required_user and required_user != running_as():
             environment_excluded.append(test)
             continue
-        if profile not in test.get("expect", {}):
-            raise CompatError(f"{MANIFEST_PATH}: {test['name']}: no expectation for {profile}")
         selected.append(test)
     return selected, environment_excluded
 
 
 def markdown_cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def provenance(test: dict) -> str:
+    if test["classification"] == "conformance":
+        return "unmodified upstream"
+    return f"{test['adaptation_kind']} adaptation ({test['adaptation']})"
 
 
 def render_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]) -> str:
@@ -421,6 +438,9 @@ def render_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]) 
         "```",
         "",
         f"Pinned rsync commit: `{manifest['upstream']['commit']}`.",
+        "Configured command prefix: `syq"
+        + "".join(f" {shlex.quote(arg)}" for arg in manifest["target"]["args"])
+        + "`.",
         "",
         "| Classification | Tests |",
         "|---|---:|",
@@ -428,14 +448,20 @@ def render_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]) 
     for classification in ("conformance", "adapted", "unsupported", "out-of-scope", "unassessed"):
         lines.append(f"| {classification} | {counts[classification]} |")
 
-    lines.extend(["", "## Runnable conformance tests", "", "| Test | Kind | Expected | Circumstances | Note |", "|---|---|---|---|---|"])
-    for name, (classification, _) in inventory.items():
-        if classification not in {"conformance", "adapted"}:
-            continue
-        test = runnable[name]
-        expected = ", ".join(
-            f"{profile}: {outcome}" for profile, outcome in sorted(test.get("expect", {}).items())
-        )
+    lines.extend(
+        [
+            "",
+            "## Runnable behavioral tests",
+            "",
+            "The baseline is the last reviewed observation, not a claim that rsync's "
+            "behavior is always the desired product policy.",
+            "",
+            "| Area | Test | Baseline | Product position | Provenance | Circumstances | Note |",
+            "|---|---|---|---|---|---|---|",
+        ]
+    )
+    for test in sorted(runnable.values(), key=lambda item: (item["area"], item["name"])):
+        name = test["name"]
         circumstances = []
         if test.get("platforms"):
             circumstances.append("platform=" + ",".join(test["platforms"]))
@@ -447,9 +473,11 @@ def render_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]) 
             + " | ".join(
                 markdown_cell(value)
                 for value in (
+                    test["area"],
                     f"`{name}`",
-                    classification,
-                    expected,
+                    test["baseline"],
+                    POSITION_LABELS[test["position"]],
+                    provenance(test),
                     "; ".join(circumstances) or "portable",
                     test.get("note", ""),
                 )
@@ -564,93 +592,230 @@ def parse_results(
     return outcomes, errors
 
 
-def outcome_class(outcome: str) -> str:
-    return "fail" if outcome in {"fail", "xfail"} else outcome
+def assess_harness(
+    runner_exit_code: int,
+    outcomes: dict[str, str],
+    parser_errors: list[str],
+    *,
+    require_tests: bool,
+    applicable: int,
+) -> tuple[int, list[str]]:
+    expected_exit_code = sum(outcome == "fail" for outcome in outcomes.values())
+    errors = list(parser_errors)
+    if runner_exit_code != expected_exit_code:
+        errors.append(
+            f"runner exit code {runner_exit_code} disagrees with "
+            f"{expected_exit_code} observed test failure(s)"
+        )
+    if require_tests and applicable == 0:
+        errors.append("no tests apply under these circumstances")
+    return expected_exit_code, errors
 
 
 def markdown_report(report: dict) -> str:
-    harness_ok = report["runner_exit_code"] == 0 and not report["parser_errors"]
-    if harness_ok:
+    command = command_text(["syq", *report["target_args"]])
+    if report["harness_ok"]:
         harness_status = (
-            "Harness status: **healthy** — runner exit code `0`; "
-            "no runner-output errors."
+            "Harness execution: **complete** — runner exit code "
+            f"`{report['runner_exit_code']}` agrees with "
+            f"{report['expected_runner_exit_code']} observed test failure(s)."
         )
     else:
-        details = []
-        if report["runner_exit_code"] != 0:
-            details.append(f"runner exit code `{report['runner_exit_code']}`")
-        if report["parser_errors"]:
-            count = len(report["parser_errors"])
-            details.append(f"{count} runner-output error{'s' if count != 1 else ''}")
-        harness_status = "Harness status: **FAILED** — " + "; ".join(details) + "."
+        harness_status = "Harness execution: **FAILED**."
     lines = [
-        "## rsync compatibility",
+        "## rsync behavioral compatibility matrix",
         "",
-        f"Pinned upstream: `{report['upstream_commit']}` · profile: `{report['profile']}` "
+        f"Pinned upstream: `{report['upstream_commit']}` · target: `{report['target_name']}` "
+        f"via `{command}` "
         f"· platform: `{report['platform']}` · run as: `{report['run_as']}`",
         "",
         harness_status,
         "",
-        "| Measure | Count |",
+        "### Product positions",
+        "",
+        "| Position | Applicable tests |",
         "|---|---:|",
-        f"| Applicable tests | {report['applicable']} |",
-        f"| Passing | {report['passing']} |",
-        f"| Known failures | {report['known_failures']} |",
-        f"| Expected skips | {report['skipped']} |",
-        f"| Adapted tests | {report['adapted']} |",
-        f"| Out of scope (ledger) | {report['ledger']['out-of-scope']} |",
-        f"| Unsupported feature (ledger) | {report['ledger']['unsupported']} |",
-        f"| Not yet assessed (ledger) | {report['ledger']['unassessed']} |",
     ]
-    if harness_ok:
+    for position, label in POSITION_LABELS.items():
+        lines.append(f"| {label} | {report['position_counts'].get(position, 0)} |")
+    lines.extend(
+        [
+            f"| **Total applicable** | **{report['applicable']}** |",
+            "",
+            "Inventory outside this matrix: "
+            f"{report['ledger']['unsupported']} unsupported user-facing tests, "
+            f"{report['ledger']['out-of-scope']} rsync-internal/out-of-scope tests, "
+            f"and {report['ledger']['unassessed']} unassessed tests.",
+            "",
+            "### Observations",
+            "",
+        ]
+    )
+    if report["tests"]:
         lines.extend(
             [
-                "",
-                f"Classified runnable-test pass rate: **{report['passing']}/{report['applicable']} "
-                f"({report['score_percent']:.1f}%)**.",
+                "| Area | Test | Observed | Product position | Provenance | Circumstances | Note |",
+                "|---|---|---|---|---|---|---|",
             ]
         )
+        for test in sorted(report["tests"], key=lambda item: (item["area"], item["name"])):
+            observed = test["actual"].upper()
+            if not test["baseline_matches"] and test["actual"] != "notrun":
+                observed += f" (baseline {test['baseline'].upper()})"
+            lines.append(
+                "| "
+                + " | ".join(
+                    markdown_cell(value)
+                    for value in (
+                        test["area"],
+                        f"`{test['name']}`",
+                        observed,
+                        POSITION_LABELS[test["position"]],
+                        provenance(test),
+                        "; ".join(test["circumstances"]) or "portable",
+                        test["note"],
+                    )
+                )
+                + " |"
+            )
     else:
-        notrun = sum(test["actual"] == "notrun" for test in report["tests"])
-        lines.extend(
-            [
-                f"| Unreported after runner failure | {notrun} |",
-                "",
-                "Compatibility score is unavailable; the counts above are partial "
-                "diagnostic observations, not a conformance result.",
-            ]
+        lines.append("No tests apply under these platform and user circumstances.")
+    lines.extend(
+        [
+            "",
+            "### Unsupported feature areas",
+            "",
+            "These user-facing areas are tracked but not yet useful to run through "
+            "their upstream tests.",
+            "",
+            "| Feature area | Upstream tests | Current limitation |",
+            "|---|---:|---|",
+        ]
+    )
+    for feature in report["unsupported_features"]:
+        lines.append(
+            f"| `{feature['area']}` | {feature['tests']} | "
+            f"{markdown_cell(feature['description'])} |"
         )
-    gaps = [test for test in report["tests"] if test["actual"] in {"fail", "xfail"}]
-    if gaps:
-        lines.extend(["", "Known gaps:", ""])
+    changes = [test for test in report["tests"] if not test["baseline_matches"]]
+    if changes:
+        lines.extend(["", "### Observation changes requiring review", ""])
         lines.extend(
-            f"- `{test['name']}` ({', '.join(test['tags']) or 'untagged'}): {test['note']}"
-            for test in gaps
+            f"- `{test['name']}`: baseline {test['baseline']}, observed {test['actual']}"
+            for test in changes
         )
-    mismatches = [
-        test
-        for test in report["tests"]
-        if not test["matches"] and test["actual"] != "notrun"
-    ]
-    if mismatches:
-        title = "Expectation mismatches:" if harness_ok else "Observed expectation mismatches:"
-        lines.extend(["", title, ""])
-        lines.extend(
-            f"- `{test['name']}`: expected {test['expected']}, got {test['actual']}"
-            for test in mismatches
-        )
-    if report["parser_errors"]:
-        lines.extend(["", "Runner output errors:", ""])
-        lines.extend(f"- {error}" for error in report["parser_errors"])
+    if report["harness_errors"]:
+        lines.extend(["", "### Harness errors", ""])
+        lines.extend(f"- {error}" for error in report["harness_errors"])
     lines.append("")
     return "\n".join(lines)
+
+
+def html_report(report: dict) -> str:
+    command = command_text(["syq", *report["target_args"]])
+    cards = "".join(
+        '<div class="card"><strong>'
+        + str(report["position_counts"].get(position, 0))
+        + "</strong><span>"
+        + escape(label)
+        + "</span></div>"
+        for position, label in POSITION_LABELS.items()
+    )
+    rows = []
+    for test in sorted(report["tests"], key=lambda item: (item["area"], item["name"])):
+        observed = test["actual"].upper()
+        if not test["baseline_matches"] and test["actual"] != "notrun":
+            observed += f" (baseline {test['baseline'].upper()})"
+        rows.append(
+            '<tr class="' + ("changed" if not test["baseline_matches"] else "") + '">'
+            f"<td>{escape(test['area'])}</td>"
+            f"<td><code>{escape(test['name'])}</code></td>"
+            f'<td><span class="badge result-{escape(test["actual"])}">{escape(observed)}</span></td>'
+            f'<td><span class="badge position-{escape(test["position"])}">'
+            f"{escape(POSITION_LABELS[test['position']])}</span></td>"
+            f"<td>{escape(provenance(test))}</td>"
+            f"<td>{escape('; '.join(test['circumstances']) or 'portable')}</td>"
+            f"<td>{escape(test['note'])}</td></tr>"
+        )
+    if not rows:
+        rows.append('<tr><td colspan="7">No tests apply under these circumstances.</td></tr>')
+    harness_errors = ""
+    if report["harness_errors"]:
+        harness_errors = '<section class="alert"><h2>Harness errors</h2><ul>' + "".join(
+            f"<li>{escape(error)}</li>" for error in report["harness_errors"]
+        ) + "</ul></section>"
+    changes = [test for test in report["tests"] if not test["baseline_matches"]]
+    change_notice = ""
+    if changes:
+        change_notice = (
+            '<section class="alert"><h2>Observation changes requiring review</h2><ul>'
+            + "".join(
+                f"<li><code>{escape(test['name'])}</code>: baseline "
+                f"{escape(test['baseline'])}, observed {escape(test['actual'])}</li>"
+                for test in changes
+            )
+            + "</ul></section>"
+        )
+    legend = "".join(
+        f"<dt>{escape(label)}</dt><dd>{escape(POSITION_DESCRIPTIONS[position])}</dd>"
+        for position, label in POSITION_LABELS.items()
+    )
+    unsupported_rows = "".join(
+        f"<tr><td><code>{escape(feature['area'])}</code></td>"
+        f"<td>{feature['tests']}</td><td>{escape(feature['description'])}</td></tr>"
+        for feature in report["unsupported_features"]
+    )
+    harness_class = "ok" if report["harness_ok"] else "bad"
+    harness_text = (
+        "Execution complete; runner status agrees with observed outcomes."
+        if report["harness_ok"]
+        else "Harness execution failed; results may be incomplete."
+    )
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>SYQ rsync behavioral matrix</title><style>
+:root {{ color-scheme: light dark; font-family: system-ui, sans-serif; }}
+body {{ max-width: 1500px; margin: 2rem auto; padding: 0 1rem; line-height: 1.45; }}
+code {{ font-family: ui-monospace, monospace; }}
+.meta {{ color: #68707a; }} .status {{ padding: .75rem 1rem; border-radius: .5rem; }}
+.status.ok {{ background: #d8f3dc; color: #16351d; }} .status.bad, .alert {{ background: #ffe3e3; color: #4b1111; }}
+.cards {{ display: flex; flex-wrap: wrap; gap: .75rem; margin: 1.25rem 0; }}
+.card {{ border: 1px solid #9aa0a6; border-radius: .5rem; padding: .7rem 1rem; min-width: 9rem; }}
+.card strong {{ display: block; font-size: 1.5rem; }} .card span {{ font-size: .9rem; }}
+table {{ border-collapse: collapse; width: 100%; font-size: .92rem; }}
+th, td {{ border: 1px solid #9aa0a6; padding: .55rem; text-align: left; vertical-align: top; }}
+th {{ position: sticky; top: 0; background: Canvas; }} tr.changed {{ outline: 2px solid #d97706; }}
+.badge {{ display: inline-block; border-radius: 999px; padding: .12rem .5rem; white-space: nowrap; background: #e5e7eb; color: #111827; }}
+.result-pass, .position-compatible {{ background: #d8f3dc; color: #16351d; }}
+.result-fail, .position-unimplemented {{ background: #ffe3e3; color: #4b1111; }}
+.position-intentional-divergence {{ background: #dbeafe; color: #172554; }}
+.position-policy-open, .position-test-unresolved {{ background: #fef3c7; color: #451a03; }}
+.alert {{ padding: .75rem 1rem; border-radius: .5rem; margin: 1rem 0; }}
+dt {{ font-weight: 700; margin-top: .5rem; }} dd {{ margin-left: 1.25rem; }}
+@media (prefers-color-scheme: dark) {{ .meta {{ color: #b0b8c1; }} }}
+</style></head><body>
+<h1>SYQ rsync behavioral compatibility matrix</h1>
+<p class="meta">Pinned rsync <code>{escape(report['upstream_commit'])}</code> · target
+<code>{escape(report['target_name'])}</code> via <code>{escape(command)}</code> ·
+{escape(report['platform'])} · {escape(report['run_as'])}</p>
+<p class="status {harness_class}">{escape(harness_text)}</p>
+<div class="cards">{cards}</div>{harness_errors}{change_notice}
+<h2>Observed tests</h2><table><thead><tr><th>Area</th><th>Test</th><th>Observed</th>
+<th>Product position</th><th>Provenance</th><th>Circumstances</th><th>Note</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+<h2>Position legend</h2><dl>{legend}</dl>
+<h2>Unsupported feature areas</h2><p>Tracked user-facing areas whose upstream tests are
+not yet useful to run against the target.</p><table><thead><tr><th>Feature area</th>
+<th>Upstream tests</th><th>Current limitation</th></tr></thead><tbody>{unsupported_rows}</tbody></table>
+<h2>Excluded inventory</h2><p>{report['ledger']['out-of-scope']} rsync-internal or
+out-of-scope tests are omitted; {report['ledger']['unassessed']} tests remain unassessed.</p>
+</body></html>"""
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run SYQ's classified compatibility subset of a pinned rsync test suite"
     )
-    parser.add_argument("--profile", default="default")
     parser.add_argument(
         "--syq-bin",
         type=Path,
@@ -672,6 +837,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preserve-scratch", action="store_true")
     parser.add_argument("--ledger-only", action="store_true")
     parser.add_argument("--update-ledger", action="store_true")
+    parser.add_argument(
+        "--require-tests",
+        action="store_true",
+        help="fail after writing reports if no tests apply (used by CI)",
+    )
     parser.add_argument(
         "--report-label",
         help="append a safe label to report filenames (for example, root)",
@@ -696,13 +866,7 @@ def main() -> int:
         raise CompatError("--report-label may contain only letters, digits, _ and -")
     manifest = load_manifest()
     inventory = load_inventory()
-    profile = manifest.get("profiles", {}).get(args.profile)
-    if profile is None:
-        raise CompatError(f"unknown compatibility profile {args.profile!r}")
-    if not profile.get("enabled", False):
-        raise CompatError(
-            f"profile {args.profile!r} is recorded but disabled: {profile['description']}"
-        )
+    target = manifest["target"]
 
     cache = args.cache_dir.resolve()
     cache.mkdir(parents=True, exist_ok=True)
@@ -718,134 +882,170 @@ def main() -> int:
     if args.ledger_only:
         return 0
 
-    selected, environment_excluded = select_tests(manifest, args.profile)
-    adaptations = sorted(
+    selected, environment_excluded = select_tests(manifest)
+    adaptation_ids = sorted(
         {test["adaptation"] for test in selected if test.get("adaptation")}
     )
-    suite = prepare_suite(
-        source, cache, manifest, adaptations, args.jobs, source_was_explicit
-    )
+    run_dir: Path | None = None
+    runner_exit_code = 0
+    log = ""
+    actual: dict[str, str] = {}
+    parser_errors: list[str] = []
+    if selected:
+        adaptations = load_adaptations(adaptation_ids)
+        suite = prepare_suite(
+            source, cache, manifest, adaptations, args.jobs, source_was_explicit
+        )
 
-    syq = (args.syq_bin or default_syq_binary()).resolve()
-    if not args.no_build_syq:
-        run(["cargo", "build", "--locked", "--bin", "syq"], cwd=ROOT)
-    if not syq.is_file():
-        raise CompatError(f"SYQ binary not found at {syq}")
+        syq = (args.syq_bin or default_syq_binary()).resolve()
+        if not args.no_build_syq:
+            run(["cargo", "build", "--locked", "--bin", "syq"], cwd=ROOT)
+        if not syq.is_file():
+            raise CompatError(f"SYQ binary not found at {syq}")
 
-    # Root-only upstream tests may execute the wrapper after dropping to a
-    # second uid. CI workspace ancestors are not guaranteed to be traversable
-    # by that uid, so keep root-run scratch space under the shared system tmp.
-    run_parent = Path("/tmp") if running_as() == "root" else cache
-    run_dir = Path(tempfile.mkdtemp(prefix=f"syq-rsync-{args.profile}-", dir=run_parent))
-    # Some upstream security tests deliberately drop privileges. They still
-    # need to traverse this directory to execute the generated SYQ wrapper.
-    run_dir.chmod(0o755)
-    run_binary = syq
-    if running_as() == "root":
-        run_binary = run_dir / "syq"
-        shutil.copy2(syq, run_binary)
-        run_binary.chmod(0o755)
-    wrapper = run_dir / "syq-rsync"
-    make_wrapper(wrapper, run_binary, list(profile.get("args", [])))
-    expected = run_dir / "expected.txt"
-    expected.write_text(
-        "".join(f"{test['name']} {test['expect'][args.profile]}\n" for test in selected)
-    )
-    scratch = run_dir / "scratch"
-    scratch.mkdir()
-    runner_args = [
-        sys.executable,
-        str(suite / "runtests.py"),
-        "--rsync-bin",
-        str(wrapper),
-        "--tooldir",
-        str(suite),
-        "--srcdir",
-        str(suite),
-        "--expect-result",
-        str(expected),
-        "--timeout",
-        str(args.test_timeout),
-        "--timing",
-        "-j",
-        str(args.jobs),
-    ]
-    if args.preserve_scratch:
-        runner_args.append("--preserve-scratch")
-    env = os.environ.copy()
-    env["scratchbase"] = str(scratch)
-    returncode, log = stream_command(runner_args, cwd=suite, env=env)
-    actual, parser_errors = parse_results(
-        log, {test["name"] for test in selected}
-    )
+        # Root-only upstream tests may execute the wrapper after dropping to a
+        # second uid. CI workspace ancestors are not guaranteed to be traversable
+        # by that uid, so keep root-run scratch space under the shared system tmp.
+        run_parent = Path("/tmp") if running_as() == "root" else cache
+        run_dir = Path(
+            tempfile.mkdtemp(prefix=f"syq-rsync-{target['name']}-", dir=run_parent)
+        )
+        # Some upstream security tests deliberately drop privileges. They still
+        # need to traverse this directory to execute the generated SYQ wrapper.
+        run_dir.chmod(0o755)
+        run_binary = syq
+        if running_as() == "root":
+            run_binary = run_dir / "syq"
+            shutil.copy2(syq, run_binary)
+            run_binary.chmod(0o755)
+        wrapper = run_dir / "syq-rsync"
+        make_wrapper(wrapper, run_binary, list(target.get("args", [])))
+        scratch = run_dir / "scratch"
+        scratch.mkdir()
+        runner_args = [
+            sys.executable,
+            str(suite / "runtests.py"),
+            "--rsync-bin",
+            str(wrapper),
+            "--tooldir",
+            str(suite),
+            "--srcdir",
+            str(suite),
+            "--timeout",
+            str(args.test_timeout),
+            "--timing",
+            "-j",
+            str(args.jobs),
+        ]
+        if args.preserve_scratch:
+            runner_args.append("--preserve-scratch")
+        runner_args.extend(test["name"] for test in selected)
+        env = os.environ.copy()
+        env["scratchbase"] = str(scratch)
+        runner_exit_code, log = stream_command(runner_args, cwd=suite, env=env)
+        actual, parser_errors = parse_results(
+            log, {test["name"] for test in selected}
+        )
+    else:
+        log = "No upstream tests apply under these circumstances.\n"
 
     test_results = []
     for test in selected:
         name = test["name"]
         got = actual.get(name, "notrun")
-        wanted = test["expect"][args.profile]
+        circumstances = []
+        if test.get("platforms"):
+            circumstances.append("platform=" + ",".join(test["platforms"]))
+        if test.get("run_as"):
+            circumstances.append("run-as=" + test["run_as"])
+        circumstances.extend(test.get("requirements", []))
         test_results.append(
             {
                 "name": name,
                 "classification": test["classification"],
                 "adaptation": test.get("adaptation"),
-                "expected": wanted,
+                "adaptation_kind": test.get("adaptation_kind"),
+                "area": test["area"],
+                "position": test["position"],
+                "baseline": test["baseline"],
                 "actual": got,
-                "matches": got != "notrun" and outcome_class(got) == outcome_class(wanted),
+                "baseline_matches": got == test["baseline"],
                 "tags": test.get("tags", []),
                 "requirements": test.get("requirements", []),
+                "circumstances": circumstances,
                 "note": test.get("note", ""),
             }
         )
 
     ledger_counts = collections.Counter(value[0] for value in inventory.values())
-    passing = sum(test["actual"] == "pass" for test in test_results)
-    known_failures = sum(test["actual"] in {"fail", "xfail"} for test in test_results)
-    skipped = sum(test["actual"] == "skip" for test in test_results)
     applicable = len(test_results)
-    harness_ok = returncode == 0 and not parser_errors
+    expected_runner_exit_code, harness_errors = assess_harness(
+        runner_exit_code,
+        actual,
+        parser_errors,
+        require_tests=args.require_tests,
+        applicable=applicable,
+    )
+    position_counts = collections.Counter(test["position"] for test in test_results)
+    observed_counts = collections.Counter(test["actual"] for test in test_results)
+    unsupported_counts = collections.Counter(
+        reason
+        for classification, reason in inventory.values()
+        if classification == "unsupported"
+    )
+    unsupported_features = [
+        {
+            "area": reason.removeprefix("unsupported-"),
+            "reason": reason,
+            "tests": count,
+            "description": manifest["reasons"][reason],
+        }
+        for reason, count in sorted(unsupported_counts.items())
+    ]
     report = {
-        "schema": 1,
+        "schema": 2,
         "upstream_repository": upstream["repository"],
         "upstream_commit": upstream["commit"],
-        "profile": args.profile,
-        "profile_args": profile.get("args", []),
+        "target_name": target["name"],
+        "target_args": target.get("args", []),
+        "target_description": target.get("description", ""),
         "platform": platform_name(),
         "run_as": running_as(),
         "applicable": applicable,
-        "passing": passing,
-        "known_failures": known_failures,
-        "skipped": skipped,
+        "observed_counts": dict(sorted(observed_counts.items())),
+        "position_counts": dict(sorted(position_counts.items())),
         "adapted": sum(test["classification"] == "adapted" for test in test_results),
         "environment_excluded": [test["name"] for test in environment_excluded],
-        "score_percent": (
-            passing * 100.0 / applicable if harness_ok and applicable else None
-        ),
+        "unsupported_features": unsupported_features,
         "ledger": {key: ledger_counts[key] for key in sorted(VALID_CLASSES)},
         "tests": test_results,
-        "runner_exit_code": returncode,
+        "runner_exit_code": runner_exit_code,
+        "expected_runner_exit_code": expected_runner_exit_code,
         "parser_errors": parser_errors,
-        "harness_ok": harness_ok,
+        "harness_errors": harness_errors,
+        "harness_ok": not harness_errors,
     }
     reports = cache / "reports"
     reports.mkdir(exist_ok=True)
-    report_stem = args.profile + (f"-{args.report_label}" if args.report_label else "")
+    report_stem = target["name"] + (f"-{args.report_label}" if args.report_label else "")
     report_json = reports / f"{report_stem}.json"
     report_md = reports / f"{report_stem}.md"
+    report_html = reports / f"{report_stem}.html"
     report_log = reports / f"{report_stem}.log"
     report_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     summary = markdown_report(report)
     report_md.write_text(summary)
+    report_html.write_text(html_report(report))
     report_log.write_text(log)
     print("\n" + summary, flush=True)
     if github_summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(github_summary).open("a") as handle:
             handle.write(summary)
 
-    if not args.preserve_scratch:
+    if run_dir is not None and not args.preserve_scratch:
         shutil.rmtree(run_dir, ignore_errors=True)
-    mismatches = [test for test in test_results if not test["matches"]]
-    return 1 if returncode or mismatches or parser_errors else 0
+    baseline_changes = [test for test in test_results if not test["baseline_matches"]]
+    return 1 if harness_errors or baseline_changes else 0
 
 
 if __name__ == "__main__":

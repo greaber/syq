@@ -1,9 +1,8 @@
-# Upstream rsync compatibility tests
+# Upstream rsync behavioral tests
 
-This directory is SYQ's executable compatibility ledger for the upstream
-rsync test suite. It answers a narrower question than `cargo test`: for rsync
-tests that exercise command-line filesystem behavior relevant to SYQ, did SYQ
-produce the result we have reviewed and recorded?
+This directory tracks what selected upstream rsync tests tell us about SYQ's
+rsync-compatible command surface. It is both a regression suite and a reviewable
+map of compatibility work. It is not an overall compatibility score.
 
 Run it from the repository root:
 
@@ -11,87 +10,88 @@ Run it from the repository root:
 python3 scripts/rsync-compat.py
 ```
 
+The manifest currently routes upstream invocations to native `syq`, because the
+dedicated command does not exist yet. When `syq rsync` lands, changing
+`target.args` from `[]` to `["rsync"]` switches the whole suite without patching
+upstream tests or adding a second harness mode.
+
 The first run fetches the commit pinned in `manifest.toml`, prepares rsync's
 test helpers under `target/rsync-compat/`, builds SYQ, and runs the applicable
 tests. Later runs reuse the prepared suite. Pass `--rsync-src PATH` to use an
-already configured checkout at the exact pin. Reports are written to
-`target/rsync-compat/reports/`.
+already configured checkout at the exact pin. Reports are written as JSON,
+Markdown, static HTML, and a raw log under `target/rsync-compat/reports/`.
 
 Only the classified runnable subset is executed, not all 351 inventoried
 tests. A warm non-root Linux run selects 22 tests and takes about 11 seconds on
-the development machine; four more tests are selected when run as root. A
-first run additionally downloads and prepares the pinned rsync checkout and
-may do a cold Rust build. The exact cold time depends mostly on network and
-Cargo state.
+the development machine; four more tests apply when run as root. A first run
+also downloads and prepares the pinned rsync checkout and may do a cold Rust
+build. The exact cold time depends mostly on network and Cargo state.
 
-The source checkout and prepared test helpers are content-addressed and reused
-until the rsync pin, helper configuration, or adaptation patches change. Cargo
-also performs its normal incremental build. CI caches both sets of artifacts,
-so routine jobs normally pay only an incremental SYQ build and the test run.
-All adapted suites are copied from one configured base, so adding or changing
-a testsuite-only adaptation does not rebuild rsync's C helpers. CI installs the
-rsync build prerequisites only on a suite-cache miss. To manage the SYQ build
+The source checkout and prepared helpers are content-addressed and reused until
+the rsync pin, helper configuration, or adaptation patches change. Cargo uses
+its normal incremental build. CI caches both sets of artifacts and installs
+rsync's build prerequisites only on a suite-cache miss. To manage the SYQ build
 separately, use `--no-build-syq --syq-bin PATH`.
 
 The upstream runner gives each test a 300-second deadline by default; override
-it with `--test-timeout SECONDS`. CI uses 120 seconds per test and also caps the
-whole conformance job at 30 minutes. A per-test timeout is reported normally so
-the JSON, Markdown, and raw-log artifacts are still written.
+it with `--test-timeout SECONDS`. CI uses 120 seconds per test, caps the entire
+job at 30 minutes, and passes `--require-tests` so an accidentally empty Linux
+selection cannot look successful. A local run with no applicable tests still
+writes a valid N/A report.
 
 The harness requires Python 3.11 or newer. Preparing a fresh checkout also
-requires Git, a C toolchain, Make, Autoconf, and Automake. The CI workflow
-installs the build prerequisites.
+requires Git, a C toolchain, Make, Autoconf, and Automake.
 
-## The ledger
+## Inventory, observations, and product positions
 
 `inventory.tsv` names every test at the pinned commit. Updating the pin without
 classifying every added or removed test is an error. Its classifications are:
 
-- `conformance`: an unmodified upstream test that measures relevant observable
-  behavior. It contributes to the compatibility score.
-- `adapted`: still an upstream conformance test, with a patch for an
-  implementation-specific fixture detail or to isolate the supported part of
-  an aggregate test. It contributes to the score and names its adaptation in
-  `manifest.toml`.
-- `unsupported`: a user-visible rsync feature SYQ does not implement. It is
-  tracked separately from internals and from known failures that we actively
-  run.
-- `out-of-scope`: rsync protocol, daemon, restricted-wrapper, build, or
-  implementation-internal testing. SYQ does not need to pass it.
-- `unassessed`: not yet reviewed closely enough to classify. This is visible
-  compatibility-audit debt, not an implicit failure or exclusion. The current
-  pin has zero tests in this category.
+- `conformance`: a relevant upstream test used without modification.
+- `adapted`: a relevant upstream test with a narrow, recorded fixture,
+  invocation, or subset adaptation.
+- `unsupported`: a user-visible rsync feature the target does not implement.
+- `out-of-scope`: rsync protocol, daemon, restricted-wrapper, build, harness,
+  or implementation-internal testing.
+- `unassessed`: a test not yet reviewed closely enough to classify.
 
-Runnable tests have an expected result per enabled profile. The upstream
-runner compares actual results with that manifest: a regression fails, and an
-unexpected pass also fails so the ledger must be updated. Requirements and
-platform restrictions record the circumstances in which an expectation is
-valid.
+Each runnable manifest entry separates three ideas that should not be collapsed
+into one pass percentage:
 
-The reported pass rate covers only the reviewed, runnable conformance tests.
-It is a regression measure, not a claim that unsupported rsync features are
-compatible; their counts are printed beside it. `LEDGER.md` lists all 351 tests
-and is generated with `--ledger-only --update-ledger`; normal runs reject a
-stale generated ledger.
+- `baseline` is the last reviewed raw runner outcome. A change in either
+  direction fails CI until someone reviews and records it.
+- `position` records what the result means for the product: `compatible`,
+  `unimplemented`, `intentional-divergence`, `policy-open`, or
+  `test-unresolved`.
+- provenance says whether the upstream test is unmodified or carries an
+  `invocation`, `fixture`, or `subset` adaptation.
 
-The future `strict` profile is already represented, but disabled until SYQ has
-the corresponding flag. The harness injects profile arguments through a
-generated executable wrapper, so upstream tests do not need to know about the
-flag.
+The runner exit status is checked independently of those baselines. An ordinary
+test failure is not a harness failure when the runner reports it consistently;
+missing, duplicate, or contradictory output is. Markdown and HTML reports show
+the observations grouped by behavioral area, their product positions,
+provenance, platform/user circumstances, any baseline changes, and a compact
+breakdown of unsupported user-facing feature areas. Rsync-internal tests remain
+out of the compatibility matrix.
+
+`LEDGER.md` is the generated readable inventory. Update it with
+`--ledger-only --update-ledger`; normal runs reject a stale copy.
 
 ## Adaptations
 
-An adaptation is a unified diff stored as
-`adaptations/<id>.patch`, referenced by an `adapted` test's `adaptation` field.
-The harness applies patches to a fresh cached checkout and includes their
-contents in the cache key. Adaptations may change an incidental fixture or
-isolate the supported part of an upstream test that combines several features;
-they must not change the semantics claimed by the resulting test. For example,
-SYQ's partial adaptation discovers the full-length sparse
-`.name.syq-part.<job-id>` sidecar instead of rsync's growing destination prefix
-while retaining the same interrupted-transfer-and-successful-resume assertions. The
-manifest's note must identify any omitted unsupported scenario.
+An adaptation is a unified diff stored as `adaptations/<id>.patch`, referenced
+by an `adapted` test. The harness hashes and applies the exact validated bytes.
+It asks Git for both the forward and reverse path sets, so additions, deletions,
+traditional multi-file diffs, renames, and copies must all stay under
+`testsuite/`.
 
-Do not adapt a test merely to make it green. If it exercises rsync internals,
-classify it `out-of-scope`; if SYQ lacks the behavior, use `unsupported`; if
-the behavior is applicable and differs, run it as an expected failure.
+Adaptations may translate an implementation-specific fixture or isolate a
+supported part of an aggregate test. They must not edit rsync sources or its
+runner, and they must not quietly change the behavioral claim. The partial test,
+for example, looks for SYQ's job-scoped sidecar instead of rsync's partial name;
+the manifest labels that fixture adaptation and the current intentional product
+divergence explicitly.
+
+Do not adapt a test merely to make it green. Classify rsync internals as
+`out-of-scope`, unsupported user behavior as `unsupported`, and runnable
+differences according to their actual product position.
