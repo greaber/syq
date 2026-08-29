@@ -960,6 +960,29 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     write(&t.path("src"), b"tcp default");
     let remote = format!("127.0.0.1:{}", t.s("dst"));
 
+    let dry = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--dry-run", "-a"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("dry-run syq over encrypted TCP through fake remote shell");
+    assert_output_ok(&dry);
+    assert!(!t.path("dst").exists());
+    let stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        stdout.contains("route: encrypted TCP to 127.0.0.1; 16 initial connections (auto-tuned)"),
+        "{stdout}"
+    );
+
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .arg("-e")
         .arg(&rsh)
@@ -1518,8 +1541,296 @@ fn dry_run_creates_nothing() {
         !t.path("dst").exists(),
         "dry run must not create the destination"
     );
-    assert!(out.contains("would transfer"), "{out}");
-    assert!(transferred(&out) > 0);
+    assert!(out.contains("syq: dry-run summary"), "{out}");
+    assert!(out.contains("regular files"), "{out}");
+    assert!(out.contains("directories"), "{out}");
+    assert!(out.contains("symlinks"), "{out}");
+    assert!(out.contains("special file"), "{out}");
+    assert!(out.contains("logical data:"), "{out}");
+}
+
+#[test]
+fn dry_run_reports_typed_preflight_summary() {
+    let t = Tmp::new();
+    write(&t.path("src/send"), b"new");
+    write(&t.path("src/same"), b"same");
+    write(&t.path("src/too-big"), b"123456");
+    write(&t.path("src/skip.log"), b"ignored");
+    write(&t.path("dst/same"), b"same");
+    write(&t.path("dst/extra"), b"delete me");
+    set_mtime(&t.path("src/same"), 1_600_000_000);
+    set_mtime(&t.path("dst/same"), 1_600_000_000);
+    set_mtime(&t.path("src"), 1_600_000_100);
+    set_mtime(&t.path("dst"), 1_600_000_100);
+
+    let out = run_ok(&[
+        "-an",
+        "--delete",
+        "--max-size",
+        "5",
+        "-i",
+        "*.log",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(out.contains("syq: dry-run summary"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "mapping: {} -> {} (directory contents)",
+            t.s("src/"),
+            t.s("dst")
+        )),
+        "{out}"
+    );
+    assert!(out.contains("changes: 1 regular file"), "{out}");
+    assert!(
+        out.contains(
+            "logical data: 3 B in 1 file needing content work (upper bound); 4 B in 1 file with unchanged content"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("exclusions: 1 path/subtree pruned by ignore rules; 1 other entry"),
+        "{out}"
+    );
+    assert!(
+        out.contains("deletions: 1 entry planned after a successful copy"),
+        "{out}"
+    );
+    assert!(
+        out.contains("route: local filesystem; 32 initial workers (auto-tuned)"),
+        "{out}"
+    );
+    assert!(t.path("dst/extra").exists());
+}
+
+#[test]
+fn dry_run_summary_resolves_path_semantics() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"data");
+
+    let child = run_ok(&["-an", &t.s("src"), &t.s("child-target")]);
+    assert!(
+        child.contains(&format!(
+            "mapping: {} -> {} (directory as child)",
+            t.s("src"),
+            t.s("child-target/src")
+        )),
+        "{child}"
+    );
+
+    let contents = run_ok(&["-an", &t.s("src/"), &t.s("contents-target/")]);
+    assert!(
+        contents.contains(&format!(
+            "mapping: {} -> {} (directory contents)",
+            t.s("src/"),
+            t.s("contents-target")
+        )),
+        "{contents}"
+    );
+
+    let exact = run_ok(&["-an", &t.s("src/file"), &t.s("exact-target")]);
+    assert!(
+        exact.contains(&format!(
+            "mapping: {} -> {} (exact destination path)",
+            t.s("src/file"),
+            t.s("exact-target")
+        )),
+        "{exact}"
+    );
+}
+
+#[test]
+fn dry_run_does_not_apply_metadata_repairs() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"same");
+    write(&t.path("dst/f"), b"same");
+    fs::set_permissions(t.path("src/f"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(t.path("dst/f"), fs::Permissions::from_mode(0o644)).unwrap();
+    set_mtime(&t.path("src/f"), 1_600_000_000);
+    set_mtime(&t.path("dst/f"), 1_600_000_000);
+    set_mtime(&t.path("src"), 1_600_000_100);
+    set_mtime(&t.path("dst"), 1_600_000_100);
+
+    let out = run_ok(&["-anv", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(
+        fs::symlink_metadata(t.path("dst/f")).unwrap().mode() & 0o777,
+        0o644,
+        "dry run changed destination permissions\n{out}"
+    );
+    assert!(out.contains("changes: 1 metadata-only entry"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "update metadata {} (requested file metadata differs)",
+            t.s("dst/f")
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("4 B in 1 file with unchanged content"),
+        "{out}"
+    );
+
+    run_ok(&["-a", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(
+        fs::symlink_metadata(t.path("dst/f")).unwrap().mode() & 0o777,
+        0o600,
+        "the corresponding real run must still repair metadata"
+    );
+}
+
+#[test]
+fn dry_run_accounts_for_changed_symlinks_and_type_replacements() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src")).unwrap();
+    fs::create_dir_all(t.path("dst")).unwrap();
+    std::os::unix::fs::symlink("new-target", t.path("src/link")).unwrap();
+    std::os::unix::fs::symlink("old-target", t.path("dst/link")).unwrap();
+    write(&t.path("src/replaced"), b"file");
+    std::os::unix::fs::symlink("old-target", t.path("dst/replaced")).unwrap();
+    set_mtime(&t.path("src"), 1_600_000_100);
+    set_mtime(&t.path("dst"), 1_600_000_100);
+
+    let out = run_ok(&["-anv", &t.s("src/"), &t.s("dst")]);
+    assert!(
+        out.contains("changes: 1 regular file; 1 symlink; 1 type replacement among them"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "update symlink {} -> new-target (target differs)",
+            t.s("dst/link")
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "replace with file {} (destination is symlink)",
+            t.s("dst/replaced")
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("4 B in 1 file needing content work (upper bound)"),
+        "{out}"
+    );
+    assert_eq!(
+        fs::read_link(t.path("dst/link")).unwrap(),
+        PathBuf::from("old-target")
+    );
+    assert!(t
+        .path("dst/replaced")
+        .symlink_metadata()
+        .unwrap()
+        .is_symlink());
+}
+
+#[test]
+fn dry_run_directory_replacement_makes_descendants_virtually_missing() {
+    let t = Tmp::new();
+    write(&t.path("src/d/f"), b"same");
+    write(&t.path("outside/f"), b"same");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("dst/d")).unwrap();
+    set_mtime(&t.path("src/d/f"), 1_600_000_000);
+    set_mtime(&t.path("outside/f"), 1_600_000_000);
+    set_mtime(&t.path("src"), 1_600_000_100);
+    set_mtime(&t.path("dst"), 1_600_000_100);
+
+    let out = run_ok(&["-anv", &t.s("src/"), &t.s("dst")]);
+    let changes = out
+        .lines()
+        .find(|line| line.starts_with("  changes:"))
+        .unwrap_or_else(|| panic!("missing changes line in {out}"));
+    assert!(changes.contains("1 regular file"), "{out}");
+    assert!(changes.contains("1 directory"), "{out}");
+    assert!(changes.contains("1 type replacement among them"), "{out}");
+    assert!(
+        out.contains("4 B in 1 file needing content work (upper bound)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("0 B in 0 files with unchanged content"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "replace with directory {}/ (destination is symlink)",
+            t.s("dst/d")
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "create file {} (destination missing)",
+            t.s("dst/d/f")
+        )),
+        "{out}"
+    );
+    assert!(t.path("dst/d").symlink_metadata().unwrap().is_symlink());
+    assert_eq!(read(&t.path("outside/f")), b"same");
+
+    let actual = run_ok(&["-a", &t.s("src/"), &t.s("dst")]);
+    assert_eq!(transferred(&actual), 1, "{actual}");
+    assert!(t.path("dst/d").is_dir());
+    assert_eq!(read(&t.path("dst/d/f")), b"same");
+    assert_eq!(read(&t.path("outside/f")), b"same");
+}
+
+#[test]
+fn dry_run_rejects_bare_directory_into_existing_file() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"source");
+    write(&t.path("destination"), b"keep me");
+
+    let skipped = syq(&["-n", &t.s("src"), &t.s("destination")]);
+    assert!(skipped.status.success(), "{}", stderr_of(&skipped));
+    assert!(stderr_of(&skipped).contains("skipping directory"));
+
+    let existing_dry = syq(&["-an", "--existing", &t.s("src"), &t.s("destination")]);
+    assert!(
+        existing_dry.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&existing_dry.stdout),
+        stderr_of(&existing_dry)
+    );
+    assert!(
+        String::from_utf8_lossy(&existing_dry.stdout).contains("changes: none"),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&existing_dry.stdout),
+        stderr_of(&existing_dry)
+    );
+    assert_eq!(read(&t.path("destination")), b"keep me");
+
+    let existing_actual = syq(&["-a", "--existing", &t.s("src"), &t.s("destination")]);
+    assert!(
+        existing_actual.status.success(),
+        "{}",
+        stderr_of(&existing_actual)
+    );
+    assert_eq!(read(&t.path("destination")), b"keep me");
+
+    let dry = syq(&["-an", &t.s("src"), &t.s("destination")]);
+    assert!(!dry.status.success());
+    assert!(
+        stderr_of(&dry).contains(&format!(
+            "destination {} is not a directory; cannot place directory {} inside it",
+            t.s("destination"),
+            t.s("src")
+        )),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&dry.stdout),
+        stderr_of(&dry)
+    );
+    assert!(
+        !String::from_utf8_lossy(&dry.stdout).contains("syq: dry-run summary"),
+        "a rejected mapping must not print a successful summary"
+    );
+    assert_eq!(read(&t.path("destination")), b"keep me");
+
+    let actual = syq(&["-a", &t.s("src"), &t.s("destination")]);
+    assert_eq!(actual.status.code(), Some(23), "{}", stderr_of(&actual));
+    assert_eq!(read(&t.path("destination")), b"keep me");
 }
 
 #[test]
@@ -2191,7 +2502,7 @@ fn ignore_applies_per_source_root_and_dry_run() {
     // Dry run with the root itself matching a pattern: the root is never ignored.
     let out = run_ok(&["-an", "-i", "s1", "-i", "*.o", &t.s("s1"), &t.s("dst2")]);
     assert!(!t.path("dst2").exists());
-    assert!(out.contains("would transfer 9 files"), "{out}");
+    assert!(out.contains("in 9 files needing content work"), "{out}");
 }
 
 #[test]
@@ -2289,18 +2600,21 @@ fn delete_removes_extras_and_protects_ignored() {
     assert!(out.status.success());
     let so = String::from_utf8_lossy(&out.stdout);
     for l in [
-        "deleting c",
-        "deleting extra/x/y",
-        "deleting extra/x/",
-        "deleting extra/",
-        "deleting keep/gone",
-        "deleting dangling",
+        "delete c (destination only)",
+        "delete extra/x/y (destination only)",
+        "delete extra/x/ (destination only)",
+        "delete extra/ (destination only)",
+        "delete keep/gone (destination only)",
+        "delete dangling (destination only)",
     ] {
         assert!(so.contains(l), "missing {l:?} in {so}");
     }
     assert!(!so.contains("k.log"), "{so}");
-    assert!(!so.lines().any(|l| l == "deleting keep/"), "{so}");
-    assert!(so.contains("6 would be deleted"), "{so}");
+    assert!(!so.contains("delete keep/ (destination only)"), "{so}");
+    assert!(
+        so.contains("deletions: 6 entries planned after a successful copy"),
+        "{so}"
+    );
     assert!(
         stderr_of(&out).contains("not deleting keep/"),
         "{}",
@@ -2420,7 +2734,10 @@ fn delete_only_inside_directories_the_sources_map_onto() {
     );
     // A dry run into a destination that doesn't exist yet has nothing to delete.
     let so = run_ok(&["-a", "-n", "--delete", &t.s("s1/"), &t.s("nowhere")]);
-    assert!(so.contains("0 would be deleted"), "{so}");
+    assert!(
+        so.contains("deletions: 0 entries planned after a successful copy"),
+        "{so}"
+    );
     assert!(!t.path("nowhere").exists());
     // A single-file source deletes nothing.
     write(&t.path("dst2/junk"), b"j");
@@ -2691,14 +3008,14 @@ fn files_from_repeats_and_late_listed_dirs_across_chunks() {
 }
 
 #[test]
-fn existing_dry_run_lists_no_missing_directories() {
+fn existing_dry_run_reports_no_missing_directory_changes() {
     let t = Tmp::new();
     write(&t.path("src/there/f"), b"f");
     write(&t.path("src/missing/g"), b"g");
     fs::create_dir_all(t.path("dst/there")).unwrap();
     let so = run_ok(&["-a", "-n", "-v", "--existing", &t.s("src/"), &t.s("dst")]);
-    assert!(so.contains("dst/there/"), "{so}");
-    assert!(!so.contains("missing"), "{so}");
+    assert!(!so.contains("create directory"), "{so}");
+    assert!(!so.contains(&t.s("dst/missing")), "{so}");
     assert!(!so.contains("there/f"), "--existing creates no files: {so}");
 }
 
@@ -2970,7 +3287,7 @@ fn existing_does_not_write_through_a_destination_symlink_dir() {
     assert_eq!(read(&t.path("elsewhere/sub/g")), b"old", "{so}");
     assert!(t.path("dst/d").symlink_metadata().unwrap().is_symlink());
     let so = run_ok(&["-a", "-n", "--existing", &t.s("src/"), &t.s("dst")]);
-    assert!(so.contains("would transfer 0 files"), "{so}");
+    assert!(so.contains("0 files needing content work"), "{so}");
 }
 
 #[test]
@@ -4879,6 +5196,22 @@ fn max_delete_refuses_everything_past_the_limit() {
     for i in 0..5 {
         write(&t.path(&format!("dst/extra{i}")), b"x");
     }
+    let dry = syq(&[
+        "-an",
+        "--delete",
+        "--max-delete",
+        "3",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert_eq!(dry.status.code(), Some(25), "{}", stderr_of(&dry));
+    let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_stdout.contains("deletions: 5 entries planned; blocked by --max-delete 3"),
+        "{dry_stdout}"
+    );
+    assert_eq!(listing(&t.path("dst")).len(), 5, "dry run changed files");
+
     let out = syq(&[
         "-a",
         "--delete",
@@ -5180,7 +5513,7 @@ fn sidecar_patterned_extras_do_not_block_directory_deletion() {
     write(&t.path(&foreign), b"unclaimed");
     write(&t.path("dst/extra/gone"), b"an ordinary extra");
     let so = run_ok(&["-a", "-n", "-v", "--delete", &t.s("src/"), &t.s("dst")]);
-    assert!(so.contains("deleting extra/"), "{so}");
+    assert!(so.contains("delete extra/ (destination only)"), "{so}");
     let out = syq(&["-a", "-v", "--delete", &t.s("src/"), &t.s("dst")]);
     assert!(out.status.success(), "{}", stderr_of(&out));
     assert_eq!(listing(&t.path("dst")), ["a"]);
@@ -5601,6 +5934,21 @@ fn direct_remote_to_remote_passes_through_defined_exit_codes() {
     write(&t.path("dst/extra2"), b"y");
     let src = format!("fake:{}", t.s("src/"));
     let dst = format!("fake:{}", t.s("dst"));
+    let dry = remote_syq(&t, &rsh, &["-an", "--no-bootstrap", &src, &dst]);
+    assert_output_ok(&dry);
+    let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_stdout.contains(&format!(
+            "mapping: fake:{} -> fake:{} (directory contents)",
+            t.s("src/"),
+            t.s("dst")
+        )),
+        "{dry_stdout}"
+    );
+    assert!(
+        dry_stdout.contains("route: local filesystem on fake; 1 worker (fixed)"),
+        "{dry_stdout}"
+    );
     // --max-delete refusal on the remote orchestrator must surface as 25.
     let out = remote_syq(
         &t,
@@ -5671,7 +6019,7 @@ fn ignore_existing_keeps_a_file_where_a_source_directory_maps() {
     write(&t.path("dst/d"), b"precious");
     // Dry run and real run agree; the existing file survives; the rest copies.
     let so = run_ok(&["-r", "-n", "--ignore-existing", &t.s("src/"), &t.s("dst")]);
-    assert_eq!(transferred(&so), 1, "{so}");
+    assert!(so.contains("1 B in 1 file needing content work"), "{so}");
     let out = syq(&["-r", "--ignore-existing", &t.s("src/"), &t.s("dst")]);
     assert!(out.status.success(), "{}", stderr_of(&out));
     assert!(

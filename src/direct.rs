@@ -139,6 +139,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.progress_json && !args.quiet {
         remote.push("--progress-json".into());
     }
+    if args.dry_run {
+        remote.push(format!("--plan-source-host={src_target}"));
+    }
     // --ignore-from files were read locally; forward the merged lines.
     for l in &args.ignore_lines {
         // One argument, so a pattern starting with '-' can't be taken for a flag.
@@ -392,7 +395,10 @@ pub fn follow(args: &Args) -> Result<i32> {
                 eprint!("\r\x1b[K");
             }
             println!("{line}");
-            if line.starts_with("syq: transferred") || line.starts_with("syq: would transfer") {
+            if line.starts_with("syq: transferred")
+                || line.starts_with("syq: would transfer")
+                || line.starts_with("  route:")
+            {
                 let _ = child.kill();
                 return Ok(0);
             }

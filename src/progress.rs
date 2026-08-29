@@ -28,6 +28,10 @@ pub struct Progress {
     /// Source files deliberately not transferred (-u, size limits, --existing,
     /// symlinks without -l, ...); neither "transferred" nor "unchanged".
     pub files_excluded: AtomicU64,
+    /// Source paths matched by ignore rules during a dry run. An ignored
+    /// directory is one path here even though its unscanned subtree may
+    /// contain many entries.
+    pub paths_ignored: AtomicU64,
     pub scanned: AtomicU64,
     pub scan_done: AtomicBool,
     pub errors: AtomicU64,
@@ -65,6 +69,7 @@ impl Progress {
             files_done: AtomicU64::new(0),
             files_skipped: AtomicU64::new(0),
             files_excluded: AtomicU64::new(0),
+            paths_ignored: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
             scan_done: AtomicBool::new(false),
             errors: AtomicU64::new(0),
