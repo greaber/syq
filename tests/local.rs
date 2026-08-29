@@ -1787,6 +1787,29 @@ fn dry_run_rejects_bare_directory_into_existing_file() {
     assert!(skipped.status.success(), "{}", stderr_of(&skipped));
     assert!(stderr_of(&skipped).contains("skipping directory"));
 
+    let existing_dry = syq(&["-an", "--existing", &t.s("src"), &t.s("destination")]);
+    assert!(
+        existing_dry.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&existing_dry.stdout),
+        stderr_of(&existing_dry)
+    );
+    assert!(
+        String::from_utf8_lossy(&existing_dry.stdout).contains("changes: none"),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&existing_dry.stdout),
+        stderr_of(&existing_dry)
+    );
+    assert_eq!(read(&t.path("destination")), b"keep me");
+
+    let existing_actual = syq(&["-a", "--existing", &t.s("src"), &t.s("destination")]);
+    assert!(
+        existing_actual.status.success(),
+        "{}",
+        stderr_of(&existing_actual)
+    );
+    assert_eq!(read(&t.path("destination")), b"keep me");
+
     let dry = syq(&["-an", &t.s("src"), &t.s("destination")]);
     assert!(!dry.status.success());
     assert!(

@@ -1782,6 +1782,7 @@ impl Planner<'_> {
                         && pl.opts.recursive
                         && dst_existed
                         && !dst_is_dir
+                        && !pl.opts.existing
                     {
                         bail!(
                             "destination {} is not a directory; cannot place directory {} inside it",

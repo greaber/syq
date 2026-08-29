@@ -261,6 +261,8 @@ Identical to rsync:
   created if missing.
 - An existing non-directory `dest` cannot be the parent of that `dest/src`
   mapping; dry-run rejects it instead of presenting an impossible summary.
+  With `--existing`, both dry-run and the real command skip the whole mapping
+  as a no-op because creating `dest/src` is outside the selected scope.
 - `syq -a src/ dest` copies the *contents* of `src` into `dest`. `src/.` and
   `.` behave the same way.
 - A single file source goes to `dest/file` if `dest` is an existing directory,
