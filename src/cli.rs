@@ -52,9 +52,17 @@ pub struct Args {
     /// Suppress non-error messages
     #[arg(short = 'q', long)]
     pub quiet: bool,
-    /// Compress data in transit (zstd)
-    #[arg(short = 'z', long)]
+    /// Compress remote data in transit with zstd (default)
+    #[arg(
+        short = 'z',
+        long,
+        default_value_t = true,
+        overrides_with = "no_compress"
+    )]
     pub compress: bool,
+    /// Disable transport compression
+    #[arg(long, overrides_with = "compress")]
+    pub no_compress: bool,
     /// Show what would be transferred without doing it
     #[arg(short = 'n', long)]
     pub dry_run: bool,
@@ -305,6 +313,9 @@ impl Args {
     }
 
     pub fn normalize(&mut self) {
+        if self.no_compress {
+            self.compress = false;
+        }
         self.recursive_explicit = self.recursive;
         if self.archive {
             self.recursive = true;
@@ -539,8 +550,29 @@ pub fn parse_size(s: &str) -> Result<u64> {
 }
 
 #[cfg(test)]
-mod size_tests {
-    use super::parse_size;
+mod tests {
+    use super::{parse_size, Args};
+    use clap::Parser;
+
+    fn args(options: &[&str]) -> Args {
+        let mut argv = vec!["syq"];
+        argv.extend_from_slice(options);
+        argv.extend_from_slice(&["src", "dst"]);
+        let mut args = Args::try_parse_from(argv).unwrap();
+        args.normalize();
+        args
+    }
+
+    #[test]
+    fn compression_defaults_on_and_can_be_disabled() {
+        assert!(args(&[]).compress);
+        assert!(args(&["-z"]).compress);
+        assert!(!args(&["--no-compress"]).compress);
+
+        // As with other clap overrides, the last spelling wins.
+        assert!(!args(&["-z", "--no-compress"]).compress);
+        assert!(args(&["--no-compress", "-z"]).compress);
+    }
 
     #[test]
     fn size_parser_checks_sign_and_range() {

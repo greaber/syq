@@ -64,7 +64,6 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         ('g', args.group && !args.archive),
         ('o', args.owner && !args.archive),
         ('D', args.devices && !args.archive),
-        ('z', args.compress),
         ('n', args.dry_run),
         ('q', args.quiet),
         ('c', args.checksum),
@@ -78,6 +77,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     if !short.is_empty() {
         remote.push(format!("-{short}"));
+    }
+    if !args.compress {
+        remote.push("--no-compress".into());
     }
     if let Some(j) = args.connections_opt {
         remote.push("-j".into());
