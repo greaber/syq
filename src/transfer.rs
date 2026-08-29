@@ -477,6 +477,9 @@ pub fn run(args: Args) -> Result<i32> {
             bail!("all sources must be on the same host");
         }
     }
+    if args.forward_agent && (!srcs[0].is_remote() || !dst.is_remote() || srcs[0].same_host(dst)) {
+        bail!("--forward-agent is only valid for a direct remote-to-remote transfer between different hosts");
+    }
     if let Some(checkpoint) = args.checkpoint.as_deref() {
         let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
         for source in srcs.iter().filter(|source| !source.is_remote()) {
@@ -1610,6 +1613,9 @@ fn print_dry_run_summary(
         }
     );
 
+    if let Some(authorization) = args.plan_authorization {
+        println!("  authorization: {}", authorization.summary());
+    }
     println!("  route: {}", selected_route(src_ep, dst_ep, args));
 }
 

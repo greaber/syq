@@ -1,6 +1,40 @@
 use anyhow::{bail, Result};
 use clap::Parser;
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub enum PlanAuthorization {
+    NotRequired,
+    SourceCredentials,
+    ForwardedAgent,
+    RemoteShell,
+}
+
+impl PlanAuthorization {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not-required",
+            Self::SourceCredentials => "source-credentials",
+            Self::ForwardedAgent => "forwarded-agent",
+            Self::RemoteShell => "remote-shell",
+        }
+    }
+
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::NotRequired => {
+                "no destination SSH credential needed (same remote host and user)"
+            }
+            Self::SourceCredentials => {
+                "local agent not forwarded; source host uses its own destination credentials"
+            }
+            Self::ForwardedAgent => {
+                "unrestricted local agent forwarded to source (--forward-agent), but not onward by syq"
+            }
+            Self::RemoteShell => "explicit --rsh controls authentication delegation",
+        }
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "syq",
@@ -136,7 +170,7 @@ pub struct Args {
     )]
     pub checkpoint: Option<String>,
 
-    /// Remote shell command (default: ssh); controls agent forwarding when set
+    /// Remote shell command (default: ssh); its agent policy is used unchanged when set
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
     /// Use this exact syq executable on the remote instead of the managed helper
@@ -164,16 +198,25 @@ pub struct Args {
     /// Remote-to-remote: relay data through this machine instead of running on the source host
     #[arg(long)]
     pub relay: bool,
-    /// Remote-to-remote with the default ssh: disable agent forwarding to the source host; it
-    /// must authenticate to the destination with its own credentials
-    #[arg(long, conflicts_with = "rsh")]
+    /// Remote-to-remote with the default ssh: explicitly disable agent forwarding (the default)
+    #[arg(long, conflicts_with_all = ["rsh", "forward_agent"])]
     pub no_forward_agent: bool,
+    /// Remote-to-remote with the default ssh: forward the unrestricted local agent to the source
+    /// host for compatibility. Prefer source-host credentials or --relay
+    #[arg(
+        long,
+        conflicts_with_all = ["rsh", "no_forward_agent", "detach", "relay"]
+    )]
+    pub forward_agent: bool,
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
     pub width: Option<usize>,
     /// Original source endpoint for a remotely orchestrated dry-run summary
     #[arg(long, hide = true)]
     pub plan_source_host: Option<String>,
+    /// Authentication delegation for a remotely orchestrated dry-run summary
+    #[arg(long, hide = true, value_enum)]
+    pub plan_authorization: Option<PlanAuthorization>,
 
     /// Skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
     /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together

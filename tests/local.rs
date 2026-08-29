@@ -3424,6 +3424,50 @@ fn no_forward_agent_conflicts_with_explicit_rsh() {
     assert!(!t.path("dst").exists());
 }
 
+#[test]
+fn unrestricted_forwarding_requires_one_unambiguous_live_policy() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    for conflicting in [
+        &["--forward-agent", "-e", "ssh -A"][..],
+        &["--forward-agent", "--no-forward-agent"],
+        &["--forward-agent", "--detach"],
+        &["--forward-agent", "--relay"],
+    ] {
+        let (src, dst) = (t.s("src"), t.s("dst"));
+        let mut argv = conflicting.to_vec();
+        argv.extend([src.as_str(), dst.as_str()]);
+        let out = syq(&argv);
+        assert_eq!(out.status.code(), Some(2), "{conflicting:?}");
+        assert!(
+            stderr_of(&out).contains("cannot be used with"),
+            "{conflicting:?}: {}",
+            stderr_of(&out)
+        );
+    }
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn unrestricted_forwarding_requires_two_different_remote_hosts() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    for (src, dst) in [
+        (t.s("src"), "hostB:dst".to_string()),
+        ("hostA:src".to_string(), t.s("dst")),
+        ("same:src".to_string(), "same:dst".to_string()),
+    ] {
+        let out = syq(&["--forward-agent", &src, &dst]);
+        assert_eq!(out.status.code(), Some(1), "{src} -> {dst}");
+        assert!(
+            stderr_of(&out).contains("only valid for a direct remote-to-remote transfer"),
+            "{}",
+            stderr_of(&out)
+        );
+    }
+    assert!(!t.path("dst").exists());
+}
+
 // Ordinary copies keep no historical completion state: the current destination
 // determines what a later invocation repairs.
 #[test]
@@ -5902,6 +5946,11 @@ fn direct_remote_to_remote_verbose_diagnostics_are_orchestrator_relative() {
         stderr.contains("transport: SSH planned for a real transfer (--no-tcp)"),
         "{stderr}"
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("authorization: explicit --rsh controls authentication delegation"),
+        "{stdout}"
+    );
 
     let same_host_dst = format!("hostA:{}", t.s("same-host-dst"));
     let out = remote_syq(
@@ -5921,6 +5970,11 @@ fn direct_remote_to_remote_verbose_diagnostics_are_orchestrator_relative() {
         "{stderr}"
     );
     assert!(!stderr.contains("syq: hostA:\n"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("authorization: explicit --rsh controls authentication delegation"),
+        "{stdout}"
+    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Direct remote-to-remote: run the orchestrator on the source host so data
 //! flows source→destination without passing through this machine.
 
-use crate::cli::{parse_rsh, Args, Location};
+use crate::cli::{parse_rsh, Args, Location, PlanAuthorization};
 use anyhow::{bail, Context, Result};
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
@@ -32,18 +32,44 @@ fn direct_command(
     cmd
 }
 
+fn source_setup_rsh(rsh: &[String], explicit_rsh: bool) -> Vec<String> {
+    let mut setup = rsh.to_vec();
+    if !explicit_rsh {
+        setup.push("-a".into());
+    }
+    setup
+}
+
+fn default_ssh_agent_policy(
+    explicit_rsh: bool,
+    forward_agent: bool,
+    no_forward_agent: bool,
+    same_host: bool,
+) -> Option<bool> {
+    (!explicit_rsh).then_some(forward_agent && !no_forward_agent && !same_host)
+}
+
+fn destination_rsh(explicit_rsh: Option<&str>, same_host: bool) -> Option<&str> {
+    (!same_host).then_some(explicit_rsh.unwrap_or("ssh -a"))
+}
+
 pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     let rsh = parse_rsh(&args.rsh)?;
     let src_host = srcs[0].host.clone().unwrap();
+    let same_host = srcs[0].same_host(dst);
     // The follow target must reconnect the way we did: keep an explicit user.
     let src_target = match &srcs[0].user {
         Some(user) => format!("{user}@{src_host}"),
         None => src_host.clone(),
     };
+    // Helper probes and installation never need a delegated agent. Override a
+    // default-ssh ForwardAgent setting even when the transfer itself explicitly
+    // opts into forwarding.
+    let source_setup_rsh = source_setup_rsh(&rsh, args.rsh.is_some());
     let spec = crate::conn::RemoteSpec {
         user: srcs[0].user.clone(),
         host: src_host.clone(),
-        rsh: rsh.clone(),
+        rsh: source_setup_rsh,
         syq_path: args.syq_path.clone(),
         auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
         helper_install: Default::default(),
@@ -141,6 +167,16 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     }
     if args.dry_run {
         remote.push(format!("--plan-source-host={src_target}"));
+        let authorization = if args.rsh.is_some() {
+            PlanAuthorization::RemoteShell
+        } else if same_host {
+            PlanAuthorization::NotRequired
+        } else if args.forward_agent {
+            PlanAuthorization::ForwardedAgent
+        } else {
+            PlanAuthorization::SourceCredentials
+        };
+        remote.push(format!("--plan-authorization={}", authorization.as_arg()));
     }
     // --ignore-from files were read locally; forward the merged lines.
     for l in &args.ignore_lines {
@@ -157,9 +193,12 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if let Some(p) = &args.syq_path {
         remote.push(format!("--syq-path={p}"));
     }
-    if let Some(e) = &args.rsh {
+    // The destination only runs a syq server and never needs an agent. The
+    // implicit `ssh -a` preserves ordinary ProxyJump routing without giving
+    // the destination an agent socket; an explicit --rsh remains user policy.
+    if let Some(e) = destination_rsh(args.rsh.as_deref(), same_host) {
         remote.push("-e".into());
-        remote.push(e.clone());
+        remote.push(e.into());
     }
     remote.push("--".into());
     for s in srcs {
@@ -168,7 +207,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     // Same host (and user) on both ends: on that host this is a plain local
     // copy — no ssh back to itself, copy_file_range applies, and the
     // copy-into-itself check sees both paths on one machine.
-    let dst_str = if srcs[0].same_host(dst) {
+    let dst_str = if same_host {
         // A relative remote path is relative to the home; anchor it so the
         // orchestrator's local parse can't take it for something else.
         if dst.path.starts_with('/')
@@ -245,10 +284,12 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         remote_cmd
     };
 
-    let default_ssh_forward_agent = args
-        .rsh
-        .is_none()
-        .then(|| !args.no_forward_agent && !srcs[0].same_host(dst));
+    let default_ssh_forward_agent = default_ssh_agent_policy(
+        args.rsh.is_some(),
+        args.forward_agent,
+        args.no_forward_agent,
+        same_host,
+    );
     let make_command = || {
         direct_command(
             &rsh,
@@ -258,6 +299,11 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             default_ssh_forward_agent,
         )
     };
+    if args.forward_agent && !same_host && !args.quiet {
+        eprintln!(
+            "syq: warning: --forward-agent exposes your unrestricted SSH agent to {src_host} for the life of this transfer"
+        );
+    }
     if args.detach {
         let run = || {
             let mut cmd = make_command();
@@ -313,6 +359,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         // be mistaken for the orchestrator.
         Some(c @ (23 | 25)) => Ok(c),
         Some(c) => {
+            if args.rsh.is_none() && !args.forward_agent && !same_host {
+                bail!("remote-to-remote transfer on {src_host} failed (exit {c}); the local agent was not forwarded: configure destination credentials on {src_host}, retry with --relay, or explicitly accept unrestricted delegation with --forward-agent")
+            }
             bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
         }
         None => bail!("remote syq on {src_host} killed by signal"),
@@ -431,6 +480,40 @@ mod tests {
         let disabled = args(&disabled);
         assert!(disabled.contains(&OsStr::new("-a")));
         assert!(!disabled.contains(&OsStr::new("-A")));
+    }
+
+    #[test]
+    fn default_agent_policy_is_fail_closed() {
+        assert_eq!(
+            default_ssh_agent_policy(false, false, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            default_ssh_agent_policy(false, true, false, false),
+            Some(true)
+        );
+        assert_eq!(
+            default_ssh_agent_policy(false, true, false, true),
+            Some(false)
+        );
+        assert_eq!(default_ssh_agent_policy(true, false, false, false), None);
+    }
+
+    #[test]
+    fn default_ssh_source_setup_never_forwards_an_agent() {
+        let rsh = vec!["ssh".to_string(), "-p".to_string(), "2222".to_string()];
+        assert_eq!(source_setup_rsh(&rsh, false), ["ssh", "-p", "2222", "-a"]);
+        assert_eq!(source_setup_rsh(&rsh, true), rsh);
+    }
+
+    #[test]
+    fn destination_never_receives_the_default_agent() {
+        assert_eq!(destination_rsh(None, false), Some("ssh -a"));
+        assert_eq!(
+            destination_rsh(Some("custom-rsh --policy"), false),
+            Some("custom-rsh --policy")
+        );
+        assert_eq!(destination_rsh(None, true), None);
     }
 
     #[test]

@@ -176,7 +176,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--verify-only` | Hash every file in the run's scope on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
 | `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
-| `-e CMD`, `--rsh CMD` | Remote shell command; controls agent forwarding when set (default `ssh`) |
+| `-e CMD`, `--rsh CMD` | Remote shell command; its authentication and agent policy is used unchanged when set (default `ssh`) |
 | `--syq-path PATH` | Use this exact remote `syq` instead of the managed helper |
 | `--no-bootstrap` | Require `syq` on the remote `PATH`; do not install a managed helper |
 | `--no-tcp` | Send data over the ssh connection instead of separate TCP sockets |
@@ -195,7 +195,8 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--from0` | `--files-from` entries are NUL-separated |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
-| `--no-forward-agent` | Remote-to-remote with default `ssh`: disable agent forwarding (conflicts with `-e`) |
+| `--no-forward-agent` | Remote-to-remote with default `ssh`: explicitly disable agent forwarding (already the default; conflicts with `-e`) |
+| `--forward-agent` | Direct remote-to-remote with default `ssh`: explicitly forward the unrestricted local agent to the source (conflicts with `-e`, `--relay`, and `--detach`) |
 | `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session; prints the follow target even with `-q` |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
@@ -220,25 +221,32 @@ does not change file contents, hashes, resume offsets, or `--bwlimit` accounting
 
 ### Remote-to-remote
 
-`syq hostA:src hostB:dst` starts the orchestrator *on hostA* over `ssh -A`
-(agent forwarding), which then pushes to hostB with N connections, so data
-flows A → B directly. Matching helpers are installed automatically on both
-hosts. HostA must be able to ssh to hostB (with your forwarded agent, or its
-own keys). Progress and `-v` output are streamed back. If hostA can't reach
-hostB, `--relay` keeps the orchestrator here and routes every byte A → you → B
-— always works, at half the bandwidth.
+`syq hostA:src hostB:dst` starts the orchestrator *on hostA* over `ssh -a`,
+which then pushes to hostB with N connections, so data flows A → B directly.
+Matching helpers are installed automatically on both hosts. HostA must be able
+to authenticate to hostB with credentials available on hostA. SYQ also uses
+`ssh -a` from hostA to hostB, overriding any `ForwardAgent yes` setting because
+the destination server does not need an agent. Progress and `-v` output are
+streamed back. If hostA cannot reach or authenticate to hostB, `--relay` keeps
+the orchestrator here and routes every byte A → you → B at half the bandwidth.
 `syq hostA:src hostA:dst` (same host and user on both ends) simply runs a
 local copy on hostA and disables agent forwarding.
 
-Agent forwarding does not copy private keys to hostA, but a process that can
-access the forwarded socket while the SSH connection is alive can ask the
-agent to authenticate on its behalf. Pass `--no-forward-agent` to use `ssh -a`
-and override any `ForwardAgent yes` in SSH configuration; hostA must then have
-its own credentials for hostB. With an explicit `-e/--rsh`, SYQ adds neither
-`-A` nor `-a`, so include the desired agent-forwarding policy in that command;
-`--no-forward-agent` therefore conflicts with `-e`. `--relay` also avoids
-exposing the agent to hostA, at the cost of routing the file data through this
-machine.
+If hostA has no suitable credential, `--forward-agent` is an explicit
+compatibility option. It uses `ssh -A` for the live launcher session and prints
+a warning. Agent forwarding does not copy private keys to hostA, but any
+process that can access the forwarded socket while the connection is alive can
+ask the unrestricted agent to authenticate on its behalf. SYQ does not forward
+that socket onward to hostB. Prefer credentials installed on hostA or `--relay`;
+`--no-forward-agent` remains available to state the safe default explicitly.
+
+An ordinary OpenSSH `ProxyJump` configured for either connection remains
+supported: it routes the SSH connection without giving the jump host an agent
+socket. A custom nested SSH chain or other special forwarding policy belongs in
+an explicit `-e/--rsh`; SYQ adds neither `-A` nor `-a` to that command, and the
+two agent-policy options therefore conflict with it. The dry-run summary states
+whether authorization comes from hostA, unrestricted agent forwarding, or the
+explicit remote shell.
 
 Like rsync, SYQ leaves host-key checking to `ssh` and therefore inherits the
 user's SSH configuration and OpenSSH defaults. First contact therefore fails
