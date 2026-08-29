@@ -1,7 +1,7 @@
 //! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
-use crate::cli::{parse_rsh, parse_size, Args, Location};
+use crate::cli::{parse_rsh, parse_size, Args, Existence, Interface, Location, Placement};
 use crate::conn::{
     ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, TcpCandidate, TcpPairStats,
 };
@@ -347,15 +347,13 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
 /// does), normalized by the endpoint that holds it. Used for the job identity —
 /// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job — and for
 /// the copy-into-itself check.
-fn canonical_path(ctl: &mut dyn Conn, path: &str, remote: bool) -> Result<std::path::PathBuf> {
+fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::path::PathBuf> {
     if !remote {
-        return Ok(crate::fsops::normalize(&crate::fsops::resolve(
-            path.as_bytes(),
-        )));
+        return Ok(crate::fsops::normalize(&crate::fsops::resolve(path)));
     }
     match ok(
         ctl.call(Request::Canonicalize {
-            path: path.as_bytes().to_vec(),
+            path: path.to_vec(),
         })?,
         "canonicalize",
     )? {
@@ -365,8 +363,17 @@ fn canonical_path(ctl: &mut dyn Conn, path: &str, remote: bool) -> Result<std::p
 }
 
 /// Encode the content/metadata-affecting options into the job identity.
-fn semantic_flags(opts: &Opts, args: &Args) -> String {
-    serde_json::json!({
+fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
+    let source_modes: Vec<&str> = srcs
+        .iter()
+        .map(|source| match source.selection {
+            crate::cli::SourceSelection::Rsync => "rsync",
+            crate::cli::SourceSelection::Named => "named-follow",
+            crate::cli::SourceSelection::Contents => "contents-follow",
+            crate::cli::SourceSelection::NamedNoFollow => "named-no-follow",
+        })
+        .collect();
+    let mut flags = serde_json::json!({
         "partial_format": 1,
         "recursive": opts.recursive,
         "links": opts.links,
@@ -378,8 +385,16 @@ fn semantic_flags(opts: &Opts, args: &Args) -> String {
         "inplace": args.inplace,
         "block_size": opts.block,
         "ignore": opts.ignore,
-    })
-    .to_string()
+    });
+    // Keep the established compatibility identity byte-for-byte stable so an
+    // upgrade does not orphan resumable sidecars or checkpoints.
+    if srcs
+        .iter()
+        .any(|source| source.selection != crate::cli::SourceSelection::Rsync)
+    {
+        flags["source_modes"] = serde_json::json!(source_modes);
+    }
+    flags.to_string()
 }
 
 /// The endpoint half of a job identity: `user@host` (the user matters — two
@@ -396,7 +411,16 @@ fn endpoint_identity(l: &Location) -> String {
 struct DestinationRoot<'a> {
     path: &'a [u8],
     existed: bool,
-    is_dir: bool,
+    is_container: bool,
+    entry_is_dir: bool,
+    exact: bool,
+}
+
+struct SourceMapping<'a> {
+    follow_root: bool,
+    contents: bool,
+    require_directory: bool,
+    sub: &'a [u8],
 }
 
 fn copy_identity(
@@ -423,7 +447,7 @@ fn copy_identity(
         &src_roots,
         &endpoint_identity(dst),
         &dst_root,
-        &semantic_flags(opts, args),
+        &semantic_flags(opts, args, srcs),
     ))
 }
 
@@ -461,13 +485,13 @@ fn checkpoint_setup(
                 display(dst.path)
             );
         }
-        if dst.is_dir {
+        if dst.entry_is_dir {
             for source in srcs.iter().filter(|source| !source.copies_contents()) {
                 let basename = source.basename();
                 if basename.is_empty() {
                     continue;
                 }
-                let prefix = basename.as_bytes();
+                let prefix = basename.as_slice();
                 let has_completed_path = loaded.completed.keys().any(|completed| {
                     completed == prefix
                         || completed
@@ -542,11 +566,14 @@ pub fn run(args: Args) -> Result<i32> {
         .then_some(args.bwlimit_bytes)
         .map(BandwidthLimit::new)
         .map(Arc::new);
-    let locs: Vec<Location> = args
-        .paths
-        .iter()
-        .map(|p| Location::parse(p))
-        .collect::<Result<_>>()?;
+    let locs: Vec<Location> = if args.locations.is_empty() {
+        args.paths
+            .iter()
+            .map(|p| Location::parse(p))
+            .collect::<Result<_>>()?
+    } else {
+        args.locations.clone()
+    };
     if locs.len() < 2 {
         bail!("need at least one source and a destination");
     }
@@ -559,7 +586,7 @@ pub fn run(args: Args) -> Result<i32> {
     if let Some(checkpoint) = args.checkpoint.as_deref() {
         let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
         for source in srcs.iter().filter(|source| !source.is_remote()) {
-            let root = crate::fsops::normalize(&crate::fsops::resolve(source.path.as_bytes()));
+            let root = crate::fsops::normalize(&crate::fsops::resolve(&source.path));
             if checkpoint.starts_with(&root) {
                 bail!(
                     "checkpoint {} must not be inside local source {}",
@@ -569,7 +596,7 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
         if !dst.is_remote() {
-            let root = crate::fsops::normalize(&crate::fsops::resolve(dst.path.as_bytes()));
+            let root = crate::fsops::normalize(&crate::fsops::resolve(&dst.path));
             if checkpoint.starts_with(&root) {
                 bail!(
                     "checkpoint {} must not be inside local destination {}",
@@ -587,7 +614,10 @@ pub fn run(args: Args) -> Result<i32> {
             if !s.copies_contents() {
                 let base = s.basename();
                 if !base.is_empty() && !seen.insert(base.clone()) {
-                    bail!("two sources named {base:?} map to the same destination; rename one or copy them separately");
+                    bail!(
+                        "two sources named {:?} map to the same destination; rename one or copy them separately",
+                        display(&base)
+                    );
                 }
             }
         }
@@ -901,21 +931,57 @@ pub fn run(args: Args) -> Result<i32> {
     // silently drops `.` components and duplicate slashes. Cleaning here
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
-    let dst_root = clean_root(dst.path.as_bytes());
+    let dst_root = clean_root(&dst.path);
     let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root, false)?;
     // A destination that is a symlink to a directory is that directory (as
     // for rsync). Use the resolved target path for all planning and metadata,
     // so ordinary in-tree symlinks can still be replaced instead of followed.
     let (dst_root, dst_root_entry) = follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?;
     let dst_existed = dst_root_entry.is_some();
-    let dst_is_dir = match &dst_root_entry {
-        Some(e) if e.kind == Kind::Dir => true,
-        Some(_) if srcs.len() > 1 => {
-            bail!("destination must be a directory when copying multiple sources")
+    let dst_entry_is_dir = dst_root_entry
+        .as_ref()
+        .is_some_and(|entry| entry.kind == Kind::Dir);
+    match args.target_existence {
+        Existence::Any => {}
+        Existence::New if dst_existed => bail!(
+            "target {} already exists, but the selected placement requires a new path",
+            display(&dst_root)
+        ),
+        Existence::Existing if !dst_existed => bail!(
+            "target {} does not exist, but the selected placement requires an existing path",
+            display(&dst_root)
+        ),
+        Existence::New | Existence::Existing => {}
+    }
+    let dst_is_dir = match args.placement {
+        Placement::Into => {
+            if dst_existed && !dst_entry_is_dir {
+                bail!(
+                    "--into target {} exists but is not a directory",
+                    display(&dst_root)
+                );
+            }
+            true
         }
-        Some(_) => false,
-        None => srcs.len() > 1 || dst.copies_contents() || args.files_from.is_some(),
+        Placement::As => false,
+        Placement::Rsync => match &dst_root_entry {
+            Some(e) if e.kind == Kind::Dir => true,
+            Some(_) if srcs.len() > 1 => {
+                bail!("destination must be a directory when copying multiple sources")
+            }
+            Some(_) => false,
+            None => srcs.len() > 1 || dst.copies_contents() || args.files_from.is_some(),
+        },
     };
+    if args.placement == Placement::Into
+        && args.target_existence == Existence::Existing
+        && !dst_entry_is_dir
+    {
+        bail!(
+            "--into-existing target {} is not an existing directory",
+            display(&dst_root)
+        );
+    }
     if args.files_from.is_some() {
         if let Some(e) = dst_root_entry.as_ref().filter(|e| e.kind != Kind::Dir) {
             bail!(
@@ -923,6 +989,24 @@ pub fn run(args: Args) -> Result<i32> {
                 display(&dst_root),
                 e.kind
             );
+        }
+    }
+    if args.interface != Interface::Rsync {
+        // Native selectors are structural: validate every selected root before
+        // a missing --into target can be created. Named selectors follow their
+        // root unless --src-no-follow was used; contents selectors additionally
+        // require the resolved object to be a directory.
+        for source in srcs {
+            match stat_one(&mut *src_ctl, &source.path, source.follows_root())? {
+                Some(entry) if source.requires_directory() && entry.kind != Kind::Dir => {
+                    bail!(
+                        "contents selector {} is not a directory",
+                        display(&source.path)
+                    )
+                }
+                Some(_) => {}
+                None => bail!("source {} does not exist", display(&source.path)),
+            }
         }
     }
 
@@ -941,30 +1025,32 @@ pub fn run(args: Args) -> Result<i32> {
             // Only a directory source can trigger the recurse-into-itself trap.
             // Judge the source the way the scan will: --files-from and
             // trailing-slash sources are followed through a symlinked root.
-            let follow_root = args.files_from.is_some() || s.copies_contents();
-            let src_is_dir = matches!(stat_one(&mut *src_ctl, s.path.as_bytes(), follow_root)?, Some(ref e) if e.kind == Kind::Dir);
+            let follow_root = args.files_from.is_some() || s.follows_root();
+            let src_is_dir = matches!(stat_one(&mut *src_ctl, &s.path, follow_root)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
             }
             let sn = canonical_path(&mut *src_ctl, &s.path, remote)?;
             // Effective destination(s): the destination itself, plus
-            // destination/basename only when the destination is really an
-            // existing directory (so a bare source lands inside it).
+            // destination/basename when placement uses it as a container.
             let mut effs = vec![canonical_path(&mut *src_ctl, &dst.path, remote)?];
             if dst_is_dir && !s.copies_contents() && args.files_from.is_none() {
                 let base = s.basename();
                 if !base.is_empty() {
-                    let joined = format!("{}/{}", dst.path.trim_end_matches('/'), base);
+                    let joined = join(dst.path.strip_suffix(b"/").unwrap_or(&dst.path), &base);
                     effs.push(canonical_path(&mut *src_ctl, &joined, remote)?);
                 }
             }
             for eff in effs {
                 if eff == sn {
-                    bail!("source and destination are the same directory {:?}", s.path);
+                    bail!(
+                        "source and destination are the same directory {:?}",
+                        display(&s.path)
+                    );
                 } else if eff.starts_with(&sn) {
                     bail!(
                         "destination {:?} maps inside source {:?} — that would copy the directory into itself",
-                        dst.path, s.path
+                        display(&dst.path), display(&s.path)
                     );
                 }
             }
@@ -982,7 +1068,9 @@ pub fn run(args: Args) -> Result<i32> {
         DestinationRoot {
             path: &dst_root,
             existed: dst_existed,
-            is_dir: dst_is_dir,
+            is_container: dst_is_dir,
+            entry_is_dir: dst_entry_is_dir,
+            exact: args.placement == Placement::As,
         },
         &mut *dst_ctl,
         &identity,
@@ -1069,7 +1157,7 @@ pub fn run(args: Args) -> Result<i32> {
         let src = &srcs[0];
         match st.scan_files_from(
             &mut *src_ctl,
-            src.path.as_bytes(),
+            &src.path,
             &dst_root,
             &args.files_from_lines,
             args.recursive_explicit,
@@ -1082,25 +1170,32 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     for src in srcs.iter().filter(|_| args.files_from.is_none()) {
-        let src_root = src.path.as_bytes().to_vec();
-        let follow = src.copies_contents();
+        let src_root = src.path.clone();
+        let contents = src.copies_contents();
+        let follow_root = src.follows_root();
         // A bare directory source goes to dest/basename even when dest doesn't
         // exist yet; a non-directory source only does so when dest is a directory
         // (decided once the root entry is seen).
-        let sub = if follow {
-            String::new()
+        let sub = if contents || args.placement == Placement::As {
+            Vec::new()
         } else {
             src.basename()
         };
         match st.scan_source(
             &mut *src_ctl,
             &src_root,
-            follow,
-            &sub,
+            SourceMapping {
+                follow_root,
+                contents,
+                require_directory: src.requires_directory(),
+                sub: &sub,
+            },
             DestinationRoot {
                 path: &dst_root,
                 existed: dst_existed,
-                is_dir: dst_is_dir,
+                is_container: dst_is_dir,
+                entry_is_dir: dst_entry_is_dir,
+                exact: args.placement == Placement::As,
             },
         ) {
             Ok(mapping) => dry_run_mappings.push(mapping),
@@ -1590,10 +1685,10 @@ fn display_location(loc: &Location, path: &[u8]) -> String {
 fn display_plan_source(loc: &Location, args: &Args) -> String {
     if !loc.is_remote() {
         if let Some(host) = &args.plan_source_host {
-            return format!("{host}:{}", display(loc.path.as_bytes()));
+            return format!("{host}:{}", display(&loc.path));
         }
     }
-    display_location(loc, loc.path.as_bytes())
+    display_location(loc, &loc.path)
 }
 
 fn display_plan_target(loc: &Location, path: &[u8], args: &Args) -> String {
@@ -1883,7 +1978,7 @@ struct Planner<'a> {
     keep_dirs: bool,
     /// (destination directory, its path relative to the transfer root) for every
     /// directory source; --delete removes extras inside these.
-    delete_roots: Vec<(PathBytes, String)>,
+    delete_roots: Vec<(PathBytes, PathBytes)>,
     deletes: Deletes,
     dry_run_changes: DryRunChanges,
 }
@@ -1959,31 +2054,40 @@ impl Planner<'_> {
         &mut self,
         src: &mut dyn Conn,
         src_root: &[u8],
-        follow: bool,
-        sub: &str,
+        source: SourceMapping<'_>,
         destination: DestinationRoot<'_>,
     ) -> Result<DryRunMapping> {
+        let SourceMapping {
+            follow_root,
+            contents,
+            require_directory,
+            sub,
+        } = source;
         let dst_root = destination.path;
-        let dst_is_dir = destination.is_dir;
+        let dst_is_dir = destination.is_container;
         let dst_existed = destination.existed;
         let mut first = true;
-        let mut sub = sub.to_string();
+        let mut sub = sub.to_vec();
         let mut skip_all = false;
         let mut mapping = None;
         let ignore = self.opts.ignore.clone();
-        scan_into_planner(self, src, src_root, follow, &ignore, |pl, batch| {
+        scan_into_planner(self, src, src_root, follow_root, &ignore, |pl, batch| {
             if skip_all {
                 return Ok(());
             }
             if first {
                 first = false;
                 if let Some(root) = batch.first() {
+                    if require_directory && root.kind != Kind::Dir {
+                        bail!("contents selector {} is not a directory", display(src_root));
+                    }
                     if pl.opts.dry_run
                         && root.kind == Kind::Dir
-                        && !follow
+                        && !contents
                         && pl.opts.recursive
                         && dst_existed
-                        && !dst_is_dir
+                        && !destination.entry_is_dir
+                        && !destination.exact
                         && !pl.opts.existing
                     {
                         bail!(
@@ -1993,15 +2097,19 @@ impl Planner<'_> {
                         );
                     }
                     if root.kind != Kind::Dir && !dst_is_dir {
-                        sub = String::new();
+                        sub.clear();
                     }
                     mapping = Some(DryRunMapping {
-                        target: join(dst_root, sub.as_bytes()),
-                        semantics: match (root.kind, follow, dst_is_dir) {
-                            (Kind::Dir, true, _) => "directory contents",
-                            (Kind::Dir, false, _) => "directory as child",
-                            (_, _, true) => "entry inside destination directory",
-                            _ => "exact destination path",
+                        target: join(dst_root, &sub),
+                        semantics: if destination.exact {
+                            "exact destination path"
+                        } else {
+                            match (root.kind, contents, dst_is_dir) {
+                                (Kind::Dir, true, _) => "directory contents",
+                                (Kind::Dir, false, _) => "directory as child",
+                                (_, _, true) => "entry inside destination directory",
+                                _ => "exact destination path",
+                            }
                         },
                     });
                     if root.kind == Kind::Dir && !pl.opts.recursive {
@@ -2013,8 +2121,7 @@ impl Planner<'_> {
                         return Ok(());
                     }
                     if root.kind == Kind::Dir {
-                        pl.delete_roots
-                            .push((join(dst_root, sub.as_bytes()), sub.clone()));
+                        pl.delete_roots.push((join(dst_root, &sub), sub.clone()));
                     }
                 }
             }
@@ -2194,7 +2301,7 @@ impl Planner<'_> {
                 }
             }
             self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            self.handle_batch(batch, src_root, "", dst_root)?;
+            self.handle_batch(batch, src_root, b"", dst_root)?;
             for rel in subtrees {
                 self.scan_subtree(src, src_root, &rel, dst_root, &mut emitted)?;
             }
@@ -2229,7 +2336,7 @@ impl Planner<'_> {
                 })
                 .collect();
             pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            pl.handle_batch(batch, src_root, "", dst_root)
+            pl.handle_batch(batch, src_root, b"", dst_root)
         })
     }
 
@@ -2237,7 +2344,7 @@ impl Planner<'_> {
         &mut self,
         batch: Vec<Entry>,
         src_root: &[u8],
-        sub: &str,
+        sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
         self.register_namespace(&batch, src_root, sub, dst_root)?;
@@ -2250,7 +2357,7 @@ impl Planner<'_> {
         let mut immediate = Vec::with_capacity(batch.len());
         let mut deferred = Vec::new();
         for entry in batch {
-            let dst_rel = join(sub.as_bytes(), &entry.path);
+            let dst_rel = join(sub, &entry.path);
             let reserved_leaf = dst_rel.is_empty()
                 && entry.kind != Kind::Dir
                 && dst_root
@@ -2306,20 +2413,19 @@ impl Planner<'_> {
         &mut self,
         batch: Vec<Entry>,
         src_root: &[u8],
-        sub: &str,
+        sub: &[u8],
         dst_root: &[u8],
     ) -> Mapped {
         let opts = self.opts;
-        let sub_b = sub.as_bytes();
         let mut dirs: Vec<(PathBytes, PathBytes, Entry)> = Vec::new();
         let mut others: Vec<Planned> = Vec::new();
         for e in batch {
             if e.kind == Kind::Dir && !opts.recursive && !self.keep_dirs {
                 continue;
             }
-            let dst_rel = join(sub_b, &e.path);
+            let dst_rel = join(sub, &e.path);
             let dst = join(dst_root, &dst_rel);
-            let rel = self.rel_name(src_root, sub_b, &e.path);
+            let rel = self.rel_name(src_root, sub, &e.path);
             // Every source entry claims its destination here, before any
             // decision about it: that blocks two sources from mapping onto one
             // path, and it is what makes --delete safe — whatever happens
@@ -2979,10 +3085,9 @@ impl Planner<'_> {
         &mut self,
         batch: &[Entry],
         src_root: &[u8],
-        sub: &str,
+        sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
-        let sub = sub.as_bytes();
         let mut files = Vec::new();
         for entry in batch {
             if !self.entry_is_payload(entry) {
@@ -3210,7 +3315,7 @@ impl Planner<'_> {
         };
         for (root, sub) in roots.clone() {
             // Every root is walked with its own -i anchoring. A root nested in
-            // this one (`syq --delete a b/ dst`: dst/a inside dst) is left to
+            // this one (`syq rsync --delete a b/ dst`: dst/a inside dst) is left to
             // its own walk, so its patterns apply and nothing is deleted twice.
             let nested: Vec<PathBytes> = roots
                 .iter()
@@ -3266,7 +3371,7 @@ impl Planner<'_> {
                             }
                             None => {}
                         }
-                        let dst_rel = join(sub.as_bytes(), &e.path);
+                        let dst_rel = join(&sub, &e.path);
                         let rel = display(&dst_rel);
                         let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
                         // The only sidecar-patterned files that are not extras

@@ -1,8 +1,9 @@
-//! `syq --rm`: recursive removal with N parallel connections. Files are
+//! `syq rsync --rm` and native `syq rm`: recursive removal with N parallel
+//! connections. Files are
 //! unlinked in batches spread across workers; directories are removed
 //! deepest-first, each depth level in parallel.
 
-use crate::cli::{Args, Location};
+use crate::cli::{Args, Interface, Location};
 use crate::conn::{ok, Conn, Endpoint};
 use crate::fsops::join;
 use crate::progress::{commas, Progress};
@@ -121,19 +122,22 @@ fn worker(
 /// path — deliberately not stricter than rm (no home/cwd/ancestor guessing).
 fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
     for l in locs {
-        let raw = l.path.trim_end_matches('/');
-        let last = raw.rsplit('/').next().unwrap_or("");
-        if raw.is_empty() || l.path == "/" {
-            bail!("refusing to remove the filesystem root {:?}", l.path);
+        let mut raw = l.path.as_slice();
+        while raw.ends_with(b"/") {
+            raw = &raw[..raw.len() - 1];
         }
-        if raw == "~" {
-            bail!("refusing to remove {:?}", l.path);
+        let last = raw.rsplit(|byte| *byte == b'/').next().unwrap_or(b"");
+        let shown = String::from_utf8_lossy(&l.path);
+        if raw.is_empty() || l.path == b"/" {
+            bail!("refusing to remove the filesystem root {shown:?}");
         }
-        if last == "." || last == ".." {
+        if raw == b"~" {
+            bail!("refusing to remove {shown:?}");
+        }
+        if last == b"." || last == b".." {
             bail!(
-                "\"{}\" may not be removed: its final path component is {:?}",
-                l.path,
-                last
+                "\"{shown}\" may not be removed: its final path component is {:?}",
+                String::from_utf8_lossy(last)
             );
         }
     }
@@ -141,11 +145,14 @@ fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
 }
 
 pub fn run(args: Args) -> Result<i32> {
-    let locs: Vec<Location> = args
-        .paths
-        .iter()
-        .map(|p| Location::parse(p))
-        .collect::<Result<_>>()?;
+    let mut locs: Vec<Location> = if args.locations.is_empty() {
+        args.paths
+            .iter()
+            .map(|p| Location::parse(p))
+            .collect::<Result<_>>()?
+    } else {
+        args.locations.clone()
+    };
     for l in &locs {
         if !l.same_host(&locs[0]) {
             bail!("all paths must be on the same host");
@@ -153,6 +160,19 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let mut args = args;
     check_rm_safety(&locs, &args)?;
+    if args.interface == Interface::NativeRm {
+        // Make duplicate and nested native selectors independent of argv order:
+        // descendants are erased before their selected ancestors, and exact
+        // duplicates are scanned only once.
+        locs.sort_by(|left, right| {
+            let left_depth = left.path.iter().filter(|byte| **byte == b'/').count();
+            let right_depth = right.path.iter().filter(|byte| **byte == b'/').count();
+            right_depth
+                .cmp(&left_depth)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        locs.dedup_by(|left, right| left.path == right.path);
+    }
     let ep = endpoint(&locs[0], &args)?;
     if args.connections_default && !ep.is_remote() {
         args.connections = crate::transfer::LOCAL_DEFAULT_CONNECTIONS;
@@ -205,7 +225,7 @@ pub fn run(args: Args) -> Result<i32> {
     let mut dirs: BTreeMap<usize, Vec<PathBytes>> = BTreeMap::new();
     let mut scan_err = None;
     for l in &locs {
-        let root = l.path.as_bytes().to_vec();
+        let root = l.path.clone();
         let mut batch: Vec<Op> = Vec::with_capacity(BATCH);
         let res = ctl.scan(
             &root,
