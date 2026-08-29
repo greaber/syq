@@ -22,7 +22,7 @@ already configured checkout at the exact pin. Reports are written as JSON,
 Markdown, static HTML, and a raw log under `target/rsync-compat/reports/`.
 
 Only the classified runnable subset is executed, not all 351 inventoried
-tests. A warm non-root Linux run selects 22 tests and takes about 11 seconds on
+tests. A warm non-root Linux run selects 31 tests and takes about 11 seconds on
 the development machine; four more tests apply when run as root. A first run
 also downloads and prepares the pinned rsync checkout and may do a cold Rust
 build. The exact cold time depends mostly on network and Cargo state.

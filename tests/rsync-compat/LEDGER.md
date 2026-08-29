@@ -12,9 +12,9 @@ Configured command prefix: `syq`.
 | Classification | Tests |
 |---|---:|
 | conformance | 15 |
-| adapted | 11 |
-| unsupported | 141 |
-| out-of-scope | 184 |
+| adapted | 20 |
+| unsupported | 133 |
+| out-of-scope | 183 |
 | unassessed | 0 |
 
 ## Runnable behavioral tests
@@ -23,11 +23,16 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 
 | Area | Test | Baseline | Product position | Provenance | Circumstances | Note |
 |---|---|---|---|---|---|---|
+| deletion | `delete-deep` | pass | Compatible | subset adaptation (delete-supported-subset) | platform=linux | Deep deletion, --delete-delay/--delete-after, --existing, and --ignore-existing agree; unsupported delete timing and backup cases and SYQ's intentional --max-delete policy difference are omitted. |
+| end-to-end | `hands` | pass | Compatible | subset adaptation (hands-supported-subset) | platform=linux; symlinks; POSIX modes | The canonical rich-tree test covers initial copy, one-file repair, a longer destination, and deletion; hard-link preservation, delta debugging, and the filter-dependent multi-source section are omitted. |
+| file-selection | `files-from-depth` | fail | Policy open | subset adaptation (files-from-core) | platform=linux | Deep --files-from and --from0 selection pass, but SYQ transfers entries beginning with # or ; instead of treating them as rsync comments; unsupported filter-list cases are omitted. |
 | file-selection | `files-from-path-clamp` | fail | Policy open | unmodified upstream | platform=linux | SYQ rejects parent components instead of clamping them at the source root. |
 | file-selection | `size-filter` | pass | Compatible | unmodified upstream | platform=linux | Apply --min-size and --max-size throughout a deep tree. |
+| hardlinks | `hardlinks-deep` | pass | Compatible | subset adaptation (hardlink-default) | platform=linux; hard links | Without -H, two cross-directory source names for one inode become independent destination files; unsupported hard-link preservation is omitted. |
 | metadata | `chgrp` | pass | Compatible | unmodified upstream | platform=linux; POSIX groups; chgrp | Preserve a supplementary group with -g. |
 | metadata | `chown` | pass | Compatible | subset adaptation (chown-syq-cli) | platform=linux; run-as=root; root; chown | Archive mode preserves numeric owners and groups; rsync-only --super and -H are removed. |
 | metadata | `dir-sgid` | pass | Compatible | unmodified upstream | platform=linux; POSIX modes | Honor setgid inheritance when creating destination directories. |
+| metadata | `executability` | pass | Compatible | subset adaptation (executability-default) | platform=linux; POSIX modes | Without -p, rerunning a copy leaves existing destination modes and executable bits unchanged; unsupported -E behavior is omitted. |
 | metadata | `metadata-depth` | pass | Compatible | subset adaptation (metadata-supported-subset) | platform=linux; POSIX modes and mtimes | Preserve modes and mtimes throughout a deep tree; upstream's unsupported --chmod case is omitted. |
 | paths | `deep-path` | pass | Compatible | subset adaptation (deep-path-local) | platform=linux; paths deeper than 64 components | Copy a 70-level local tree; the rsync-daemon half is outside SYQ's scope. |
 | paths | `dest-symlinked-dir` | pass | Compatible | unmodified upstream | platform=linux; symlinks | Follow an operator-named destination symlink to a directory. |
@@ -35,19 +40,23 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | permissions | `protected-regular` | pass | Compatible | unmodified upstream | platform=linux; run-as=root; root; Linux fs.protected_regular | --inplace can update a foreign-owned file in a sticky directory when the caller has authority. |
 | permissions | `search-only-destination` | pass | Compatible | unmodified upstream | platform=linux; Linux search-only directory semantics; setpriv when run as root | Traverse a searchable but unreadable destination parent. |
 | publication | `inplace` | pass | Compatible | invocation adaptation (inplace-syq-cli) | platform=linux; stable inode numbers | --inplace retains the destination inode while the default atomic path replaces it. |
+| quick-check | `compare` | pass | Compatible | subset adaptation (compare-supported-subset) | platform=linux; POSIX mtimes | At depth, the default size-and-mtime check skips a stealth change, -c repairs it, and an mtime change triggers the default transfer; unsupported -I, --size-only, and --modify-window cases are omitted. |
 | remote | `ssh-basic` | pass | Compatible | invocation adaptation (ssh-syq-path) | platform=linux; rsync lsh test helper | Remote-shell copy and follow-up deletion using SYQ's remote executable option. |
 | resume | `partial` | pass | Intentional divergence | fixture adaptation (syq-partial-layout) | platform=linux; signals; bandwidth limiting | An interrupted transfer leaves SYQ's job-scoped deterministic sidecar and a rerun completes it. |
 | robustness | `change-shrink` | pass | Compatible | invocation adaptation (source-mutation-cli) | platform=linux; threads; bandwidth limiting | Continue a transfer when a source file shrinks after the source scan. |
 | robustness | `change-vanish` | pass | Compatible | invocation adaptation (source-mutation-cli) | platform=linux; threads; bandwidth limiting | Continue a transfer when a source file vanishes after the source scan. |
 | robustness | `growing-file` | pass | Compatible | invocation adaptation (source-mutation-cli) | platform=linux; threads; bandwidth limiting | Copy the final contents of a file that grows after the source scan. |
 | robustness | `highfd-hang` | pass | Compatible | unmodified upstream | platform=linux; C compiler; soft fd limit above FD_SETSIZE | An ordinary transfer completes when the child inherits high-numbered descriptors. |
+| security | `remote-shell-newline-escaping` | pass | Compatible | invocation adaptation (remote-shell-syq-cli) | platform=linux; rsync lsh test helper | A newline-bearing remote destination cannot split SYQ's quoted remote command and execute an injected shell command. |
 | security | `sender-scan-dir-escape` | pass | Compatible | unmodified upstream | platform=linux; symlinks; C compiler; renameat2 | A raced source parent cannot make the copy enumerate outside the source tree. |
 | security | `symlink-race-dest` | fail | Unimplemented | unmodified upstream | platform=linux; run-as=root; root; a second uid; symlinks | SYQ follows an attacker-owned symlink in an operator-named absolute destination path. |
 | security | `symlink-race-relative-dest` | fail | Unimplemented | unmodified upstream | platform=linux; run-as=root; root; a second uid; symlinks | SYQ follows an attacker-owned symlink in an operator-named relative destination path. |
 | security | `symlink-race-source` | pass | Compatible | unmodified upstream | platform=linux; symlinks; C compiler; renameat2 | A raced source parent cannot make SYQ read file contents from outside the source tree. |
 | source-mapping | `duplicates` | fail | Policy open | unmodified upstream | platform=linux; symlinks | SYQ still treats repeated identical sources as destination collisions. |
 | special-files | `nested-socket-specials` | pass | Compatible | unmodified upstream | platform=linux; Unix-domain sockets | Archive mode handles a nested socket without losing ordinary files. |
+| symlinks | `links` | pass | Compatible | subset adaptation (links-preserve-subset) | platform=linux; symlinks | -l preserves both file and directory symlinks several levels deep; unsupported -L and -k cases are omitted. |
 | symlinks | `symlink-ignore` | pass | Compatible | unmodified upstream | platform=linux; symlinks | Without -l/-L/-a, omit symlinks while copying referent files. |
+| symlinks | `unsafe-links` | pass | Compatible | subset adaptation (unsafe-links-default) | platform=linux; symlinks | Default -a preserves both in-tree and lexically escaping symlinks without following them; unsupported copy-links variants are omitted. |
 | update | `update` | pass | Compatible | subset adaptation (update-supported-subset) | platform=linux; symlinks | -u skips a newer deep destination, updates an older one, and still replaces a type mismatch. |
 
 ## Exclusion reasons
@@ -101,7 +110,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `chmod-symlink-race` | `unsupported-metadata` |
 | `chmod-temp-dir` | `unsupported-metadata` |
 | `chown-fake` | `unsupported-xattrs` |
-| `compare` | `unsupported-transfer-mode` |
 | `compress-options` | `unsupported-transfer-mode` |
 | `copy-dest-source-symlink` | `unsupported-alt-dest` |
 | `copy-dest-symlink-readleak` | `unsupported-alt-dest` |
@@ -111,7 +119,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `delay-updates` | `unsupported-transfer-mode` |
 | `delay-updates-deep` | `unsupported-transfer-mode` |
 | `delete` | `unsupported-filters` |
-| `delete-deep` | `unsupported-alt-dest` |
 | `delete-missing-args-files-from` | `unsupported-transfer-mode` |
 | `devices` | `unsupported-hardlinks` |
 | `devices-fake` | `unsupported-xattrs` |
@@ -121,12 +128,10 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `exclude-implied-trailing-backslash` | `unsupported-filters` |
 | `exclude-lsh` | `unsupported-filters` |
 | `excludefrom-symlink` | `unsupported-filters` |
-| `executability` | `unsupported-metadata` |
 | `fake-super-acl-xattr` | `unsupported-xattrs` |
 | `fake-super-backup-fifo-regression` | `unsupported-xattrs` |
 | `file-to-file-mkpath-dry-run` | `unsupported-transfer-mode` |
 | `files-from` | `unsupported-transfer-mode` |
-| `files-from-depth` | `unsupported-filters` |
 | `filter-depth` | `unsupported-filters` |
 | `filter-leak` | `unsupported-filters` |
 | `filter-merge-content-echo` | `unsupported-filters` |
@@ -134,9 +139,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `filter-merge-symlink` | `unsupported-filters` |
 | `fuzzy` | `unsupported-transfer-mode` |
 | `fuzzy-basis` | `unsupported-transfer-mode` |
-| `hands` | `unsupported-hardlinks` |
 | `hardlinks` | `unsupported-hardlinks` |
-| `hardlinks-deep` | `unsupported-hardlinks` |
 | `itemize` | `unsupported-transfer-mode` |
 | `keep-dirlinks-rule` | `unsupported-transfer-mode` |
 | `keep-dirlinks-symlinked-dest` | `unsupported-transfer-mode` |
@@ -147,7 +150,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `link-dest-pathroot` | `unsupported-alt-dest` |
 | `link-dest-relative-basis` | `unsupported-alt-dest` |
 | `link-dest-symlink-enotsup` | `unsupported-alt-dest` |
-| `links` | `unsupported-transfer-mode` |
 | `log-control-chars` | `unsupported-transfer-mode` |
 | `log-file-symlink` | `unsupported-transfer-mode` |
 | `macos-setgid-ordinary-mode-regression` | `unsupported-metadata` |
@@ -206,7 +208,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `symlink-mknod-fakesuper-symlink-race` | `unsupported-xattrs` |
 | `temp-dir` | `unsupported-transfer-mode` |
 | `temp-dir-symlink-injection` | `unsupported-transfer-mode` |
-| `unsafe-links` | `unsupported-transfer-mode` |
 | `write-batch-filter-injection` | `unsupported-batch` |
 | `write-batch-quoting` | `unsupported-batch` |
 | `xattr-wire-cap` | `unsupported-xattrs` |
@@ -352,7 +353,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `readonly-partial-abort-mode-regression` | `rsync-wire` |
 | `recv-discard-nullderef` | `rsync-wire` |
 | `recv-generator-acl-leak` | `rsync-wire` |
-| `remote-shell-newline-escaping` | `rsync-internal` |
 | `rename-mixed-parent-escape-poc` | `rsync-internal` |
 | `rename-mixed-parent-symlink-race` | `rsync-internal` |
 | `rename-mixed-parent-transfer` | `rsync-daemon` |

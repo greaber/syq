@@ -51,12 +51,12 @@ product position: compatible, unimplemented, intentional divergence, undecided
 policy, or unresolved test claim. CI fails when the observation changes in
 either direction until it is reviewed, but an expected test failure is not
 misreported as a harness crash. Runner completeness and output parsing are
-checked independently. All 351 pinned tests are classified: 26 are runnable,
-141 require unsupported user-facing features, and 184 exercise rsync's own
+checked independently. All 351 pinned tests are classified: 35 are runnable,
+133 require unsupported user-facing features, and 183 exercise rsync's own
 internals, protocol, daemon, or restricted wrapper. There are no unassessed
-tests. CI runs the 22 non-root and four additional root circumstances and
-publishes JSON, Markdown, static HTML, and raw-log matrices rather than a
-headline score.
+tests. CI runs 31 tests as a non-root user, then those tests plus four
+root-only circumstances as root, and publishes JSON, Markdown, static HTML,
+and raw-log matrices rather than a headline score.
 
 The generated `tests/rsync-compat/LEDGER.md` is the readable per-test record;
 CI rejects it if it drifts from the manifest and inventory. An adapted test
