@@ -279,49 +279,42 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
             "\n  tcp statistics: unavailable on this platform/kernel".into()
         };
     }
-    let sum = |field: fn(&TcpSocketStats) -> u64| sockets.iter().map(field).sum::<u64>();
+    // Aggregates are meaningful only when every sampled socket exposes the
+    // field. Do not turn an unsupported end into a genuine zero.
+    let sum =
+        |field: fn(&TcpSocketStats) -> Option<u64>| sockets.iter().map(field).sum::<Option<u64>>();
+    let values = |field: fn(&TcpSocketStats) -> Option<u64>| {
+        sockets.iter().map(field).collect::<Option<Vec<u64>>>()
+    };
     let bytes_sent = sum(|stats| stats.bytes_sent);
     let bytes_retransmitted = sum(|stats| stats.bytes_retransmitted);
     let segments_sent = sum(|stats| stats.segments_sent);
     let retransmissions = sum(|stats| stats.retransmissions);
-    let rtts: Vec<u64> = sockets
-        .iter()
-        .map(|stats| stats.rtt_us)
-        .filter(|rtt| *rtt > 0)
-        .collect();
-    let average_rtt = (!rtts.is_empty()).then(|| rtts.iter().sum::<u64>() / rtts.len() as u64);
-    let min_rtt = sockets
-        .iter()
-        .map(|stats| stats.min_rtt_us)
-        .filter(|rtt| *rtt > 0)
-        .min();
-    let retransmit_percent = if bytes_sent > 0 {
-        bytes_retransmitted as f64 * 100.0 / bytes_sent as f64
-    } else {
-        0.0
+    let average_rtt =
+        values(|stats| stats.rtt_us).map(|rtts| rtts.iter().sum::<u64>() / rtts.len() as u64);
+    let min_rtt = values(|stats| stats.min_rtt_us).and_then(|rtts| rtts.into_iter().min());
+    let loss = |amount: Option<u64>, sent: Option<u64>| match amount {
+        None => "unavailable".into(),
+        Some(amount) => match sent {
+            Some(sent) if sent > 0 => format!(
+                "{} ({:.3}% of sent)",
+                commas(amount),
+                amount as f64 * 100.0 / sent as f64
+            ),
+            _ => format!("{} (percentage unavailable)", commas(amount)),
+        },
     };
-    let retransmit_packet_percent = if segments_sent > 0 {
-        retransmissions as f64 * 100.0 / segments_sent as f64
-    } else {
-        0.0
-    };
-    let congestion_windows: Vec<u64> = sockets
-        .iter()
-        .map(|stats| stats.send_cwnd_bytes)
-        .filter(|window| *window > 0)
-        .collect();
-    let average_congestion_window = (!congestion_windows.is_empty())
-        .then(|| congestion_windows.iter().sum::<u64>() / congestion_windows.len() as u64);
+    let average_congestion_window = values(|stats| stats.send_cwnd_bytes)
+        .map(|windows| windows.iter().sum::<u64>() / windows.len() as u64);
     let delivery_rate = sum(|stats| stats.delivery_rate);
     let busy = sum(|stats| stats.busy_time_us);
     let receive_limited = sum(|stats| stats.receive_window_limited_us);
     let send_limited = sum(|stats| stats.send_buffer_limited_us);
-    let limited_percent = |limited: u64| {
-        if busy > 0 {
-            limited as f64 * 100.0 / busy as f64
-        } else {
-            0.0
+    let limited_percent = |limited: Option<u64>| match (limited, busy) {
+        (Some(limited), Some(busy)) if busy > 0 => {
+            format!("{:.1}%", limited as f64 * 100.0 / busy as f64)
         }
+        _ => "unavailable".into(),
     };
     let paths = pairs
         .iter()
@@ -329,23 +322,20 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     let mut output = format!(
-        "\n  tcp connection lifetimes sampled: {} across {} path(s) ({} socket ends)\n  tcp retransmissions (loss signal): {} packets ({retransmit_packet_percent:.3}% of sent), {} bytes ({retransmit_percent:.3}% of sent)\n  tcp RTT: current average {}, minimum {}\n  tcp congestion: average send window {}, aggregate delivery rate {}\n  tcp window-limited time: receive {:.1}%, send-buffer {:.1}%\n  tcp ECN CE deliveries: {}",
+        "\n  tcp connection lifetimes sampled: {} across {} path(s) ({} socket ends)\n  tcp retransmissions (loss signal): {} packets, {} bytes\n  tcp RTT: current average {}, minimum {}\n  tcp congestion: average send window {}, aggregate delivery rate {}\n  tcp window-limited time: receive {}, send-buffer {}\n  tcp ECN CE deliveries: {}",
         pairs.len(),
         paths,
         sockets.len(),
-        commas(retransmissions),
-        commas(bytes_retransmitted),
+        loss(retransmissions, segments_sent),
+        loss(bytes_retransmitted, bytes_sent),
         average_rtt.map_or_else(|| "unavailable".into(), |value| format!("{:.2} ms", value as f64 / 1000.0)),
         min_rtt.map_or_else(|| "unavailable".into(), |value| format!("{:.2} ms", value as f64 / 1000.0)),
         average_congestion_window.map_or_else(|| "unavailable".into(), human),
-        if delivery_rate > 0 {
-            format!("{}/s", human(delivery_rate))
-        } else {
-            "unavailable".into()
-        },
+        delivery_rate.map_or_else(|| "unavailable".into(), |value| format!("{}/s", human(value))),
         limited_percent(receive_limited),
         limited_percent(send_limited),
-        commas(sum(|stats| stats.ecn_ce_delivered)),
+        sum(|stats| stats.ecn_ce_delivered)
+            .map_or_else(|| "unavailable".into(), commas),
     );
     if has_ssh_data {
         output.push_str("\n  ssh data connections: kernel TCP loss statistics unavailable");
@@ -1176,7 +1166,17 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
-    let tuned = tuner.lock().unwrap().take().and_then(|t| t.join().ok());
+    let tuned = match tuner.lock().unwrap().take() {
+        Some(thread) => match thread.join() {
+            Ok(policy) => Some(policy),
+            Err(_) => {
+                progress.error("syq: auto-tuning thread panicked");
+                sched.abort();
+                None
+            }
+        },
+        None => None,
+    };
 
     let aborted = sched.is_aborted();
     let mut deleted = 0u64;
@@ -1234,10 +1234,19 @@ pub fn run(args: Args) -> Result<i32> {
         && !collision
     {
         if let Some(policy) = tuned.as_ref().filter(|policy| policy.measured()) {
-            // Recompute after the copy: a failed direct TCP path may have
-            // fallen back to ssh, and the two transports must learn separately.
-            if let Some(key) = tune::path_key(&src_ep, &dst_ep).or(tuning_key) {
-                tune::remember(&key, policy.settled());
+            // A TCP failure affects later connections but leaves earlier TCP
+            // workers alive, so a changed key means the measurements may mix
+            // transports. Such a run is useful live evidence but not a safe
+            // hint for either future pure path.
+            if let Some(initial_key) = tuning_key.as_deref() {
+                let final_key = tune::path_key(&src_ep, &dst_ep);
+                if final_key.as_deref() == Some(initial_key) {
+                    tune::remember(initial_key, policy.settled());
+                } else if debug() {
+                    eprintln!(
+                        "syq: auto-tuning: transport changed during transfer; not updating cache"
+                    );
+                }
             }
         }
     }
@@ -4671,5 +4680,30 @@ mod tests {
                 "clean_root({given:?})"
             );
         }
+    }
+
+    #[test]
+    fn tcp_stats_distinguish_unavailable_fields_from_zero() {
+        let output = format_tcp_stats(
+            &[TcpPairStats {
+                label: "host".into(),
+                local: Some(TcpSocketStats {
+                    bytes_sent: Some(100),
+                    bytes_retransmitted: Some(0),
+                    segments_sent: Some(10),
+                    retransmissions: None,
+                    rtt_us: Some(1_000),
+                    min_rtt_us: None,
+                    ecn_ce_delivered: None,
+                    ..TcpSocketStats::default()
+                }),
+                peer: None,
+            }],
+            false,
+        );
+        assert!(output.contains("unavailable packets, 0 (0.000% of sent) bytes"));
+        assert!(output.contains("current average 1.00 ms, minimum unavailable"));
+        assert!(output.contains("receive unavailable, send-buffer unavailable"));
+        assert!(output.contains("tcp ECN CE deliveries: unavailable"));
     }
 }

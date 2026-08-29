@@ -50,13 +50,10 @@ pub const MAX: usize = 64;
 pub const MIN: usize = 1;
 /// Multiplicative step between worker counts, up or down.
 pub const STEP: f64 = 1.3;
-/// A step up is kept if it gains at least this fraction of what linear
-/// scaling would have given (STEP - 1). Lenient on purpose: a false "no
-/// gain" strands a window-capped ssh path at half speed, while a false
-/// "gain" costs a few idle connections that the next down-probe reclaims.
-const GAIN_FRACTION: f64 = 1.0 / 3.0;
-/// A step down is kept unless throughput fell by more than this.
-const DOWN_TOLERANCE: f64 = 0.05;
+/// Prefer the smallest measured count whose throughput is this close to the
+/// recent best. Probe scheduling handles noise independently from this
+/// objective; acceptance must not impose a stricter, contradictory threshold.
+const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// Measurements in the hold phase between probes. Each failed probe in a
 /// direction doubles only that direction's wait (up to
 /// 2^PROBE_BACKOFF_MAX times), so a sharp knee — a disk that collapses one
@@ -422,13 +419,6 @@ impl Policy {
         PROBE_EVERY << backoff
     }
 
-    /// The gain a step up by `factor` must show to be kept. This deliberately
-    /// asks for only part of linear scaling: getting stuck below the knee is
-    /// normally more expensive than briefly trying one surplus connection.
-    fn gain_needed(factor: f64) -> f64 {
-        1.0 + (factor - 1.0) * GAIN_FRACTION
-    }
-
     fn record(&mut self, n: usize, score: f64) {
         self.points
             .entry(n)
@@ -456,7 +446,7 @@ impl Policy {
                         return lower + (self.n - lower) / 2;
                     }
                     if self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
-                        && point.score < self.recent_best() * (1.0 - DOWN_TOLERANCE)
+                        && point.score < self.recent_best() * (1.0 - NEAR_BEST_TOLERANCE)
                     {
                         return self.n;
                     }
@@ -480,9 +470,9 @@ impl Policy {
                         return self.n + (upper - self.n).div_ceil(2);
                     }
                     let current = self.points.get(&self.n).map_or(0.0, |point| point.score);
-                    let factor = upper as f64 / self.n as f64;
+                    let best = self.recent_best().max(point.score);
                     if self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
-                        && point.score <= current * Self::gain_needed(factor)
+                        && current >= best * (1.0 - NEAR_BEST_TOLERANCE)
                     {
                         return self.n;
                     }
@@ -565,17 +555,17 @@ impl Policy {
                 if base <= 0.0 && score <= 0.0 {
                     return self.n;
                 }
-                let ratio = if base > 0.0 {
-                    score / base
-                } else {
-                    f64::INFINITY
-                };
+                let best = self.recent_best();
+                let floor = best * (1.0 - NEAR_BEST_TOLERANCE);
                 let keep = match direction {
+                    // Keep the larger count only when it is near-best and the
+                    // smaller baseline is not. If both qualify, the objective
+                    // explicitly prefers the smaller one.
                     Direction::Up => {
-                        let factor = self.n as f64 / from as f64;
-                        ratio > Self::gain_needed(factor)
+                        let from_score = self.points.get(&from).map_or(base, |point| point.score);
+                        score >= floor && from_score < floor
                     }
-                    Direction::Down => score >= self.recent_best() * (1.0 - DOWN_TOLERANCE),
+                    Direction::Down => score >= floor,
                 };
                 self.comparisons += 1;
                 let idx = direction.index();
@@ -767,6 +757,12 @@ pub trait Meter: Send + Sync {
     fn set_active(&self, n: usize);
 }
 
+fn activity_rate(last: (u64, u64), now: (u64, u64), seconds: f64) -> Option<f64> {
+    let bytes = now.0.checked_sub(last.0)?;
+    let files = now.1.checked_sub(last.1)?;
+    Some((bytes as f64 + files as f64 * FILE_CREDIT as f64) / seconds)
+}
+
 /// Drive the policy: sample progress, hand stable scores to the policy,
 /// apply its decisions to the gate and spawn workers that don't exist yet.
 /// Returns the final policy (for stats).
@@ -882,7 +878,15 @@ pub fn run(
         }
         // Per second, so jitter in the sample length doesn't masquerade as a
         // throughput change.
-        let rate = ((now.0 - last.0) as f64 + (now.1 - last.1) as f64 * FILE_CREDIT as f64) / secs;
+        let Some(rate) = activity_rate(last, now, secs) else {
+            // Progress can be retracted after uncertain acknowledgements. The
+            // production meter is monotonic, but keep the generic driver safe
+            // and discard any interval from a regressing implementation.
+            last = now;
+            sampler.reset();
+            collapse_samples = 0;
+            continue;
+        };
         last = now;
         if policy
             .probe_base()
@@ -995,6 +999,29 @@ mod tests {
     }
 
     #[test]
+    fn upward_acceptance_uses_the_near_best_objective() {
+        let mut worthwhile = Policy::new(10, MIN, MAX);
+        measure(&mut worthwhile, 100.0);
+        measure(&mut worthwhile, 107.0);
+        assert_eq!(worthwhile.settled(), 13);
+
+        let mut unnecessary = Policy::new(10, MIN, MAX);
+        measure(&mut unnecessary, 100.0);
+        measure(&mut unnecessary, 104.0);
+        assert_eq!(unnecessary.settled(), 10);
+    }
+
+    #[test]
+    fn activity_rate_discards_a_regressing_sample() {
+        assert_eq!(activity_rate((100, 2), (90, 3), 1.0), None);
+        assert_eq!(activity_rate((100, 2), (110, 1), 1.0), None);
+        assert_eq!(
+            activity_rate((100, 2), (110, 3), 2.0),
+            Some((10.0 + FILE_CREDIT as f64) / 2.0)
+        );
+    }
+
+    #[test]
     fn successful_direction_continues_to_the_plateau() {
         let p = simulate(START_SSH, 32, 80, |_| 1.0);
         assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
@@ -1084,6 +1111,15 @@ mod tests {
     }
 
     #[test]
+    fn a_short_run_has_no_cacheable_comparison() {
+        let mut p = Policy::new(START_SSH, MIN, MAX);
+        measure(&mut p, 80.0);
+        assert!(!p.measured());
+        measure(&mut p, 80.0);
+        assert!(p.measured());
+    }
+
+    #[test]
     fn cache_remembers_only_the_named_path_and_clamps_values() {
         let dir = temporary_cache("roundtrip");
         let path = dir.join("tuning.json");
@@ -1103,6 +1139,18 @@ mod tests {
         assert_ne!(path_key(&local, &ssh), path_key(&ssh, &local));
         assert_ne!(path_key(&local, &ssh), path_key(&local, &tcp));
         assert_eq!(path_key(&local, &local), None);
+    }
+
+    #[test]
+    fn tcp_fallback_changes_the_cache_key() {
+        let local = Endpoint::Local;
+        let remote = remote("host", true);
+        let initial = path_key(&local, &remote);
+        let Endpoint::Remote(spec) = &remote else {
+            unreachable!()
+        };
+        spec.tcp.lock().unwrap().as_mut().unwrap().failed = true;
+        assert_ne!(path_key(&local, &remote), initial);
     }
 
     #[test]
@@ -1184,5 +1232,20 @@ mod tests {
         assert!(!gate.park(1, || false), "surplus slot should retire");
         gate.mark_absent(1);
         assert_eq!(gate.begin_warming(2), vec![1]);
+    }
+
+    #[test]
+    fn optional_provisioning_failure_does_not_poison_active_slots() {
+        let gate = Gate::new(2);
+        assert_eq!(gate.begin_warming(3), vec![0, 1, 2]);
+        gate.mark_ready(0);
+        gate.mark_ready(1);
+        gate.mark_failed(2);
+        assert!(!gate.permanent_failure_through(2));
+        assert!(gate.permanent_failure_through(3));
+
+        gate.clear_failed_from(2);
+        assert_eq!(gate.begin_warming(3), vec![2]);
+        assert!(gate.ready_through(2));
     }
 }

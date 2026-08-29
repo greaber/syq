@@ -596,20 +596,22 @@ the tuner a probe or two. The cache is
 `$XDG_CACHE_HOME/syq/tuning-v1.json` (normally
 `~/.cache/syq/tuning-v1.json`; set `SYQ_TUNING_CACHE` to override it or to an
 empty value to disable it). Explicit `-j`, dry runs, verification, short runs
-that compare no counts, and failed/aborted copies do not update it.
+that compare no counts, failed/aborted copies, and runs whose TCP path falls
+back to ssh after workers start do not update it; the last case may contain
+mixed-transport measurements that are not representative of either pure path.
 
 Progress (bytes, plus a small credit per completed file so small-file trees
 count) is sampled every 2.5 s. A count has been *measured* only once two
 consecutive samples agree within 10 %, so a burst that gets throttled or a link
 still ramping up is waited out (up to 20 s) rather than credited to the last
 change. The first probe is a 1.3× step up — 8→10, not 8→16. A step up is kept
-when it gains at least a third of proportional scaling; a step down is kept
-when it stays within 5 % of the best recent measurement. A successful move
-keeps exploring in the same direction. A failed move returns to the last good
-count and records a bound, so later probes refine untested integers: if 10→13
-helps and 13→17 is flat, syq stays at 13 and can later try 11 rather than
-immediately falling back to 10. The objective is the smallest count within 5 %
-of the best observed speed, from 1 through 64.
+only when the smaller count is more than 5 % below the best recent measurement;
+a step down is kept when it stays within 5 %. Thus acceptance directly follows
+the objective: the smallest measured count within 5 % of the best observed
+speed, from 1 through 64. A successful move keeps exploring in the same
+direction. A failed move returns to the last good count and records a bound, so
+later probes refine untested integers: if 10→13 helps and 13→17 is flat, syq
+stays at 13 and can later try 11 rather than immediately falling back to 10.
 
 In steady state, evidence in the upward and downward directions ages and backs
 off independently. A direction is first eligible again after 6 stable
@@ -659,9 +661,10 @@ With `--stats`, direct TCP copies also report the kernel counters available on
 both socket ends: retransmitted packets and bytes (a packet-loss signal),
 current/minimum RTT, congestion window and delivery rate, receive-window and
 send-buffer limited time, and ECN CE deliveries. These are diagnostic telemetry
-only and do not change the tuning cache key. SSH does not expose
-per-data-connection TCP counters to syq, so the statistics say they are
-unavailable when the data transport is SSH.
+only and do not change the tuning cache key. Unsupported fields are labeled
+unavailable rather than displayed as zero. SSH does not expose per-data-
+connection TCP counters to syq, so the statistics say they are unavailable
+when the data transport is SSH.
 
 The remote advertises every address it has (the one your ssh session arrived
 on first, then private LAN, then public, then CGNAT/Tailscale); the client

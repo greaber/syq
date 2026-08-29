@@ -70,21 +70,34 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
             &mut len,
         )
     };
-    (result == 0).then_some(TcpSocketStats {
-        bytes_sent: info.tcpi_bytes_sent,
-        bytes_retransmitted: info.tcpi_bytes_retrans,
-        segments_sent: info.tcpi_segs_out.into(),
-        segments_received: info.tcpi_segs_in.into(),
-        retransmissions: info.tcpi_total_retrans.into(),
-        rtt_us: info.tcpi_rtt.into(),
-        rtt_variance_us: info.tcpi_rttvar.into(),
-        min_rtt_us: info.tcpi_min_rtt.into(),
-        send_cwnd_bytes: u64::from(info.tcpi_snd_cwnd) * u64::from(info.tcpi_snd_mss),
-        delivery_rate: info.tcpi_delivery_rate,
-        busy_time_us: info.tcpi_busy_time,
-        receive_window_limited_us: info.tcpi_rwnd_limited,
-        send_buffer_limited_us: info.tcpi_sndbuf_limited,
-        ecn_ce_delivered: info.tcpi_delivered_ce.into(),
+    if result != 0 {
+        return None;
+    }
+    macro_rules! field {
+        ($name:ident, $value:expr) => {
+            ((len as usize)
+                >= std::mem::offset_of!(libc::tcp_info, $name) + std::mem::size_of_val(&info.$name))
+            .then(|| $value)
+        };
+    }
+    Some(TcpSocketStats {
+        bytes_sent: field!(tcpi_bytes_sent, info.tcpi_bytes_sent),
+        bytes_retransmitted: field!(tcpi_bytes_retrans, info.tcpi_bytes_retrans),
+        segments_sent: field!(tcpi_segs_out, info.tcpi_segs_out.into()),
+        segments_received: field!(tcpi_segs_in, info.tcpi_segs_in.into()),
+        retransmissions: field!(tcpi_total_retrans, info.tcpi_total_retrans.into()),
+        rtt_us: field!(tcpi_rtt, info.tcpi_rtt.into()),
+        rtt_variance_us: field!(tcpi_rttvar, info.tcpi_rttvar.into()),
+        min_rtt_us: field!(tcpi_min_rtt, info.tcpi_min_rtt.into()),
+        send_cwnd_bytes: field!(
+            tcpi_snd_cwnd,
+            u64::from(info.tcpi_snd_cwnd) * u64::from(info.tcpi_snd_mss)
+        ),
+        delivery_rate: field!(tcpi_delivery_rate, info.tcpi_delivery_rate),
+        busy_time_us: field!(tcpi_busy_time, info.tcpi_busy_time),
+        receive_window_limited_us: field!(tcpi_rwnd_limited, info.tcpi_rwnd_limited),
+        send_buffer_limited_us: field!(tcpi_sndbuf_limited, info.tcpi_sndbuf_limited),
+        ecn_ce_delivered: field!(tcpi_delivered_ce, info.tcpi_delivered_ce.into()),
     })
 }
 
@@ -101,22 +114,33 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
             &mut len,
         )
     };
-    (result == 0).then_some(TcpSocketStats {
-        bytes_sent: info.tcpi_txbytes,
-        bytes_retransmitted: info.tcpi_txretransmitbytes,
-        segments_sent: info.tcpi_txpackets,
-        segments_received: info.tcpi_rxpackets,
-        retransmissions: 0,
+    if result != 0 {
+        return None;
+    }
+    macro_rules! field {
+        ($name:ident, $value:expr) => {
+            ((len as usize)
+                >= std::mem::offset_of!(libc::tcp_connection_info, $name)
+                    + std::mem::size_of_val(&info.$name))
+            .then(|| $value)
+        };
+    }
+    Some(TcpSocketStats {
+        bytes_sent: field!(tcpi_txbytes, info.tcpi_txbytes),
+        bytes_retransmitted: field!(tcpi_txretransmitbytes, info.tcpi_txretransmitbytes),
+        segments_sent: field!(tcpi_txpackets, info.tcpi_txpackets),
+        segments_received: field!(tcpi_rxpackets, info.tcpi_rxpackets),
+        retransmissions: None,
         // Darwin reports these fields in milliseconds.
-        rtt_us: u64::from(info.tcpi_srtt) * 1000,
-        rtt_variance_us: u64::from(info.tcpi_rttvar) * 1000,
-        min_rtt_us: 0,
-        send_cwnd_bytes: info.tcpi_snd_cwnd.into(),
-        delivery_rate: 0,
-        busy_time_us: 0,
-        receive_window_limited_us: 0,
-        send_buffer_limited_us: 0,
-        ecn_ce_delivered: 0,
+        rtt_us: field!(tcpi_srtt, u64::from(info.tcpi_srtt) * 1000),
+        rtt_variance_us: field!(tcpi_rttvar, u64::from(info.tcpi_rttvar) * 1000),
+        min_rtt_us: None,
+        send_cwnd_bytes: field!(tcpi_snd_cwnd, info.tcpi_snd_cwnd.into()),
+        delivery_rate: None,
+        busy_time_us: None,
+        receive_window_limited_us: None,
+        send_buffer_limited_us: None,
+        ecn_ce_delivered: None,
     })
 }
 
@@ -193,6 +217,7 @@ pub struct RemoteConn {
 }
 
 const READ_AHEAD: usize = 4;
+const TRANSPORT_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn spawn_reader(
     input: Box<dyn Read + Send>,
@@ -209,6 +234,16 @@ fn spawn_reader(
         }
     });
     rx
+}
+
+fn receive_transport_stats(
+    rx: &std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    timeout: std::time::Duration,
+) -> Option<TcpSocketStats> {
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(Response::TransportStats(stats))) => stats,
+        _ => None,
+    }
 }
 
 fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()> {
@@ -282,18 +317,15 @@ impl Conn for RemoteConn {
     fn transport_stats(&mut self) -> Option<TcpPairStats> {
         let socket = self.tcp_socket.as_ref()?.try_clone().ok()?;
         let local = tcp_socket_stats(&socket);
-        // Diagnostics must not make a completed copy wait forever for a
-        // wedged peer. The option is socket-wide, including the reader clone.
-        let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-        let peer = if self.dead {
+        // Changing SO_RCVTIMEO cannot wake a reader already blocked on another
+        // clone. Bound the actual response wait instead. This connection is
+        // retired immediately after collection, so a late reply cannot become
+        // a response to a later request.
+        let peer = if self.dead || self.send(Request::TransportStats).is_err() {
             None
         } else {
-            match self.call(Request::TransportStats) {
-                Ok(Response::TransportStats(stats)) => stats,
-                _ => None,
-            }
+            receive_transport_stats(&self.rx, TRANSPORT_STATS_TIMEOUT)
         };
-        let _ = socket.set_read_timeout(None);
         (local.is_some() || peer.is_some()).then(|| TcpPairStats {
             label: self.label.clone(),
             local,
@@ -1397,8 +1429,24 @@ mod tests {
         let client_stats = tcp_socket_stats(&client).unwrap();
         let server_stats = server.join().unwrap();
         assert_eq!(byte, [7]);
-        assert!(client_stats.segments_sent > 0 || client_stats.bytes_sent > 0);
-        assert!(server_stats.segments_sent > 0 || server_stats.bytes_sent > 0);
+        assert!(
+            client_stats.segments_sent.is_some_and(|value| value > 0)
+                || client_stats.bytes_sent.is_some_and(|value| value > 0)
+        );
+        assert!(
+            server_stats.segments_sent.is_some_and(|value| value > 0)
+                || server_stats.bytes_sent.is_some_and(|value| value > 0)
+        );
+    }
+
+    #[test]
+    fn transport_stats_response_wait_has_a_deadline() {
+        let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let timeout = std::time::Duration::from_millis(20);
+        let start = std::time::Instant::now();
+        assert!(receive_transport_stats(&receiver, timeout).is_none());
+        assert!(start.elapsed() >= timeout);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
     fn entry(path: &[u8]) -> Entry {
