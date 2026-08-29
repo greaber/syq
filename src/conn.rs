@@ -312,8 +312,6 @@ pub struct RemoteDiagnostics {
     pub peer: Option<PeerInfo>,
     pub tcp_probe: Option<TcpProbe>,
     pub tcp_setup_error: Option<String>,
-    pub data_connection_verified: bool,
-    pub data_connection_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,14 +365,6 @@ impl RemoteSpec {
             .unwrap_or_else(|| std::ffi::OsStr::new(&self.rsh[0]))
             .to_string_lossy()
             .into_owned()
-    }
-
-    pub fn record_data_connection_check(&self, result: &Result<()>) {
-        let mut diagnostics = self.diagnostics.lock().unwrap();
-        match result {
-            Ok(()) => diagnostics.data_connection_verified = true,
-            Err(error) => diagnostics.data_connection_error = Some(format!("{error:#}")),
-        }
     }
 
     fn record_peer(&self, conn: &RemoteConn) {
@@ -644,7 +634,6 @@ impl RemoteSpec {
             token,
             failed: false,
             failure: None,
-            verified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         Ok(())
@@ -729,8 +718,6 @@ impl RemoteSpec {
                 peer: None,
             };
             let conn = hello(conn, compress, info.token.clone())?;
-            info.verified
-                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.record_peer(&conn);
             return Ok(conn);
         }
@@ -789,9 +776,6 @@ pub struct TcpInfo {
     /// Set once a connect attempt failed; later connections use ssh.
     pub failed: bool,
     pub failure: Option<String>,
-    /// Shared across snapshots so diagnostics can distinguish a socket probe
-    /// from a complete authenticated syq handshake.
-    pub verified: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Round-robin cursor so successive data connections use different addresses.
     pub next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }

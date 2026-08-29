@@ -454,7 +454,7 @@ fn remote_retained_basis_handles_matching_and_changed_files() {
 }
 
 #[test]
-fn double_verbose_dry_run_verifies_tcp_without_writing() {
+fn double_verbose_dry_run_reports_tcp_without_extra_connection() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src"), b"diagnose");
@@ -495,7 +495,9 @@ fn double_verbose_dry_run_verifies_tcp_without_writing() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("transport: encrypted TCP verified by a dry-run data connection"),
+        stderr.contains(
+            "transport: encrypted TCP planned for a real transfer (reachability preflight passed)"
+        ),
         "{stderr}"
     );
     assert!(
@@ -504,10 +506,18 @@ fn double_verbose_dry_run_verifies_tcp_without_writing() {
         ),
         "{stderr}"
     );
+    assert_eq!(
+        fs::read_to_string(t.path("rsh.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "-vv must not add a remote-shell connection during dry-run"
+    );
 }
 
 #[test]
-fn double_verbose_dry_run_explains_ssh_fallback() {
+fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     executable(
@@ -541,7 +551,7 @@ fn double_verbose_dry_run_explains_ssh_fallback() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("transport: SSH fallback verified by a dry-run data connection"),
+        stderr.contains("transport: SSH planned for a real transfer (TCP unavailable:"),
         "{stderr}"
     );
     assert!(
@@ -549,6 +559,14 @@ fn double_verbose_dry_run_explains_ssh_fallback() {
             "a real transfer would start with 8 connections (auto-tuned); dry-run starts no workers"
         ),
         "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(t.path("rsh.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "-vv must not verify fallback with an extra connection"
     );
 }
 
@@ -615,7 +633,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("transport: plaintext TCP selected"),
+        stderr.contains("transport: plaintext TCP planned (reachability preflight passed)"),
         "{stderr}"
     );
     assert!(
@@ -5169,6 +5187,55 @@ fn files_from_leaves_unlisted_destination_root_metadata_alone() {
         &t.s("dst2"),
     ]);
     assert!(t.path("dst2").is_dir());
+}
+
+#[test]
+fn direct_remote_to_remote_verbose_diagnostics_are_orchestrator_relative() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    write(&t.path("src/a"), b"a");
+
+    let src = format!("hostA:{}", t.s("src/"));
+    let dst = format!("hostB:{}", t.s("dst"));
+    let out = remote_syq(
+        &t,
+        &rsh,
+        &["-avv", "--dry-run", "--no-bootstrap", &src, &dst],
+    );
+    assert_output_ok(&out);
+    assert!(!t.path("dst").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote-to-remote: running on hostA"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("syq: hostB:\n"), "{stderr}");
+    assert!(!stderr.contains("syq: hostA:\n"), "{stderr}");
+    assert!(
+        stderr.contains("transport: SSH planned for a real transfer (--no-tcp)"),
+        "{stderr}"
+    );
+
+    let same_host_dst = format!("hostA:{}", t.s("same-host-dst"));
+    let out = remote_syq(
+        &t,
+        &rsh,
+        &["-avv", "--dry-run", "--no-bootstrap", &src, &same_host_dst],
+    );
+    assert_output_ok(&out);
+    assert!(!t.path("same-host-dst").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote-to-remote: running on hostA"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("syq: transport: local filesystem"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("syq: hostA:\n"), "{stderr}");
 }
 
 #[test]

@@ -23,7 +23,7 @@ SYQ_DEBUG=1 syq -a --stats SOURCE HOST:DESTINATION
 ```
 
 `-vv` reports the remote helper and platform, candidate TCP addresses, the
-selected data transport, and the initial connection count; `--stats` reports
+planned data transport, and the initial connection count; `--stats` reports
 where automatic connection tuning settled. `SYQ_DEBUG=1` adds engineering
 timings showing connection setup and where workers spent their time. Check CPU,
 disk, and network utilization on both endpoints at the same time. More network
