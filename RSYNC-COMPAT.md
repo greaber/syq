@@ -10,8 +10,8 @@ Each entry says whether it was **measured** (run against upstream rsync —
 **believed** (from documentation or memory, not yet exercised). A raw run of
 the upstream rsync test suite is not a compatibility score: most of its
 failures come from unsupported options, protocol internals, daemon mode, or
-its harness. The classified non-root Linux subset currently passes 20 of 22
-tests; the two known failures are open issues 2 and 3 below.
+its harness. The automated matrix therefore reports raw observations alongside
+our product position on each behavior instead of reducing them to a percentage.
 
 Categories:
 
@@ -33,11 +33,12 @@ Categories:
 python3 scripts/rsync-compat.py
 ```
 
-The manifest pins rsync commit `7c20b077`, records normal and future strict
-profiles, and gives every runnable test an expected result plus platform and
-environment requirements. `inventory.tsv` names all 351 tests at that commit;
-changing the pin without classifying every added or removed test is an error.
-The classifications deliberately distinguish:
+The manifest pins rsync commit `7c20b077` and defines one target representing
+SYQ's rsync-compatible command surface. It currently invokes native `syq`; once
+the dedicated `syq rsync` command exists, changing the target's argument list
+switches the suite without changing upstream test calls. `inventory.tsv` names
+all 351 tests at that commit; changing the pin without classifying every added
+or removed test is an error. The classifications deliberately distinguish:
 
 - relevant unmodified and adapted conformance tests;
 - user-visible features syq does not implement;
@@ -45,24 +46,27 @@ The classifications deliberately distinguish:
   that syq does not need to pass; and
 - an explicit unassessed category for future pin updates (currently empty).
 
-The upstream runner's expected-result mode is the oracle. A known failure is
-green, while both a regression and an unexpected pass fail CI until the ledger
-is updated. All 351 pinned tests are classified: 26 are runnable conformance
-tests, 141 require unsupported user-facing features, and 184 exercise rsync's
-own internals, protocol, daemon, or restricted wrapper. There are no unassessed
-tests. The normal non-root Linux run selects 22 of the 26 and currently records
-20 passes and 2 known failures; CI also runs the four root-only circumstances.
-That pass rate covers the selected conformance subset, not an overall
-percentage of rsync compatibility.
+Each runnable entry records a raw observation baseline separately from its
+product position: compatible, unimplemented, intentional divergence, undecided
+policy, or unresolved test claim. CI fails when the observation changes in
+either direction until it is reviewed, but an expected test failure is not
+misreported as a harness crash. Runner completeness and output parsing are
+checked independently. All 351 pinned tests are classified: 26 are runnable,
+141 require unsupported user-facing features, and 184 exercise rsync's own
+internals, protocol, daemon, or restricted wrapper. There are no unassessed
+tests. CI runs the 22 non-root and four additional root circumstances and
+publishes JSON, Markdown, static HTML, and raw-log matrices rather than a
+headline score.
 
 The generated `tests/rsync-compat/LEDGER.md` is the readable per-test record;
 CI rejects it if it drifts from the manifest and inventory. An adapted test
 names a patch under `tests/rsync-compat/adaptations/`. Patches may translate an
 incidental implementation detail, such as SYQ's partial-file layout, or isolate
 a supported scenario from an aggregate upstream test, but must preserve the
-claimed behavioral oracle. The future `strict` profile is recorded but disabled
-until its CLI flag exists; the harness will inject that flag without changing
-upstream test invocations.
+claimed behavioral oracle. Their provenance is visible in the matrix, including
+whether they alter an invocation, fixture, or tested subset. Git validates both
+the forward and reverse path sets before the exact patch bytes are applied, so
+adaptations cannot modify rsync sources or the runner outside `testsuite/`.
 
 ## Compatible
 
