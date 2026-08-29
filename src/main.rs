@@ -51,18 +51,18 @@ fn raise_nofile() {
 fn main() {
     tune_allocator();
     raise_nofile();
-    let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(String::as_str) == Some("--build-identity") {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--build-identity") {
         println!("{}", identity::build());
         return;
     }
     // Compatibility with the 0.1.0 standalone updater. New code uses the
     // release/build identity above and never interprets this as a protocol.
-    if argv.get(1).map(String::as_str) == Some("--remote-helper-id") {
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--remote-helper-id") {
         println!("{}", identity::legacy_helper_id());
         return;
     }
-    if argv.get(1).map(String::as_str) == Some("--release-manifest-signing-payload") {
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--release-manifest-signing-payload") {
         if argv.len() != 3 {
             eprintln!("syq: --release-manifest-signing-payload requires one manifest path");
             std::process::exit(2);
@@ -73,7 +73,13 @@ fn main() {
         }
         return;
     }
-    if argv.get(1).map(String::as_str) == Some("--server") {
+    // Keep accepting the historical root spelling for managed helpers. A
+    // compatibility wrapper whose public prefix is `syq rsync` naturally
+    // turns its remote `--server` launch into `syq rsync --server`.
+    let server_mode = argv.get(1).and_then(|arg| arg.to_str()) == Some("--server")
+        || (argv.get(1).and_then(|arg| arg.to_str()) == Some("rsync")
+            && argv.get(2).and_then(|arg| arg.to_str()) == Some("--server"));
+    if server_mode {
         if let Err(e) = server::run() {
             eprintln!("syq server: {e:#}");
             std::process::exit(1);
