@@ -561,6 +561,9 @@ differs and why, what's missing, and the open issues. The short version:
 - rsync daemon mode / `rsync://`. syq speaks its own protocol; it cannot talk
   to an rsync server.
 - Rolling-checksum delta transfer (see Resume above).
+- UDP or forward-error-correcting data transport. TCP retransmission/RTT
+  counters are collected for diagnosis, but a loss-tolerant transport would be
+  a separate protocol and security design.
 - Preserving existing partial files from `rsync --partial`; only SYQ's own
   `.name.syq-part.<job-id>` sidecars for the same logical command are
   recognised.
@@ -583,26 +586,51 @@ differs and why, what's missing, and the open issues. The short version:
 
 Without `-j`, syq tunes the number of workers while a copy runs instead of
 guessing (`--rm` keeps a fixed 8, or 32 locally: removal is metadata-bound
-and short). It starts with 16 when every remote endpoint has a reachable TCP
-data path, 8 over ssh, or 32 when both ends are local (threads are free,
-connections are not), and measures: progress (bytes, plus a small credit per
-completed file so small-file trees count) is sampled every 2.5 s, and a count
-has been *measured* only once two consecutive samples agree within 10 % — so a
-burst that gets throttled, or a link still ramping up, is waited out (up to 20
-s) rather than credited to the last change. Each measured count is compared
-with the previous one: it doubles while a doubling gains at least a third of
-what linear scaling would (up to 64); when a doubling doesn't, it goes back to
-the last good count and refines upward in 1.3× steps; when even that buys
-nothing it shrinks by 1.3× as long as that costs less than 5 % (down to 2);
-then it holds. It never stops watching: after every 6 measurements it probes
-one step down (kept if throughput doesn't drop — this is what saves a spinning
-disk from seek thrash) or one step up (the route or a shared NAS may have freed
-up), and a direction that keeps failing is tried progressively less often.
-Surplus workers are parked, not closed: they keep their connections and stop
-taking work, handing back the rest of their range, so un-parking is instant.
-Transfers shorter than a measurement or two just run with the starting count.
-The progress line shows the current count (`16 conn`), and `--stats` reports
-the path it took (`connections: auto: settled at 16 (path 16, peak 16)`).
+and short). On a data path it has measured before, it starts at that path's last
+settled count; otherwise it starts with 16 when every remote endpoint has a
+reachable TCP data path, 8 over ssh, or 32 when both ends are local (threads
+are free, connections are not). Remembered results are keyed only by the
+directional endpoint path and transport (TCP and ssh learn separately), not by
+RTT, workload, filesystem or other volatile telemetry. A stale hint only costs
+the tuner a probe or two. The cache is
+`$XDG_CACHE_HOME/syq/tuning-v1.json` (normally
+`~/.cache/syq/tuning-v1.json`; set `SYQ_TUNING_CACHE` to override it or to an
+empty value to disable it). Explicit `-j`, dry runs, verification, short runs
+that compare no counts, and failed/aborted copies do not update it.
+
+Progress (bytes, plus a small credit per completed file so small-file trees
+count) is sampled every 2.5 s. A count has been *measured* only once two
+consecutive samples agree within 10 %, so a burst that gets throttled or a link
+still ramping up is waited out (up to 20 s) rather than credited to the last
+change. The first probe is a 1.3× step up — 8→10, not 8→16. A step up is kept
+when it gains at least a third of proportional scaling; a step down is kept
+when it stays within 5 % of the best recent measurement. A successful move
+keeps exploring in the same direction. A failed move returns to the last good
+count and records a bound, so later probes refine untested integers: if 10→13
+helps and 13→17 is flat, syq stays at 13 and can later try 11 rather than
+immediately falling back to 10. The objective is the smallest count within 5 %
+of the best observed speed, from 1 through 64.
+
+In steady state, evidence in the upward and downward directions ages and backs
+off independently. A direction is first eligible again after 6 stable
+measurements (about 30 seconds at minimum); repeated failures double only that
+direction's delay, up to 4 minutes at the minimum sampling rate. When both
+directions are equally informative, syq deterministically probes up first:
+most connection/throughput curves are concave or saturating, so an extra
+connection usually loses less transfer speed than removing a useful one. This
+is a prior, not a rule — measured collapse aborts a probe early, and independent
+backoff lets downward evidence win.
+
+Upward candidates connect in the background while the settled workers keep
+copying; connection setup time is not scored as throughput. After a decision,
+surplus connections are closed instead of retaining the largest pool ever
+tried. At one active connection syq keeps exactly one ready spare so the
+important 1→2 probe remains cheap. A dropped data connection is reopened with
+bounded exponential backoff; ranges with uncertain acknowledgements and final
+publication are safely requeued. Transfers shorter than a measurement or two
+just run with the starting count. The progress line shows the current count
+(`16 conn`), and `--stats` reports the path it took
+(`connections: auto: settled at 16 (path 16, peak 16)`).
 
 Measured from a 1 Gbit box in Germany to a host in Japan (265 ms): over TCP
 data connections it settles around 8–13 at line rate; over ssh data
@@ -626,6 +654,14 @@ AES-256-GCM records keyed by a secret exchanged over the ssh session
 (`--tcp-plain` skips the encryption on trusted networks; `--no-tcp` sends data over the ssh connection instead). If the port can't be
 reached — a firewall, typically — syq says so once and falls back to ssh data
 connections, so the default is always safe.
+
+With `--stats`, direct TCP copies also report the kernel counters available on
+both socket ends: retransmitted packets and bytes (a packet-loss signal),
+current/minimum RTT, congestion window and delivery rate, receive-window and
+send-buffer limited time, and ECN CE deliveries. These are diagnostic telemetry
+only and do not change the tuning cache key. SSH does not expose
+per-data-connection TCP counters to syq, so the statistics say they are
+unavailable when the data transport is SSH.
 
 The remote advertises every address it has (the one your ssh session arrived
 on first, then private LAN, then public, then CGNAT/Tailscale); the client

@@ -1453,6 +1453,7 @@ impl FsOps {
             }
             Request::Hello { .. }
             | Request::Scan { .. }
+            | Request::TransportStats
             | Request::Shutdown
             | Request::TcpListen { .. } => Err(anyhow!("unexpected request")),
         };

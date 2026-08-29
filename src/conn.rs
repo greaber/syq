@@ -10,6 +10,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
 
 pub trait Conn: Send {
@@ -22,6 +23,11 @@ pub trait Conn: Send {
     /// True once the transport has failed (remote process gone).
     fn is_dead(&self) -> bool {
         false
+    }
+    /// Best-effort counters for a direct TCP data connection. Collection is
+    /// deliberately observational: unavailable kernels and SSH return None.
+    fn transport_stats(&mut self) -> Option<TcpPairStats> {
+        None
     }
     /// Streamed scan; `sink` gets batches, `warn` gets non-fatal messages,
     /// `ignored` gets the paths the patterns pruned (only if `report_ignored`).
@@ -42,6 +48,81 @@ pub trait Conn: Send {
 pub struct PeerInfo {
     pub identity: String,
     pub platform: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TcpPairStats {
+    pub label: String,
+    pub local: Option<TcpSocketStats>,
+    pub peer: Option<TcpSocketStats>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (result == 0).then_some(TcpSocketStats {
+        bytes_sent: info.tcpi_bytes_sent,
+        bytes_retransmitted: info.tcpi_bytes_retrans,
+        segments_sent: info.tcpi_segs_out.into(),
+        segments_received: info.tcpi_segs_in.into(),
+        retransmissions: info.tcpi_total_retrans.into(),
+        rtt_us: info.tcpi_rtt.into(),
+        rtt_variance_us: info.tcpi_rttvar.into(),
+        min_rtt_us: info.tcpi_min_rtt.into(),
+        send_cwnd_bytes: u64::from(info.tcpi_snd_cwnd) * u64::from(info.tcpi_snd_mss),
+        delivery_rate: info.tcpi_delivery_rate,
+        busy_time_us: info.tcpi_busy_time,
+        receive_window_limited_us: info.tcpi_rwnd_limited,
+        send_buffer_limited_us: info.tcpi_sndbuf_limited,
+        ecn_ce_delivered: info.tcpi_delivered_ce.into(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
+    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (result == 0).then_some(TcpSocketStats {
+        bytes_sent: info.tcpi_txbytes,
+        bytes_retransmitted: info.tcpi_txretransmitbytes,
+        segments_sent: info.tcpi_txpackets,
+        segments_received: info.tcpi_rxpackets,
+        retransmissions: 0,
+        // Darwin reports these fields in milliseconds.
+        rtt_us: u64::from(info.tcpi_srtt) * 1000,
+        rtt_variance_us: u64::from(info.tcpi_rttvar) * 1000,
+        min_rtt_us: 0,
+        send_cwnd_bytes: info.tcpi_snd_cwnd.into(),
+        delivery_rate: 0,
+        busy_time_us: 0,
+        receive_window_limited_us: 0,
+        send_buffer_limited_us: 0,
+        ecn_ce_delivered: 0,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn tcp_socket_stats(_stream: &TcpStream) -> Option<TcpSocketStats> {
+    None
 }
 
 /// Turn an `Err` response into an error, otherwise pass through.
@@ -108,6 +189,7 @@ pub struct RemoteConn {
     label: String,
     dead: bool,
     peer: Option<PeerInfo>,
+    tcp_socket: Option<TcpStream>,
 }
 
 const READ_AHEAD: usize = 4;
@@ -196,6 +278,27 @@ impl Conn for RemoteConn {
     }
     fn is_dead(&self) -> bool {
         self.dead
+    }
+    fn transport_stats(&mut self) -> Option<TcpPairStats> {
+        let socket = self.tcp_socket.as_ref()?.try_clone().ok()?;
+        let local = tcp_socket_stats(&socket);
+        // Diagnostics must not make a completed copy wait forever for a
+        // wedged peer. The option is socket-wide, including the reader clone.
+        let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        let peer = if self.dead {
+            None
+        } else {
+            match self.call(Request::TransportStats) {
+                Ok(Response::TransportStats(stats)) => stats,
+                _ => None,
+            }
+        };
+        let _ = socket.set_read_timeout(None);
+        (local.is_some() || peer.is_some()).then(|| TcpPairStats {
+            label: self.label.clone(),
+            local,
+            peer,
+        })
     }
     fn scan(
         &mut self,
@@ -510,6 +613,7 @@ impl RemoteSpec {
             label: self.label(),
             dead: false,
             peer: None,
+            tcp_socket: None,
         };
         let conn = hello(conn, compress, Vec::new())?;
         self.record_peer(&conn);
@@ -708,6 +812,7 @@ impl RemoteSpec {
                 None => (None, None),
             };
             let writer = RecordWriter::new(stream.try_clone()?, wc);
+            let tcp_socket = stream.try_clone()?;
             let reader = RecordReader::new(stream, rc);
             let conn = RemoteConn {
                 child: None,
@@ -716,6 +821,7 @@ impl RemoteSpec {
                 label: format!("{} (tcp {addr_s})", self.label()),
                 dead: false,
                 peer: None,
+                tcp_socket: Some(tcp_socket),
             };
             let conn = hello(conn, compress, info.token.clone())?;
             self.record_peer(&conn);
@@ -1271,6 +1377,29 @@ impl Endpoint {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn kernel_tcp_stats_are_available_for_a_live_socket() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            socket.read_exact(&mut byte).unwrap();
+            socket.write_all(&byte).unwrap();
+            tcp_socket_stats(&socket).unwrap()
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(&[7]).unwrap();
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).unwrap();
+        let client_stats = tcp_socket_stats(&client).unwrap();
+        let server_stats = server.join().unwrap();
+        assert_eq!(byte, [7]);
+        assert!(client_stats.segments_sent > 0 || client_stats.bytes_sent > 0);
+        assert!(server_stats.segments_sent > 0 || server_stats.bytes_sent > 0);
+    }
 
     fn entry(path: &[u8]) -> Entry {
         Entry {

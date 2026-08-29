@@ -825,6 +825,7 @@ fn double_verbose_dry_run_reports_tcp_without_extra_connection() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
         .output()
         .expect("run double-verbose dry-run over TCP");
 
@@ -996,6 +997,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
         .output()
         .expect("run syq over TCP through fake remote shell");
 
@@ -1004,6 +1006,10 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("connections: auto: settled at 16 (path 16, peak 16)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("tcp retransmissions (loss signal):"),
         "{stdout}"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1015,6 +1021,138 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         stderr.contains("concurrency: starting with 16 connections (auto-tuned)"),
         "{stderr}"
     );
+}
+
+#[test]
+fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let cache = t.path("tuning.json");
+    write(
+        &cache,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "paths": { "v1|local>fake|ssh": 1 }
+        }))
+        .unwrap()
+        .as_bytes(),
+    );
+    let run = |destination: &str, fixed: Option<usize>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .arg("-e")
+            .arg(&rsh)
+            .arg("--syq-path")
+            .arg(env!("CARGO_BIN_EXE_syq"))
+            .args(["--no-tcp", "--stats", "-avv"]);
+        if let Some(fixed) = fixed {
+            command.args(["-j", &fixed.to_string()]);
+        }
+        command
+            .arg(t.s("src"))
+            .arg(format!("fake:{}", t.s(destination)))
+            .arg("--no-progress")
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("SYQ_TUNING_CACHE", &cache)
+            .output()
+            .unwrap()
+    };
+    write(&t.path("src"), b"remembered start");
+
+    let automatic = run("auto", None);
+    assert_output_ok(&automatic);
+    assert!(
+        String::from_utf8_lossy(&automatic.stderr)
+            .contains("starting with 1 connections remembered for this path"),
+        "{}",
+        String::from_utf8_lossy(&automatic.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&automatic.stdout)
+            .contains("connections: auto: settled at 1 (path 1, peak 1)"),
+        "{}",
+        String::from_utf8_lossy(&automatic.stdout)
+    );
+
+    let fixed = run("fixed", Some(3));
+    assert_output_ok(&fixed);
+    let cached: serde_json::Value = serde_json::from_slice(&read(&cache)).unwrap();
+    assert_eq!(cached["paths"]["v1|local>fake|ssh"], 1);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    let data: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|offset| (offset % 251) as u8)
+        .collect();
+    write(&t.path("src"), &data);
+    let remote = format!("fake:{}", t.s("dst"));
+    let marker = t.path("drop-write-once");
+
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--no-bootstrap",
+            "--block-size=64K",
+            &t.s("src"),
+            &remote,
+        ],
+    )
+    .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
+    .env("SYQ_TEST_DROP_MARKER", &marker)
+    .output()
+    .unwrap();
+
+    assert_output_ok(&out);
+    assert!(marker.exists());
+    assert_eq!(read(&t.path("dst")), data);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("connection dropped; reopening"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn lost_finalize_response_is_verified_after_reconnect() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    let data = vec![b'z'; 2 * 1024 * 1024];
+    write(&t.path("src"), &data);
+    let remote = format!("fake:{}", t.s("dst"));
+    let marker = t.path("drop-finalize-once");
+
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--no-bootstrap",
+            "--block-size=64K",
+            &t.s("src"),
+            &remote,
+        ],
+    )
+    .env("SYQ_TEST_DROP_AFTER_REQUEST", "finalize")
+    .env("SYQ_TEST_DROP_MARKER", &marker)
+    .output()
+    .unwrap();
+
+    assert_output_ok(&out);
+    assert!(marker.exists());
+    assert_eq!(read(&t.path("dst")), data);
+    assert!(partial_files(&t.0).is_empty());
 }
 
 fn set_mtime(p: &Path, secs: i64) {

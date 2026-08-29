@@ -35,12 +35,14 @@ pub type RangeHandle = Arc<Mutex<RangeState>>;
 pub enum Item {
     File(usize),
     Range(RangeHandle),
+    Finish { idx: usize, matched: bool },
     Exit,
 }
 
 struct Inner {
     files: BinaryHeap<(u64, Reverse<usize>)>,
     ranges: Vec<(usize, u64, u64)>,
+    finishes: Vec<(usize, bool)>,
     inflight: Vec<RangeHandle>,
     outstanding: HashMap<usize, u32>,
     failed: HashSet<usize>,
@@ -63,6 +65,7 @@ impl Sched {
             inner: Mutex::new(Inner {
                 files: BinaryHeap::new(),
                 ranges: Vec::new(),
+                finishes: Vec::new(),
                 inflight: Vec::new(),
                 outstanding: HashMap::new(),
                 failed: HashSet::new(),
@@ -125,6 +128,7 @@ impl Sched {
             && g.inflight.is_empty()
             && g.files.is_empty()
             && g.ranges.is_empty()
+            && g.finishes.is_empty()
     }
 
     /// Whether enough work is left for `n` workers to be measurable: the
@@ -183,6 +187,9 @@ impl Sched {
                     let h = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
                     g.inflight.push(h.clone());
                     return Item::Range(h);
+                }
+                if let Some((idx, matched)) = g.finishes.pop() {
+                    return Item::Finish { idx, matched };
                 }
                 if let Some((_, Reverse(idx))) = g.files.pop() {
                     g.probing += 1;
@@ -286,5 +293,77 @@ impl Sched {
         }
         self.cv.notify_all();
         done
+    }
+
+    /// A connection died with this range's acknowledgements uncertain. Put
+    /// its whole claimed interval back without changing `outstanding`: the
+    /// replacement carries the failed handle's existing share.
+    pub fn retry_range(&self, h: &RangeHandle, start: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.inflight.retain(|candidate| !Arc::ptr_eq(candidate, h));
+        let range = h.lock().unwrap();
+        if start < range.end {
+            g.ranges.push((range.idx, start, range.end));
+            g.ranges.sort_by_key(|(_, off, end)| end - off);
+        } else {
+            let n = g.outstanding.get_mut(&range.idx).expect("outstanding");
+            *n -= 1;
+            if *n == 0 {
+                g.outstanding.remove(&range.idx);
+                g.finishes.push((range.idx, false));
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    /// Final publication is separate from range accounting so a lost
+    /// Finalize response can be retried on a fresh connection.
+    pub fn requeue_finish(&self, idx: usize, matched: bool) {
+        self.inner.lock().unwrap().finishes.push((idx, matched));
+        self.cv.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_range_replaces_the_failed_inflight_share() {
+        let sched = Sched::new(64, 128);
+        let range = Arc::new(Mutex::new(RangeState {
+            idx: 4,
+            pos: 192,
+            end: 256,
+        }));
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            inner.inflight.push(range.clone());
+            inner.outstanding.insert(4, 1);
+        }
+        sched.retry_range(&range, 128);
+        let inner = sched.inner.lock().unwrap();
+        assert!(inner.inflight.is_empty());
+        assert_eq!(inner.ranges, vec![(4, 128, 256)]);
+        assert_eq!(inner.outstanding.get(&4), Some(&1));
+    }
+
+    #[test]
+    fn retry_of_an_empty_claim_preserves_finalization() {
+        let sched = Sched::new(64, 128);
+        let range = Arc::new(Mutex::new(RangeState {
+            idx: 5,
+            pos: 256,
+            end: 256,
+        }));
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            inner.inflight.push(range.clone());
+            inner.outstanding.insert(5, 1);
+        }
+        sched.retry_range(&range, 256);
+        let inner = sched.inner.lock().unwrap();
+        assert!(!inner.outstanding.contains_key(&5));
+        assert_eq!(inner.finishes, vec![(5, false)]);
     }
 }

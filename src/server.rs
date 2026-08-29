@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub fn run() -> Result<()> {
-    serve(io::stdin(), io::stdout().lock(), true, None, None)
+    serve(io::stdin(), io::stdout().lock(), true, None, None, None)
 }
 
 /// Serve one connection. `over_ssh` connections may set up a TCP listener;
@@ -23,6 +23,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     over_ssh: bool,
     expect_token: Option<Vec<u8>>,
     authed: Option<&std::sync::atomic::AtomicBool>,
+    tcp_socket: Option<TcpStream>,
 ) -> Result<()> {
     let mut r = FrameReader::new(r);
     let mut w = FrameWriter::new(w, false);
@@ -153,10 +154,18 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     Err(e) => w.write_msg(&Response::Err(format!("{e:#}")))?,
                 }
             }
+            Request::TransportStats => {
+                w.write_msg(&Response::TransportStats(
+                    tcp_socket.as_ref().and_then(crate::conn::tcp_socket_stats),
+                ))?;
+            }
             other => {
                 let t0 = std::time::Instant::now();
                 let resp = ops.handle(&other);
                 t[1] += t0.elapsed().as_secs_f64();
+                if drop_after_handling_for_test(&other) {
+                    return Ok(());
+                }
                 let t0 = std::time::Instant::now();
                 w.write_msg(&resp)?;
                 t[2] += t0.elapsed().as_secs_f64();
@@ -340,11 +349,40 @@ fn serve_tcp(
         false,
         Some(token),
         Some(&authed),
+        Some(stream.try_clone()?),
     );
     if res.is_err() && !authed.load(std::sync::atomic::Ordering::SeqCst) {
         seen.lock().unwrap().remove(&conn_id);
     }
     res
+}
+
+#[cfg(debug_assertions)]
+fn drop_after_handling_for_test(request: &Request) -> bool {
+    let Some(kind) = std::env::var_os("SYQ_TEST_DROP_AFTER_REQUEST") else {
+        return false;
+    };
+    let matches = match kind.to_string_lossy().as_ref() {
+        "write" => matches!(request, Request::WriteRange { .. }),
+        "finalize" => matches!(request, Request::Finalize { .. }),
+        _ => false,
+    };
+    if !matches {
+        return false;
+    }
+    let Some(marker) = std::env::var_os("SYQ_TEST_DROP_MARKER") else {
+        return false;
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .is_ok()
+}
+
+#[cfg(not(debug_assertions))]
+fn drop_after_handling_for_test(_request: &Request) -> bool {
+    false
 }
 
 /// Clears the socket read timeout after the first successful read.
