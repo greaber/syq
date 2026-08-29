@@ -1,7 +1,7 @@
 //! Direct remote-to-remote: run the orchestrator on the source host so data
 //! flows source→destination without passing through this machine.
 
-use crate::cli::{parse_rsh, Args, Location};
+use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, SourceSelection};
 use anyhow::{bail, Context, Result};
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
@@ -32,6 +32,39 @@ fn direct_command(
     cmd
 }
 
+fn utf8_path(path: &[u8], role: &str) -> Result<String> {
+    String::from_utf8(path.to_vec()).map_err(|_| {
+        anyhow::anyhow!(
+            "direct remote-to-remote {role} is not valid UTF-8; use --relay so raw path bytes travel in the protocol"
+        )
+    })
+}
+
+fn endpoint_arg(location: &Location) -> String {
+    let host = location.host.as_deref().expect("remote endpoint");
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match &location.user {
+        Some(user) => format!("{user}@{host}"),
+        None => host,
+    }
+}
+
+fn native_placement_arg(args: &Args) -> Result<&'static str> {
+    Ok(match (args.placement, args.target_existence) {
+        (Placement::Into, Existence::Any) => "--into",
+        (Placement::Into, Existence::New) => "--into-new",
+        (Placement::Into, Existence::Existing) => "--into-existing",
+        (Placement::As, Existence::Any) => "--as",
+        (Placement::As, Existence::New) => "--as-new",
+        (Placement::As, Existence::Existing) => "--as-existing",
+        (Placement::Rsync, _) => bail!("native transfer is missing explicit placement"),
+    })
+}
+
 pub fn run(
     args: &Args,
     srcs: &[Location],
@@ -58,22 +91,35 @@ pub fn run(
         diagnostics: Default::default(),
     };
 
-    // Rebuild the option list for the remote orchestrator.
-    let mut remote: Vec<String> = Vec::new();
+    // Rebuild the public command for the remote orchestrator. Compatibility
+    // runs remain compatibility runs; native placement must not be translated
+    // back into destination-existence or trailing-slash heuristics.
+    let mut remote: Vec<String> = vec![match args.interface {
+        Interface::Rsync => "rsync",
+        Interface::NativeCp => "cp",
+        Interface::NativeCprm => "cprm",
+        Interface::NativeRm => bail!("native rm cannot be a remote-to-remote transfer"),
+    }
+    .into()];
     let mut short = String::new();
-    for (flag, on) in [
-        ('a', args.archive),
-        ('r', args.recursive && !args.archive),
-        ('l', args.links && !args.archive),
-        ('p', args.perms && !args.archive),
-        ('t', args.times && !args.archive),
-        ('g', args.group && !args.archive),
-        ('o', args.owner && !args.archive),
-        ('D', args.devices && !args.archive),
-        ('n', args.dry_run),
-        ('q', args.quiet),
-        ('c', args.checksum),
-    ] {
+    let short_flags: Vec<(char, bool)> = if args.interface == Interface::Rsync {
+        vec![
+            ('a', args.archive),
+            ('r', args.recursive && !args.archive),
+            ('l', args.links && !args.archive),
+            ('p', args.perms && !args.archive),
+            ('t', args.times && !args.archive),
+            ('g', args.group && !args.archive),
+            ('o', args.owner && !args.archive),
+            ('D', args.devices && !args.archive),
+            ('n', args.dry_run),
+            ('q', args.quiet),
+            ('c', args.checksum),
+        ]
+    } else {
+        vec![('n', args.dry_run), ('q', args.quiet)]
+    };
+    for (flag, on) in short_flags {
         if on {
             short.push(flag);
         }
@@ -91,49 +137,54 @@ pub fn run(
         remote.push("-j".into());
         remote.push(j.to_string());
     }
-    remote.push(format!("--block-size={}", args.block_size));
-    remote.push(format!("--min-split={}", args.min_split));
-    if let Some(rate) = &args.bwlimit {
-        remote.push(format!("--bwlimit={rate}"));
+    if args.interface == Interface::Rsync {
+        remote.push(format!("--block-size={}", args.block_size));
+        remote.push(format!("--min-split={}", args.min_split));
+        if let Some(rate) = &args.bwlimit {
+            remote.push(format!("--bwlimit={rate}"));
+        }
+        if args.verify_only {
+            remote.push("--verify-only".into());
+        }
+        if args.inplace {
+            remote.push("--inplace".into());
+        }
+        if args.insecure_links {
+            remote.push("--insecure-links".into());
+        }
+        if args.delete {
+            remote.push("--delete".into());
+        }
+        if args.delete_excluded {
+            remote.push("--delete-excluded".into());
+        }
+        if args.update {
+            remote.push("--update".into());
+        }
+        if args.ignore_existing {
+            remote.push("--ignore-existing".into());
+        }
+        if args.existing {
+            remote.push("--existing".into());
+        }
+        if let Some(m) = &args.max_size {
+            remote.push(format!("--max-size={m}"));
+        }
+        if let Some(m) = &args.min_size {
+            remote.push(format!("--min-size={m}"));
+        }
+        if let Some(path) = &args.checkpoint {
+            remote.push(format!("--checkpoint={path}"));
+        }
+        for line in &args.ignore_lines {
+            remote.push(format!("--ignore={line}"));
+        }
     }
     if args.stats {
         remote.push("--stats".into());
     }
-    if args.verify_only {
-        remote.push("--verify-only".into());
-    }
-    if args.inplace {
-        remote.push("--inplace".into());
-    }
-    if args.insecure_links {
-        remote.push("--insecure-links".into());
-    }
-    if args.delete {
-        remote.push("--delete".into());
-    }
-    if args.delete_excluded {
-        remote.push("--delete-excluded".into());
-    }
     if let Some(n) = args.max_delete {
         remote.push(format!("--max-delete={n}"));
-    }
-    if args.update {
-        remote.push("--update".into());
-    }
-    if args.ignore_existing {
-        remote.push("--ignore-existing".into());
-    }
-    if args.existing {
-        remote.push("--existing".into());
-    }
-    if let Some(m) = &args.max_size {
-        remote.push(format!("--max-size={m}"));
-    }
-    if let Some(m) = &args.min_size {
-        remote.push(format!("--min-size={m}"));
-    }
-    if let Some(path) = &args.checkpoint {
-        remote.push(format!("--checkpoint={path}"));
     }
     if args.no_bootstrap {
         remote.push("--no-bootstrap".into());
@@ -154,19 +205,15 @@ pub fn run(
     if args.dry_run {
         remote.push(format!("--plan-source-host={src_target}"));
     }
-    remote.push(format!(
-        "--direct-source-operand-count={source_operand_count}"
-    ));
-    remote.push("--direct-sources-prededuplicated".into());
-    // --ignore-from files were read locally; forward the merged lines.
-    for l in &args.ignore_lines {
-        // One argument, so a pattern starting with '-' can't be taken for a flag.
-        remote.push(format!("--ignore={l}"));
+    if args.interface == Interface::Rsync {
+        remote.push(format!(
+            "--direct-source-operand-count={source_operand_count}"
+        ));
+        remote.push("--direct-sources-prededuplicated".into());
     }
     if args.no_progress || args.quiet {
         remote.push("--no-progress".into());
     } else if std::io::stderr().is_terminal() {
-        // The remote has no tty; force the display and tell it our width.
         remote.push("--progress".into());
         remote.push(format!("--width={}", crate::progress::term_width()));
     }
@@ -174,43 +221,64 @@ pub fn run(
         remote.push(format!("--syq-path={p}"));
     }
     if let Some(e) = &args.rsh {
-        remote.push("-e".into());
+        remote.push(if args.interface == Interface::Rsync {
+            "-e".into()
+        } else {
+            "--rsh".into()
+        });
         remote.push(e.clone());
     }
-    remote.push("--".into());
-    for s in srcs {
-        remote.push(s.path.clone());
-    }
-    // Same host (and user) on both ends: on that host this is a plain local
-    // copy — no ssh back to itself, copy_file_range applies, and the
-    // copy-into-itself check sees both paths on one machine.
-    let dst_str = if srcs[0].same_host(dst) {
-        // A relative remote path is relative to the home; anchor it so the
-        // orchestrator's local parse can't take it for something else.
-        if dst.path.starts_with('/')
-            || dst.path == "~"
-            || dst.path.starts_with("~/")
-            || dst.path.starts_with("./")
-            || dst.path.starts_with("../")
-        {
-            dst.path.clone()
+
+    if args.interface == Interface::Rsync {
+        remote.push("--".into());
+        for source in srcs {
+            remote.push(utf8_path(&source.path, "source path")?);
+        }
+        let dst_path = utf8_path(&dst.path, "target path")?;
+        let dst_arg = if srcs[0].same_host(dst) {
+            if dst.path.starts_with(b"/")
+                || dst.path == b"~"
+                || dst.path.starts_with(b"~/")
+                || dst.path.starts_with(b"./")
+                || dst.path.starts_with(b"../")
+            {
+                dst_path
+            } else {
+                format!("./{dst_path}")
+            }
         } else {
-            format!("./{}", dst.path)
-        }
+            match &dst.user {
+                Some(user) => format!("{user}@{}:{dst_path}", dst.host.as_ref().unwrap()),
+                None => format!("{}:{dst_path}", dst.host.as_ref().unwrap()),
+            }
+        };
+        remote.push(dst_arg);
     } else {
-        match &dst.user {
-            Some(u) => format!("{u}@{}:{}", dst.host.as_ref().unwrap(), dst.path),
-            None => format!("{}:{}", dst.host.as_ref().unwrap(), dst.path),
+        for source in srcs {
+            remote.push(
+                match source.selection {
+                    SourceSelection::Contents => "--src-src",
+                    SourceSelection::NamedNoFollow => "--src-no-follow",
+                    SourceSelection::Named | SourceSelection::Rsync => "--src",
+                }
+                .into(),
+            );
+            remote.push(utf8_path(&source.path, "source path")?);
         }
-    };
-    remote.push(dst_str);
+        if !srcs[0].same_host(dst) {
+            remote.push("--to".into());
+            remote.push(endpoint_arg(dst));
+        }
+        remote.push(native_placement_arg(args)?.into());
+        remote.push(utf8_path(&dst.path, "target path")?);
+    }
 
     if args.detach {
         // Detached: log JSON progress instead of a live display.
         remote.retain(|a| a != "--progress" && !a.starts_with("--width="));
-        remote.insert(0, "--no-progress".into());
-        remote.insert(0, "--progress-json".into());
-        remote.insert(0, "-v".into());
+        remote.insert(1, "--no-progress".into());
+        remote.insert(1, "--progress-json".into());
+        remote.insert(1, "-v".into());
     }
     // A detached launcher returns before the background syq execs, so a
     // missing helper could otherwise look like a successful start.  Validate
@@ -234,11 +302,12 @@ pub fn run(
         // safe characters so a crafted filename can't inject commands.
         let raw = srcs[0]
             .path
-            .trim_end_matches('/')
-            .rsplit('/')
+            .strip_suffix(b"/")
+            .unwrap_or(&srcs[0].path)
+            .rsplit(|byte| *byte == b'/')
             .next()
-            .unwrap_or("syq");
-        let name: String = raw
+            .unwrap_or(b"syq");
+        let name: String = String::from_utf8_lossy(raw)
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
@@ -297,7 +366,7 @@ pub fn run(
             println!("{src_target}:{log}");
         } else {
             println!("syq: started on {src_target}, log {log}");
-            println!("syq: follow with:  syq --follow {src_target}:{log}");
+            println!("syq: follow with:  syq rsync --follow {src_target}:{log}");
         }
         return Ok(0);
     }
@@ -344,17 +413,18 @@ fn helper_missing(code: Option<i32>, automatic: bool) -> bool {
         )
 }
 
-/// `syq --follow HOST:LOG`: tail a detached transfer's log, rendering the JSON
+/// `syq rsync --follow HOST:LOG`: tail a detached transfer's log, rendering the JSON
 /// progress lines as a status line and passing everything else through.
 pub fn follow(args: &Args) -> Result<i32> {
     let target = args
         .paths
         .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: syq --follow HOST:LOGFILE"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: syq rsync --follow HOST:LOGFILE"))?;
     let loc = Location::parse(target)?;
     let (Some(host), log) = (&loc.host, &loc.path) else {
-        bail!("usage: syq --follow HOST:LOGFILE")
+        bail!("usage: syq rsync --follow HOST:LOGFILE")
     };
+    let log = utf8_path(log, "log path")?;
     let rsh = parse_rsh(&args.rsh)?;
     let mut cmd = Command::new(&rsh[0]);
     cmd.args(&rsh[1..]);
@@ -362,7 +432,7 @@ pub fn follow(args: &Args) -> Result<i32> {
         cmd.args(["-l", u]);
     }
     cmd.arg(host)
-        .arg(format!("tail -n +1 -f {}", shell_words::quote(log)));
+        .arg(format!("tail -n +1 -f {}", shell_words::quote(&log)));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
