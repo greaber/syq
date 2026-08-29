@@ -11,8 +11,64 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
 
+struct RequestReader {
+    rx: Option<std::sync::mpsc::Receiver<io::Result<Request>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    tcp_socket: Option<TcpStream>,
+}
+
+impl RequestReader {
+    fn spawn<R: Read + Send + 'static>(
+        mut reader: FrameReader<R>,
+        tcp_socket: Option<TcpStream>,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let thread = std::thread::spawn(move || loop {
+            let msg = reader.read_msg::<Request>();
+            let failed = msg.is_err();
+            if tx.send(msg).is_err() || failed {
+                break;
+            }
+        });
+        Self {
+            rx: Some(rx),
+            thread: Some(thread),
+            tcp_socket,
+        }
+    }
+
+    fn recv(&self) -> std::result::Result<io::Result<Request>, std::sync::mpsc::RecvError> {
+        self.rx.as_ref().expect("request receiver present").recv()
+    }
+
+    fn tcp_stats(&self) -> Option<TcpSocketStats> {
+        self.tcp_socket
+            .as_ref()
+            .and_then(crate::conn::tcp_socket_stats)
+    }
+}
+
+impl Drop for RequestReader {
+    fn drop(&mut self) {
+        let tcp = self.tcp_socket.is_some();
+        if let Some(socket) = &self.tcp_socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        self.rx.take();
+        // An ssh server process exits immediately after `serve`; joining its
+        // stdin reader here would deadlock while the client waits for process
+        // exit before closing stdin. A TCP socket can be woken explicitly, so
+        // its reader is joined deterministically on every return path.
+        if tcp {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
 pub fn run() -> Result<()> {
-    serve(io::stdin(), io::stdout().lock(), true, None, None)
+    serve(io::stdin(), io::stdout().lock(), true, None, None, None)
 }
 
 /// Serve one connection. `over_ssh` connections may set up a TCP listener;
@@ -23,6 +79,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     over_ssh: bool,
     expect_token: Option<Vec<u8>>,
     authed: Option<&std::sync::atomic::AtomicBool>,
+    tcp_socket: Option<TcpStream>,
 ) -> Result<()> {
     let mut r = FrameReader::new(r);
     let mut w = FrameWriter::new(w, false);
@@ -64,22 +121,16 @@ fn serve<R: Read + Send + 'static, W: Write>(
     }
 
     // Requests are parsed on a reader thread so incoming data keeps flowing
-    // while a block is being hashed and written.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<Request>>(4);
-    std::thread::spawn(move || loop {
-        let msg = r.read_msg::<Request>();
-        let failed = msg.is_err();
-        if tx.send(msg).is_err() || failed {
-            break;
-        }
-    });
+    // while a block is being hashed and written. TCP readers are shut down and
+    // joined by the guard on every exit path.
+    let reader = RequestReader::spawn(r, tcp_socket);
 
     let mut ops = FsOps::new();
     let mut t = [0f64; 3];
     let (mut blocks, mut bytes) = (0u64, 0u64);
     loop {
         let t0 = std::time::Instant::now();
-        let req: Request = match rx.recv() {
+        let req: Request = match reader.recv() {
             Ok(Ok(req)) => req,
             Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
             Ok(Err(e)) => return Err(e.into()),
@@ -153,10 +204,16 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     Err(e) => w.write_msg(&Response::Err(format!("{e:#}")))?,
                 }
             }
+            Request::TransportStats => {
+                w.write_msg(&Response::TransportStats(reader.tcp_stats()))?;
+            }
             other => {
                 let t0 = std::time::Instant::now();
                 let resp = ops.handle(&other);
                 t[1] += t0.elapsed().as_secs_f64();
+                if drop_after_handling_for_test(&other) {
+                    return Ok(());
+                }
                 let t0 = std::time::Instant::now();
                 w.write_msg(&resp)?;
                 t[2] += t0.elapsed().as_secs_f64();
@@ -340,11 +397,50 @@ fn serve_tcp(
         false,
         Some(token),
         Some(&authed),
+        Some(stream.try_clone()?),
     );
     if res.is_err() && !authed.load(std::sync::atomic::Ordering::SeqCst) {
         seen.lock().unwrap().remove(&conn_id);
     }
     res
+}
+
+#[cfg(debug_assertions)]
+static TEST_DROP_MATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(debug_assertions)]
+fn drop_after_handling_for_test(request: &Request) -> bool {
+    let Some(kind) = std::env::var_os("SYQ_TEST_DROP_AFTER_REQUEST") else {
+        return false;
+    };
+    let matches = match kind.to_string_lossy().as_ref() {
+        "write" => matches!(request, Request::WriteRange { .. }),
+        "finalize" => matches!(request, Request::Finalize { .. }),
+        _ => false,
+    };
+    if !matches {
+        return false;
+    }
+    let target = std::env::var_os("SYQ_TEST_DROP_AFTER_N_REQUESTS")
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    if TEST_DROP_MATCHES.fetch_add(1, Relaxed) + 1 < target {
+        return false;
+    }
+    let Some(marker) = std::env::var_os("SYQ_TEST_DROP_MARKER") else {
+        return false;
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .is_ok()
+}
+
+#[cfg(not(debug_assertions))]
+fn drop_after_handling_for_test(_request: &Request) -> bool {
+    false
 }
 
 /// Clears the socket read timeout after the first successful read.
@@ -362,5 +458,71 @@ impl<R: Read> Read for TimeoutOnce<R> {
             let _ = self.stream.set_read_timeout(None);
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ExitObserved<R> {
+        inner: R,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<R: Read> Read for ExitObserved<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl<R> Drop for ExitObserved<R> {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn tcp_server_joins_request_reader_on_shutdown() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = dropped.clone();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            serve(
+                ExitObserved {
+                    inner: socket.try_clone().unwrap(),
+                    dropped: observed,
+                },
+                socket.try_clone().unwrap(),
+                false,
+                None,
+                None,
+                Some(socket),
+            )
+            .unwrap();
+        });
+
+        let socket = TcpStream::connect(address).unwrap();
+        let mut writer = FrameWriter::new(socket.try_clone().unwrap(), false);
+        let mut reader = FrameReader::new(socket);
+        writer
+            .write_msg(&Request::Hello {
+                identity: crate::identity::build().to_string(),
+                compress: false,
+                debug: false,
+                token: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::HelloOk { .. }
+        ));
+        writer.write_msg(&Request::Shutdown).unwrap();
+        server.join().unwrap();
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&dropped), 1);
     }
 }

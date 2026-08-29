@@ -10,6 +10,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
 
 pub trait Conn: Send {
@@ -22,6 +23,11 @@ pub trait Conn: Send {
     /// True once the transport has failed (remote process gone).
     fn is_dead(&self) -> bool {
         false
+    }
+    /// Best-effort counters for a direct TCP data connection. Collection is
+    /// deliberately observational: unavailable kernels and SSH return None.
+    fn transport_stats(&mut self) -> Option<TcpPairStats> {
+        None
     }
     /// Streamed scan; `sink` gets batches, `warn` gets non-fatal messages,
     /// `ignored` gets the paths the patterns pruned (only if `report_ignored`).
@@ -42,6 +48,105 @@ pub trait Conn: Send {
 pub struct PeerInfo {
     pub identity: String,
     pub platform: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TcpPairStats {
+    pub label: String,
+    pub local: Option<TcpSocketStats>,
+    pub peer: Option<TcpSocketStats>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    macro_rules! field {
+        ($name:ident, $value:expr) => {
+            ((len as usize)
+                >= std::mem::offset_of!(libc::tcp_info, $name) + std::mem::size_of_val(&info.$name))
+            .then(|| $value)
+        };
+    }
+    Some(TcpSocketStats {
+        bytes_sent: field!(tcpi_bytes_sent, info.tcpi_bytes_sent),
+        bytes_retransmitted: field!(tcpi_bytes_retrans, info.tcpi_bytes_retrans),
+        segments_sent: field!(tcpi_segs_out, info.tcpi_segs_out.into()),
+        segments_received: field!(tcpi_segs_in, info.tcpi_segs_in.into()),
+        retransmissions: field!(tcpi_total_retrans, info.tcpi_total_retrans.into()),
+        rtt_us: field!(tcpi_rtt, info.tcpi_rtt.into()),
+        rtt_variance_us: field!(tcpi_rttvar, info.tcpi_rttvar.into()),
+        min_rtt_us: field!(tcpi_min_rtt, info.tcpi_min_rtt.into()),
+        send_cwnd_bytes: field!(
+            tcpi_snd_cwnd,
+            u64::from(info.tcpi_snd_cwnd) * u64::from(info.tcpi_snd_mss)
+        ),
+        delivery_rate: field!(tcpi_delivery_rate, info.tcpi_delivery_rate),
+        busy_time_us: field!(tcpi_busy_time, info.tcpi_busy_time),
+        receive_window_limited_us: field!(tcpi_rwnd_limited, info.tcpi_rwnd_limited),
+        send_buffer_limited_us: field!(tcpi_sndbuf_limited, info.tcpi_sndbuf_limited),
+        ecn_ce_delivered: field!(tcpi_delivered_ce, info.tcpi_delivered_ce.into()),
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
+    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    macro_rules! field {
+        ($name:ident, $value:expr) => {
+            ((len as usize)
+                >= std::mem::offset_of!(libc::tcp_connection_info, $name)
+                    + std::mem::size_of_val(&info.$name))
+            .then(|| $value)
+        };
+    }
+    Some(TcpSocketStats {
+        bytes_sent: field!(tcpi_txbytes, info.tcpi_txbytes),
+        bytes_retransmitted: field!(tcpi_txretransmitbytes, info.tcpi_txretransmitbytes),
+        segments_sent: field!(tcpi_txpackets, info.tcpi_txpackets),
+        segments_received: field!(tcpi_rxpackets, info.tcpi_rxpackets),
+        retransmissions: None,
+        // Darwin reports these fields in milliseconds.
+        rtt_us: field!(tcpi_srtt, u64::from(info.tcpi_srtt) * 1000),
+        rtt_variance_us: field!(tcpi_rttvar, u64::from(info.tcpi_rttvar) * 1000),
+        min_rtt_us: None,
+        send_cwnd_bytes: field!(tcpi_snd_cwnd, info.tcpi_snd_cwnd.into()),
+        delivery_rate: None,
+        busy_time_us: None,
+        receive_window_limited_us: None,
+        send_buffer_limited_us: None,
+        ecn_ce_delivered: None,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn tcp_socket_stats(_stream: &TcpStream) -> Option<TcpSocketStats> {
+    None
 }
 
 /// Turn an `Err` response into an error, otherwise pass through.
@@ -104,19 +209,25 @@ pub struct RemoteConn {
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
-    rx: std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    rx: Option<std::sync::mpsc::Receiver<std::io::Result<Response>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
     label: String,
     dead: bool,
     peer: Option<PeerInfo>,
+    tcp_socket: Option<TcpStream>,
 }
 
 const READ_AHEAD: usize = 4;
+const TRANSPORT_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn spawn_reader(
     input: Box<dyn Read + Send>,
-) -> std::sync::mpsc::Receiver<std::io::Result<Response>> {
+) -> (
+    std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    std::thread::JoinHandle<()>,
+) {
     let (tx, rx) = std::sync::mpsc::sync_channel(READ_AHEAD);
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
         loop {
             let msg = r.read_msg::<Response>();
@@ -126,7 +237,17 @@ fn spawn_reader(
             }
         }
     });
-    rx
+    (rx, reader)
+}
+
+fn receive_transport_stats(
+    rx: &std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    timeout: std::time::Duration,
+) -> Option<TcpSocketStats> {
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(Response::TransportStats(stats))) => stats,
+        _ => None,
+    }
 }
 
 fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()> {
@@ -158,6 +279,28 @@ fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()
 }
 
 impl RemoteConn {
+    fn transport_stats_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Option<TcpPairStats> {
+        let socket = self.tcp_socket.as_ref()?.try_clone().ok()?;
+        let local = tcp_socket_stats(&socket);
+        // Changing SO_RCVTIMEO cannot wake a reader already blocked on another
+        // clone. Bound the actual response wait instead. This connection is
+        // retired immediately after collection, so a late reply cannot become
+        // a response to a later request.
+        let peer = if self.dead || self.send(Request::TransportStats).is_err() {
+            None
+        } else {
+            receive_transport_stats(self.rx.as_ref().expect("reader receiver present"), timeout)
+        };
+        (local.is_some() || peer.is_some()).then(|| TcpPairStats {
+            label: self.label.clone(),
+            local,
+            peer,
+        })
+    }
+
     fn io_err(&mut self, e: anyhow::Error) -> anyhow::Error {
         self.dead = true;
         // If the child has exited (or does so shortly), that's the more useful error.
@@ -186,7 +329,7 @@ impl Conn for RemoteConn {
         self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))
     }
     fn recv(&mut self) -> Result<Response> {
-        match self.rx.recv() {
+        match self.rx.as_ref().expect("reader receiver present").recv() {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => Err(self.io_err(e.into())),
             Err(_) => Err(self.io_err(
@@ -196,6 +339,9 @@ impl Conn for RemoteConn {
     }
     fn is_dead(&self) -> bool {
         self.dead
+    }
+    fn transport_stats(&mut self) -> Option<TcpPairStats> {
+        self.transport_stats_with_timeout(TRANSPORT_STATS_TIMEOUT)
     }
     fn scan(
         &mut self,
@@ -237,8 +383,20 @@ impl Drop for RemoteConn {
         if !self.dead {
             let _ = self.w.write_msg(&Request::Shutdown);
         }
+        // Sending Shutdown asks for an orderly peer exit; shutting down the
+        // retained TCP descriptor also wakes our reader clone and the peer's
+        // request reader if either side is wedged or the diagnostic reply
+        // timed out. Drop the receiver before joining so a reader blocked on a
+        // full response channel can exit as well.
+        if let Some(socket) = &self.tcp_socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        self.rx.take();
         if let Some(child) = &mut self.child {
             let _ = child.wait();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
         }
     }
 }
@@ -503,13 +661,16 @@ impl RemoteSpec {
             .with_context(|| format!("spawn {:?}", self.rsh[0]))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let (rx, reader) = spawn_reader(Box::new(stdout));
         let conn = RemoteConn {
             child: Some(child),
             w: FrameWriter::new(Box::new(stdin), compress),
-            rx: spawn_reader(Box::new(stdout)),
+            rx: Some(rx),
+            reader: Some(reader),
             label: self.label(),
             dead: false,
             peer: None,
+            tcp_socket: None,
         };
         let conn = hello(conn, compress, Vec::new())?;
         self.record_peer(&conn);
@@ -708,14 +869,18 @@ impl RemoteSpec {
                 None => (None, None),
             };
             let writer = RecordWriter::new(stream.try_clone()?, wc);
+            let tcp_socket = stream.try_clone()?;
             let reader = RecordReader::new(stream, rc);
+            let (rx, reader) = spawn_reader(Box::new(reader));
             let conn = RemoteConn {
                 child: None,
                 w: FrameWriter::new(Box::new(writer), compress),
-                rx: spawn_reader(Box::new(reader)),
+                rx: Some(rx),
+                reader: Some(reader),
                 label: format!("{} (tcp {addr_s})", self.label()),
                 dead: false,
                 peer: None,
+                tcp_socket: Some(tcp_socket),
             };
             let conn = hello(conn, compress, info.token.clone())?;
             self.record_peer(&conn);
@@ -1271,6 +1436,108 @@ impl Endpoint {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    struct ExitObserved<R> {
+        inner: R,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<R: Read> Read for ExitObserved<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl<R> Drop for ExitObserved<R> {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn kernel_tcp_stats_are_available_for_a_live_socket() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            socket.read_exact(&mut byte).unwrap();
+            socket.write_all(&byte).unwrap();
+            tcp_socket_stats(&socket).unwrap()
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(&[7]).unwrap();
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).unwrap();
+        let client_stats = tcp_socket_stats(&client).unwrap();
+        let server_stats = server.join().unwrap();
+        assert_eq!(byte, [7]);
+        assert!(
+            client_stats.segments_sent.is_some_and(|value| value > 0)
+                || client_stats.bytes_sent.is_some_and(|value| value > 0)
+        );
+        assert!(
+            server_stats.segments_sent.is_some_and(|value| value > 0)
+                || server_stats.bytes_sent.is_some_and(|value| value > 0)
+        );
+    }
+
+    #[test]
+    fn transport_stats_response_wait_has_a_deadline() {
+        let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let timeout = std::time::Duration::from_millis(20);
+        let start = std::time::Instant::now();
+        assert!(receive_transport_stats(&receiver, timeout).is_none());
+        assert!(start.elapsed() >= timeout);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn repeatedly_retiring_timed_out_tcp_connections_joins_their_readers() {
+        const CONNECTIONS: usize = 32;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..CONNECTIONS {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request_bytes = Vec::new();
+                socket.read_to_end(&mut request_bytes).unwrap();
+                assert!(!request_bytes.is_empty());
+            }
+        });
+
+        for _ in 0..CONNECTIONS {
+            let socket = TcpStream::connect(address).unwrap();
+            let writer = socket.try_clone().unwrap();
+            let tcp_socket = socket.try_clone().unwrap();
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let input = ExitObserved {
+                inner: socket,
+                dropped: dropped.clone(),
+            };
+            let (rx, reader) = spawn_reader(Box::new(input));
+            let mut connection = RemoteConn {
+                child: None,
+                w: FrameWriter::new(Box::new(writer), false),
+                rx: Some(rx),
+                reader: Some(reader),
+                label: "test tcp".into(),
+                dead: false,
+                peer: None,
+                tcp_socket: Some(tcp_socket),
+            };
+            let timeout = std::time::Duration::from_millis(5);
+            let start = std::time::Instant::now();
+            let _ = connection.transport_stats_with_timeout(timeout);
+            assert!(start.elapsed() >= timeout);
+            drop(connection);
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(std::sync::Arc::strong_count(&dropped), 1);
+        }
+        server.join().unwrap();
+    }
 
     fn entry(path: &[u8]) -> Entry {
         Entry {

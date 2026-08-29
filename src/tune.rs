@@ -1,29 +1,35 @@
 //! Automatic tuning of the number of parallel workers / connections.
 //!
-//! When `-j` is not given, syq does not guess: it starts with a few workers
-//! and measures. Progress (bytes, plus a small credit per completed file so
-//! small-file transfers count too) is sampled every few seconds; a worker
-//! count has been *measured* once the rate has stopped changing — two
-//! consecutive samples agree — so a burst credit running out, or a link that
-//! is still ramping up, is waited out rather than attributed to the last
-//! change. Each measured count is compared with the previous one: the count
-//! grows by [`STEP`] while that pays at least a third of what linear scaling
-//! would give, shrinks by [`STEP`] while that costs nothing, and then holds.
-//! It never stops watching: in the hold phase it periodically probes a step
-//! down (if throughput doesn't drop, fewer connections were enough — this is
-//! what saves a spinning disk from seek thrash) and a step up (the route or a
-//! shared NAS may have freed up).
+//! When `-j` is not given, syq starts with a modest (or previously learned)
+//! count and measures. Progress (bytes, plus a small credit per completed
+//! file so small-file transfers count too) is sampled every few seconds; a
+//! worker count has been *measured* once the rate has stopped changing. A
+//! successful move keeps exploring in the same direction. A failed move
+//! returns to the last good count and leaves a measured bound that later
+//! probes can refine one integer at a time. Independent per-direction aging
+//! and backoff decide when evidence is stale enough to probe again; when both
+//! directions are equally informative, upward wins the tie because transfer
+//! curves are usually concave or saturating and an extra connection therefore
+//! tends to have lower throughput regret than removing a useful one.
 //!
-//! Workers are never killed. Surplus ones are *parked* — they keep their
-//! connections open and simply stop taking work — so un-parking is instant.
-//! Parking takes effect within one block even in the middle of a huge range:
-//! the worker hands the rest of its range back to the scheduler.
+//! Candidate workers are connected while the current count remains active.
+//! They become active only when the whole candidate set is ready. Surplus
+//! workers are retired after a decision instead of retaining every connection
+//! ever tried (except that count one retains one ready spare for a cheap 1→2
+//! probe). Parking takes effect within one block even in a huge range: the
+//! worker hands the rest of its range back to the scheduler.
 //!
 //! [`Sampler`] turns raw samples into stable measurements and [`Policy`] is
 //! the decision state machine; both are pure and unit tested. [`Gate`] is the
 //! shared switch the workers consult; [`run`] is the driver.
 
+use crate::conn::{DataTransport, Endpoint};
 use crate::sched::Sched;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -41,38 +47,201 @@ pub const START_LOCAL: usize = 32;
 /// Never auto-tune beyond this many workers.
 pub const MAX: usize = 64;
 /// Never auto-tune below this many.
-pub const MIN: usize = 2;
+pub const MIN: usize = 1;
 /// Multiplicative step between worker counts, up or down.
 pub const STEP: f64 = 1.3;
-/// The initial ramp-up uses this coarser step, so a path that wants many
-/// connections gets them in a few steps; once a coarse step stops paying,
-/// the ramp goes back to the last good count and refines with STEP.
-pub const COARSE_STEP: f64 = 2.0;
-/// A step up is kept if it gains at least this fraction of what linear
-/// scaling would have given (STEP - 1). Lenient on purpose: a false "no
-/// gain" strands a window-capped ssh path at half speed, while a false
-/// "gain" costs a few idle connections that the next down-probe reclaims.
-const GAIN_FRACTION: f64 = 1.0 / 3.0;
-/// A step down is kept unless throughput fell by more than this.
-const DOWN_TOLERANCE: f64 = 0.05;
+/// Prefer the smallest measured count whose throughput is this close to the
+/// recent best. Probe scheduling handles noise independently from this
+/// objective; acceptance must not impose a stricter, contradictory threshold.
+const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// Measurements in the hold phase between probes. Each failed probe in a
-/// direction doubles the wait before that direction is tried again (up to
+/// direction doubles only that direction's wait (up to
 /// 2^PROBE_BACKOFF_MAX times), so a sharp knee — a disk that collapses one
 /// step up — isn't paid for every few measurements forever.
 const PROBE_EVERY: usize = 6;
 const PROBE_BACKOFF_MAX: u32 = 3;
+/// Old high-water measurements must not permanently prevent adaptation when
+/// the path changes during a long transfer.
+const EVIDENCE_MAX_AGE: usize = PROBE_EVERY * 4;
 /// How often progress is sampled.
 pub const SAMPLE: Duration = Duration::from_millis(2500);
+/// One discarded warm-up interval plus the two samples needed for stability.
+const MEASUREMENT_SAMPLES: f64 = 3.0;
 /// Two consecutive samples this close count as a stable rate.
 const STABLE_WITHIN: f64 = 0.10;
 /// Give up waiting for stability after this many samples and use what we have.
 const MAX_SAMPLES: usize = 8;
-/// Don't judge a worker count unless each worker has at least this much left
-/// to do: in the tail of a transfer, idle workers say nothing about the path.
-const TAIL_BYTES_PER_WORKER: u64 = 64 << 20;
+/// Conservative requirement before the first rate sample. Every real probe is
+/// based on a measured duration estimate; this is only a startup fallback.
+const TAIL_FALLBACK_BYTES_PER_WORKER: u64 = 64 << 20;
 /// A completed file counts as this many bytes, so small-file transfers
 /// (where bytes are negligible) still produce a usable signal.
 pub const FILE_CREDIT: u64 = 512 * 1024;
+
+fn sample_interval() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(milliseconds) = std::env::var_os("SYQ_TEST_TUNE_SAMPLE_MS")
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    SAMPLE
+}
+
+fn required_remaining_activity(rate: Option<f64>, workers: usize, sample: Duration) -> u64 {
+    match rate.filter(|rate| rate.is_finite() && *rate >= 0.0) {
+        Some(rate) => (rate * sample.as_secs_f64() * MEASUREMENT_SAMPLES)
+            .ceil()
+            .clamp(0.0, u64::MAX as f64) as u64,
+        None => (workers as u64).saturating_mul(TAIL_FALLBACK_BYTES_PER_WORKER),
+    }
+}
+
+fn enough_work(sched: &Sched, workers: usize, rate: Option<f64>, sample: Duration) -> bool {
+    sched.work_left_for(
+        workers,
+        required_remaining_activity(rate, workers, sample),
+        FILE_CREDIT,
+    )
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TuningCache {
+    /// Deliberately only path+transport → last settled count. Volatile facts
+    /// such as RTT, loss, workload and filesystem are telemetry, not key
+    /// dimensions: a stale count is merely a cheap starting hint.
+    paths: BTreeMap<String, usize>,
+}
+
+fn endpoint_key(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Local => "local".into(),
+        Endpoint::Remote(spec) => spec.label(),
+    }
+}
+
+fn transport_key(endpoint: &Endpoint) -> Option<&'static str> {
+    match endpoint {
+        Endpoint::Local => None,
+        Endpoint::Remote(spec) => Some(match spec.data_transport() {
+            DataTransport::Ssh => "ssh",
+            DataTransport::EncryptedTcp | DataTransport::PlaintextTcp => "tcp",
+        }),
+    }
+}
+
+/// Stable identity for the directional data path. TCP and ssh results never
+/// seed one another. Local-only work is intentionally not persisted: its best
+/// count is primarily a property of whichever filesystems happen to be used.
+pub fn path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
+    if !src.is_remote() && !dst.is_remote() {
+        return None;
+    }
+    let transport = [transport_key(src), transport_key(dst)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("+");
+    Some(format!(
+        "v1|{}>{}|{transport}",
+        endpoint_key(src),
+        endpoint_key(dst)
+    ))
+}
+
+fn cache_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SYQ_TUNING_CACHE") {
+        return (!path.is_empty()).then(|| PathBuf::from(path));
+    }
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })
+        .map(|root| root.join("syq/tuning-v1.json"))
+}
+
+fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
+    let lock_path = path.with_extension("json.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    let operation = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(lock)
+}
+
+fn read_cache(path: &Path) -> TuningCache {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn cached_at(path: &Path, key: &str) -> Option<usize> {
+    let _lock = lock_file(path, false).ok()?;
+    read_cache(path)
+        .paths
+        .get(key)
+        .copied()
+        .map(|n| n.clamp(MIN, MAX))
+}
+
+fn remember_at(path: &Path, key: &str, connections: usize) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let _lock = lock_file(path, true)?;
+    let mut cache = read_cache(path);
+    cache
+        .paths
+        .insert(key.to_string(), connections.clamp(MIN, MAX));
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("tuning"),
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(&cache)?)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+pub fn cached(key: &str) -> Option<usize> {
+    cached_at(&cache_path()?, key)
+}
+
+pub fn remember(key: &str, connections: usize) {
+    let Some(path) = cache_path() else {
+        return;
+    };
+    if let Err(error) = remember_at(&path, key, connections) {
+        if crate::transfer::debug() {
+            eprintln!("syq: tuning cache {}: {error}", path.display());
+        }
+    }
+}
 
 /// Next count up / down by `factor`, always moving by at least one.
 pub fn step_up_by(n: usize, factor: f64) -> usize {
@@ -125,33 +294,70 @@ impl Sampler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Down,
+    Up,
+}
+
+impl Direction {
+    fn index(self) -> usize {
+        match self {
+            Direction::Down => 0,
+            Direction::Up => 1,
+        }
+    }
+
+    fn opposite(self) -> Self {
+        match self {
+            Direction::Down => Direction::Up,
+            Direction::Up => Direction::Down,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
-    /// Stepping up while each step pays (`up`; by COARSE_STEP first, then
-    /// STEP), or down while each step costs nothing (`!up`).
-    Ramp { up: bool, coarse: bool },
-    /// Steady; counting measurements until the next probe.
-    Hold { measured: usize, next_up: bool },
-    /// Trying a different count; `from` is where to go back to.
-    Probe { from: usize, up: bool },
+    /// Waiting for the starting count's first useful measurement.
+    Initial,
+    /// Measuring `n` against the last accepted count and its baseline score.
+    /// An upward baseline may refresh while candidate workers are warming.
+    Explore {
+        from: usize,
+        base: f64,
+        direction: Direction,
+    },
+    /// The last decision is settled; wait until evidence in either direction
+    /// is old enough to be worth another probe.
+    Hold,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Point {
+    score: f64,
+    measured_at: usize,
 }
 
 /// Pure decision logic. Feed it one stable score per worker count; it
 /// returns the number of workers that should be active from now on.
 #[derive(Debug, Clone)]
 pub struct Policy {
+    /// Candidate count. It can be ahead of `active` while workers warm.
     pub n: usize,
     pub min: usize,
     pub max: usize,
+    /// Highest count that was actually activated, not merely requested.
     pub peak: usize,
+    active: usize,
     state: State,
-    /// The count before the last change.
-    prev: usize,
-    /// Score of the count we compare against.
-    base: Option<f64>,
+    points: BTreeMap<usize, Point>,
     /// Consecutive failed probes up / down.
     fails: [u32; 2],
-    /// Decision log, for --stats / debug.
+    /// Stable-measurement number when each direction may next be probed.
+    due: [usize; 2],
+    tick: usize,
+    comparisons: usize,
+    /// Counts actually activated, for --stats / debug.
     pub history: Vec<usize>,
 }
 
@@ -163,13 +369,13 @@ impl Policy {
             min,
             max,
             peak: n,
-            state: State::Ramp {
-                up: true,
-                coarse: true,
-            },
-            prev: n,
-            base: None,
+            active: n,
+            state: State::Initial,
+            points: BTreeMap::new(),
             fails: [0, 0],
+            due: [PROBE_EVERY, PROBE_EVERY],
+            tick: 0,
+            comparisons: 0,
             history: vec![n],
         }
     }
@@ -178,154 +384,264 @@ impl Policy {
     /// progress, in which case the count it will return to if the probe fails.
     pub fn settled(&self) -> usize {
         match self.state {
-            State::Probe { from, .. } => from,
+            State::Explore { from, .. } => from,
             _ => self.n,
         }
     }
 
-    /// Change the count (clamped). Returns true if it actually changed.
-    fn set(&mut self, n: usize) -> bool {
+    /// Record that the candidate count has become active. Warming a candidate
+    /// does not inflate the peak or the decision history.
+    pub fn activated(&mut self) {
+        if self.active == self.n {
+            return;
+        }
+        self.active = self.n;
+        self.peak = self.peak.max(self.n);
+        self.history.push(self.n);
+    }
+
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    /// True only after at least two worker counts were genuinely measured.
+    /// This is the minimum evidence worth persisting as a future start hint.
+    pub fn measured(&self) -> bool {
+        self.comparisons > 0
+    }
+
+    fn probe_base(&self) -> Option<f64> {
+        match self.state {
+            State::Explore { base, .. } => Some(base),
+            _ => None,
+        }
+    }
+
+    /// Refresh an upward probe's comparison while its extra workers warm. The
+    /// settled count remains active, so this is baseline evidence rather than
+    /// a new policy tick or worker-count comparison.
+    fn refresh_warming_baseline(&mut self, score: f64) -> bool {
+        let from = match &mut self.state {
+            State::Explore {
+                from,
+                base,
+                direction: Direction::Up,
+            } if *from == self.active => {
+                *base = score;
+                Some(*from)
+            }
+            _ => None,
+        };
+        if let Some(from) = from {
+            self.points.insert(
+                from,
+                Point {
+                    score,
+                    measured_at: self.tick,
+                },
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cancel a candidate that has not yet been activated (normally because
+    /// the transfer entered its tail before enough workers finished warming).
+    pub fn cancel_unapplied(&mut self) {
+        if self.active == self.n {
+            return;
+        }
+        if let State::Explore {
+            from, direction, ..
+        } = self.state
+        {
+            self.n = from;
+            self.state = State::Hold;
+            // Provisioning is not throughput evidence, but retrying the same
+            // unavailable candidate on the very next measurement is wasteful.
+            self.due[direction.index()] = self.tick + PROBE_EVERY;
+        }
+    }
+
+    /// Change the candidate count (clamped). Returns true if it changed.
+    fn set_candidate(&mut self, n: usize) -> bool {
         let n = n.clamp(self.min, self.max);
         if n == self.n {
             return false;
         }
-        self.prev = self.n;
         self.n = n;
-        self.peak = self.peak.max(n);
-        self.history.push(n);
         true
     }
 
-    fn hold(&mut self, next_up: bool) {
-        self.state = State::Hold {
-            measured: 0,
-            next_up,
-        };
+    fn retry_after(&self, direction: Direction) -> usize {
+        let backoff = self.fails[direction.index()].min(PROBE_BACKOFF_MAX);
+        PROBE_EVERY << backoff
     }
 
-    /// The gain a step up by `factor` must show to be kept.
-    fn gain_needed(factor: f64) -> f64 {
-        1.0 + (factor - 1.0) * GAIN_FRACTION
+    fn record(&mut self, n: usize, score: f64) {
+        self.points
+            .entry(n)
+            .and_modify(|point| {
+                point.score = 0.5 * point.score + 0.5 * score;
+                point.measured_at = self.tick;
+            })
+            .or_insert(Point {
+                score,
+                measured_at: self.tick,
+            });
+    }
+
+    /// Pick an unmeasured integer inside the nearest bound before taking
+    /// another geometric step. This is what turns measurements at 10 and 13
+    /// into a later probe at 11 rather than needlessly re-testing 10.
+    fn target(&self, direction: Direction) -> usize {
+        match direction {
+            Direction::Down => {
+                if self.n <= self.min {
+                    return self.n;
+                }
+                if let Some((&lower, point)) = self.points.range(self.min..self.n).next_back() {
+                    if self.n - lower > 1 {
+                        return lower + (self.n - lower) / 2;
+                    }
+                    if self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
+                        && point.score < self.recent_best() * (1.0 - NEAR_BEST_TOLERANCE)
+                    {
+                        return self.n;
+                    }
+                    return lower;
+                }
+                step_down(self.n).max(self.min)
+            }
+            Direction::Up => {
+                if self.n >= self.max {
+                    return self.n;
+                }
+                if let Some((&upper, point)) = self
+                    .points
+                    .range((
+                        std::ops::Bound::Excluded(self.n),
+                        std::ops::Bound::Included(self.max),
+                    ))
+                    .next()
+                {
+                    if upper - self.n > 1 {
+                        return self.n + (upper - self.n).div_ceil(2);
+                    }
+                    let current = self.points.get(&self.n).map_or(0.0, |point| point.score);
+                    let best = self.recent_best().max(point.score);
+                    if self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
+                        && current >= best * (1.0 - NEAR_BEST_TOLERANCE)
+                    {
+                        return self.n;
+                    }
+                    return upper;
+                }
+                step_up(self.n).min(self.max)
+            }
+        }
+    }
+
+    fn begin(&mut self, direction: Direction, base: f64) -> bool {
+        let from = self.n;
+        let target = self.target(direction);
+        if !self.set_candidate(target) {
+            self.due[direction.index()] = if (direction == Direction::Down && self.n == self.min)
+                || (direction == Direction::Up && self.n == self.max)
+            {
+                usize::MAX
+            } else {
+                self.tick + self.retry_after(direction)
+            };
+            return false;
+        }
+        self.state = State::Explore {
+            from,
+            base,
+            direction,
+        };
+        true
+    }
+
+    fn begin_due_probe(&mut self, base: f64) {
+        let down = self.due[Direction::Down.index()] <= self.tick && self.n > self.min;
+        let up = self.due[Direction::Up.index()] <= self.tick && self.n < self.max;
+        // Up is the deterministic tie-break. It is a prior, not an invariant:
+        // a failed upward probe backs off independently, allowing down to win.
+        let direction = match (down, up) {
+            (_, true) => Some(Direction::Up),
+            (true, false) => Some(Direction::Down),
+            (false, false) => None,
+        };
+        if let Some(direction) = direction {
+            self.begin(direction, base);
+        }
+    }
+
+    fn recent_best(&self) -> f64 {
+        self.points
+            .values()
+            .filter(|point| self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE)
+            .map(|point| point.score)
+            .fold(0.0, f64::max)
     }
 
     /// One stable measurement of the current count. Returns the worker count
-    /// to apply from now on (`self.n` when nothing changes).
+    /// to prepare or apply next (`self.n` when nothing changes).
     pub fn observe(&mut self, score: f64) -> usize {
-        let Some(base) = self.base else {
-            self.base = Some(score);
-            if let State::Ramp { up: true, coarse } = self.state {
-                if score > 0.0 {
-                    // First real measurement: try a step up right away.
-                    let f = if coarse { COARSE_STEP } else { STEP };
-                    self.set(step_up_by(self.n, f));
-                }
-            }
-            return self.n;
-        };
-        if base <= 0.0 && score <= 0.0 {
-            return self.n; // nothing is moving; no information
-        }
-        let ratio = if base > 0.0 {
-            score / base
-        } else {
-            f64::INFINITY
-        };
+        debug_assert_eq!(
+            self.active, self.n,
+            "candidate must be active before measuring"
+        );
+        self.tick += 1;
+        self.record(self.n, score);
         match self.state {
-            State::Ramp { up: true, coarse } => {
-                let factor = if coarse { COARSE_STEP } else { STEP };
-                let p = self.prev.min(self.n);
-                if ratio > Self::gain_needed(factor) {
-                    self.base = Some(score);
-                    if self.n < self.max {
-                        self.set(step_up_by(self.n, factor));
-                    } else {
-                        // It paid all the way up to the cap: stay there.
-                        self.hold(false);
-                    }
-                } else if coarse && step_up(p) < self.n {
-                    // The doubling from `p` didn't pay as a whole, but the
-                    // best count may lie between p and 2p: go back to p and
-                    // refine upward in finer steps, judged against p's score.
-                    self.set(step_up(p));
-                    self.prev = p;
-                    self.state = State::Ramp {
-                        up: true,
-                        coarse: false,
-                    };
-                } else if p > self.min && step_down(p) >= self.min {
-                    // Even a fine step from `p` bought nothing (or hurt):
-                    // `p` did the same work for less. Maybe fewer still
-                    // does — ramp down, judging each step against p's score
-                    // (`base`), going there directly.
-                    self.set(step_down(p));
-                    self.prev = p;
-                    self.state = State::Ramp {
-                        up: false,
-                        coarse: false,
-                    };
-                } else {
-                    self.set(p);
-                    self.base = Some(score);
-                    self.hold(false);
-                }
-            }
-            State::Ramp { up: false, .. } => {
-                if ratio >= 1.0 - DOWN_TOLERANCE {
-                    // Fewer kept up: keep it, try fewer again.
-                    self.base = Some(score);
-                    if self.n > self.min && step_down(self.n) >= self.min {
-                        self.set(step_down(self.n));
-                    } else {
-                        self.hold(true);
-                    }
-                } else {
-                    // Too few: go back to the last count that kept up.
-                    self.set(self.prev);
-                    self.hold(true);
-                }
-            }
-            State::Hold { measured, next_up } => {
-                // Track the baseline slowly so a drifting route doesn't make
-                // every later comparison meaningless.
-                self.base = Some(0.5 * base + 0.5 * score);
-                let measured = measured + 1;
-                let backoff = self.fails[usize::from(!next_up)].min(PROBE_BACKOFF_MAX);
-                if measured < PROBE_EVERY << backoff {
-                    self.state = State::Hold { measured, next_up };
-                } else {
-                    let target = if next_up {
-                        step_up(self.n)
-                    } else {
-                        step_down(self.n)
-                    };
-                    let from = self.n;
-                    if self.set(target) {
-                        self.state = State::Probe { from, up: next_up };
-                    } else {
-                        // Can't move that way; try the other direction next time.
-                        self.hold(!next_up);
+            State::Initial => {
+                if score > 0.0 {
+                    // A first 1.3× upward step discovers paths that can use
+                    // more workers without greedily opening twice the start.
+                    if !self.begin(Direction::Up, score) {
+                        self.begin(Direction::Down, score);
                     }
                 }
             }
-            State::Probe { from, up } => {
-                let keep = if up {
-                    ratio > Self::gain_needed(STEP)
-                } else {
-                    ratio >= 1.0 - DOWN_TOLERANCE
+            State::Hold => self.begin_due_probe(score),
+            State::Explore {
+                from,
+                base,
+                direction,
+            } => {
+                if base <= 0.0 && score <= 0.0 {
+                    return self.n;
+                }
+                let best = self.recent_best();
+                let floor = best * (1.0 - NEAR_BEST_TOLERANCE);
+                let keep = match direction {
+                    // Keep the larger count only when it is near-best and the
+                    // smaller baseline is not. If both qualify, the objective
+                    // explicitly prefers the smaller one.
+                    Direction::Up => score >= floor && base < floor,
+                    Direction::Down => score >= floor,
                 };
+                self.comparisons += 1;
+                let idx = direction.index();
+                let inverse = direction.opposite().index();
                 if keep {
-                    // A successful move: try further in the same direction
-                    // sooner than usual.
-                    self.fails[usize::from(!up)] = 0;
-                    self.base = Some(score);
-                    self.state = State::Hold {
-                        measured: PROBE_EVERY / 2,
-                        next_up: up,
-                    };
+                    self.fails[idx] = 0;
+                    self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
+                    self.state = State::Hold;
+                    // Success is direct evidence that there may be more gain
+                    // in the same direction, so continue immediately.
+                    self.begin(direction, score);
                 } else {
-                    self.fails[usize::from(!up)] += 1;
-                    self.set(from);
-                    self.hold(!up);
+                    self.fails[idx] += 1;
+                    self.due[idx] = self.tick + self.retry_after(direction);
+                    // Do not mechanically bounce to the opposite side after
+                    // a failed probe. Let current throughput settle first.
+                    self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
+                    self.set_candidate(from);
+                    self.state = State::Hold;
                 }
             }
         }
@@ -333,49 +649,158 @@ impl Policy {
     }
 }
 
-/// The switch workers consult: worker `id` may work iff `id < limit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotPhase {
+    Absent,
+    Warming,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct Slot {
+    phase: SlotPhase,
+}
+
+impl Default for Slot {
+    fn default() -> Self {
+        Self {
+            phase: SlotPhase::Absent,
+        }
+    }
+}
+
+/// The worker lifecycle shared by the tuner and workers. `active` controls who
+/// may take work; `retain` controls who keeps a connection while parked. Slot
+/// state distinguishes a genuinely ready connection from one still warming or
+/// one whose setup failed.
 pub struct Gate {
-    limit: AtomicUsize,
-    /// Workers whose connections are up (parked or not).
-    pub connected: AtomicUsize,
-    m: Mutex<()>,
+    active: AtomicUsize,
+    retain: AtomicUsize,
+    slots: Mutex<Vec<Slot>>,
     cv: Condvar,
 }
 
 impl Gate {
-    pub fn new(limit: usize) -> Arc<Self> {
+    pub fn new(active: usize) -> Arc<Self> {
         Arc::new(Gate {
-            limit: AtomicUsize::new(limit),
-            connected: AtomicUsize::new(0),
-            m: Mutex::new(()),
+            active: AtomicUsize::new(active),
+            retain: AtomicUsize::new(active),
+            slots: Mutex::new(Vec::new()),
             cv: Condvar::new(),
         })
     }
 
     pub fn allowed(&self, id: usize) -> bool {
-        id < self.limit.load(Relaxed)
+        id < self.active.load(Relaxed)
     }
 
-    pub fn set_limit(&self, n: usize) {
-        let _g = self.m.lock().unwrap();
-        self.limit.store(n, Relaxed);
+    pub fn active(&self) -> usize {
+        self.active.load(Relaxed)
+    }
+
+    pub fn set_active(&self, n: usize) {
+        let _g = self.slots.lock().unwrap();
+        self.active.store(n, Relaxed);
+        self.retain.fetch_max(n, Relaxed);
         self.cv.notify_all();
     }
 
+    pub fn set_retain(&self, n: usize) {
+        let _g = self.slots.lock().unwrap();
+        self.retain.store(n.max(self.active()), Relaxed);
+        self.cv.notify_all();
+    }
+
+    /// Claim absent slots through `n` for connection setup.
+    pub fn begin_warming(&self, n: usize) -> Vec<usize> {
+        let mut slots = self.slots.lock().unwrap();
+        slots.resize_with(n, Slot::default);
+        let mut ids = Vec::new();
+        for (id, slot) in slots.iter_mut().take(n).enumerate() {
+            if slot.phase == SlotPhase::Absent {
+                slot.phase = SlotPhase::Warming;
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    pub fn mark_ready(&self, id: usize) {
+        let mut slots = self.slots.lock().unwrap();
+        slots.resize_with(id + 1, Slot::default);
+        slots[id].phase = SlotPhase::Ready;
+        self.cv.notify_all();
+    }
+
+    pub fn mark_warming(&self, id: usize) {
+        let mut slots = self.slots.lock().unwrap();
+        slots.resize_with(id + 1, Slot::default);
+        slots[id].phase = SlotPhase::Warming;
+        self.cv.notify_all();
+    }
+
+    /// Mark a cleanly retired worker reusable immediately.
+    pub fn mark_absent(&self, id: usize) {
+        let mut slots = self.slots.lock().unwrap();
+        slots.resize_with(id + 1, Slot::default);
+        slots[id] = Slot::default();
+        self.cv.notify_all();
+    }
+
+    /// Mark setup or repeated connection loss after bounded retries.
+    pub fn mark_failed(&self, id: usize) {
+        let mut slots = self.slots.lock().unwrap();
+        slots.resize_with(id + 1, Slot::default);
+        slots[id].phase = SlotPhase::Failed;
+        self.cv.notify_all();
+    }
+
+    pub fn retained(&self, id: usize) -> bool {
+        id < self.retain.load(Relaxed)
+    }
+
+    pub fn ready_through(&self, n: usize) -> bool {
+        let slots = self.slots.lock().unwrap();
+        slots.len() >= n
+            && slots
+                .iter()
+                .take(n)
+                .all(|slot| slot.phase == SlotPhase::Ready)
+    }
+
+    pub fn permanent_failure_through(&self, n: usize) -> bool {
+        self.slots
+            .lock()
+            .unwrap()
+            .iter()
+            .take(n)
+            .any(|slot| slot.phase == SlotPhase::Failed)
+    }
+
+    pub fn clear_failed_from(&self, first: usize) {
+        let mut slots = self.slots.lock().unwrap();
+        for slot in slots.iter_mut().skip(first) {
+            if slot.phase == SlotPhase::Failed {
+                *slot = Slot::default();
+            }
+        }
+    }
+
     /// Block until `id` is allowed again. Returns false if the transfer is
-    /// over (`done` became true) and the worker should exit instead.
+    /// over or this surplus connection should be retired.
     pub fn park(&self, id: usize, done: impl Fn() -> bool) -> bool {
-        let mut g = self.m.lock().unwrap();
+        let mut slots = self.slots.lock().unwrap();
         loop {
             if self.allowed(id) {
                 return true;
             }
-            if done() {
+            if done() || id >= self.retain.load(Relaxed) {
                 return false;
             }
-            g = self
+            slots = self
                 .cv
-                .wait_timeout(g, Duration::from_millis(250))
+                .wait_timeout(slots, Duration::from_millis(250))
                 .unwrap()
                 .0;
         }
@@ -389,6 +814,12 @@ pub trait Meter: Send + Sync {
     fn set_active(&self, n: usize);
 }
 
+fn activity_rate(last: (u64, u64), now: (u64, u64), seconds: f64) -> Option<f64> {
+    let bytes = now.0.checked_sub(last.0)?;
+    let files = now.1.checked_sub(last.1)?;
+    Some((bytes as f64 + files as f64 * FILE_CREDIT as f64) / seconds)
+}
+
 /// Drive the policy: sample progress, hand stable scores to the policy,
 /// apply its decisions to the gate and spawn workers that don't exist yet.
 /// Returns the final policy (for stats).
@@ -398,54 +829,195 @@ pub fn run(
     sched: Arc<Sched>,
     meter: Arc<dyn Meter>,
     mut spawn: impl FnMut(usize),
-    mut spawned: usize,
 ) -> Policy {
     let mut policy = policy;
     let mut sampler = Sampler::default();
     sampler.reset();
     let mut last = (meter.bytes(), meter.files());
     let mut sample_start = std::time::Instant::now();
+    let mut active = policy.active();
+    let mut collapse_samples = 0;
+    let sample = sample_interval();
+    let poll = Duration::from_millis(250).min(sample);
+    let mut last_rate = None;
     meter.set_active(policy.n);
     loop {
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(poll);
         if sched.is_aborted() || sched.finished() {
             break;
         }
-        if sample_start.elapsed() < SAMPLE {
+
+        // Apply reductions immediately. An increase leaves the current set
+        // active while its candidate workers connect in the background.
+        if policy.n < active {
+            let before = active;
+            gate.set_active(policy.n);
+            active = policy.n;
+            policy.activated();
+            meter.set_active(active);
+            gate.set_retain(if active == 1 { 2 } else { active });
+            sampler.reset();
+            collapse_samples = 0;
+            last = (meter.bytes(), meter.files());
+            sample_start = std::time::Instant::now();
+            if crate::transfer::debug() {
+                eprintln!(
+                    "syq: tune: {before} -> {active} workers (state {:?})",
+                    policy.state
+                );
+            }
+            continue;
+        }
+        if policy.n > active {
+            if !enough_work(&sched, policy.n, last_rate, sample) {
+                policy.cancel_unapplied();
+                gate.set_retain(if active == 1 { 2 } else { active });
+                continue;
+            }
+            gate.set_retain(policy.n);
+            for id in gate.begin_warming(policy.n) {
+                spawn(id);
+            }
+            if gate.permanent_failure_through(policy.n) {
+                if gate.permanent_failure_through(active) {
+                    sched.abort();
+                    break;
+                }
+                // Failure to provision an optional upward probe is not a
+                // throughput result and must not fail the copy.
+                policy.cancel_unapplied();
+                gate.set_retain(if active == 1 { 2 } else { active });
+                gate.clear_failed_from(active);
+                continue;
+            }
+            if gate.ready_through(policy.n) {
+                let before = active;
+                gate.set_active(policy.n);
+                active = policy.n;
+                policy.activated();
+                meter.set_active(active);
+                sampler.reset();
+                collapse_samples = 0;
+                last = (meter.bytes(), meter.files());
+                sample_start = std::time::Instant::now();
+                if crate::transfer::debug() {
+                    eprintln!(
+                        "syq: tune: {before} -> {active} workers (candidate ready, state {:?})",
+                        policy.state
+                    );
+                }
+                continue;
+            }
+
+            // The settled workers keep providing a fresh comparison while an
+            // upward candidate connects. This prevents handshake delay from
+            // turning unrelated path drift into an apparent candidate effect.
+            if sample_start.elapsed() >= sample {
+                let now = (meter.bytes(), meter.files());
+                let secs = sample_start.elapsed().as_secs_f64();
+                sample_start = std::time::Instant::now();
+                if !gate.ready_through(active) {
+                    last = now;
+                    sampler.reset();
+                    continue;
+                }
+                let Some(rate) = activity_rate(last, now, secs) else {
+                    last = now;
+                    sampler.reset();
+                    continue;
+                };
+                last = now;
+                last_rate = Some(rate);
+                if !enough_work(&sched, policy.n, last_rate, sample) {
+                    policy.cancel_unapplied();
+                    gate.set_retain(if active == 1 { 2 } else { active });
+                    sampler.reset();
+                    continue;
+                }
+                if let Some(score) = sampler.push(rate) {
+                    policy.refresh_warming_baseline(score);
+                    if crate::transfer::debug() {
+                        eprintln!(
+                            "syq: tune: refreshed {active}-worker baseline to {:.1} MB/s while {} workers warm",
+                            score / 1e6,
+                            policy.n
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Heal an unexpectedly missing active slot. At one active worker keep
+        // exactly one ready spare so the important 1→2 probe is instantaneous.
+        let retain = if active == 1 { 2 } else { active };
+        gate.set_retain(retain);
+        for id in gate.begin_warming(retain) {
+            spawn(id);
+        }
+        if gate.permanent_failure_through(active) {
+            sched.abort();
+            break;
+        }
+        if sample_start.elapsed() < sample {
             continue;
         }
         let now = (meter.bytes(), meter.files());
         let secs = sample_start.elapsed().as_secs_f64();
         sample_start = std::time::Instant::now();
         // Only judge a configuration once every requested worker is actually
-        // connected (ssh sessions can take seconds each), and only while there
-        // is enough work left — in the tail, idle workers say nothing.
-        let all_up = gate.connected.load(Relaxed) >= policy.n.min(spawned);
-        if !all_up || !sched.work_left_for(policy.n, TAIL_BYTES_PER_WORKER) {
+        // connected (ssh sessions can take seconds each).
+        if !gate.ready_through(active) {
             last = now;
             sampler.reset();
             continue;
         }
         // Per second, so jitter in the sample length doesn't masquerade as a
         // throughput change.
-        let rate = ((now.0 - last.0) as f64 + (now.1 - last.1) as f64 * FILE_CREDIT as f64) / secs;
+        let Some(rate) = activity_rate(last, now, secs) else {
+            // Progress can be retracted after uncertain acknowledgements. The
+            // production meter is monotonic, but keep the generic driver safe
+            // and discard any interval from a regressing implementation.
+            last = now;
+            sampler.reset();
+            collapse_samples = 0;
+            continue;
+        };
         last = now;
+        last_rate = Some(rate);
+        // Estimate the time left at the rate just observed. In the tail, idle
+        // workers say nothing; unlike a fixed byte threshold this remains
+        // useful on both very slow and very fast paths.
+        if !enough_work(&sched, active, last_rate, sample) {
+            sampler.reset();
+            collapse_samples = 0;
+            continue;
+        }
+        if policy
+            .probe_base()
+            .is_some_and(|base| base > 0.0 && rate < 0.5 * base)
+        {
+            collapse_samples += 1;
+        } else {
+            collapse_samples = 0;
+        }
+        if collapse_samples >= 2 {
+            policy.observe(rate);
+            sampler.reset();
+            collapse_samples = 0;
+            continue;
+        }
         let Some(score) = sampler.push(rate) else {
             continue;
         };
         let before = policy.n;
-        let n = policy.observe(score);
-        if n != before {
-            while spawned < n {
-                spawn(spawned);
-                spawned += 1;
-            }
-            gate.set_limit(n);
-            meter.set_active(n);
+        policy.observe(score);
+        if policy.n != before {
             sampler.reset();
             if crate::transfer::debug() {
                 eprintln!(
-                    "syq: tune: {before} -> {n} workers (measured {:.1} MB/s at {before}, state {:?})",
+                    "syq: tune: candidate {before} -> {} workers (measured {:.1} MB/s at {before}, state {:?})",
+                    policy.n,
                     score / 1e6,
                     policy.state
                 );
@@ -459,13 +1031,51 @@ pub fn run(
 mod tests {
     use super::*;
 
+    fn remote(host: &str, tcp: bool) -> Endpoint {
+        Endpoint::Remote(crate::conn::RemoteSpec {
+            user: Some("user".into()),
+            host: host.into(),
+            rsh: vec!["ssh".into()],
+            syq_path: None,
+            auto_helper: false,
+            helper_install: Default::default(),
+            quiet: true,
+            tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp.then(|| crate::conn::TcpInfo {
+                addrs: vec!["127.0.0.1".into()],
+                port: 1,
+                key: Some(vec![0; 32]),
+                token: vec![],
+                failed: false,
+                failure: None,
+                next: Default::default(),
+            }))),
+            diagnostics: Default::default(),
+        })
+    }
+
+    fn temporary_cache(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "syq-tune-test-{}-{name}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn measure(p: &mut Policy, score: f64) {
+        p.observe(score);
+        p.activated();
+    }
+
     /// Feed the policy a model where throughput rises linearly with workers
     /// up to `cap` workers and is flat after.
     fn simulate(start: usize, cap: usize, rounds: usize, noise: impl Fn(usize) -> f64) -> Policy {
         let mut p = Policy::new(start, MIN, MAX);
         for i in 0..rounds {
             let eff = p.n.min(cap) as f64;
-            p.observe(eff * 10e6 * noise(i));
+            measure(&mut p, eff * 10e6 * noise(i));
         }
         p
     }
@@ -475,7 +1085,7 @@ mod tests {
         assert_eq!(step_up(8), 10);
         assert_eq!(step_up(2), 3);
         assert_eq!(step_down(8), 6);
-        assert_eq!(step_down(3), 2);
+        assert_eq!(step_down(2), 1);
         let mut n = START_SSH;
         let mut steps = 0;
         while n < MAX {
@@ -486,62 +1096,120 @@ mod tests {
     }
 
     #[test]
-    fn ramps_to_the_plateau_and_holds() {
-        let p = simulate(START_SSH, 32, 40, |_| 1.0);
-        // Doubles up to the knee, overshoots once, refines, and stays.
+    fn first_probe_is_modest_instead_of_doubling() {
+        let mut p = Policy::new(START_SSH, MIN, MAX);
+        measure(&mut p, 80.0);
+        assert_eq!(p.n, 10);
+        assert_eq!(p.history, vec![8, 10]);
+    }
+
+    #[test]
+    fn upward_acceptance_uses_the_near_best_objective() {
+        let mut worthwhile = Policy::new(10, MIN, MAX);
+        measure(&mut worthwhile, 100.0);
+        measure(&mut worthwhile, 107.0);
+        assert_eq!(worthwhile.settled(), 13);
+
+        let mut unnecessary = Policy::new(10, MIN, MAX);
+        measure(&mut unnecessary, 100.0);
+        measure(&mut unnecessary, 104.0);
+        assert_eq!(unnecessary.settled(), 10);
+    }
+
+    #[test]
+    fn activity_rate_discards_a_regressing_sample() {
+        assert_eq!(activity_rate((100, 2), (90, 3), 1.0), None);
+        assert_eq!(activity_rate((100, 2), (110, 1), 1.0), None);
         assert_eq!(
-            &p.history[..5],
-            &[8, 16, 32, 64, 42],
-            "history {:?}",
-            p.history
+            activity_rate((100, 2), (110, 3), 2.0),
+            Some((10.0 + FILE_CREDIT as f64) / 2.0)
         );
-        assert!((25..=42).contains(&p.settled()), "history {:?}", p.history);
+    }
+
+    #[test]
+    fn remaining_work_requirement_scales_with_rate_not_worker_count() {
+        let slow = required_remaining_activity(Some(1_000_000.0), 8, SAMPLE);
+        let fast = required_remaining_activity(Some(1_000_000_000.0), 8, SAMPLE);
+        assert_eq!(slow, 7_500_000);
+        assert_eq!(fast, 7_500_000_000);
+        assert_eq!(
+            required_remaining_activity(None, 8, SAMPLE),
+            8 * TAIL_FALLBACK_BYTES_PER_WORKER
+        );
+    }
+
+    #[test]
+    fn upward_probe_refreshes_its_baseline_while_warming() {
+        let mut policy = Policy::new(10, MIN, MAX);
+        policy.observe(100.0);
+        assert_eq!(policy.active(), 10);
+        assert_eq!(policy.n, 13);
+        assert!(policy.refresh_warming_baseline(70.0));
+        assert_eq!(policy.probe_base(), Some(70.0));
+
+        policy.activated();
+        policy.observe(75.0);
+        assert_eq!(policy.settled(), 13);
+    }
+
+    #[test]
+    fn successful_direction_continues_to_the_plateau() {
+        let p = simulate(START_SSH, 32, 80, |_| 1.0);
+        assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
+        // 31 is the smallest integer within 5% of the observed best (32).
+        assert_eq!(p.settled(), 31, "history {:?}", p.history);
     }
 
     #[test]
     fn a_gain_at_the_cap_holds_at_the_cap() {
-        // Linear all the way past MAX (e.g. a fast NAS): 32 -> 64 doubles
-        // throughput, and 64 is the cap, so it must stay at 64.
-        let p = simulate(START_LOCAL, 200, 30, |_| 1.0);
-        assert_eq!(&p.history[..2], &[32, 64], "history {:?}", p.history);
-        assert_eq!(p.settled(), MAX, "history {:?}", p.history);
-        assert!(
-            p.history[1..].iter().all(|&n| n >= 48),
-            "history {:?}",
-            p.history
-        );
+        let p = simulate(START_LOCAL, 200, 40, |_| 1.0);
+        // Once the cap establishes the best score, downward refinement finds
+        // the smallest integer within the 5% near-best tolerance.
+        assert_eq!(p.settled(), 61, "history {:?}", p.history);
+        assert_eq!(p.peak, MAX);
     }
 
     #[test]
-    fn coarse_ramp_refines_between_doublings() {
-        // Scales linearly up to 24 workers: 16 -> 32 as a whole gains only
-        // 50% of the 100% linear would give... which is above a third, so
-        // model a sharper case: flat past 20. 16 -> 32 gains 25% (< 33%),
-        // so it goes back to 16 and refines: 21 (+25% of 30%: kept), 27
-        // (flat), back to 21, then descends 16 (worse), settles 21.
-        let p = simulate(START_SSH, 20, 40, |_| 1.0);
-        assert_eq!(
-            &p.history[..5],
-            &[8, 16, 32, 21, 27],
-            "history {:?}",
-            p.history
-        );
-        assert_eq!(p.settled(), 21, "history {:?}", p.history);
+    fn a_failed_up_probe_does_not_immediately_bounce_down() {
+        let mut p = Policy::new(10, MIN, MAX);
+        measure(&mut p, 100.0); // 10 -> 13
+        measure(&mut p, 130.0); // 13 paid; try 17
+        measure(&mut p, 130.0); // 17 did not; return to 13
+        assert_eq!(p.n, 13);
+        for _ in 0..PROBE_EVERY - 1 {
+            measure(&mut p, 130.0);
+            assert_eq!(p.n, 13, "history {:?}", p.history);
+        }
+        measure(&mut p, 130.0);
+        // The later down probe refines the measured 10..13 bracket.
+        assert_eq!(p.n, 11, "history {:?}", p.history);
     }
 
     #[test]
-    fn does_not_grow_when_it_never_pays() {
-        // One worker already saturates the link (TCP on a clean path).
-        let p = simulate(START_SSH, 1, 40, |_| 1.0);
-        // The doubling fails, the fine step fails, then it walks down since
-        // nothing drops.
-        assert!(p.settled() < START_SSH, "history {:?}", p.history);
-        assert_eq!(&p.history[..3], &[8, 16, 10]);
+    fn refines_to_the_smallest_near_best_integer() {
+        let mut p = Policy::new(10, MIN, MAX);
+        measure(&mut p, 100.0);
+        measure(&mut p, 130.0);
+        measure(&mut p, 130.0);
+        for _ in 0..PROBE_EVERY {
+            measure(&mut p, 130.0);
+        }
+        assert_eq!(p.n, 11);
+        measure(&mut p, 129.0);
+        // 10 is a fresh lower bound and was materially slower; do not retest
+        // it immediately just because the probe at 11 succeeded.
+        assert_eq!(p.settled(), 11);
+        assert_eq!(p.n, 11);
+    }
+
+    #[test]
+    fn descends_all_the_way_to_one_when_one_saturates_the_link() {
+        let p = simulate(START_SSH, 1, 80, |_| 1.0);
+        assert_eq!(p.settled(), 1, "history {:?}", p.history);
     }
 
     #[test]
     fn backs_off_when_more_workers_hurt() {
-        // A spinning disk: scales to 8 workers, collapses past that.
         let score = |n: usize| {
             if n <= 8 {
                 n as f64 * 12.5e6
@@ -550,45 +1218,12 @@ mod tests {
             }
         };
         let mut p = Policy::new(START_SSH, MIN, MAX);
-        for _ in 0..40 {
-            p.observe(score(p.n));
+        for _ in 0..80 {
+            let n = p.n;
+            measure(&mut p, score(n));
         }
         assert_eq!(p.settled(), 8, "history {:?}", p.history);
-        // 16 hurt; refine: 10 hurt too; 6 (judged against 8) was too few; back to 8.
-        assert_eq!(&p.history[..5], &[8, 16, 10, 6, 8]);
-        // Probes back off: far fewer than one excursion per 6 measurements.
-        assert!(p.history.len() <= 12, "history {:?}", p.history);
-    }
-
-    #[test]
-    fn descends_quickly_from_a_high_local_start() {
-        // Same disk, started at the local default of 32.
-        let score = |n: usize| {
-            if n <= 8 {
-                n as f64 * 12.5e6
-            } else {
-                30e6
-            }
-        };
-        let mut p = Policy::new(START_LOCAL, MIN, MAX);
-        let mut settled_at = None;
-        for i in 0..60 {
-            p.observe(score(p.n));
-            if settled_at.is_none() && (7..=8).contains(&p.settled()) && p.n == p.settled() {
-                settled_at = Some(i + 1);
-            }
-        }
-        // The 1.3x grid around the knee is 7 / 9, so 7 is the best it can do.
-        assert!((7..=8).contains(&p.settled()), "history {:?}", p.history);
-        // 32 -> 64 (hurt) -> 42 (hurt) -> 25 -> 19 -> 15 -> 12 -> 9 -> 7 -> 5
-        // (worse) -> 7: one measurement per step.
-        assert!(
-            settled_at.unwrap() <= 13,
-            "took {:?}: {:?}",
-            settled_at,
-            p.history
-        );
-        assert_eq!(&p.history[..4], &[32, 64, 42, 25]);
+        assert!(p.history.len() < 20, "history {:?}", p.history);
     }
 
     #[test]
@@ -601,9 +1236,64 @@ mod tests {
     fn silence_is_not_a_signal() {
         let mut p = Policy::new(START_SSH, MIN, MAX);
         for _ in 0..10 {
-            p.observe(0.0);
+            measure(&mut p, 0.0);
         }
         assert_eq!(p.history, vec![START_SSH]);
+    }
+
+    #[test]
+    fn a_short_run_has_no_cacheable_comparison() {
+        let mut p = Policy::new(START_SSH, MIN, MAX);
+        measure(&mut p, 80.0);
+        assert!(!p.measured());
+        measure(&mut p, 80.0);
+        assert!(p.measured());
+    }
+
+    #[test]
+    fn cache_remembers_only_the_named_path_and_clamps_values() {
+        let dir = temporary_cache("roundtrip");
+        let path = dir.join("tuning.json");
+        remember_at(&path, "a>b|tcp", 13).unwrap();
+        remember_at(&path, "a>b|ssh", MAX + 100).unwrap();
+        assert_eq!(cached_at(&path, "a>b|tcp"), Some(13));
+        assert_eq!(cached_at(&path, "a>b|ssh"), Some(MAX));
+        assert_eq!(cached_at(&path, "b>a|tcp"), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_key_separates_direction_and_transport() {
+        let local = Endpoint::Local;
+        let ssh = remote("host", false);
+        let tcp = remote("host", true);
+        assert_ne!(path_key(&local, &ssh), path_key(&ssh, &local));
+        assert_ne!(path_key(&local, &ssh), path_key(&local, &tcp));
+        assert_eq!(path_key(&local, &local), None);
+    }
+
+    #[test]
+    fn tcp_fallback_changes_the_cache_key() {
+        let local = Endpoint::Local;
+        let remote = remote("host", true);
+        let initial = path_key(&local, &remote);
+        let Endpoint::Remote(spec) = &remote else {
+            unreachable!()
+        };
+        spec.tcp.lock().unwrap().as_mut().unwrap().failed = true;
+        assert_ne!(path_key(&local, &remote), initial);
+    }
+
+    #[test]
+    fn corrupt_cache_is_ignored_and_replaced() {
+        let dir = temporary_cache("corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tuning.json");
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(cached_at(&path, "a>b|tcp"), None);
+        remember_at(&path, "a>b|tcp", 7).unwrap();
+        assert_eq!(cached_at(&path, "a>b|tcp"), Some(7));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -642,10 +1332,11 @@ mod tests {
         let g = Gate::new(2);
         assert!(g.allowed(1));
         assert!(!g.allowed(2));
+        g.set_retain(3);
         let g2 = g.clone();
         let t = std::thread::spawn(move || g2.park(2, || false));
         std::thread::sleep(Duration::from_millis(50));
-        g.set_limit(3);
+        g.set_active(3);
         assert!(t.join().unwrap());
         let g3 = g.clone();
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -653,5 +1344,39 @@ mod tests {
         let t = std::thread::spawn(move || g3.park(5, || d.load(Relaxed)));
         done.store(true, Relaxed);
         assert!(!t.join().unwrap());
+    }
+
+    #[test]
+    fn gate_distinguishes_warming_ready_active_and_retired() {
+        let gate = Gate::new(2);
+        assert_eq!(gate.begin_warming(2), vec![0, 1]);
+        assert!(!gate.ready_through(2));
+        gate.mark_ready(0);
+        assert!(!gate.ready_through(2));
+        gate.mark_ready(1);
+        assert!(gate.ready_through(2));
+
+        gate.set_active(1);
+        gate.set_retain(1);
+        assert!(gate.allowed(0));
+        assert!(!gate.allowed(1));
+        assert!(!gate.park(1, || false), "surplus slot should retire");
+        gate.mark_absent(1);
+        assert_eq!(gate.begin_warming(2), vec![1]);
+    }
+
+    #[test]
+    fn optional_provisioning_failure_does_not_poison_active_slots() {
+        let gate = Gate::new(2);
+        assert_eq!(gate.begin_warming(3), vec![0, 1, 2]);
+        gate.mark_ready(0);
+        gate.mark_ready(1);
+        gate.mark_failed(2);
+        assert!(!gate.permanent_failure_through(2));
+        assert!(gate.permanent_failure_through(3));
+
+        gate.clear_failed_from(2);
+        assert_eq!(gate.begin_warming(3), vec![2]);
+        assert!(gate.ready_through(2));
     }
 }

@@ -78,6 +78,27 @@ pub mod flags {
     pub const TIMES: u8 = 8;
 }
 
+/// Best-effort kernel counters for one end of a TCP data socket. `None` means
+/// the platform or returned kernel structure does not expose that field; a
+/// reported zero is therefore a genuine measurement.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct TcpSocketStats {
+    pub bytes_sent: Option<u64>,
+    pub bytes_retransmitted: Option<u64>,
+    pub segments_sent: Option<u64>,
+    pub segments_received: Option<u64>,
+    pub retransmissions: Option<u64>,
+    pub rtt_us: Option<u64>,
+    pub rtt_variance_us: Option<u64>,
+    pub min_rtt_us: Option<u64>,
+    pub send_cwnd_bytes: Option<u64>,
+    pub delivery_rate: Option<u64>,
+    pub busy_time_us: Option<u64>,
+    pub receive_window_limited_us: Option<u64>,
+    pub send_buffer_limited_us: Option<u64>,
+    pub ecn_ce_delivered: Option<u64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Which {
     Final,
@@ -262,6 +283,10 @@ pub enum Request {
     Canonicalize {
         path: PathBytes,
     },
+    /// Kernel TCP_INFO/TCP_CONNECTION_INFO for this end of a direct data
+    /// socket. SSH data transports report None at the orchestrator instead of
+    /// sending this request.
+    TransportStats,
     Shutdown,
 }
 
@@ -302,6 +327,7 @@ pub enum Response {
         hash: u128,
     },
     Path(PathBytes),
+    TransportStats(Option<TcpSocketStats>),
     Ok,
     Err(String),
 }
