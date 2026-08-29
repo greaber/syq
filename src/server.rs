@@ -57,6 +57,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             w.compress = compress;
             w.write_msg(&Response::HelloOk {
                 identity: expected_identity.to_string(),
+                platform: crate::identity::platform(),
             })?;
         }
         _ => bail!("expected Hello"),

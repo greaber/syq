@@ -12,23 +12,26 @@ permissions:
 jobs:
   conformance:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: target/cargo
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install rsync test-build prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y autoconf automake build-essential
       - name: Cache pinned rsync source and helpers
+        id: rsync-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             target/rsync-compat/sources
             target/rsync-compat/suites
           key: rsync-compat-${{ runner.os }}-${{ hashFiles('scripts/rsync-compat.py', 'tests/rsync-compat/manifest.toml', 'tests/rsync-compat/inventory.tsv', 'tests/rsync-compat/adaptations/*.patch') }}
+      - name: Install rsync test-build prerequisites
+        if: steps.rsync-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake build-essential
       - name: Cache Cargo dependencies and build output
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -42,15 +45,19 @@ jobs:
       - name: Test compatibility harness
         run: python3 tests/rsync-compat/harness_test.py
       - name: Run classified upstream tests
-        run: python3 scripts/rsync-compat.py --profile default -j 4
+        run: python3 scripts/rsync-compat.py --require-tests --test-timeout 120 -j 4
       - name: Run suite as root, including root-only circumstances
         run: |
           sudo env \
             PATH="$PATH" \
             CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
-            python3 scripts/rsync-compat.py --profile default --report-label root \
-              --no-build-syq --syq-bin "$PWD/target/cargo/debug/syq" -j 4
+            python3 scripts/rsync-compat.py --require-tests --report-label root \
+              --no-build-syq --syq-bin "$PWD/target/cargo/debug/syq" \
+              --test-timeout 120 -j 4
+      - name: Restore compatibility-cache ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target/rsync-compat
       - name: Upload compatibility report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

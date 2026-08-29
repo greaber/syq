@@ -8,6 +8,13 @@ pub const fn build() -> &'static str {
     env!("SYQ_BUILD_IDENTITY")
 }
 
+/// The platform this executable was built for, reported by remote helpers in
+/// the wire handshake. This avoids a separate `uname` ssh round trip on a
+/// managed-helper cache hit.
+pub fn platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
 pub fn release() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
 }

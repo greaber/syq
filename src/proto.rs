@@ -269,6 +269,7 @@ pub enum Request {
 pub enum Response {
     HelloOk {
         identity: String,
+        platform: String,
     },
     /// Each advertised data address with its interface link speed in Mbps
     /// (0 = unknown). The address the client's ssh session arrived on is first.

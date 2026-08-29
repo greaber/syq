@@ -6,8 +6,11 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,7 +21,129 @@ rsync_compat = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(rsync_compat)
 
 
+def sample_report(tests: list[dict] | None = None) -> dict:
+    tests = tests or []
+    return {
+        "upstream_commit": "abc123",
+        "target_name": "rsync",
+        "target_args": [],
+        "platform": "linux",
+        "run_as": "non-root",
+        "applicable": len(tests),
+        "position_counts": {
+            position: sum(test["position"] == position for test in tests)
+            for position in rsync_compat.VALID_POSITIONS
+        },
+        "adapted": sum(test["classification"] == "adapted" for test in tests),
+        "ledger": {
+            "out-of-scope": 50,
+            "unsupported": 30,
+            "unassessed": 4,
+        },
+        "unsupported_features": [
+            {
+                "area": "filters",
+                "reason": "unsupported-filters",
+                "tests": 30,
+                "description": "Filter behavior is not implemented.",
+            }
+        ],
+        "tests": tests,
+        "runner_exit_code": 0,
+        "expected_runner_exit_code": 0,
+        "parser_errors": [],
+        "harness_errors": [],
+        "harness_ok": True,
+    }
+
+
 class HarnessTests(unittest.TestCase):
+    def test_scope_rejects_later_file_in_traditional_multi_file_patch(self) -> None:
+        patch = b"""--- a/testsuite/README.md
++++ b/testsuite/README.md
+@@ -1 +1 @@
+-old
++new
+--- a/flist.c
++++ b/flist.c
+@@ -1 +1 @@
+-old
++new
+"""
+
+        with self.assertRaisesRegex(rsync_compat.CompatError, "testsuite files"):
+            rsync_compat.validate_adaptation_patch("bad-multi-file", patch)
+
+    def test_scope_rejects_rename_source_outside_testsuite(self) -> None:
+        patch = b"""diff --git a/flist.c b/testsuite/flist.c
+similarity index 100%
+rename from flist.c
+rename to testsuite/flist.c
+"""
+
+        with self.assertRaisesRegex(rsync_compat.CompatError, "testsuite files"):
+            rsync_compat.validate_adaptation_patch("bad-rename", patch)
+
+    def test_scope_rejects_copy_source_outside_testsuite(self) -> None:
+        patch = b"""diff --git a/flist.c b/testsuite/flist.c
+similarity index 100%
+copy from flist.c
+copy to testsuite/flist.c
+"""
+
+        with self.assertRaisesRegex(rsync_compat.CompatError, "testsuite files"):
+            rsync_compat.validate_adaptation_patch("bad-copy", patch)
+
+    def test_scope_allows_testsuite_deletion(self) -> None:
+        patch = b"""diff --git a/testsuite/old b/testsuite/old
+deleted file mode 100644
+--- a/testsuite/old
++++ /dev/null
+@@ -1 +0,0 @@
+-old
+"""
+
+        rsync_compat.validate_adaptation_patch("good-delete", patch)
+
+    def test_ledger_requires_target_and_product_metadata(self) -> None:
+        manifest = {
+            "target": {"name": "rsync", "args": []},
+            "reasons": {},
+            "tests": [
+                {
+                    "name": "alpha",
+                    "classification": "conformance",
+                    "baseline": "pass",
+                    "position": "compatible",
+                }
+            ],
+        }
+        inventory = {"alpha": ("conformance", None)}
+
+        with mock.patch.object(
+            rsync_compat, "upstream_test_names", return_value={"alpha"}
+        ):
+            with self.assertRaisesRegex(rsync_compat.CompatError, "area"):
+                rsync_compat.validate_ledger(manifest, inventory, ROOT)
+
+    def test_target_arguments_are_inserted_before_upstream_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wrapper = Path(temporary) / "wrapper"
+            rsync_compat.make_wrapper(
+                wrapper,
+                Path(sys.executable),
+                ["-c", "import sys; print('|'.join(sys.argv[1:]))", "rsync"],
+            )
+
+            result = subprocess.run(
+                [wrapper, "-a", "src", "dst"],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+        self.assertEqual(result.stdout, "rsync|-a|src|dst\n")
+
     def test_stream_command_replaces_non_utf8_output(self) -> None:
         returncode, log = rsync_compat.stream_command(
             [sys.executable, "-c", "import os; os.write(1, b'before\\xffafter\\n')"],
@@ -55,6 +180,55 @@ PASS    stranger
         self.assertTrue(any("duplicate result for alpha" in error for error in errors))
         self.assertTrue(any("unexpected result for stranger" in error for error in errors))
         self.assertTrue(any("missing result for beta" in error for error in errors))
+
+    def test_expected_failure_is_not_a_harness_error(self) -> None:
+        expected, errors = rsync_compat.assess_harness(
+            1, {"alpha": "fail", "beta": "pass"}, [], require_tests=True, applicable=2
+        )
+
+        self.assertEqual(expected, 1)
+        self.assertEqual(errors, [])
+
+    def test_runner_status_inconsistent_with_results_is_a_harness_error(self) -> None:
+        expected, errors = rsync_compat.assess_harness(
+            2, {"alpha": "fail"}, [], require_tests=True, applicable=1
+        )
+
+        self.assertEqual(expected, 1)
+        self.assertRegex(errors[0], "runner exit code 2")
+
+    def test_zero_applicable_tests_render_without_a_score(self) -> None:
+        report = sample_report()
+
+        markdown = rsync_compat.markdown_report(report)
+        html = rsync_compat.html_report(report)
+
+        self.assertIn("No tests apply", markdown)
+        self.assertIn("No tests apply", html)
+        self.assertNotIn("score", markdown.lower())
+
+    def test_baseline_change_is_separate_from_harness_health(self) -> None:
+        test = {
+            "name": "alpha",
+            "classification": "conformance",
+            "adaptation": None,
+            "adaptation_kind": None,
+            "area": "paths",
+            "position": "policy-open",
+            "baseline": "pass",
+            "actual": "fail",
+            "baseline_matches": False,
+            "circumstances": [],
+            "note": "A <review> is needed.",
+        }
+        report = sample_report([test])
+
+        markdown = rsync_compat.markdown_report(report)
+        html = rsync_compat.html_report(report)
+
+        self.assertIn("Harness execution: **complete**", markdown)
+        self.assertIn("Observation changes requiring review", markdown)
+        self.assertIn("A &lt;review&gt; is needed.", html)
 
 
 if __name__ == "__main__":

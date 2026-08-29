@@ -7,6 +7,7 @@ python3 scripts/rsync-compat.py --ledger-only --update-ledger
 ```
 
 Pinned rsync commit: `7c20b077c980036a19587701cec320cc88e42a4a`.
+Configured command prefix: `syq`.
 
 | Classification | Tests |
 |---|---:|
@@ -16,36 +17,38 @@ Pinned rsync commit: `7c20b077c980036a19587701cec320cc88e42a4a`.
 | out-of-scope | 184 |
 | unassessed | 0 |
 
-## Runnable conformance tests
+## Runnable behavioral tests
 
-| Test | Kind | Expected | Circumstances | Note |
-|---|---|---|---|---|
-| `change-shrink` | adapted | default: pass | platform=linux; threads; bandwidth limiting | Continue a transfer when a source file shrinks after the source scan. |
-| `change-vanish` | adapted | default: pass | platform=linux; threads; bandwidth limiting | Continue a transfer when a source file vanishes after the source scan. |
-| `chgrp` | conformance | default: pass | platform=linux; POSIX groups; chgrp | Preserve a supplementary group with -g. |
-| `chown` | adapted | default: pass | platform=linux; run-as=root; root; chown | Archive mode preserves numeric owners and groups; rsync-only --super and -H are removed. |
-| `deep-path` | adapted | default: pass | platform=linux; paths deeper than 64 components | Copy a 70-level local tree; the rsync-daemon half is outside SYQ's scope. |
-| `dest-symlinked-dir` | conformance | default: pass | platform=linux; symlinks | Follow an operator-named destination symlink to a directory. |
-| `dir-sgid` | conformance | default: pass | platform=linux; POSIX modes | Honor setgid inheritance when creating destination directories. |
-| `duplicates` | conformance | default: fail | platform=linux; symlinks | SYQ still treats repeated identical sources as destination collisions. |
-| `files-from-path-clamp` | conformance | default: fail | platform=linux | SYQ rejects parent components instead of clamping them at the source root. |
-| `growing-file` | adapted | default: pass | platform=linux; threads; bandwidth limiting | Copy the final contents of a file that grows after the source scan. |
-| `highfd-hang` | conformance | default: pass | platform=linux; C compiler; soft fd limit above FD_SETSIZE | An ordinary transfer completes when the child inherits high-numbered descriptors. |
-| `inplace` | adapted | default: pass | platform=linux; stable inode numbers | --inplace retains the destination inode while the default atomic path replaces it. |
-| `longdir` | adapted | default: pass | platform=linux; long path components | Copy and delete within a tree containing three 175-character path components. |
-| `metadata-depth` | adapted | default: pass | platform=linux; POSIX modes and mtimes | Preserve modes and mtimes throughout a deep tree; upstream's unsupported --chmod case is omitted. |
-| `nested-socket-specials` | conformance | default: pass | platform=linux; Unix-domain sockets | Archive mode handles a nested socket without losing ordinary files. |
-| `partial` | adapted | default: pass | platform=linux; signals; bandwidth limiting | An interrupted transfer leaves SYQ's job-scoped deterministic sidecar and a rerun completes it. |
-| `protected-regular` | conformance | default: pass | platform=linux; run-as=root; root; Linux fs.protected_regular | --inplace can update a foreign-owned file in a sticky directory when the caller has authority. |
-| `search-only-destination` | conformance | default: pass | platform=linux; Linux search-only directory semantics; setpriv when run as root | Traverse a searchable but unreadable destination parent. |
-| `sender-scan-dir-escape` | conformance | default: pass | platform=linux; symlinks; C compiler; renameat2 | A raced source parent cannot make the copy enumerate outside the source tree. |
-| `size-filter` | conformance | default: pass | platform=linux | Apply --min-size and --max-size throughout a deep tree. |
-| `ssh-basic` | adapted | default: pass | platform=linux; rsync lsh test helper | Remote-shell copy and follow-up deletion using SYQ's remote executable option. |
-| `symlink-ignore` | conformance | default: pass | platform=linux; symlinks | Without -l/-L/-a, omit symlinks while copying referent files. |
-| `symlink-race-dest` | conformance | default: fail | platform=linux; run-as=root; root; a second uid; symlinks | SYQ follows an attacker-owned symlink in an operator-named absolute destination path. |
-| `symlink-race-relative-dest` | conformance | default: fail | platform=linux; run-as=root; root; a second uid; symlinks | SYQ follows an attacker-owned symlink in an operator-named relative destination path. |
-| `symlink-race-source` | conformance | default: pass | platform=linux; symlinks; C compiler; renameat2 | A raced source parent cannot make SYQ read file contents from outside the source tree. |
-| `update` | adapted | default: pass | platform=linux; symlinks | -u skips a newer deep destination, updates an older one, and still replaces a type mismatch. |
+The baseline is the last reviewed observation, not a claim that rsync's behavior is always the desired product policy.
+
+| Area | Test | Baseline | Product position | Provenance | Circumstances | Note |
+|---|---|---|---|---|---|---|
+| file-selection | `files-from-path-clamp` | fail | Policy open | unmodified upstream | platform=linux | SYQ rejects parent components instead of clamping them at the source root. |
+| file-selection | `size-filter` | pass | Compatible | unmodified upstream | platform=linux | Apply --min-size and --max-size throughout a deep tree. |
+| metadata | `chgrp` | pass | Compatible | unmodified upstream | platform=linux; POSIX groups; chgrp | Preserve a supplementary group with -g. |
+| metadata | `chown` | pass | Compatible | subset adaptation (chown-syq-cli) | platform=linux; run-as=root; root; chown | Archive mode preserves numeric owners and groups; rsync-only --super and -H are removed. |
+| metadata | `dir-sgid` | pass | Compatible | unmodified upstream | platform=linux; POSIX modes | Honor setgid inheritance when creating destination directories. |
+| metadata | `metadata-depth` | pass | Compatible | subset adaptation (metadata-supported-subset) | platform=linux; POSIX modes and mtimes | Preserve modes and mtimes throughout a deep tree; upstream's unsupported --chmod case is omitted. |
+| paths | `deep-path` | pass | Compatible | subset adaptation (deep-path-local) | platform=linux; paths deeper than 64 components | Copy a 70-level local tree; the rsync-daemon half is outside SYQ's scope. |
+| paths | `dest-symlinked-dir` | pass | Compatible | unmodified upstream | platform=linux; symlinks | Follow an operator-named destination symlink to a directory. |
+| paths | `longdir` | pass | Compatible | subset adaptation (longdir-no-hardlinks) | platform=linux; long path components | Copy and delete within a tree containing three 175-character path components. |
+| permissions | `protected-regular` | pass | Compatible | unmodified upstream | platform=linux; run-as=root; root; Linux fs.protected_regular | --inplace can update a foreign-owned file in a sticky directory when the caller has authority. |
+| permissions | `search-only-destination` | pass | Compatible | unmodified upstream | platform=linux; Linux search-only directory semantics; setpriv when run as root | Traverse a searchable but unreadable destination parent. |
+| publication | `inplace` | pass | Compatible | invocation adaptation (inplace-syq-cli) | platform=linux; stable inode numbers | --inplace retains the destination inode while the default atomic path replaces it. |
+| remote | `ssh-basic` | pass | Compatible | invocation adaptation (ssh-syq-path) | platform=linux; rsync lsh test helper | Remote-shell copy and follow-up deletion using SYQ's remote executable option. |
+| resume | `partial` | pass | Intentional divergence | fixture adaptation (syq-partial-layout) | platform=linux; signals; bandwidth limiting | An interrupted transfer leaves SYQ's job-scoped deterministic sidecar and a rerun completes it. |
+| robustness | `change-shrink` | pass | Compatible | invocation adaptation (source-mutation-cli) | platform=linux; threads; bandwidth limiting | Continue a transfer when a source file shrinks after the source scan. |
+| robustness | `change-vanish` | pass | Compatible | invocation adaptation (source-mutation-cli) | platform=linux; threads; bandwidth limiting | Continue a transfer when a source file vanishes after the source scan. |
+| robustness | `growing-file` | pass | Compatible | invocation adaptation (source-mutation-cli) | platform=linux; threads; bandwidth limiting | Copy the final contents of a file that grows after the source scan. |
+| robustness | `highfd-hang` | pass | Compatible | unmodified upstream | platform=linux; C compiler; soft fd limit above FD_SETSIZE | An ordinary transfer completes when the child inherits high-numbered descriptors. |
+| security | `sender-scan-dir-escape` | pass | Compatible | unmodified upstream | platform=linux; symlinks; C compiler; renameat2 | A raced source parent cannot make the copy enumerate outside the source tree. |
+| security | `symlink-race-dest` | fail | Unimplemented | unmodified upstream | platform=linux; run-as=root; root; a second uid; symlinks | SYQ follows an attacker-owned symlink in an operator-named absolute destination path. |
+| security | `symlink-race-relative-dest` | fail | Unimplemented | unmodified upstream | platform=linux; run-as=root; root; a second uid; symlinks | SYQ follows an attacker-owned symlink in an operator-named relative destination path. |
+| security | `symlink-race-source` | pass | Compatible | unmodified upstream | platform=linux; symlinks; C compiler; renameat2 | A raced source parent cannot make SYQ read file contents from outside the source tree. |
+| source-mapping | `duplicates` | fail | Policy open | unmodified upstream | platform=linux; symlinks | SYQ still treats repeated identical sources as destination collisions. |
+| special-files | `nested-socket-specials` | pass | Compatible | unmodified upstream | platform=linux; Unix-domain sockets | Archive mode handles a nested socket without losing ordinary files. |
+| symlinks | `symlink-ignore` | pass | Compatible | unmodified upstream | platform=linux; symlinks | Without -l/-L/-a, omit symlinks while copying referent files. |
+| update | `update` | pass | Compatible | subset adaptation (update-supported-subset) | platform=linux; symlinks | -u skips a newer deep destination, updates an older one, and still replaces a type mismatch. |
 
 ## Exclusion reasons
 

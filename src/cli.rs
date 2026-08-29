@@ -46,7 +46,7 @@ pub struct Args {
     #[arg(short = 'D')]
     pub devices: bool,
 
-    /// Increase verbosity (list files as they complete)
+    /// Increase verbosity (-v lists files; -vv also explains copy helpers and transport)
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
     /// Suppress non-error messages
