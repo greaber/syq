@@ -1581,7 +1581,12 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
             }
             root.create_node(path, *mode, *rdev)
         }
-        Op::SetMeta { meta, flags, .. } => set_meta_rooted(target, meta, *flags),
+        Op::SetMeta {
+            meta,
+            flags,
+            condition,
+            ..
+        } => set_meta_rooted(target, meta, *flags, *condition),
         Op::SetFileMetaIfSame {
             condition,
             meta,
@@ -1617,19 +1622,28 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
     }
 }
 
-fn set_meta_rooted(target: &GuardedTarget, meta: &Meta, flags: u8) -> Result<()> {
+fn set_meta_rooted(
+    target: &GuardedTarget,
+    meta: &Meta,
+    flags: u8,
+    condition: TargetCondition,
+) -> Result<()> {
     if target.relative.is_empty() {
         let directory = target.root.open_directory(&target.relative)?;
-        return set_meta_file(&directory, meta, flags);
+        require_open_target(&directory, &target.label, condition)?;
+        set_meta_file(&directory, meta, flags)?;
+        return require_rooted_named_identity(target, &directory, condition);
     }
     let metadata = target.root.metadata(&target.relative)?;
     if metadata.is_symlink() {
+        require_rooted_condition(metadata, condition, &target.label)?;
         apply_owner(flags, meta, |uid, gid| {
             target.root.chown(&target.relative, uid, gid)
         })?;
     } else {
         let handle = target.root.open_metadata(&target.relative)?;
         require_rooted_metadata(&handle, metadata, &target.label)?;
+        require_open_target(&handle, &target.label, condition)?;
         // Timestamp mutation is performed separately with no-follow
         // descriptor-relative semantics. All other metadata is applied to
         // the stable opened inode, so a raced leaf symlink cannot redirect it.
@@ -1642,7 +1656,69 @@ fn set_meta_rooted(target: &GuardedTarget, meta: &Meta, flags: u8) -> Result<()>
         ];
         target.root.set_times(&target.relative, &times)?;
     }
+    if metadata.is_symlink() {
+        let after = target.root.metadata(&target.relative)?;
+        require_rooted_identity(after, condition, &target.label)?;
+    } else {
+        let handle = target.root.open_metadata(&target.relative)?;
+        require_rooted_named_identity(target, &handle, condition)?;
+    }
     Ok(())
+}
+
+fn require_rooted_identity(
+    metadata: RootMetadata,
+    condition: TargetCondition,
+    label: &Path,
+) -> Result<()> {
+    match condition {
+        TargetCondition::Any => Ok(()),
+        TargetCondition::Absent => {
+            bail!("target {} appeared before metadata update", label.display())
+        }
+        TargetCondition::Matches { dev, ino }
+        | TargetCondition::MatchesFingerprint { dev, ino, .. }
+            if (metadata.dev, metadata.ino) == (dev, ino) =>
+        {
+            Ok(())
+        }
+        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
+            bail!("target {} changed during metadata update", label.display())
+        }
+    }
+}
+
+fn require_rooted_condition(
+    metadata: RootMetadata,
+    condition: TargetCondition,
+    label: &Path,
+) -> Result<()> {
+    match condition {
+        TargetCondition::Any => Ok(()),
+        TargetCondition::Absent => {
+            bail!("target {} appeared before metadata update", label.display())
+        }
+        TargetCondition::Matches { dev, ino } if (metadata.dev, metadata.ino) == (dev, ino) => {
+            Ok(())
+        }
+        TargetCondition::MatchesFingerprint {
+            dev,
+            ino,
+            ctime,
+            ctime_nsec,
+        } if (
+            metadata.dev,
+            metadata.ino,
+            metadata.ctime,
+            metadata.ctime_nsec,
+        ) == (dev, ino, ctime, ctime_nsec) =>
+        {
+            Ok(())
+        }
+        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
+            bail!("target {} changed before metadata update", label.display())
+        }
+    }
 }
 
 fn require_rooted_metadata(file: &File, expected: RootMetadata, label: &Path) -> Result<()> {
@@ -2562,7 +2638,7 @@ impl FsOps {
                 .with_context(|| format!("set metadata {}", pp.display()))?;
             #[cfg(debug_assertions)]
             fail_put_small_before_rename_for_test(&p)?;
-            guarded.root.rename(&relative, &guarded.relative)?;
+            publish_partial_rooted(&guarded.root, &relative, &guarded.relative, condition)?;
             return Ok(());
         }
         if matches!(
@@ -2697,10 +2773,10 @@ impl FsOps {
         flags: u8,
         mutation: TargetMutation<'_>,
     ) -> Result<()> {
-        let TargetMutation { condition, guard } = mutation;
-        if let Some(guard) = guard {
-            return self.finalize_rooted(path, inplace, partial_id, meta, flags, guard);
+        if mutation.guard.is_some() {
+            return self.finalize_rooted(path, inplace, partial_id, meta, flags, mutation);
         }
+        let TargetMutation { condition, .. } = mutation;
         let p = resolve(path);
         let src = if inplace {
             p.clone()
@@ -2774,8 +2850,15 @@ impl FsOps {
         partial_id: &PartialId,
         meta: &Meta,
         flags: u8,
-        guard: &ContainerGuard,
+        mutation: TargetMutation<'_>,
     ) -> Result<()> {
+        let TargetMutation {
+            condition,
+            guard: Some(guard),
+        } = mutation
+        else {
+            unreachable!("rooted finalization requires a container guard")
+        };
         if inplace {
             bail!("guarded destination cannot be finalized in place");
         }
@@ -2804,7 +2887,7 @@ impl FsOps {
         {
             bail!("destination {} is a directory", target.label.display());
         }
-        target.root.rename(&src_relative, &target.relative)?;
+        publish_partial_rooted(&target.root, &src_relative, &target.relative, condition)?;
         Ok(())
     }
 
@@ -3112,6 +3195,27 @@ fn publish_partial(src: &Path, dst: &Path, condition: TargetCondition) -> Result
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
             bail!("internal error: matched publication must update the held target inode")
         }
+    }
+}
+
+fn publish_partial_rooted(
+    root: &Root,
+    source: &RelativePath,
+    target: &RelativePath,
+    condition: TargetCondition,
+) -> Result<()> {
+    match condition {
+        TargetCondition::Any => root.rename(source, target),
+        TargetCondition::Absent => root.publish_new_regular(source, target),
+        TargetCondition::Matches { dev, ino } => {
+            root.replace_regular_if_same(source, target, dev, ino, None)
+        }
+        TargetCondition::MatchesFingerprint {
+            dev,
+            ino,
+            ctime,
+            ctime_nsec,
+        } => root.replace_regular_if_same(source, target, dev, ino, Some((ctime, ctime_nsec))),
     }
 }
 

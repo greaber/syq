@@ -11,14 +11,14 @@ use crate::enrollment::{
     TransportPublicKey,
 };
 use crate::proto::{self, ContainerGuard, Op, Request};
-use crate::rooted::{Root, RootIdentity};
+use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use ssh_key::private::Ed25519Keypair;
 use ssh_key::{LineEnding, PrivateKey};
-use std::collections::HashSet;
-use std::ffi::{CStr, CString, OsString};
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -113,10 +113,124 @@ pub(crate) struct PreparedTransfer {
 
 struct AuthorityState {
     paths: HashSet<Vec<u8>>,
+    receiver_modes: HashMap<Vec<u8>, ReceiverModeState>,
     transferred_bytes: u64,
     deletions: u64,
     live_connections: u16,
     tcp_listener_started: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReceiverModeState {
+    /// Keep the permissions HostB had before syq temporarily opened an
+    /// existing object or prepared to replace its contents.
+    Existing {
+        mode: u32,
+        kind: ReceiverModeKind,
+        dev: u64,
+        ino: u64,
+        ctime: i64,
+        ctime_nsec: u32,
+    },
+    /// The object will be created by this transfer. Its proposed source mode
+    /// has not yet been constrained by HostB's umask.
+    New(ReceiverModeKind),
+    /// A new object's already-constrained mode. Pin it for the remainder of
+    /// the grant so repeated requests cannot act as repeated chmod calls.
+    Selected { mode: u32, kind: ReceiverModeKind },
+}
+
+impl ReceiverModeState {
+    fn carry_forward(self, observed: Self) -> Option<Self> {
+        match (self, observed) {
+            (
+                Self::Existing {
+                    mode,
+                    kind,
+                    dev,
+                    ino,
+                    ..
+                },
+                Self::Existing {
+                    mode: observed_mode,
+                    kind: observed_kind,
+                    dev: observed_dev,
+                    ino: observed_ino,
+                    ctime: observed_ctime,
+                    ctime_nsec: observed_ctime_nsec,
+                },
+            ) if kind == observed_kind && (dev, ino) == (observed_dev, observed_ino) => {
+                let mode = if kind == ReceiverModeKind::Directory && observed_mode == (mode | 0o700)
+                {
+                    mode
+                } else {
+                    observed_mode
+                };
+                Some(Self::Existing {
+                    mode,
+                    kind,
+                    dev,
+                    ino,
+                    ctime: observed_ctime,
+                    ctime_nsec: observed_ctime_nsec,
+                })
+            }
+            (Self::New(kind), Self::New(observed_kind))
+            | (Self::Selected { kind, .. }, Self::New(observed_kind))
+            | (
+                Self::New(kind),
+                Self::Existing {
+                    kind: observed_kind,
+                    ..
+                },
+            )
+            | (
+                Self::Selected { kind, .. },
+                Self::Existing {
+                    kind: observed_kind,
+                    ..
+                },
+            ) if kind == observed_kind => Some(self),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiverModeKind {
+    Directory,
+    RegularFile,
+    Other,
+}
+
+#[derive(Clone, Copy)]
+enum ReceiverModeTarget {
+    AnyExisting,
+    RegularFile,
+}
+
+#[derive(Clone, Copy)]
+struct ReceiverModeDecision {
+    mode: u32,
+    identity: Option<(u64, u64, i64, u32)>,
+}
+
+#[cfg(not(test))]
+fn read_process_umask() -> u32 {
+    // RestrictedAuthority is constructed by the forced receiver before it
+    // starts any protocol worker threads.
+    unsafe {
+        let mask = libc::umask(0o022);
+        libc::umask(mask);
+        mask as u32
+    }
+}
+
+#[cfg(test)]
+fn read_process_umask() -> u32 {
+    // Avoid changing the process-global umask while unit tests run in
+    // parallel. Individual policy tests can override the stored value.
+    0o022
 }
 
 /// Shared capability inherited by the authorized SSH control process and all
@@ -126,6 +240,7 @@ pub(crate) struct RestrictedAuthority {
     guard: ContainerGuard,
     destination: Vec<u8>,
     copy: CopyOperationV1,
+    receiver_umask: u32,
     deadline: Instant,
     control_open: AtomicBool,
     state: Mutex<AuthorityState>,
@@ -154,6 +269,7 @@ impl RestrictedAuthority {
                 ino: config.root_ino,
             },
         )?;
+        let receiver_umask = read_process_umask();
         Ok(Self {
             guard: ContainerGuard {
                 root: config.root.as_bytes().to_vec(),
@@ -162,10 +278,12 @@ impl RestrictedAuthority {
             },
             destination: copy.destination.clone(),
             copy,
+            receiver_umask,
             deadline,
             control_open: AtomicBool::new(true),
             state: Mutex::new(AuthorityState {
                 paths: HashSet::new(),
+                receiver_modes: HashMap::new(),
                 transferred_bytes: 0,
                 deletions: 0,
                 live_connections: 0,
@@ -305,6 +423,227 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    fn rooted_metadata(&self, path: &[u8]) -> Result<Option<RootMetadata>> {
+        let root_path = Path::new(OsStr::from_bytes(&self.guard.root));
+        let target = Path::new(OsStr::from_bytes(path));
+        let relative = target.strip_prefix(root_path).with_context(|| {
+            format!(
+                "receiver metadata target {} is outside enrolled root {}",
+                target.display(),
+                root_path.display()
+            )
+        })?;
+        let relative = RelativePath::new(relative.as_os_str().as_bytes())?;
+        let root = Root::open_verified(
+            root_path,
+            RootIdentity {
+                dev: self.guard.dev,
+                ino: self.guard.ino,
+            },
+        )?;
+        root.metadata_optional(&relative)
+    }
+
+    fn remember_receiver_creation(&self, path: &[u8], existing_directory_kept: bool) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let metadata = self.rooted_metadata(path)?;
+        let kind = if existing_directory_kept {
+            ReceiverModeKind::Directory
+        } else {
+            ReceiverModeKind::Other
+        };
+        let initial =
+            if existing_directory_kept && metadata.is_some_and(|metadata| metadata.is_dir()) {
+                ReceiverModeState::Existing {
+                    mode: metadata.unwrap().mode & 0o7777,
+                    kind,
+                    dev: metadata.unwrap().dev,
+                    ino: metadata.unwrap().ino,
+                    ctime: metadata.unwrap().ctime,
+                    ctime_nsec: metadata.unwrap().ctime_nsec,
+                }
+            } else {
+                ReceiverModeState::New(kind)
+            };
+        let mode = state
+            .receiver_modes
+            .get(path)
+            .copied()
+            .and_then(|existing| existing.carry_forward(initial))
+            .unwrap_or(initial);
+        state.receiver_modes.insert(path.to_vec(), mode);
+        Ok(())
+    }
+
+    fn receiver_mode(
+        &self,
+        path: &[u8],
+        proposed: u32,
+        target: ReceiverModeTarget,
+    ) -> Result<ReceiverModeDecision> {
+        let mut state = self.state.lock().unwrap();
+        if matches!(target, ReceiverModeTarget::AnyExisting) {
+            if let Some(
+                existing @ (ReceiverModeState::New(_) | ReceiverModeState::Selected { .. }),
+            ) = state.receiver_modes.get(path).copied()
+            {
+                return Ok(Self::select_receiver_mode(
+                    &mut state.receiver_modes,
+                    path,
+                    proposed,
+                    self.receiver_umask,
+                    existing,
+                ));
+            }
+        }
+        let observed = self.rooted_metadata(path)?;
+        let initial = match (target, observed) {
+            (ReceiverModeTarget::AnyExisting, Some(metadata)) => {
+                let kind = if metadata.is_dir() {
+                    ReceiverModeKind::Directory
+                } else if metadata.is_file() {
+                    ReceiverModeKind::RegularFile
+                } else {
+                    ReceiverModeKind::Other
+                };
+                ReceiverModeState::Existing {
+                    mode: metadata.mode & 0o7777,
+                    kind,
+                    dev: metadata.dev,
+                    ino: metadata.ino,
+                    ctime: metadata.ctime,
+                    ctime_nsec: metadata.ctime_nsec,
+                }
+            }
+            (ReceiverModeTarget::RegularFile, Some(metadata)) if metadata.is_file() => {
+                ReceiverModeState::Existing {
+                    mode: metadata.mode & 0o7777,
+                    kind: ReceiverModeKind::RegularFile,
+                    dev: metadata.dev,
+                    ino: metadata.ino,
+                    ctime: metadata.ctime,
+                    ctime_nsec: metadata.ctime_nsec,
+                }
+            }
+            (ReceiverModeTarget::RegularFile, _) => {
+                ReceiverModeState::New(ReceiverModeKind::RegularFile)
+            }
+            (ReceiverModeTarget::AnyExisting, None) => {
+                ReceiverModeState::New(ReceiverModeKind::Other)
+            }
+        };
+        let mode = state
+            .receiver_modes
+            .get(path)
+            .copied()
+            .and_then(|existing| existing.carry_forward(initial))
+            .unwrap_or(initial);
+        state.receiver_modes.insert(path.to_vec(), mode);
+        Ok(Self::select_receiver_mode(
+            &mut state.receiver_modes,
+            path,
+            proposed,
+            self.receiver_umask,
+            mode,
+        ))
+    }
+
+    fn select_receiver_mode(
+        modes: &mut HashMap<Vec<u8>, ReceiverModeState>,
+        path: &[u8],
+        proposed: u32,
+        receiver_umask: u32,
+        mode: ReceiverModeState,
+    ) -> ReceiverModeDecision {
+        match mode {
+            ReceiverModeState::Existing {
+                mode,
+                dev,
+                ino,
+                ctime,
+                ctime_nsec,
+                ..
+            } => ReceiverModeDecision {
+                mode,
+                identity: Some((dev, ino, ctime, ctime_nsec)),
+            },
+            ReceiverModeState::Selected { mode, .. } => ReceiverModeDecision {
+                mode,
+                identity: None,
+            },
+            ReceiverModeState::New(kind) => {
+                // New objects may inherit ordinary source permission bits, but
+                // never special bits, and HostB's own umask is authoritative.
+                let selected = proposed & 0o777 & !receiver_umask;
+                modes.insert(
+                    path.to_vec(),
+                    ReceiverModeState::Selected {
+                        mode: selected,
+                        kind,
+                    },
+                );
+                ReceiverModeDecision {
+                    mode: selected,
+                    identity: None,
+                }
+            }
+        }
+    }
+
+    fn constrain_receiver_mode(
+        &self,
+        path: &[u8],
+        meta: &mut proto::Meta,
+        flags: &mut u8,
+        condition: &mut proto::TargetCondition,
+        target: ReceiverModeTarget,
+    ) -> Result<()> {
+        self.check_flags(*flags)?;
+        if *flags & proto::flags::RECEIVER_MODE != 0 {
+            let decision = self.receiver_mode(path, meta.mode, target)?;
+            meta.mode = decision.mode;
+            if let Some((dev, ino, ctime, ctime_nsec)) = decision.identity {
+                match *condition {
+                    proto::TargetCondition::Any => {
+                        *condition = proto::TargetCondition::MatchesFingerprint {
+                            dev,
+                            ino,
+                            ctime,
+                            ctime_nsec,
+                        };
+                    }
+                    proto::TargetCondition::Matches {
+                        dev: expected_dev,
+                        ino: expected_ino,
+                    } if (expected_dev, expected_ino) == (dev, ino) => {
+                        *condition = proto::TargetCondition::MatchesFingerprint {
+                            dev,
+                            ino,
+                            ctime,
+                            ctime_nsec,
+                        };
+                    }
+                    proto::TargetCondition::MatchesFingerprint {
+                        dev: expected_dev,
+                        ino: expected_ino,
+                        ctime: expected_ctime,
+                        ctime_nsec: expected_ctime_nsec,
+                    } if (
+                        expected_dev,
+                        expected_ino,
+                        expected_ctime,
+                        expected_ctime_nsec,
+                    ) == (dev, ino, ctime, ctime_nsec) => {}
+                    _ => bail!("receiver-managed mode target changed before authorization"),
+                }
+            }
+            // From this point on MODE contains receiver-authored data. FsOps
+            // never interprets the untrusted RECEIVER_MODE proposal directly.
+            *flags = (*flags & !proto::flags::RECEIVER_MODE) | proto::flags::MODE;
+        }
+        Ok(())
+    }
+
     fn check_hash_request(&self, block: u64, len: u64) -> Result<()> {
         if block != self.copy.limits.hash_block_bytes {
             bail!("hash block size does not match the signed grant");
@@ -353,30 +692,19 @@ impl RestrictedAuthority {
     }
 
     fn authorize_op(&self, operation: &mut Op) -> Result<()> {
-        let path = match operation {
-            Op::Mkdir { path, mode, .. } => {
-                if !self.copy.options.preserve_permissions {
-                    *mode = 0o700;
-                }
-                path
-            }
-            Op::SetMeta { path, .. } | Op::SetFileMetaIfSame { path, .. } => path,
+        let path = match &*operation {
+            Op::Mkdir { path, .. }
+            | Op::SetMeta { path, .. }
+            | Op::SetFileMetaIfSame { path, .. } => path,
             Op::Symlink { path, .. } => {
                 if !self.copy.options.preserve_symlinks {
                     bail!("symlink creation is not authorized by the signed grant");
                 }
                 path
             }
-            Op::Mknod { path, mode, .. } => {
+            Op::Mknod { path, .. } => {
                 if !self.copy.options.preserve_devices {
                     bail!("special-file creation is not authorized by the signed grant");
-                }
-                if !self.copy.options.preserve_permissions {
-                    #[cfg(target_os = "linux")]
-                    let file_type = *mode & libc::S_IFMT;
-                    #[cfg(not(target_os = "linux"))]
-                    let file_type = *mode & libc::S_IFMT as u32;
-                    *mode = file_type | 0o600;
                 }
                 path
             }
@@ -385,14 +713,54 @@ impl RestrictedAuthority {
             }
             Op::Rmdir { path } | Op::Unlink { path } => {
                 self.charge_deletion(path)?;
+                self.state.lock().unwrap().receiver_modes.remove(path);
                 return Ok(());
             }
         };
         self.check_mutation_path(path)?;
         match operation {
-            Op::SetMeta { flags, .. } | Op::SetFileMetaIfSame { flags, .. } => {
-                self.check_flags(*flags)
+            Op::Mkdir { path, mode, .. } => {
+                if !self.copy.options.preserve_permissions {
+                    self.remember_receiver_creation(path, true)?;
+                    *mode = 0o700;
+                }
+                Ok(())
             }
+            Op::Mknod { path, mode, .. } => {
+                if !self.copy.options.preserve_permissions {
+                    self.remember_receiver_creation(path, false)?;
+                    #[cfg(target_os = "linux")]
+                    let file_type = *mode & libc::S_IFMT;
+                    #[cfg(not(target_os = "linux"))]
+                    let file_type = *mode & libc::S_IFMT as u32;
+                    *mode = file_type | 0o600;
+                }
+                Ok(())
+            }
+            Op::SetMeta {
+                path,
+                meta,
+                flags,
+                condition,
+            } => self.constrain_receiver_mode(
+                path,
+                meta,
+                flags,
+                condition,
+                ReceiverModeTarget::AnyExisting,
+            ),
+            Op::SetFileMetaIfSame {
+                path,
+                meta,
+                flags,
+                condition,
+            } => self.constrain_receiver_mode(
+                path,
+                meta,
+                flags,
+                condition,
+                ReceiverModeTarget::RegularFile,
+            ),
             _ => Ok(()),
         }
     }
@@ -522,10 +890,21 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
-                path, flags, guard, ..
+                path,
+                meta,
+                flags,
+                condition,
+                guard,
+                ..
             } => {
                 self.check_mutation_path(path)?;
-                self.check_flags(*flags)?;
+                self.constrain_receiver_mode(
+                    path,
+                    meta,
+                    flags,
+                    condition,
+                    ReceiverModeTarget::RegularFile,
+                )?;
                 *guard = Some(self.guard.clone());
             }
             Request::Prepare {
@@ -561,7 +940,9 @@ impl RestrictedAuthority {
             Request::Finalize {
                 path,
                 inplace,
+                meta,
                 flags,
+                condition,
                 guard,
                 ..
             } => {
@@ -569,13 +950,25 @@ impl RestrictedAuthority {
                     bail!("signed receiver requires atomic staged publication");
                 }
                 self.check_mutation_path(path)?;
-                self.check_flags(*flags)?;
+                self.constrain_receiver_mode(
+                    path,
+                    meta,
+                    flags,
+                    condition,
+                    ReceiverModeTarget::RegularFile,
+                )?;
                 *guard = Some(self.guard.clone());
             }
             Request::PutSmallBatch(puts) => {
                 for put in puts {
                     self.charge_bytes(&put.path, 0, put.data.len())?;
-                    self.check_flags(put.flags)?;
+                    self.constrain_receiver_mode(
+                        &put.path,
+                        &mut put.meta,
+                        &mut put.flags,
+                        &mut put.condition,
+                        ReceiverModeTarget::RegularFile,
+                    )?;
                     put.guard = Some(self.guard.clone());
                 }
             }
@@ -2222,6 +2615,243 @@ mod tests {
         source_modes.authorize(&mut source_mode, false).unwrap();
         let mut receiver_mode = metadata(proto::flags::RECEIVER_MODE);
         assert!(source_modes.authorize(&mut receiver_mode, false).is_err());
+    }
+
+    #[test]
+    fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let existing_directory = target.join("existing-dir");
+        let new_directory = target.join("new-dir");
+        fs::create_dir_all(&existing_directory).unwrap();
+        fs::set_permissions(&existing_directory, fs::Permissions::from_mode(0o500)).unwrap();
+        let mut authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        authority.receiver_umask = 0o022;
+        let path = |path: &Path| path.as_os_str().as_bytes().to_vec();
+
+        let mut mkdir = Request::Apply {
+            ops: vec![
+                Op::Mkdir {
+                    path: path(&existing_directory),
+                    mode: 0o7777,
+                    condition: proto::TargetCondition::Any,
+                },
+                Op::Mkdir {
+                    path: path(&new_directory),
+                    mode: 0o7777,
+                    condition: proto::TargetCondition::Any,
+                },
+            ],
+            guard: None,
+        };
+        authority.authorize(&mut mkdir, false).unwrap();
+        let Request::Apply {
+            ops,
+            guard: Some(guard),
+        } = &mkdir
+        else {
+            panic!("authority did not guard directory creation")
+        };
+        assert!(ops
+            .iter()
+            .all(|operation| matches!(operation, Op::Mkdir { mode: 0o700, .. })));
+        assert!(crate::fsops::FsOps::new()
+            .apply(ops, Some(guard))
+            .into_iter()
+            .all(|error| error.is_none()));
+        assert_eq!(
+            fs::metadata(&existing_directory).unwrap().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(fs::metadata(&new_directory).unwrap().mode() & 0o7777, 0o700);
+
+        let receiver_meta = |path: &Path| Op::SetMeta {
+            path: path.as_os_str().as_bytes().to_vec(),
+            meta: proto::Meta {
+                mode: 0o7777,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: proto::flags::RECEIVER_MODE,
+            condition: proto::TargetCondition::Any,
+        };
+        let mut metadata = Request::Apply {
+            ops: vec![
+                receiver_meta(&existing_directory),
+                receiver_meta(&new_directory),
+            ],
+            guard: None,
+        };
+        authority.authorize(&mut metadata, false).unwrap();
+        let Request::Apply {
+            ops,
+            guard: Some(guard),
+        } = &metadata
+        else {
+            panic!("authority did not guard directory metadata")
+        };
+        assert!(matches!(
+            &ops[0],
+            Op::SetMeta {
+                meta: proto::Meta { mode: 0o500, .. },
+                flags: proto::flags::MODE,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &ops[1],
+            Op::SetMeta {
+                meta: proto::Meta { mode: 0o755, .. },
+                flags: proto::flags::MODE,
+                ..
+            }
+        ));
+        assert!(crate::fsops::FsOps::new()
+            .apply(ops, Some(guard))
+            .into_iter()
+            .all(|error| error.is_none()));
+        assert_eq!(
+            fs::metadata(&existing_directory).unwrap().mode() & 0o7777,
+            0o500
+        );
+        assert_eq!(fs::metadata(&new_directory).unwrap().mode() & 0o7777, 0o755);
+
+        let raced_directory = target.join("raced-dir");
+        fs::create_dir(&raced_directory).unwrap();
+        fs::set_permissions(&raced_directory, fs::Permissions::from_mode(0o500)).unwrap();
+        let mut raced_mkdir = Request::Apply {
+            ops: vec![Op::Mkdir {
+                path: path(&raced_directory),
+                mode: 0o7777,
+                condition: proto::TargetCondition::Any,
+            }],
+            guard: None,
+        };
+        authority.authorize(&mut raced_mkdir, false).unwrap();
+        let Request::Apply {
+            ops,
+            guard: Some(guard),
+        } = &raced_mkdir
+        else {
+            unreachable!()
+        };
+        assert!(crate::fsops::FsOps::new()
+            .apply(ops, Some(guard))
+            .into_iter()
+            .all(|error| error.is_none()));
+        let mut raced_metadata = Request::Apply {
+            ops: vec![receiver_meta(&raced_directory)],
+            guard: None,
+        };
+        authority.authorize(&mut raced_metadata, false).unwrap();
+        let displaced_directory = File::open(&raced_directory).unwrap();
+        fs::remove_dir(&raced_directory).unwrap();
+        fs::create_dir(&raced_directory).unwrap();
+        fs::set_permissions(&raced_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let Request::Apply {
+            ops,
+            guard: Some(guard),
+        } = &raced_metadata
+        else {
+            unreachable!()
+        };
+        assert!(crate::fsops::FsOps::new()
+            .apply(ops, Some(guard))
+            .into_iter()
+            .all(|error| error.is_some()));
+        drop(displaced_directory);
+        assert_eq!(
+            fs::metadata(&raced_directory).unwrap().mode() & 0o7777,
+            0o700
+        );
+
+        let existing_file = target.join("existing-file");
+        let new_file = target.join("new-file");
+        fs::write(&existing_file, b"old").unwrap();
+        fs::set_permissions(&existing_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let put = |path: &Path, mode| proto::SmallPut {
+            path: path.as_os_str().as_bytes().to_vec(),
+            partial_id: [1; 16],
+            data: b"new".to_vec(),
+            hash: xxhash_rust::xxh3::xxh3_64(b"new"),
+            meta: proto::Meta {
+                mode,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: proto::flags::RECEIVER_MODE,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        let mut files =
+            Request::PutSmallBatch(vec![put(&existing_file, 0o7777), put(&new_file, 0o7777)]);
+        authority.authorize(&mut files, false).unwrap();
+        let Request::PutSmallBatch(puts) = &files else {
+            unreachable!()
+        };
+        assert_eq!(
+            (puts[0].meta.mode, puts[0].flags),
+            (0o600, proto::flags::MODE)
+        );
+        assert_eq!(
+            (puts[1].meta.mode, puts[1].flags),
+            (0o755, proto::flags::MODE)
+        );
+        assert!(matches!(
+            puts[0].condition,
+            proto::TargetCondition::MatchesFingerprint { .. }
+        ));
+        assert_eq!(puts[1].condition, proto::TargetCondition::Any);
+        let response = crate::fsops::FsOps::new().handle(&files);
+        let proto::Response::Applied(errors) = response else {
+            panic!("unexpected small-publication response")
+        };
+        assert!(errors.iter().all(Option::is_none), "{errors:?}");
+        assert_eq!(fs::read(&existing_file).unwrap(), b"new");
+        assert_eq!(fs::metadata(&existing_file).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(fs::read(&new_file).unwrap(), b"new");
+        assert_eq!(fs::metadata(&new_file).unwrap().mode() & 0o7777, 0o755);
+
+        let mut repeated = Request::PutSmallBatch(vec![put(&new_file, 0o600)]);
+        authority.authorize(&mut repeated, false).unwrap();
+        let Request::PutSmallBatch(puts) = repeated else {
+            unreachable!()
+        };
+        assert_eq!(
+            (puts[0].meta.mode, puts[0].flags),
+            (0o755, proto::flags::MODE)
+        );
+
+        // A later type replacement cannot reuse an existing directory's
+        // receiver-owned mode (including any directory-only special bits) for
+        // a newly published regular file.
+        let mut replacement = Request::PutSmallBatch(vec![put(&existing_directory, 0o7777)]);
+        authority.authorize(&mut replacement, false).unwrap();
+        let Request::PutSmallBatch(puts) = replacement else {
+            unreachable!()
+        };
+        assert_eq!(
+            (puts[0].meta.mode, puts[0].flags),
+            (0o755, proto::flags::MODE)
+        );
+
+        let raced_file = target.join("raced-file");
+        fs::write(&raced_file, b"old").unwrap();
+        fs::set_permissions(&raced_file, fs::Permissions::from_mode(0o6777)).unwrap();
+        let mut raced = Request::PutSmallBatch(vec![put(&raced_file, 0o600)]);
+        authority.authorize(&mut raced, false).unwrap();
+        fs::remove_file(&raced_file).unwrap();
+        let response = crate::fsops::FsOps::new().handle(&raced);
+        assert!(matches!(
+            response,
+            proto::Response::Applied(errors) if errors.iter().all(Option::is_some)
+        ));
+        assert!(!raced_file.exists());
     }
 
     #[test]

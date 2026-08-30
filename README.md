@@ -353,11 +353,16 @@ sidecar operation, metadata change, write, and deletion is rewritten onto the
 enrolled root descriptor. Descendant symlinks are payload, never traversal.
 HostA cannot replace that guard, widen the destination, add an unsigned
 preservation option, exceed signed entry/byte/deletion/connection limits, or
-replay the request. Source-permission preservation and the modes syq must apply
-for ordinary destination creation/restoration use distinct protocol flags and
-distinct signed policy, so default non-`-p` publication works without silently
-granting `-p`. Hash requests must use the signed block size, and the receiver
-rejects any request whose hash vector could exceed the protocol frame limit.
+replay the request. Source-permission preservation and ordinary non-`-p`
+creation/restoration use distinct protocol flags and signed policy. For
+non-`-p` requests, existing objects retain the mode observed on hostB; new
+objects accept only ordinary permission bits masked by hostB's umask. HostA
+cannot supply special bits or turn this path into chmod authority over existing
+objects. Preserved modes are bound to the receiver-observed inode fingerprint;
+atomic publication fails if that object changes instead of carrying its mode
+onto a replacement. Hash requests must use the signed block size, and the
+receiver rejects any request whose hash vector could exceed the protocol frame
+limit.
 Encrypted token-authenticated TCP workers inherit the same authority. The
 receiver permits one encrypted listener in the signed port range and closes it
 when the forced control session ends or the grant expires; after redemption

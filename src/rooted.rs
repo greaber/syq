@@ -589,6 +589,105 @@ impl Root {
         })
     }
 
+    /// Publish a staged regular file only if the target name is still absent.
+    /// The hard link makes the final name visible atomically without replacing
+    /// a raced target; removing the staged name leaves one link on success.
+    pub(crate) fn publish_new_regular(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+    ) -> Result<()> {
+        let source_parent = self.resolve_parent(source)?;
+        let target_parent = self.resolve_parent(target)?;
+        let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+        if !staged.is_file() {
+            bail!(
+                "confined staged path {} is not a regular file",
+                source.label()
+            );
+        }
+        retry_zero(|| unsafe {
+            libc::linkat(
+                source_parent.directory.as_raw_fd(),
+                source_parent.leaf.as_ptr(),
+                target_parent.directory.as_raw_fd(),
+                target_parent.leaf.as_ptr(),
+                0,
+            )
+        })
+        .with_context(|| {
+            format!(
+                "publish new confined path {} as {}",
+                source.label(),
+                target.label()
+            )
+        })?;
+        unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
+            .with_context(|| format!("remove staged confined path {}", source.label()))
+    }
+
+    /// Atomically replace exactly one previously observed regular-file inode.
+    /// The exchange retains the displaced inode under the staged name long
+    /// enough to verify it. A raced target is exchanged back and left intact.
+    pub(crate) fn replace_regular_if_same(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+        expected_dev: u64,
+        expected_ino: u64,
+        expected_ctime: Option<(i64, u32)>,
+    ) -> Result<()> {
+        let source_parent = self.resolve_parent(source)?;
+        let target_parent = self.resolve_parent(target)?;
+        let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+        if !staged.is_file() {
+            bail!(
+                "confined staged path {} is not a regular file",
+                source.label()
+            );
+        }
+        let before = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
+        let has_expected_identity = |metadata: RootMetadata| {
+            metadata.is_file() && metadata.dev == expected_dev && metadata.ino == expected_ino
+        };
+        if !has_expected_identity(before)
+            || !expected_ctime.is_none_or(|(ctime, ctime_nsec)| {
+                (before.ctime, before.ctime_nsec) == (ctime, ctime_nsec)
+            })
+        {
+            bail!(
+                "confined target {} changed before publication",
+                target.label()
+            );
+        }
+        rename_exchange(
+            source_parent.directory.as_raw_fd(),
+            &source_parent.leaf,
+            target_parent.directory.as_raw_fd(),
+            &target_parent.leaf,
+        )
+        .with_context(|| format!("atomically publish confined path {}", target.label()))?;
+        let displaced = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+        // The exchange itself may update the displaced inode's ctime. Its
+        // dev/inode identity cannot be recycled while the link still exists,
+        // so the pre-exchange fingerprint plus this identity check is enough.
+        if !has_expected_identity(displaced) {
+            rename_exchange(
+                source_parent.directory.as_raw_fd(),
+                &source_parent.leaf,
+                target_parent.directory.as_raw_fd(),
+                &target_parent.leaf,
+            )
+            .with_context(|| format!("restore raced target {}", target.label()))?;
+            bail!(
+                "confined target {} changed during publication",
+                target.label()
+            );
+        }
+        unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
+            .with_context(|| format!("remove displaced confined path {}", target.label()))
+    }
+
     /// Remove a non-directory leaf. Symlinks are removed themselves, never
     /// followed. Directories are refused by the kernel.
     pub(crate) fn unlink(&self, path: &RelativePath) -> Result<()> {

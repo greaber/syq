@@ -54,6 +54,7 @@ pub struct Opts {
     pub inplace: bool,
     pub same_host: bool,
     pub dst_remote: bool,
+    pub restricted_receiver: bool,
     pub dry_run: bool,
     pub quiet: bool,
     pub verbose: u8,
@@ -810,6 +811,7 @@ pub fn run(args: Args) -> Result<i32> {
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         dst_remote: dst_ep.is_remote(),
+        restricted_receiver: args.restricted_grant.is_some(),
         dry_run: args.dry_run,
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
@@ -1459,7 +1461,12 @@ pub fn run(args: Args) -> Result<i32> {
                 .expect("destination anchor set once");
         }
     } else if create_root && !multiple_distinct_sources {
-        let created = mkdir_root(&mut *dst_ctl, &dst_root, root_create_condition)?;
+        let created = mkdir_root(
+            &mut *dst_ctl,
+            &dst_root,
+            root_create_condition,
+            opts.restricted_receiver,
+        )?;
         mutation_root_condition = target_identity(&created);
         if guard_containers {
             container_guard = Some(target_container(&dst_root, &created));
@@ -1956,18 +1963,14 @@ fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn mkdir_root(conn: &mut dyn Conn, dst_root: &[u8], condition: TargetCondition) -> Result<Entry> {
-    match ok(
-        conn.call(Request::Apply {
-            ops: vec![Op::Mkdir {
-                path: dst_root.to_vec(),
-                mode: 0o755,
-                condition,
-            }],
-            guard: None,
-        })?,
-        "mkdir",
-    )? {
+fn mkdir_root(
+    conn: &mut dyn Conn,
+    dst_root: &[u8],
+    condition: TargetCondition,
+    restricted_receiver: bool,
+) -> Result<Entry> {
+    let ops = mkdir_root_ops(dst_root, condition, restricted_receiver);
+    match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
         Response::Applied(errs) => {
             if let Some(e) = errs.into_iter().flatten().next() {
                 bail!("{e}");
@@ -1978,6 +1981,33 @@ fn mkdir_root(conn: &mut dyn Conn, dst_root: &[u8], condition: TargetCondition) 
         }
         other => bail!("unexpected response {other:?}"),
     }
+}
+
+fn mkdir_root_ops(
+    dst_root: &[u8],
+    condition: TargetCondition,
+    restricted_receiver: bool,
+) -> Vec<Op> {
+    let mut ops = vec![Op::Mkdir {
+        path: dst_root.to_vec(),
+        mode: 0o755,
+        condition,
+    }];
+    if restricted_receiver {
+        ops.push(Op::SetMeta {
+            path: dst_root.to_vec(),
+            meta: Meta {
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: flags::RECEIVER_MODE,
+            condition: TargetCondition::Any,
+        });
+    }
+    ops
 }
 
 /// Lexically canonical spelling of a root path: `.` components and duplicate
@@ -3211,7 +3241,8 @@ impl Planner<'_> {
                     .set(anchor)
                     .expect("destination anchor set once");
             } else {
-                let created = mkdir_root(self.dst, &root, condition)?;
+                let created =
+                    mkdir_root(self.dst, &root, condition, self.opts.restricted_receiver)?;
                 self.mutation_root_condition = target_identity(&created);
                 if self.guard_containers {
                     self.container_guard = Some(target_container(&root, &created));
@@ -3437,15 +3468,16 @@ impl Planner<'_> {
                     let depth = p.iter().filter(|&&c| c == b'/').count();
                     let mut meta = e.meta();
                     let mut flags = flags;
-                    // An existing directory we had to open up (u+rwx) gets its
-                    // own mode back at the end when nothing else sets it.
+                    // Without -p, existing directories retain their mode and
+                    // new directories receive the source mode through the
+                    // receiving side's umask. The restricted receiver derives
+                    // or constrains this value again from its own state.
                     if flags & flags::MODE == 0 {
-                        if let Some(d) = s {
-                            if d.kind == Kind::Dir && d.mode & 0o700 != 0o700 {
-                                meta.mode = d.mode & 0o7777;
-                                flags |= flags::RECEIVER_MODE;
-                            }
-                        }
+                        meta.mode = s
+                            .as_ref()
+                            .filter(|d| d.kind == Kind::Dir)
+                            .map_or(e.mode & 0o777 & !opts.umask, |d| d.mode & 0o7777);
+                        flags |= flags::RECEIVER_MODE;
                     }
                     self.deferred.push((
                         p.clone(),
@@ -3842,11 +3874,17 @@ impl Planner<'_> {
                         rdev: e.rdev,
                         condition: self.exact_condition_for(&dst_path),
                     });
+                    let mut meta = e.meta();
+                    let mut flags = opts.flags;
+                    if flags & flags::MODE == 0 {
+                        meta.mode = e.mode & 0o777 & !opts.umask;
+                        flags |= flags::RECEIVER_MODE;
+                    }
                     ops.push(Op::SetMeta {
                         condition: TargetCondition::Any,
                         path: dst_path,
-                        meta: e.meta(),
-                        flags: opts.flags,
+                        meta,
+                        flags,
                     });
                     self.specials_created += 1;
                 }
@@ -5793,6 +5831,25 @@ mod tests {
                 "clean_root({given:?})"
             );
         }
+    }
+
+    #[test]
+    fn restricted_root_creation_includes_receiver_managed_final_mode() {
+        let ordinary = mkdir_root_ops(b"/destination", TargetCondition::Absent, false);
+        assert_eq!(ordinary.len(), 1);
+
+        let restricted = mkdir_root_ops(b"/destination", TargetCondition::Absent, true);
+        assert!(matches!(
+            restricted.as_slice(),
+            [
+                Op::Mkdir { mode: 0o755, .. },
+                Op::SetMeta {
+                    meta: Meta { mode: 0o755, .. },
+                    flags: flags::RECEIVER_MODE,
+                    ..
+                }
+            ]
+        ));
     }
 
     #[test]

@@ -155,8 +155,9 @@ pub mod flags {
     pub const OWNER: u8 = 2;
     pub const GROUP: u8 = 4;
     pub const TIMES: u8 = 8;
-    /// A mode selected by ordinary destination creation/restoration semantics,
-    /// rather than source-mode preservation requested with `-p`.
+    /// A mode proposed by ordinary destination creation/restoration semantics,
+    /// rather than source-mode preservation requested with `-p`. Restricted
+    /// receivers replace it with a mode derived from receiver state and umask.
     pub const RECEIVER_MODE: u8 = 16;
     pub const MODE_MASK: u8 = MODE | RECEIVER_MODE;
 }
