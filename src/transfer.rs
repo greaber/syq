@@ -209,6 +209,13 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
                 candidate_status(candidate, fastest)
             );
         }
+        let remote = probe.congestion_control.as_deref().unwrap_or("unavailable");
+        match &args.tcp_congestion {
+            Some(requested) => eprintln!(
+                "  congestion control: remote listener {remote}; local data sockets request {requested}"
+            ),
+            None => eprintln!("  congestion control: remote listener {remote} (host default)"),
+        }
     }
 
     let route_state = if args.dry_run {
@@ -286,9 +293,13 @@ fn print_transport_diagnostics(args: &Args, src: &Endpoint, dst: &Endpoint) {
 }
 
 fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
-    let sockets: Vec<TcpSocketStats> = pairs
+    let sockets: Vec<&TcpSocketStats> = pairs
         .iter()
-        .flat_map(|pair| [pair.local, pair.peer].into_iter().flatten())
+        .flat_map(|pair| {
+            [pair.local.as_ref(), pair.peer.as_ref()]
+                .into_iter()
+                .flatten()
+        })
         .collect();
     if sockets.is_empty() {
         return if has_ssh_data {
@@ -299,10 +310,17 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
     }
     // Aggregates are meaningful only when every sampled socket exposes the
     // field. Do not turn an unsupported end into a genuine zero.
-    let sum =
-        |field: fn(&TcpSocketStats) -> Option<u64>| sockets.iter().map(field).sum::<Option<u64>>();
+    let sum = |field: fn(&TcpSocketStats) -> Option<u64>| {
+        sockets
+            .iter()
+            .map(|stats| field(stats))
+            .sum::<Option<u64>>()
+    };
     let values = |field: fn(&TcpSocketStats) -> Option<u64>| {
-        sockets.iter().map(field).collect::<Option<Vec<u64>>>()
+        sockets
+            .iter()
+            .map(|stats| field(stats))
+            .collect::<Option<Vec<u64>>>()
     };
     let bytes_sent = sum(|stats| stats.bytes_sent);
     let bytes_retransmitted = sum(|stats| stats.bytes_retransmitted);
@@ -339,11 +357,30 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
         .map(|pair| pair.label.as_str())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
+    let mut congestion_controls = std::collections::BTreeMap::<&str, usize>::new();
+    let mut unavailable_congestion_controls = 0usize;
+    for socket in &sockets {
+        match socket.congestion_control.as_deref() {
+            Some(algorithm) => *congestion_controls.entry(algorithm).or_default() += 1,
+            None => unavailable_congestion_controls += 1,
+        }
+    }
+    let mut congestion_control = congestion_controls
+        .into_iter()
+        .map(|(algorithm, count)| format!("{algorithm} ({count} socket ends)"))
+        .collect::<Vec<_>>();
+    if unavailable_congestion_controls > 0 {
+        congestion_control.push(format!(
+            "unavailable ({unavailable_congestion_controls} socket ends)"
+        ));
+    }
+    let congestion_control = congestion_control.join(", ");
     let mut output = format!(
-        "\n  tcp connection lifetimes sampled: {} across {} path(s) ({} socket ends)\n  tcp retransmissions (loss signal): {} packets, {} bytes\n  tcp RTT: current average {}, minimum {}\n  tcp congestion: average send window {}, aggregate delivery rate {}\n  tcp window-limited time: receive {}, send-buffer {}\n  tcp ECN CE deliveries: {}",
+        "\n  tcp connection lifetimes sampled: {} across {} path(s) ({} socket ends)\n  tcp congestion control: {}\n  tcp retransmissions (loss signal): {} packets, {} bytes\n  tcp RTT: current average {}, minimum {}\n  tcp congestion: average send window {}, aggregate delivery rate {}\n  tcp window-limited time: receive {}, send-buffer {}\n  tcp ECN CE deliveries: {}",
         pairs.len(),
         paths,
         sockets.len(),
+        congestion_control,
         loss(retransmissions, segments_sent),
         loss(bytes_retransmitted, bytes_sent),
         average_rtt.map_or_else(|| "unavailable".into(), |value| format!("{:.2} ms", value as f64 / 1000.0)),
@@ -645,6 +682,9 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
+    if args.tcp_congestion.is_some() && !src_ep.is_remote() && !dst_ep.is_remote() {
+        bail!("--tcp-congestion applies only to copies with a remote endpoint");
+    }
     // TCP data connections are the default (auto-selecting the fastest reachable
     // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
     // Local<->local needs no data plane at all.
@@ -668,6 +708,12 @@ pub fn run(args: Args) -> Result<i32> {
         if !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(algorithm) = &args.tcp_congestion {
+        bail!(
+            "--tcp-congestion {algorithm} requires a Linux transfer orchestrator and Linux remote endpoints"
+        );
     }
 
     let opts = Arc::new(Opts {
@@ -767,6 +813,10 @@ pub fn run(args: Args) -> Result<i32> {
                         .and_then(|src| Ok((src, dst_ep.connect(compress)?)));
                     let (src, dst) = match conns {
                         Ok(conns) => conns,
+                        Err(error) if crate::conn::is_tcp_congestion_error(&error) => {
+                            gate.mark_failed(id);
+                            return Err(error);
+                        }
                         Err(error) => {
                             failures += 1;
                             if failures >= CONNECTION_RECOVERY_ATTEMPTS {
@@ -890,10 +940,27 @@ pub fn run(args: Args) -> Result<i32> {
         let ports = parse_ports(&args.tcp_ports)?;
         for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
             if let Endpoint::Remote(spec) = ep {
-                if let Err(e) = spec.setup_tcp(&mut **ctl, args.tcp_plain, ports) {
+                if let Err(e) = spec.setup_tcp(
+                    &mut **ctl,
+                    args.tcp_plain,
+                    ports,
+                    args.tcp_congestion.as_deref(),
+                ) {
+                    if crate::conn::is_tcp_congestion_error(&e) {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "{} could not apply --tcp-congestion {}",
+                                spec.label(),
+                                args.tcp_congestion.as_deref().unwrap_or_default()
+                            )
+                        });
+                    }
                     if !args.quiet || debug() {
+                        let congestion_note = crate::conn::tcp_congestion_fallback_note(
+                            args.tcp_congestion.as_deref(),
+                        );
                         eprintln!(
-                            "syq: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}); a Tailscale address or an open port is faster",
+                            "syq: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}{congestion_note}); a Tailscale address or an open port is faster",
                             spec.label(),
                             ports.0,
                             ports.1

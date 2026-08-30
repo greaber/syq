@@ -155,6 +155,14 @@ pub struct Args {
     /// Port range the remote listens on for TCP data connections
     #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
     pub tcp_ports: String,
+    /// Use this congestion-control algorithm for direct TCP data sockets (Linux only)
+    #[arg(
+        long,
+        value_name = "ALGO",
+        value_parser = parse_tcp_congestion,
+        conflicts_with_all = ["no_tcp", "rm", "follow"]
+    )]
+    pub tcp_congestion: Option<String>,
     /// Remote-to-remote: start the transfer detached on the source host (survives losing this
     /// ssh session) and return; progress goes to a log you can watch with --follow
     #[arg(long)]
@@ -444,6 +452,7 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         "--max-delete",
         "--checkpoint",
         "--tcp-ports",
+        "--tcp-congestion",
         "--syq-path",
         "--width",
     ];
@@ -467,6 +476,20 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_tcp_congestion(value: &str) -> std::result::Result<String, String> {
+    // Linux's TCP_CA_NAME_MAX is 16 including the terminating NUL. Keep this
+    // validation platform-independent so a forwarded command fails the same
+    // way on every orchestrator. The kernel otherwise looks up the registered
+    // name exactly, without imposing a character whitelist.
+    if value.is_empty() {
+        return Err("congestion-control algorithm cannot be empty".into());
+    }
+    if value.len() >= 16 {
+        return Err("congestion-control algorithm must be at most 15 bytes".into());
+    }
+    Ok(value.to_string())
 }
 
 fn unsupported_message(tok: &str) -> Option<String> {
@@ -587,6 +610,28 @@ mod tests {
         // As with other clap overrides, the last spelling wins.
         assert!(!args(&["-z", "--no-compress"]).compress);
         assert!(args(&["--no-compress", "-z"]).compress);
+    }
+
+    #[test]
+    fn tcp_congestion_names_are_validated() {
+        assert_eq!(
+            args(&["--tcp-congestion", "bbr"]).tcp_congestion.as_deref(),
+            Some("bbr")
+        );
+        assert_eq!(
+            args(&["--tcp-congestion", "foo-bar"])
+                .tcp_congestion
+                .as_deref(),
+            Some("foo-bar")
+        );
+        for value in ["", "1234567890123456"] {
+            let parsed = Args::try_parse_from(["syq", "--tcp-congestion", value, "src", "dst"]);
+            assert!(parsed.is_err(), "accepted {value:?}");
+        }
+        assert!(Args::try_parse_from(
+            ["syq", "--tcp-congestion", "bbr", "--no-tcp", "src", "dst",]
+        )
+        .is_err());
     }
 
     #[test]
