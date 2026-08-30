@@ -10,6 +10,8 @@ mod progress;
 mod proto;
 mod remote_helper;
 mod rm;
+#[allow(dead_code)]
+mod rooted;
 mod scan;
 mod sched;
 mod server;
