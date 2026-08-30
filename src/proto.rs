@@ -61,6 +61,34 @@ impl Entry {
     }
 }
 
+/// One whole-file read in the pipelined small-file path.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallRead {
+    pub path: PathBytes,
+    pub attempt: u32,
+    pub len: u32,
+}
+
+/// One whole-file publication in the pipelined small-file path.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallPut {
+    pub path: PathBytes,
+    pub partial_id: PartialId,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub hash: u64,
+    pub meta: Meta,
+    pub flags: u8,
+}
+
+/// Contents and integrity hash for one successful `SmallRead`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallBlock {
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub hash: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct Meta {
     pub mode: u32,
@@ -134,6 +162,8 @@ pub enum Op {
         meta: Meta,
         flags: u8,
     },
+    /// Remove whatever currently occupies the path, recursively when it is a
+    /// directory. Planned deletion uses Unlink/Rmdir instead.
     Remove {
         path: PathBytes,
     },
@@ -205,6 +235,15 @@ pub enum Request {
         paths: Vec<PathBytes>,
         partial_id: PartialId,
     },
+    /// Resolve sidecar names and inspect an existing destination batch in one
+    /// turn. Leaf stats are returned only when every directory is still a
+    /// directory, so callers can preserve parent-before-child replacement.
+    PlanBatch {
+        partial_paths: Vec<PathBytes>,
+        partial_id: PartialId,
+        directories: Vec<PathBytes>,
+        others: Vec<PathBytes>,
+    },
     Apply(Vec<Op>),
     /// Return the size of the deterministic sidecar, if it is a regular file.
     /// The planner has already statted the final path.
@@ -269,6 +308,8 @@ pub enum Request {
         off: u64,
         len: u32,
     },
+    /// Read a complete small-file batch in one frame and response.
+    ReadSmallBatch(Vec<SmallRead>),
     WriteRange {
         path: PathBytes,
         inplace: bool,
@@ -286,18 +327,8 @@ pub enum Request {
         meta: Meta,
         flags: u8,
     },
-    /// Whole small file in one request: verify, write a sidecar, then rename it
-    /// atomically over the final path. This preserves small-file pipelining
-    /// without exposing partial final-named files.
-    PutSmall {
-        path: PathBytes,
-        partial_id: PartialId,
-        #[serde(with = "serde_bytes")]
-        data: Vec<u8>,
-        hash: u64,
-        meta: Meta,
-        flags: u8,
-    },
+    /// Verify and atomically publish a complete small-file batch in one frame.
+    PutSmallBatch(Vec<SmallPut>),
     FileHash {
         path: PathBytes,
     },
@@ -335,6 +366,13 @@ pub enum Response {
     /// directory, or None when an allowed missing suffix was reached.
     DirectorySelection(Option<DirectoryAnchor>),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
+    BatchPlan {
+        partial_paths: Vec<std::result::Result<PathBytes, String>>,
+        directories: Vec<Option<Entry>>,
+        /// None means a directory was missing or a non-directory, so the
+        /// caller must apply directory changes before inspecting leaves.
+        others: Option<Vec<Option<Entry>>>,
+    },
     Applied(Vec<Option<String>>),
     PartialSize(Option<u64>),
     Hashes(Vec<u64>),
@@ -348,6 +386,7 @@ pub enum Response {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
+    SmallBlocks(Vec<std::result::Result<SmallBlock, String>>),
     FileHash {
         size: u64,
         hash: u128,
@@ -374,9 +413,34 @@ impl SizeHint for Request {
     fn size_hint(&self) -> usize {
         match self {
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
-            Request::PutSmall { data, path, .. } => data.len() + path.len() + 96,
+            Request::ReadSmallBatch(reads) => {
+                reads.iter().map(|read| read.path.len() + 16).sum::<usize>() + 16
+            }
+            Request::PutSmallBatch(puts) => {
+                puts.iter()
+                    .map(|put| put.data.len() + put.path.len() + 96)
+                    .sum::<usize>()
+                    + 16
+            }
             Request::StatMany { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
+            }
+            Request::PartialPaths { paths, .. } => {
+                paths.iter().map(|path| path.len() + 8).sum::<usize>() + 32
+            }
+            Request::PlanBatch {
+                partial_paths,
+                directories,
+                others,
+                ..
+            } => {
+                partial_paths
+                    .iter()
+                    .chain(directories)
+                    .chain(others)
+                    .map(|path| path.len() + 8)
+                    .sum::<usize>()
+                    + 48
             }
             Request::Apply(v) => v.len() * 128 + 16,
             _ => 256,
@@ -388,8 +452,28 @@ impl SizeHint for Response {
     fn size_hint(&self) -> usize {
         match self {
             Response::Block { data, .. } => data.len() + 64,
+            Response::SmallBlocks(blocks) => {
+                blocks
+                    .iter()
+                    .map(|block| match block {
+                        Ok(block) => block.data.len() + 16,
+                        Err(error) => error.len() + 8,
+                    })
+                    .sum::<usize>()
+                    + 16
+            }
             Response::ScanBatch(v) => v.len() * 160 + 16,
             Response::Stats(v) => v.len() * 96 + 16,
+            Response::BatchPlan {
+                partial_paths,
+                directories,
+                others,
+            } => {
+                partial_paths.len() * 96
+                    + directories.len() * 96
+                    + others.as_ref().map_or(0, |items| items.len() * 96)
+                    + 32
+            }
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 9 + 24,
             _ => 256,
         }

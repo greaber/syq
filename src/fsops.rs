@@ -858,6 +858,16 @@ impl FsOps {
                     map(path)?;
                 }
             }
+            Request::PlanBatch {
+                partial_paths,
+                directories,
+                others,
+                ..
+            } => {
+                for path in partial_paths.iter_mut().chain(directories).chain(others) {
+                    map(path)?;
+                }
+            }
             Request::Apply(ops) => {
                 for op in ops {
                     let path = match op {
@@ -878,7 +888,6 @@ impl FsOps {
             | Request::HashAndHold { path, .. }
             | Request::FinishBasis { path, .. }
             | Request::SeedBasis { path, .. }
-            | Request::PutSmall { path, .. }
             | Request::HashBlocks { path, .. }
             | Request::ReadRange { path, .. }
             | Request::WriteRange { path, .. }
@@ -888,6 +897,16 @@ impl FsOps {
             Request::CopyLocal { src, dst, .. } => {
                 *src = self.initial_absolute(src);
                 map(dst)?;
+            }
+            Request::ReadSmallBatch(reads) => {
+                for read in reads {
+                    map(&mut read.path)?;
+                }
+            }
+            Request::PutSmallBatch(puts) => {
+                for put in puts {
+                    map(&mut put.path)?;
+                }
             }
             Request::Hello { .. }
             | Request::TcpListen { .. }
@@ -915,6 +934,18 @@ impl FsOps {
                     .map(|path| path.map(|path| self.destination_full(&path)))
                     .collect(),
             ),
+            Response::BatchPlan {
+                partial_paths,
+                directories,
+                others,
+            } => Response::BatchPlan {
+                partial_paths: partial_paths
+                    .into_iter()
+                    .map(|path| path.map(|path| self.destination_full(&path)))
+                    .collect(),
+                directories,
+                others,
+            },
             response => response,
         }
     }
@@ -1137,10 +1168,9 @@ fn apply_one(op: &Op) -> Result<()> {
                     r => r.with_context(|| format!("rmdir {}", p.display())),
                 }
             }
-            // Remove (for --rm) swallows lstat errors: rm -rf semantics, keep
-            // going. Unlink (below, for --delete) reports them: a mirror that
-            // silently failed to mirror would be worse. Deliberate divergence,
-            // pinned by unlink_never_recurses_into_a_directory.
+            // Remove follows the path's current type and may recurse. Planned
+            // deletion paths use Unlink/Rmdir below so a type change fails
+            // safely instead of broadening the selected deletion scope.
             Op::Remove { path } => {
                 let p = resolve(path);
                 match fs::symlink_metadata(&p) {
@@ -1918,6 +1948,26 @@ impl FsOps {
             Request::PartialPaths { paths, partial_id } => {
                 Ok(Response::PathResults(self.partial_paths(paths, partial_id)))
             }
+            Request::PlanBatch {
+                partial_paths,
+                partial_id,
+                directories,
+                others,
+            } => {
+                let partial_paths = self.partial_paths(partial_paths, partial_id);
+                let directories = self.stat_many(directories, false);
+                let safe_to_stat_others = directories.iter().all(|entry| {
+                    entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 == 0o700)
+                });
+                let others = safe_to_stat_others.then(|| self.stat_many(others, false));
+                Ok(Response::BatchPlan {
+                    partial_paths,
+                    directories,
+                    others,
+                })
+            }
             Request::Apply(ops) => Ok(Response::Applied(self.apply(ops))),
             Request::ProbePartial { path, partial_id } => self.probe_partial(path, partial_id),
             Request::Prepare {
@@ -1962,25 +2012,24 @@ impl FsOps {
             } => self
                 .copy_local(src, dst, *inplace, partial_id, *size, *mode)
                 .map(|_| Response::Ok),
-            Request::PutSmall {
-                path,
-                partial_id,
-                data,
-                hash,
-                meta,
-                flags,
-            } => self
-                .put_small(
-                    PartialTarget {
-                        path,
-                        id: partial_id,
-                    },
-                    data,
-                    *hash,
-                    meta,
-                    *flags,
-                )
-                .map(|_| Response::Ok),
+            Request::PutSmallBatch(puts) => Ok(Response::Applied(
+                puts.iter()
+                    .map(|put| {
+                        self.put_small(
+                            PartialTarget {
+                                path: &put.path,
+                                id: &put.partial_id,
+                            },
+                            &put.data,
+                            put.hash,
+                            &put.meta,
+                            put.flags,
+                        )
+                        .err()
+                        .map(|error| errstr(&error))
+                    })
+                    .collect(),
+            )),
             Request::HashBlocks {
                 path,
                 which,
@@ -1996,6 +2045,18 @@ impl FsOps {
                 off,
                 len,
             } => self.read_range(path, *attempt, *off, *len),
+            Request::ReadSmallBatch(reads) => Ok(Response::SmallBlocks(
+                reads
+                    .iter()
+                    .map(
+                        |read| match self.read_range(&read.path, read.attempt, 0, read.len) {
+                            Ok(Response::Block { data, hash, .. }) => Ok(SmallBlock { data, hash }),
+                            Ok(other) => Err(format!("unexpected response {other:?}")),
+                            Err(error) => Err(errstr(&error)),
+                        },
+                    )
+                    .collect(),
+            )),
             Request::WriteRange {
                 path,
                 inplace,
@@ -2475,6 +2536,66 @@ mod tests {
         assert!(errs[1].is_none() && !dir.join("f").exists());
         assert!(errs[2].is_none(), "a vanished leaf is not an error");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_batch_only_stats_leaves_below_ready_directories() {
+        let root = test_dir();
+        let ready = root.join("ready");
+        let leaf = ready.join("leaf");
+        fs::create_dir_all(&ready).unwrap();
+        fs::write(&leaf, b"data").unwrap();
+        let mut ops = FsOps::new();
+        let request = |directory: &Path| Request::PlanBatch {
+            partial_paths: vec![path_bytes(&leaf)],
+            partial_id: [7; 16],
+            directories: vec![path_bytes(directory)],
+            others: vec![path_bytes(&leaf)],
+        };
+
+        let Response::BatchPlan {
+            partial_paths,
+            directories,
+            others,
+        } = ops.handle(&request(&ready))
+        else {
+            panic!("expected a batch plan");
+        };
+        assert!(partial_paths[0].is_ok());
+        assert_eq!(directories[0].as_ref().unwrap().kind, Kind::Dir);
+        assert_eq!(others.unwrap()[0].as_ref().unwrap().kind, Kind::File);
+
+        let Response::BatchPlan {
+            directories,
+            others,
+            ..
+        } = ops.handle(&request(&root.join("missing")))
+        else {
+            panic!("expected a batch plan");
+        };
+        assert!(directories[0].is_none());
+        assert!(
+            others.is_none(),
+            "leaf stats must wait for directory repair"
+        );
+
+        fs::set_permissions(&ready, fs::Permissions::from_mode(0o500)).unwrap();
+        let Response::BatchPlan {
+            directories,
+            others,
+            ..
+        } = ops.handle(&request(&ready))
+        else {
+            panic!("expected a batch plan");
+        };
+        assert_eq!(directories[0].as_ref().unwrap().kind, Kind::Dir);
+        assert!(
+            others.is_none(),
+            "leaf stats must wait until the directory is writable"
+        );
+        fs::set_permissions(&ready, fs::Permissions::from_mode(0o700)).unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

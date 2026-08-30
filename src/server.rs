@@ -146,6 +146,14 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 blocks += 1;
                 bytes += *len as u64;
             }
+            Request::ReadSmallBatch(reads) => {
+                blocks += reads.len() as u64;
+                bytes += reads.iter().map(|read| u64::from(read.len)).sum::<u64>();
+            }
+            Request::PutSmallBatch(puts) => {
+                blocks += puts.len() as u64;
+                bytes += puts.iter().map(|put| put.data.len() as u64).sum::<u64>();
+            }
             _ => {}
         }
         match req {
