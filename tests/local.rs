@@ -1996,7 +1996,7 @@ fn tcp_congestion_override_is_applied_on_both_socket_ends_and_reported() {
     write(&t.path("src"), b"per-socket congestion control");
     let remote = format!("127.0.0.1:{}", t.s("dst"));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .arg("-e")
         .arg(&rsh)
         .arg("--syq-path")
@@ -2042,7 +2042,7 @@ fn rejected_tcp_congestion_override_is_fatal_instead_of_falling_back() {
     write(&t.path("src"), b"must not silently fall back");
     let remote = format!("127.0.0.1:{}", t.s("dst"));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .arg("-e")
         .arg(&rsh)
         .arg("--syq-path")
@@ -2083,7 +2083,7 @@ fn ordinary_tcp_setup_failure_still_falls_back_with_congestion_notice() {
     let held_port = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
     let port = held_port.local_addr().unwrap().port();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .arg("-e")
         .arg(&rsh)
         .arg("--syq-path")
@@ -2124,7 +2124,7 @@ fn direct_remote_to_remote_forwards_tcp_congestion_override() {
     let src = format!("hostA:{}", t.s("src"));
     let dst = format!("hostB:{}", t.s("dst"));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .arg("-e")
         .arg(&rsh)
         .arg("--syq-path")
