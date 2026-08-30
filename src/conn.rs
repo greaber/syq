@@ -9,7 +9,7 @@ use crate::remote_helper::{self, Target};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
 
@@ -62,6 +62,139 @@ pub struct TcpPairStats {
     pub peer: Option<TcpSocketStats>,
 }
 
+/// Marker for an explicit per-socket congestion-control request that could
+/// not be honored. Callers use this to distinguish a bad experiment setup
+/// from ordinary TCP reachability failures, which may fall back to SSH.
+#[derive(Debug)]
+pub(crate) struct TcpCongestionError(String);
+
+impl std::fmt::Display for TcpCongestionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TcpCongestionError {}
+
+pub(crate) fn is_tcp_congestion_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<TcpCongestionError>())
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_congestion_control<S: AsRawFd>(socket: &S) -> std::io::Result<String> {
+    // Linux currently caps names at TCP_CA_NAME_MAX (16 including NUL). Leave
+    // extra room so this remains safe if the kernel raises that limit.
+    let mut name = [0u8; 64];
+    let mut len = name.len() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            name.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let len = (len as usize).min(name.len());
+    let end = name[..len]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(len);
+    std::str::from_utf8(&name[..end])
+        .map(str::to_owned)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Apply an explicit Linux TCP_CONGESTION override and read it back. With no
+/// override this is observational only: an unavailable getter returns None
+/// and never changes normal socket behavior.
+pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
+    socket: &S,
+    requested: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(requested) = requested else {
+        #[cfg(target_os = "linux")]
+        return Ok(tcp_congestion_control(socket).ok());
+        #[cfg(not(target_os = "linux"))]
+        return Ok(None);
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    return Err(TcpCongestionError(format!(
+        "TCP congestion control {requested:?} was requested, but per-socket selection is supported only on Linux"
+    ))
+    .into());
+
+    #[cfg(target_os = "linux")]
+    {
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                requested.as_ptr().cast(),
+                requested.len() as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(TcpCongestionError(format!(
+                "kernel rejected TCP congestion control {requested:?}: {error}; check net.ipv4.tcp_available_congestion_control and net.ipv4.tcp_allowed_congestion_control on this host"
+            ))
+            .into());
+        }
+        let actual = tcp_congestion_control(socket).map_err(|error| {
+            TcpCongestionError(format!(
+                "could not verify TCP congestion control {requested:?}: {error}"
+            ))
+        })?;
+        if actual != requested {
+            return Err(TcpCongestionError(format!(
+                "requested TCP congestion control {requested:?}, but the socket reports {actual:?}"
+            ))
+            .into());
+        }
+        Ok(Some(actual))
+    }
+}
+
+fn connect_tcp_stream(
+    address: &SocketAddr,
+    timeout: std::time::Duration,
+    congestion_control: Option<&str>,
+) -> Result<TcpStream> {
+    let Some(congestion_control) = congestion_control else {
+        return TcpStream::connect_timeout(address, timeout).map_err(Into::into);
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (address, timeout);
+        return Err(TcpCongestionError(format!(
+            "TCP congestion control {congestion_control:?} was requested, but per-socket selection is supported only on Linux"
+        ))
+        .into());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+        let domain = if address.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        configure_tcp_congestion(&socket, Some(congestion_control))?;
+        socket.connect_timeout(&SockAddr::from(*address), timeout)?;
+        Ok(socket.into())
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
@@ -86,6 +219,7 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
         };
     }
     Some(TcpSocketStats {
+        congestion_control: tcp_congestion_control(stream).ok(),
         bytes_sent: field!(tcpi_bytes_sent, info.tcpi_bytes_sent),
         bytes_retransmitted: field!(tcpi_bytes_retrans, info.tcpi_bytes_retrans),
         segments_sent: field!(tcpi_segs_out, info.tcpi_segs_out.into()),
@@ -131,6 +265,7 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
         };
     }
     Some(TcpSocketStats {
+        congestion_control: None,
         bytes_sent: field!(tcpi_txbytes, info.tcpi_txbytes),
         bytes_retransmitted: field!(tcpi_txretransmitbytes, info.tcpi_txretransmitbytes),
         segments_sent: field!(tcpi_txpackets, info.tcpi_txpackets),
@@ -473,6 +608,8 @@ pub struct TcpCandidate {
 pub struct TcpProbe {
     pub port: u16,
     pub encrypted: bool,
+    /// Effective algorithm read back from the remote listener, when exposed.
+    pub congestion_control: Option<String>,
     pub candidates: Vec<TcpCandidate>,
 }
 
@@ -690,21 +827,33 @@ impl RemoteSpec {
 
     /// Ask the remote (over the control connection) to accept TCP data
     /// connections; records how to reach it for later `connect` calls.
-    pub fn setup_tcp(&self, ctl: &mut dyn Conn, plain: bool, ports: (u16, u16)) -> Result<()> {
+    pub fn setup_tcp(
+        &self,
+        ctl: &mut dyn Conn,
+        plain: bool,
+        ports: (u16, u16),
+        congestion_control: Option<&str>,
+    ) -> Result<()> {
         *self.tcp.lock().unwrap() = None;
         {
             let mut diagnostics = self.diagnostics.lock().unwrap();
             diagnostics.tcp_probe = None;
             diagnostics.tcp_setup_error = None;
         }
-        let result = self.setup_tcp_inner(ctl, plain, ports);
+        let result = self.setup_tcp_inner(ctl, plain, ports, congestion_control);
         if let Err(error) = &result {
             self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
         }
         result
     }
 
-    fn setup_tcp_inner(&self, ctl: &mut dyn Conn, plain: bool, ports: (u16, u16)) -> Result<()> {
+    fn setup_tcp_inner(
+        &self,
+        ctl: &mut dyn Conn,
+        plain: bool,
+        ports: (u16, u16),
+        congestion_control: Option<&str>,
+    ) -> Result<()> {
         let key = if plain {
             None
         } else {
@@ -716,10 +865,18 @@ impl RemoteSpec {
             token: token.clone(),
             port_lo: ports.0,
             port_hi: ports.1,
+            congestion_control: congestion_control.map(str::to_owned),
         })?;
-        let (port, advertised) = match ok(resp, "tcp listen")? {
-            Response::TcpListening { port, addrs } => (port, addrs),
-            other => bail!("unexpected response {other:?}"),
+        let (port, advertised, remote_congestion_control) = match resp {
+            Response::TcpCongestionRejected(error) => return Err(TcpCongestionError(error).into()),
+            response => match ok(response, "tcp listen")? {
+                Response::TcpListening {
+                    port,
+                    addrs,
+                    congestion_control,
+                } => (port, addrs, congestion_control),
+                other => bail!("unexpected response {other:?}"),
+            },
         };
         let mut candidates: Vec<TcpCandidate> = advertised
             .into_iter()
@@ -781,6 +938,7 @@ impl RemoteSpec {
         self.diagnostics.lock().unwrap().tcp_probe = Some(TcpProbe {
             port,
             encrypted: key.is_some(),
+            congestion_control: remote_congestion_control,
             candidates: candidates.clone(),
         });
         let addrs: Vec<String> = candidates
@@ -804,6 +962,7 @@ impl RemoteSpec {
             port,
             key,
             token,
+            congestion_control: congestion_control.map(str::to_owned),
             failed: false,
             failure: None,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -850,10 +1009,17 @@ impl RemoteSpec {
             // unreachable family first).
             let mut got = None;
             for sa in &resolved {
-                match TcpStream::connect_timeout(sa, std::time::Duration::from_secs(4)) {
+                match connect_tcp_stream(
+                    sa,
+                    std::time::Duration::from_secs(4),
+                    info.congestion_control.as_deref(),
+                ) {
                     Ok(s) => {
                         got = Some(s);
                         break;
+                    }
+                    Err(error) if is_tcp_congestion_error(&error) => {
+                        return Err(error).with_context(|| self.label())
                     }
                     Err(e) => last = anyhow!("{addr}:{}: {e}", info.port),
                 }
@@ -986,6 +1152,9 @@ pub struct TcpInfo {
     pub port: u16,
     pub key: Option<Vec<u8>>,
     pub token: Vec<u8>,
+    /// Explicit algorithm requested for each outgoing data socket. None keeps
+    /// the host default.
+    pub congestion_control: Option<String>,
     /// Set once a connect attempt failed; later connections use ssh.
     pub failed: bool,
     pub failure: Option<String>,
@@ -1460,6 +1629,7 @@ impl Endpoint {
                 if let Some(info) = info.filter(|i| !i.failed) {
                     match spec.connect_tcp(&info, compress) {
                         Ok(c) => return Ok(Box::new(c)),
+                        Err(e) if is_tcp_congestion_error(&e) => return Err(e),
                         Err(e) => {
                             let mut g = spec.tcp.lock().unwrap();
                             if let Some(i) = g.as_mut() {
@@ -1530,6 +1700,39 @@ mod tests {
             server_stats.segments_sent.is_some_and(|value| value > 0)
                 || server_stats.bytes_sent.is_some_and(|value| value > 0)
         );
+        #[cfg(target_os = "linux")]
+        {
+            assert!(client_stats.congestion_control.is_some());
+            assert!(server_stats.congestion_control.is_some());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_tcp_congestion_is_set_before_connect_and_inherited_on_accept() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        assert_eq!(
+            configure_tcp_congestion(&listener, Some("reno")).unwrap(),
+            Some("reno".into())
+        );
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            tcp_congestion_control(&socket).unwrap()
+        });
+        let client =
+            connect_tcp_stream(&address, std::time::Duration::from_secs(1), Some("reno")).unwrap();
+        assert_eq!(tcp_congestion_control(&client).unwrap(), "reno");
+        assert_eq!(server.join().unwrap(), "reno");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_tcp_congestion_is_classified_separately() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let error = configure_tcp_congestion(&listener, Some("syq_missing_cc")).unwrap_err();
+        assert!(is_tcp_congestion_error(&error));
+        assert!(error.to_string().contains("kernel rejected"));
     }
 
     #[test]

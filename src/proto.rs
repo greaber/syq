@@ -109,8 +109,9 @@ pub mod flags {
 /// Best-effort kernel counters for one end of a TCP data socket. `None` means
 /// the platform or returned kernel structure does not expose that field; a
 /// reported zero is therefore a genuine measurement.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TcpSocketStats {
+    pub congestion_control: Option<String>,
     pub bytes_sent: Option<u64>,
     pub bytes_retransmitted: Option<u64>,
     pub segments_sent: Option<u64>,
@@ -193,6 +194,7 @@ pub enum Request {
         token: Vec<u8>,
         port_lo: u16,
         port_hi: u16,
+        congestion_control: Option<String>,
     },
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
     /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
@@ -332,7 +334,12 @@ pub enum Response {
     TcpListening {
         port: u16,
         addrs: Vec<(String, u32)>,
+        congestion_control: Option<String>,
     },
+    /// The peer understood the requested per-socket override but its kernel
+    /// could not honor it. Keep this distinct from ordinary TCP reachability
+    /// failures, for which the orchestrator may safely fall back to SSH.
+    TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
     /// Paths (relative to the root) pruned by the ignore patterns.
