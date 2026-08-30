@@ -296,9 +296,13 @@ ordinary OpenSSH percent tokens except `%C`; named-user tildes are also refused
 rather than guessed. Credential and host-key algorithms that syq's SSH library
 cannot cryptographically verify are removed or refused rather than failing only
 after a signing request. OpenSSH's `ssh -G` output does not preserve quoting for
-custom known-hosts filenames. Syq therefore accepts OpenSSH's separately
-verified compiled default list, or one absolute whitespace-free configured file
-per `UserKnownHostsFile`/`GlobalKnownHostsFile` directive; ambiguous custom
+custom known-hosts filenames. Syq uses OpenSSH's debug provenance to inspect the
+configuration files OpenSSH actually read for the host. It accepts the compiled
+default list only when none of those files contains the corresponding
+known-hosts directive; an explicitly configured value that renders exactly like
+the defaults is still treated as configured. Otherwise syq accepts one absolute
+whitespace-free configured file per
+`UserKnownHostsFile`/`GlobalKnownHostsFile` directive. Ambiguous custom
 multi-file or whitespace-containing values fail closed.
 
 The local configuration resolves hostB's login user, and syq passes it

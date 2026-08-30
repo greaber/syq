@@ -18,6 +18,7 @@ use ssh_agent_lib::ssh_key::{
 };
 use std::collections::HashMap;
 use std::ffi::{CStr, OsString};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -35,6 +36,8 @@ const MAX_AGENT_FRAME: usize = 256 * 1024;
 /// Bound stalled forwarded clients and ambient-agent operations while leaving
 /// enough time for hardware-token touch/PIN/confirmation prompts.
 const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_SSH_CONFIG_FILES: usize = 256;
+const MAX_SSH_CONFIG_BYTES: usize = 1024 * 1024;
 const SSH_AGENT_FAILURE: &[u8] = &[5];
 const SSH_AGENT_SUCCESS: &[u8] = &[6];
 const SSH_AGENT_EXTENSION_FAILURE: &[u8] = &[28];
@@ -95,11 +98,15 @@ pub fn resolve_host_policy(
     host: &str,
     load_user_certificates: bool,
 ) -> Result<HostPolicy> {
-    let output = inspect_ssh_configuration(ssh_program, explicit_user, host, false)?;
+    let inspection = inspect_ssh_configuration(ssh_program, explicit_user, host, false)?;
     let defaults = inspect_ssh_configuration(ssh_program, explicit_user, host, true)?;
-    let defaults = KnownHostsDefaults::from_openssh(&defaults)?;
-    let config = parse_ssh_config_with_defaults(&output, Some(&defaults))
-        .with_context(|| format!("parse `ssh -G` output for {host}"))?;
+    let defaults = KnownHostsDefaults::from_openssh(&defaults.output)?;
+    let config = parse_ssh_config_with_defaults(
+        &inspection.output,
+        Some(&defaults),
+        &inspection.known_hosts_configured,
+    )
+    .with_context(|| format!("parse `ssh -G` output for {host}"))?;
     let keygen = ssh_keygen_for(ssh_program);
     let (mut host_keys, saw_ca) = read_known_host_keys(&keygen, &config.lookup, &config.files)?;
     host_keys.retain(|key| configured_host_key_allowed(&config, key));
@@ -130,16 +137,27 @@ pub fn resolve_host_policy(
     })
 }
 
+struct SshConfigurationInspection {
+    output: Vec<u8>,
+    known_hosts_configured: KnownHostsConfigured,
+}
+
 fn inspect_ssh_configuration(
     ssh_program: &str,
     explicit_user: Option<&str>,
     host: &str,
     compiled_defaults_only: bool,
-) -> Result<Vec<u8>> {
+) -> Result<SshConfigurationInspection> {
     let mut command = Command::new(ssh_program);
     command.arg("-G");
     if compiled_defaults_only {
         command.args(["-F", "/dev/null"]);
+    } else {
+        // OpenSSH does not retain filename quoting in `ssh -G` output. Its
+        // debug stream identifies the configuration files that contributed to
+        // this query, which lets us distinguish compiled defaults from an
+        // explicitly configured value that happens to render identically.
+        command.arg("-vvv");
     }
     if let Some(user) = explicit_user {
         command.args(["-l", user]);
@@ -159,7 +177,89 @@ fn inspect_ssh_configuration(
             }
         );
     }
-    Ok(output.stdout)
+    let known_hosts_configured = if compiled_defaults_only {
+        KnownHostsConfigured::default()
+    } else {
+        configured_known_hosts_directives(&output.stderr)?
+    };
+    Ok(SshConfigurationInspection {
+        output: output.stdout,
+        known_hosts_configured,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct KnownHostsConfigured {
+    user: bool,
+    global: bool,
+}
+
+fn configured_known_hosts_directives(debug: &[u8]) -> Result<KnownHostsConfigured> {
+    const PREFIX: &str = "debug1: Reading configuration data ";
+    let debug = std::str::from_utf8(debug).context("OpenSSH debug output was not UTF-8")?;
+    let mut paths = Vec::new();
+    for line in debug.lines() {
+        let Some(path) = line.strip_prefix(PREFIX) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!(
+                "OpenSSH reported a non-absolute configuration path while resolving known_hosts provenance"
+            );
+        }
+        if !paths.contains(&path) {
+            if paths.len() == MAX_SSH_CONFIG_FILES {
+                bail!(
+                    "OpenSSH read too many configuration files to establish known_hosts provenance"
+                );
+            }
+            paths.push(path);
+        }
+    }
+
+    let mut configured = KnownHostsConfigured::default();
+    for path in paths {
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("open SSH configuration file {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspect SSH configuration file {}", path.display()))?;
+        if !metadata.is_file() || metadata.len() > MAX_SSH_CONFIG_BYTES as u64 {
+            bail!(
+                "SSH configuration file {} is not a bounded regular file; constrained agent forwarding cannot establish known_hosts provenance",
+                path.display()
+            );
+        }
+        let mut contents = Vec::new();
+        Read::by_ref(&mut file)
+            .take(MAX_SSH_CONFIG_BYTES as u64 + 1)
+            .read_to_end(&mut contents)
+            .with_context(|| format!("read SSH configuration file {}", path.display()))?;
+        if contents.len() > MAX_SSH_CONFIG_BYTES {
+            bail!(
+                "SSH configuration file {} grew beyond the provenance size limit",
+                path.display()
+            );
+        }
+        configured.user |= contains_ssh_config_directive(&contents, b"userknownhostsfile");
+        configured.global |= contains_ssh_config_directive(&contents, b"globalknownhostsfile");
+    }
+    Ok(configured)
+}
+
+fn contains_ssh_config_directive(contents: &[u8], keyword: &[u8]) -> bool {
+    contents.split(|byte| *byte == b'\n').any(|line| {
+        let line = line.trim_ascii_start();
+        if line.is_empty() || line[0] == b'#' {
+            return false;
+        }
+        let end = line
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace() || *byte == b'=')
+            .unwrap_or(line.len());
+        line[..end].eq_ignore_ascii_case(keyword)
+    })
 }
 
 #[derive(Debug)]
@@ -224,12 +324,13 @@ impl KnownHostsDefaults {
 
 #[cfg(test)]
 fn parse_ssh_config(output: &[u8]) -> Result<EffectiveSshConfig> {
-    parse_ssh_config_with_defaults(output, None)
+    parse_ssh_config_with_defaults(output, None, &KnownHostsConfigured::default())
 }
 
 fn parse_ssh_config_with_defaults(
     output: &[u8],
     defaults: Option<&KnownHostsDefaults>,
+    configured: &KnownHostsConfigured,
 ) -> Result<EffectiveSshConfig> {
     let output = std::str::from_utf8(output).context("SSH configuration was not UTF-8")?;
     let mut user = None;
@@ -287,10 +388,20 @@ fn parse_ssh_config_with_defaults(
             }
             "identityfile" if value != "none" => identity_files.push(value.to_string()),
             "userknownhostsfile" => {
-                append_known_hosts_files(&mut files, value, defaults.map(|item| &item.user))?;
+                append_known_hosts_files(
+                    &mut files,
+                    value,
+                    defaults.map(|item| &item.user),
+                    configured.user,
+                )?;
             }
             "globalknownhostsfile" => {
-                append_known_hosts_files(&mut files, value, defaults.map(|item| &item.global))?;
+                append_known_hosts_files(
+                    &mut files,
+                    value,
+                    defaults.map(|item| &item.global),
+                    configured.global,
+                )?;
             }
             _ => {}
         }
@@ -369,11 +480,14 @@ fn append_known_hosts_files(
     files: &mut Vec<PathBuf>,
     value: &str,
     compiled_default: Option<&KnownHostsDefault>,
+    configured: bool,
 ) -> Result<()> {
     if value == "none" {
         return Ok(());
     }
-    if let Some(compiled_default) = compiled_default.filter(|default| default.rendered == value) {
+    if let Some(compiled_default) =
+        compiled_default.filter(|default| !configured && default.rendered == value)
+    {
         files.extend(compiled_default.files.iter().cloned());
         return Ok(());
     }
@@ -1800,7 +1914,12 @@ mod tests {
                 files: Vec::new(),
             },
         };
-        let config = parse_ssh_config_with_defaults(output, Some(&defaults)).unwrap();
+        let config = parse_ssh_config_with_defaults(
+            output,
+            Some(&defaults),
+            &KnownHostsConfigured::default(),
+        )
+        .unwrap();
         assert_eq!(config.user, "backup");
         assert_eq!(config.lookup, "[vault.internal]:2222");
         assert_eq!(config.required_rsa_size, 3072);
@@ -1825,6 +1944,55 @@ mod tests {
                 "unexpected error for {value:?}: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn configured_value_identical_to_flattened_defaults_fails_closed() {
+        let rendered = "/home/grant/.ssh/known_hosts /home/grant/.ssh/known_hosts2";
+        let output = format!(
+            "user backup\nhostname vault.internal\nport 22\nuserknownhostsfile {rendered}\nglobalknownhostsfile none\nhostkeyalgorithms ssh-ed25519\n"
+        );
+        let defaults = KnownHostsDefaults {
+            user: KnownHostsDefault {
+                rendered: rendered.into(),
+                files: vec![
+                    "/home/grant/.ssh/known_hosts".into(),
+                    "/home/grant/.ssh/known_hosts2".into(),
+                ],
+            },
+            global: KnownHostsDefault {
+                rendered: "none".into(),
+                files: Vec::new(),
+            },
+        };
+        let error = parse_ssh_config_with_defaults(
+            output.as_bytes(),
+            Some(&defaults),
+            &KnownHostsConfigured {
+                user: true,
+                global: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ambiguous known_hosts"));
+    }
+
+    #[test]
+    fn configured_known_hosts_provenance_uses_files_openssh_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("ssh_config");
+        std::fs::write(
+            &config,
+            b"# GlobalKnownHostsFile /ignored/comment\nHost *\n  UserKnownHostsFile=\"/tmp/known hosts\"\n",
+        )
+        .unwrap();
+        let debug = format!(
+            "OpenSSH test\ndebug1: Reading configuration data {}\n",
+            config.display()
+        );
+        let configured = configured_known_hosts_directives(debug.as_bytes()).unwrap();
+        assert!(configured.user);
+        assert!(!configured.global);
     }
 
     #[test]
@@ -2198,7 +2366,7 @@ mod tests {
     #[test]
     fn openssh_defaults_and_hashed_known_hosts_lookup_are_exercised() {
         let output = inspect_ssh_configuration("ssh", None, "unused.example", true).unwrap();
-        let defaults = KnownHostsDefaults::from_openssh(&output).unwrap();
+        let defaults = KnownHostsDefaults::from_openssh(&output.output).unwrap();
         assert_eq!(defaults.user.files.len(), 2);
         assert!(defaults.user.files.iter().all(|path| path.is_absolute()));
         assert!(defaults.global.files.iter().all(|path| path.is_absolute()));
