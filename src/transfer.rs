@@ -1125,11 +1125,14 @@ pub fn run(args: Args) -> Result<i32> {
         TargetCondition::Any
     };
     if create_root && srcs.len() == 1 {
-        let created = mkdir_root(&mut *dst_ctl, &dst_root, root_create_condition)?;
-        mutation_root_condition = target_identity(&created);
-        if guard_containers {
-            container_guard = Some(target_container(&dst_root, &created));
-        }
+        let (created, guard) = mkdir_root(
+            &mut *dst_ctl,
+            &dst_root,
+            root_create_condition,
+            guard_containers,
+        )?;
+        mutation_root_condition = created;
+        container_guard = guard;
     }
 
     let checkpoint_completed = checkpoint_state
@@ -1574,6 +1577,13 @@ fn target_container(root: &[u8], entry: &Entry) -> ContainerGuard {
     }
 }
 
+fn container_identity(guard: &ContainerGuard) -> TargetCondition {
+    TargetCondition::Matches {
+        dev: guard.dev,
+        ino: guard.ino,
+    }
+}
+
 #[cfg(debug_assertions)]
 fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
     if args.interface == Interface::Rsync || args.target_existence == Existence::Any {
@@ -1600,7 +1610,16 @@ fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn mkdir_root(conn: &mut dyn Conn, dst_root: &[u8], condition: TargetCondition) -> Result<Entry> {
+fn mkdir_root(
+    conn: &mut dyn Conn,
+    dst_root: &[u8],
+    condition: TargetCondition,
+    guarded: bool,
+) -> Result<(TargetCondition, Option<ContainerGuard>)> {
+    if guarded {
+        let guard = create_container(conn, dst_root, 0o755)?;
+        return Ok((container_identity(&guard), Some(guard)));
+    }
     match ok(
         conn.call(Request::Apply {
             ops: vec![Op::Mkdir {
@@ -1616,10 +1635,26 @@ fn mkdir_root(conn: &mut dyn Conn, dst_root: &[u8], condition: TargetCondition) 
             if let Some(e) = errs.into_iter().flatten().next() {
                 bail!("{e}");
             }
-            stat_one(conn, dst_root, false)?
+            let created = stat_one(conn, dst_root, false)?
                 .filter(|entry| entry.kind == Kind::Dir)
-                .with_context(|| format!("created target {} is not a directory", display(dst_root)))
+                .with_context(|| {
+                    format!("created target {} is not a directory", display(dst_root))
+                })?;
+            Ok((target_identity(&created), None))
         }
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn create_container(conn: &mut dyn Conn, path: &[u8], mode: u32) -> Result<ContainerGuard> {
+    match ok(
+        conn.call(Request::CreateContainer {
+            path: path.to_vec(),
+            mode,
+        })?,
+        "create container",
+    )? {
+        Response::Container(guard) => Ok(guard),
         other => bail!("unexpected response {other:?}"),
     }
 }
@@ -2677,11 +2712,9 @@ impl Planner<'_> {
             return Ok(());
         }
         if let Some((root, condition)) = self.create_root.take() {
-            let created = mkdir_root(self.dst, &root, condition)?;
-            self.mutation_root_condition = target_identity(&created);
-            if self.guard_containers {
-                self.container_guard = Some(target_container(&root, &created));
-            }
+            let (created, guard) = mkdir_root(self.dst, &root, condition, self.guard_containers)?;
+            self.mutation_root_condition = created;
+            self.container_guard = guard;
         }
         // Validated: from here on they are ordinary entries (the one that is
         // the destination file skips itself; the other is written).
@@ -2838,25 +2871,26 @@ impl Planner<'_> {
                     // descendant operation after this point carries the
                     // identity returned by that atomic mkdir.
                     let root_op = new_dirs.remove(root_index);
-                    let error = self.apply(vec![root_op])?.into_iter().next().flatten();
-                    if let Some(error) = error {
-                        self.progress.error(&format!("syq: {error}"));
-                        self.collision = true;
-                        return Ok(());
-                    }
+                    let mode = match root_op {
+                        Op::Mkdir { mode, .. } => mode,
+                        _ => unreachable!(),
+                    };
+                    let created = match create_container(self.dst, &self.root_path, mode) {
+                        Ok(created) => created,
+                        Err(error) => {
+                            self.progress.error(&format!("syq: {error:#}"));
+                            self.collision = true;
+                            return Ok(());
+                        }
+                    };
                     self.dirs_created += 1;
                     if opts.verbose > 0 {
                         self.progress
                             .println(&format!("{}/", display(&self.root_path)));
                     }
-                    let created = stat_many(self.dst, vec![self.root_path.clone()], false)?
-                        .pop()
-                        .flatten()
-                        .filter(|entry| entry.kind == Kind::Dir)
-                        .context("new exact target was not a directory after creation")?;
-                    self.exact_condition = target_identity(&created);
-                    self.mutation_root_condition = target_identity(&created);
-                    self.container_guard = Some(target_container(&self.root_path, &created));
+                    self.exact_condition = container_identity(&created);
+                    self.mutation_root_condition = container_identity(&created);
+                    self.container_guard = Some(created);
                 }
                 if !new_dirs.is_empty() {
                     let n = new_dirs.len();

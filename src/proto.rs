@@ -172,18 +172,12 @@ pub enum Op {
     },
     /// Remove whatever currently occupies the path, recursively when it is a
     /// directory. Planned deletion uses Unlink/Rmdir instead.
-    Remove {
-        path: PathBytes,
-    },
+    Remove { path: PathBytes },
     /// Remove an empty directory.
-    Rmdir {
-        path: PathBytes,
-    },
+    Rmdir { path: PathBytes },
     /// Remove a non-directory; a directory that has appeared there is an
     /// error, never recursed into (used by --delete for planned leaves).
-    Unlink {
-        path: PathBytes,
-    },
+    Unlink { path: PathBytes },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -223,6 +217,12 @@ pub enum Request {
     Apply {
         ops: Vec<Op>,
         guard: Option<ContainerGuard>,
+    },
+    /// Create a new directory without replacement and return the identity of
+    /// the inode held open across its publication.
+    CreateContainer {
+        path: PathBytes,
+        mode: u32,
     },
     /// Return the size of the deterministic sidecar, if it is a regular file.
     /// The planner has already statted the final path.
@@ -362,6 +362,7 @@ pub enum Response {
     Stats(Vec<Option<Entry>>),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
     Applied(Vec<Option<String>>),
+    Container(ContainerGuard),
     PartialSize(Option<u64>),
     Hashes(Vec<u64>),
     HeldHashes {

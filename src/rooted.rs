@@ -10,9 +10,9 @@
 //! Native guarded placements use these operations for every descendant
 //! mutation; the unrestricted rsync-shaped implementation remains separate.
 //! Existing roots, regular-file I/O, leaf creation/replacement, metadata, and
-//! non-recursive unlink/rmdir are supported. Recursive removal and missing-root
-//! creation stay outside this layer. Roots and directory components must be
-//! openable with `O_RDONLY | O_DIRECTORY`.
+//! non-recursive unlink/rmdir are supported. Recursive removal stays outside
+//! this layer. Directory authority descriptors need search permission, not
+//! read permission.
 //!
 //! Linux currently uses the same component walk as other Unix platforms. An
 //! `openat2` fast path should be added only with tests proving that it has
@@ -25,14 +25,22 @@
 
 use anyhow::{bail, Context, Result};
 use std::ffi::CString;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+const DIRECTORY_SEARCH_FLAGS: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
+#[cfg(target_os = "macos")]
+const DIRECTORY_SEARCH_FLAGS: libc::c_int = libc::O_SEARCH;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const DIRECTORY_SEARCH_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
 
 #[cfg(target_os = "linux")]
 const MODE_TYPE_MASK: u32 = libc::S_IFMT;
@@ -158,11 +166,14 @@ impl Root {
     /// Open an explicit root. Symlinks in this user-selected path are followed;
     /// symlinks in every later descendant path are rejected.
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(path)
-            .with_context(|| format!("open confined root {}", path.display()))?;
+        let name = CString::new(path.as_os_str().as_bytes()).context("root path contains NUL")?;
+        let directory = open_at(
+            libc::AT_FDCWD,
+            &name,
+            DIRECTORY_SEARCH_FLAGS | libc::O_CLOEXEC,
+            0,
+        )
+        .with_context(|| format!("open confined root {}", path.display()))?;
         let metadata = directory
             .metadata()
             .with_context(|| format!("stat confined root {}", path.display()))?;
@@ -290,13 +301,57 @@ impl Root {
         cvt_zero(result).with_context(|| format!("create confined directory {}", path.label()))
     }
 
+    /// Create a directory under a private temporary name, open that exact
+    /// inode, then publish it without replacing anything. The returned
+    /// identity comes from the descriptor held across publication, never from
+    /// a later lookup of the public path.
+    pub(crate) fn create_directory_noreplace(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+    ) -> Result<RootIdentity> {
+        let parent = self.resolve_parent(path)?;
+        let (temporary, directory, identity) = create_temporary_directory(&parent, mode)?;
+        if let Err(error) = rename_noreplace(
+            parent.directory.as_raw_fd(),
+            &temporary,
+            parent.directory.as_raw_fd(),
+            &parent.leaf,
+        ) {
+            // Do not unlink by name here. A hostile writer could replace even
+            // an unguessable staging name between validation and unlink. The
+            // empty recovery directory is safer than deleting an object syq
+            // did not create.
+            drop(directory);
+            return Err(error).with_context(|| {
+                format!(
+                    "publish new confined directory {} (staging directory {} retained)",
+                    path.label(),
+                    String::from_utf8_lossy(temporary.as_bytes())
+                )
+            });
+        }
+        drop(directory);
+        Ok(identity)
+    }
+
     pub(crate) fn metadata(&self, path: &RelativePath) -> Result<RootMetadata> {
+        if path.is_empty() {
+            return self
+                .directory
+                .metadata()
+                .map(|metadata| root_metadata(&metadata))
+                .context("stat confined root");
+        }
         let parent = self.resolve_parent(path)?;
         metadata_at(parent.directory.as_raw_fd(), &parent.leaf)
             .with_context(|| format!("stat confined path {}", path.label()))
     }
 
     pub(crate) fn metadata_optional(&self, path: &RelativePath) -> Result<Option<RootMetadata>> {
+        if path.is_empty() {
+            return self.metadata(path).map(Some);
+        }
         let parent = self.resolve_parent(path)?;
         match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
             Ok(metadata) => Ok(Some(metadata)),
@@ -334,7 +389,7 @@ impl Root {
     }
 
     pub(crate) fn chmod(&self, path: &RelativePath, mode: u32) -> Result<()> {
-        let parent = self.resolve_parent(path)?;
+        let parent = self.resolve_metadata_target(path)?;
         let result = unsafe {
             libc::fchmodat(
                 parent.directory.as_raw_fd(),
@@ -353,7 +408,7 @@ impl Root {
         gid: Option<u32>,
     ) -> io::Result<()> {
         let parent = self
-            .resolve_parent(path)
+            .resolve_metadata_target(path)
             .map_err(|error| io::Error::other(format!("{error:#}")))?;
         let result = unsafe {
             libc::fchownat(
@@ -368,7 +423,7 @@ impl Root {
     }
 
     pub(crate) fn set_times(&self, path: &RelativePath, times: &[libc::timespec; 2]) -> Result<()> {
-        let parent = self.resolve_parent(path)?;
+        let parent = self.resolve_metadata_target(path)?;
         let result = unsafe {
             libc::utimensat(
                 parent.directory.as_raw_fd(),
@@ -441,6 +496,7 @@ impl Root {
                 path.label()
             );
         }
+        hold_after_swap_precondition_for_test()?;
         let temporary = create_temporary(&parent, create)?;
         if let Err(error) = rename_exchange(
             parent.directory.as_raw_fd(),
@@ -457,17 +513,16 @@ impl Root {
             || swapped.ino != expected_ino
             || swapped.file_type() != expected_type
         {
-            rename_exchange(
-                parent.directory.as_raw_fd(),
-                &temporary,
-                parent.directory.as_raw_fd(),
-                &parent.leaf,
-            )
-            .with_context(|| format!("restore raced target {}", path.label()))?;
-            unlink_at(parent.directory.as_raw_fd(), &temporary, 0)?;
+            hold_after_swap_mismatch_for_test()?;
+            // A second exchange would be an unsafe rollback: another writer
+            // could replace the destination after the check, causing its new
+            // object to be displaced and then unlinked. Preserve the raced
+            // inode at the staging name and leave every later destination
+            // publication untouched.
             bail!(
-                "confined target {} changed during replacement",
-                path.label()
+                "confined target {} changed during replacement; displaced object retained at {}",
+                path.label(),
+                String::from_utf8_lossy(temporary.as_bytes())
             );
         }
         unlink_at(parent.directory.as_raw_fd(), &temporary, 0)
@@ -533,6 +588,16 @@ impl Root {
             leaf: component_cstring(leaf),
         })
     }
+
+    fn resolve_metadata_target(&self, path: &RelativePath) -> Result<ResolvedParent> {
+        if path.is_empty() {
+            return Ok(ResolvedParent {
+                directory: self.directory.try_clone().context("duplicate root fd")?,
+                leaf: CString::new(".").expect("dot contains no NUL"),
+            });
+        }
+        self.resolve_parent(path)
+    }
 }
 
 struct ResolvedParent {
@@ -548,7 +613,7 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     open_at(
         parent.as_raw_fd(),
         &component_cstring(component),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        DIRECTORY_SEARCH_FLAGS | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         0,
     )
 }
@@ -584,6 +649,16 @@ fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
         nlink: stat_nlink(&stat),
         len: stat.st_size as u64,
     })
+}
+
+fn root_metadata(metadata: &std::fs::Metadata) -> RootMetadata {
+    RootMetadata {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        nlink: metadata.nlink(),
+        len: metadata.len(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -635,6 +710,121 @@ fn create_temporary(
         }
     }
     bail!("could not allocate a replacement sidecar name")
+}
+
+fn create_temporary_directory(
+    parent: &ResolvedParent,
+    mode: u32,
+) -> Result<(CString, File, RootIdentity)> {
+    for _ in 0..32 {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).context("generate new-directory staging name")?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let name = CString::new(format!(".syq-new-directory-{suffix}"))
+            .expect("generated directory name contains no NUL");
+        let result = unsafe {
+            libc::mkdirat(
+                parent.directory.as_raw_fd(),
+                name.as_ptr(),
+                (mode & 0o7777) as libc::mode_t,
+            )
+        };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(error).context("create new-directory staging inode");
+        }
+
+        // The unpredictable name prevents a target-path racer from selecting
+        // this inode. Record it immediately, open it without following, and
+        // require both names to agree before publication.
+        let created = metadata_at(parent.directory.as_raw_fd(), &name)
+            .context("stat new-directory staging inode")?;
+        let directory = open_at(
+            parent.directory.as_raw_fd(),
+            &name,
+            DIRECTORY_SEARCH_FLAGS | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .context("open new-directory staging inode")?;
+        let opened = root_metadata(&directory.metadata()?);
+        let named = metadata_at(parent.directory.as_raw_fd(), &name)
+            .context("restat new-directory staging inode")?;
+        if !created.is_dir()
+            || opened.dev != created.dev
+            || opened.ino != created.ino
+            || named.dev != created.dev
+            || named.ino != created.ino
+        {
+            bail!("new-directory staging inode changed before publication");
+        }
+        return Ok((
+            name,
+            directory,
+            RootIdentity {
+                dev: opened.dev,
+                ino: opened.ino,
+            },
+        ));
+    }
+    bail!("could not allocate a new-directory staging name")
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(
+    old_parent: RawFd,
+    old_name: &CString,
+    new_parent: RawFd,
+    new_name: &CString,
+) -> io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            old_parent,
+            old_name.as_ptr(),
+            new_parent,
+            new_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_noreplace(
+    old_parent: RawFd,
+    old_name: &CString,
+    new_parent: RawFd,
+    new_name: &CString,
+) -> io::Result<()> {
+    cvt_zero(unsafe {
+        libc::renameatx_np(
+            old_parent,
+            old_name.as_ptr(),
+            new_parent,
+            new_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_noreplace(
+    _old_parent: RawFd,
+    _old_name: &CString,
+    _new_parent: RawFd,
+    _new_name: &CString,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -690,6 +880,42 @@ fn rename_exchange(
         io::ErrorKind::Unsupported,
         "atomic exchange rename is unavailable",
     ))
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_swap_precondition_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_SWAP_PRECONDITION_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_SWAP_PRECONDITION_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_swap_precondition_for_test() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_swap_mismatch_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_SWAP_MISMATCH_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_SWAP_MISMATCH_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_swap_mismatch_for_test() -> Result<()> {
+    Ok(())
 }
 
 fn require_regular(file: &File, path: &RelativePath) -> Result<()> {
@@ -809,6 +1035,23 @@ mod tests {
         old.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"old");
         assert!(root.open_regular_read(&relative(b"new")).is_err());
+    }
+
+    #[test]
+    fn search_only_directory_can_be_an_authority_root() {
+        let tree = TestDir::new("search-only");
+        let root_path = tree.path().join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let root = Root::open(&root_path).unwrap();
+        let mut file = root.create_file(&relative(b"created"), 0o600).unwrap();
+        file.write_all(b"inside").unwrap();
+        drop(file);
+        drop(root);
+
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(fs::read(root_path.join("created")).unwrap(), b"inside");
     }
 
     #[test]
