@@ -411,12 +411,12 @@ classification = "adapted"
 adaptation = "files-from-split"
 adaptation_kind = "subset"
 area = "file-selection"
-position = "unimplemented"
-baseline = "fail"
+position = "compatible"
+baseline = "pass"
 platforms = ["linux"]
-tags = ["local", "files-from", "comments", "known-gap"]
+tags = ["local", "files-from", "comments"]
 requirements = []
-note = "SYQ currently treats entries beginning with # or ; as filenames in a line-delimited --files-from list instead of rsync comments."
+note = "Entries beginning with # or ; are ignored as rsync comments in a line-delimited --files-from list."
 
 [[tests]]
 name = "files-from-comments-from0"
@@ -425,12 +425,12 @@ classification = "adapted"
 adaptation = "files-from-split"
 adaptation_kind = "subset"
 area = "file-selection"
-position = "unimplemented"
-baseline = "fail"
+position = "compatible"
+baseline = "pass"
 platforms = ["linux"]
-tags = ["local", "files-from", "from0", "comments", "known-gap"]
+tags = ["local", "files-from", "from0", "comments"]
 requirements = []
-note = "SYQ currently treats entries beginning with # or ; as filenames in a NUL-delimited --files-from list instead of rsync comments."
+note = "Entries beginning with # or ; are ignored as rsync comments in a NUL-delimited --files-from list."
 
 [[tests]]
 name = "hands"
