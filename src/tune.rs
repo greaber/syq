@@ -117,6 +117,7 @@ struct TuningCache {
 fn endpoint_key(endpoint: &Endpoint) -> String {
     match endpoint {
         Endpoint::Local => "local".into(),
+        Endpoint::Remote(spec) if spec.local_process => "local".into(),
         Endpoint::Remote(spec) => spec.label(),
     }
 }
@@ -124,6 +125,7 @@ fn endpoint_key(endpoint: &Endpoint) -> String {
 fn transport_key(endpoint: &Endpoint) -> Option<&'static str> {
     match endpoint {
         Endpoint::Local => None,
+        Endpoint::Remote(spec) if spec.local_process => None,
         Endpoint::Remote(spec) => Some(match spec.data_transport() {
             DataTransport::Ssh => "ssh",
             DataTransport::EncryptedTcp | DataTransport::PlaintextTcp => "tcp",
@@ -1033,6 +1035,7 @@ mod tests {
 
     fn remote(host: &str, tcp: bool) -> Endpoint {
         Endpoint::Remote(crate::conn::RemoteSpec {
+            local_process: false,
             user: Some("user".into()),
             host: host.into(),
             rsh: vec!["ssh".into()],

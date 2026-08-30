@@ -176,7 +176,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 ignore,
                 report_ignored,
             } => {
-                let root = fsops::resolve(&root);
+                let root = match ops.scan_root(&root) {
+                    Ok(root) => fsops::resolve(&root),
+                    Err(error) => {
+                        w.write_msg(&Response::Err(format!("{error:#}")))?;
+                        continue;
+                    }
+                };
                 // Warnings are collected and sent between batches so a single
                 // writer borrow suffices.
                 let warns = std::cell::RefCell::new(Vec::new());

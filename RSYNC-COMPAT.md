@@ -89,7 +89,7 @@ behavior; an entry without one is only believed, not held.
 | `--files-from` baseline: paths relative to one source; implied parents created; a plain listed directory is copied without its contents unless `-r` is given explicitly (`-a` doesn't count); `--from0`; `-` reads stdin; blank entries and entries starting with `#` or `;` dropped in both separator modes (literal names remain reachable as `./#name` and `./;name`) | measured; entry *parsing* has gaps, open issue 2 | `files_from_copies_listed_paths_with_their_parents`, `files_from_treats_hash_and_semicolon_entries_as_comments`, `files_from_creates_listed_and_implied_dirs_without_r`, `files_from_repeats_and_late_listed_dirs_across_chunks`, `files_from_root_may_be_a_symlink_and_root_lines_are_rejected` |
 | `--delete-after` / `--delete-delay` accepted as synonyms of `--delete` (they describe what syq does) | by construction | `delete_after_and_delay_are_synonyms` |
 | `--max-delete N` exists and exits 25 when it trips | believed (exit code matches rsync); see "Different" for the cap semantics | `max_delete_refuses_everything_past_the_limit` |
-| A normal operator-owned destination *argument* that is a symlink to a directory is that directory | measured; see open issue 6 for a root/cross-uid case | `symlink_destination_is_followed`, `destination_root_symlink_preserves_target_metadata_for_both_spellings`, `existing_updates_through_a_destination_root_symlink_to_a_dir` |
+| An operator-named destination symlink is followed when owned by root or by the receiving process's effective uid; a foreign-owned component is refused unless `--insecure-links` is given | measured, including absolute and relative root/cross-uid cases | `symlink_destination_is_followed`, `destination_root_symlink_preserves_target_metadata_for_both_spellings`, `existing_updates_through_a_destination_root_symlink_to_a_dir`, `foreign_owned_destination_root_symlink_is_refused_unless_explicitly_allowed` |
 | A symlink to a directory found *inside* the destination tree is replaced with a real directory; only the argument itself is followed (rsync without `-K`) | measured | `in_tree_destination_symlink_is_replaced_not_followed`, `existing_does_not_write_through_a_destination_symlink_dir` |
 | `-P`, `-h`, `--partial`, `--numeric-ids`, `-V` accepted as no-ops/aliases; common unsupported flags are rejected with an explanation | by construction | `rsync_compat_noops_are_accepted`, `unsupported_rsync_flags_explain_themselves` |
 | Source entries whose names look like SYQ sidecars (`.name.syq-part.<id>`) are copied as ordinary payload (with one warning); only the exact case where a payload path equals a sidecar this job would use for another file is refused, before anything is written | by construction (PR #7's namespace preflight) | `sidecar_named_source_directory_is_payload`, `delete_treats_sidecar_patterned_files_as_ordinary_extras`, `partial_named_symlink_is_a_symlink_not_a_leftover` |
@@ -230,21 +230,19 @@ command says what to change.
 3. **`-h` alone should print help**, as rsync does, while staying
    `--human-readable` inside a cluster (`-avh`). Essentially free.
 4. **`-u` for symlinks/devices** — measure rsync, then align or record.
-5. **Cross-uid symlinks in an operator-named destination path.** Current rsync
-   refuses an absolute or relative destination component owned by another uid
-   when root runs the copy, preventing an unprivileged user from redirecting a
-   privileged copy outside the intended tree. syq currently follows it just as
-   it follows an ordinary destination-argument symlink. The root-only upstream
-   `symlink-race-dest` and `symlink-race-relative-dest` tests record this as a
-   known failure. This is a strong default-alignment candidate because it closes
-   a privilege-boundary write redirection without changing the normal
-   same-owner symlink behavior.
 
 ## Resolved
 
 - Exactly repeated raw source operands are deduplicated before scanning while
   preserving the original operand count for destination placement. Distinct
   spellings remain distinct even when parsing gives them the same endpoint.
+- Operator-named destination paths use rsync's ownership walk on the receiving
+  endpoint: symlinks at any component are followed only when owned by root or
+  by that endpoint's effective uid. `--insecure-links` is the explicit legacy
+  opt-out. The control connection retains that selected directory; every worker
+  securely reopens or inherits it, verifies its device/inode, and performs
+  destination requests relative to it. Replacing the external spelling after
+  selection therefore cannot redirect the copy.
 - Source entries named like sidecars were excluded from copies; PR #7's
   namespace preflight made them ordinary payload (rsync-compatible), and
   this branch follows it. Former open issue 4. Destination `--delete` now

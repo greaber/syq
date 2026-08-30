@@ -4,8 +4,8 @@
 use crate::proto::*;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::ffi::{CString, OsStr, OsString};
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -35,6 +35,264 @@ pub fn resolve(p: &[u8]) -> PathBuf {
         }
     }
     PathBuf::from(OsStr::from_bytes(p))
+}
+
+/// A receiver-side selection retained from the ownership walk until it is
+/// either created or made the connection's working directory. Keeping the fd,
+/// rather than just its identity, closes the post-check pathname race.
+struct OperatorDirectorySelection {
+    path: PathBytes,
+    directory: File,
+    missing: VecDeque<Vec<u8>>,
+}
+
+impl OperatorDirectorySelection {
+    fn anchor(&self) -> Result<DirectoryAnchor> {
+        let metadata = self.directory.metadata()?;
+        Ok(DirectoryAnchor {
+            path: self.path.clone(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    fn create_missing(&mut self, mode: u32) -> Result<DirectoryAnchor> {
+        while let Some(component) = self.missing.pop_front() {
+            if component == b"." {
+                continue;
+            }
+            if component == b".." {
+                self.directory = open_operator_directory_at(&self.directory, b"..")?;
+                continue;
+            }
+            match operator_lstat_at(&self.directory, &component) {
+                Ok(metadata) if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR => {}
+                Ok(_) => bail!(
+                    "destination path component {:?} appeared with an unsafe type while creating the destination",
+                    OsStr::from_bytes(&component)
+                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // Match create_dir_all's historical behavior: intermediate
+                    // components start at 0777 (subject to umask), while the
+                    // requested mode applies to the selected destination root.
+                    let component_mode = if self.missing.is_empty() { mode } else { 0o777 };
+                    mkdir_operator_directory_at(&self.directory, &component, component_mode)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            self.directory = open_operator_directory_at(&self.directory, &component)?;
+        }
+        self.anchor()
+    }
+}
+
+/// Resolve an operator-selected directory with rsync's ownership rule:
+/// symlinks at any component are followed only when owned by uid 0 or by this
+/// process's effective uid. The descriptor remains in the returned selection.
+fn select_operator_directory(
+    path: &[u8],
+    allow_missing: bool,
+    insecure_links: bool,
+) -> Result<(OperatorDirectorySelection, Option<DirectoryAnchor>)> {
+    let path = resolve(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let raw = path.as_os_str().as_bytes();
+    if raw.contains(&0) {
+        bail!("destination path contains NUL");
+    }
+
+    let absolute = raw.starts_with(b"/");
+    let mut directory = open_operator_directory_start(absolute)?;
+    let mut remaining: VecDeque<Vec<u8>> = raw
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    let mut symlink_hops = 0usize;
+
+    while let Some(component) = remaining.pop_front() {
+        if component == b"." {
+            continue;
+        }
+        if component == b".." {
+            directory = open_operator_directory_at(&directory, b"..")?;
+            continue;
+        }
+
+        let metadata = match operator_lstat_at(&directory, &component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && allow_missing => {
+                remaining.push_front(component);
+                let selection = OperatorDirectorySelection {
+                    path: path_bytes(&path),
+                    directory,
+                    missing: remaining,
+                };
+                return Ok((selection, None));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            let euid = unsafe { libc::geteuid() };
+            if !insecure_links && !operator_symlink_owner_is_trusted(metadata.st_uid, euid) {
+                bail!(
+                    "refusing symlink component {:?} owned by uid {}; expected uid 0 or receiver uid {}",
+                    OsStr::from_bytes(&component),
+                    metadata.st_uid,
+                    euid
+                );
+            }
+            symlink_hops += 1;
+            if symlink_hops > 40 {
+                bail!("too many symlink levels in destination path");
+            }
+            let target = operator_readlink_at(&directory, &component)?;
+            if target.starts_with(b"/") {
+                directory = open_operator_directory_start(true)?;
+            }
+            let mut expanded: VecDeque<Vec<u8>> = target
+                .split(|byte| *byte == b'/')
+                .filter(|part| !part.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect();
+            expanded.append(&mut remaining);
+            remaining = expanded;
+            continue;
+        }
+
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
+        }
+        directory = open_operator_directory_at(&directory, &component)?;
+    }
+
+    let selection = OperatorDirectorySelection {
+        path: path_bytes(&path),
+        directory,
+        missing: VecDeque::new(),
+    };
+    let anchor = selection.anchor()?;
+    Ok((selection, Some(anchor)))
+}
+
+fn operator_symlink_owner_is_trusted(owner: u32, euid: u32) -> bool {
+    owner == 0 || owner == euid
+}
+
+fn operator_directory_flags() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    {
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+}
+
+fn open_operator_directory_start(absolute: bool) -> Result<File> {
+    let component = if absolute { c"/" } else { c"." };
+    open_operator_directory_fd(libc::AT_FDCWD, component)
+}
+
+fn open_operator_directory_at(parent: &File, component: &[u8]) -> Result<File> {
+    let component = CString::new(component).expect("path component was checked for NUL");
+    open_operator_directory_fd(parent.as_raw_fd(), &component)
+}
+
+fn open_operator_directory_fd(parent: libc::c_int, component: &CStr) -> Result<File> {
+    loop {
+        let fd = unsafe { libc::openat(parent, component.as_ptr(), operator_directory_flags()) };
+        if fd >= 0 {
+            let file = unsafe { File::from_raw_fd(fd) };
+            if !file.metadata()?.is_dir() {
+                bail!("destination path component is not a directory");
+            }
+            return Ok(file);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+}
+
+fn mkdir_operator_directory_at(parent: &File, component: &[u8], mode: u32) -> Result<()> {
+    let component = CString::new(component).expect("path component was checked for NUL");
+    loop {
+        let result = unsafe {
+            libc::mkdirat(
+                parent.as_raw_fd(),
+                component.as_ptr(),
+                (mode & 0o7777) as libc::mode_t,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+}
+
+fn operator_lstat_at(parent: &File, component: &[u8]) -> io::Result<libc::stat> {
+    let component = CString::new(component).expect("path component was checked for NUL");
+    loop {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                component.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            return Ok(unsafe { metadata.assume_init() });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn operator_readlink_at(parent: &File, component: &[u8]) -> io::Result<Vec<u8>> {
+    let component = CString::new(component).expect("path component was checked for NUL");
+    let mut capacity = 256usize;
+    loop {
+        let mut target = Vec::<u8>::with_capacity(capacity);
+        let length = unsafe {
+            libc::readlinkat(
+                parent.as_raw_fd(),
+                component.as_ptr(),
+                target.as_mut_ptr().cast(),
+                capacity,
+            )
+        };
+        if length < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let length = length as usize;
+        if length < capacity {
+            unsafe { target.set_len(length) };
+            return Ok(target);
+        }
+        capacity = capacity
+            .checked_mul(2)
+            .filter(|next| *next <= libc::PATH_MAX as usize * 2)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENAMETOOLONG))?;
+    }
 }
 
 pub fn path_bytes(p: &Path) -> PathBytes {
@@ -335,12 +593,23 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+fn process_initial_cwd() -> PathBuf {
+    static INITIAL_CWD: OnceLock<PathBuf> = OnceLock::new();
+    INITIAL_CWD
+        .get_or_init(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .clone()
+}
+
 pub struct FsOps {
     fds: HashMap<FdKey, File>,
     fd_order: Vec<FdKey>,
     /// One final-file descriptor retained between the hash response and the
     /// controller's decision to repair or accept that exact inode.
     held_basis: Option<HeldBasis>,
+    operator_selection: Option<OperatorDirectorySelection>,
+    destination_root: Option<File>,
+    destination_prefix: Option<PathBytes>,
+    initial_cwd: PathBuf,
 }
 
 struct HeldBasis {
@@ -376,6 +645,277 @@ impl FsOps {
             fds: HashMap::new(),
             fd_order: Vec::new(),
             held_basis: None,
+            operator_selection: None,
+            destination_root: None,
+            destination_prefix: None,
+            initial_cwd: process_initial_cwd(),
+        }
+    }
+
+    fn check_operator_directory(
+        &mut self,
+        path: &[u8],
+        allow_missing: bool,
+        insecure_links: bool,
+    ) -> Result<Option<DirectoryAnchor>> {
+        let (selection, anchor) = select_operator_directory(path, allow_missing, insecure_links)?;
+        self.operator_selection = Some(selection);
+        Ok(anchor)
+    }
+
+    fn create_operator_directory(&mut self, mode: u32) -> Result<DirectoryAnchor> {
+        self.operator_selection
+            .as_mut()
+            .context("no checked destination directory to create")?
+            .create_missing(mode)
+    }
+
+    fn anchor_destination(
+        &mut self,
+        path: Option<&[u8]>,
+        expected_dev: u64,
+        expected_ino: u64,
+        request_prefix: &[u8],
+        insecure_links: bool,
+    ) -> Result<()> {
+        let selection = if let Some(path) = path {
+            match select_operator_directory(path, false, insecure_links) {
+                Ok((selection, Some(anchor)))
+                    if (anchor.dev, anchor.ino) == (expected_dev, expected_ino) =>
+                {
+                    selection
+                }
+                result => {
+                    // TCP workers share the receiver process with the already
+                    // anchored control connection. If the external spelling
+                    // was replaced after selection, its cwd is still the exact
+                    // retained directory and is safe to reuse.
+                    let directory = open_operator_directory_start(false)?;
+                    let metadata = directory.metadata()?;
+                    if (metadata.dev(), metadata.ino()) != (expected_dev, expected_ino) {
+                        match result {
+                            Ok((_, Some(anchor))) => bail!(
+                                "destination root changed identity (expected {expected_dev}:{expected_ino}, found {}:{})",
+                                anchor.dev,
+                                anchor.ino
+                            ),
+                            Ok((_, None)) => bail!("destination root disappeared before worker setup"),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    OperatorDirectorySelection {
+                        path: path.to_vec(),
+                        directory,
+                        missing: VecDeque::new(),
+                    }
+                }
+            }
+        } else {
+            self.operator_selection
+                .take()
+                .context("destination directory was not checked on this connection")?
+        };
+        if !selection.missing.is_empty() {
+            bail!("destination directory has not been created");
+        }
+        let anchor = selection.anchor()?;
+        if (anchor.dev, anchor.ino) != (expected_dev, expected_ino) {
+            bail!(
+                "destination root changed identity (expected {expected_dev}:{expected_ino}, found {}:{})",
+                anchor.dev,
+                anchor.ino
+            );
+        }
+        loop {
+            if unsafe { libc::fchdir(selection.directory.as_raw_fd()) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error).context("enter retained destination root");
+            }
+        }
+        self.fds.clear();
+        self.fd_order.clear();
+        self.held_basis.take();
+        self.destination_prefix = Some(request_prefix.to_vec());
+        self.destination_root = Some(selection.directory);
+
+        #[cfg(debug_assertions)]
+        if path.is_none() {
+            if let Some(ready) = std::env::var_os("SYQ_TEST_DESTINATION_ANCHORED_FILE") {
+                fs::write(&ready, b"ready").with_context(|| {
+                    format!(
+                        "write destination-anchor-ready signal {}",
+                        Path::new(&ready).display()
+                    )
+                })?;
+            }
+            if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS") {
+                if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn destination_relative(&self, path: &[u8]) -> Result<PathBytes> {
+        let Some(prefix) = self.destination_prefix.as_deref() else {
+            return Ok(path.to_vec());
+        };
+        let relative = if prefix == b"." {
+            if path == b"." {
+                b"".as_slice()
+            } else if path.starts_with(b"/") {
+                bail!("destination path is outside the retained root");
+            } else {
+                path.strip_prefix(b"./").unwrap_or(path)
+            }
+        } else if path == prefix {
+            b"".as_slice()
+        } else if prefix == b"/" {
+            path.strip_prefix(b"/")
+                .context("destination path is outside the retained root")?
+        } else {
+            path.strip_prefix(prefix)
+                .and_then(|suffix| suffix.strip_prefix(b"/"))
+                .context("destination path is outside the retained root")?
+        };
+        if relative.starts_with(b"/")
+            || relative.contains(&0)
+            || relative.split(|byte| *byte == b'/').any(|component| {
+                !relative.is_empty()
+                    && (component.is_empty() || component == b"." || component == b"..")
+            })
+        {
+            bail!("destination path contains an unsafe relative component");
+        }
+        Ok(relative.to_vec())
+    }
+
+    fn destination_full(&self, relative: &[u8]) -> PathBytes {
+        let prefix = self
+            .destination_prefix
+            .as_deref()
+            .expect("relative response requires an active destination root");
+        join(prefix, relative)
+    }
+
+    fn partial_path(&self, final_path: &Path, partial_id: &PartialId) -> Result<PathBuf> {
+        if self.destination_prefix.is_none() {
+            return partial_path(final_path, partial_id);
+        }
+        let relative = path_bytes(final_path);
+        let logical = PathBuf::from(OsStr::from_bytes(&self.destination_full(&relative)));
+        let parent = if final_path
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
+            final_path.parent().unwrap()
+        } else {
+            Path::new(".")
+        };
+        let logical_partial = partial_path_with_name_max(&logical, partial_id, name_max(parent))?;
+        Ok(PathBuf::from(OsStr::from_bytes(
+            &self.destination_relative(logical_partial.as_os_str().as_bytes())?,
+        )))
+    }
+
+    fn logical_destination_path(&self, relative: &Path) -> PathBuf {
+        if self.destination_prefix.is_some() {
+            PathBuf::from(OsStr::from_bytes(
+                &self.destination_full(relative.as_os_str().as_bytes()),
+            ))
+        } else {
+            relative.to_path_buf()
+        }
+    }
+
+    fn initial_absolute(&self, path: &[u8]) -> PathBytes {
+        let path = resolve(path);
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            self.initial_cwd.join(path)
+        };
+        path_bytes(&absolute)
+    }
+
+    fn map_request(&self, req: &Request) -> Result<Request> {
+        if self.destination_prefix.is_none() {
+            return Ok(req.clone());
+        }
+        let mut req = req.clone();
+        let map = |path: &mut PathBytes| -> Result<()> {
+            *path = self.destination_relative(path)?;
+            Ok(())
+        };
+        match &mut req {
+            Request::Scan { root, .. } => map(root)?,
+            Request::StatMany { paths, .. } | Request::PartialPaths { paths, .. } => {
+                for path in paths {
+                    map(path)?;
+                }
+            }
+            Request::Apply(ops) => {
+                for op in ops {
+                    let path = match op {
+                        Op::Mkdir { path, .. }
+                        | Op::Symlink { path, .. }
+                        | Op::Mknod { path, .. }
+                        | Op::SetMeta { path, .. }
+                        | Op::SetFileMetaIfSame { path, .. }
+                        | Op::Remove { path }
+                        | Op::Rmdir { path }
+                        | Op::Unlink { path } => path,
+                    };
+                    map(path)?;
+                }
+            }
+            Request::ProbePartial { path, .. }
+            | Request::Prepare { path, .. }
+            | Request::HashAndHold { path, .. }
+            | Request::FinishBasis { path, .. }
+            | Request::SeedBasis { path, .. }
+            | Request::PutSmall { path, .. }
+            | Request::HashBlocks { path, .. }
+            | Request::ReadRange { path, .. }
+            | Request::WriteRange { path, .. }
+            | Request::Finalize { path, .. }
+            | Request::FileHash { path }
+            | Request::Canonicalize { path } => map(path)?,
+            Request::CopyLocal { src, dst, .. } => {
+                *src = self.initial_absolute(src);
+                map(dst)?;
+            }
+            Request::Hello { .. }
+            | Request::TcpListen { .. }
+            | Request::CheckOperatorDirectory { .. }
+            | Request::CreateOperatorDirectory { .. }
+            | Request::AnchorDestination { .. }
+            | Request::TransportStats
+            | Request::Shutdown => {}
+        }
+        Ok(req)
+    }
+
+    pub fn scan_root(&self, root: &[u8]) -> Result<PathBytes> {
+        self.destination_relative(root)
+    }
+
+    fn rebase_response(&self, response: Response) -> Response {
+        if self.destination_prefix.is_none() {
+            return response;
+        }
+        match response {
+            Response::PathResults(paths) => Response::PathResults(
+                paths
+                    .into_iter()
+                    .map(|path| path.map(|path| self.destination_full(&path)))
+                    .collect(),
+            ),
+            response => response,
         }
     }
 
@@ -434,7 +974,7 @@ impl FsOps {
     ) -> Vec<std::result::Result<PathBytes, String>> {
         parallel_map(paths, |path| {
             let requested = Path::new(OsStr::from_bytes(path));
-            partial_path(&resolve(path), partial_id)
+            self.partial_path(&resolve(path), partial_id)
                 .map(|resolved| {
                     let name = resolved.file_name().expect("partial always has a name");
                     let parent = requested.parent().unwrap_or_else(|| Path::new(""));
@@ -779,7 +1319,7 @@ fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<u64>>
 impl FsOps {
     pub fn probe_partial(&mut self, path: &[u8], partial_id: &PartialId) -> Result<Response> {
         let p = resolve(path);
-        let pp = partial_path(&p, partial_id)?;
+        let pp = self.partial_path(&p, partial_id)?;
         let partial_size = match fs::symlink_metadata(&pp) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Ok(metadata) if is_safe_partial(&metadata) => Some(metadata.len()),
@@ -939,14 +1479,14 @@ impl FsOps {
         if inplace {
             self.uncache(&p);
             // A stale partial from an interrupted run would otherwise be orphaned.
-            if let Ok(pp) = partial_path(&p, partial_id) {
+            if let Ok(pp) = self.partial_path(&p, partial_id) {
                 let _ = fs::remove_file(pp);
             }
             let f = open_regular_write(&p, mode, false)?;
             f.set_len(size)?;
             return Ok(());
         }
-        let pp = partial_path(&p, partial_id)?;
+        let pp = self.partial_path(&p, partial_id)?;
         let (f, basis_size) = self.open_private_partial(&pp)?;
         if basis_size.is_some() {
             f.set_len(size)?;
@@ -1035,7 +1575,7 @@ impl FsOps {
 
     pub fn seed_basis(&mut self, path: &[u8], partial_id: &PartialId, len: u64) -> Result<()> {
         let mut held = self.take_held_basis(path, partial_id)?;
-        let pp = partial_path(&held.path, partial_id)?;
+        let pp = self.partial_path(&held.path, partial_id)?;
         let (dst, _) = self.open_private_partial(&pp)?;
         dst.set_len(0)?;
         preallocate(&dst, len)?;
@@ -1077,7 +1617,7 @@ impl FsOps {
         let target = if inplace {
             dp.clone()
         } else {
-            partial_path(&dp, partial_id)?
+            self.partial_path(&dp, partial_id)?
         };
         self.uncache(&target);
         if let Some(parent) = target.parent() {
@@ -1178,7 +1718,7 @@ impl FsOps {
         }
         let p = resolve(target.path);
         self.uncache(&p);
-        let pp = partial_path(&p, target.id)?;
+        let pp = self.partial_path(&p, target.id)?;
         self.uncache(&pp);
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -1194,7 +1734,8 @@ impl FsOps {
         if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
             // Test hook (debug builds only): model interruption after the
             // sidecar is complete but before it becomes the final name.
-            if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
+            let logical = self.logical_destination_path(&p);
+            if !pat.is_empty() && logical.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
                 bail!("put small {}: injected failure before rename", p.display());
             }
         }
@@ -1214,7 +1755,7 @@ impl FsOps {
     ) -> Result<Vec<u64>> {
         let p = resolve(path);
         let p = if which == Which::Partial {
-            partial_path(&p, partial_id)?
+            self.partial_path(&p, partial_id)?
         } else {
             p
         };
@@ -1257,7 +1798,7 @@ impl FsOps {
         let p = if inplace {
             p
         } else {
-            partial_path(&p, target.id)?
+            self.partial_path(&p, target.id)?
         };
         let f = self.cached(&p, true, attempt, !inplace)?;
         f.write_all_at(data, off)
@@ -1276,7 +1817,7 @@ impl FsOps {
         let src = if inplace {
             p.clone()
         } else {
-            partial_path(&p, partial_id)?
+            self.partial_path(&p, partial_id)?
         };
         let f = self
             .uncache(&src)
@@ -1326,16 +1867,54 @@ impl FsOps {
 
     /// Dispatch a request that has a single response (everything except Scan).
     pub fn handle(&mut self, req: &Request) -> Response {
+        let req = match self.map_request(req) {
+            Ok(req) => req,
+            Err(error) => return Response::Err(errstr(&error)),
+        };
         // HashAndHold's next request must consume the retained descriptor.
         // Any other request means the controller abandoned that comparison
         // (for example because the source hash failed), so release it here.
-        if !matches!(req, Request::FinishBasis { .. } | Request::SeedBasis { .. }) {
+        if !matches!(
+            &req,
+            Request::FinishBasis { .. } | Request::SeedBasis { .. }
+        ) {
             self.held_basis.take();
         }
-        let r: Result<Response> = match req {
+        let r: Result<Response> = match &req {
             Request::StatMany { paths, follow } => {
                 Ok(Response::Stats(self.stat_many(paths, *follow)))
             }
+            Request::CheckOperatorDirectory {
+                path,
+                allow_missing,
+                insecure_links,
+            } => self
+                .check_operator_directory(path, *allow_missing, *insecure_links)
+                .with_context(|| {
+                    format!(
+                        "resolve operator destination directory {}",
+                        resolve(path).display()
+                    )
+                })
+                .map(Response::DirectorySelection),
+            Request::CreateOperatorDirectory { mode } => self
+                .create_operator_directory(*mode)
+                .map(|anchor| Response::DirectorySelection(Some(anchor))),
+            Request::AnchorDestination {
+                path,
+                expected_dev,
+                expected_ino,
+                request_prefix,
+                insecure_links,
+            } => self
+                .anchor_destination(
+                    path.as_deref(),
+                    *expected_dev,
+                    *expected_ino,
+                    request_prefix,
+                    *insecure_links,
+                )
+                .map(|_| Response::Ok),
             Request::PartialPaths { paths, partial_id } => {
                 Ok(Response::PathResults(self.partial_paths(paths, partial_id)))
             }
@@ -1458,7 +2037,7 @@ impl FsOps {
             | Request::TcpListen { .. } => Err(anyhow!("unexpected request")),
         };
         match r {
-            Ok(resp) => resp,
+            Ok(resp) => self.rebase_response(resp),
             Err(e) => Response::Err(errstr(&e)),
         }
     }
@@ -1763,6 +2342,74 @@ mod tests {
 
         assert!(regular_opened);
         assert!(link_rejected);
+    }
+
+    #[test]
+    fn operator_directory_walk_follows_owned_links_and_reports_missing_suffixes() {
+        let dir = test_dir();
+        let real = dir.join("real/nested");
+        fs::create_dir_all(&real).unwrap();
+        symlink("real", dir.join("relative-link")).unwrap();
+        symlink(dir.join("real"), dir.join("absolute-link")).unwrap();
+
+        let expected = fs::metadata(&real).unwrap();
+        for selected in [
+            dir.join("relative-link/nested"),
+            dir.join("absolute-link/nested"),
+        ] {
+            let (_, anchor) =
+                select_operator_directory(selected.as_os_str().as_bytes(), false, false).unwrap();
+            let anchor = anchor.unwrap();
+            assert_eq!((anchor.dev, anchor.ino), (expected.dev(), expected.ino()));
+        }
+        assert!(select_operator_directory(
+            dir.join("relative-link/missing/deeper")
+                .as_os_str()
+                .as_bytes(),
+            true,
+            false,
+        )
+        .unwrap()
+        .1
+        .is_none());
+        assert!(select_operator_directory(
+            dir.join("relative-link/missing").as_os_str().as_bytes(),
+            false,
+            false,
+        )
+        .is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_operator_directory_is_created_under_retained_ancestor() {
+        let dir = test_dir();
+        fs::create_dir_all(dir.join("parent")).unwrap();
+        fs::create_dir_all(dir.join("outside")).unwrap();
+        let (mut selection, anchor) = select_operator_directory(
+            dir.join("parent/missing/deeper").as_os_str().as_bytes(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(anchor.is_none());
+
+        fs::rename(dir.join("parent"), dir.join("selected-and-moved")).unwrap();
+        symlink(dir.join("outside"), dir.join("parent")).unwrap();
+        selection.create_missing(0o755).unwrap();
+
+        assert!(dir.join("selected-and-moved/missing/deeper").is_dir());
+        assert!(!dir.join("outside/missing").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn operator_symlink_trust_is_root_or_receiver_ownership() {
+        assert!(operator_symlink_owner_is_trusted(0, 1000));
+        assert!(operator_symlink_owner_is_trusted(1000, 1000));
+        assert!(!operator_symlink_owner_is_trusted(1001, 1000));
+        assert!(!operator_symlink_owner_is_trusted(1000, 0));
     }
 
     #[test]
