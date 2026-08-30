@@ -8,8 +8,17 @@
 //! The wire representation deliberately signs a typed, canonical binary grant
 //! rather than a command line. The signature is an OpenSSH SSHSIG in the fixed
 //! [`SSHSIG_NAMESPACE`], verified by OpenSSH against an explicit allowed-signers
-//! policy. A fresh random [`RequestId`] is a replay nonce; it is a separate type
-//! and size from the stable copy/checkpoint IDs in `proto`.
+//! policy. A fresh random [`RequestId`] is a replay nonce; durable claiming gives
+//! at-most-once redemption, not exactly-once execution across a receiver crash.
+//! The ID is a separate type and size from the stable copy/checkpoint IDs in
+//! `proto`.
+//!
+//! "Durable" here means that claim contents and directory-entry changes are
+//! flushed with ordinary `fsync` through [`File::sync_all`] on a local filesystem
+//! that honors those operations. It is not a promise against filesystems or
+//! storage hardware that discard acknowledged writes. In particular, this core
+//! does not issue macOS `F_FULLFSYNC`, which Apple documents as the stronger
+//! power-loss barrier.
 
 // This module is intentionally unreachable until path confinement is ready.
 // Keep the complete core compiled in normal builds without pretending its
@@ -20,14 +29,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub(crate) const SSHSIG_NAMESPACE: &str = "syq-grant-v1@greaber.github";
 const WIRE_MAGIC: &[u8; 8] = b"SYQGRNT\0";
@@ -523,22 +534,41 @@ impl SshsigPolicy {
             .map(|contents| store.temporary_file("revocations", contents))
             .transpose()?;
 
+        // ssh-keygen must consume the exact open snapshot in the pinned replay
+        // directory. Re-resolving ReplayStore::path would let a writable
+        // ancestor rename that directory and substitute a different policy.
+        let mut inherited_files = vec![&signature_file, &allowed_file];
+        if let Some(revocation) = &revocation_file {
+            inherited_files.push(revocation);
+        }
+        for (index, file) in inherited_files.iter().enumerate() {
+            if let Err(error) = file.set_close_on_exec(false) {
+                for previous in &inherited_files[..index] {
+                    let _ = previous.set_close_on_exec(true);
+                }
+                return Err(error).context("make verifier snapshot descriptor inheritable");
+            }
+        }
+
         let mut command = Command::new(&self.ssh_keygen);
         command
             .env_clear()
             .args(["-Y", "verify", "-f"])
-            .arg(allowed_file.path())
+            .arg(allowed_file.inherited_path())
             .args(["-I", signer, "-n", SSHSIG_NAMESPACE, "-s"])
-            .arg(signature_file.path());
+            .arg(signature_file.inherited_path());
         if let Some(revocation) = &revocation_file {
-            command.arg("-r").arg(revocation.path());
+            command.arg("-r").arg(revocation.inherited_path());
         }
-        let mut child = command
+        let spawn_result = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .context("start trusted ssh-keygen SSHSIG verifier")?;
+            .spawn();
+        for file in inherited_files {
+            let _ = file.set_close_on_exec(true);
+        }
+        let mut child = spawn_result.context("start trusted ssh-keygen SSHSIG verifier")?;
         let write_result = child
             .stdin
             .take()
@@ -563,11 +593,20 @@ impl SshsigPolicy {
 
 /// Evidence that the signature, target binding, time bounds, and one-time
 /// replay claim all succeeded. This type intentionally has no conversion into
-/// existing `server::Request` authorization.
+/// existing `server::Request` authorization. A future executor must enforce
+/// `execution_deadline`; successful verification does not grant an unbounded
+/// interval in which to start or continue the operation.
 #[derive(Debug)]
 pub(crate) struct VerifiedGrant {
     #[allow(dead_code)]
     grant: GrantV1,
+    execution_deadline: Instant,
+}
+
+impl VerifiedGrant {
+    pub(crate) fn execution_deadline(&self) -> Instant {
+        self.execution_deadline
+    }
 }
 
 pub(crate) fn verify_and_claim(
@@ -576,6 +615,7 @@ pub(crate) fn verify_and_claim(
     policy: &SshsigPolicy,
     replay: &ReplayStore,
 ) -> Result<VerifiedGrant> {
+    let verification_started = Instant::now();
     let envelope = SignedGrantEnvelopeV1::decode(encoded)?;
     context.validate(&envelope.grant)?;
     let payload = envelope.signing_payload()?;
@@ -587,9 +627,51 @@ pub(crate) fn verify_and_claim(
     )?;
     let digest: [u8; 32] = Sha256::digest(&payload).into();
     replay.claim(envelope.grant.request_id, digest, context.now)?;
+    let verified_at = Instant::now();
+    let execution_deadline =
+        execution_deadline(&envelope.grant, context, verification_started, verified_at)?;
     Ok(VerifiedGrant {
         grant: envelope.grant,
+        execution_deadline,
     })
+}
+
+fn execution_deadline(
+    grant: &GrantV1,
+    context: &ReceiverContext<'_>,
+    verification_started: Instant,
+    verified_at: Instant,
+) -> Result<Instant> {
+    let elapsed = verified_at.saturating_duration_since(verification_started);
+    // Round up: underestimating verifier/claim latency could extend authority
+    // past the signed wall-clock expiry by almost a second.
+    let elapsed_seconds = elapsed
+        .as_secs()
+        .checked_add(u64::from(elapsed.subsec_nanos() != 0))
+        .ok_or_else(|| anyhow!("receiver verification duration overflow"))?;
+    let elapsed_seconds = i64::try_from(elapsed_seconds)
+        .map_err(|_| anyhow!("receiver verification duration is out of range"))?;
+    let current_wall_time = context
+        .now
+        .checked_add(elapsed_seconds)
+        .ok_or_else(|| anyhow!("receiver time overflow after verification"))?;
+    let authorization_end = grant
+        .not_after
+        .checked_add(context.clock_skew_seconds)
+        .ok_or_else(|| anyhow!("grant authorization deadline overflow"))?;
+    let remaining = authorization_end
+        .checked_sub(current_wall_time)
+        .ok_or_else(|| anyhow!("grant remaining validity overflow"))?;
+    if remaining <= 0 {
+        bail!("grant expired while it was being verified and claimed");
+    }
+    let max_runtime = match &grant.operation {
+        GrantOperationV1::Copy(copy) => u64::from(copy.limits.max_runtime_seconds),
+    };
+    let budget = max_runtime.min(remaining as u64);
+    verified_at
+        .checked_add(Duration::from_secs(budget))
+        .ok_or_else(|| anyhow!("monotonic execution deadline overflow"))
 }
 
 #[derive(Clone)]
@@ -701,36 +783,59 @@ impl ReplayStore {
 
     fn temporary_file(&self, label: &str, contents: &[u8]) -> Result<TemporaryStateFile> {
         let name = format!(".{label}-{}.tmp", hex(&random_array::<16>()?));
-        let path = self.path.join(&name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .with_context(|| format!("create private {label} file"))?;
+        let mut file = openat_file(
+            self.directory.as_raw_fd(),
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+        .with_context(|| format!("create private {label} file"))?;
         validate_private_file(&file, label)?;
         file.write_all(contents)
             .with_context(|| format!("write private {label} file"))?;
         file.flush()
             .with_context(|| format!("flush private {label} file"))?;
-        Ok(TemporaryStateFile { path })
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("rewind private {label} file"))?;
+        Ok(TemporaryStateFile {
+            directory: Arc::clone(&self.directory),
+            name,
+            file,
+        })
     }
 }
 
 struct TemporaryStateFile {
-    path: PathBuf,
+    directory: Arc<File>,
+    name: String,
+    file: File,
 }
 
 impl TemporaryStateFile {
-    fn path(&self) -> &Path {
-        &self.path
+    fn inherited_path(&self) -> PathBuf {
+        PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()))
+    }
+
+    fn set_close_on_exec(&self, close_on_exec: bool) -> io::Result<()> {
+        let current = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETFD) };
+        if current == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let updated = if close_on_exec {
+            current | libc::FD_CLOEXEC
+        } else {
+            current & !libc::FD_CLOEXEC
+        };
+        if unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETFD, updated) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
 impl Drop for TemporaryStateFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = unlinkat(self.directory.as_raw_fd(), &self.name);
     }
 }
 
@@ -779,21 +884,65 @@ fn validate_secure_executable(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         bail!("ssh-keygen verifier path must be absolute");
     }
-    let file = OpenOptions::new()
+    let mut directory = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("open trusted SSHSIG verifier {}", path.display()))?;
-    let metadata = file.metadata()?;
-    let effective_uid = unsafe { libc::geteuid() };
-    if !metadata.is_file()
-        || (metadata.uid() != 0 && metadata.uid() != effective_uid)
-        || metadata.permissions().mode() & 0o022 != 0
-        || metadata.permissions().mode() & 0o111 == 0
-    {
-        bail!("SSHSIG verifier must be a trusted non-writable executable");
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .context("open filesystem root for SSHSIG verifier validation")?;
+    let mut components = path.components().peekable();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        bail!("ssh-keygen verifier path must start at the filesystem root");
     }
-    Ok(())
+    let effective_uid = unsafe { libc::geteuid() };
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("ssh-keygen verifier path contains a noncanonical component");
+        };
+        if components.peek().is_some() {
+            let next = openat_os_file(
+                directory.as_raw_fd(),
+                name,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+            .with_context(|| {
+                format!(
+                    "securely open SSHSIG verifier ancestor in {}",
+                    path.display()
+                )
+            })?;
+            let metadata = next.metadata()?;
+            if !metadata.is_dir()
+                || (metadata.uid() != 0 && metadata.uid() != effective_uid)
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                bail!("SSHSIG verifier ancestors must be trusted and not group/world writable");
+            }
+            directory = next;
+            continue;
+        }
+
+        let file = openat_os_file(
+            directory.as_raw_fd(),
+            name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .with_context(|| format!("open trusted SSHSIG verifier {}", path.display()))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || (metadata.uid() != 0 && metadata.uid() != effective_uid)
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.permissions().mode() & 0o111 == 0
+        {
+            bail!("SSHSIG verifier must be a trusted non-writable executable");
+        }
+        // The validated ancestor chain cannot be replaced by an untrusted OS
+        // user, so Command's subsequent path resolution cannot be redirected.
+        // The receiver's own effective uid is part of the trusted boundary.
+        return Ok(());
+    }
+    bail!("ssh-keygen verifier path has no executable component")
 }
 
 fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>> {
@@ -859,7 +1008,16 @@ fn validate_claim_record(record: &[u8], request: RequestId, digest: [u8; 32]) ->
 }
 
 fn openat_file(directory: RawFd, name: &str, flags: i32, mode: libc::c_int) -> io::Result<File> {
-    let name = CString::new(name)
+    openat_os_file(directory, OsStr::new(name), flags, mode)
+}
+
+fn openat_os_file(
+    directory: RawFd,
+    name: &OsStr,
+    flags: i32,
+    mode: libc::c_int,
+) -> io::Result<File> {
+    let name = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in state filename"))?;
     loop {
         let fd = unsafe { libc::openat(directory, name.as_ptr(), flags, mode) };
@@ -1263,11 +1421,104 @@ mod tests {
 
     #[test]
     fn version_one_grant_encoding_is_frozen() {
-        let bytes = canonical_grant_bytes(&fixture_grant(1)).expect("encode version-one grant");
+        fn placement_tag(value: DestinationPlacementV1) -> u8 {
+            match value {
+                DestinationPlacementV1::ExactPath => 0,
+                DestinationPlacementV1::DirectoryContents => 1,
+                DestinationPlacementV1::DirectoryAsChild => 2,
+            }
+        }
+        fn existing_tag(value: ExistingDestinationPolicyV1) -> u8 {
+            match value {
+                ExistingDestinationPolicyV1::Replace => 0,
+                ExistingDestinationPolicyV1::Skip => 1,
+                ExistingDestinationPolicyV1::UpdateIfOlder => 2,
+                ExistingDestinationPolicyV1::MustExist => 3,
+            }
+        }
+        fn deletion_tag(value: DeletionPolicyV1) -> u8 {
+            match value {
+                DeletionPolicyV1::Forbid => 0,
+                DeletionPolicyV1::DeleteDestinationOnly => 1,
+            }
+        }
+        fn publication_tag(value: PublicationPolicyV1) -> u8 {
+            match value {
+                PublicationPolicyV1::AtomicStaged => 0,
+                PublicationPolicyV1::InPlace => 1,
+            }
+        }
+        fn append(transcript: &mut Vec<u8>, grant: &GrantV1) {
+            // Keep operation matching exhaustive so adding a V1 operation must
+            // deliberately update this schema fingerprint.
+            let operation_tag = match grant.operation {
+                GrantOperationV1::Copy(_) => 0,
+            };
+            transcript.push(operation_tag);
+            let payload = signing_payload(grant).expect("encode version-one signing payload");
+            transcript.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            transcript.extend_from_slice(&payload);
+        }
+
+        let mut transcript = Vec::new();
+        transcript.extend_from_slice(&(SSHSIG_NAMESPACE.len() as u32).to_be_bytes());
+        transcript.extend_from_slice(SSHSIG_NAMESPACE.as_bytes());
+        let mut request = 1;
+        for placement in [
+            DestinationPlacementV1::ExactPath,
+            DestinationPlacementV1::DirectoryContents,
+            DestinationPlacementV1::DirectoryAsChild,
+        ] {
+            let mut grant = fixture_grant(request);
+            request += 1;
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.policy.placement = placement;
+            transcript.push(placement_tag(placement));
+            append(&mut transcript, &grant);
+        }
+        for existing in [
+            ExistingDestinationPolicyV1::Replace,
+            ExistingDestinationPolicyV1::Skip,
+            ExistingDestinationPolicyV1::UpdateIfOlder,
+            ExistingDestinationPolicyV1::MustExist,
+        ] {
+            let mut grant = fixture_grant(request);
+            request += 1;
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.policy.existing = existing;
+            transcript.push(existing_tag(existing));
+            append(&mut transcript, &grant);
+        }
+        for deletion in [
+            DeletionPolicyV1::Forbid,
+            DeletionPolicyV1::DeleteDestinationOnly,
+        ] {
+            let mut grant = fixture_grant(request);
+            request += 1;
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.policy.deletion = deletion;
+            copy.limits.max_deletions = match deletion {
+                DeletionPolicyV1::Forbid => 0,
+                DeletionPolicyV1::DeleteDestinationOnly => 1,
+            };
+            transcript.push(deletion_tag(deletion));
+            append(&mut transcript, &grant);
+        }
+        for publication in [
+            PublicationPolicyV1::AtomicStaged,
+            PublicationPolicyV1::InPlace,
+        ] {
+            let mut grant = fixture_grant(request);
+            request += 1;
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.policy.publication = publication;
+            transcript.push(publication_tag(publication));
+            append(&mut transcript, &grant);
+        }
         assert_eq!(
-            hex(&Sha256::digest(&bytes)),
-            "14e187e3648784c1878d887e8b70bead312874ae6296e492907232481b9af1b6",
-            "changing these bytes requires a new wire version"
+            hex(&Sha256::digest(&transcript)),
+            "e39918bdef4693cbe499aeb693fddbb23ac63dde7029ed23e105b2df5eeaaab5",
+            "changing the namespace, signing bytes, or variant surface requires a new wire version"
         );
     }
 
@@ -1436,6 +1687,59 @@ mod tests {
     }
 
     #[test]
+    fn execution_deadline_is_monotonic_and_bounded_by_expiry_and_runtime() {
+        let started = Instant::now();
+        let verified = started + Duration::from_secs(3);
+
+        let mut expiry_limited = fixture_grant(17);
+        expiry_limited.not_after = NOW + 20;
+        let expiry_context = context(SIGNER, TARGET, NOW, 5);
+        assert_eq!(
+            execution_deadline(&expiry_limited, &expiry_context, started, verified)
+                .expect("expiry-limited deadline"),
+            verified + Duration::from_secs(22)
+        );
+
+        let runtime_limited = fixture_grant(18);
+        assert_eq!(
+            execution_deadline(
+                &runtime_limited,
+                &context(SIGNER, TARGET, NOW, 0),
+                started,
+                verified,
+            )
+            .expect("runtime-limited deadline"),
+            verified + Duration::from_secs(300)
+        );
+
+        let partially_elapsed = started + Duration::from_millis(1100);
+        let mut rounded = fixture_grant(19);
+        rounded.not_after = NOW + 5;
+        assert_eq!(
+            execution_deadline(
+                &rounded,
+                &context(SIGNER, TARGET, NOW, 0),
+                started,
+                partially_elapsed,
+            )
+            .expect("subsecond verification is rounded conservatively"),
+            partially_elapsed + Duration::from_secs(3)
+        );
+
+        let mut expired = fixture_grant(20);
+        expired.not_after = NOW + 1;
+        let GrantOperationV1::Copy(copy) = &mut expired.operation;
+        copy.limits.max_runtime_seconds = 1;
+        assert!(execution_deadline(
+            &expired,
+            &context(SIGNER, TARGET, NOW, 0),
+            started,
+            started + Duration::from_secs(2),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn duplicate_and_concurrent_redemption_allow_exactly_one_claim() {
         let fixture = Fixture::ordinary();
         let encoded = Arc::new(fixture.signed(fixture_grant(12)));
@@ -1501,6 +1805,33 @@ mod tests {
     }
 
     #[test]
+    fn verifier_snapshots_remain_pinned_when_the_state_path_is_replaced() {
+        let directory = TestDir::new("pinned-snapshot");
+        let state = directory.join("state");
+        let relocated = directory.join("relocated-state");
+        let store = ReplayStore::open(&state).expect("open replay store");
+        fs::rename(&state, &relocated).expect("relocate open replay directory");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .expect("replace replay pathname");
+
+        let temporary = store
+            .temporary_file("policy", b"pinned policy contents")
+            .expect("create pinned verifier snapshot");
+        let name = temporary.name.clone();
+        assert!(relocated.join(&name).is_file());
+        assert!(!state.join(&name).exists());
+        assert_eq!(
+            fs::read(temporary.inherited_path()).expect("read inherited snapshot descriptor"),
+            b"pinned policy contents"
+        );
+
+        drop(temporary);
+        assert!(!relocated.join(name).exists());
+    }
+
+    #[test]
     fn replay_store_rejects_nonprivate_or_symlinked_state() {
         let directory = TestDir::new("replay-security");
         let public = directory.join("public-state");
@@ -1518,6 +1849,25 @@ mod tests {
         let link = directory.join("state-link");
         std::os::unix::fs::symlink(&private, &link).expect("create state symlink");
         assert!(ReplayStore::open(&link).is_err());
+    }
+
+    #[test]
+    fn verifier_rejects_a_group_or_world_writable_ancestor() {
+        validate_secure_executable(&ssh_tool("ssh-keygen"))
+            .expect("system verifier chain is trusted");
+
+        let directory = TestDir::new("verifier-ancestor");
+        let ancestor = directory.join("unsafe");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&ancestor)
+            .expect("create verifier ancestor");
+        let executable = ancestor.join("ssh-keygen");
+        write_private(&executable, b"test executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))
+            .expect("make test verifier executable");
+
+        assert!(validate_secure_executable(&executable).is_err());
     }
 
     #[test]
