@@ -170,6 +170,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `-P` | Turns on `--progress` (the `--partial` half is always on; see below) |
 | `--partial` | No-op for rsync compatibility (syq always keeps partial files) |
 | `--numeric-ids` | No-op for rsync compatibility (syq always uses numeric uid/gid) |
+| `--insecure-links` | Allow a receiving process to follow destination-path symlinks owned by other users (unsafe legacy opt-out) |
 | `--progress-json` | One JSON line per second on stderr |
 | `--stats` | Summary counts at the end |
 | `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
@@ -280,9 +281,13 @@ Identical to rsync:
   the original source count for placement, so `syq file file new-dest` creates
   the directory `new-dest` and writes `new-dest/file`.
 - An explicitly supplied destination root that is a symlink to a directory is
-  that directory (the link is kept, with or without a trailing slash). A
-  symlink encountered below the destination root is payload at that path: it
-  is replaced rather than followed, even when it points to a directory.
+  that directory when the link is owned by root or by the receiver's effective
+  uid (the link is kept, with or without a trailing slash). A foreign-owned
+  component is refused unless `--insecure-links` is given. Each receiving
+  connection retains and verifies the selected directory, so replacing the
+  external destination spelling afterward cannot redirect its writes. A
+  symlink encountered below the destination root is payload at that path: it is
+  replaced rather than followed, even when it points to a directory.
 - Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
   payload and produce one warning summary. Before transfer starts, SYQ rejects
   the exceptional case where a mapped payload path exactly equals a sidecar
@@ -312,7 +317,11 @@ Each source gets its own `mapping` line. The annotation distinguishes directory
 contents, a directory copied as a child, a file placed inside a directory, and
 an exact destination path. `--files-from` is identified as a selected-path
 mapping. A destination-root symlink is shown as the effective directory it
-resolves to. The `changes` line separately accounts for regular files,
+resolves to. By default, syq follows a symlink in this operator-named path only
+when the link is owned by root or by the receiving process's effective user,
+matching rsync. This rule is the same for every receiver; running as root makes
+links owned by an unprivileged user fail it. `--insecure-links` restores the
+legacy follow-any-link behavior. The `changes` line separately accounts for regular files,
 directories, symlinks, special files, and metadata-only updates; type
 replacements are called out as an overlapping subset. This is a current
 preflight assessment, not a frozen mutation ledger that can later be executed

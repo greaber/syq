@@ -117,12 +117,20 @@ fn partial_files(dir: &Path) -> Vec<PathBuf> {
 
 #[cfg(debug_assertions)]
 fn interrupted_partial(args: &[&str], dir: &Path) -> PathBuf {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    interrupted_partial_from(args, dir, None)
+}
+
+#[cfg(debug_assertions)]
+fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> PathBuf {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
         .args(args)
         .arg("--no-progress")
-        .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000")
-        .spawn()
-        .unwrap();
+        .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command.spawn().unwrap();
     let partial = (0..300).find_map(|_| {
         let mut partials = partial_files(dir);
         if partials.len() == 1 {
@@ -4418,6 +4426,36 @@ fn exact_payload_sidecar_collision_fails_before_publication() {
     assert!(!t.path("dst").join(collision_name).exists());
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn exact_payload_sidecar_collision_with_dot_destination_fails_before_publication() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
+    fs::create_dir(t.path("dst")).unwrap();
+    let src = t.s("src/");
+    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, "."];
+    let partial = interrupted_partial_from(&args, &t.path("dst"), Some(&t.path("dst")));
+    let collision_name = partial.file_name().unwrap().to_owned();
+    fs::remove_file(&partial).unwrap();
+    write(
+        &t.path("src").join(&collision_name),
+        b"deliberate collision",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .current_dir(t.path("dst"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reserved sidecar"), "{stderr}");
+    assert!(!t.path("dst/file").exists());
+    assert!(!t.path("dst").join(collision_name).exists());
+}
+
 // Several content sources map onto the destination root; the last one's
 // metadata wins, as for any other directory.
 #[test]
@@ -5383,6 +5421,95 @@ fn symlink_destination_is_followed() {
         .file_type()
         .is_symlink());
     assert_eq!(read(&t.path("real/src/f")), b"hi");
+}
+
+#[test]
+fn foreign_owned_destination_root_symlink_is_refused_unless_explicitly_allowed() {
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"payload");
+    fs::create_dir_all(t.path("outside")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
+    let foreign_uid = 65_534;
+    std::os::unix::fs::lchown(t.path("dst"), Some(foreign_uid), Some(foreign_uid)).unwrap();
+
+    let refused = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert!(!refused.status.success(), "foreign-owned link was followed");
+    assert!(
+        stderr_of(&refused).contains("refusing symlink component"),
+        "{}",
+        stderr_of(&refused)
+    );
+    assert!(!t.path("outside/f").exists());
+
+    run_ok(&["-a", "--insecure-links", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(read(&t.path("outside/f")), b"payload");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn destination_root_replacement_after_selection_cannot_redirect_worker() {
+    for no_tcp in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/f"), b"payload");
+        fs::create_dir_all(t.path("dst")).unwrap();
+        fs::create_dir_all(t.path("outside")).unwrap();
+        let ready = t.path("anchor-ready");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args(["-a", "-j", "1", &t.s("src/"), &t.s("dst/")]);
+        if no_tcp {
+            command.arg("--no-tcp");
+        }
+        let mut child = command
+            .arg("--no-progress")
+            .env("SYQ_TEST_DESTINATION_ANCHORED_FILE", &ready)
+            .env("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS", "1000")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before retaining the destination root"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "destination root was not retained before timeout"
+        );
+
+        fs::rename(t.path("dst"), t.path("selected-and-moved")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        if no_tcp {
+            assert!(
+                !output.status.success(),
+                "a fresh worker reused a changed root"
+            );
+            assert!(
+                stderr_of(&output).contains("destination root changed identity"),
+                "{}",
+                stderr_of(&output)
+            );
+            assert!(!t.path("selected-and-moved/f").exists());
+        } else {
+            assert_output_ok(&output);
+            assert_eq!(read(&t.path("selected-and-moved/f")), b"payload");
+        }
+        assert!(!t.path("outside/f").exists());
+        assert!(fs::symlink_metadata(t.path("dst"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 }
 
 #[test]
@@ -6536,7 +6663,7 @@ fn direct_remote_to_remote_passes_through_defined_exit_codes() {
 }
 
 #[test]
-fn direct_remote_to_remote_forwards_compression_opt_out() {
+fn direct_remote_to_remote_forwards_receiver_policy_opt_outs() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     fs::create_dir_all(t.path("remote-bin")).unwrap();
@@ -6548,15 +6675,25 @@ fn direct_remote_to_remote_forwards_compression_opt_out() {
     let out = remote_syq(
         &t,
         &rsh,
-        &["-a", "--no-bootstrap", "--no-compress", &src, &dst],
+        &[
+            "-a",
+            "--no-bootstrap",
+            "--no-compress",
+            "--insecure-links",
+            &src,
+            &dst,
+        ],
     );
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"payload");
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     assert!(
-        fs::read_to_string(t.path("rsh.log"))
-            .unwrap()
-            .contains("--no-compress"),
+        log.contains("--no-compress"),
         "the source-side orchestrator silently reverted to default compression"
+    );
+    assert!(
+        log.contains("--insecure-links"),
+        "the source-side orchestrator silently changed destination-link policy"
     );
 }
 

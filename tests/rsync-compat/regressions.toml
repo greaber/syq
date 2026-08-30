@@ -9,8 +9,8 @@ impact = "security"
 status = "partial"
 claim = "Peer-selected source and destination paths must not be redirected outside their transfer roots by raced parent symlinks."
 compat_tests = ["sender-scan-dir-escape", "symlink-race-source", "symlink-race-dest", "symlink-race-relative-dest"]
-local_tests = ["self_copy_guard_sees_through_symlinks", "files_from_self_copy_through_symlinked_root_is_rejected"]
-note = "Source-side confinement passes. The two root-only destination tests deliberately retain expected failures for attacker-owned symlinks in operator-named destination paths, so this remains partial and highly visible."
+local_tests = ["destination_root_replacement_after_selection_cannot_redirect_worker", "self_copy_guard_sees_through_symlinks", "files_from_self_copy_through_symlinked_root_is_rejected"]
+note = "Source-side confinement and retained operator-named destination roots pass. Destination operations still resolve in-tree descendant components from relative pathnames, so descendant parent-component race confinement remains partial and highly visible."
 
 [[regressions]]
 id = "rsync-359"
