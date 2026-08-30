@@ -294,6 +294,7 @@ pub enum Request {
     ProbePartial {
         path: PathBytes,
         partial_id: PartialId,
+        guard: Option<ContainerGuard>,
     },
     /// Create/adjust the write target for `path` with the given final size.
     /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
@@ -351,6 +352,7 @@ pub enum Request {
         partial_id: PartialId,
         block: u64,
         len: u64,
+        guard: Option<ContainerGuard>,
     },
     ReadRange {
         path: PathBytes,
@@ -384,6 +386,8 @@ pub enum Request {
     PutSmallBatch(Vec<SmallPut>),
     FileHash {
         path: PathBytes,
+        condition: TargetCondition,
+        guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
     /// existing prefix resolved), for a stable job identity.

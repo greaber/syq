@@ -30,7 +30,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 const DIRECTORY_SEARCH_FLAGS: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
@@ -304,27 +304,46 @@ impl Root {
     /// the final directory therefore cannot be rebound through a later lookup
     /// of any public ancestor pathname.
     pub(crate) fn create_path_directory_noreplace(path: &Path, mode: u32) -> Result<RootIdentity> {
-        let mut components: Vec<_> = path.components().collect();
-        let mut current = if path.is_absolute() {
-            if matches!(components.first(), Some(Component::RootDir)) {
-                components.remove(0);
+        let components: Vec<_> = path.components().collect();
+        let prefix_len = components
+            .iter()
+            .rposition(|component| matches!(component, Component::ParentDir))
+            .map_or(0, |index| index + 1);
+        let (prefix, suffix) = components.split_at(prefix_len);
+        let mut current = if prefix.is_empty() {
+            if path.is_absolute() {
+                Self::open(Path::new("/"))?
+            } else {
+                Self::open(Path::new("."))?
             }
-            Self::open(Path::new("/"))?
         } else {
-            Self::open(Path::new("."))?
+            let mut explicit = PathBuf::new();
+            for component in prefix {
+                explicit.push(component.as_os_str());
+            }
+            // Resolve every parent component in the one explicit root
+            // selection. Once creation begins, walking `..` from a held
+            // directory would be unsafe because a rename can change that
+            // directory's parent.
+            Self::open(&explicit)?
         };
+        hold_after_parent_prefix_for_test()?;
 
-        let leaf = components
-            .pop()
+        let mut suffix = suffix;
+        if matches!(suffix.first(), Some(Component::RootDir)) {
+            suffix = &suffix[1..];
+        }
+
+        let (leaf, parents) = suffix
+            .split_last()
             .context("new container path has no leaf name")?;
-        let Component::Normal(leaf) = leaf else {
+        let Component::Normal(leaf) = *leaf else {
             bail!("new container path must end in a normal path component");
         };
 
-        for component in components {
+        for component in parents {
             current = match component {
                 Component::CurDir => continue,
-                Component::ParentDir => current.open_explicit_directory(b"..")?,
                 Component::Normal(name) => match current.open_explicit_directory(name.as_bytes()) {
                     Ok(directory) => directory,
                     Err(error) if is_not_found(&error) => {
@@ -338,7 +357,7 @@ impl Root {
                     }
                     Err(error) => return Err(error),
                 },
-                Component::RootDir | Component::Prefix(_) => {
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     bail!("unexpected root component in new container path")
                 }
             };
@@ -1098,6 +1117,24 @@ fn hold_after_created_parent_for_test() -> Result<()> {
 
 #[cfg(not(debug_assertions))]
 fn hold_after_created_parent_for_test() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_parent_prefix_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_PARENT_PREFIX_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARENT_PREFIX_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_parent_prefix_for_test() -> Result<()> {
     Ok(())
 }
 

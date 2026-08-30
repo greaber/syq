@@ -1896,6 +1896,29 @@ fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+fn hold_before_finalize_for_test(path: &[u8]) -> Result<()> {
+    let Some(suffix) = std::env::var_os("SYQ_TEST_BEFORE_FINALIZE_SUFFIX") else {
+        return Ok(());
+    };
+    if !path.ends_with(suffix.as_bytes()) {
+        return Ok(());
+    }
+    if let Some(ready) = std::env::var_os("SYQ_TEST_BEFORE_FINALIZE_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_BEFORE_FINALIZE_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_before_finalize_for_test(_path: &[u8]) -> Result<()> {
+    Ok(())
+}
 fn create_container(conn: &mut dyn Conn, path: &[u8], mode: u32) -> Result<ContainerGuard> {
     match ok(
         conn.call(Request::CreateContainer {
@@ -4935,6 +4958,7 @@ impl Worker {
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
                     partial_id: self.partial_id(),
+                    guard: job.container_guard.clone(),
                 })?,
                 "probe partial",
             )? {
@@ -5229,6 +5253,7 @@ impl Worker {
                 partial_id: self.partial_id(),
                 block: self.opts.block,
                 len: job.entry.size,
+                guard: job.container_guard.clone(),
             },
             "hash destination",
         )
@@ -5271,6 +5296,7 @@ impl Worker {
             partial_id: self.partial_id(),
             block,
             len: size,
+            guard: None,
         })?;
         self.dst.send(destination_request)?;
         // Both requests are in flight. Always consume both responses before
@@ -5455,6 +5481,7 @@ impl Worker {
         let mut meta = job.entry.meta();
         meta.mode = self.create_mode(&job);
         let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
+        hold_before_finalize_for_test(&job.dst)?;
         let finalized = ok(
             self.dst.call(Request::Finalize {
                 path: job.dst.clone(),
@@ -5479,6 +5506,7 @@ impl Worker {
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
                     partial_id: self.partial_id(),
+                    guard: job.container_guard.clone(),
                 })?,
                 "probe partial after finalize",
             )? {
@@ -5501,9 +5529,13 @@ impl Worker {
     fn contents_match(&mut self, job: &FileJob) -> Result<bool> {
         self.src.send(Request::FileHash {
             path: job.src.clone(),
+            condition: TargetCondition::Any,
+            guard: None,
         })?;
         self.dst.send(Request::FileHash {
             path: job.dst.clone(),
+            condition: job.target_condition,
+            guard: job.container_guard.clone(),
         })?;
         let source = self.src.recv();
         let destination = self.dst.recv();
@@ -5601,9 +5633,13 @@ impl Worker {
         let r = (|| -> Result<bool> {
             self.src.send(Request::FileHash {
                 path: job.src.clone(),
+                condition: TargetCondition::Any,
+                guard: None,
             })?;
             self.dst.send(Request::FileHash {
                 path: job.dst.clone(),
+                condition: job.target_condition,
+                guard: job.container_guard.clone(),
             })?;
             // Keep both reusable connections aligned even if one endpoint
             // reports an ordinary per-file error.

@@ -519,6 +519,106 @@ fn missing_container_parents_are_walked_through_held_descriptors() {
 }
 
 #[cfg(debug_assertions)]
+#[test]
+fn parent_components_are_resolved_before_held_parent_creation() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("source/file"), b"source");
+    fs::create_dir_all(t.path("base/gate")).unwrap();
+    fs::create_dir(t.path("outside")).unwrap();
+    let ready = t.path("parent-prefix-ready");
+    let target = t.path("base/gate/../target");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            &t.s("source"),
+            "--into-new",
+            &target.to_string_lossy(),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_PARENT_PREFIX_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_PARENT_PREFIX_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_signal(&ready);
+    fs::rename(t.path("base/gate"), t.path("outside/gate")).unwrap();
+    symlink(t.path("outside"), t.path("base/gate")).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "parent-component race unexpectedly succeeded"
+    );
+    assert!(t.path("base/target").is_dir());
+    assert!(!t.path("outside/target").exists());
+    assert!(!t.path("outside/file").exists());
+}
+
+#[test]
+fn missing_component_before_parent_component_is_not_bootstrapped() {
+    let t = Tmp::new();
+    write(&t.path("source/file"), b"source");
+
+    let output = native_syq(&[
+        "cp",
+        "--src-src",
+        &t.s("source"),
+        "--into-new",
+        &t.s("missing/../target"),
+    ]);
+
+    assert!(!output.status.success());
+    assert!(!t.path("missing").exists());
+    assert!(!t.path("target").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn finalize_recovery_keeps_the_container_guard() {
+    let t = Tmp::new();
+    let data = vec![b'x'; 8 * 1024 * 1024];
+    write(&t.path("source/file"), &data);
+    fs::create_dir(t.path("target")).unwrap();
+    let ready = t.path("before-finalize-ready");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            &t.s("source"),
+            "--into-existing",
+            &t.s("target"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_BEFORE_FINALIZE_SUFFIX", "file")
+        .env("SYQ_TEST_BEFORE_FINALIZE_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_BEFORE_FINALIZE_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_signal(&ready);
+    fs::rename(t.path("target"), t.path("original-target")).unwrap();
+    write(&t.path("target/file"), &data);
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "replacement container satisfied finalize recovery"
+    );
+    assert_eq!(read(&t.path("target/file")), data);
+    assert!(
+        !partial_files(&t.path("original-target")).is_empty(),
+        "guard-rejected finalize should preserve its staged file"
+    );
+}
+
+#[cfg(debug_assertions)]
 fn swap_staging_directory(t: &Tmp) -> PathBuf {
     let stages: Vec<_> = fs::read_dir(t.path(""))
         .unwrap()
