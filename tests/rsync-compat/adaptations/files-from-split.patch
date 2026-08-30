@@ -75,7 +75,8 @@ index 3a1b990..6939cc8 100644
  #!/usr/bin/env python3
 -"""Coverage of --files-from, -0/--from0, --exclude-from, --include-from at depth.
 +"""Coverage of --files-from and -0/--from0 at depth.
- 
+-
++
  --files-from selects exactly the listed source-relative paths (creating their
 -implied parent dirs); --from0 makes the list NUL-delimited; --exclude-from /
 ---include-from read filter patterns from a file. All resolve names several
@@ -85,7 +86,8 @@ index 3a1b990..6939cc8 100644
  """
 @@ -45,50 +44,3 @@ for rel in unlisted:
      assert_not_exists(TODIR / rel, label=f'--from0 excluded {rel}')
- 
+-
++
 -# --- comments: line mode and --from0 both ignore them -----------------------
 -rmtree(TODIR)
 -(src / '#ignored').write_text('hash ignored\n')

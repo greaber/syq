@@ -46,7 +46,7 @@ status = "covered"
 claim = "A source that shrinks at read time must fail visibly, preserve an existing destination, and not abort unrelated later files."
 compat_tests = ["source-read-failure-continues"]
 local_tests = []
-note = "The adapted fixture deterministically mutates the source in SYQ's ReadRange path and checks all three consequences."
+note = "The adapted fixture uses an external positioned-read shim and checks all three consequences against ordinary debug or release binaries."
 
 [[regressions]]
 id = "rsync-remote-shell-newline"

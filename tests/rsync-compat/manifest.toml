@@ -294,15 +294,15 @@ note = "Remote-shell copy and follow-up deletion using SYQ's remote executable o
 name = "source-read-failure-continues"
 upstream_test = "source-change-size-continues"
 classification = "adapted"
-adaptation = "source-read-failure-syq-hook"
+adaptation = "source-read-failure-preload"
 adaptation_kind = "fixture"
 area = "failure-isolation"
 position = "compatible"
 baseline = "pass"
 platforms = ["linux"]
 tags = ["local", "source-change", "partial-failure", "data-integrity"]
-requirements = ["debug SYQ build"]
-note = "A deterministic source shrink during ReadRange fails visibly, preserves the existing destination, and allows a later file to transfer; rsync's exact exit code and diagnostic wording are not required."
+requirements = ["C compiler", "LD_PRELOAD", "/proc/self/fd"]
+note = "An external shim deterministically shrinks a source at its first positioned read. The failure remains visible, preserves the existing destination, and allows a later file to transfer; rsync's exact exit code and diagnostic wording are not required."
 
 [[tests]]
 name = "symlink-race-dest"
