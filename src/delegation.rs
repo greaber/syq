@@ -12,6 +12,9 @@
 //! at-most-once redemption, not exactly-once execution across a receiver crash.
 //! The ID is a separate type and size from the stable copy/checkpoint IDs in
 //! `proto`.
+//! Redeemed IDs are rejected from the pinned claim store before invoking the
+//! verifier. Each verifier runs in an isolated process group with a 30-second
+//! deadline; a timeout kills the group before request handling returns.
 //!
 //! "Durable" here means that claim contents and directory-entry changes are
 //! flushed with ordinary `fsync` through [`File::sync_all`] on a local filesystem
@@ -46,8 +49,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub(crate) const SSHSIG_NAMESPACE: &str = "syq-grant-v1@greaber.github";
@@ -59,6 +63,8 @@ const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 const MAX_ENVELOPE_BYTES: usize = WIRE_HEADER_LEN + MAX_GRANT_BYTES + MAX_SIGNATURE_BYTES;
 const MAX_POLICY_BYTES: usize = 1024 * 1024;
 const MAX_REVOCATION_BYTES: usize = 4 * 1024 * 1024;
+const MAX_VERIFIER_OUTPUT_BYTES: usize = 4096;
+const VERIFIER_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_LOGIN_BYTES: usize = 256;
 const MAX_SIGNER_BYTES: usize = 512;
@@ -612,31 +618,29 @@ impl SshsigPolicy {
         }
         unsafe {
             command.pre_exec(move || {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
                 for (source, target) in &mappings {
                     dup2_retry(*source, *target)?;
                 }
                 Ok(())
             });
         }
-        let mut child = command
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .context("start trusted ssh-keygen SSHSIG verifier")?;
-        let write_result = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("SSHSIG verifier stdin unavailable"))?
-            .write_all(payload)
-            .context("write SSHSIG verification payload");
-        let output = child
-            .wait_with_output()
-            .context("wait for SSHSIG verifier")?;
-        write_result?;
+        let output = wait_for_verifier(child, payload, VERIFIER_TIMEOUT)?;
         if !output.status.success() {
             let diagnostic = String::from_utf8_lossy(&output.stderr);
-            let diagnostic: String = diagnostic.trim().chars().take(4096).collect();
+            let diagnostic: String = diagnostic
+                .trim()
+                .chars()
+                .take(MAX_VERIFIER_OUTPUT_BYTES)
+                .collect();
             if diagnostic.is_empty() {
                 bail!("SSHSIG verification failed");
             }
@@ -644,6 +648,95 @@ impl SshsigPolicy {
         }
         Ok(())
     }
+}
+
+#[derive(Debug)]
+struct VerifierOutput {
+    status: ExitStatus,
+    stderr: Vec<u8>,
+}
+
+fn wait_for_verifier(
+    mut child: Child,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<VerifierOutput> {
+    let process_group =
+        libc::pid_t::try_from(child.id()).context("SSHSIG verifier process ID is out of range")?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow!("SSHSIG verifier timeout overflow"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("SSHSIG verifier stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("SSHSIG verifier stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("SSHSIG verifier stderr unavailable"))?;
+    let payload = payload.to_vec();
+    let writer = thread::spawn(move || stdin.write_all(&payload));
+    let stdout_reader = thread::spawn(move || read_verifier_output(stdout));
+    let stderr_reader = thread::spawn(move || read_verifier_output(stderr));
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                terminate_verifier(&mut child, process_group);
+                let _ = writer.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error).context("poll SSHSIG verifier");
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            // pre_exec creates a dedicated process group, so descendants cannot
+            // keep the verifier pipes or receiver resources alive after timeout.
+            terminate_verifier(&mut child, process_group);
+            let _ = writer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("SSHSIG verifier exceeded its configured timeout");
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(10)));
+    };
+
+    writer
+        .join()
+        .map_err(|_| anyhow!("SSHSIG verifier input worker panicked"))?
+        .context("write SSHSIG verification payload")?;
+    stdout_reader
+        .join()
+        .map_err(|_| anyhow!("SSHSIG verifier output worker panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("SSHSIG verifier diagnostic worker panicked"))??;
+    Ok(VerifierOutput { status, stderr })
+}
+
+fn terminate_verifier(child: &mut Child, process_group: libc::pid_t) {
+    let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn read_verifier_output(mut output: impl Read) -> io::Result<Vec<u8>> {
+    let mut contents = Vec::new();
+    output
+        .by_ref()
+        .take(MAX_VERIFIER_OUTPUT_BYTES as u64 + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() > MAX_VERIFIER_OUTPUT_BYTES {
+        contents.truncate(MAX_VERIFIER_OUTPUT_BYTES);
+    }
+    Ok(contents)
 }
 
 /// Evidence that the signature, target binding, time bounds, and one-time
@@ -673,13 +766,14 @@ pub(crate) fn verify_and_claim(
     let envelope = SignedGrantEnvelopeV1::decode(encoded)?;
     context.validate_at(&envelope.grant, Instant::now())?;
     let payload = envelope.signing_payload()?;
+    let digest: [u8; 32] = Sha256::digest(&payload).into();
+    replay.reject_if_claimed(envelope.grant.request_id, digest)?;
     policy.verify(
         replay,
         context.expected_signer,
         &envelope.signature,
         &payload,
     )?;
-    let digest: [u8; 32] = Sha256::digest(&payload).into();
     replay.claim_after_lock(envelope.grant.request_id, digest, || {
         context.validate_at(&envelope.grant, Instant::now())
     })?;
@@ -739,6 +833,20 @@ impl ReplayStore {
 
     fn claim(&self, request: RequestId, digest: [u8; 32], claimed_at: i64) -> Result<()> {
         self.claim_after_lock(request, digest, || Ok(claimed_at))
+    }
+
+    fn reject_if_claimed(&self, request: RequestId, digest: [u8; 32]) -> Result<()> {
+        request.validate()?;
+        let final_name = format!("claim-{}", request.file_component());
+        if let Some(existing) = readat_optional(
+            self.directory.as_raw_fd(),
+            &final_name,
+            CLAIM_RECORD_LEN + 1,
+        )? {
+            validate_claim_record(&existing, request, digest)?;
+            bail!("signed request has already been redeemed");
+        }
+        Ok(())
     }
 
     fn claim_after_lock(
@@ -949,9 +1057,7 @@ fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
 }
 
 fn open_existing_replay_directory(path: &Path) -> Result<File> {
-    if !path.is_absolute() {
-        bail!("replay state directory must be absolute");
-    }
+    validate_canonical_trusted_path(path, "replay state directory")?;
     let mut directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -1015,9 +1121,7 @@ fn validate_private_file(file: &File, label: &str) -> Result<()> {
 }
 
 fn validate_secure_executable(path: &Path) -> Result<()> {
-    if !path.is_absolute() {
-        bail!("ssh-keygen verifier path must be absolute");
-    }
+    validate_canonical_trusted_path(path, "ssh-keygen verifier")?;
     let mut directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -1076,9 +1180,7 @@ fn validate_secure_executable(path: &Path) -> Result<()> {
 }
 
 fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>> {
-    if !path.is_absolute() {
-        bail!("{label} path must be absolute");
-    }
+    validate_canonical_trusted_path(path, label)?;
     let mut directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -1137,6 +1239,22 @@ fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u
         bail!("{label} size is outside the supported range");
     }
     Ok(contents)
+}
+
+fn validate_canonical_trusted_path(path: &Path, label: &str) -> Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.first() != Some(&b'/') {
+        bail!("{label} path must be absolute");
+    }
+    if bytes.len() > 1
+        && (bytes.ends_with(b"/")
+            || bytes[1..]
+                .split(|byte| *byte == b'/')
+                .any(|component| component.is_empty() || component == b"." || component == b".."))
+    {
+        bail!("{label} path contains a noncanonical component");
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1345,6 +1463,7 @@ mod tests {
 
     const NOW: i64 = 1_900_000_000;
     const SIGNER: &str = "alice@example.test";
+    const MALLORY: &str = "mallory@example.test";
     const TARGET: &str = "backup";
 
     struct TestDir(PathBuf);
@@ -1469,6 +1588,18 @@ mod tests {
             .arg(path)
             .stdin(Stdio::null());
         command_output(command, "generate test signing key");
+    }
+
+    fn certify_key(ca: &Path, public_key: &Path, principals: &str) {
+        let mut command = Command::new(ssh_tool("ssh-keygen"));
+        command
+            .env_clear()
+            .args(["-q", "-s"])
+            .arg(ca)
+            .args(["-I", "syq-test", "-n", principals])
+            .arg(public_key)
+            .stdin(Stdio::null());
+        command_output(command, "create test signing certificate");
     }
 
     fn write_private(path: &Path, contents: &[u8]) {
@@ -2009,14 +2140,14 @@ mod tests {
         let replay = fixture.replay("expired-replay");
         assert!(verify_and_claim(
             &encoded,
-            &context(SIGNER, TARGET, NOW + 611, 10),
+            &context(SIGNER, TARGET, NOW + 620, 10),
             &fixture.policy(),
             &replay,
         )
         .is_err());
         verify_and_claim(
             &encoded,
-            &context(SIGNER, TARGET, NOW + 605, 10),
+            &context(SIGNER, TARGET, NOW + 590, 10),
             &fixture.policy(),
             &replay,
         )
@@ -2030,14 +2161,14 @@ mod tests {
         let replay = fixture.replay("future-replay");
         assert!(verify_and_claim(
             &encoded,
-            &context(SIGNER, TARGET, NOW, 99),
+            &context(SIGNER, TARGET, NOW, 90),
             &fixture.policy(),
             &replay,
         )
         .is_err());
         verify_and_claim(
             &encoded,
-            &context(SIGNER, TARGET, NOW, 100),
+            &context(SIGNER, TARGET, NOW + 50, 60),
             &fixture.policy(),
             &replay,
         )
@@ -2143,22 +2274,30 @@ mod tests {
             threads.push(thread::spawn(move || {
                 barrier.wait();
                 verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
-                    .is_ok()
             }));
         }
-        let successes = threads
+        let results: Vec<_> = threads
             .into_iter()
             .map(|thread| thread.join().expect("redemption thread"))
-            .filter(|succeeded| *succeeded)
-            .count();
-        assert_eq!(successes, 1);
-        assert!(verify_and_claim(
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let failures: Vec<_> = results.into_iter().filter_map(Result::err).collect();
+        assert_eq!(failures.len(), 7);
+        assert!(failures.iter().all(|error| error
+            .to_string()
+            .contains("signed request has already been redeemed")));
+        let mut no_verifier = fixture.policy();
+        no_verifier.ssh_keygen = PathBuf::from("/missing/verifier-must-not-run");
+        let error = verify_and_claim(
             &encoded,
             &context(SIGNER, TARGET, NOW, 0),
-            &fixture.policy(),
+            &no_verifier,
             &replay,
         )
-        .is_err());
+        .expect_err("duplicate request must fail");
+        assert!(error
+            .to_string()
+            .contains("signed request has already been redeemed"));
     }
 
     #[test]
@@ -2264,6 +2403,8 @@ mod tests {
             .mode(0o700)
             .create(&private)
             .expect("create private state directory");
+        let dotted = PathBuf::from(format!("{}/./private-state", directory.0.display()));
+        assert!(ReplayStore::open(&dotted).is_err());
         let link = directory.join("state-link");
         std::os::unix::fs::symlink(&private, &link).expect("create state symlink");
         assert!(ReplayStore::open(&link).is_err());
@@ -2398,21 +2539,80 @@ mod tests {
     }
 
     #[test]
+    fn verifier_timeout_kills_its_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("start stalled verifier fixture");
+        let started = Instant::now();
+        let error = wait_for_verifier(child, b"test", Duration::from_millis(50))
+            .expect_err("stalled verifier must time out");
+        assert!(error.to_string().contains("timeout"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn rejects_a_key_authorized_only_for_another_principal() {
+        let directory = TestDir::new("wrong-principal-key");
+        let key = directory.join("mallory");
+        generate_key(&key);
+        let allowed_signers = directory.join("allowed-signers");
+        write_allowed_signers(&allowed_signers, MALLORY, &key.with_extension("pub"), false);
+        let encoded = signed_envelope(fixture_grant(24), &key, SSHSIG_NAMESPACE, None);
+        let replay_path = directory.join("replay");
+        provision_test_replay_directory(&replay_path);
+        let replay = ReplayStore::open(&replay_path).expect("open replay store");
+        let policy = SshsigPolicy {
+            ssh_keygen: ssh_tool("ssh-keygen"),
+            allowed_signers,
+            revocation_file: None,
+        };
+
+        assert!(
+            verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_a_revoked_signing_key() {
+        let fixture = Fixture::ordinary();
+        let revocations = fixture.directory.join("revocations");
+        let public_key =
+            fs::read(fixture.key.with_extension("pub")).expect("read revoked test public key");
+        write_private(&revocations, &public_key);
+        let mut policy = fixture.policy();
+        policy.revocation_file = Some(revocations);
+        let replay = fixture.replay("revoked-replay");
+
+        assert!(verify_and_claim(
+            &fixture.signed(fixture_grant(25)),
+            &context(SIGNER, TARGET, NOW, 0),
+            &policy,
+            &replay,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn verifies_certificate_signature_against_allowed_ca() {
         let directory = TestDir::new("certificate");
         let ca = directory.join("ca");
         let user = directory.join("user");
         generate_key(&ca);
         generate_key(&user);
-        let mut certify = Command::new(ssh_tool("ssh-keygen"));
-        certify
-            .env_clear()
-            .args(["-q", "-s"])
-            .arg(&ca)
-            .args(["-I", "syq-test", "-n", SIGNER])
-            .arg(user.with_extension("pub"))
-            .stdin(Stdio::null());
-        command_output(certify, "create test signing certificate");
+        certify_key(&ca, &user.with_extension("pub"), SIGNER);
 
         let agent = start_agent(&directory);
         add_to_agent(&agent, &user);
@@ -2435,5 +2635,73 @@ mod tests {
         };
         verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
             .expect("verify SSH certificate signature through allowed CA");
+    }
+
+    #[test]
+    fn rejects_certificate_without_the_expected_principal() {
+        let directory = TestDir::new("certificate-principal");
+        let ca = directory.join("ca");
+        let user = directory.join("user");
+        generate_key(&ca);
+        generate_key(&user);
+        certify_key(&ca, &user.with_extension("pub"), MALLORY);
+
+        let agent = start_agent(&directory);
+        add_to_agent(&agent, &user);
+        let allowed_signers = directory.join("allowed-signers");
+        write_allowed_signers(&allowed_signers, SIGNER, &ca.with_extension("pub"), true);
+        let encoded = signed_envelope(
+            fixture_grant(26),
+            &directory.join("user-cert.pub"),
+            SSHSIG_NAMESPACE,
+            Some(&agent),
+        );
+        let replay_path = directory.join("replay");
+        provision_test_replay_directory(&replay_path);
+        let replay = ReplayStore::open(&replay_path).expect("open replay store");
+        let policy = SshsigPolicy {
+            ssh_keygen: ssh_tool("ssh-keygen"),
+            allowed_signers,
+            revocation_file: None,
+        };
+
+        assert!(
+            verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_certificate_when_ca_is_not_marked_as_an_authority() {
+        let directory = TestDir::new("certificate-not-ca");
+        let ca = directory.join("ca");
+        let user = directory.join("user");
+        generate_key(&ca);
+        generate_key(&user);
+        certify_key(&ca, &user.with_extension("pub"), SIGNER);
+
+        let agent = start_agent(&directory);
+        add_to_agent(&agent, &user);
+        let allowed_signers = directory.join("allowed-signers");
+        write_allowed_signers(&allowed_signers, SIGNER, &ca.with_extension("pub"), false);
+        let encoded = signed_envelope(
+            fixture_grant(27),
+            &directory.join("user-cert.pub"),
+            SSHSIG_NAMESPACE,
+            Some(&agent),
+        );
+        let replay_path = directory.join("replay");
+        provision_test_replay_directory(&replay_path);
+        let replay = ReplayStore::open(&replay_path).expect("open replay store");
+        let policy = SshsigPolicy {
+            ssh_keygen: ssh_tool("ssh-keygen"),
+            allowed_signers,
+            revocation_file: None,
+        };
+
+        assert!(
+            verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay,)
+                .is_err()
+        );
     }
 }
