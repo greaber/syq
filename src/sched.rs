@@ -13,6 +13,8 @@ pub struct FileJob {
     pub rel: String,
     pub entry: Entry,
     pub dst_entry: Option<Entry>,
+    /// Placement-root condition enforced by the receiver at publication.
+    pub target_condition: crate::proto::TargetCondition,
     pub attempts: u32,
     /// Bytes of this file in place on the destination (transferred or matched).
     pub done: Arc<AtomicU64>,
