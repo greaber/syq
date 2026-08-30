@@ -422,6 +422,26 @@ impl FsOps {
         removed
     }
 
+    fn create_container(&mut self, path: &[u8], mode: u32) -> Result<ContainerGuard> {
+        let target = resolve(path);
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create parent {}", parent.display()))?;
+            }
+        }
+        let (parent, relative) = exact_parent(&target)?;
+        // The container has to remain writable while descendants are copied.
+        // Deferred directory metadata restores the requested final mode.
+        let identity = parent.create_directory_noreplace(&relative, (mode & 0o7777) | 0o700)?;
+        hold_after_created_container_for_test(&target)?;
+        Ok(ContainerGuard {
+            root: path.to_vec(),
+            dev: identity.dev,
+            ino: identity.ino,
+        })
+    }
+
     fn cached_rooted(
         &mut self,
         label: &Path,
@@ -822,11 +842,9 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
     match op {
         Op::Mkdir { mode, .. } => {
             if path.is_empty() {
-                let directory = root.open_directory(path)?;
-                let metadata = directory.metadata()?;
-                if metadata.mode() & 0o700 != 0o700 {
-                    directory
-                        .set_permissions(fs::Permissions::from_mode(metadata.mode() | 0o700))?;
+                let metadata = root.metadata(path)?;
+                if metadata.mode & 0o700 != 0o700 {
+                    root.chmod(path, metadata.mode | 0o700)?;
                 }
                 return Ok(());
             }
@@ -904,11 +922,18 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
 
 fn set_meta_rooted(target: &GuardedTarget, meta: &Meta, flags: u8) -> Result<()> {
     if target.relative.is_empty() {
-        let directory = target.root.open_directory(&target.relative)?;
-        return set_meta_file(&directory, meta, flags);
+        apply_owner(flags, meta, |uid, gid| {
+            target.root.chown(&target.relative, uid, gid)
+        })?;
+        if flags & flags::MODE != 0 {
+            target.root.chmod(&target.relative, meta.mode)?;
+        }
     }
     let metadata = target.root.metadata(&target.relative)?;
-    if metadata.is_symlink() {
+    if target.relative.is_empty() {
+        // Ownership and mode were applied through descriptor-relative "."
+        // above; only timestamps remain below.
+    } else if metadata.is_symlink() {
         apply_owner(flags, meta, |uid, gid| {
             target.root.chown(&target.relative, uid, gid)
         })?;
@@ -985,6 +1010,11 @@ fn file_type_bits(mode: u32) -> u32 {
 
 fn exact_parent(path: &Path) -> Result<(Root, RelativePath)> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     let leaf = path
         .file_name()
         .context("exact replacement target has no leaf name")?;
@@ -1001,6 +1031,30 @@ fn replace_exact_node(path: &Path, mode: u32, rdev: u64, condition: TargetCondit
     let (dev, ino) = condition_identity(condition)?;
     let (root, relative) = exact_parent(path)?;
     root.replace_node_if_same(&relative, mode, rdev, dev, ino)
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_created_container_for_test(path: &Path) -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_CREATED_CONTAINER_READY_FILE") {
+        fs::write(&ready, b"ready").with_context(|| {
+            format!(
+                "write created-container-ready signal {} for {}",
+                Path::new(&ready).display(),
+                path.display()
+            )
+        })?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_CREATED_CONTAINER_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_created_container_for_test(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(debug_assertions)]
@@ -2107,6 +2161,9 @@ impl FsOps {
                 })
             }
             Request::Apply { ops, guard } => Ok(Response::Applied(self.apply(ops, guard.as_ref()))),
+            Request::CreateContainer { path, mode } => {
+                self.create_container(path, *mode).map(Response::Container)
+            }
             Request::ProbePartial { path, partial_id } => self.probe_partial(path, partial_id),
             Request::Prepare {
                 path,
