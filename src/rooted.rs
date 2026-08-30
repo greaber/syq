@@ -749,44 +749,20 @@ fn root_metadata_from_std(metadata: &std::fs::Metadata) -> Result<RootMetadata> 
     })
 }
 
-#[cfg(target_os = "linux")]
 fn stat_mtime(stat: &libc::stat) -> i64 {
     stat.st_mtime
 }
 
-#[cfg(not(target_os = "linux"))]
-fn stat_mtime(stat: &libc::stat) -> i64 {
-    stat.st_mtimespec.tv_sec
-}
-
-#[cfg(target_os = "linux")]
 fn stat_mtime_nsec(stat: &libc::stat) -> u32 {
     stat.st_mtime_nsec as u32
 }
 
-#[cfg(not(target_os = "linux"))]
-fn stat_mtime_nsec(stat: &libc::stat) -> u32 {
-    stat.st_mtimespec.tv_nsec as u32
-}
-
-#[cfg(target_os = "linux")]
 fn stat_ctime(stat: &libc::stat) -> i64 {
     stat.st_ctime
 }
 
-#[cfg(not(target_os = "linux"))]
-fn stat_ctime(stat: &libc::stat) -> i64 {
-    stat.st_ctimespec.tv_sec
-}
-
-#[cfg(target_os = "linux")]
 fn stat_ctime_nsec(stat: &libc::stat) -> u32 {
     stat.st_ctime_nsec as u32
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stat_ctime_nsec(stat: &libc::stat) -> u32 {
-    stat.st_ctimespec.tv_nsec as u32
 }
 
 #[cfg(target_os = "linux")]
