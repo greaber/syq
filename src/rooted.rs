@@ -302,7 +302,10 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
 }
 
 fn open_at(parent: RawFd, name: &CString, flags: libc::c_int, mode: u32) -> io::Result<File> {
-    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, mode as libc::mode_t) };
+    // `mode_t` is narrower than `int` on some platforms (including macOS),
+    // so C's default argument promotions require an `int` in this variadic
+    // position. Our callers have already restricted modes to 0o7777.
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, mode as libc::c_int) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
