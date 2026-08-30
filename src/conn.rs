@@ -80,6 +80,12 @@ pub(crate) fn is_tcp_congestion_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<TcpCongestionError>())
 }
 
+pub(crate) fn tcp_congestion_fallback_note(requested: Option<&str>) -> String {
+    requested
+        .map(|algorithm| format!("; requested congestion control {algorithm} was not used"))
+        .unwrap_or_default()
+}
+
 #[cfg(target_os = "linux")]
 fn tcp_congestion_control<S: AsRawFd>(socket: &S) -> std::io::Result<String> {
     // Linux currently caps names at TCP_CA_NAME_MAX (16 including NUL). Leave
@@ -1019,7 +1025,12 @@ impl RemoteSpec {
                         break;
                     }
                     Err(error) if is_tcp_congestion_error(&error) => {
-                        return Err(error).with_context(|| self.label())
+                        return Err(error).with_context(|| {
+                            format!(
+                                "local/orchestrating host could not configure the connecting data socket to {}",
+                                self.label()
+                            )
+                        })
                     }
                     Err(e) => last = anyhow!("{addr}:{}: {e}", info.port),
                 }
@@ -1637,7 +1648,10 @@ impl Endpoint {
                                     i.failed = true;
                                     i.failure = Some(format!("{e:#}"));
                                     if !spec.quiet || crate::transfer::debug() {
-                                        eprintln!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#})", spec.label(), info.port);
+                                        let congestion_note = tcp_congestion_fallback_note(
+                                            info.congestion_control.as_deref(),
+                                        );
+                                        eprintln!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#}{congestion_note})", spec.label(), info.port);
                                     }
                                 }
                             }
@@ -1733,6 +1747,51 @@ mod tests {
         let error = configure_tcp_congestion(&listener, Some("syq_missing_cc")).unwrap_err();
         assert!(is_tcp_congestion_error(&error));
         assert!(error.to_string().contains("kernel rejected"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connecting_socket_congestion_rejection_is_attributed_locally() {
+        let spec = RemoteSpec {
+            user: None,
+            host: "remote.example".into(),
+            rsh: vec!["ssh".into()],
+            syq_path: None,
+            auto_helper: false,
+            helper_install: Default::default(),
+            quiet: false,
+            tcp: Default::default(),
+            diagnostics: Default::default(),
+        };
+        let info = TcpInfo {
+            addrs: vec!["127.0.0.1".into()],
+            port: 9,
+            key: None,
+            token: Vec::new(),
+            congestion_control: Some("syq_missing_cc".into()),
+            failed: false,
+            failure: None,
+            next: Default::default(),
+        };
+
+        let error = spec
+            .connect_tcp(&info, false)
+            .err()
+            .expect("unregistered congestion control should fail locally");
+        let message = format!("{error:#}");
+        assert!(is_tcp_congestion_error(&error));
+        assert!(message.contains(
+            "local/orchestrating host could not configure the connecting data socket to remote.example"
+        ));
+    }
+
+    #[test]
+    fn tcp_fallback_note_reports_an_unused_override() {
+        assert_eq!(tcp_congestion_fallback_note(None), "");
+        assert_eq!(
+            tcp_congestion_fallback_note(Some("reno")),
+            "; requested congestion control reno was not used"
+        );
     }
 
     #[test]

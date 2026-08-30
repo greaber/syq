@@ -929,13 +929,9 @@ pub fn run(args: Args) -> Result<i32> {
                         });
                     }
                     if !args.quiet || debug() {
-                        let congestion_note = args
-                            .tcp_congestion
-                            .as_deref()
-                            .map(|algorithm| {
-                                format!("; requested congestion control {algorithm} was not used")
-                            })
-                            .unwrap_or_default();
+                        let congestion_note = crate::conn::tcp_congestion_fallback_note(
+                            args.tcp_congestion.as_deref(),
+                        );
                         eprintln!(
                             "syq: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}{congestion_note}); a Tailscale address or an open port is faster",
                             spec.label(),

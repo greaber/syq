@@ -475,20 +475,13 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
 fn parse_tcp_congestion(value: &str) -> std::result::Result<String, String> {
     // Linux's TCP_CA_NAME_MAX is 16 including the terminating NUL. Keep this
     // validation platform-independent so a forwarded command fails the same
-    // way on every orchestrator.
+    // way on every orchestrator. The kernel otherwise looks up the registered
+    // name exactly, without imposing a character whitelist.
     if value.is_empty() {
         return Err("congestion-control algorithm cannot be empty".into());
     }
     if value.len() >= 16 {
         return Err("congestion-control algorithm must be at most 15 bytes".into());
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return Err(
-            "congestion-control algorithm may contain only ASCII letters, digits, and `_`".into(),
-        );
     }
     Ok(value.to_string())
 }
@@ -619,7 +612,13 @@ mod tests {
             args(&["--tcp-congestion", "bbr"]).tcp_congestion.as_deref(),
             Some("bbr")
         );
-        for value in ["", "not-an-algo", "1234567890123456"] {
+        assert_eq!(
+            args(&["--tcp-congestion", "foo-bar"])
+                .tcp_congestion
+                .as_deref(),
+            Some("foo-bar")
+        );
+        for value in ["", "1234567890123456"] {
             let parsed = Args::try_parse_from(["syq", "--tcp-congestion", value, "src", "dst"]);
             assert!(parsed.is_err(), "accepted {value:?}");
         }
