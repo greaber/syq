@@ -172,11 +172,14 @@ Placement is always explicit in this initial native surface:
 
 The receiver enforces `new` and `existing` again when it mutates the target,
 not only during planning. New targets use no-replace creation or publication.
-Existing containers must remain the same directory object; an exact existing
-regular file is updated through the object that passed preflight, preserving
-its inode (and therefore updating any hard-link aliases). An exact
-`--as-existing` operation that would change the target's type is refused; use
-`--as` when replacement is intended.
+Existing containers must remain the same directory object: every descendant
+mutation reopens that identity and uses descriptor-relative filesystem calls,
+so replacing the container path makes the operation fail without touching its
+replacement. An exact existing regular file is updated through the object that
+passed preflight, preserving its inode (and therefore updating any hard-link
+aliases). Existing symlinks and special files can be atomically replaced by
+the same type. An exact `--as-existing` operation that would change the
+target's type is refused; use `--as` when type replacement is intended.
 
 `cp` copies or updates mapped source objects and keeps unrelated target
 objects. `cprm` uses the same mapping and transfer engine, then applies the

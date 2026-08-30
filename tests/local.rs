@@ -103,6 +103,24 @@ fn spawn_native_after_precondition(args: &[&str], ready: &Path) -> std::process:
 }
 
 #[cfg(debug_assertions)]
+fn spawn_native_before_guarded_mutation(
+    args: &[&str],
+    suffix: &str,
+    ready: &Path,
+) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_GUARDED_MUTATION_SUFFIX", suffix)
+        .env("SYQ_TEST_GUARDED_MUTATION_READY_FILE", ready)
+        .env("SYQ_TEST_HOLD_GUARDED_MUTATION_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn native command held at guarded receiver mutation")
+}
+
+#[cfg(debug_assertions)]
 fn wait_for_signal(path: &Path) {
     for attempt in 0..500 {
         if path.exists() {
@@ -340,6 +358,106 @@ fn native_placement_preconditions_are_enforced_at_mutation_time() {
     );
     assert_eq!(read(&t.path("into-existing/concurrent")), b"winner");
     assert!(!t.path("into-existing/file").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_container_identity_anchors_worker_writes_and_cprm_deletions() {
+    let t = Tmp::new();
+    write(&t.path("source/file"), b"source");
+
+    fs::create_dir_all(t.path("into-existing")).unwrap();
+    let existing_ready = t.path("existing-worker-ready");
+    let existing = spawn_native_before_guarded_mutation(
+        &[
+            "cp",
+            "--src-src",
+            &t.s("source"),
+            "--into-existing",
+            &t.s("into-existing"),
+        ],
+        "file",
+        &existing_ready,
+    );
+    wait_for_signal(&existing_ready);
+    fs::rename(t.path("into-existing"), t.path("displaced-existing")).unwrap();
+    write(&t.path("into-existing/winner"), b"replacement");
+    let output = existing.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced worker unexpectedly succeeded"
+    );
+    assert_eq!(read(&t.path("into-existing/winner")), b"replacement");
+    assert!(!t.path("into-existing/file").exists());
+
+    let new_ready = t.path("new-worker-ready");
+    let new = spawn_native_before_guarded_mutation(
+        &[
+            "cp",
+            "--src-src",
+            &t.s("source"),
+            "--into-new",
+            &t.s("into-new"),
+        ],
+        "file",
+        &new_ready,
+    );
+    wait_for_signal(&new_ready);
+    fs::rename(t.path("into-new"), t.path("displaced-new")).unwrap();
+    write(&t.path("into-new/winner"), b"replacement");
+    let output = new.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced new-container worker succeeded"
+    );
+    assert_eq!(read(&t.path("into-new/winner")), b"replacement");
+    assert!(!t.path("into-new/file").exists());
+
+    fs::create_dir_all(t.path("empty-source")).unwrap();
+    write(&t.path("mirror/extra"), b"old extra");
+    let delete_ready = t.path("delete-ready");
+    let delete = spawn_native_before_guarded_mutation(
+        &[
+            "cprm",
+            "--src-src",
+            &t.s("empty-source"),
+            "--into-existing",
+            &t.s("mirror"),
+        ],
+        "extra",
+        &delete_ready,
+    );
+    wait_for_signal(&delete_ready);
+    fs::rename(t.path("mirror"), t.path("displaced-mirror")).unwrap();
+    write(&t.path("mirror/extra"), b"replacement extra");
+    let output = delete.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced cprm unexpectedly succeeded"
+    );
+    assert_eq!(read(&t.path("mirror/extra")), b"replacement extra");
+}
+
+#[test]
+fn native_as_existing_updates_a_same_type_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    symlink("new-target", t.path("source-link")).unwrap();
+    symlink("old-target", t.path("destination-link")).unwrap();
+
+    run_native_ok(&[
+        "cp",
+        "--src-no-follow",
+        &t.s("source-link"),
+        "--as-existing",
+        &t.s("destination-link"),
+    ]);
+
+    assert_eq!(
+        fs::read_link(t.path("destination-link")).unwrap(),
+        Path::new("new-target")
+    );
 }
 
 #[test]

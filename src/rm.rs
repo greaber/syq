@@ -80,7 +80,9 @@ fn worker(
                 _ => Vec::new(),
             })
             .collect();
-        let res = conn.call(Request::Apply(ops)).and_then(|r| ok(r, "remove"));
+        let res = conn
+            .call(Request::Apply { ops, guard: None })
+            .and_then(|r| ok(r, "remove"));
         match res {
             Ok(Response::Applied(errs)) => {
                 for (name, err) in names.iter().zip(errs) {
