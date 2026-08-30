@@ -10,7 +10,7 @@ use crate::progress::{commas, Progress};
 use crate::proto::*;
 use crate::transfer::{connect_ctl, endpoint};
 use anyhow::{bail, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
@@ -146,7 +146,7 @@ fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct SelectorKey {
     absolute: bool,
     components: Vec<Vec<u8>>,
@@ -171,40 +171,48 @@ impl SelectorKey {
     }
 }
 
-/// Give one lexical removal root one scan. Exact aliases are coalesced, and
-/// overlapping roots are ordered deepest-first so they can be serialized
-/// without dropping selections that pass through a selected symlink.
+fn selection_order(selection: SourceSelection) -> u8 {
+    match selection {
+        SourceSelection::Contents => 0,
+        SourceSelection::Named | SourceSelection::NamedNoFollow | SourceSelection::Rsync => 1,
+    }
+}
+
+/// Give each distinct lexical path-and-mode selector one scan. Exact aliases
+/// in the same mode are deduplicated. Cross-mode selectors remain independent,
+/// and overlapping roots are ordered so they can be serialized without one
+/// selection mutating the namespace beneath another.
 fn normalize_native_rm_locations(locs: Vec<Location>) -> (Vec<Location>, bool) {
-    let mut positions: HashMap<SelectorKey, usize> = HashMap::new();
+    let mut identities = HashSet::new();
     let mut normalized: Vec<(Location, SelectorKey)> = Vec::with_capacity(locs.len());
     for location in locs {
         let key = SelectorKey::new(&location.path);
-        match positions.get(&key).copied() {
-            Some(position) => {
-                let existing: &mut Location = &mut normalized[position].0;
-                if existing.selection == SourceSelection::Contents
-                    && location.selection == SourceSelection::NamedNoFollow
-                {
-                    existing.selection = location.selection;
-                }
-            }
-            None => {
-                positions.insert(key.clone(), normalized.len());
-                normalized.push((location, key));
-            }
+        let identity = (key.clone(), location.selection);
+        if !identities.insert(identity) {
+            continue;
         }
+        normalized.push((location, key));
     }
 
     let overlaps = normalized.iter().enumerate().any(|(index, (_, key))| {
-        normalized[index + 1..]
-            .iter()
-            .any(|(_, other)| key.is_strict_ancestor_of(other) || other.is_strict_ancestor_of(key))
+        normalized[index + 1..].iter().any(|(_, other)| {
+            key == other || key.is_strict_ancestor_of(other) || other.is_strict_ancestor_of(key)
+        })
     });
     if overlaps {
-        // Stable by selector order within one depth; only ancestry constrains
-        // the order needed to avoid one scan mutating beneath another.
-        normalized
-            .sort_by(|(_, left), (_, right)| right.components.len().cmp(&left.components.len()));
+        // Descendants precede ancestors. At one path, contents precedes the
+        // named object so a selected symlink remains usable for that scan.
+        normalized.sort_by(|(left_location, left), (right_location, right)| {
+            right
+                .components
+                .len()
+                .cmp(&left.components.len())
+                .then_with(|| left.cmp(right))
+                .then_with(|| {
+                    selection_order(left_location.selection)
+                        .cmp(&selection_order(right_location.selection))
+                })
+        });
     }
     (
         normalized

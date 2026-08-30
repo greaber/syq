@@ -427,7 +427,7 @@ fn native_rm_is_idempotent_for_exact_duplicate_selectors() {
 }
 
 #[test]
-fn native_rm_named_selector_subsumes_same_path_contents_selector() {
+fn native_rm_serializes_same_path_selection_modes() {
     let t = Tmp::new();
     for trial in 0..5 {
         let relative = format!("overlap-{trial}");
@@ -441,6 +441,56 @@ fn native_rm_named_selector_subsumes_same_path_contents_selector() {
             run_native_ok(&["rm", "--src-src", &path, "--src", &path]);
         }
         assert!(!t.path(&relative).exists());
+    }
+}
+
+#[test]
+fn native_rm_preserves_both_same_path_modes_for_symlink_roots() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    for contents_first in [false, true] {
+        let suffix = u8::from(contents_first);
+        let referent = format!("referent-{suffix}");
+        let link = format!("link-{suffix}");
+        for file in 0..1_000 {
+            write(&t.path(&format!("{referent}/file-{file}")), b"data");
+        }
+        symlink(&referent, t.path(&link)).unwrap();
+        let path = t.s(&link);
+
+        if contents_first {
+            run_native_ok(&["rm", "--src-src", &path, "--src", &path]);
+        } else {
+            run_native_ok(&["rm", "--src", &path, "--src-src", &path]);
+        }
+
+        assert!(!t.path(&link).exists());
+        assert!(t.path(&referent).is_dir());
+        assert_eq!(fs::read_dir(t.path(&referent)).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn native_rm_same_path_file_modes_keep_current_stop_on_scan_error() {
+    let t = Tmp::new();
+    for contents_first in [false, true] {
+        let relative = format!("file-modes-{}", u8::from(contents_first));
+        write(&t.path(&relative), b"data");
+        let path = t.s(&relative);
+        let output = if contents_first {
+            native_syq(&["rm", "--src-src", &path, "--src", &path])
+        } else {
+            native_syq(&["rm", "--src", &path, "--src-src", &path])
+        };
+
+        assert_eq!(output.status.code(), Some(23));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("is not a directory"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(read(&t.path(&relative)), b"data");
     }
 }
 
