@@ -32,6 +32,9 @@ use std::time::Duration;
 /// Agent messages are normally only a few KiB. This accommodates large
 /// identity lists without allowing a peer to force an unbounded allocation.
 const MAX_AGENT_FRAME: usize = 256 * 1024;
+/// Bound stalled forwarded clients and ambient-agent operations while leaving
+/// enough time for hardware-token touch/PIN/confirmation prompts.
+const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(120);
 const SSH_AGENT_FAILURE: &[u8] = &[5];
 const SSH_AGENT_SUCCESS: &[u8] = &[6];
 const SSH_AGENT_EXTENSION_FAILURE: &[u8] = &[28];
@@ -92,27 +95,10 @@ pub fn resolve_host_policy(
     host: &str,
     load_user_certificates: bool,
 ) -> Result<HostPolicy> {
-    let mut command = Command::new(ssh_program);
-    command.arg("-G");
-    if let Some(user) = explicit_user {
-        command.args(["-l", user]);
-    }
-    command.args(["--", host]).env("LC_ALL", "C");
-    let output = command
-        .output()
-        .with_context(|| format!("inspect SSH configuration for {host}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "could not inspect SSH configuration for {host}{}",
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        );
-    }
-    let config = parse_ssh_config(&output.stdout)
+    let output = inspect_ssh_configuration(ssh_program, explicit_user, host, false)?;
+    let defaults = inspect_ssh_configuration(ssh_program, explicit_user, host, true)?;
+    let defaults = KnownHostsDefaults::from_openssh(&defaults)?;
+    let config = parse_ssh_config_with_defaults(&output, Some(&defaults))
         .with_context(|| format!("parse `ssh -G` output for {host}"))?;
     let keygen = ssh_keygen_for(ssh_program);
     let (mut host_keys, saw_ca) = read_known_host_keys(&keygen, &config.lookup, &config.files)?;
@@ -144,6 +130,38 @@ pub fn resolve_host_policy(
     })
 }
 
+fn inspect_ssh_configuration(
+    ssh_program: &str,
+    explicit_user: Option<&str>,
+    host: &str,
+    compiled_defaults_only: bool,
+) -> Result<Vec<u8>> {
+    let mut command = Command::new(ssh_program);
+    command.arg("-G");
+    if compiled_defaults_only {
+        command.args(["-F", "/dev/null"]);
+    }
+    if let Some(user) = explicit_user {
+        command.args(["-l", user]);
+    }
+    command.args(["--", host]).env("LC_ALL", "C");
+    let output = command
+        .output()
+        .with_context(|| format!("inspect SSH configuration for {host}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "could not inspect SSH configuration for {host}{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        );
+    }
+    Ok(output.stdout)
+}
+
 #[derive(Debug)]
 struct EffectiveSshConfig {
     user: String,
@@ -160,7 +178,59 @@ struct EffectiveSshConfig {
     identity_files: Vec<String>,
 }
 
+#[derive(Debug)]
+struct KnownHostsDefault {
+    rendered: String,
+    files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct KnownHostsDefaults {
+    user: KnownHostsDefault,
+    global: KnownHostsDefault,
+}
+
+impl KnownHostsDefaults {
+    fn from_openssh(output: &[u8]) -> Result<Self> {
+        let (user, global) = known_hosts_values(output)?;
+        let account = local_account()?;
+        let user_files = [
+            PathBuf::from(&account.home).join(".ssh/known_hosts"),
+            PathBuf::from(&account.home).join(".ssh/known_hosts2"),
+        ];
+        let expected_user = user_files
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if user != expected_user {
+            bail!(
+                "OpenSSH reported unfamiliar compiled UserKnownHostsFile defaults; constrained agent forwarding cannot recover their filename boundaries"
+            );
+        }
+        let global_files = parse_compiled_global_known_hosts(&global)?;
+        Ok(Self {
+            user: KnownHostsDefault {
+                rendered: user,
+                files: user_files.into_iter().collect(),
+            },
+            global: KnownHostsDefault {
+                rendered: global,
+                files: global_files,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
 fn parse_ssh_config(output: &[u8]) -> Result<EffectiveSshConfig> {
+    parse_ssh_config_with_defaults(output, None)
+}
+
+fn parse_ssh_config_with_defaults(
+    output: &[u8],
+    defaults: Option<&KnownHostsDefaults>,
+) -> Result<EffectiveSshConfig> {
     let output = std::str::from_utf8(output).context("SSH configuration was not UTF-8")?;
     let mut user = None;
     let mut hostname = None;
@@ -216,16 +286,11 @@ fn parse_ssh_config(output: &[u8]) -> Result<EffectiveSshConfig> {
                 }
             }
             "identityfile" if value != "none" => identity_files.push(value.to_string()),
-            "userknownhostsfile" | "globalknownhostsfile" => {
-                for path in value
-                    .split_ascii_whitespace()
-                    .filter(|path| *path != "none")
-                {
-                    if path.contains('%') || path.starts_with('~') {
-                        bail!("unexpanded known_hosts path {path:?} in `ssh -G` output");
-                    }
-                    files.push(PathBuf::from(path));
-                }
+            "userknownhostsfile" => {
+                append_known_hosts_files(&mut files, value, defaults.map(|item| &item.user))?;
+            }
+            "globalknownhostsfile" => {
+                append_known_hosts_files(&mut files, value, defaults.map(|item| &item.global))?;
             }
             _ => {}
         }
@@ -260,6 +325,72 @@ fn parse_ssh_config(output: &[u8]) -> Result<EffectiveSshConfig> {
         certificate_files_configured,
         identity_files,
     })
+}
+
+fn known_hosts_values(output: &[u8]) -> Result<(String, String)> {
+    let output = std::str::from_utf8(output).context("SSH configuration was not UTF-8")?;
+    let mut user = None;
+    let mut global = None;
+    for line in output.lines() {
+        let Some((name, value)) = line.split_once(' ') else {
+            continue;
+        };
+        match name {
+            "userknownhostsfile" => user = Some(value.trim().to_owned()),
+            "globalknownhostsfile" => global = Some(value.trim().to_owned()),
+            _ => {}
+        }
+    }
+    Ok((
+        user.context("missing SSH UserKnownHostsFile")?,
+        global.context("missing SSH GlobalKnownHostsFile")?,
+    ))
+}
+
+fn parse_compiled_global_known_hosts(value: &str) -> Result<Vec<PathBuf>> {
+    if value == "none" {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for path in value.split_ascii_whitespace() {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!("OpenSSH reported a relative compiled GlobalKnownHostsFile default");
+        }
+        files.push(path);
+    }
+    if files.is_empty() {
+        bail!("OpenSSH reported empty compiled GlobalKnownHostsFile defaults");
+    }
+    Ok(files)
+}
+
+fn append_known_hosts_files(
+    files: &mut Vec<PathBuf>,
+    value: &str,
+    compiled_default: Option<&KnownHostsDefault>,
+) -> Result<()> {
+    if value == "none" {
+        return Ok(());
+    }
+    if let Some(compiled_default) = compiled_default.filter(|default| default.rendered == value) {
+        files.extend(compiled_default.files.iter().cloned());
+        return Ok(());
+    }
+    if value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        bail!(
+            "ambiguous known_hosts filenames in `ssh -G` output {value:?}; OpenSSH removes quoting, so constrained agent forwarding accepts only one whitespace-free configured file per directive"
+        );
+    }
+    if value.contains('%') || value.starts_with('~') {
+        bail!("unexpanded known_hosts path {value:?} in `ssh -G` output");
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        bail!("relative known_hosts path {value:?} in `ssh -G` output");
+    }
+    files.push(path);
+    Ok(())
 }
 
 fn configured_host_key_allowed(config: &EffectiveSshConfig, key: &KeyData) -> bool {
@@ -541,7 +672,10 @@ fn read_user_certificates(paths: &[PathBuf]) -> Result<Vec<Certificate>> {
         certificate
             .verify_signature()
             .with_context(|| format!("verify CertificateFile {}", path.display()))?;
-        if !certificates.contains(&certificate) {
+        if !certificates
+            .iter()
+            .any(|existing| certificates_equal_on_wire(existing, &certificate))
+        {
             certificates.push(certificate);
         }
     }
@@ -845,6 +979,8 @@ struct ConnectionRegistry {
 
 impl ConnectionRegistry {
     fn track(self: &Arc<Self>, stream: UnixStream) -> io::Result<TrackedStream> {
+        stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
         let registered = stream.try_clone()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.streams
@@ -1192,8 +1328,23 @@ impl SanitizedIdentities {
     fn advertises(&self, credential: &PublicCredential) -> bool {
         self.advertised
             .iter()
-            .any(|identity| &identity.credential == credential)
+            .any(|identity| credentials_equal_on_wire(&identity.credential, credential))
     }
+}
+
+fn credentials_equal_on_wire(left: &PublicCredential, right: &PublicCredential) -> bool {
+    let mut left_encoded = Vec::new();
+    let mut right_encoded = Vec::new();
+    left.encode(&mut left_encoded).is_ok()
+        && right.encode(&mut right_encoded).is_ok()
+        && left_encoded == right_encoded
+}
+
+fn certificates_equal_on_wire(left: &Certificate, right: &Certificate) -> bool {
+    credentials_equal_on_wire(
+        &PublicCredential::Cert(Box::new(left.clone())),
+        &PublicCredential::Cert(Box::new(right.clone())),
+    )
 }
 
 fn sanitize_identities(
@@ -1221,11 +1372,16 @@ fn sanitize_identities(
                 || certificates.iter().any(|certificate| {
                     matches!(
                         &identity.credential,
-                        PublicCredential::Cert(advertised) if advertised.as_ref() == certificate
+                        PublicCredential::Cert(advertised)
+                            if certificates_equal_on_wire(advertised, certificate)
                     )
                 })
         })
         .cloned()
+        .map(|mut identity| {
+            identity.comment.clear();
+            identity
+        })
         .collect();
     for certificate in certificates {
         let credential = PublicCredential::Cert(Box::new(certificate.clone()));
@@ -1234,14 +1390,14 @@ fn sanitize_identities(
         }
         if advertised
             .iter()
-            .any(|identity| identity.credential == credential)
+            .any(|identity| credentials_equal_on_wire(&identity.credential, &credential))
         {
             continue;
         }
         if ambient_raw_keys.contains(certificate.public_key()) {
             advertised.push(Identity {
                 credential,
-                comment: format!("syq CertificateFile {}", certificate.key_id()),
+                comment: String::new(),
             });
         }
     }
@@ -1266,8 +1422,10 @@ fn translated_sign_request(
     if let PublicCredential::Cert(certificate) = &request.credential {
         let ambient_has_exact_certificate = ambient_identities
             .iter()
-            .any(|identity| identity.credential == request.credential);
-        let configured_locally = certificates.contains(certificate.as_ref());
+            .any(|identity| credentials_equal_on_wire(&identity.credential, &request.credential));
+        let configured_locally = certificates
+            .iter()
+            .any(|configured| certificates_equal_on_wire(configured, certificate));
         let ambient_has_raw_key = ambient_identities.iter().any(|identity| {
             matches!(
                 &identity.credential,
@@ -1631,17 +1789,42 @@ mod tests {
 
     #[test]
     fn parses_effective_host_lookup_and_files() {
-        let config = parse_ssh_config(
-            b"host alias\nuser backup\nhostname vault.internal\nport 2222\nuserknownhostsfile /tmp/one /tmp/two\nglobalknownhostsfile none\nhostkeyalgorithms ssh-ed25519,rsa-sha2-512\nrequiredrsasize 3072\n",
-        )
-        .unwrap();
+        let output = b"host alias\nuser backup\nhostname vault.internal\nport 2222\nuserknownhostsfile /tmp/default-one /tmp/default-two\nglobalknownhostsfile none\nhostkeyalgorithms ssh-ed25519,rsa-sha2-512\nrequiredrsasize 3072\n";
+        let defaults = KnownHostsDefaults {
+            user: KnownHostsDefault {
+                rendered: "/tmp/default-one /tmp/default-two".into(),
+                files: vec!["/tmp/default-one".into(), "/tmp/default-two".into()],
+            },
+            global: KnownHostsDefault {
+                rendered: "none".into(),
+                files: Vec::new(),
+            },
+        };
+        let config = parse_ssh_config_with_defaults(output, Some(&defaults)).unwrap();
         assert_eq!(config.user, "backup");
         assert_eq!(config.lookup, "[vault.internal]:2222");
         assert_eq!(config.required_rsa_size, 3072);
         assert_eq!(
             config.files,
-            [PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
+            [
+                PathBuf::from("/tmp/default-one"),
+                PathBuf::from("/tmp/default-two")
+            ]
         );
+    }
+
+    #[test]
+    fn ambiguous_or_relative_known_hosts_filenames_fail_closed() {
+        for value in ["/tmp/known hosts", "/tmp/one /tmp/two", "relative-hosts"] {
+            let output = format!(
+                "user backup\nhostname vault.internal\nport 22\nuserknownhostsfile {value}\nglobalknownhostsfile none\nhostkeyalgorithms ssh-ed25519\n"
+            );
+            let error = parse_ssh_config(output.as_bytes()).unwrap_err();
+            assert!(
+                error.to_string().contains("known_hosts"),
+                "unexpected error for {value:?}: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -1766,6 +1949,73 @@ mod tests {
         assert!(certificate_paths(&explicit_none, "vault")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn openssh_certificate_comments_do_not_break_translation() {
+        let temp = tempfile::tempdir().unwrap();
+        let ca = temp.path().join("ca");
+        let subject = temp.path().join("subject");
+        for (path, comment) in [
+            (&ca, "test certificate authority"),
+            (&subject, "raw key comment"),
+        ] {
+            let status = Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-C", comment, "-f"])
+                .arg(path)
+                .status()
+                .expect("run ssh-keygen key generation");
+            assert!(status.success(), "ssh-keygen key generation failed");
+        }
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-s"])
+            .arg(&ca)
+            .args(["-I", "central-cert", "-n", "backup", "-V", "+1h"])
+            .arg(subject.with_extension("pub"))
+            .status()
+            .expect("run ssh-keygen certificate signing");
+        assert!(status.success(), "ssh-keygen certificate signing failed");
+
+        let certificate_path = temp.path().join("subject-cert.pub");
+        let configured = read_user_certificates(std::slice::from_ref(&certificate_path)).unwrap();
+        assert_eq!(configured.len(), 1);
+        assert!(!configured[0].comment().is_empty());
+        let raw_key = PublicKey::read_openssh_file(&subject.with_extension("pub"))
+            .unwrap()
+            .key_data()
+            .clone();
+        let ambient = vec![Identity {
+            credential: PublicCredential::Key(raw_key.clone()),
+            comment: "ambient comment must stay private".into(),
+        }];
+        let identities = sanitize_identities(ambient.clone(), &configured);
+        assert_eq!(identities.advertised.len(), 1);
+        assert!(identities.advertised[0].comment.is_empty());
+
+        let mut encoded = Vec::new();
+        identities.advertised[0]
+            .credential
+            .encode(&mut encoded)
+            .unwrap();
+        let mut input = encoded.as_slice();
+        let echoed = PublicCredential::decode(&mut input).unwrap();
+        assert!(input.is_empty());
+        let PublicCredential::Cert(echoed_certificate) = &echoed else {
+            panic!("expected echoed user certificate")
+        };
+        assert!(echoed_certificate.comment().is_empty());
+        assert!(identities.advertises(&echoed));
+
+        let request = SignRequest {
+            credential: echoed,
+            data: b"host-bound certificate request".to_vec(),
+            flags: 0,
+        };
+        let translated = translated_sign_request(&request, &ambient, &configured).unwrap();
+        assert_eq!(
+            parse_sign_request(&translated).unwrap().credential,
+            PublicCredential::Key(raw_key)
+        );
     }
 
     #[test]
@@ -1943,6 +2193,39 @@ mod tests {
             &mut saw_ca,
         )
         .is_err());
+    }
+
+    #[test]
+    fn openssh_defaults_and_hashed_known_hosts_lookup_are_exercised() {
+        let output = inspect_ssh_configuration("ssh", None, "unused.example", true).unwrap();
+        let defaults = KnownHostsDefaults::from_openssh(&output).unwrap();
+        assert_eq!(defaults.user.files.len(), 2);
+        assert!(defaults.user.files.iter().all(|path| path.is_absolute()));
+        assert!(defaults.global.files.iter().all(|path| path.is_absolute()));
+
+        let temp = tempfile::tempdir().unwrap();
+        let known_hosts = temp.path().join("known_hosts");
+        let lookup = "[vault.internal]:2222";
+        let (_, host_key) = key(53);
+        let public = PublicKey::new(host_key.clone(), "").to_openssh().unwrap();
+        std::fs::write(&known_hosts, format!("{lookup} {public}\n")).unwrap();
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-H", "-f"])
+            .arg(&known_hosts)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("hash test known_hosts entry");
+        assert!(status.success(), "ssh-keygen known_hosts hashing failed");
+
+        let (trusted, saw_ca) = read_known_host_keys(
+            &ssh_keygen_for("ssh"),
+            lookup,
+            std::slice::from_ref(&known_hosts),
+        )
+        .unwrap();
+        assert_eq!(trusted, [host_key]);
+        assert!(!saw_ca);
     }
 
     #[test]
@@ -2146,7 +2429,7 @@ mod tests {
             panic!("expected identities response")
         };
         assert_eq!(identities.len(), 1);
-        assert_eq!(identities[0].comment, "hardware-backed test key");
+        assert!(identities[0].comment.is_empty());
         assert_eq!(requests.recv().unwrap(), source_bind);
         assert_eq!(requests.recv().unwrap(), vec![11]);
 
@@ -2374,5 +2657,20 @@ mod tests {
                 .unwrap();
             assert_closed(&mut client);
         }
+    }
+
+    #[test]
+    fn tracked_broker_connections_have_bounded_io() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let registry = Arc::new(ConnectionRegistry::default());
+        let tracked = registry.track(stream).unwrap();
+        assert_eq!(
+            tracked.stream.read_timeout().unwrap(),
+            Some(BROKER_IO_TIMEOUT)
+        );
+        assert_eq!(
+            tracked.stream.write_timeout().unwrap(),
+            Some(BROKER_IO_TIMEOUT)
+        );
     }
 }

@@ -231,8 +231,9 @@ local copy on hostA and disables agent forwarding.
 
 With implicit OpenSSH, the default is a temporary local agent broker rather
 than unrestricted `ssh -A`. HostA may list a sanitized snapshot of the ambient
-agent's supported public identities, but the broker signs only with an exact
-credential from that snapshot and only after validating this path:
+agent's supported public identities with identity comments removed, but the
+broker signs only with an exact credential from that snapshot and only after
+validating this path:
 
 ```text
 trusted hostA session -> configured-user@trusted-hostB session
@@ -271,7 +272,9 @@ itself reject certificate translation when the raw key has
 `ssh-add -h` destination constraints but the certificate was not associated
 with the agent; that combination fails closed. Loading the certificate into the
 agent avoids translation. The broker socket and every open channel are closed
-when the attached transfer ends.
+when the attached transfer ends. Stalled broker and ambient-agent operations
+time out after two minutes, long enough for ordinary hardware-token approval
+while preventing idle clients from holding worker slots indefinitely.
 
 This restricts *where and as whom* hostA may authenticate; stock OpenSSH does
 not bind the subsequent command. A compromised hostA still receives the
@@ -292,7 +295,11 @@ not yet reproduce those dynamic or external revocation checks. Local
 ordinary OpenSSH percent tokens except `%C`; named-user tildes are also refused
 rather than guessed. Credential and host-key algorithms that syq's SSH library
 cannot cryptographically verify are removed or refused rather than failing only
-after a signing request.
+after a signing request. OpenSSH's `ssh -G` output does not preserve quoting for
+custom known-hosts filenames. Syq therefore accepts OpenSSH's separately
+verified compiled default list, or one absolute whitespace-free configured file
+per `UserKnownHostsFile`/`GlobalKnownHostsFile` directive; ambiguous custom
+multi-file or whitespace-containing values fail closed.
 
 The local configuration resolves hostB's login user, and syq passes it
 explicitly to hostA. The inner client is forced to use its forwarded
@@ -310,13 +317,15 @@ hostB for this broker. Deployments requiring distinct host identities must not
 reuse host private keys between them.
 
 Pass `--no-forward-agent` to give hostA no agent at all; hostA must then have
-its own credentials for hostB. `--unrestricted-agent-forwarding` is a
+its own credentials for hostB, and its own `IdentityAgent` configuration is
+left intact. `--unrestricted-agent-forwarding` is a
 conspicuous compatibility escape hatch that exposes the complete ambient agent
-to hostA for the attached transfer. With an explicit `-e/--rsh`, syq creates no
-broker and adds neither `-A` nor `-a`, so that command is the complete agent
-policy; `--no-forward-agent` and the unrestricted escape hatch therefore
-conflict with `-e`. `--relay` also avoids exposing authentication to hostA, at
-the cost of routing file data through this machine.
+to hostA for the attached transfer without imposing the constrained path's
+host-bound authentication requirement. With an explicit `-e/--rsh`, syq
+creates no broker and adds neither `-A` nor `-a`, so that command is the
+complete agent policy; `--no-forward-agent` and the unrestricted escape hatch
+therefore conflict with `-e`. `--relay` also avoids exposing authentication to
+hostA, at the cost of routing file data through this machine.
 
 SYQ uses the user's SSH configuration to resolve the login user, host-key name,
 port, static known-hosts files, host-key algorithms, RSA size, and configured or

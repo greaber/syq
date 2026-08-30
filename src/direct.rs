@@ -76,13 +76,34 @@ fn source_setup_rsh(rsh: &[String], explicit_rsh: bool) -> Vec<String> {
     setup
 }
 
-fn destination_rsh(explicit_rsh: Option<&str>, same_host: bool) -> Option<&str> {
-    // A uses the broker to authenticate to B, but B must never receive it.
-    // Force the forwarded environment socket and its advertised identities;
-    // requiring host-bound authentication prevents A from omitting B's key.
-    (!same_host).then_some(explicit_rsh.unwrap_or(
-        "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no -o PubkeyAuthentication=host-bound",
-    ))
+fn destination_rsh<'a>(
+    explicit_rsh: Option<&'a str>,
+    same_host: bool,
+    agent_forwarding: Option<&AgentForwarding>,
+) -> Option<&'a str> {
+    if same_host {
+        return None;
+    }
+    if let Some(explicit) = explicit_rsh {
+        return Some(explicit);
+    }
+    match agent_forwarding {
+        // A uses the broker to authenticate to B, but B must never receive it.
+        // Force the forwarded environment socket and its advertised identities;
+        // requiring host-bound authentication prevents A from omitting B's key.
+        Some(AgentForwarding::Constrained { .. }) => Some(
+            "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no -o PubkeyAuthentication=host-bound",
+        ),
+        // The compatibility escape hatch still selects the forwarded ambient
+        // agent, but does not require host-bound authentication from OpenSSH
+        // versions that predate the constrained broker's 8.9 floor.
+        Some(AgentForwarding::Unrestricted) => {
+            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no")
+        }
+        // With no forwarded agent, preserve hostA's own IdentityAgent and
+        // authentication configuration while preventing another forwarding hop.
+        Some(AgentForwarding::Disabled) | None => Some("ssh -a"),
+    }
 }
 
 fn broker_connection_limit(connections_opt: Option<usize>, connections: usize) -> Result<usize> {
@@ -265,7 +286,11 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if let Some(p) = &args.syq_path {
         remote.push(format!("--syq-path={p}"));
     }
-    if let Some(e) = destination_rsh(args.rsh.as_deref(), same_host) {
+    if let Some(e) = destination_rsh(
+        args.rsh.as_deref(),
+        same_host,
+        default_ssh_agent_policy.as_ref(),
+    ) {
         remote.push("-e".into());
         remote.push(e.into());
     }
@@ -587,21 +612,33 @@ mod tests {
     }
 
     #[test]
-    fn setup_and_destination_connections_never_forward_an_agent() {
+    fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
         let rsh = vec!["ssh".to_string(), "-p".to_string(), "2222".to_string()];
         assert_eq!(source_setup_rsh(&rsh, false), ["ssh", "-p", "2222", "-a"]);
         assert_eq!(source_setup_rsh(&rsh, true), rsh);
+        let constrained = AgentForwarding::Constrained {
+            ambient: "/tmp/ambient-agent".into(),
+            broker: "/tmp/syq-agent".into(),
+        };
         assert_eq!(
-            destination_rsh(None, false),
+            destination_rsh(None, false, Some(&constrained)),
             Some(
                 "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no -o PubkeyAuthentication=host-bound"
             )
         );
         assert_eq!(
-            destination_rsh(Some("custom-rsh"), false),
+            destination_rsh(None, false, Some(&AgentForwarding::Unrestricted)),
+            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no")
+        );
+        assert_eq!(
+            destination_rsh(None, false, Some(&AgentForwarding::Disabled)),
+            Some("ssh -a")
+        );
+        assert_eq!(
+            destination_rsh(Some("custom-rsh"), false, None),
             Some("custom-rsh")
         );
-        assert_eq!(destination_rsh(None, true), None);
+        assert_eq!(destination_rsh(None, true, Some(&constrained)), None);
     }
 
     #[test]
