@@ -85,7 +85,7 @@ behavior; an entry without one is only believed, not held.
 | `-u`/`--update`: a destination regular file with a newer mtime is left alone | measured for regular files; see "Different" for symlinks/devices | `update_skips_files_newer_on_the_destination` |
 | `--existing` / `--ignore-existing`, including `--existing` covering directories | measured | `ignore_existing_and_existing`, `existing_never_creates_the_destination_root`, `existing_leaves_a_file_where_a_source_directory_would_go`, `existing_dry_run_lists_no_missing_directories`, `existing_opens_up_readonly_dirs_even_after_a_symlinked_dir` |
 | `--max-size` / `--min-size` on regular files only; `K`/`M`/`G` suffixes | measured | `size_limits_filter_files_and_protect_them_from_delete`, `bad_size_limits_fail_before_anything_connects` |
-| `--files-from` baseline: paths relative to one source; implied parents created; a plain listed directory is copied without its contents unless `-r` is given explicitly (`-a` doesn't count); `--from0`; `-` reads stdin; blank entries dropped | measured; entry *parsing* has gaps, open issue 2 | `files_from_copies_listed_paths_with_their_parents`, `files_from_creates_listed_and_implied_dirs_without_r`, `files_from_repeats_and_late_listed_dirs_across_chunks`, `files_from_root_may_be_a_symlink_and_root_lines_are_rejected` |
+| `--files-from` baseline: paths relative to one source; implied parents created; a plain listed directory is copied without its contents unless `-r` is given explicitly (`-a` doesn't count); `--from0`; `-` reads stdin; blank entries and entries starting with `#` or `;` dropped in both separator modes (literal names remain reachable as `./#name` and `./;name`) | measured; entry *parsing* has gaps, open issue 2 | `files_from_copies_listed_paths_with_their_parents`, `files_from_treats_hash_and_semicolon_entries_as_comments`, `files_from_creates_listed_and_implied_dirs_without_r`, `files_from_repeats_and_late_listed_dirs_across_chunks`, `files_from_root_may_be_a_symlink_and_root_lines_are_rejected` |
 | `--delete-after` / `--delete-delay` accepted as synonyms of `--delete` (they describe what syq does) | by construction | `delete_after_and_delay_are_synonyms` |
 | `--max-delete N` exists and exits 25 when it trips | believed (exit code matches rsync); see "Different" for the cap semantics | `max_delete_refuses_everything_past_the_limit` |
 | A normal operator-owned destination *argument* that is a symlink to a directory is that directory | measured; see open issue 6 for a root/cross-uid case | `symlink_destination_is_followed`, `destination_root_symlink_preserves_target_metadata_for_both_spellings`, `existing_updates_through_a_destination_root_symlink_to_a_dir` |
@@ -218,14 +218,12 @@ command says what to change.
    `--ignore`/`--ignore-from` long-only; reject a bare `-i` with a specific
    explanation until itemized output exists. Don't pick another rsync short
    letter for ignore (`-I` is `--ignore-times`).
-2. **`--files-from` entry parsing doesn't match rsync's** (measured on 3.2.7
-   and 3.5.0). Adopt the full rule set as one change: skip entries starting
-   with `#` or `;` (line mode and `--from0`); normalize `..` and clamp it at
-   the source root instead of rejecting; preserve a trailing slash (`dir/`
-   selects the directory's immediate children without `-r`, `dir` only the
-   directory); accept `.`/`/` as the root entry (children without `-r`); add
-   `-0` as an alias of `--from0`. Comment-looking names remain reachable as
-   `./#name`.
+2. **The remaining `--files-from` entry parsing doesn't match rsync's**
+   (measured on 3.2.7 and 3.5.0). Finish the related path rules as one change:
+   normalize `..` and clamp it at the source root instead of rejecting;
+   preserve a trailing slash (`dir/` selects the directory's immediate
+   children without `-r`, `dir` only the directory); accept `.`/`/` as the root
+   entry (children without `-r`); add `-0` as an alias of `--from0`.
 3. **Repeated identical sources should be deduplicated**, not reported as a
    collision (rsync scans a source given ten times once). Only for
    byte-identical source arguments including trailing-slash mode; distinct

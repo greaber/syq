@@ -3093,6 +3093,43 @@ fn files_from_copies_listed_paths_with_their_parents() {
     assert!(!t.path("dst3").exists());
 }
 
+#[test]
+fn files_from_treats_hash_and_semicolon_entries_as_comments() {
+    let t = Tmp::new();
+    for f in ["ordinary", "#literal", ";literal"] {
+        write(&t.path("src").join(f), f.as_bytes());
+    }
+
+    // A comment-looking name is still reachable through an explicit `./`.
+    write(
+        &t.path("list"),
+        b"# ignored\n; ignored too\nordinary\n./#literal\n./;literal\n",
+    );
+    run_ok(&["-a", "--files-from", &t.s("list"), &t.s("src"), &t.s("dst")]);
+    assert_eq!(
+        listing(&t.path("dst")),
+        ["#literal", ";literal", "ordinary"]
+    );
+
+    // rsync applies the same comment rule when entries are NUL-separated.
+    write(
+        &t.path("list0"),
+        b"# ignored\0; ignored too\0ordinary\0./#literal\0./;literal\0",
+    );
+    run_ok(&[
+        "-a",
+        "--from0",
+        "--files-from",
+        &t.s("list0"),
+        &t.s("src"),
+        &t.s("dst0"),
+    ]);
+    assert_eq!(
+        listing(&t.path("dst0")),
+        ["#literal", ";literal", "ordinary"]
+    );
+}
+
 // ------------------------------------------------------------ review fixes
 
 #[test]
