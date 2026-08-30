@@ -3,7 +3,7 @@
 //! unlinked in batches spread across workers; directories are removed
 //! deepest-first, each depth level in parallel.
 
-use crate::cli::{Args, Location};
+use crate::cli::{Args, Interface, Location};
 use crate::conn::{ok, Conn, Endpoint};
 use crate::fsops::join;
 use crate::progress::{commas, Progress};
@@ -147,7 +147,7 @@ fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
 }
 
 pub fn run(args: Args) -> Result<i32> {
-    let locs: Vec<Location> = if args.locations.is_empty() {
+    let mut locs: Vec<Location> = if args.locations.is_empty() {
         args.paths
             .iter()
             .map(|p| Location::parse(p))
@@ -159,6 +159,13 @@ pub fn run(args: Args) -> Result<i32> {
         if !l.same_host(&locs[0]) {
             bail!("all paths must be on the same host");
         }
+    }
+    if args.interface == Interface::NativeRm {
+        // Exact repeated selectors describe one removal. Preserve the user's
+        // first-seen streaming order; in particular, do not sort or collapse
+        // distinct nested selections into a fixed removal population.
+        let mut seen = std::collections::HashSet::new();
+        locs.retain(|location| seen.insert((location.path.clone(), location.selection)));
     }
     let mut args = args;
     check_rm_safety(&locs, &args)?;

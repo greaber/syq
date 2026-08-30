@@ -415,6 +415,18 @@ fn native_rm_trailing_slash_removes_a_selected_symlink_not_its_referent() {
 }
 
 #[test]
+fn native_rm_is_idempotent_for_exact_duplicate_selectors() {
+    let t = Tmp::new();
+    for trial in 0..8 {
+        let relative = format!("duplicate-{trial}");
+        write(&t.path(&relative), b"data");
+        let path = t.s(&relative);
+        run_native_ok(&["rm", "--src", &path, "--src", &path]);
+        assert!(!t.path(&relative).exists());
+    }
+}
+
+#[test]
 fn top_level_rsync_syntax_is_rejected_without_mutation() {
     let t = Tmp::new();
     write(&t.path("src"), b"data");
