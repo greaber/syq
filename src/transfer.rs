@@ -21,7 +21,7 @@ use xxhash_rust::xxh3::xxh3_64;
 const WINDOW: usize = 4;
 const MAX_ATTEMPTS: u32 = 3;
 pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
-const FAST_BATCH_FILES: usize = 64;
+const FAST_BATCH_FILES: usize = 128;
 const FAST_BATCH_BYTES: u64 = 16 << 20;
 const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 
@@ -433,6 +433,7 @@ fn copy_identity(
     dst: &Location,
     src_ctl: &mut dyn Conn,
     dst_ctl: &mut dyn Conn,
+    dst_canonical: Option<std::path::PathBuf>,
     opts: &Opts,
 ) -> Result<String> {
     let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
@@ -443,9 +444,12 @@ fn copy_identity(
             source.copies_contents(),
         ));
     }
-    let dst_root = canonical_path(dst_ctl, &dst.path, dst.is_remote())?
-        .to_string_lossy()
-        .into_owned();
+    let dst_root = match dst_canonical {
+        Some(path) => path,
+        None => canonical_path(dst_ctl, &dst.path, dst.is_remote())?,
+    }
+    .to_string_lossy()
+    .into_owned();
     Ok(crate::checkpoint::job_identity(
         &endpoint_identity(&srcs[0]),
         &src_roots,
@@ -794,6 +798,7 @@ pub fn run(args: Args) -> Result<i32> {
                         bwlimit: bwlimit.clone(),
                         gate: gate.clone(),
                         t: [0.0; 4],
+                        fast: FastTiming::default(),
                     };
                     if debug() {
                         eprintln!(
@@ -803,10 +808,8 @@ pub fn run(args: Args) -> Result<i32> {
                     }
                     let result = worker.run();
                     if collect_tcp_stats {
-                        transport_stats
-                            .lock()
-                            .unwrap()
-                            .extend(worker.collect_transport_stats());
+                        let stats = worker.collect_transport_stats();
+                        transport_stats.lock().unwrap().extend(stats);
                     }
                     let dropped = result.is_err() && worker.transport_dead();
                     match result {
@@ -960,11 +963,13 @@ pub fn run(args: Args) -> Result<i32> {
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
     let dst_root = clean_root(&dst.path);
-    let dst_root_entry = stat_one(&mut *dst_ctl, &dst_root, false)?;
+    let (dst_root_entry, dst_canonical) =
+        stat_and_canonicalize(&mut *dst_ctl, &dst_root, &dst.path, dst.is_remote())?;
     // A destination that is a symlink to a directory is that directory (as
     // for rsync). Use the resolved target path for all planning and metadata,
     // so ordinary in-tree symlinks can still be replaced instead of followed.
     let (dst_root, dst_root_entry) = follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?;
+    let dst_initially_missing = dst_root_entry.is_none();
     let dst_existed = dst_root_entry.is_some();
     let dst_entry_is_dir = dst_root_entry
         .as_ref()
@@ -1117,7 +1122,15 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
-    let identity = copy_identity(&args, srcs, dst, &mut *src_ctl, &mut *dst_ctl, &opts)?;
+    let identity = copy_identity(
+        &args,
+        srcs,
+        dst,
+        &mut *src_ctl,
+        &mut *dst_ctl,
+        Some(dst_canonical),
+        &opts,
+    )?;
     opts.partial_id
         .set(crate::checkpoint::partial_id(&identity))
         .expect("partial identity set once");
@@ -1159,7 +1172,6 @@ pub fn run(args: Args) -> Result<i32> {
             container_guard = Some(target_container(&dst_root, &created));
         }
     }
-
     let checkpoint_completed = checkpoint_state
         .as_ref()
         .map(|state| state.completed.clone());
@@ -1181,6 +1193,11 @@ pub fn run(args: Args) -> Result<i32> {
         opts: &opts,
         completed: checkpoint_completed,
         checkpoint: checkpoint_writer,
+        destination_tree_known_missing: dst.is_remote()
+            && dst_initially_missing
+            && !opts.ignore_existing
+            && !opts.update
+            && !opts.checksum,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         dry_run_replaced_dirs: std::collections::HashSet::new(),
@@ -1687,6 +1704,45 @@ fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Ent
         .flatten())
 }
 
+/// Fetch the destination root's entry and canonical spelling in one network
+/// turn. They are independent read-only queries; sending both before waiting
+/// avoids an otherwise unnecessary RTT on every remote copy.
+fn stat_and_canonicalize(
+    conn: &mut dyn Conn,
+    stat_path: &[u8],
+    canonical_path: &[u8],
+    remote: bool,
+) -> Result<(Option<Entry>, std::path::PathBuf)> {
+    if !remote {
+        return Ok((
+            stat_one(conn, stat_path, false)?,
+            crate::fsops::normalize(&crate::fsops::resolve(canonical_path)),
+        ));
+    }
+    conn.send(Request::StatMany {
+        paths: vec![stat_path.to_vec()],
+        follow: false,
+        guard: None,
+    })?;
+    conn.send(Request::Canonicalize {
+        path: canonical_path.to_vec(),
+        guard: None,
+    })?;
+    // Consume both replies before interpreting either endpoint error so the
+    // reusable control stream cannot be left one response behind.
+    let stat_response = conn.recv();
+    let canonical_response = conn.recv();
+    let entry = match ok(stat_response?, "stat")? {
+        Response::Stats(mut entries) if entries.len() == 1 => entries.pop().flatten(),
+        other => bail!("unexpected response {other:?}"),
+    };
+    let canonical = match ok(canonical_response?, "canonicalize")? {
+        Response::Path(path) => crate::fsops::resolve(&path),
+        other => bail!("unexpected response {other:?}"),
+    };
+    Ok((entry, canonical))
+}
+
 /// Run a source scan whose batches feed the planner, and remember whether it
 /// reported any problem — `scan_warned` is what gates --delete, so every
 /// source walk must go through here.
@@ -2074,6 +2130,10 @@ struct Planner<'a> {
     completed:
         Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>>,
     checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
+    /// Once syq has observed a missing remote destination root, every mapped
+    /// path is missing too. Avoid WAN round trips for impossible descendants;
+    /// local stats stay cheap and warm filesystem metadata for the writers.
+    destination_tree_known_missing: bool,
     /// Mapped payload paths that look like current sidecars, and every
     /// sidecar path the current job may use. Their intersection is unsafe.
     /// Ordinary payload names cannot collide and do not need to stay in RAM.
@@ -2750,7 +2810,11 @@ impl Planner<'_> {
         // the same filtered list drives creation, listing and deferred
         // metadata so they can't disagree.
         if !dirs.is_empty() {
-            let stats = self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?;
+            let stats = if self.destination_tree_known_missing {
+                vec![None; dirs.len()]
+            } else {
+                self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
+            };
             let mut planned: Vec<(PathBytes, PathBytes, Entry, Option<Entry>)> = Vec::new();
             for ((p, dst_rel, e), mut st) in dirs.into_iter().zip(stats) {
                 // Keep the parent-first overlay invariant explicit here too:
@@ -2974,10 +3038,14 @@ impl Planner<'_> {
             }
             others = kept;
         }
-        let stats = self.stat_many_with_dry_run_overlay(
-            others.iter().map(|p| p.dst.clone()).collect(),
-            dst_root,
-        )?;
+        let stats = if self.destination_tree_known_missing {
+            vec![None; others.len()]
+        } else {
+            self.stat_many_with_dry_run_overlay(
+                others.iter().map(|p| p.dst.clone()).collect(),
+                dst_root,
+            )?
+        };
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<String> = Vec::new();
         // Metadata repairs for quick-check-identical files, each with the
@@ -3998,6 +4066,18 @@ struct Worker {
     gate: Arc<Gate>,
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
     t: [f64; 4],
+    fast: FastTiming,
+}
+
+#[derive(Default)]
+struct FastTiming {
+    batches: usize,
+    files: usize,
+    source: f64,
+    dest_send: f64,
+    dest_ack: f64,
+    restat: f64,
+    bookkeeping: f64,
 }
 
 struct BlockDiff {
@@ -4050,14 +4130,28 @@ impl Worker {
                 Item::Exit => {
                     if debug() {
                         eprintln!(
-                            "syq: worker {} blocked: src recv {:.2}s, dst send {:.2}s, dst ack {:.2}s, idle {:.2}s",
-                            self.id, self.t[0], self.t[1], self.t[2], self.t[3]
+                            "syq: worker {} blocked: src recv {:.2}s, dst send {:.2}s, dst ack {:.2}s, idle {:.2}s; small: {} files in {} batches, src {:.2}s, dst send {:.2}s, dst ack {:.2}s, restat {:.2}s, bookkeeping {:.2}s",
+                            self.id,
+                            self.t[0],
+                            self.t[1],
+                            self.t[2],
+                            self.t[3],
+                            self.fast.files,
+                            self.fast.batches,
+                            self.fast.source,
+                            self.fast.dest_send,
+                            self.fast.dest_ack,
+                            self.fast.restat,
+                            self.fast.bookkeeping,
                         );
                     }
                     return Ok(());
                 }
                 Item::File(idx) => {
                     if self.fast_eligible(idx) {
+                        let target = self
+                            .sched
+                            .begin_fast_batch(self.gate.active(), FAST_BATCH_FILES);
                         let mut batch = vec![idx];
                         // The fast path reads a whole batch before sending it.
                         // Keep rate-limited batches to one file so a push can't
@@ -4065,16 +4159,16 @@ impl Worker {
                         if self.bwlimit.is_none() {
                             batch.extend(self.sched.take_small(
                                 self.opts.block,
-                                FAST_BATCH_FILES,
+                                target - batch.len(),
                                 FAST_BATCH_BYTES,
                             ));
                         }
                         let (fast, slow): (Vec<usize>, Vec<usize>) =
                             batch.into_iter().partition(|&i| self.fast_eligible(i));
-                        if let Err(e) = self.fast_batch(&fast) {
-                            for &i in &fast {
-                                self.sched.ranges_ready(i, vec![]);
-                            }
+                        self.sched.mark_fast(fast.len() - 1);
+                        let fast_result = self.fast_batch(&fast);
+                        self.sched.complete_fast_batch(fast.len());
+                        if let Err(e) = fast_result {
                             if self.transport_dead() {
                                 for &i in &slow {
                                     self.sched.ranges_ready(i, vec![]);
@@ -4169,6 +4263,8 @@ impl Worker {
     }
 
     fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
+        self.fast.batches += 1;
+        self.fast.files += batch.len();
         let jobs: Vec<FileJob> = {
             let all = self.sched.jobs.lock().unwrap();
             batch.iter().map(|&i| all[i].clone()).collect()
@@ -4184,39 +4280,59 @@ impl Worker {
             );
         }
         // Reads.
+        let phase = std::time::Instant::now();
         for j in &jobs {
             if j.entry.size > 0 {
                 self.limit(j.entry.size);
-                self.src.send(Request::ReadRange {
-                    path: j.src.clone(),
-                    attempt: j.attempts,
-                    off: 0,
-                    len: j.entry.size as u32,
-                })?;
             }
         }
-        let mut data: Vec<Result<Vec<u8>>> = Vec::with_capacity(jobs.len());
-        for j in &jobs {
-            if j.entry.size == 0 {
-                data.push(Ok(Vec::new()));
-                continue;
+        // Empty files need no source access. Besides saving wire work, this
+        // preserves the valid archive-copy case where an empty source is 000.
+        let reads: Vec<SmallRead> = jobs
+            .iter()
+            .filter(|job| job.entry.size > 0)
+            .map(|job| SmallRead {
+                path: job.src.clone(),
+                attempt: job.attempts,
+                len: job.entry.size as u32,
+            })
+            .collect();
+        let blocks = if reads.is_empty() {
+            Vec::new()
+        } else {
+            let count = reads.len();
+            self.src.send(Request::ReadSmallBatch(reads))?;
+            match ok(self.src.recv()?, "read small batch")? {
+                Response::SmallBlocks(blocks) if blocks.len() == count => blocks,
+                other => bail!("unexpected response {other:?}"),
             }
-            data.push(match ok(self.src.recv()?, "read") {
-                Ok(Response::Block { hash, data, .. }) => {
-                    if xxh3_64(&data) != hash {
-                        Err(anyhow::anyhow!("block hash mismatch on read"))
-                    } else {
+        };
+        let mut blocks = blocks.into_iter();
+        let mut data: Vec<Result<Vec<u8>>> = jobs
+            .iter()
+            .map(|job| {
+                if job.entry.size == 0 {
+                    return Ok(Vec::new());
+                }
+                match blocks.next() {
+                    Some(Ok(SmallBlock { data, hash }))
+                        if data.len() as u64 == job.entry.size && xxh3_64(&data) == hash =>
+                    {
                         Ok(data)
                     }
+                    Some(Ok(_)) => Err(anyhow::anyhow!("block size or hash mismatch on read")),
+                    Some(Err(error)) => Err(anyhow::anyhow!("read: {error}")),
+                    None => Err(anyhow::anyhow!("missing block in read small batch")),
                 }
-                Ok(other) => Err(anyhow::anyhow!("unexpected response {other:?}")),
-                Err(e) => Err(e),
-            });
-        }
-        // One PutSmall per file (pipelined): the server writes each small file
-        // through its sidecar and atomically renames it into place.
+            })
+            .collect();
+        self.fast.source += phase.elapsed().as_secs_f64();
+        // One batch request: the server still publishes every file through its
+        // own sidecar, but framing, compression and encryption are amortized.
+        let phase = std::time::Instant::now();
         let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
         let mut sent: Vec<bool> = Vec::with_capacity(jobs.len());
+        let mut puts = Vec::with_capacity(jobs.len());
         for (j, d) in jobs.iter().zip(data.iter_mut()) {
             let Ok(bytes) = d else {
                 sent.push(false);
@@ -4226,7 +4342,7 @@ impl Worker {
             let hash = xxh3_64(&bytes);
             let mut meta = j.entry.meta();
             meta.mode = self.create_mode(j);
-            self.dst.send(Request::PutSmall {
+            puts.push(SmallPut {
                 path: j.dst.clone(),
                 partial_id: self.partial_id(),
                 data: bytes,
@@ -4235,9 +4351,26 @@ impl Worker {
                 flags,
                 condition: j.target_condition,
                 guard: j.container_guard.clone(),
-            })?;
+            });
             sent.push(true);
         }
+        if !puts.is_empty() {
+            self.dst.send(Request::PutSmallBatch(puts))?;
+        }
+        self.fast.dest_send += phase.elapsed().as_secs_f64();
+        let phase = std::time::Instant::now();
+        let mut applied = if sent.iter().any(|sent| *sent) {
+            match ok(self.dst.recv()?, "put small batch")? {
+                Response::Applied(results)
+                    if results.len() == sent.iter().filter(|sent| **sent).count() =>
+                {
+                    results.into_iter()
+                }
+                other => bail!("unexpected response {other:?}"),
+            }
+        } else {
+            Vec::new().into_iter()
+        };
         let mut results: Vec<Result<()>> = Vec::with_capacity(jobs.len());
         for (d, &was_sent) in data.iter_mut().zip(sent.iter()) {
             let res: Result<()> = if !was_sent {
@@ -4246,19 +4379,25 @@ impl Worker {
                     Err(e) => Err(anyhow::anyhow!("{e:#}")),
                 }
             } else {
-                ok(self.dst.recv()?, "put").map(|_| ())
+                match applied.next().flatten() {
+                    None => Ok(()),
+                    Some(error) => Err(anyhow::anyhow!("put: {error}")),
+                }
             };
             results.push(res);
         }
+        self.fast.dest_ack += phase.elapsed().as_secs_f64();
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
+        let phase = std::time::Instant::now();
         let now = stat_many(&mut *self.src, paths, false)?;
+        self.fast.restat += phase.elapsed().as_secs_f64();
+        let phase = std::time::Instant::now();
         for ((idx, j), (res, now)) in batch
             .iter()
             .zip(jobs.iter())
             .zip(results.into_iter().zip(now.into_iter()))
         {
-            self.sched.ranges_ready(*idx, vec![]);
             if let Err(e) = res {
                 self.progress.error(&format!("syq: {}: {e:#}", j.rel));
                 self.sched.fail_file(*idx);
@@ -4314,6 +4453,7 @@ impl Worker {
                 self.progress.println(&j.rel);
             }
         }
+        self.fast.bookkeeping += phase.elapsed().as_secs_f64();
         Ok(())
     }
 
@@ -4425,7 +4565,7 @@ impl Worker {
             let full = || if size > 0 { vec![(0, size)] } else { vec![] };
             // Unless --inplace was explicit, changed files are published
             // through a sidecar + atomic rename. Small new files normally take
-            // the pipelined PutSmall path instead of reaching this worker path.
+            // the batched small-file path instead of reaching this worker path.
             self.set_inplace(idx, inplace);
 
             if inplace {

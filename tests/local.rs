@@ -1977,6 +1977,20 @@ fn single_file_to_new_name() {
 }
 
 #[test]
+fn archive_copies_mode_zero_empty_file_without_opening_source() {
+    let t = Tmp::new();
+    let src = t.path("src/empty");
+    write(&src, b"");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
+
+    run_ok(&["-a", &t.s("src/empty"), &t.s("dst/empty")]);
+
+    let dst = fs::metadata(t.path("dst/empty")).unwrap();
+    assert_eq!(dst.len(), 0);
+    assert_eq!(dst.mode() & 0o777, 0);
+}
+
+#[test]
 fn single_file_into_existing_dir() {
     let t = Tmp::new();
     write(&t.path("src/f.txt"), b"data");
@@ -2757,6 +2771,53 @@ fn rm_normal_target_works() {
     write(&t.path("killme/sub/f"), b"f");
     run_ok(&["--rm", &t.s("killme")]);
     assert!(!t.path("killme").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn rm_never_recurses_into_directory_that_replaced_scanned_leaf() {
+    let t = Tmp::new();
+    write(&t.path("killme/leaf"), b"old");
+    let ready = t.path("rm-leaf-ready");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rm", "-j", "1", &t.s("killme"), "--no-progress"])
+        .env("SYQ_TEST_RM_LEAF_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_RM_LEAF_MS", "1000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+        let out = child.wait_with_output().unwrap();
+        panic!(
+            "rm did not report the scanned leaf: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fs::remove_file(t.path("killme/leaf")).unwrap();
+    write(&t.path("killme/leaf/important"), b"keep");
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is now a directory"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("killme/leaf/important")), b"keep");
 }
 
 #[test]

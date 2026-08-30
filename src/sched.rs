@@ -51,6 +51,11 @@ struct Inner {
     outstanding: HashMap<usize, u32>,
     failed: HashSet<usize>,
     probing: usize,
+    /// Files owned by the pipelined small-file path. Unlike ordinary probes,
+    /// these will not expose ranges another worker can steal.
+    fast_probing: usize,
+    /// Workers currently processing one pipelined small-file batch.
+    fast_batches: usize,
     scan_done: bool,
     abort: bool,
 }
@@ -74,6 +79,8 @@ impl Sched {
                 outstanding: HashMap::new(),
                 failed: HashSet::new(),
                 probing: 0,
+                fast_probing: 0,
+                fast_batches: 0,
                 scan_done: false,
                 abort: false,
             }),
@@ -133,6 +140,56 @@ impl Sched {
             && g.files.is_empty()
             && g.ranges.is_empty()
             && g.finishes.is_empty()
+    }
+
+    /// Whether useful capacity is queued or about to emerge from an ordinary
+    /// large-file probe. A pipelined small-file batch already has an owner and
+    /// will never expose ranges, so it does not justify replacing a worker
+    /// that retired after draining the queue.
+    pub fn needs_worker_capacity(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        !g.files.is_empty()
+            || !g.ranges.is_empty()
+            || !g.finishes.is_empty()
+            || g.probing > g.fast_probing
+            || g.inflight.iter().any(|handle| {
+                let range = handle.lock().unwrap();
+                range.pos < range.end
+            })
+    }
+
+    /// Mark the first file of a fast batch and choose a balanced total batch
+    /// size. Existing owners are subtracted from `active`, leaving each worker
+    /// that has not yet claimed a batch a comparable share of the queue. The
+    /// WAN ceiling remains useful without letting early local workers drain it.
+    pub fn begin_fast_batch(&self, active: usize, max_n: usize) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        debug_assert!(g.probing > g.fast_probing);
+        let available_workers = active.saturating_sub(g.fast_batches).max(1);
+        let available_files = g.files.len() + 1;
+        let target = available_files.div_ceil(available_workers).clamp(1, max_n);
+        g.fast_probing += 1;
+        g.fast_batches += 1;
+        target
+    }
+
+    /// Further files claimed by a worker may include slow-path entries; mark
+    /// only those that survived its fast-path eligibility check.
+    pub fn mark_fast(&self, n: usize) {
+        let mut g = self.inner.lock().unwrap();
+        g.fast_probing += n;
+        debug_assert!(g.fast_probing <= g.probing);
+    }
+
+    /// Finish all scheduler bookkeeping for one fast batch at once.
+    pub fn complete_fast_batch(&self, n: usize) {
+        let mut g = self.inner.lock().unwrap();
+        debug_assert!(n > 0);
+        debug_assert!(g.probing >= n && g.fast_probing >= n && g.fast_batches > 0);
+        g.probing -= n;
+        g.fast_probing -= n;
+        g.fast_batches -= 1;
+        self.cv.notify_all();
     }
 
     /// Whether enough splittable activity remains to measure `n` workers.
@@ -342,6 +399,52 @@ mod tests {
         assert!(sched.work_left_for(2, 1_200, 512));
         assert!(!sched.work_left_for(2, 1_300, 512));
         assert!(!sched.work_left_for(3, 1_000, 512));
+    }
+
+    #[test]
+    fn claimed_small_files_do_not_request_replacement_capacity() {
+        let sched = Sched::new(64, 128);
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            inner.scan_done = true;
+            inner.probing = 2;
+            inner.fast_probing = 2;
+            inner.fast_batches = 1;
+        }
+        assert!(!sched.finished());
+        assert!(!sched.needs_worker_capacity());
+
+        // A regular file probe will soon expose transferable ranges, so its
+        // spare connection should warm while hashing/preparation is underway.
+        sched.inner.lock().unwrap().probing += 1;
+        assert!(sched.needs_worker_capacity());
+        sched.inner.lock().unwrap().probing -= 1;
+
+        sched.inner.lock().unwrap().files.push((100, Reverse(0)));
+        assert!(sched.needs_worker_capacity());
+    }
+
+    #[test]
+    fn fast_batches_share_the_queue_across_active_workers() {
+        let sched = Sched::new(4096, 8192);
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            inner.scan_done = true;
+            for idx in 0..2000 {
+                inner.files.push((4096, Reverse(idx)));
+            }
+        }
+
+        assert!(matches!(sched.next(), Item::File(_)));
+        let first_target = sched.begin_fast_batch(32, 128);
+        assert_eq!(first_target, 63);
+        let first_extra = sched.take_small(4096, first_target - 1, u64::MAX);
+        sched.mark_fast(first_extra.len());
+        assert_eq!(first_extra.len() + 1, 63);
+
+        assert!(matches!(sched.next(), Item::File(_)));
+        let second_target = sched.begin_fast_batch(32, 128);
+        assert_eq!(second_target, 63);
     }
 
     #[test]

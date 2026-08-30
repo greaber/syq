@@ -952,8 +952,14 @@ pub fn run(
         // exactly one ready spare so the important 1→2 probe is instantaneous.
         let retain = if active == 1 { 2 } else { active };
         gate.set_retain(retain);
-        for id in gate.begin_warming(retain) {
-            spawn(id);
+        // A pipelined whole-file batch is already owned and cannot be stolen.
+        // Do not repeatedly reconnect slots that drained the queue while the
+        // remaining owners finish. Queued/retried work or an ordinary
+        // large-file probe re-enables healing on the next poll.
+        if sched.needs_worker_capacity() {
+            for id in gate.begin_warming(retain) {
+                spawn(id);
+            }
         }
         if gate.permanent_failure_through(active) {
             sched.abort();

@@ -840,10 +840,9 @@ fn apply_one_unrooted(op: &Op) -> Result<()> {
                     r => r.with_context(|| format!("rmdir {}", p.display())),
                 }
             }
-            // Remove (for --rm) swallows lstat errors: rm -rf semantics, keep
-            // going. Unlink (below, for --delete) reports them: a mirror that
-            // silently failed to mirror would be worse. Deliberate divergence,
-            // pinned by unlink_never_recurses_into_a_directory.
+            // Remove follows the path's current type and may recurse. Planned
+            // deletion paths use Unlink/Rmdir below so a type change fails
+            // safely instead of broadening the selected deletion scope.
             Op::Remove { path } => {
                 let p = resolve(path);
                 match fs::symlink_metadata(&p) {
@@ -2279,29 +2278,26 @@ impl FsOps {
             } => self
                 .copy_local(src, dst, *inplace, partial_id, *size, *mode)
                 .map(|_| Response::Ok),
-            Request::PutSmall {
-                path,
-                partial_id,
-                data,
-                hash,
-                meta,
-                flags,
-                condition,
-                guard,
-            } => self
-                .put_small(
-                    PartialTarget {
-                        path,
-                        id: partial_id,
-                        guard: guard.as_ref(),
-                    },
-                    data,
-                    *hash,
-                    meta,
-                    *flags,
-                    *condition,
-                )
-                .map(|_| Response::Ok),
+            Request::PutSmallBatch(puts) => Ok(Response::Applied(
+                puts.iter()
+                    .map(|put| {
+                        self.put_small(
+                            PartialTarget {
+                                path: &put.path,
+                                id: &put.partial_id,
+                                guard: put.guard.as_ref(),
+                            },
+                            &put.data,
+                            put.hash,
+                            &put.meta,
+                            put.flags,
+                            put.condition,
+                        )
+                        .err()
+                        .map(|error| errstr(&error))
+                    })
+                    .collect(),
+            )),
             Request::HashBlocks {
                 path,
                 which,
@@ -2318,6 +2314,18 @@ impl FsOps {
                 off,
                 len,
             } => self.read_range(path, *attempt, *off, *len),
+            Request::ReadSmallBatch(reads) => Ok(Response::SmallBlocks(
+                reads
+                    .iter()
+                    .map(
+                        |read| match self.read_range(&read.path, read.attempt, 0, read.len) {
+                            Ok(Response::Block { data, hash, .. }) => Ok(SmallBlock { data, hash }),
+                            Ok(other) => Err(format!("unexpected response {other:?}")),
+                            Err(error) => Err(errstr(&error)),
+                        },
+                    )
+                    .collect(),
+            )),
             Request::WriteRange {
                 path,
                 inplace,

@@ -527,18 +527,14 @@ impl RestrictedAuthority {
                 self.check_flags(*flags)?;
                 *guard = Some(self.guard.clone());
             }
-            Request::PutSmall {
-                path,
-                data,
-                flags,
-                guard,
-                ..
-            } => {
-                self.charge_bytes(path, 0, data.len())?;
-                self.check_flags(*flags)?;
-                *guard = Some(self.guard.clone());
+            Request::PutSmallBatch(puts) => {
+                for put in puts {
+                    self.charge_bytes(&put.path, 0, put.data.len())?;
+                    self.check_flags(put.flags)?;
+                    put.guard = Some(self.guard.clone());
+                }
             }
-            Request::CopyLocal { .. } | Request::ReadRange { .. } => {
+            Request::CopyLocal { .. } | Request::ReadRange { .. } | Request::ReadSmallBatch(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
             Request::Hello { .. } => bail!("unexpected second receiver handshake"),
@@ -2053,7 +2049,7 @@ mod tests {
         assert_eq!(guard.root, root.as_os_str().as_bytes());
 
         let mut outside_stat = Request::StatMany {
-            paths: vec![outside],
+            paths: vec![outside.clone()],
             follow: false,
             guard: None,
         };
@@ -2072,6 +2068,35 @@ mod tests {
             unreachable!()
         };
         assert!(matches!(ops[0], Op::Mkdir { mode: 0o700, .. }));
+
+        let mut small = Request::PutSmallBatch(vec![proto::SmallPut {
+            path: target.clone(),
+            partial_id: [1; 16],
+            data: vec![0; 4],
+            hash: 0,
+            meta: proto::Meta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: Some(ContainerGuard {
+                root: outside,
+                dev: 1,
+                ino: 2,
+            }),
+        }]);
+        authority.authorize(&mut small, false).unwrap();
+        let Request::PutSmallBatch(puts) = small else {
+            unreachable!()
+        };
+        assert_eq!(
+            puts[0].guard.as_ref().unwrap().root,
+            root.as_os_str().as_bytes()
+        );
 
         let mut write = Request::WriteRange {
             path: target,
@@ -2149,6 +2174,24 @@ mod tests {
             guard: None,
         };
         assert!(authority.authorize(&mut mutation, false).is_err());
+
+        let mut small = Request::PutSmallBatch(vec![proto::SmallPut {
+            path: target.clone(),
+            partial_id: [1; 16],
+            data: vec![0],
+            hash: 0,
+            meta: proto::Meta {
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        }]);
+        assert!(authority.authorize(&mut small, false).is_err());
 
         let mut observation = Request::StatMany {
             paths: vec![target],

@@ -94,6 +94,36 @@ pub struct ContainerGuard {
     pub ino: u64,
 }
 
+/// One whole-file read in the pipelined small-file path.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallRead {
+    pub path: PathBytes,
+    pub attempt: u32,
+    pub len: u32,
+}
+
+/// One whole-file publication in the pipelined small-file path.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallPut {
+    pub path: PathBytes,
+    pub partial_id: PartialId,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub hash: u64,
+    pub meta: Meta,
+    pub flags: u8,
+    pub condition: TargetCondition,
+    pub guard: Option<ContainerGuard>,
+}
+
+/// Contents and integrity hash for one successful `SmallRead`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallBlock {
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub hash: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct Meta {
     pub mode: u32,
@@ -170,18 +200,14 @@ pub enum Op {
         meta: Meta,
         flags: u8,
     },
-    Remove {
-        path: PathBytes,
-    },
+    /// Remove whatever currently occupies the path, recursively when it is a
+    /// directory. Planned deletion uses Unlink/Rmdir instead.
+    Remove { path: PathBytes },
     /// Remove an empty directory.
-    Rmdir {
-        path: PathBytes,
-    },
+    Rmdir { path: PathBytes },
     /// Remove a non-directory; a directory that has appeared there is an
     /// error, never recursed into (used by --delete for planned leaves).
-    Unlink {
-        path: PathBytes,
-    },
+    Unlink { path: PathBytes },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -296,6 +322,8 @@ pub enum Request {
         off: u64,
         len: u32,
     },
+    /// Read a complete small-file batch in one frame and response.
+    ReadSmallBatch(Vec<SmallRead>),
     WriteRange {
         path: PathBytes,
         inplace: bool,
@@ -316,20 +344,8 @@ pub enum Request {
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
-    /// Whole small file in one request: verify, write a sidecar, then rename it
-    /// atomically over the final path. This preserves small-file pipelining
-    /// without exposing partial final-named files.
-    PutSmall {
-        path: PathBytes,
-        partial_id: PartialId,
-        #[serde(with = "serde_bytes")]
-        data: Vec<u8>,
-        hash: u64,
-        meta: Meta,
-        flags: u8,
-        condition: TargetCondition,
-        guard: Option<ContainerGuard>,
-    },
+    /// Verify and atomically publish a complete small-file batch in one frame.
+    PutSmallBatch(Vec<SmallPut>),
     FileHash {
         path: PathBytes,
         guard: Option<ContainerGuard>,
@@ -379,6 +395,7 @@ pub enum Response {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
+    SmallBlocks(Vec<std::result::Result<SmallBlock, String>>),
     FileHash {
         size: u64,
         hash: u128,
@@ -398,7 +415,15 @@ impl SizeHint for Request {
     fn size_hint(&self) -> usize {
         match self {
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
-            Request::PutSmall { data, path, .. } => data.len() + path.len() + 96,
+            Request::ReadSmallBatch(reads) => {
+                reads.iter().map(|read| read.path.len() + 16).sum::<usize>() + 16
+            }
+            Request::PutSmallBatch(puts) => {
+                puts.iter()
+                    .map(|put| put.data.len() + put.path.len() + 96)
+                    .sum::<usize>()
+                    + 16
+            }
             Request::StatMany { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
@@ -412,6 +437,16 @@ impl SizeHint for Response {
     fn size_hint(&self) -> usize {
         match self {
             Response::Block { data, .. } => data.len() + 64,
+            Response::SmallBlocks(blocks) => {
+                blocks
+                    .iter()
+                    .map(|block| match block {
+                        Ok(block) => block.data.len() + 16,
+                        Err(error) => error.len() + 8,
+                    })
+                    .sum::<usize>()
+                    + 16
+            }
             Response::ScanBatch(v) => v.len() * 160 + 16,
             Response::Stats(v) => v.len() * 96 + 16,
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 9 + 24,
