@@ -172,18 +172,18 @@ pub enum AuthorizedKeysChange {
 /// Add one managed entry without replacing an existing entry or touching
 /// unrelated authorized_keys contents.
 pub fn install_authorized_key(
-    original: &str,
+    original: &[u8],
     entry: &AuthorizedKeyEntry,
-) -> Result<(String, AuthorizedKeysChange)> {
+) -> Result<(Vec<u8>, AuthorizedKeysChange)> {
     let marker = entry.marker();
-    let matches: Vec<&str> = original
-        .lines()
-        .filter(|line| line.split_ascii_whitespace().last() == Some(marker.as_str()))
+    let matches: Vec<&[u8]> = original
+        .split(|byte| *byte == b'\n')
+        .filter(|line| last_ascii_token(line) == Some(marker.as_bytes()))
         .collect();
     match matches.as_slice() {
         [] => {}
-        [existing] if *existing == entry.line() => {
-            return Ok((original.to_owned(), AuthorizedKeysChange::Unchanged));
+        [existing] if *existing == entry.line().as_bytes() => {
+            return Ok((original.to_vec(), AuthorizedKeysChange::Unchanged));
         }
         [_] => bail!(
             "authorized_keys already contains a different entry for {}",
@@ -192,38 +192,49 @@ pub fn install_authorized_key(
         _ => bail!("authorized_keys contains duplicate entries for {}", marker),
     }
 
-    let mut updated = original.to_owned();
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
+    let mut updated = original.to_vec();
+    if !updated.is_empty() && !updated.ends_with(b"\n") {
+        updated.push(b'\n');
     }
-    updated.push_str(entry.line());
-    updated.push('\n');
+    updated.extend_from_slice(entry.line().as_bytes());
+    updated.push(b'\n');
     Ok((updated, AuthorizedKeysChange::Installed))
 }
 
 /// Remove exactly one managed entry.  A missing entry is an idempotent
-/// no-op; duplicates fail instead of guessing which authorization to retain.
+/// no-op; collisions and duplicates fail instead of guessing which
+/// authorization to retain.
 pub fn revoke_authorized_key(
-    original: &str,
-    id: &EnrollmentId,
-) -> Result<(String, AuthorizedKeysChange)> {
-    let marker = id.marker();
+    original: &[u8],
+    entry: &AuthorizedKeyEntry,
+) -> Result<(Vec<u8>, AuthorizedKeysChange)> {
+    let marker = entry.marker();
     let mut found = 0usize;
-    let mut updated = String::with_capacity(original.len());
-    for line in original.split_inclusive('\n') {
-        let without_newline = line.strip_suffix('\n').unwrap_or(line);
-        if without_newline.split_ascii_whitespace().last() == Some(marker.as_str()) {
+    let mut collision = false;
+    let mut updated = Vec::with_capacity(original.len());
+    for line in original.split_inclusive(|byte| *byte == b'\n') {
+        let without_newline = line.strip_suffix(b"\n").unwrap_or(line);
+        if without_newline == entry.line().as_bytes() {
             found += 1;
+        } else if last_ascii_token(without_newline) == Some(marker.as_bytes()) {
+            collision = true;
+            updated.extend_from_slice(line);
         } else {
-            updated.push_str(line);
+            updated.extend_from_slice(line);
         }
     }
     if found > 1 {
         bail!("authorized_keys contains duplicate entries for {}", marker);
     }
+    if collision {
+        bail!(
+            "authorized_keys contains a different entry for {}; refusing revocation",
+            marker
+        );
+    }
     Ok((
         if found == 0 {
-            original.to_owned()
+            original.to_vec()
         } else {
             updated
         },
@@ -235,55 +246,117 @@ pub fn revoke_authorized_key(
     ))
 }
 
+fn last_ascii_token(line: &[u8]) -> Option<&[u8]> {
+    line.rsplit(|byte| byte.is_ascii_whitespace())
+        .find(|word| !word.is_empty())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshEndpoint(String);
+
+impl SshEndpoint {
+    /// Parse the deliberately narrow endpoint syntax accepted by automatic
+    /// enrollment. Ports and unusual SSH routing belong in trusted ssh_config;
+    /// accepting free-form destination text here would make OpenSSH's
+    /// ProxyCommand expansion a shell-injection boundary.
+    pub fn parse(value: &str) -> Result<Self> {
+        let (user, host) = match value.split_once('@') {
+            Some((user, host)) if !host.contains('@') => (Some(user), host),
+            Some(_) => bail!("enrollment endpoint contains more than one @"),
+            None => (None, value),
+        };
+        if user.is_some_and(|user| !safe_ssh_name(user)) || !safe_ssh_name(host) {
+            bail!(
+                "enrollment endpoint must be [user@]host using only letters, digits, dot, underscore, and hyphen"
+            );
+        }
+        if host == "none" {
+            bail!("none is not an enrollment host");
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn safe_ssh_name(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnrollmentRemoteCommand(String);
+
+impl EnrollmentRemoteCommand {
+    /// Construct shell source only from a validated absolute program and
+    /// individually quoted arguments. sshd always invokes remote commands via
+    /// the account's shell, even when the local process supplied one argv.
+    pub fn new(program: &Path, args: &[String]) -> Result<Self> {
+        let program = safe_receiver_path(program)?;
+        if args.iter().any(|arg| arg.bytes().any(|byte| byte == 0)) {
+            bail!("enrollment command argument contains NUL");
+        }
+        let mut words = Vec::with_capacity(args.len() + 1);
+        words.push(program);
+        words.extend(args.iter().cloned());
+        Ok(Self(shell_words::join(words)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EnrollmentRoute<'a> {
     Direct,
-    ProxyJump { jump: &'a str },
+    ProxyJump { jump: &'a SshEndpoint },
 }
 
 /// Arguments for the trusted local OpenSSH client that enrolls HostB.  A jump
 /// host receives only an opaque TCP stream; it never receives an agent socket
 /// or an authenticated HostB session.
 pub fn enrollment_ssh_args(
-    target: &str,
+    target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
-    remote_command: &str,
-) -> Result<Vec<String>> {
-    validate_ssh_target(target, "target")?;
-    if remote_command.is_empty()
-        || remote_command
-            .bytes()
-            .any(|byte| byte == 0 || byte == b'\n')
-    {
-        bail!("enrollment remote command must be one nonempty line");
-    }
+    remote_command: &EnrollmentRemoteCommand,
+) -> Vec<String> {
     let mut args = vec![
         "-a".to_owned(),
+        "-x".to_owned(),
+        "-k".to_owned(),
         "-T".to_owned(),
+        "-o".to_owned(),
+        "ClearAllForwardings=yes".to_owned(),
+        "-o".to_owned(),
+        "ControlMaster=no".to_owned(),
+        "-o".to_owned(),
+        "ControlPath=none".to_owned(),
+        "-o".to_owned(),
+        "ForwardX11=no".to_owned(),
         "-o".to_owned(),
         "PermitLocalCommand=no".to_owned(),
     ];
     if let EnrollmentRoute::ProxyJump { jump } = route {
-        validate_ssh_target(jump, "jump host")?;
-        args.push("-J".to_owned());
-        args.push(jump.to_owned());
+        // -J does not apply destination command-line safety options to its
+        // implicit jump process. A fixed ProxyCommand lets us constrain that
+        // process explicitly while the inner SSH connection remains local and
+        // end-to-end with HostB.
+        args.push("-o".to_owned());
+        args.push(format!(
+            "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W %h:%p -- {}",
+            jump.as_str()
+        ));
     }
     args.push("--".to_owned());
-    args.push(target.to_owned());
-    args.push(remote_command.to_owned());
-    Ok(args)
-}
-
-fn validate_ssh_target(value: &str, label: &str) -> Result<()> {
-    if value.is_empty()
-        || value.starts_with('-')
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
-        bail!("invalid enrollment {label}");
-    }
-    Ok(())
+    args.push(target.as_str().to_owned());
+    args.push(remote_command.as_str().to_owned());
+    args
 }
 
 #[cfg(test)]
@@ -348,7 +421,7 @@ mod tests {
     #[test]
     fn install_is_idempotent_and_preserves_unrelated_lines() {
         let entry = AuthorizedKeyEntry::new(id(), Path::new("/opt/syq/receiver"), &key()).unwrap();
-        let original = "# administrator comment\nssh-ed25519 AAAA existing\n";
+        let original = b"# administrator \xff comment\nssh-ed25519 AAAA existing\n";
         let (installed, change) = install_authorized_key(original, &entry).unwrap();
         assert_eq!(change, AuthorizedKeysChange::Installed);
         assert!(installed.starts_with(original));
@@ -364,7 +437,7 @@ mod tests {
             "restrict,command=\"evil\" ssh-ed25519 AAAA {}\n",
             id().marker()
         );
-        assert!(install_authorized_key(&original, &entry)
+        assert!(install_authorized_key(original.as_bytes(), &entry)
             .unwrap_err()
             .to_string()
             .contains("different entry"));
@@ -374,27 +447,82 @@ mod tests {
     fn revoke_removes_only_the_exact_managed_line() {
         let entry = AuthorizedKeyEntry::new(id(), Path::new("/opt/syq/receiver"), &key()).unwrap();
         let original = format!("before\n{}\nafter\n", entry.line());
-        let (updated, change) = revoke_authorized_key(&original, &id()).unwrap();
+        let (updated, change) = revoke_authorized_key(original.as_bytes(), &entry).unwrap();
         assert_eq!(change, AuthorizedKeysChange::Revoked);
-        assert_eq!(updated, "before\nafter\n");
+        assert_eq!(updated, b"before\nafter\n");
+    }
+
+    #[test]
+    fn revoke_refuses_a_marker_collision() {
+        let entry = AuthorizedKeyEntry::new(id(), Path::new("/opt/syq/receiver"), &key()).unwrap();
+        let original = format!("ssh-ed25519 AAAA administrator-key {}\n", entry.marker());
+        assert!(revoke_authorized_key(original.as_bytes(), &entry)
+            .unwrap_err()
+            .to_string()
+            .contains("different entry"));
+    }
+
+    #[test]
+    fn endpoint_rejects_proxy_shell_syntax_and_multi_hop_forms() {
+        for unsafe_endpoint in [
+            "none",
+            "user;touch@host",
+            "user@host,other",
+            "user@$(command)",
+            "-option",
+            "user name@host",
+            "user@@host",
+        ] {
+            assert!(
+                SshEndpoint::parse(unsafe_endpoint).is_err(),
+                "accepted {unsafe_endpoint}"
+            );
+        }
+        assert_eq!(
+            SshEndpoint::parse("backup_user@host-b.example")
+                .unwrap()
+                .as_str(),
+            "backup_user@host-b.example"
+        );
+    }
+
+    #[test]
+    fn remote_command_quotes_every_argument_for_the_remote_shell() {
+        let command = EnrollmentRemoteCommand::new(
+            Path::new("/opt/syq/receiver"),
+            &["enroll".into(), "argument with spaces;$(bad)".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            command.as_str(),
+            "/opt/syq/receiver enroll 'argument with spaces;$(bad)'"
+        );
     }
 
     #[test]
     fn proxyjump_route_keeps_authentication_local() {
+        let target = SshEndpoint::parse("backup@hostB").unwrap();
+        let jump = SshEndpoint::parse("user@hostA").unwrap();
+        let command = EnrollmentRemoteCommand::new(Path::new("/opt/syq/enroll"), &[]).unwrap();
         assert_eq!(
-            enrollment_ssh_args(
-                "backup@hostB",
-                EnrollmentRoute::ProxyJump { jump: "user@hostA" },
-                "/opt/syq/enroll"
-            )
-            .unwrap(),
+            enrollment_ssh_args(&target, EnrollmentRoute::ProxyJump { jump: &jump }, &command),
             [
                 "-a",
+                "-x",
+                "-k",
                 "-T",
                 "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "ForwardX11=no",
+                "-o",
                 "PermitLocalCommand=no",
-                "-J",
-                "user@hostA",
+                "-o",
+                "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W %h:%p -- user@hostA",
                 "--",
                 "backup@hostB",
                 "/opt/syq/enroll",
