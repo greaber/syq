@@ -162,6 +162,8 @@ pub enum Op {
         meta: Meta,
         flags: u8,
     },
+    /// Remove whatever currently occupies the path, recursively when it is a
+    /// directory. Planned deletion uses Unlink/Rmdir instead.
     Remove {
         path: PathBytes,
     },
