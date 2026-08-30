@@ -2014,6 +2014,30 @@ fn mkdir_root_batches(
     batches
 }
 
+fn directory_creation_batches(ops: Vec<Op>, restricted_receiver: bool) -> Vec<Vec<Op>> {
+    if ops.is_empty() {
+        return Vec::new();
+    }
+    if !restricted_receiver {
+        return vec![ops];
+    }
+
+    // A restricted receiver authorizes the whole request before executing any
+    // operation in it. Send parents first so receiver-side mode policy can
+    // inspect every child path without depending on an unexecuted Mkdir from
+    // the same request. Siblings retain the existing parallel batch behavior.
+    let mut by_depth: std::collections::BTreeMap<usize, Vec<Op>> =
+        std::collections::BTreeMap::new();
+    for op in ops {
+        let Op::Mkdir { path, .. } = &op else {
+            unreachable!("directory creation batch contains a non-Mkdir operation")
+        };
+        let depth = path.iter().filter(|&&byte| byte == b'/').count();
+        by_depth.entry(depth).or_default().push(op);
+    }
+    by_depth.into_values().collect()
+}
+
 /// Lexically canonical spelling of a root path: `.` components and duplicate
 /// or trailing slashes dropped (`dst/.` -> `dst`, `dst//x` -> `dst/x`), the
 /// leading `/` or `~` kept, a path that is nothing but dots left as `.`.
@@ -3438,7 +3462,7 @@ impl Planner<'_> {
                         self.container_guard = Some(target_container(&self.root_path, &created));
                     }
                 }
-                if !new_dirs.is_empty() {
+                for new_dirs in directory_creation_batches(new_dirs, opts.restricted_receiver) {
                     let n = new_dirs.len();
                     let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs
                         .iter()
@@ -5864,6 +5888,48 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn restricted_directory_creation_batches_put_parents_before_children() {
+        let mkdir = |path: &[u8]| Op::Mkdir {
+            path: path.to_vec(),
+            mode: 0o755,
+            condition: TargetCondition::Any,
+        };
+        let ops = vec![
+            mkdir(b"/destination/a/b"),
+            mkdir(b"/destination/c"),
+            mkdir(b"/destination/a"),
+            mkdir(b"/destination/c/d"),
+        ];
+
+        let ordinary = directory_creation_batches(ops.clone(), false);
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].len(), 4);
+
+        let restricted = directory_creation_batches(ops, true);
+        assert_eq!(restricted.len(), 2);
+        fn paths(batch: &[Op]) -> Vec<&[u8]> {
+            batch
+                .iter()
+                .map(|op| match op {
+                    Op::Mkdir { path, .. } => path.as_slice(),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        }
+        assert_eq!(
+            paths(&restricted[0]),
+            vec![b"/destination/c".as_slice(), b"/destination/a".as_slice()]
+        );
+        assert_eq!(
+            paths(&restricted[1]),
+            vec![
+                b"/destination/a/b".as_slice(),
+                b"/destination/c/d".as_slice()
+            ]
+        );
     }
 
     #[test]
