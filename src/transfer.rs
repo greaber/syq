@@ -1863,6 +1863,13 @@ fn target_container(root: &[u8], entry: &Entry) -> ContainerGuard {
     }
 }
 
+fn container_identity(guard: &ContainerGuard) -> TargetCondition {
+    TargetCondition::Matches {
+        dev: guard.dev,
+        ino: guard.ino,
+    }
+}
+
 #[cfg(debug_assertions)]
 fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
     if args.interface == Interface::Rsync || args.target_existence == Existence::Any {
@@ -1887,6 +1894,19 @@ fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
 #[cfg(not(debug_assertions))]
 fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
     Ok(())
+}
+
+fn create_container(conn: &mut dyn Conn, path: &[u8], mode: u32) -> Result<ContainerGuard> {
+    match ok(
+        conn.call(Request::CreateContainer {
+            path: path.to_vec(),
+            mode,
+        })?,
+        "create container",
+    )? {
+        Response::Container(guard) => Ok(guard),
+        other => bail!("unexpected response {other:?}"),
+    }
 }
 
 /// Lexically canonical spelling of a root path: `.` components and duplicate
@@ -3267,25 +3287,26 @@ impl Planner<'_> {
                     // descendant operation after this point carries the
                     // identity returned by that atomic mkdir.
                     let root_op = new_dirs.remove(root_index);
-                    let error = self.apply(vec![root_op])?.into_iter().next().flatten();
-                    if let Some(error) = error {
-                        self.progress.error(&format!("syq: {error}"));
-                        self.collision = true;
-                        return Ok(());
-                    }
+                    let mode = match root_op {
+                        Op::Mkdir { mode, .. } => mode,
+                        _ => unreachable!(),
+                    };
+                    let created = match create_container(self.dst, &self.root_path, mode) {
+                        Ok(created) => created,
+                        Err(error) => {
+                            self.progress.error(&format!("syq: {error:#}"));
+                            self.collision = true;
+                            return Ok(());
+                        }
+                    };
                     self.dirs_created += 1;
                     if opts.verbose > 0 {
                         self.progress
                             .println(&format!("{}/", display(&self.root_path)));
                     }
-                    let created = stat_many(self.dst, vec![self.root_path.clone()], false)?
-                        .pop()
-                        .flatten()
-                        .filter(|entry| entry.kind == Kind::Dir)
-                        .context("new exact target was not a directory after creation")?;
-                    self.exact_condition = target_identity(&created);
-                    self.mutation_root_condition = target_identity(&created);
-                    self.container_guard = Some(target_container(&self.root_path, &created));
+                    self.exact_condition = container_identity(&created);
+                    self.mutation_root_condition = container_identity(&created);
+                    self.container_guard = Some(created);
                 }
                 if !new_dirs.is_empty() {
                     let n = new_dirs.len();

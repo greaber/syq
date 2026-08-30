@@ -172,14 +172,22 @@ Placement is always explicit in this initial native surface:
 
 The receiver enforces `new` and `existing` again when it mutates the target,
 not only during planning. New targets use no-replace creation or publication.
+For a newly created container, the receiver captures the identity from a
+directory descriptor held across publication; it never rebinds the guard with
+a later pathname lookup. Container authority requires directory search
+permission, not read permission, so a write-and-search-only directory is a
+valid target.
 Existing containers must remain the same directory object: every descendant
 mutation reopens that identity and uses descriptor-relative filesystem calls,
 so replacing the container path makes the operation fail without touching its
 replacement. An exact existing regular file is updated through the object that
 passed preflight, preserving its inode (and therefore updating any hard-link
 aliases). Existing symlinks and special files can be atomically replaced by
-the same type. An exact `--as-existing` operation that would change the
-target's type is refused; use `--as` when type replacement is intended.
+the same type. If the target changes during that exchange, syq reports failure
+and retains the displaced object under a `.syq-swap-*` recovery name instead
+of risking a destructive rollback. An exact `--as-existing` operation that
+would change the target's type is refused; use `--as` when type replacement is
+intended.
 
 `cp` copies or updates mapped source objects and keeps unrelated target
 objects. `cprm` uses the same mapping and transfer engine, then applies the

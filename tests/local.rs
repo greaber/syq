@@ -121,6 +121,19 @@ fn spawn_native_before_guarded_mutation(
 }
 
 #[cfg(debug_assertions)]
+fn spawn_native_after_container_creation(args: &[&str], ready: &Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_CREATED_CONTAINER_READY_FILE", ready)
+        .env("SYQ_TEST_HOLD_CREATED_CONTAINER_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn native command held after container publication")
+}
+
+#[cfg(debug_assertions)]
 fn wait_for_signal(path: &Path) {
     for attempt in 0..500 {
         if path.exists() {
@@ -436,6 +449,136 @@ fn native_container_identity_anchors_worker_writes_and_cprm_deletions() {
         "raced cprm unexpectedly succeeded"
     );
     assert_eq!(read(&t.path("mirror/extra")), b"replacement extra");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn newly_created_container_keeps_the_identity_returned_by_creation() {
+    let t = Tmp::new();
+    write(&t.path("source/file"), b"source");
+    let ready = t.path("created-container-ready");
+    let child = spawn_native_after_container_creation(
+        &[
+            "cp",
+            "--src-src",
+            &t.s("source"),
+            "--into-new",
+            &t.s("target"),
+        ],
+        &ready,
+    );
+
+    wait_for_signal(&ready);
+    fs::rename(t.path("target"), t.path("created-container")).unwrap();
+    write(&t.path("target/winner"), b"replacement");
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!output.status.success(), "rebound new container succeeded");
+    assert_eq!(read(&t.path("target/winner")), b"replacement");
+    assert!(!t.path("target/file").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn same_type_replacement_never_rolls_back_over_a_later_publication() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    symlink("source-target", t.path("source-link")).unwrap();
+    symlink("preflight-target", t.path("destination-link")).unwrap();
+    let preflight_ready = t.path("swap-precondition-ready");
+    let mismatch_ready = t.path("mismatch-ready");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-no-follow",
+            &t.s("source-link"),
+            "--as-existing",
+            &t.s("destination-link"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SWAP_PRECONDITION_READY_FILE", &preflight_ready)
+        .env("SYQ_TEST_HOLD_SWAP_PRECONDITION_MS", "2000")
+        .env("SYQ_TEST_SWAP_MISMATCH_READY_FILE", &mismatch_ready)
+        .env("SYQ_TEST_HOLD_SWAP_MISMATCH_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_signal(&preflight_ready);
+    fs::rename(
+        t.path("destination-link"),
+        t.path("displaced-preflight-link"),
+    )
+    .unwrap();
+    symlink("first-racer", t.path("destination-link")).unwrap();
+    wait_for_signal(&mismatch_ready);
+    fs::rename(t.path("destination-link"), t.path("displaced-syq-link")).unwrap();
+    symlink("later-publication", t.path("destination-link")).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!output.status.success(), "raced replacement succeeded");
+    assert_eq!(
+        fs::read_link(t.path("destination-link")).unwrap(),
+        Path::new("later-publication")
+    );
+    let retained: Vec<_> = fs::read_dir(t.path(""))
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".syq-swap-")
+        })
+        .collect();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        fs::read_link(retained[0].path()).unwrap(),
+        Path::new("first-racer")
+    );
+}
+
+#[test]
+fn native_into_existing_accepts_a_write_and_search_only_container() {
+    let t = Tmp::new();
+    write(&t.path("source/file"), b"payload");
+    fs::create_dir(t.path("target")).unwrap();
+    fs::set_permissions(t.path("target"), fs::Permissions::from_mode(0o300)).unwrap();
+
+    let output = native_syq(&[
+        "cp",
+        "--src-src",
+        &t.s("source"),
+        "--into-existing",
+        &t.s("target"),
+    ]);
+    fs::set_permissions(t.path("target"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(&t.path("target/file")), b"payload");
+}
+
+#[test]
+fn native_as_new_populates_a_read_only_source_directory() {
+    let t = Tmp::new();
+    write(&t.path("source/file"), b"payload");
+    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = native_syq(&["cp", "--src", &t.s("source"), "--as-new", &t.s("target")]);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(&t.path("target/file")), b"payload");
+    assert_ne!(fs::metadata(t.path("target")).unwrap().mode() & 0o200, 0);
 }
 
 #[test]
@@ -2959,7 +3102,7 @@ fn rm_never_recurses_into_directory_that_replaced_scanned_leaf() {
     let t = Tmp::new();
     write(&t.path("killme/leaf"), b"old");
     let ready = t.path("rm-leaf-ready");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut child = compat_command()
         .args(["--rm", "-j", "1", &t.s("killme"), "--no-progress"])
         .env("SYQ_TEST_RM_LEAF_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_RM_LEAF_MS", "1000")
