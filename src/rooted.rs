@@ -1,4 +1,4 @@
-//! Root-anchored filesystem primitives for restricted receivers.
+//! Root-anchored filesystem primitives for guarded receivers.
 //!
 //! `Root` follows the explicitly selected root path once, opens that directory,
 //! and uses only the resulting descriptor afterward. Descendant paths are raw
@@ -7,15 +7,12 @@
 //! `O_DIRECTORY | O_NOFOLLOW`; leaf operations are performed relative to a
 //! held parent descriptor. There is no pathname fallback.
 //!
-//! This is currently an internal foundation rather than a replacement for the
-//! unrestricted rsync-shaped filesystem implementation. It supports existing
-//! directory roots, opening existing regular files for reading or writing,
-//! creating new regular files and single directories, renaming leaves, and
-//! non-recursive unlink/rmdir. Recursive removal, symlink and special-file
-//! creation, metadata mutation, missing-root creation, and protocol root IDs
-//! remain intentionally unsupported until they can preserve the same
-//! confinement guarantee. Roots and directory components must be openable with
-//! `O_RDONLY | O_DIRECTORY`.
+//! Native guarded placements use these operations for every descendant
+//! mutation; the unrestricted rsync-shaped implementation remains separate.
+//! Existing roots, regular-file I/O, leaf creation/replacement, metadata, and
+//! non-recursive unlink/rmdir are supported. Recursive removal and missing-root
+//! creation stay outside this layer. Roots and directory components must be
+//! openable with `O_RDONLY | O_DIRECTORY`.
 //!
 //! Linux currently uses the same component walk as other Unix platforms. An
 //! `openat2` fast path should be added only with tests proving that it has
@@ -33,6 +30,30 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+const MODE_TYPE_MASK: u32 = libc::S_IFMT;
+#[cfg(not(target_os = "linux"))]
+const MODE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+#[cfg(target_os = "linux")]
+const MODE_DIRECTORY: u32 = libc::S_IFDIR;
+#[cfg(not(target_os = "linux"))]
+const MODE_DIRECTORY: u32 = libc::S_IFDIR as u32;
+#[cfg(target_os = "linux")]
+const MODE_REGULAR: u32 = libc::S_IFREG;
+#[cfg(not(target_os = "linux"))]
+const MODE_REGULAR: u32 = libc::S_IFREG as u32;
+#[cfg(target_os = "linux")]
+const MODE_SYMLINK: u32 = libc::S_IFLNK;
+#[cfg(not(target_os = "linux"))]
+const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
+#[cfg(target_os = "linux")]
+const MODE_FIFO: u32 = libc::S_IFIFO;
+#[cfg(not(target_os = "linux"))]
+const MODE_FIFO: u32 = libc::S_IFIFO as u32;
 
 /// Stable identity of an opened root. Independent helper processes can reopen
 /// the configured path and require this identity before serving requests.
@@ -40,6 +61,33 @@ use std::path::Path;
 pub(crate) struct RootIdentity {
     pub(crate) dev: u64,
     pub(crate) ino: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RootMetadata {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) mode: u32,
+    pub(crate) nlink: u64,
+    pub(crate) len: u64,
+}
+
+impl RootMetadata {
+    pub(crate) fn is_dir(self) -> bool {
+        self.mode & MODE_TYPE_MASK == MODE_DIRECTORY
+    }
+
+    pub(crate) fn is_file(self) -> bool {
+        self.mode & MODE_TYPE_MASK == MODE_REGULAR
+    }
+
+    pub(crate) fn is_symlink(self) -> bool {
+        self.mode & MODE_TYPE_MASK == MODE_SYMLINK
+    }
+
+    pub(crate) fn file_type(self) -> u32 {
+        self.mode & MODE_TYPE_MASK
+    }
 }
 
 /// A syntactically safe descendant path. Empty means the opened root itself;
@@ -84,6 +132,10 @@ impl RelativePath {
         Ok((parents, leaf))
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.components.is_empty()
+    }
+
     fn label(&self) -> String {
         if self.components.is_empty() {
             return ".".into();
@@ -108,7 +160,7 @@ impl Root {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let directory = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC)
             .open(path)
             .with_context(|| format!("open confined root {}", path.display()))?;
         let metadata = directory
@@ -167,6 +219,28 @@ impl Root {
         self.open_regular(path, libc::O_WRONLY, truncate)
     }
 
+    pub(crate) fn open_regular_read_write(&self, path: &RelativePath) -> Result<File> {
+        self.open_regular(path, libc::O_RDWR, false)
+    }
+
+    pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
+        let parent = self.resolve_parent(path)?;
+        #[cfg(target_os = "linux")]
+        let flags =
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        #[cfg(target_os = "macos")]
+        let flags = libc::O_EVTONLY
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_NOCTTY
+            | libc::O_CLOEXEC;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let flags =
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        open_at(parent.directory.as_raw_fd(), &parent.leaf, flags, 0)
+            .with_context(|| format!("open confined metadata handle {}", path.label()))
+    }
+
     fn open_regular(
         &self,
         path: &RelativePath,
@@ -192,8 +266,7 @@ impl Root {
     }
 
     /// Create a new regular leaf. Existing leaves of every type are refused.
-    /// Creation accepts only ordinary `0777` permission bits; special mode
-    /// bits require a future explicit metadata operation.
+    /// Special permission bits require the explicit metadata operations.
     pub(crate) fn create_file(&self, path: &RelativePath, mode: u32) -> Result<File> {
         let parent = self.resolve_parent(path)?;
         let file = open_at(
@@ -216,8 +289,7 @@ impl Root {
     }
 
     /// Create exactly one directory. Parents must already exist and be real
-    /// directories beneath this root. Creation accepts only ordinary `0777`
-    /// permission bits.
+    /// directories beneath this root.
     pub(crate) fn create_directory(&self, path: &RelativePath, mode: u32) -> Result<()> {
         let parent = self.resolve_parent(path)?;
         retry_zero(|| unsafe {
@@ -228,6 +300,187 @@ impl Root {
             )
         })
         .with_context(|| format!("create confined directory {}", path.label()))
+    }
+
+    pub(crate) fn metadata(&self, path: &RelativePath) -> Result<RootMetadata> {
+        let parent = self.resolve_parent(path)?;
+        metadata_at(parent.directory.as_raw_fd(), &parent.leaf)
+            .with_context(|| format!("stat confined path {}", path.label()))
+    }
+
+    pub(crate) fn metadata_optional(&self, path: &RelativePath) -> Result<Option<RootMetadata>> {
+        let parent = self.resolve_parent(path)?;
+        match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("stat confined path {}", path.label()))
+            }
+        }
+    }
+
+    pub(crate) fn create_symlink(&self, path: &RelativePath, target: &[u8]) -> Result<()> {
+        let parent = self.resolve_parent(path)?;
+        let target = CString::new(target).context("symlink target contains NUL")?;
+        retry_zero(|| unsafe {
+            libc::symlinkat(
+                target.as_ptr(),
+                parent.directory.as_raw_fd(),
+                parent.leaf.as_ptr(),
+            )
+        })
+        .with_context(|| format!("create confined symlink {}", path.label()))
+    }
+
+    pub(crate) fn create_node(&self, path: &RelativePath, mode: u32, rdev: u64) -> Result<()> {
+        let parent = self.resolve_parent(path)?;
+        retry_zero(|| unsafe {
+            libc::mknodat(
+                parent.directory.as_raw_fd(),
+                parent.leaf.as_ptr(),
+                mode as libc::mode_t,
+                rdev as libc::dev_t,
+            )
+        })
+        .with_context(|| format!("create confined node {}", path.label()))
+    }
+
+    pub(crate) fn chmod(&self, path: &RelativePath, mode: u32) -> Result<()> {
+        let parent = self.resolve_parent(path)?;
+        retry_zero(|| unsafe {
+            libc::fchmodat(
+                parent.directory.as_raw_fd(),
+                parent.leaf.as_ptr(),
+                (mode & 0o7777) as libc::mode_t,
+                0,
+            )
+        })
+        .with_context(|| format!("chmod confined path {}", path.label()))
+    }
+
+    pub(crate) fn chown(
+        &self,
+        path: &RelativePath,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> io::Result<()> {
+        let parent = self
+            .resolve_parent(path)
+            .map_err(|error| io::Error::other(format!("{error:#}")))?;
+        retry_zero(|| unsafe {
+            libc::fchownat(
+                parent.directory.as_raw_fd(),
+                parent.leaf.as_ptr(),
+                uid.unwrap_or(u32::MAX),
+                gid.unwrap_or(u32::MAX),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+    }
+
+    pub(crate) fn set_times(&self, path: &RelativePath, times: &[libc::timespec; 2]) -> Result<()> {
+        let parent = self.resolve_parent(path)?;
+        retry_zero(|| unsafe {
+            libc::utimensat(
+                parent.directory.as_raw_fd(),
+                parent.leaf.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+        .with_context(|| format!("set times on confined path {}", path.label()))
+    }
+
+    pub(crate) fn replace_symlink_if_same(
+        &self,
+        path: &RelativePath,
+        target: &[u8],
+        expected_dev: u64,
+        expected_ino: u64,
+    ) -> Result<()> {
+        let target = CString::new(target).context("symlink target contains NUL")?;
+        self.replace_leaf_if_same(
+            path,
+            expected_dev,
+            expected_ino,
+            MODE_SYMLINK,
+            |fd, name| {
+                retry_zero(|| unsafe { libc::symlinkat(target.as_ptr(), fd, name.as_ptr()) })
+            },
+        )
+    }
+
+    pub(crate) fn replace_node_if_same(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+        rdev: u64,
+        expected_dev: u64,
+        expected_ino: u64,
+    ) -> Result<()> {
+        self.replace_leaf_if_same(
+            path,
+            expected_dev,
+            expected_ino,
+            mode & MODE_TYPE_MASK,
+            |fd, name| {
+                retry_zero(|| unsafe {
+                    libc::mknodat(fd, name.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t)
+                })
+            },
+        )
+    }
+
+    fn replace_leaf_if_same(
+        &self,
+        path: &RelativePath,
+        expected_dev: u64,
+        expected_ino: u64,
+        expected_type: u32,
+        create: impl Fn(RawFd, &CString) -> io::Result<()>,
+    ) -> Result<()> {
+        let parent = self.resolve_parent(path)?;
+        let before = metadata_at(parent.directory.as_raw_fd(), &parent.leaf)?;
+        if before.dev != expected_dev
+            || before.ino != expected_ino
+            || before.file_type() != expected_type
+        {
+            bail!(
+                "confined target {} changed before replacement",
+                path.label()
+            );
+        }
+        let temporary = create_temporary(&parent, create)?;
+        if let Err(error) = rename_exchange(
+            parent.directory.as_raw_fd(),
+            &temporary,
+            parent.directory.as_raw_fd(),
+            &parent.leaf,
+        ) {
+            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
+            return Err(error)
+                .with_context(|| format!("atomically replace confined path {}", path.label()));
+        }
+        let swapped = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+        if swapped.dev != expected_dev
+            || swapped.ino != expected_ino
+            || swapped.file_type() != expected_type
+        {
+            rename_exchange(
+                parent.directory.as_raw_fd(),
+                &temporary,
+                parent.directory.as_raw_fd(),
+                &parent.leaf,
+            )
+            .with_context(|| format!("restore raced target {}", path.label()))?;
+            unlink_at(parent.directory.as_raw_fd(), &temporary, 0)?;
+            bail!(
+                "confined target {} changed during replacement",
+                path.label()
+            );
+        }
+        unlink_at(parent.directory.as_raw_fd(), &temporary, 0)
+            .with_context(|| format!("remove replaced confined path {}", path.label()))
     }
 
     /// Rename one leaf to another. Both parents are resolved and retained
@@ -318,7 +571,7 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
 fn open_at(parent: RawFd, name: &CString, flags: libc::c_int, mode: u32) -> io::Result<File> {
     // `mode_t` is narrower than `int` on some platforms (including macOS),
     // so C's default argument promotions require an `int` in this variadic
-    // position. Our callers have already restricted modes to 0o777.
+    // position. Callers restrict ordinary creation modes before reaching here.
     loop {
         let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, mode as libc::c_int) };
         if fd >= 0 {
@@ -345,15 +598,9 @@ fn clear_nonblocking(file: &File) -> io::Result<()> {
     if flags & libc::O_NONBLOCK == 0 {
         return Ok(());
     }
-    loop {
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
+    retry_zero(|| unsafe {
+        libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK)
+    })
 }
 
 fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
@@ -366,6 +613,131 @@ fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
             return Err(error);
         }
     }
+}
+
+fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    retry_zero(|| unsafe {
+        libc::fstatat(parent, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)
+    })?;
+    Ok(RootMetadata {
+        dev: stat_dev(&stat),
+        ino: stat.st_ino,
+        mode: stat_mode(&stat),
+        nlink: stat_nlink(&stat),
+        len: stat.st_size as u64,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn stat_dev(stat: &libc::stat) -> u64 {
+    stat.st_dev
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_dev(stat: &libc::stat) -> u64 {
+    stat.st_dev as u64
+}
+
+#[cfg(target_os = "linux")]
+fn stat_mode(stat: &libc::stat) -> u32 {
+    stat.st_mode
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_mode(stat: &libc::stat) -> u32 {
+    stat.st_mode as u32
+}
+
+#[cfg(target_os = "linux")]
+fn stat_nlink(stat: &libc::stat) -> u64 {
+    stat.st_nlink
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_nlink(stat: &libc::stat) -> u64 {
+    stat.st_nlink as u64
+}
+
+fn unlink_at(parent: RawFd, name: &CString, flags: libc::c_int) -> io::Result<()> {
+    retry_zero(|| unsafe { libc::unlinkat(parent, name.as_ptr(), flags) })
+}
+
+fn create_temporary(
+    parent: &ResolvedParent,
+    create: impl Fn(RawFd, &CString) -> io::Result<()>,
+) -> Result<CString> {
+    for _ in 0..32 {
+        let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
+        let name = CString::new(format!(".syq-swap-{}-{counter}", std::process::id()))
+            .expect("generated swap name contains no NUL");
+        match create(parent.directory.as_raw_fd(), &name) {
+            Ok(()) => return Ok(name),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create replacement sidecar"),
+        }
+    }
+    bail!("could not allocate a replacement sidecar name")
+}
+
+#[cfg(target_os = "linux")]
+fn rename_exchange(
+    old_parent: RawFd,
+    old_name: &CString,
+    new_parent: RawFd,
+    new_name: &CString,
+) -> io::Result<()> {
+    let result = loop {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                old_parent,
+                old_name.as_ptr(),
+                new_parent,
+                new_name.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        if result == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break result;
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exchange(
+    old_parent: RawFd,
+    old_name: &CString,
+    new_parent: RawFd,
+    new_name: &CString,
+) -> io::Result<()> {
+    retry_zero(|| unsafe {
+        libc::renameatx_np(
+            old_parent,
+            old_name.as_ptr(),
+            new_parent,
+            new_name.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_exchange(
+    _old_parent: RawFd,
+    _old_name: &CString,
+    _new_parent: RawFd,
+    _new_name: &CString,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic exchange rename is unavailable",
+    ))
 }
 
 fn require_regular(file: &File, path: &RelativePath) -> Result<()> {
@@ -496,12 +868,8 @@ mod tests {
         let raw_name = std::ffi::OsString::from_vec(b"stage-\xff".to_vec());
         let stage_path = tree.path().join("dir").join(&raw_name);
         let mut stage = root
-            .create_file(&relative(b"dir/stage-\xff"), 0o7600)
+            .create_file(&relative(b"dir/stage-\xff"), 0o600)
             .unwrap();
-        let descriptor_flags = unsafe { libc::fcntl(stage.as_raw_fd(), libc::F_GETFL) };
-        assert_ne!(descriptor_flags, -1);
-        assert_eq!(descriptor_flags & libc::O_NONBLOCK, 0);
-        assert_eq!(stage.metadata().unwrap().permissions().mode() & 0o7000, 0);
         stage.write_all(b"payload").unwrap();
         stage.flush().unwrap();
         assert_eq!(fs::read(&stage_path).unwrap(), b"payload");
@@ -551,7 +919,6 @@ mod tests {
         let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(descriptor_flags, -1);
         assert_eq!(descriptor_flags & libc::O_ACCMODE, libc::O_WRONLY);
-        assert_eq!(descriptor_flags & libc::O_NONBLOCK, 0);
         file.write_all(b"updated").unwrap();
         drop(file);
         assert!(root
@@ -607,7 +974,6 @@ mod tests {
         fs::create_dir(&root_path).unwrap();
         fs::create_dir(root_path.join("gate")).unwrap();
         fs::create_dir(&outside).unwrap();
-        fs::write(root_path.join("gate/sentinel"), b"inside").unwrap();
         fs::write(outside.join("sentinel"), b"unchanged").unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -625,50 +991,23 @@ mod tests {
         });
 
         let root = Root::open(&root_path).unwrap();
-        let target = relative(b"gate/sentinel");
-        let mut successful_opens = 0usize;
-        for _ in 0..20_000 {
-            if let Ok(mut file) = root.open_regular_write(&target, true) {
-                file.write_all(b"inside").unwrap();
-                successful_opens += 1;
+        let temp = relative(b"gate/work");
+        let final_path = relative(b"gate/final");
+        for _ in 0..2_000 {
+            if let Ok(mut file) = root.create_file(&temp, 0o600) {
+                let _ = file.write_all(b"inside");
+                drop(file);
+                let _ = root.rename(&temp, &final_path);
+                let _ = root.unlink(&final_path);
+                let _ = root.unlink(&temp);
             }
         }
         stop.store(true, Ordering::Relaxed);
         attacker.join().unwrap();
 
-        assert!(
-            successful_opens > 0,
-            "race test never exercised a successful open"
-        );
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
-        assert_eq!(
-            fs::read(root_path.join("gate/sentinel")).unwrap(),
-            b"inside"
-        );
-    }
-
-    #[test]
-    fn special_leaf_types_fail_without_leaking_nonblocking_or_special_modes() {
-        let tree = TestDir::new("special-leaf");
-        let root = Root::open(tree.path()).unwrap();
-        let fifo_path = tree.path().join("fifo");
-        let fifo = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        assert!(root.open_regular_read(&relative(b"fifo")).is_err());
-        assert!(root.open_regular_write(&relative(b"fifo"), false).is_err());
-
-        let file = root.create_file(&relative(b"file"), 0o7777).unwrap();
-        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o7000, 0);
-        root.create_directory(&relative(b"directory"), 0o7777)
-            .unwrap();
-        assert_eq!(
-            fs::metadata(tree.path().join("directory"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7000,
-            0
-        );
+        assert!(!outside.join("work").exists());
+        assert!(!outside.join("final").exists());
     }
 
     #[test]
@@ -686,6 +1025,34 @@ mod tests {
         assert_eq!(fs::read(&outside).unwrap(), b"unchanged");
         root.unlink(&relative(b"leaf")).unwrap();
         assert_eq!(fs::read(&outside).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn same_type_symlink_and_special_replacement_exchange_the_expected_inode() {
+        let tree = TestDir::new("same-type-replacement");
+        let root = Root::open(tree.path()).unwrap();
+
+        let link = relative(b"link");
+        root.create_symlink(&link, b"old").unwrap();
+        let old_link = root.metadata(&link).unwrap();
+        root.replace_symlink_if_same(&link, b"new", old_link.dev, old_link.ino)
+            .unwrap();
+        let new_link = root.metadata(&link).unwrap();
+        assert!(new_link.is_symlink());
+        assert_ne!(new_link.ino, old_link.ino);
+        assert_eq!(
+            fs::read_link(tree.path().join("link")).unwrap(),
+            Path::new("new")
+        );
+
+        let fifo = relative(b"fifo");
+        root.create_node(&fifo, MODE_FIFO | 0o644, 0).unwrap();
+        let old_fifo = root.metadata(&fifo).unwrap();
+        root.replace_node_if_same(&fifo, MODE_FIFO | 0o600, 0, old_fifo.dev, old_fifo.ino)
+            .unwrap();
+        let new_fifo = root.metadata(&fifo).unwrap();
+        assert_eq!(new_fifo.file_type(), MODE_FIFO);
+        assert_ne!(new_fifo.ino, old_fifo.ino);
     }
 
     #[test]

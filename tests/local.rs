@@ -6,6 +6,7 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -54,11 +55,83 @@ impl Drop for Tmp {
 }
 
 fn syq(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_syq"))
+    compat_command()
         .args(args)
         .arg("--no-progress")
         .output()
         .expect("run syq")
+}
+
+fn compat_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command.arg("rsync");
+    command
+}
+
+fn native_syq(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .output()
+        .expect("run native syq command")
+}
+
+fn run_native_ok(args: &[&str]) -> String {
+    let out = native_syq(args);
+    assert!(
+        out.status.success(),
+        "native syq {:?} failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
+        args,
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[cfg(debug_assertions)]
+fn spawn_native_after_precondition(args: &[&str], ready: &Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_TARGET_PRECONDITION_READY_FILE", ready)
+        .env("SYQ_TEST_HOLD_TARGET_PRECONDITION_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn native command held after its target precondition")
+}
+
+#[cfg(debug_assertions)]
+fn spawn_native_before_guarded_mutation(
+    args: &[&str],
+    suffix: &str,
+    ready: &Path,
+) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_GUARDED_MUTATION_SUFFIX", suffix)
+        .env("SYQ_TEST_GUARDED_MUTATION_READY_FILE", ready)
+        .env("SYQ_TEST_HOLD_GUARDED_MUTATION_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn native command held at guarded receiver mutation")
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_signal(path: &Path) {
+    for attempt in 0..500 {
+        if path.exists() {
+            return;
+        }
+        if attempt % 100 == 0 {
+            eprintln!("waiting for test signal {}", path.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("timed out waiting for test signal {}", path.display());
 }
 
 fn run_ok(args: &[&str]) -> String {
@@ -115,9 +188,477 @@ fn partial_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+#[test]
+fn native_copy_distinguishes_named_contents_and_exact_placement() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/file"), b"data");
+
+    let many_slashes = format!("{}///", t.s("src"));
+    run_native_ok(&["cp", &many_slashes, "--into", &t.s("named")]);
+    assert_eq!(read(&t.path("named/src/sub/file")), b"data");
+
+    run_native_ok(&["cp", "--src-src", &t.s("src"), "--into", &t.s("contents")]);
+    assert_eq!(read(&t.path("contents/sub/file")), b"data");
+    assert!(!t.path("contents/src").exists());
+
+    run_native_ok(&["cp", &t.s("src"), "--as", &t.s("exact")]);
+    assert_eq!(read(&t.path("exact/sub/file")), b"data");
+    assert!(!t.path("exact/src").exists());
+
+    // Existing target state does not change either placement mapping.
+    fs::create_dir_all(t.path("named-existing")).unwrap();
+    fs::create_dir_all(t.path("exact-existing")).unwrap();
+    run_native_ok(&["cp", &t.s("src"), "--into-existing", &t.s("named-existing")]);
+    run_native_ok(&["cp", &t.s("src"), "--as-existing", &t.s("exact-existing")]);
+    assert_eq!(read(&t.path("named-existing/src/sub/file")), b"data");
+    assert_eq!(read(&t.path("exact-existing/sub/file")), b"data");
+    assert!(!t.path("exact-existing/src").exists());
+
+    let plan = run_native_ok(&[
+        "cp",
+        "--dry-run",
+        &t.s("src"),
+        "--as",
+        &t.s("planned-exact"),
+    ]);
+    assert!(plan.contains("(exact destination path)"), "{plan}");
+
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("src"),
+        ".",
+        "--as-new",
+        &t.s("dot-exact"),
+    ]);
+    assert_eq!(read(&t.path("dot-exact/sub/file")), b"data");
+}
+
+#[test]
+fn native_copy_enforces_placement_preconditions_before_mutation() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"source");
+    write(&t.path("occupied/keep"), b"keep");
+
+    for args in [
+        vec!["cp", &t.s("src"), "--into-new", &t.s("occupied")],
+        vec![
+            "cp",
+            &t.s("src"),
+            "--into-existing",
+            &t.s("missing-container"),
+        ],
+        vec!["cp", &t.s("src"), "--as-new", &t.s("occupied/keep")],
+        vec!["cp", &t.s("src"), "--as-existing", &t.s("missing-exact")],
+    ] {
+        let out = native_syq(&args);
+        assert!(!out.status.success(), "unexpected success for {args:?}");
+    }
+    assert_eq!(read(&t.path("occupied/keep")), b"keep");
+    assert!(!t.path("missing-container").exists());
+    assert!(!t.path("missing-exact").exists());
+
+    write(&t.path("existing-exact"), b"old");
+    let before = fs::metadata(t.path("existing-exact")).unwrap();
+    run_native_ok(&["cp", &t.s("src"), "--as-existing", &t.s("existing-exact")]);
+    let after = fs::metadata(t.path("existing-exact")).unwrap();
+    assert_eq!(read(&t.path("existing-exact")), b"source");
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+
+    let missing_source_target = t.s("missing-source-target");
+    let missing_source = native_syq(&["cp", &t.s("absent"), "--into-new", &missing_source_target]);
+    assert!(!missing_source.status.success());
+    assert!(!Path::new(&missing_source_target).exists());
+
+    let contents_target = t.s("bad-contents-target");
+    let not_a_directory = native_syq(&[
+        "cp",
+        "--src-src",
+        &t.s("src"),
+        "--into-new",
+        &contents_target,
+    ]);
+    assert!(!not_a_directory.status.success());
+    assert!(!Path::new(&contents_target).exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_placement_preconditions_are_enforced_at_mutation_time() {
+    let t = Tmp::new();
+    write(&t.path("source-file"), b"source");
+    write(&t.path("source-dir/file"), b"source");
+
+    let as_new_ready = t.path("as-new-ready");
+    let as_new = spawn_native_after_precondition(
+        &["cp", &t.s("source-file"), "--as-new", &t.s("as-new")],
+        &as_new_ready,
+    );
+    wait_for_signal(&as_new_ready);
+    write(&t.path("as-new"), b"concurrent winner");
+    let output = as_new.wait_with_output().unwrap();
+    assert!(!output.status.success(), "raced --as-new unexpectedly won");
+    assert_eq!(read(&t.path("as-new")), b"concurrent winner");
+
+    let into_new_ready = t.path("into-new-ready");
+    let into_new = spawn_native_after_precondition(
+        &["cp", &t.s("source-dir"), "--into-new", &t.s("into-new")],
+        &into_new_ready,
+    );
+    wait_for_signal(&into_new_ready);
+    write(&t.path("into-new/concurrent"), b"winner");
+    let output = into_new.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced --into-new unexpectedly accepted another directory"
+    );
+    assert_eq!(read(&t.path("into-new/concurrent")), b"winner");
+    assert!(!t.path("into-new/source-dir").exists());
+
+    write(&t.path("as-existing"), b"original");
+    let as_existing_ready = t.path("as-existing-ready");
+    let as_existing = spawn_native_after_precondition(
+        &[
+            "cp",
+            &t.s("source-file"),
+            "--as-existing",
+            &t.s("as-existing"),
+        ],
+        &as_existing_ready,
+    );
+    wait_for_signal(&as_existing_ready);
+    fs::remove_file(t.path("as-existing")).unwrap();
+    write(&t.path("as-existing"), b"concurrent replacement");
+    let output = as_existing.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced --as-existing ignored target identity"
+    );
+    assert_eq!(read(&t.path("as-existing")), b"concurrent replacement");
+
+    fs::create_dir_all(t.path("into-existing")).unwrap();
+    let into_existing_ready = t.path("into-existing-ready");
+    let into_existing = spawn_native_after_precondition(
+        &[
+            "cp",
+            "--src-src",
+            &t.s("source-dir"),
+            "--into-existing",
+            &t.s("into-existing"),
+        ],
+        &into_existing_ready,
+    );
+    wait_for_signal(&into_existing_ready);
+    fs::rename(t.path("into-existing"), t.path("displaced-directory")).unwrap();
+    write(&t.path("into-existing/concurrent"), b"winner");
+    let output = into_existing.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced --into-existing ignored target identity"
+    );
+    assert_eq!(read(&t.path("into-existing/concurrent")), b"winner");
+    assert!(!t.path("into-existing/file").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_container_identity_anchors_worker_writes_and_cprm_deletions() {
+    let t = Tmp::new();
+    write(&t.path("source/file"), b"source");
+
+    fs::create_dir_all(t.path("into-existing")).unwrap();
+    let existing_ready = t.path("existing-worker-ready");
+    let existing = spawn_native_before_guarded_mutation(
+        &[
+            "cp",
+            "--src-src",
+            &t.s("source"),
+            "--into-existing",
+            &t.s("into-existing"),
+        ],
+        "file",
+        &existing_ready,
+    );
+    wait_for_signal(&existing_ready);
+    fs::rename(t.path("into-existing"), t.path("displaced-existing")).unwrap();
+    write(&t.path("into-existing/winner"), b"replacement");
+    let output = existing.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced worker unexpectedly succeeded"
+    );
+    assert_eq!(read(&t.path("into-existing/winner")), b"replacement");
+    assert!(!t.path("into-existing/file").exists());
+
+    let new_ready = t.path("new-worker-ready");
+    let new = spawn_native_before_guarded_mutation(
+        &[
+            "cp",
+            "--src-src",
+            &t.s("source"),
+            "--into-new",
+            &t.s("into-new"),
+        ],
+        "file",
+        &new_ready,
+    );
+    wait_for_signal(&new_ready);
+    fs::rename(t.path("into-new"), t.path("displaced-new")).unwrap();
+    write(&t.path("into-new/winner"), b"replacement");
+    let output = new.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced new-container worker succeeded"
+    );
+    assert_eq!(read(&t.path("into-new/winner")), b"replacement");
+    assert!(!t.path("into-new/file").exists());
+
+    fs::create_dir_all(t.path("empty-source")).unwrap();
+    write(&t.path("mirror/extra"), b"old extra");
+    let delete_ready = t.path("delete-ready");
+    let delete = spawn_native_before_guarded_mutation(
+        &[
+            "cprm",
+            "--src-src",
+            &t.s("empty-source"),
+            "--into-existing",
+            &t.s("mirror"),
+        ],
+        "extra",
+        &delete_ready,
+    );
+    wait_for_signal(&delete_ready);
+    fs::rename(t.path("mirror"), t.path("displaced-mirror")).unwrap();
+    write(&t.path("mirror/extra"), b"replacement extra");
+    let output = delete.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced cprm unexpectedly succeeded"
+    );
+    assert_eq!(read(&t.path("mirror/extra")), b"replacement extra");
+}
+
+#[test]
+fn native_as_existing_updates_a_same_type_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    symlink("new-target", t.path("source-link")).unwrap();
+    symlink("old-target", t.path("destination-link")).unwrap();
+
+    run_native_ok(&[
+        "cp",
+        "--src-no-follow",
+        &t.s("source-link"),
+        "--as-existing",
+        &t.s("destination-link"),
+    ]);
+
+    assert_eq!(
+        fs::read_link(t.path("destination-link")).unwrap(),
+        Path::new("new-target")
+    );
+}
+
+#[test]
+fn native_copy_uses_explicit_endpoints_cwd_and_option_safe_selectors() {
+    let t = Tmp::new();
+    write(&t.path("base/foo"), b"cwd");
+    write(&t.path("base/--into"), b"option-looking");
+    write(&t.path("base/host:path"), b"colon-local");
+
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("base"),
+        "--src",
+        "foo",
+        "--src",
+        "--into",
+        "host:path",
+        "--into",
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/foo")), b"cwd");
+    assert_eq!(read(&t.path("dst/--into")), b"option-looking");
+    assert_eq!(read(&t.path("dst/host:path")), b"colon-local");
+
+    let split = native_syq(&[
+        "cp",
+        "--from",
+        "host:/mistaken/path",
+        "foo",
+        "--into",
+        &t.s("never"),
+    ]);
+    assert!(!split.status.success());
+    assert!(String::from_utf8_lossy(&split.stderr).contains("pass paths separately"));
+    assert!(!t.path("never").exists());
+
+    let no_basename = native_syq(&["cp", "..", "--into", &t.s("no-basename")]);
+    assert!(!no_basename.status.success());
+    assert!(String::from_utf8_lossy(&no_basename.stderr).contains("no target basename"));
+    assert!(!t.path("no-basename").exists());
+}
+
+#[test]
+fn native_copy_follows_only_an_explicitly_selected_root_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real/file"), b"data");
+    symlink("real", t.path("link")).unwrap();
+
+    run_native_ok(&["cp", &t.s("link"), "--into", &t.s("followed")]);
+    assert_eq!(read(&t.path("followed/link/file")), b"data");
+
+    run_native_ok(&[
+        "cp",
+        "--src-no-follow",
+        &t.s("link"),
+        "--into",
+        &t.s("preserved"),
+    ]);
+    assert_eq!(
+        fs::read_link(t.path("preserved/link")).unwrap(),
+        Path::new("real")
+    );
+
+    let link_with_slashes = format!("{}///", t.s("link"));
+    run_native_ok(&[
+        "cp",
+        "--src-no-follow",
+        &link_with_slashes,
+        "--into",
+        &t.s("preserved-with-slashes"),
+    ]);
+    assert_eq!(
+        fs::read_link(t.path("preserved-with-slashes/link")).unwrap(),
+        Path::new("real")
+    );
+}
+
+#[test]
+fn native_copy_preserves_non_utf8_selector_bytes() {
+    let t = Tmp::new();
+    let mut source = t.0.as_os_str().as_bytes().to_vec();
+    source.extend_from_slice(b"/non-utf8-");
+    source.push(0xff);
+    let source = std::ffi::OsString::from_vec(source);
+    write(Path::new(&source), b"raw path");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("cp")
+        .arg(&source)
+        .arg("--as-new")
+        .arg(t.path("copied"))
+        .arg("--no-progress")
+        .output()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("copied")), b"raw path");
+}
+
+#[test]
+fn native_cprm_removes_only_target_extras_after_copy() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"new content");
+    write(&t.path("dst/keep"), b"old");
+    write(&t.path("dst/extra"), b"extra");
+
+    run_native_ok(&[
+        "cprm",
+        "--src-src",
+        &t.s("src"),
+        "--into-existing",
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("src/keep")), b"new content");
+    assert_eq!(read(&t.path("dst/keep")), b"new content");
+    assert!(!t.path("dst/extra").exists());
+}
+
+#[test]
+fn native_direct_remote_to_remote_preserves_explicit_grammar() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src/file"), b"remote data");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--from",
+            "source.invalid",
+            "--src-src",
+            &t.s("src"),
+            "--to",
+            "target.invalid",
+            "--into-new",
+            &t.s("dst"),
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--no-tcp",
+            "--connections",
+            "1",
+            "--no-progress",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .output()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/file")), b"remote data");
+    let launches = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        launches.contains("syq cp"),
+        "remote command was {launches:?}"
+    );
+    assert!(launches.contains("--src-src"));
+    assert!(launches.contains("--into-new"));
+}
+
+#[test]
+fn native_rm_is_idempotent_for_duplicate_and_nested_selectors() {
+    let t = Tmp::new();
+    write(&t.path("tree/child/file"), b"data");
+    run_native_ok(&["rm", &t.s("tree"), &t.s("tree/child"), &t.s("tree")]);
+    assert!(!t.path("tree").exists());
+}
+
+#[test]
+fn native_rm_trailing_slash_removes_a_selected_symlink_not_its_referent() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real/file"), b"keep");
+    symlink("real", t.path("link")).unwrap();
+
+    let link_with_slashes = format!("{}///", t.s("link"));
+    run_native_ok(&["rm", &link_with_slashes]);
+
+    assert!(!t.path("link").exists());
+    assert_eq!(read(&t.path("real/file")), b"keep");
+}
+
+#[test]
+fn top_level_rsync_syntax_is_rejected_without_mutation() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["-a", &t.s("src"), &t.s("dst")])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("syq rsync"));
+    assert!(!t.path("dst").exists());
+}
+
 #[cfg(debug_assertions)]
 fn interrupted_partial(args: &[&str], dir: &Path) -> PathBuf {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut child = compat_command()
         .args(args)
         .arg("--no-progress")
         .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000")
@@ -166,7 +707,7 @@ exec /bin/sh -c "$1"
 }
 
 fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
+    let mut cmd = compat_command();
     cmd.args(["-e", rsh.to_str().unwrap(), "--no-tcp", "-j", "1"])
         .args(args)
         .arg("--no-progress")
@@ -778,6 +1319,40 @@ fn no_bootstrap_uses_remote_path_without_managed_cache() {
 }
 
 #[test]
+fn rsync_subcommand_wrapper_can_start_the_remote_server() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let wrapper = t.path("syq-rsync");
+    executable(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' rsync \"$@\"\n",
+            env!("CARGO_BIN_EXE_syq")
+        )
+        .as_bytes(),
+    );
+
+    write(&t.path("src"), b"compatibility wrapper");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--syq-path",
+            wrapper.to_str().unwrap(),
+            &t.s("src"),
+            &remote,
+        ],
+    )
+    .output()
+    .expect("run through an rsync-prefixed remote wrapper");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"compatibility wrapper");
+}
+
+#[test]
 fn remote_retained_basis_handles_matching_and_changed_files() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
@@ -812,7 +1387,7 @@ fn double_verbose_dry_run_reports_tcp_without_extra_connection() {
     write(&t.path("src"), b"diagnose");
     let remote = format!("127.0.0.1:{}", t.s("dst"));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .arg("-e")
         .arg(&rsh)
         .arg("--syq-path")
@@ -880,7 +1455,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
     write(&t.path("src"), b"fallback");
     let remote = format!("diagnostic.invalid:{}", t.s("dst"));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .arg("-e")
         .arg(&rsh)
         .arg("--syq-path")
@@ -930,7 +1505,7 @@ fn single_verbose_keeps_file_listing_semantics() {
     write(&t.path("src"), b"listed");
     let remote = format!("fake:{}", t.s("dst"));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .arg("-e")
         .arg(&rsh)
         .arg("--syq-path")
@@ -961,7 +1536,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     write(&t.path("src"), b"tcp default");
     let remote = format!("127.0.0.1:{}", t.s("dst"));
 
-    let dry = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let dry = compat_command()
         .arg("-e")
         .arg(&rsh)
         .arg("--syq-path")
@@ -984,7 +1559,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         "{stdout}"
     );
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .arg("-e")
         .arg(&rsh)
         .arg("--syq-path")
@@ -1037,7 +1612,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
         .as_bytes(),
     );
     let run = |destination: &str, fixed: Option<usize>| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        let mut command = compat_command();
         command
             .arg("-e")
             .arg(&rsh)
@@ -1147,7 +1722,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .as_bytes(),
     );
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .arg("-e")
         .arg(&rsh)
         .args([
@@ -2156,7 +2731,7 @@ fn rm_rejects_parent_traversal() {
     fs::create_dir_all(t.path("parent/child")).unwrap();
     write(&t.path("parent/sibling"), b"x");
     write(&t.path("parent/child/y"), b"y");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args(["--rm", ".."])
         .arg("--no-progress")
         .current_dir(t.path("parent/child"))
@@ -2410,7 +2985,7 @@ fn small_files_atomic_no_partials() {
 fn small_file_failure_never_publishes_partial_contents() {
     let t = Tmp::new();
     write(&t.path("src/f"), b"complete contents");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "/f")
         .output()
@@ -3742,7 +4317,7 @@ fn ordinary_copy_needs_no_writable_history_directory() {
     // A regular file cannot contain an application state directory. Ordinary
     // copies must ignore both locations because history is opt-in.
     write(&t.path("not-a-directory"), b"occupied");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("XDG_STATE_HOME", t.s("not-a-directory"))
         .env("HOME", t.s("not-a-directory"))
@@ -3766,7 +4341,7 @@ fn checkpoint_is_explicit_retained_and_source_sensitive() {
     write(&t.path("src/fail/other"), b"other");
     set_mtime(&t.path("src/f"), 1_600_000_000);
     let checkpoint = t.s("copy.checkpoint");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args([
             "-a",
             "--no-progress",
@@ -3865,7 +4440,7 @@ fn checkpoint_tombstone_precedes_destination_deletion() {
     ]);
 
     fs::remove_file(t.path("src/f")).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut child = compat_command()
         .args([
             "-a",
             "--delete",
@@ -3958,7 +4533,7 @@ fn checkpoint_skip_still_detects_collision() {
     write(&t.path("A/fail/y"), b"failure trigger");
     fs::create_dir_all(t.path("B")).unwrap();
     let checkpoint = t.s("copy.checkpoint");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args([
             "-a",
             "--no-progress",
@@ -4209,7 +4784,7 @@ fn opened_up_directories_get_their_mode_back() {
 fn root_meta_failure_is_visible() {
     let t = Tmp::new();
     write(&t.path("src/f"), b"data");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst")])
         .env("SYQ_TEST_FAIL_SETMETA", "dst")
         .output()
@@ -4234,7 +4809,7 @@ fn checkpoint_records_quick_check_only_after_meta_repair() {
     fs::set_permissions(t.path("src/f"), fs::Permissions::from_mode(0o600)).unwrap();
     set_mtime(&t.path("src/f"), 1_600_000_000);
     let checkpoint = t.s("copy.checkpoint");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args([
             "-a",
             "--no-progress",
@@ -4334,7 +4909,7 @@ fn checkpoint_identity_is_spelling_independent() {
     set_mtime(&t.path("src/f"), 1_600_000_000);
     let dotted = format!("{}/./src/", t.s(""));
     let checkpoint = t.s("copy.checkpoint");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args([
             "-a",
             "--no-progress",
@@ -4370,7 +4945,7 @@ fn existing_checkpoint_with_missing_destination_fails() {
     write(&t.path("src/a"), b"aaaa");
     write(&t.path("src/fail/secret"), b"secret");
     let checkpoint = t.s("copy.checkpoint");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args([
             "-a",
             "--no-progress",
@@ -4460,7 +5035,7 @@ fn concurrent_copies_union() {
         write(&t.path(&format!("B/b{i}")), b"b");
     }
     let spawn = |src: &str| {
-        Command::new(env!("CARGO_BIN_EXE_syq"))
+        compat_command()
             .args(["-a", "--no-progress", &t.s(src), &t.s("dest/")])
             .spawn()
             .unwrap()
@@ -4486,7 +5061,7 @@ fn different_jobs_use_distinct_partial_inodes() {
     write(&t.path("first"), &first_contents);
     write(&t.path("second"), &second_contents);
 
-    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut first = compat_command()
         .args([
             "-a",
             "-j",
@@ -4550,7 +5125,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     set_mtime(&t.path("second"), 1_600_000_002);
     let ready = t.path("basis-ready");
 
-    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut first = compat_command()
         .args([
             "-a",
             "-j",
@@ -4606,7 +5181,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
     set_mtime(&t.path("basis"), 1_600_000_000);
     let ready = t.path("basis-ready");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut child = compat_command()
         .args([
             "-a",
             "-j",
@@ -4659,7 +5234,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     set_mtime(&t.path("second"), 1_600_000_002);
     let ready = t.path("basis-ready");
 
-    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut first = compat_command()
         .args([
             "-a",
             "-j",
@@ -4729,7 +5304,7 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
     set_mtime(&t.path("second"), 1_600_000_001);
     let ready = t.path("quick-meta-ready");
 
-    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut first = compat_command()
         .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
         .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_QUICK_META_MS", "2000")
@@ -4791,7 +5366,7 @@ fn quick_check_metadata_open_reports_concurrent_fifo_without_blocking() {
     set_mtime(&t.path("first"), 1_600_000_000);
     let ready = t.path("quick-meta-ready");
 
-    let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut first = compat_command()
         .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
         .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_QUICK_META_MS", "1000")
@@ -4882,7 +5457,7 @@ fn unchmodable_interrupted_partial_is_replaced() {
     let partial = interrupted_partial(&args, &t.0);
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o000)).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args(args)
         .arg("--no-progress")
         .env("SYQ_TEST_FAIL_PARTIAL_CHMOD", "1")
@@ -4906,7 +5481,7 @@ fn writable_interrupted_partial_is_made_private_before_reuse() {
     let partial = interrupted_partial(&args, &t.0);
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o644)).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut child = compat_command()
         .args(args)
         .arg("--no-progress")
         .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000")
@@ -4933,7 +5508,7 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
     set_mtime(&t.path("src"), 1_600_000_001);
     set_mtime(&t.path("dst"), 1_600_000_000);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args(["-a", "-j", "1", "--no-progress", &t.s("src"), &t.s("dst")])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .output()
@@ -5020,7 +5595,7 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
     write(&t.path("src"), &original);
     set_mtime(&t.path("src"), 1_600_000_000);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let child = compat_command()
         .args([
             "-a",
             "--stats",
@@ -5070,7 +5645,7 @@ fn changed_source_retry_still_uses_copy_file_range() {
     write(&t.path("src"), &original);
     set_mtime(&t.path("src"), 1_600_000_000);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let child = compat_command()
         .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
         .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
         .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
@@ -5197,7 +5772,7 @@ fn checkpoint_records_metadata_only_reconcile() {
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
     set_mtime(&t.path("src/f"), 1_600_000_001);
     let checkpoint = t.s("copy.checkpoint");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let out = compat_command()
         .args([
             "-a",
             "--no-progress",
@@ -5684,7 +6259,7 @@ fn files_from_rejections_and_stdin() {
     write(&t.path("src/b"), b"b");
     write(&t.path("list"), b"a\n");
     // `-` reads the list from stdin.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut child = compat_command()
         .args([
             "-a",
             "--files-from",
@@ -5901,7 +6476,7 @@ fn delete_halts_when_checkpoint_intents_cannot_be_persisted() {
     ]);
     fs::remove_file(t.path("src/f")).unwrap();
     let limit = fs::metadata(t.path("state")).unwrap().len();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
+    let mut cmd = compat_command();
     cmd.args([
         "-a",
         "--checkpoint",

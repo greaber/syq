@@ -1,7 +1,8 @@
 # syq
 
-`syq` is a parallel file copier with an rsync-shaped command line. It scans
-source and destination, works out what differs, and moves the data over
+`syq` is a parallel file copier with an explicit native command line and a
+retained rsync-compatibility subcommand. It scans source and destination, works
+out what differs, and moves the data over
 **N independent connections at once** — encrypted TCP by default, authenticated
 over ssh, falling back to ssh's own channels when a direct port can't be
 reached — splitting large files into ranges
@@ -127,35 +128,107 @@ Git-derived identity when an explicit source-built helper is used.
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
   (the musl target also works if `musl-gcc` is installed, which `zstd-sys` needs).
 
-## Usage
+## Native commands
+
+Native syntax starts with an operation and keeps endpoints, selectors, and
+target placement in separate arguments:
+
+```sh
+syq cp project --to server --into /backup       # named object → /backup/project
+syq cp --src-src project --to server --into /app # project contents → /app
+syq cp --from server --cwd /data --src a --src b --into ./data
+syq cp report --to server --as-new /reports/final
+syq cprm --src-src build --to server --into-existing /srv/app
+syq rm cache old-output
+syq rm --at server --cwd /srv --path old-output
+```
+
+`--from [USER@]HOST` selects one source endpoint and `--to [USER@]HOST`
+selects one target endpoint; omission means local. A local path containing `:`
+stays local because native mode never guesses endpoints from path text.
+`--cwd DIR`/`-C DIR` changes where relative source selectors are resolved at
+the source endpoint. Absolute selectors ignore it.
+
+Bare paths and repeatable `--src PATH` select named objects. A named directory
+keeps its basename at the target; a trailing slash is ordinary path spelling
+and has no semantic effect. `--src-src DIR` selects a directory's contents and
+merges them directly into the target container. `--src-no-follow PATH` selects
+a top-level symlink object itself; bare paths and `--src` follow a top-level
+symlink while retaining its written basename. Symlinks found while traversing
+a directory are copied as symlinks and are never followed. Singular selector
+options consume their next argument even when it begins with `-`, so every Unix
+filename is expressible without losing raw path bytes.
+
+Placement is always explicit in this initial native surface:
+
+| Placement | Mapping | Target precondition |
+|---|---|---|
+| `--into DIR` | Put selected names inside `DIR` | Use or create the directory |
+| `--into-new DIR` | Put selected names inside `DIR` | Must not exist |
+| `--into-existing DIR` | Put selected names inside `DIR` | Must already be a directory |
+| `--as PATH` | Map one named source exactly to `PATH` | Create or update the path |
+| `--as-new PATH` | Map one named source exactly to `PATH` | Must not exist |
+| `--as-existing PATH` | Map one named source exactly to `PATH` | Must exist |
+
+The receiver enforces `new` and `existing` again when it mutates the target,
+not only during planning. New targets use no-replace creation or publication.
+Existing containers must remain the same directory object: every descendant
+mutation reopens that identity and uses descriptor-relative filesystem calls,
+so replacing the container path makes the operation fail without touching its
+replacement. An exact existing regular file is updated through the object that
+passed preflight, preserving its inode (and therefore updating any hard-link
+aliases). Existing symlinks and special files can be atomically replaced by
+the same type. An exact `--as-existing` operation that would change the
+target's type is refused; use `--as` when type replacement is intended.
+
+`cp` copies or updates mapped source objects and keeps unrelated target
+objects. `cprm` uses the same mapping and transfer engine, then applies the
+existing safe deletion planner to remove target-only descendants in mapped
+directory scopes. It never removes a source and requires explicit placement;
+`--max-delete N` keeps its all-or-nothing deletion budget. `rm` removes the
+explicitly selected object trees and never follows a selected symlink.
+
+The first native fidelity default recurses through directories, copies in-tree
+symlinks as objects, and retains mtimes. Owner, group, modes, special files,
+hard links, ACLs, xattrs, filtering, comparison policy, and the automation API
+are intentionally not frozen by this first grammar. Use `syq rsync` when the
+current compatibility options for those capabilities are needed.
+
+The native commands currently share `-n/--dry-run`, `-v`, `-q`,
+`-j/--connections`, `--progress`, `--no-progress`, `--progress-json`, and the
+remote runtime options shown by `syq cp --help`. Remote-to-remote copies run on
+the source endpoint by default; `--relay` keeps orchestration local. Direct
+SSH command construction requires UTF-8 paths, while `--relay` carries raw path
+bytes in syq's protocol.
+
+## Rsync compatibility
+
+The complete previous command surface remains available under `syq rsync`:
 
 ```
-syq [OPTIONS] SRC... DEST
-syq [OPTIONS] [USER@]HOST:SRC... DEST
-syq [OPTIONS] SRC... [USER@]HOST:DEST
+syq rsync [OPTIONS] SRC... DEST
+syq rsync [OPTIONS] [USER@]HOST:SRC... DEST
+syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 ```
 
 ```sh
-syq -av project/ server:backup/project/       # push
-syq -av server:data/ ./data/                  # pull
-syq -a /mnt/nfs/tree /local/tree              # local → local (parallel scan and copy)
-syq -a hostA:big/ hostB:big/                  # remote → remote: runs on hostA, data goes A → B directly
-syq -a --relay hostA:big/ hostB:big/          # ...or relay through this machine if A can't reach B
-syq -av -j 16 bigdir server:dest              # 16 parallel connections
-syq -a --bwlimit 50M src server:dst            # cap all connections at 50 MiB/s total
-syq -a -e 'ssh -p 2222 -i ~/.ssh/other' src host:dst
-syq -a --dry-run -v src host:dst              # show what would be copied
-syq -ac src host:dst                          # skip the quick check; compare blocks, repair differences
-syq -a --verify-only src host:dst             # compare only; transfer nothing
-syq -a src newhost:dst                        # the matching remote helper is automatic
-syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for later runs
+syq rsync -av project/ server:backup/project/       # push
+syq rsync -av server:data/ ./data/                  # pull
+syq rsync -a /mnt/nfs/tree /local/tree              # local → local
+syq rsync -a hostA:big/ hostB:big/                  # direct remote → remote
+syq rsync -a --relay hostA:big/ hostB:big/          # relay when A cannot reach B
+syq rsync -av -j 16 bigdir server:dest              # fixed parallelism
+syq rsync -a --dry-run -v src host:dst              # preview
+syq rsync -a --verify-only src host:dst             # compare only
 ```
 
-### Options
+The sections below document this retained compatibility surface unless they
+explicitly say otherwise.
+
+### Compatibility options
 
 | Option | Meaning |
 |---|---|
-| `--self-update` | Install the newest signed release (standalone installer builds only) |
 | `-a`, `--archive` | Same as `-rlptgoD` |
 | `-r` `-l` `-p` `-t` `-g` `-o` `-D` | Recursive; symlinks as symlinks; perms; mtimes; group; owner; devices and specials |
 | `-v`, `-vv` | `-v` lists files as they complete; for copies, `-vv` also explains remote helpers, candidate TCP addresses, the planned transport, and initial concurrency |
@@ -221,12 +294,12 @@ does not change file contents, hashes, resume offsets, or `--bwlimit` accounting
 
 ### Remote-to-remote
 
-`syq hostA:src hostB:dst` starts the orchestrator *on hostA*, which then pushes
+`syq rsync hostA:src hostB:dst` starts the orchestrator *on hostA*, which then pushes
 to hostB with N connections, so data flows A → B directly. Matching helpers
 are installed automatically on both hosts. Progress and `-v` output are
 streamed back. If hostA can't reach hostB, `--relay` keeps the orchestrator
 here and routes every byte A → you → B — always works, at half the bandwidth.
-`syq hostA:src hostA:dst` (same host and user on both ends) simply runs a
+`syq rsync hostA:src hostA:dst` (same host and user on both ends) simply runs a
 local copy on hostA and disables agent forwarding.
 
 With implicit OpenSSH, the default is a temporary local agent broker rather
@@ -356,13 +429,13 @@ remote-to-remote copy (`--relay` keeps it local).
 
 Identical to rsync:
 
-- `syq -a src dest` copies the directory itself → `dest/src`. `dest` is
+- `syq rsync -a src dest` copies the directory itself → `dest/src`. `dest` is
   created if missing.
 - An existing non-directory `dest` cannot be the parent of that `dest/src`
   mapping; dry-run rejects it instead of presenting an impossible summary.
   With `--existing`, both dry-run and the real command skip the whole mapping
   as a no-op because creating `dest/src` is outside the selected scope.
-- `syq -a src/ dest` copies the *contents* of `src` into `dest`. `src/.` and
+- `syq rsync -a src/ dest` copies the *contents* of `src` into `dest`. `src/.` and
   `.` behave the same way.
 - A single file source goes to `dest/file` if `dest` is an existing directory,
   otherwise `dest` is the new filename.
@@ -551,7 +624,7 @@ Only when repeated destination metadata lookups are themselves too expensive
 should you opt in to a checkpoint:
 
 ```sh
-syq -a --checkpoint ./copy.state huge-tree/ host:huge-tree/
+syq rsync -a --checkpoint ./copy.state huge-tree/ host:huge-tree/
 # after an interruption, run the identical command again
 ```
 
@@ -803,7 +876,7 @@ or start transfer workers, and verbosity does not change dry-run's success or
 failure. The reported route is therefore a plan for a real transfer, not a
 claim that a worker data connection was completed.
 
-Remote→remote (`syq hostA:src hostB:dst`) works the same way: the orchestrator
+Remote→remote (`syq rsync hostA:src hostB:dst`) works the same way: the orchestrator
 on hostA connects to hostB's listener. Diagnostics are relative to that active
 orchestrator: the existing status message identifies hostA, and the detailed
 remote block describes hostB. If both paths are on hostA, `-vv` reports a local
@@ -831,11 +904,11 @@ both are applied in command-line order with gitignore semantics (last match
 wins, `!` re-includes), so anything you'd write in a `.gitignore` works here:
 
 ```sh
-syq -a -i node_modules -i .git src/ host:dst/   # a name matches at any depth
-syq -a -i '*.o' -i /build src/ host:dst/         # glob; leading / anchors to the root
-syq -a -i 'logs/*' -i '!logs/keep/' src/ dst/    # everything in logs/ except keep/
-syq -a --ignore-from .gitignore -i '!dist/' repo/ host:repo/
-syq -a -i '*' -i '!*/' -i '!*.jpg' photos/ bak/  # copy only *.jpg
+syq rsync -a -i node_modules -i .git src/ host:dst/   # a name matches at any depth
+syq rsync -a -i '*.o' -i /build src/ host:dst/         # glob; leading / anchors to the root
+syq rsync -a -i 'logs/*' -i '!logs/keep/' src/ dst/    # everything in logs/ except keep/
+syq rsync -a --ignore-from .gitignore -i '!dist/' repo/ host:repo/
+syq rsync -a -i '*' -i '!*/' -i '!*.jpg' photos/ bak/  # copy only *.jpg
 ```
 
 Rules of thumb (they're git's): `foo` matches a file or directory named `foo`
@@ -855,11 +928,11 @@ nothing to act on. Ignore the siblings instead (`logs/*`, which does not cross
 
 ## Deleting extras (`--delete`)
 
-`syq -a --delete src/ host:dst/` makes `dst` look like `src`: after the
+`syq rsync -a --delete src/ host:dst/` makes `dst` look like `src`: after the
 transfer, anything under a destination directory that the source doesn't
 have is removed. The rules are simpler than rsync's, deliberately:
 
-- **Scope.** Only inside directories the sources map onto: `syq --delete a b
+- **Scope.** Only inside directories the sources map onto: `syq rsync --delete a b
   dst/` cleans `dst/a` and `dst/b`, never `dst/c`. A single-file source deletes
   nothing.
 - **Ignored means out of scope, on both sides.** The `-i` patterns are applied
@@ -936,7 +1009,7 @@ the same command would transfer and nothing else.
 
 ## Copying a list (`--files-from`)
 
-`syq -a --files-from list.txt host:src/ dst/` copies only the paths named in
+`syq rsync -a --files-from list.txt host:src/ dst/` copies only the paths named in
 `list.txt`, one per line (`--from0`: NUL-separated; `-` reads stdin), each
 relative to the single source directory, to the same relative path under the
 destination. The source is not walked, which is the point on a slow
@@ -959,7 +1032,7 @@ it needs `--relay` (the list is read on this machine).
 
 ## Parallel removal (`--rm`)
 
-`syq --rm [-j N] [-n] [-v] PATH...` removes trees the way syq copies them:
+`syq rsync --rm [-j N] [-n] [-v] PATH...` removes trees the way syq copies them:
 a parallel scan, files unlinked in batches across N workers, directories
 removed deepest-first with each level in parallel. Symlinks are removed, not
 followed. Remote paths (`host:path`) work. It refuses `/`, `.` and `~`. On
@@ -982,7 +1055,7 @@ exception described above.
 
 ## NFS
 
-Local↔NFS copies are a local→local syq run (`syq -a -j16 /raid/x /mnt/nfs/x`)
+Local↔NFS copies are a local→local syq run (`syq rsync -a -j16 /raid/x /mnt/nfs/x`)
 and benefit from the same parallelism: measured on a 20 Gbit NFSv4.2 mount,
 reads of one 4 GB file 858 MiB/s with `-j8` vs ~400 MB/s for `cp`; 20,000
 small files written in 28 s vs 72 s for `cp -r`. Writes of a *single* file
@@ -1013,7 +1086,7 @@ fix for that.
   time. `--no-forward-agent` with a narrowly scoped key on the source host
   avoids that round trip.
 - Measured on two 160-core hosts on a 20 Gbit LAN: a single ssh stream tops out
-  around 450–550 MB/s; `syq -j8` into tmpfs reached ~1.2–1.3 GiB/s (the raw
+  around 450–550 MB/s; `syq rsync -j8` into tmpfs reached ~1.2–1.3 GiB/s (the raw
   multi-stream ssh ceiling), while writes to the destination's ext4 NVMe capped
   everything, rsync included, at ~600 MB/s. Check the disk before blaming the
   network.
