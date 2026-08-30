@@ -4,6 +4,7 @@ mod cli;
 mod conn;
 mod crypto;
 mod direct;
+pub mod enrollment;
 mod fsops;
 mod identity;
 mod progress;
