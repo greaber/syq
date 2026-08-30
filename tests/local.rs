@@ -1402,6 +1402,20 @@ fn single_file_to_new_name() {
 }
 
 #[test]
+fn archive_copies_mode_zero_empty_file_without_opening_source() {
+    let t = Tmp::new();
+    let src = t.path("src/empty");
+    write(&src, b"");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
+
+    run_ok(&["-a", &t.s("src/empty"), &t.s("dst/empty")]);
+
+    let dst = fs::metadata(t.path("dst/empty")).unwrap();
+    assert_eq!(dst.len(), 0);
+    assert_eq!(dst.mode() & 0o777, 0);
+}
+
+#[test]
 fn single_file_into_existing_dir() {
     let t = Tmp::new();
     write(&t.path("src/f.txt"), b"data");

@@ -3884,30 +3884,44 @@ impl Worker {
                 self.limit(j.entry.size);
             }
         }
-        self.src.send(Request::ReadSmallBatch(
-            jobs.iter()
-                .map(|job| SmallRead {
-                    path: job.src.clone(),
-                    attempt: job.attempts,
-                    len: job.entry.size as u32,
-                })
-                .collect(),
-        ))?;
-        let blocks = match ok(self.src.recv()?, "read small batch")? {
-            Response::SmallBlocks(blocks) if blocks.len() == jobs.len() => blocks,
-            other => bail!("unexpected response {other:?}"),
+        // Empty files need no source access. Besides saving wire work, this
+        // preserves the valid archive-copy case where an empty source is 000.
+        let reads: Vec<SmallRead> = jobs
+            .iter()
+            .filter(|job| job.entry.size > 0)
+            .map(|job| SmallRead {
+                path: job.src.clone(),
+                attempt: job.attempts,
+                len: job.entry.size as u32,
+            })
+            .collect();
+        let blocks = if reads.is_empty() {
+            Vec::new()
+        } else {
+            let count = reads.len();
+            self.src.send(Request::ReadSmallBatch(reads))?;
+            match ok(self.src.recv()?, "read small batch")? {
+                Response::SmallBlocks(blocks) if blocks.len() == count => blocks,
+                other => bail!("unexpected response {other:?}"),
+            }
         };
+        let mut blocks = blocks.into_iter();
         let mut data: Vec<Result<Vec<u8>>> = jobs
             .iter()
-            .zip(blocks)
-            .map(|(job, block)| match block {
-                Ok(SmallBlock { data, hash })
-                    if data.len() as u64 == job.entry.size && xxh3_64(&data) == hash =>
-                {
-                    Ok(data)
+            .map(|job| {
+                if job.entry.size == 0 {
+                    return Ok(Vec::new());
                 }
-                Ok(_) => Err(anyhow::anyhow!("block size or hash mismatch on read")),
-                Err(error) => Err(anyhow::anyhow!("read: {error}")),
+                match blocks.next() {
+                    Some(Ok(SmallBlock { data, hash }))
+                        if data.len() as u64 == job.entry.size && xxh3_64(&data) == hash =>
+                    {
+                        Ok(data)
+                    }
+                    Some(Ok(_)) => Err(anyhow::anyhow!("block size or hash mismatch on read")),
+                    Some(Err(error)) => Err(anyhow::anyhow!("read: {error}")),
+                    None => Err(anyhow::anyhow!("missing block in read small batch")),
+                }
             })
             .collect();
         self.fast.source += phase.elapsed().as_secs_f64();
