@@ -10,7 +10,7 @@ use crate::progress::{commas, Progress};
 use crate::proto::*;
 use crate::transfer::{connect_ctl, endpoint};
 use anyhow::{bail, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
@@ -161,11 +161,29 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     if args.interface == Interface::NativeRm {
-        // Exact repeated selectors describe one removal. Preserve the user's
-        // first-seen streaming order; in particular, do not sort or collapse
-        // distinct nested selections into a fixed removal population.
-        let mut seen = std::collections::HashSet::new();
-        locs.retain(|location| seen.insert((location.path.clone(), location.selection)));
+        // Repeated selectors for one path describe one removal, and selecting
+        // the named object subsumes selecting only its contents. Preserve the
+        // path's first-seen streaming position; in particular, do not sort or
+        // collapse distinct nested paths into a fixed removal population.
+        let mut positions = HashMap::new();
+        let mut normalized = Vec::with_capacity(locs.len());
+        for location in locs {
+            match positions.get(&location.path).copied() {
+                Some(position) => {
+                    let existing: &mut Location = &mut normalized[position];
+                    if existing.selection == crate::cli::SourceSelection::Contents
+                        && location.selection == crate::cli::SourceSelection::NamedNoFollow
+                    {
+                        existing.selection = location.selection;
+                    }
+                }
+                None => {
+                    positions.insert(location.path.clone(), normalized.len());
+                    normalized.push(location);
+                }
+            }
+        }
+        locs = normalized;
     }
     let mut args = args;
     check_rm_safety(&locs, &args)?;

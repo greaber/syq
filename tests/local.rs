@@ -427,6 +427,24 @@ fn native_rm_is_idempotent_for_exact_duplicate_selectors() {
 }
 
 #[test]
+fn native_rm_named_selector_subsumes_same_path_contents_selector() {
+    let t = Tmp::new();
+    for trial in 0..5 {
+        let relative = format!("overlap-{trial}");
+        for file in 0..1_000 {
+            write(&t.path(&format!("{relative}/file-{file}")), b"data");
+        }
+        let path = t.s(&relative);
+        if trial % 2 == 0 {
+            run_native_ok(&["rm", "--src", &path, "--src-src", &path]);
+        } else {
+            run_native_ok(&["rm", "--src-src", &path, "--src", &path]);
+        }
+        assert!(!t.path(&relative).exists());
+    }
+}
+
+#[test]
 fn top_level_rsync_syntax_is_rejected_without_mutation() {
     let t = Tmp::new();
     write(&t.path("src"), b"data");
