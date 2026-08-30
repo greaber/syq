@@ -177,19 +177,22 @@ directory descriptor held across publication; it never rebinds the guard with
 a later pathname lookup. If parent directories are missing, the receiver
 walks from an existing ancestor and creates each component relative to the
 preceding held directory descriptor, so replacing a newly created parent
-cannot redirect later creation. Container authority requires directory search
+cannot redirect later creation. Every `..` and the prefix before the last one
+must resolve before that creation walk begins; syq refuses to bootstrap a
+missing component before `..`. Container authority requires directory search
 permission, not read permission, so a write-and-search-only directory is a
 valid target.
 Existing containers must remain the same directory object: every descendant
-mutation reopens that identity and uses descriptor-relative filesystem calls,
-so replacing the container path makes the operation fail without touching its
-replacement. An exact existing regular file is updated through the object that
-passed preflight, preserving its inode (and therefore updating any hard-link
-aliases). Existing symlinks and special files can be atomically replaced by
-the same type. The new object is created inside an unpredictable private
-staging directory held by descriptor, and syq checks the identities of both
-objects after the exchange and again before cleanup. If either object changes,
-syq reports failure and retains the staging directory under a
+mutation, sidecar probe, destination hash, and finalize-recovery check reopens
+that identity and uses descriptor-relative filesystem calls, so replacing the
+container path makes the operation fail without touching or accepting its
+replacement. An exact existing regular file is updated through the object
+that passed preflight, preserving its inode (and therefore updating any
+hard-link aliases). Existing symlinks and special files can be atomically
+replaced by the same type. The new object is created inside an unpredictable
+private staging directory held by descriptor, and syq checks the identities
+of both objects after the exchange and again before cleanup. If either object
+changes, syq reports failure and retains the staging directory under a
 `.syq-swap-directory-*` recovery name instead of publishing or deleting an
 unverified object. An exact `--as-existing` operation that would change the
 target's type is refused; use `--as` when type replacement is intended.

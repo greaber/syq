@@ -1352,14 +1352,29 @@ fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<u64>>
 }
 
 impl FsOps {
-    pub fn probe_partial(&mut self, path: &[u8], partial_id: &PartialId) -> Result<Response> {
+    pub fn probe_partial(
+        &mut self,
+        path: &[u8],
+        partial_id: &PartialId,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Response> {
         let p = resolve(path);
         let pp = partial_path(&p, partial_id)?;
-        let partial_size = match fs::symlink_metadata(&pp) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Ok(metadata) if is_safe_partial(&metadata) => Some(metadata.len()),
-            Ok(_) => None,
-            Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
+        let partial_size = if let Some(guard) = guard {
+            let target = guarded_target(path, guard)?;
+            let relative = relative_under(&target.root_path, &pp)?;
+            target
+                .root
+                .metadata_optional(&relative)?
+                .filter(|metadata| is_safe_rooted_partial(*metadata))
+                .map(|metadata| metadata.len)
+        } else {
+            match fs::symlink_metadata(&pp) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Ok(metadata) if is_safe_partial(&metadata) => Some(metadata.len()),
+                Ok(_) => None,
+                Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
+            }
         };
         Ok(Response::PartialSize(partial_size))
     }
@@ -1917,17 +1932,41 @@ impl FsOps {
         partial_id: &PartialId,
         block: u64,
         len: u64,
+        guard: Option<&ContainerGuard>,
     ) -> Result<Vec<u64>> {
-        let p = resolve(path);
-        let p = if which == Which::Partial {
-            partial_path(&p, partial_id)?
+        let final_path = resolve(path);
+        let selected = if which == Which::Partial {
+            partial_path(&final_path, partial_id)?
         } else {
-            p
+            final_path
         };
-        let mut f = open_existing_regular(&p, false)?;
-        if which == Which::Partial {
-            require_safe_partial(&f, &p)?;
-        }
+        let mut f = if let Some(guard) = guard {
+            let target = guarded_target(path, guard)?;
+            let relative = if which == Which::Partial {
+                relative_under(&target.root_path, &selected)?
+            } else {
+                target.relative
+            };
+            let file = target.root.open_regular_read(&relative)?;
+            if which == Which::Partial {
+                let opened = file.metadata()?;
+                let named = target.root.metadata(&relative)?;
+                if !is_safe_partial(&opened)
+                    || !is_safe_rooted_partial(named)
+                    || opened.dev() != named.dev
+                    || opened.ino() != named.ino
+                {
+                    bail!("partial {} changed while opening it", selected.display());
+                }
+            }
+            file
+        } else {
+            let file = open_existing_regular(&selected, false)?;
+            if which == Which::Partial {
+                require_safe_partial(&file, &selected)?;
+            }
+            file
+        };
         hash_reader(&mut f, block, len)
     }
 
@@ -2099,9 +2138,30 @@ impl FsOps {
         Ok(())
     }
 
-    pub fn file_hash(&mut self, path: &[u8]) -> Result<Response> {
+    pub fn file_hash(
+        &mut self,
+        path: &[u8],
+        condition: TargetCondition,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Response> {
         let p = resolve(path);
-        let mut f = open_existing_regular(&p, false)?;
+        // `Absent` described the state before publication; recovery hashes the
+        // object that may have been published, so only existing-object
+        // conditions remain meaningful here.
+        let condition = match condition {
+            TargetCondition::Absent => TargetCondition::Any,
+            TargetCondition::MatchesFingerprint { dev, ino, .. } => {
+                TargetCondition::Matches { dev, ino }
+            }
+            condition => condition,
+        };
+        let target = guard.map(|guard| guarded_target(path, guard)).transpose()?;
+        let mut f = if let Some(target) = &target {
+            target.root.open_regular_read(&target.relative)?
+        } else {
+            open_existing_regular(&p, false)?
+        };
+        require_open_target(&f, &p, condition)?;
         let mut h = Xxh3::new();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
@@ -2112,6 +2172,11 @@ impl FsOps {
             }
             h.update(&buf[..n]);
             size += n as u64;
+        }
+        if let Some(target) = &target {
+            require_rooted_named_identity(target, &f, condition)?;
+        } else {
+            require_named_target_identity(&f, &p, condition)?;
         }
         let _ = xxh3_128; // keep the symbol in case of future use
         Ok(Response::FileHash {
@@ -2159,7 +2224,11 @@ impl FsOps {
             Request::CreateContainer { path, mode } => {
                 self.create_container(path, *mode).map(Response::Container)
             }
-            Request::ProbePartial { path, partial_id } => self.probe_partial(path, partial_id),
+            Request::ProbePartial {
+                path,
+                partial_id,
+                guard,
+            } => self.probe_partial(path, partial_id, guard.as_ref()),
             Request::Prepare {
                 path,
                 size,
@@ -2234,8 +2303,9 @@ impl FsOps {
                 partial_id,
                 block,
                 len,
+                guard,
             } => self
-                .hash_blocks(path, *which, partial_id, *block, *len)
+                .hash_blocks(path, *which, partial_id, *block, *len, guard.as_ref())
                 .map(Response::Hashes),
             Request::ReadRange {
                 path,
@@ -2299,7 +2369,11 @@ impl FsOps {
                     },
                 )
                 .map(|_| Response::Ok),
-            Request::FileHash { path } => self.file_hash(path),
+            Request::FileHash {
+                path,
+                condition,
+                guard,
+            } => self.file_hash(path, *condition, guard.as_ref()),
             Request::Canonicalize { path } => {
                 Ok(Response::Path(path_bytes(&normalize(&resolve(path)))))
             }
