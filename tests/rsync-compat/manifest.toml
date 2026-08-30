@@ -8,7 +8,7 @@ helpers = ["tls", "trimslash", "t_unsafe", "t_chmod_secure", "t_secure_relpath",
 
 [target]
 name = "rsync"
-args = []
+args = ["rsync"]
 description = "The rsync-compatible command surface; currently routed through native SYQ until the syq rsync subcommand exists"
 
 [reasons]

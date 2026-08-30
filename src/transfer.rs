@@ -1,7 +1,7 @@
 //! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
-use crate::cli::{parse_rsh, parse_size, Args, Location};
+use crate::cli::{parse_rsh, parse_size, Args, Existence, Location, Placement};
 use crate::conn::{
     ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, TcpCandidate, TcpPairStats,
 };
@@ -407,15 +407,13 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
 /// does), normalized by the endpoint that holds it. Used for the job identity —
 /// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job — and for
 /// the copy-into-itself check.
-fn canonical_path(ctl: &mut dyn Conn, path: &str, remote: bool) -> Result<std::path::PathBuf> {
+fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::path::PathBuf> {
     if !remote {
-        return Ok(crate::fsops::normalize(&crate::fsops::resolve(
-            path.as_bytes(),
-        )));
+        return Ok(crate::fsops::normalize(&crate::fsops::resolve(path)));
     }
     match ok(
         ctl.call(Request::Canonicalize {
-            path: path.as_bytes().to_vec(),
+            path: path.to_vec(),
         })?,
         "canonicalize",
     )? {
@@ -452,11 +450,31 @@ fn endpoint_identity(l: &Location) -> String {
     }
 }
 
+/// Keep existing checkpoint/partial identities unchanged for UTF-8 paths,
+/// while giving native raw-byte paths a lossless and unambiguous spelling.
+fn path_identity(path: &std::path::Path) -> String {
+    if let Some(path) = path.to_str() {
+        return path.to_string();
+    }
+    use std::fmt::Write as _;
+    let bytes = path.as_os_str().as_bytes();
+    let mut encoded = String::with_capacity(15 + bytes.len() * 2);
+    // NUL cannot occur in a Unix pathname, so no valid UTF-8 path can collide
+    // with this encoded namespace.
+    encoded.push_str("\0unix-path-hex:");
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 /// Load and, for a real copy, open the explicitly requested checkpoint.
 struct DestinationRoot<'a> {
     path: &'a [u8],
     existed: bool,
-    is_dir: bool,
+    is_container: bool,
+    entry_is_dir: bool,
+    exact: bool,
 }
 
 fn copy_identity(
@@ -471,17 +489,13 @@ fn copy_identity(
     let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
     for source in srcs {
         let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
-        src_roots.push((
-            path.to_string_lossy().into_owned(),
-            source.copies_contents(),
-        ));
+        src_roots.push((path_identity(&path), source.copies_contents()));
     }
     let dst_root = match dst_canonical {
         Some(path) => path,
         None => canonical_path(dst_ctl, &dst.path, dst.is_remote())?,
-    }
-    .to_string_lossy()
-    .into_owned();
+    };
+    let dst_root = path_identity(&dst_root);
     Ok(crate::checkpoint::job_identity(
         &endpoint_identity(&srcs[0]),
         &src_roots,
@@ -525,13 +539,13 @@ fn checkpoint_setup(
                 display(dst.path)
             );
         }
-        if dst.is_dir {
+        if dst.is_container {
             for source in srcs.iter().filter(|source| !source.copies_contents()) {
                 let basename = source.basename();
                 if basename.is_empty() {
                     continue;
                 }
-                let prefix = basename.as_bytes();
+                let prefix = basename.as_slice();
                 let has_completed_path = loaded.completed.keys().any(|completed| {
                     completed == prefix
                         || completed
@@ -616,19 +630,23 @@ pub fn run(args: Args) -> Result<i32> {
         .then_some(args.bwlimit_bytes)
         .map(BandwidthLimit::new)
         .map(Arc::new);
-    let locs: Vec<Location> = args
-        .paths
-        .iter()
-        .map(|p| Location::parse(p))
-        .collect::<Result<_>>()?;
+    let native_locations = !args.locations.is_empty();
+    let locs: Vec<Location> = if native_locations {
+        args.locations.clone()
+    } else {
+        args.paths
+            .iter()
+            .map(|p| Location::parse(p))
+            .collect::<Result<_>>()?
+    };
     if locs.len() < 2 {
         bail!("need at least one source and a destination");
     }
-    let (_, raw_source_operands) = args.paths.split_last().unwrap();
     let (dst, original_srcs) = locs.split_last().unwrap();
+    let raw_source_operands = args.paths.split_last().map(|(_, sources)| sources);
     let source_operand_count = args
         .direct_source_operand_count
-        .unwrap_or(raw_source_operands.len());
+        .unwrap_or_else(|| raw_source_operands.map_or(original_srcs.len(), <[_]>::len));
     if source_operand_count < original_srcs.len() {
         bail!("invalid direct source-operand count");
     }
@@ -648,9 +666,17 @@ pub fn run(args: Args) -> Result<i32> {
     let multiple_source_operands = source_operand_count > 1;
     let srcs: Vec<Location> = if args.direct_sources_prededuplicated {
         original_srcs.to_vec()
+    } else if native_locations {
+        let mut seen_sources = std::collections::HashSet::new();
+        original_srcs
+            .iter()
+            .filter(|source| seen_sources.insert((source.path.clone(), source.selection)))
+            .cloned()
+            .collect()
     } else {
         let mut seen_sources = std::collections::HashSet::new();
         raw_source_operands
+            .expect("rsync operands present")
             .iter()
             .zip(original_srcs)
             .filter(|(raw, _)| seen_sources.insert(raw.as_str()))
@@ -662,7 +688,7 @@ pub fn run(args: Args) -> Result<i32> {
     if let Some(checkpoint) = args.checkpoint.as_deref() {
         let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
         for source in srcs.iter().filter(|source| !source.is_remote()) {
-            let root = crate::fsops::normalize(&crate::fsops::resolve(source.path.as_bytes()));
+            let root = crate::fsops::normalize(&crate::fsops::resolve(&source.path));
             if checkpoint.starts_with(&root) {
                 bail!(
                     "checkpoint {} must not be inside local source {}",
@@ -672,7 +698,7 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
         if !dst.is_remote() {
-            let root = crate::fsops::normalize(&crate::fsops::resolve(dst.path.as_bytes()));
+            let root = crate::fsops::normalize(&crate::fsops::resolve(&dst.path));
             if checkpoint.starts_with(&root) {
                 bail!(
                     "checkpoint {} must not be inside local destination {}",
@@ -690,7 +716,10 @@ pub fn run(args: Args) -> Result<i32> {
             if !s.copies_contents() {
                 let base = s.basename();
                 if !base.is_empty() && !seen.insert(base.clone()) {
-                    bail!("two sources named {base:?} map to the same destination; rename one or copy them separately");
+                    bail!(
+                        "two sources named {:?} map to the same destination; rename one or copy them separately",
+                        display(&base)
+                    );
                 }
             }
         }
@@ -721,11 +750,22 @@ pub fn run(args: Args) -> Result<i32> {
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
-            // Let the remote orchestrator observe the original source count so
-            // repeated file sources keep multi-source destination semantics.
-            return crate::direct::run(&args, srcs, dst, source_operand_count);
+            let direct_paths_are_utf8 = srcs
+                .iter()
+                .chain(std::iter::once(dst))
+                .all(|location| std::str::from_utf8(&location.path).is_ok());
+            if args.interface == crate::cli::Interface::Rsync || direct_paths_are_utf8 {
+                // Let the remote orchestrator observe the original source count so
+                // repeated file sources keep multi-source destination semantics.
+                return crate::direct::run(&args, srcs, dst, source_operand_count);
+            }
+            if !args.quiet {
+                eprintln!(
+                    "syq: remote-to-remote transfer: relaying raw path bytes through this machine"
+                );
+            }
         }
-        if !args.quiet {
+        if args.relay && !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
     }
@@ -1059,7 +1099,7 @@ pub fn run(args: Args) -> Result<i32> {
     // silently drops `.` components and duplicate slashes. Cleaning here
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
-    let operator_dst_root = clean_root(dst.path.as_bytes());
+    let operator_dst_root = clean_root(&dst.path);
     let (dst_root_entry, dst_canonical) = stat_and_canonicalize(
         &mut *dst_ctl,
         &operator_dst_root,
@@ -1073,13 +1113,39 @@ pub fn run(args: Args) -> Result<i32> {
         follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?;
     let mut dst_initially_missing = dst_root_entry.is_none();
     let mut dst_existed = !dst_initially_missing;
-    let dst_is_dir = match &dst_root_entry {
-        Some(e) if e.kind == Kind::Dir => true,
-        Some(_) if multiple_source_operands => {
-            bail!("destination must be a directory when copying multiple sources")
+    let dst_entry_is_dir = dst_root_entry
+        .as_ref()
+        .is_some_and(|entry| entry.kind == Kind::Dir);
+    match args.target_existence {
+        Existence::New if dst_existed => bail!(
+            "target {} already exists, but the selected placement requires a new path",
+            display(&dst_root)
+        ),
+        Existence::Existing if !dst_existed => bail!(
+            "target {} does not exist, but the selected placement requires an existing path",
+            display(&dst_root)
+        ),
+        Existence::Any | Existence::New | Existence::Existing => {}
+    }
+    let dst_is_dir = match args.placement {
+        Placement::Into => {
+            if dst_existed && !dst_entry_is_dir {
+                bail!(
+                    "--into target {} exists but is not a directory",
+                    display(&dst_root)
+                );
+            }
+            true
         }
-        Some(_) => false,
-        None => multiple_source_operands || dst.copies_contents() || args.files_from.is_some(),
+        Placement::As => false,
+        Placement::Rsync => match &dst_root_entry {
+            Some(entry) if entry.kind == Kind::Dir => true,
+            Some(_) if multiple_source_operands => {
+                bail!("destination must be a directory when copying multiple sources")
+            }
+            Some(_) => false,
+            None => multiple_source_operands || dst.copies_contents() || args.files_from.is_some(),
+        },
     };
     if args.files_from.is_some() {
         if let Some(e) = dst_root_entry.as_ref().filter(|e| e.kind != Kind::Dir) {
@@ -1161,7 +1227,7 @@ pub fn run(args: Args) -> Result<i32> {
             // Judge the source the way the scan will: --files-from and
             // trailing-slash sources are followed through a symlinked root.
             let follow_root = args.files_from.is_some() || s.copies_contents();
-            let src_is_dir = matches!(stat_one(&mut *src_ctl, s.path.as_bytes(), follow_root)?, Some(ref e) if e.kind == Kind::Dir);
+            let src_is_dir = matches!(stat_one(&mut *src_ctl, &s.path, follow_root)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
             }
@@ -1173,7 +1239,7 @@ pub fn run(args: Args) -> Result<i32> {
             if dst_is_dir && !s.copies_contents() && args.files_from.is_none() {
                 let base = s.basename();
                 if !base.is_empty() {
-                    let joined = format!("{}/{}", dst.path.trim_end_matches('/'), base);
+                    let joined = join(&dst.path, &base);
                     effs.push(canonical_path(&mut *src_ctl, &joined, remote)?);
                 }
             }
@@ -1209,7 +1275,9 @@ pub fn run(args: Args) -> Result<i32> {
         DestinationRoot {
             path: &dst_root,
             existed: dst_existed,
-            is_dir: dst_is_dir,
+            is_container: dst_is_dir,
+            entry_is_dir: dst_entry_is_dir,
+            exact: args.placement == Placement::As,
         },
         &mut *dst_ctl,
         &identity,
@@ -1317,7 +1385,7 @@ pub fn run(args: Args) -> Result<i32> {
         let src = &srcs[0];
         match st.scan_files_from(
             &mut *src_ctl,
-            src.path.as_bytes(),
+            &src.path,
             &dst_root,
             &args.files_from_lines,
             args.recursive_explicit,
@@ -1330,25 +1398,24 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     for src in srcs.iter().filter(|_| args.files_from.is_none()) {
-        let src_root = src.path.as_bytes().to_vec();
+        let src_root = src.path.clone();
         let follow = src.copies_contents();
         // A bare directory source goes to dest/basename even when dest doesn't
         // exist yet; a non-directory source only does so when dest is a directory
         // (decided once the root entry is seen).
-        let sub = if follow {
-            String::new()
-        } else {
-            src.basename()
-        };
+        let sub = if follow { Vec::new() } else { src.basename() };
         match st.scan_source(
             &mut *src_ctl,
             &src_root,
             follow,
+            src.requires_directory(),
             &sub,
             DestinationRoot {
                 path: &dst_root,
                 existed: dst_existed,
-                is_dir: dst_is_dir,
+                is_container: dst_is_dir,
+                entry_is_dir: dst_entry_is_dir,
+                exact: args.placement == Placement::As,
             },
         ) {
             Ok(mapping) => dry_run_mappings.push(mapping),
@@ -1780,13 +1847,13 @@ fn parent_path(path: &[u8]) -> PathBytes {
 fn stat_and_canonicalize(
     conn: &mut dyn Conn,
     stat_path: &[u8],
-    canonical_path: &str,
+    canonical_path: &[u8],
     remote: bool,
 ) -> Result<(Option<Entry>, std::path::PathBuf)> {
     if !remote {
         return Ok((
             stat_one(conn, stat_path, false)?,
-            crate::fsops::normalize(&crate::fsops::resolve(canonical_path.as_bytes())),
+            crate::fsops::normalize(&crate::fsops::resolve(canonical_path)),
         ));
     }
     conn.send(Request::StatMany {
@@ -1794,7 +1861,7 @@ fn stat_and_canonicalize(
         follow: false,
     })?;
     conn.send(Request::Canonicalize {
-        path: canonical_path.as_bytes().to_vec(),
+        path: canonical_path.to_vec(),
     })?;
     // Consume both replies before interpreting either endpoint error so the
     // reusable control stream cannot be left one response behind.
@@ -1947,10 +2014,10 @@ fn display_location(loc: &Location, path: &[u8]) -> String {
 fn display_plan_source(loc: &Location, args: &Args) -> String {
     if !loc.is_remote() {
         if let Some(host) = &args.plan_source_host {
-            return format!("{host}:{}", display(loc.path.as_bytes()));
+            return format!("{host}:{}", display(&loc.path));
         }
     }
-    display_location(loc, loc.path.as_bytes())
+    display_location(loc, &loc.path)
 }
 
 fn display_plan_target(loc: &Location, path: &[u8], args: &Args) -> String {
@@ -2252,7 +2319,7 @@ struct Planner<'a> {
     keep_dirs: bool,
     /// (destination directory, its path relative to the transfer root) for every
     /// directory source; --delete removes extras inside these.
-    delete_roots: Vec<(PathBytes, String)>,
+    delete_roots: Vec<(PathBytes, PathBytes)>,
     deletes: Deletes,
     dry_run_changes: DryRunChanges,
 }
@@ -2331,14 +2398,15 @@ impl Planner<'_> {
         src: &mut dyn Conn,
         src_root: &[u8],
         follow: bool,
-        sub: &str,
+        require_directory: bool,
+        sub: &[u8],
         destination: DestinationRoot<'_>,
     ) -> Result<DryRunMapping> {
         let dst_root = destination.path;
-        let dst_is_dir = destination.is_dir;
+        let dst_is_dir = destination.is_container;
         let dst_existed = destination.existed;
         let mut first = true;
-        let mut sub = sub.to_string();
+        let mut sub = sub.to_vec();
         let mut skip_all = false;
         let mut mapping = None;
         let ignore = self.opts.ignore.clone();
@@ -2349,12 +2417,16 @@ impl Planner<'_> {
             if first {
                 first = false;
                 if let Some(root) = batch.first() {
+                    if require_directory && root.kind != Kind::Dir {
+                        bail!("contents selector {} is not a directory", display(src_root));
+                    }
                     if pl.opts.dry_run
                         && root.kind == Kind::Dir
                         && !follow
                         && pl.opts.recursive
                         && dst_existed
-                        && !dst_is_dir
+                        && !destination.entry_is_dir
+                        && !destination.exact
                         && !pl.opts.existing
                     {
                         bail!(
@@ -2363,16 +2435,20 @@ impl Planner<'_> {
                             display(src_root)
                         );
                     }
-                    if root.kind != Kind::Dir && !dst_is_dir {
-                        sub = String::new();
+                    if destination.exact || (root.kind != Kind::Dir && !dst_is_dir) {
+                        sub.clear();
                     }
                     mapping = Some(DryRunMapping {
-                        target: join(dst_root, sub.as_bytes()),
-                        semantics: match (root.kind, follow, dst_is_dir) {
-                            (Kind::Dir, true, _) => "directory contents",
-                            (Kind::Dir, false, _) => "directory as child",
-                            (_, _, true) => "entry inside destination directory",
-                            _ => "exact destination path",
+                        target: join(dst_root, &sub),
+                        semantics: if destination.exact {
+                            "exact destination path"
+                        } else {
+                            match (root.kind, follow, dst_is_dir) {
+                                (Kind::Dir, true, _) => "directory contents",
+                                (Kind::Dir, false, _) => "directory as child",
+                                (_, _, true) => "entry inside destination directory",
+                                _ => "exact destination path",
+                            }
                         },
                     });
                     if root.kind == Kind::Dir && !pl.opts.recursive {
@@ -2384,8 +2460,7 @@ impl Planner<'_> {
                         return Ok(());
                     }
                     if root.kind == Kind::Dir {
-                        pl.delete_roots
-                            .push((join(dst_root, sub.as_bytes()), sub.clone()));
+                        pl.delete_roots.push((join(dst_root, &sub), sub.clone()));
                     }
                 }
             }
@@ -2411,7 +2486,7 @@ impl Planner<'_> {
         recurse: bool,
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
-        // Through a symlink: `syq --files-from L link dst` should work like `link/`.
+        // Through a symlink: `syq rsync --files-from L link dst` should work like `link/`.
         // Validate the root but never plan it: it isn't in the list, so an
         // existing destination is not stamped with source-root metadata
         // (creation-when-missing happened in run()).
@@ -2565,7 +2640,7 @@ impl Planner<'_> {
                 }
             }
             self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            self.handle_batch(batch, src_root, "", dst_root)?;
+            self.handle_batch(batch, src_root, b"", dst_root)?;
             for rel in subtrees {
                 self.scan_subtree(src, src_root, &rel, dst_root, &mut emitted)?;
             }
@@ -2600,7 +2675,7 @@ impl Planner<'_> {
                 })
                 .collect();
             pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            pl.handle_batch(batch, src_root, "", dst_root)
+            pl.handle_batch(batch, src_root, b"", dst_root)
         })
     }
 
@@ -2608,7 +2683,7 @@ impl Planner<'_> {
         &mut self,
         batch: Vec<Entry>,
         src_root: &[u8],
-        sub: &str,
+        sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
         let namespace_files = self.collect_namespace_files(&batch, src_root, sub, dst_root);
@@ -2621,7 +2696,7 @@ impl Planner<'_> {
         let mut immediate = Vec::with_capacity(batch.len());
         let mut deferred = Vec::new();
         for entry in batch {
-            let dst_rel = join(sub.as_bytes(), &entry.path);
+            let dst_rel = join(sub, &entry.path);
             let reserved_leaf = dst_rel.is_empty()
                 && entry.kind != Kind::Dir
                 && dst_root
@@ -2681,11 +2756,11 @@ impl Planner<'_> {
         &mut self,
         batch: Vec<Entry>,
         src_root: &[u8],
-        sub: &str,
+        sub: &[u8],
         dst_root: &[u8],
     ) -> Mapped {
         let opts = self.opts;
-        let sub_b = sub.as_bytes();
+        let sub_b = sub;
         let mut dirs: Vec<(PathBytes, PathBytes, Entry)> = Vec::new();
         let mut others: Vec<Planned> = Vec::new();
         for e in batch {
@@ -3382,10 +3457,9 @@ impl Planner<'_> {
         &mut self,
         batch: &[Entry],
         src_root: &[u8],
-        sub: &str,
+        sub: &[u8],
         dst_root: &[u8],
     ) -> Vec<(PathBytes, String)> {
-        let sub = sub.as_bytes();
         let mut files = Vec::new();
         for entry in batch {
             if !self.entry_is_payload(entry) {
@@ -3685,7 +3759,7 @@ impl Planner<'_> {
         };
         for (root, sub) in roots.clone() {
             // Every root is walked with its own -i anchoring. A root nested in
-            // this one (`syq --delete a b/ dst`: dst/a inside dst) is left to
+            // this one (`syq rsync --delete a b/ dst`: dst/a inside dst) is left to
             // its own walk, so its patterns apply and nothing is deleted twice.
             let nested: Vec<PathBytes> = roots
                 .iter()
@@ -3741,7 +3815,7 @@ impl Planner<'_> {
                             }
                             None => {}
                         }
-                        let dst_rel = join(sub.as_bytes(), &e.path);
+                        let dst_rel = join(&sub, &e.path);
                         let rel = display(&dst_rel);
                         let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
                         // The only sidecar-patterned files that are not extras
@@ -5204,6 +5278,18 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_path_identity_is_lossless_without_changing_utf8_identity() {
+        assert_eq!(
+            path_identity(std::path::Path::new("/tmp/name")),
+            "/tmp/name"
+        );
+        let first = std::path::Path::new(OsStr::from_bytes(b"/tmp/raw-\xff"));
+        let second = std::path::Path::new(OsStr::from_bytes(b"/tmp/raw-\xfe"));
+        assert_ne!(path_identity(first), path_identity(second));
+        assert!(path_identity(first).starts_with('\0'));
+    }
 
     #[test]
     fn fast_batch_ceiling_only_grows_on_high_rtt_tcp() {

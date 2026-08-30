@@ -1,4 +1,4 @@
-//! `syq --rm`: recursive removal with N parallel connections. Files are
+//! `syq rsync --rm` and native `syq rm`: recursive removal with N parallel connections. Files are
 //! unlinked in batches spread across workers; directories are removed
 //! deepest-first, each depth level in parallel.
 
@@ -14,6 +14,10 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 const BATCH: usize = 200;
+
+fn display(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
 
 struct Pool {
     tx: Mutex<Option<mpsc::Sender<Vec<Op>>>>,
@@ -121,19 +125,25 @@ fn worker(
 /// path — deliberately not stricter than rm (no home/cwd/ancestor guessing).
 fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
     for l in locs {
-        let raw = l.path.trim_end_matches('/');
-        let last = raw.rsplit('/').next().unwrap_or("");
-        if raw.is_empty() || l.path == "/" {
-            bail!("refusing to remove the filesystem root {:?}", l.path);
+        let mut raw = l.path.as_slice();
+        while raw.ends_with(b"/") {
+            raw = &raw[..raw.len() - 1];
         }
-        if raw == "~" {
-            bail!("refusing to remove {:?}", l.path);
-        }
-        if last == "." || last == ".." {
+        let last = raw.rsplit(|byte| *byte == b'/').next().unwrap_or(b"");
+        if raw.is_empty() || l.path == b"/" {
             bail!(
-                "\"{}\" may not be removed: its final path component is {:?}",
-                l.path,
-                last
+                "refusing to remove the filesystem root {:?}",
+                display(&l.path)
+            );
+        }
+        if raw == b"~" {
+            bail!("refusing to remove {:?}", display(&l.path));
+        }
+        if last == b"." || last == b".." {
+            bail!(
+                "\"{}\" may not be removed: its final path component is \"{}\"",
+                display(&l.path),
+                display(last)
             );
         }
     }
@@ -141,11 +151,14 @@ fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
 }
 
 pub fn run(args: Args) -> Result<i32> {
-    let locs: Vec<Location> = args
-        .paths
-        .iter()
-        .map(|p| Location::parse(p))
-        .collect::<Result<_>>()?;
+    let locs: Vec<Location> = if args.locations.is_empty() {
+        args.paths
+            .iter()
+            .map(|p| Location::parse(p))
+            .collect::<Result<_>>()?
+    } else {
+        args.locations.clone()
+    };
     for l in &locs {
         if !l.same_host(&locs[0]) {
             bail!("all paths must be on the same host");
@@ -205,15 +218,22 @@ pub fn run(args: Args) -> Result<i32> {
     let mut dirs: BTreeMap<usize, Vec<PathBytes>> = BTreeMap::new();
     let mut scan_err = None;
     for l in &locs {
-        let root = l.path.as_bytes().to_vec();
+        let root = l.path.clone();
+        let contents = l.copies_contents();
         let mut batch: Vec<Op> = Vec::with_capacity(BATCH);
         let res = ctl.scan(
             &root,
-            false,
+            contents,
             &[],
             false,
             &mut |entries: Vec<Entry>| {
                 for e in entries {
+                    if contents && e.path.is_empty() {
+                        if e.kind != Kind::Dir {
+                            bail!("contents selector {} is not a directory", display(&root));
+                        }
+                        continue;
+                    }
                     let full = join(&root, &e.path);
                     progress.files_total.fetch_add(1, Relaxed);
                     if e.kind == Kind::Dir {

@@ -1,7 +1,7 @@
 //! Direct remote-to-remote: run the orchestrator on the source host so data
 //! flows source→destination without passing through this machine.
 
-use crate::cli::{parse_rsh, Args, Location};
+use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, SourceSelection};
 use anyhow::{bail, Context, Result};
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
@@ -32,34 +32,88 @@ fn direct_command(
     cmd
 }
 
-pub fn run(
+fn utf8_path(path: &[u8]) -> Result<String> {
+    String::from_utf8(path.to_vec())
+        .map_err(|_| anyhow::anyhow!("direct remote-to-remote paths must be valid UTF-8"))
+}
+
+fn endpoint_arg(location: &Location) -> String {
+    let host = location.host.as_deref().expect("remote endpoint");
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match &location.user {
+        Some(user) => format!("{user}@{host}"),
+        None => host,
+    }
+}
+
+fn native_remote_args(args: &Args, srcs: &[Location], dst: &Location) -> Result<Vec<String>> {
+    let command = match args.interface {
+        Interface::NativeCp => "cp",
+        Interface::NativeCpPrune => "cp-prune",
+        Interface::NativeRm | Interface::Rsync => unreachable!(),
+    };
+    let mut remote = vec![command.to_string()];
+    let mut short = String::new();
+    if args.dry_run {
+        short.push('n');
+    }
+    if args.quiet {
+        short.push('q');
+    }
+    for _ in 0..args.verbose {
+        short.push('v');
+    }
+    if !short.is_empty() {
+        remote.push(format!("-{short}"));
+    }
+    if let Some(connections) = args.connections_opt {
+        remote.push("-j".into());
+        remote.push(connections.to_string());
+    }
+    if let Some(max_delete) = args.max_delete {
+        remote.push(format!("--max-delete={max_delete}"));
+    }
+    for source in srcs {
+        remote.push(
+            match source.selection {
+                SourceSelection::Named => "--src",
+                SourceSelection::Contents => "--src-src",
+                SourceSelection::Rsync => unreachable!(),
+            }
+            .into(),
+        );
+        remote.push(utf8_path(&source.path)?);
+    }
+    if !srcs[0].same_host(dst) {
+        remote.push("--to".into());
+        remote.push(endpoint_arg(dst));
+    }
+    let placement = match (args.placement, args.target_existence) {
+        (Placement::Into, Existence::Any) => "--into",
+        (Placement::Into, Existence::New) => "--into-new",
+        (Placement::Into, Existence::Existing) => "--into-existing",
+        (Placement::As, Existence::Any) => "--as",
+        (Placement::As, Existence::New) => "--as-new",
+        (Placement::As, Existence::Existing) => "--as-existing",
+        (Placement::Rsync, _) => unreachable!(),
+    };
+    remote.push(placement.into());
+    remote.push(utf8_path(&dst.path)?);
+    Ok(remote)
+}
+
+fn rsync_remote_args(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
     source_operand_count: usize,
-) -> Result<i32> {
-    let rsh = parse_rsh(&args.rsh)?;
-    let src_host = srcs[0].host.clone().unwrap();
-    // The follow target must reconnect the way we did: keep an explicit user.
-    let src_target = match &srcs[0].user {
-        Some(user) => format!("{user}@{src_host}"),
-        None => src_host.clone(),
-    };
-    let spec = crate::conn::RemoteSpec {
-        local_process: false,
-        user: srcs[0].user.clone(),
-        host: src_host.clone(),
-        rsh: rsh.clone(),
-        syq_path: args.syq_path.clone(),
-        auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
-        helper_install: Default::default(),
-        quiet: args.quiet,
-        tcp: Default::default(),
-        diagnostics: Default::default(),
-    };
-
-    // Rebuild the option list for the remote orchestrator.
-    let mut remote: Vec<String> = Vec::new();
+    src_target: &str,
+) -> Result<Vec<String>> {
+    let mut remote: Vec<String> = vec!["rsync".into()];
     let mut short = String::new();
     for (flag, on) in [
         ('a', args.archive),
@@ -158,59 +212,85 @@ pub fn run(
         "--direct-source-operand-count={source_operand_count}"
     ));
     remote.push("--direct-sources-prededuplicated".into());
-    // --ignore-from files were read locally; forward the merged lines.
-    for l in &args.ignore_lines {
-        // One argument, so a pattern starting with '-' can't be taken for a flag.
-        remote.push(format!("--ignore={l}"));
+    for line in &args.ignore_lines {
+        remote.push(format!("--ignore={line}"));
     }
     if args.no_progress || args.quiet {
         remote.push("--no-progress".into());
     } else if std::io::stderr().is_terminal() {
-        // The remote has no tty; force the display and tell it our width.
         remote.push("--progress".into());
         remote.push(format!("--width={}", crate::progress::term_width()));
     }
-    if let Some(p) = &args.syq_path {
-        remote.push(format!("--syq-path={p}"));
+    if let Some(path) = &args.syq_path {
+        remote.push(format!("--syq-path={path}"));
     }
-    if let Some(e) = &args.rsh {
+    if let Some(rsh) = &args.rsh {
         remote.push("-e".into());
-        remote.push(e.clone());
+        remote.push(rsh.clone());
     }
     remote.push("--".into());
-    for s in srcs {
-        remote.push(s.path.clone());
+    for source in srcs {
+        remote.push(utf8_path(&source.path)?);
     }
-    // Same host (and user) on both ends: on that host this is a plain local
-    // copy — no ssh back to itself, copy_file_range applies, and the
-    // copy-into-itself check sees both paths on one machine.
-    let dst_str = if srcs[0].same_host(dst) {
-        // A relative remote path is relative to the home; anchor it so the
-        // orchestrator's local parse can't take it for something else.
-        if dst.path.starts_with('/')
-            || dst.path == "~"
-            || dst.path.starts_with("~/")
-            || dst.path.starts_with("./")
-            || dst.path.starts_with("../")
+    let dst_path = utf8_path(&dst.path)?;
+    let dst_arg = if srcs[0].same_host(dst) {
+        if dst.path.starts_with(b"/")
+            || dst.path == b"~"
+            || dst.path.starts_with(b"~/")
+            || dst.path.starts_with(b"./")
+            || dst.path.starts_with(b"../")
         {
-            dst.path.clone()
+            dst_path
         } else {
-            format!("./{}", dst.path)
+            format!("./{dst_path}")
         }
     } else {
-        match &dst.user {
-            Some(u) => format!("{u}@{}:{}", dst.host.as_ref().unwrap(), dst.path),
-            None => format!("{}:{}", dst.host.as_ref().unwrap(), dst.path),
-        }
+        format!("{}:{dst_path}", endpoint_arg(dst))
     };
-    remote.push(dst_str);
+    remote.push(dst_arg);
+    Ok(remote)
+}
+
+pub fn run(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    source_operand_count: usize,
+) -> Result<i32> {
+    let rsh = parse_rsh(&args.rsh)?;
+    let src_host = srcs[0].host.clone().unwrap();
+    // The follow target must reconnect the way we did: keep an explicit user.
+    let src_target = match &srcs[0].user {
+        Some(user) => format!("{user}@{src_host}"),
+        None => src_host.clone(),
+    };
+    let spec = crate::conn::RemoteSpec {
+        local_process: false,
+        user: srcs[0].user.clone(),
+        host: src_host.clone(),
+        rsh: rsh.clone(),
+        syq_path: args.syq_path.clone(),
+        auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
+        helper_install: Default::default(),
+        quiet: args.quiet,
+        tcp: Default::default(),
+        diagnostics: Default::default(),
+    };
+
+    // Rebuild only the public surface that produced this operation. Native
+    // commands remain a strict allowlist even though they share the engine.
+    let mut remote = match args.interface {
+        Interface::Rsync => rsync_remote_args(args, srcs, dst, source_operand_count, &src_target)?,
+        Interface::NativeCp | Interface::NativeCpPrune => native_remote_args(args, srcs, dst)?,
+        Interface::NativeRm => unreachable!(),
+    };
 
     if args.detach {
         // Detached: log JSON progress instead of a live display.
         remote.retain(|a| a != "--progress" && !a.starts_with("--width="));
-        remote.insert(0, "--no-progress".into());
-        remote.insert(0, "--progress-json".into());
-        remote.insert(0, "-v".into());
+        remote.insert(1, "--no-progress".into());
+        remote.insert(1, "--progress-json".into());
+        remote.insert(1, "-v".into());
     }
     // A detached launcher returns before the background syq execs, so a
     // missing helper could otherwise look like a successful start.  Validate
@@ -234,15 +314,16 @@ pub fn run(
         // safe characters so a crafted filename can't inject commands.
         let raw = srcs[0]
             .path
-            .trim_end_matches('/')
-            .rsplit('/')
+            .strip_suffix(b"/")
+            .unwrap_or(&srcs[0].path)
+            .rsplit(|byte| *byte == b'/')
             .next()
-            .unwrap_or("syq");
+            .unwrap_or(b"syq");
         let name: String = raw
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                    c
+            .iter()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+                    *byte as char
                 } else {
                     '_'
                 }
@@ -297,12 +378,16 @@ pub fn run(
             println!("{src_target}:{log}");
         } else {
             println!("syq: started on {src_target}, log {log}");
-            println!("syq: follow with:  syq --follow {src_target}:{log}");
+            println!("syq: follow with:  syq rsync --follow {src_target}:{log}");
         }
         return Ok(0);
     }
     if !args.quiet {
-        eprintln!("syq: remote-to-remote: running on {src_host} (use --relay to route data through this machine)");
+        if args.interface == Interface::Rsync {
+            eprintln!("syq: remote-to-remote: running on {src_host} (use --relay to route data through this machine)");
+        } else {
+            eprintln!("syq: remote-to-remote: running on {src_host}");
+        }
     }
     let run = || {
         let mut cmd = make_command();
@@ -328,6 +413,9 @@ pub fn run(
         // transport failures); a custom shell that exits 23/25 itself would
         // be mistaken for the orchestrator.
         Some(c @ (23 | 25)) => Ok(c),
+        Some(c) if args.interface != Interface::Rsync => {
+            bail!("remote-to-remote transfer on {src_host} failed (exit {c}); the source host must be able to reach the target host")
+        }
         Some(c) => {
             bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
         }
@@ -344,16 +432,16 @@ fn helper_missing(code: Option<i32>, automatic: bool) -> bool {
         )
 }
 
-/// `syq --follow HOST:LOG`: tail a detached transfer's log, rendering the JSON
+/// `syq rsync --follow HOST:LOG`: tail a detached transfer's log, rendering the JSON
 /// progress lines as a status line and passing everything else through.
 pub fn follow(args: &Args) -> Result<i32> {
     let target = args
         .paths
         .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: syq --follow HOST:LOGFILE"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: syq rsync --follow HOST:LOGFILE"))?;
     let loc = Location::parse(target)?;
     let (Some(host), log) = (&loc.host, &loc.path) else {
-        bail!("usage: syq --follow HOST:LOGFILE")
+        bail!("usage: syq rsync --follow HOST:LOGFILE")
     };
     let rsh = parse_rsh(&args.rsh)?;
     let mut cmd = Command::new(&rsh[0]);
@@ -361,6 +449,7 @@ pub fn follow(args: &Args) -> Result<i32> {
     if let Some(u) = &loc.user {
         cmd.args(["-l", u]);
     }
+    let log = std::str::from_utf8(log).context("log path is not valid UTF-8")?;
     cmd.arg(host)
         .arg(format!("tail -n +1 -f {}", shell_words::quote(log)));
     cmd.stdin(Stdio::null())
@@ -429,6 +518,7 @@ pub fn follow(args: &Args) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::ffi::OsStr;
 
     fn args(command: &Command) -> Vec<&OsStr> {
@@ -468,5 +558,57 @@ mod tests {
         let args = args(&command);
         assert!(!args.contains(&OsStr::new("-a")));
         assert!(!args.contains(&OsStr::new("-A")));
+    }
+
+    #[test]
+    fn native_direct_invocation_stays_on_the_strict_surface() {
+        let mut parsed = Args::try_parse_from(["syq rsync", "source", "destination"]).unwrap();
+        parsed.interface = Interface::NativeCpPrune;
+        parsed.placement = Placement::Into;
+        parsed.target_existence = Existence::New;
+        parsed.dry_run = true;
+        parsed.verbose = 2;
+        parsed.connections_opt = Some(3);
+        parsed.max_delete = Some(4);
+        let sources = [
+            Location {
+                user: Some("alice".into()),
+                host: Some("source.test".into()),
+                path: b"one".to_vec(),
+                selection: SourceSelection::Named,
+            },
+            Location {
+                user: Some("alice".into()),
+                host: Some("source.test".into()),
+                path: b"tree".to_vec(),
+                selection: SourceSelection::Contents,
+            },
+        ];
+        let destination = Location {
+            user: Some("bob".into()),
+            host: Some("target.test".into()),
+            path: b"dest".to_vec(),
+            selection: SourceSelection::Named,
+        };
+
+        let remote = native_remote_args(&parsed, &sources, &destination).unwrap();
+        assert_eq!(
+            remote,
+            [
+                "cp-prune",
+                "-nvv",
+                "-j",
+                "3",
+                "--max-delete=4",
+                "--src",
+                "one",
+                "--src-src",
+                "tree",
+                "--to",
+                "bob@target.test",
+                "--into-new",
+                "dest",
+            ]
+        );
     }
 }
