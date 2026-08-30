@@ -55,7 +55,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | security | `symlink-race-dest` | fail | Unimplemented | unmodified upstream | platform=linux; run-as=root; root; a second uid; symlinks | SYQ follows an attacker-owned symlink in an operator-named absolute destination path. |
 | security | `symlink-race-relative-dest` | fail | Unimplemented | unmodified upstream | platform=linux; run-as=root; root; a second uid; symlinks | SYQ follows an attacker-owned symlink in an operator-named relative destination path. |
 | security | `symlink-race-source` | pass | Compatible | unmodified upstream | platform=linux; symlinks; C compiler; renameat2 | A raced source parent cannot make SYQ read file contents from outside the source tree. |
-| source-mapping | `duplicates` | fail | Policy open | unmodified upstream | platform=linux; symlinks | SYQ still treats repeated identical sources as destination collisions. |
+| source-mapping | `duplicates` | pass | Compatible | unmodified upstream | platform=linux; symlinks | Exactly repeated source operands are scanned and copied once while retaining multi-source destination placement. |
 | special-files | `nested-socket-specials` | pass | Compatible | unmodified upstream | platform=linux; Unix-domain sockets | Archive mode handles a nested socket without losing ordinary files. |
 | symlinks | `links` | pass | Compatible | subset adaptation (links-preserve-subset) | platform=linux; symlinks | -l preserves both file and directory symlinks several levels deep; unsupported -L and -k cases are omitted. |
 | symlinks | `symlink-ignore` | pass | Compatible | unmodified upstream | platform=linux; symlinks | Without -l/-L/-a, omit symlinks while copying referent files. |

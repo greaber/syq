@@ -175,6 +175,12 @@ pub struct Args {
     /// Original source endpoint for a remotely orchestrated dry-run summary
     #[arg(long, hide = true)]
     pub plan_source_host: Option<String>,
+    /// Original source-operand count for a direct remote orchestrator
+    #[arg(long, hide = true)]
+    pub direct_source_operand_count: Option<usize>,
+    /// Direct remote launch already deduplicated its raw source operands
+    #[arg(long, hide = true, requires = "direct_source_operand_count")]
+    pub direct_sources_prededuplicated: bool,
 
     /// Skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
     /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together

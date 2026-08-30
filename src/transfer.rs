@@ -550,12 +550,41 @@ pub fn run(args: Args) -> Result<i32> {
     if locs.len() < 2 {
         bail!("need at least one source and a destination");
     }
-    let (dst, srcs) = locs.split_last().unwrap();
-    for s in srcs {
-        if !s.same_host(&srcs[0]) {
+    let (_, raw_source_operands) = args.paths.split_last().unwrap();
+    let (dst, original_srcs) = locs.split_last().unwrap();
+    let source_operand_count = args
+        .direct_source_operand_count
+        .unwrap_or(raw_source_operands.len());
+    if source_operand_count < original_srcs.len() {
+        bail!("invalid direct source-operand count");
+    }
+    for s in original_srcs {
+        if !s.same_host(&original_srcs[0]) {
             bail!("all sources must be on the same host");
         }
     }
+    if args.files_from.is_some() && source_operand_count > 1 {
+        bail!("--files-from takes exactly one source directory");
+    }
+    // Rsync's file-list cleanup collapses an exactly repeated source. Key that
+    // decision on the raw operands, before parsing has normalized spellings,
+    // while retaining original multiplicity for destination placement:
+    // `file file new-dest` still creates a directory like other multi-source
+    // commands.
+    let multiple_source_operands = source_operand_count > 1;
+    let srcs: Vec<Location> = if args.direct_sources_prededuplicated {
+        original_srcs.to_vec()
+    } else {
+        let mut seen_sources = std::collections::HashSet::new();
+        raw_source_operands
+            .iter()
+            .zip(original_srcs)
+            .filter(|(raw, _)| seen_sources.insert(raw.as_str()))
+            .map(|(_, source)| source.clone())
+            .collect()
+    };
+    let srcs = srcs.as_slice();
+    let multiple_distinct_sources = srcs.len() > 1;
     if let Some(checkpoint) = args.checkpoint.as_deref() {
         let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
         for source in srcs.iter().filter(|source| !source.is_remote()) {
@@ -610,7 +639,9 @@ pub fn run(args: Args) -> Result<i32> {
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
-            return crate::direct::run(&args, srcs, dst);
+            // Let the remote orchestrator observe the original source count so
+            // repeated file sources keep multi-source destination semantics.
+            return crate::direct::run(&args, srcs, dst, source_operand_count);
         }
         if !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
@@ -643,10 +674,6 @@ pub fn run(args: Args) -> Result<i32> {
         max_size,
         min_size,
     });
-    if args.files_from.is_some() && srcs.len() > 1 {
-        bail!("--files-from takes exactly one source directory");
-    }
-
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let progress = Progress::new(
         args.connections,
@@ -910,11 +937,11 @@ pub fn run(args: Args) -> Result<i32> {
     let dst_existed = dst_root_entry.is_some();
     let dst_is_dir = match &dst_root_entry {
         Some(e) if e.kind == Kind::Dir => true,
-        Some(_) if srcs.len() > 1 => {
+        Some(_) if multiple_source_operands => {
             bail!("destination must be a directory when copying multiple sources")
         }
         Some(_) => false,
-        None => srcs.len() > 1 || dst.copies_contents() || args.files_from.is_some(),
+        None => multiple_source_operands || dst.copies_contents() || args.files_from.is_some(),
     };
     if args.files_from.is_some() {
         if let Some(e) = dst_root_entry.as_ref().filter(|e| e.kind != Kind::Dir) {
@@ -999,7 +1026,7 @@ pub fn run(args: Args) -> Result<i32> {
         && !args.existing;
     let dry_run_creates_root =
         args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
-    if create_root && srcs.len() == 1 {
+    if create_root && !multiple_distinct_sources {
         mkdir_root(&mut *dst_ctl, &dst_root)?;
     }
 
@@ -1041,12 +1068,12 @@ pub fn run(args: Args) -> Result<i32> {
         scan_warned: false,
         max_delete_hit: false,
         delete_walk_failed: false,
-        buffer: if srcs.len() > 1 {
+        buffer: if multiple_distinct_sources {
             Some(Vec::new())
         } else {
             None
         },
-        create_root: if create_root && srcs.len() > 1 {
+        create_root: if create_root && multiple_distinct_sources {
             Some(dst_root.clone())
         } else {
             None

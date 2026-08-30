@@ -32,7 +32,12 @@ fn direct_command(
     cmd
 }
 
-pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
+pub fn run(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    source_operand_count: usize,
+) -> Result<i32> {
     let rsh = parse_rsh(&args.rsh)?;
     let src_host = srcs[0].host.clone().unwrap();
     // The follow target must reconnect the way we did: keep an explicit user.
@@ -142,6 +147,10 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.dry_run {
         remote.push(format!("--plan-source-host={src_target}"));
     }
+    remote.push(format!(
+        "--direct-source-operand-count={source_operand_count}"
+    ));
+    remote.push("--direct-sources-prededuplicated".into());
     // --ignore-from files were read locally; forward the merged lines.
     for l in &args.ignore_lines {
         // One argument, so a pattern starting with '-' can't be taken for a flag.
