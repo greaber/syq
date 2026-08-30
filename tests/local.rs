@@ -445,6 +445,102 @@ fn native_rm_named_selector_subsumes_same_path_contents_selector() {
 }
 
 #[test]
+fn native_rm_serializes_nested_and_lexically_aliased_selectors() {
+    let t = Tmp::new();
+    for trial in 0..5 {
+        let relative = format!("nested-{trial}");
+        for file in 0..1_000 {
+            write(&t.path(&format!("{relative}/child/file-{file}")), b"data");
+        }
+        write(&t.path(&format!("{relative}/sibling")), b"data");
+
+        let tree = t.s(&relative);
+        let tree_alias = format!("{}/./{relative}", t.s(""));
+        let child = format!("{tree}/child");
+        if trial % 2 == 0 {
+            run_native_ok(&["rm", "--src", &tree_alias, "--src", &child]);
+        } else {
+            run_native_ok(&["rm", "--src", &child, "--src", &tree_alias]);
+        }
+        assert!(!t.path(&relative).exists());
+    }
+}
+
+#[test]
+fn native_rm_nested_selector_through_selected_symlink_removes_both() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real/child/file"), b"data");
+    symlink("real", t.path("link")).unwrap();
+
+    run_native_ok(&["rm", "--src", &t.s("link"), "--src", &t.s("link/child")]);
+
+    assert!(!t.path("link").exists());
+    assert!(!t.path("real/child").exists());
+    assert!(t.path("real").is_dir());
+}
+
+#[test]
+fn native_rm_serializes_all_nested_selector_mode_combinations() {
+    let t = Tmp::new();
+    for ancestor_named in [false, true] {
+        for child_named in [false, true] {
+            for descendant_first in [false, true] {
+                let relative = format!(
+                    "modes-{}-{}-{}",
+                    u8::from(ancestor_named),
+                    u8::from(child_named),
+                    u8::from(descendant_first)
+                );
+                write(&t.path(&format!("{relative}/child/file")), b"data");
+                write(&t.path(&format!("{relative}/sibling")), b"data");
+                let tree = t.s(&relative);
+                let child = format!("{tree}/child");
+                let ancestor_flag = if ancestor_named { "--src" } else { "--src-src" };
+                let child_flag = if child_named { "--src" } else { "--src-src" };
+                if descendant_first {
+                    run_native_ok(&["rm", child_flag, &child, ancestor_flag, &tree]);
+                } else {
+                    run_native_ok(&["rm", ancestor_flag, &tree, child_flag, &child]);
+                }
+
+                if ancestor_named {
+                    assert!(!t.path(&relative).exists());
+                } else {
+                    assert!(t.path(&relative).is_dir());
+                    assert_eq!(fs::read_dir(t.path(&relative)).unwrap().count(), 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_rm_nested_dry_run_reports_each_entry_once() {
+    let t = Tmp::new();
+    write(&t.path("tree/child/file"), b"data");
+    write(&t.path("tree/sibling"), b"data");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "rm",
+            "--dry-run",
+            "--src",
+            &t.s("tree"),
+            "--src",
+            &t.s("tree/child"),
+        ])
+        .output()
+        .unwrap();
+    assert_output_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("would remove 4 entries"), "{stdout}");
+    assert!(t.path("tree/child/file").exists());
+    assert!(t.path("tree/sibling").exists());
+}
+
+#[test]
 fn top_level_rsync_syntax_is_rejected_without_mutation() {
     let t = Tmp::new();
     write(&t.path("src"), b"data");

@@ -3,14 +3,14 @@
 //! unlinked in batches spread across workers; directories are removed
 //! deepest-first, each depth level in parallel.
 
-use crate::cli::{Args, Interface, Location};
+use crate::cli::{Args, Interface, Location, SourceSelection};
 use crate::conn::{ok, Conn, Endpoint};
 use crate::fsops::join;
 use crate::progress::{commas, Progress};
 use crate::proto::*;
 use crate::transfer::{connect_ctl, endpoint};
 use anyhow::{bail, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
@@ -146,6 +146,110 @@ fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct SelectorKey {
+    absolute: bool,
+    components: Vec<Vec<u8>>,
+}
+
+impl SelectorKey {
+    fn new(path: &[u8]) -> Self {
+        Self {
+            absolute: path.starts_with(b"/"),
+            components: path
+                .split(|byte| *byte == b'/')
+                .filter(|component| !component.is_empty() && *component != b".")
+                .map(<[u8]>::to_vec)
+                .collect(),
+        }
+    }
+
+    fn is_strict_ancestor_of(&self, other: &Self) -> bool {
+        self.absolute == other.absolute
+            && self.components.len() < other.components.len()
+            && other.components.starts_with(&self.components)
+    }
+}
+
+/// Give one lexical removal root one scan. Exact aliases are coalesced, and
+/// overlapping roots are ordered deepest-first so they can be serialized
+/// without dropping selections that pass through a selected symlink.
+fn normalize_native_rm_locations(locs: Vec<Location>) -> (Vec<Location>, bool) {
+    let mut positions: HashMap<SelectorKey, usize> = HashMap::new();
+    let mut normalized: Vec<(Location, SelectorKey)> = Vec::with_capacity(locs.len());
+    for location in locs {
+        let key = SelectorKey::new(&location.path);
+        match positions.get(&key).copied() {
+            Some(position) => {
+                let existing: &mut Location = &mut normalized[position].0;
+                if existing.selection == SourceSelection::Contents
+                    && location.selection == SourceSelection::NamedNoFollow
+                {
+                    existing.selection = location.selection;
+                }
+            }
+            None => {
+                positions.insert(key.clone(), normalized.len());
+                normalized.push((location, key));
+            }
+        }
+    }
+
+    let overlaps = normalized.iter().enumerate().any(|(index, (_, key))| {
+        normalized[index + 1..]
+            .iter()
+            .any(|(_, other)| key.is_strict_ancestor_of(other) || other.is_strict_ancestor_of(key))
+    });
+    if overlaps {
+        // Stable by selector order within one depth; only ancestry constrains
+        // the order needed to avoid one scan mutating beneath another.
+        normalized
+            .sort_by(|(_, left), (_, right)| right.components.len().cmp(&left.components.len()));
+    }
+    (
+        normalized
+            .into_iter()
+            .map(|(location, _)| location)
+            .collect(),
+        overlaps,
+    )
+}
+
+fn remove_pending_directories(
+    dirs: &mut BTreeMap<usize, Vec<PathBytes>>,
+    args: &Args,
+    pool: &Arc<Pool>,
+    progress: &Arc<Progress>,
+    verbose: bool,
+) {
+    // Deepest first; every directory at one depth can go in parallel.
+    for paths in dirs.values().rev() {
+        if args.dry_run {
+            progress.files_done.fetch_add(paths.len() as u64, Relaxed);
+            if verbose {
+                for p in paths {
+                    println!("{}/", String::from_utf8_lossy(p));
+                }
+            }
+            continue;
+        }
+        for chunk in paths.chunks(
+            BATCH
+                .max(paths.len() / (args.connections * 2).max(1))
+                .min(BATCH),
+        ) {
+            pool.submit(
+                chunk
+                    .iter()
+                    .map(|p| Op::Rmdir { path: p.clone() })
+                    .collect(),
+            );
+        }
+        pool.wait_idle();
+    }
+    dirs.clear();
+}
+
 pub fn run(args: Args) -> Result<i32> {
     let mut locs: Vec<Location> = if args.locations.is_empty() {
         args.paths
@@ -160,33 +264,15 @@ pub fn run(args: Args) -> Result<i32> {
             bail!("all paths must be on the same host");
         }
     }
-    if args.interface == Interface::NativeRm {
-        // Repeated selectors for one path describe one removal, and selecting
-        // the named object subsumes selecting only its contents. Preserve the
-        // path's first-seen streaming position; in particular, do not sort or
-        // collapse distinct nested paths into a fixed removal population.
-        let mut positions = HashMap::new();
-        let mut normalized = Vec::with_capacity(locs.len());
-        for location in locs {
-            match positions.get(&location.path).copied() {
-                Some(position) => {
-                    let existing: &mut Location = &mut normalized[position];
-                    if existing.selection == crate::cli::SourceSelection::Contents
-                        && location.selection == crate::cli::SourceSelection::NamedNoFollow
-                    {
-                        existing.selection = location.selection;
-                    }
-                }
-                None => {
-                    positions.insert(location.path.clone(), normalized.len());
-                    normalized.push(location);
-                }
-            }
-        }
-        locs = normalized;
-    }
-    let mut args = args;
     check_rm_safety(&locs, &args)?;
+    let serialize_selectors = if args.interface == Interface::NativeRm {
+        let (normalized, overlaps) = normalize_native_rm_locations(locs);
+        locs = normalized;
+        overlaps
+    } else {
+        false
+    };
+    let mut args = args;
     let ep = endpoint(&locs[0], &args)?;
     if args.connections_default && !ep.is_remote() {
         args.connections = crate::transfer::LOCAL_DEFAULT_CONNECTIONS;
@@ -237,6 +323,9 @@ pub fn run(args: Args) -> Result<i32> {
 
     // Directories by depth, removed after all files are gone.
     let mut dirs: BTreeMap<usize, Vec<PathBytes>> = BTreeMap::new();
+    // A dry run cannot make a descendant disappear before its ancestor is
+    // scanned, so suppress entries already reported by an overlapping root.
+    let mut dry_run_seen = (serialize_selectors && args.dry_run).then(HashSet::new);
     let mut scan_err = None;
     for l in &locs {
         let root = l.path.clone();
@@ -259,6 +348,11 @@ pub fn run(args: Args) -> Result<i32> {
                         continue;
                     }
                     let full = join(&root, &e.path);
+                    if let Some(seen) = dry_run_seen.as_mut() {
+                        if !seen.insert(SelectorKey::new(&full)) {
+                            continue;
+                        }
+                    }
                     progress.files_total.fetch_add(1, Relaxed);
                     if e.kind == Kind::Dir {
                         let depth = full.iter().filter(|&&c| c == b'/').count();
@@ -294,38 +388,18 @@ pub fn run(args: Args) -> Result<i32> {
             &mut |w| progress.error(&format!("syq: {w}")),
         );
         pool.submit(batch);
-        if let Err(e) = res {
+        let error = res.err();
+        if serialize_selectors {
+            pool.wait_idle();
+            remove_pending_directories(&mut dirs, &args, &pool, &progress, verbose);
+        }
+        if let Some(e) = error {
             scan_err = Some(e);
             break;
         }
     }
     pool.wait_idle();
-
-    // Deepest first; every directory at one depth can go in parallel.
-    for (_, paths) in dirs.iter().rev() {
-        if args.dry_run {
-            progress.files_done.fetch_add(paths.len() as u64, Relaxed);
-            if verbose {
-                for p in paths {
-                    println!("{}/", String::from_utf8_lossy(p));
-                }
-            }
-            continue;
-        }
-        for chunk in paths.chunks(
-            BATCH
-                .max(paths.len() / (args.connections * 2).max(1))
-                .min(BATCH),
-        ) {
-            pool.submit(
-                chunk
-                    .iter()
-                    .map(|p| Op::Rmdir { path: p.clone() })
-                    .collect(),
-            );
-        }
-        pool.wait_idle();
-    }
+    remove_pending_directories(&mut dirs, &args, &pool, &progress, verbose);
     pool.close();
     for w in workers {
         if let Ok(Err(e)) = w.join() {
