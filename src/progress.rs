@@ -21,6 +21,10 @@ pub struct Progress {
     pub rm: bool,
     pub bytes_total: AtomicU64,
     pub bytes_done: AtomicU64,
+    /// Monotonic high-water mark of logical completion. Recovery may roll
+    /// `bytes_done` back, but retransmitting the same range is not fresh useful
+    /// throughput and cannot advance this meter until progress passes the mark.
+    tuning_high_water: AtomicU64,
     pub bytes_skipped: AtomicU64,
     pub files_total: AtomicU64,
     pub files_done: AtomicU64,
@@ -64,6 +68,7 @@ impl Progress {
             rm: false,
             bytes_total: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
+            tuning_high_water: AtomicU64::new(0),
             bytes_skipped: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
@@ -94,7 +99,8 @@ impl Progress {
     }
 
     pub fn add_bytes(&self, n: u64) {
-        self.bytes_done.fetch_add(n, Relaxed);
+        let done = self.bytes_done.fetch_add(n, Relaxed).saturating_add(n);
+        self.tuning_high_water.fetch_max(done, Relaxed);
     }
 
     /// Print a line to stdout, keeping the progress area intact.
@@ -146,6 +152,14 @@ impl Progress {
     fn rate(&self, t: &mut TermState) -> f64 {
         let now = Instant::now();
         let done = self.bytes_done.load(Relaxed);
+        if t.samples
+            .back()
+            .is_some_and(|&(_, previous)| done < previous)
+        {
+            // Recovery can retract bytes whose acknowledgement is uncertain.
+            // A window spanning that rollback is not a meaningful rate.
+            t.samples.clear();
+        }
         t.samples.push_back((now, done));
         while t.samples.len() > 2 && now - t.samples[0].0 > Duration::from_secs(5) {
             t.samples.pop_front();
@@ -349,12 +363,37 @@ pub fn commas(n: u64) -> String {
 
 impl crate::tune::Meter for Progress {
     fn bytes(&self) -> u64 {
-        self.bytes_done.load(Relaxed)
+        self.tuning_high_water.load(Relaxed)
     }
     fn files(&self) -> u64 {
         self.files_done.load(Relaxed)
     }
     fn set_active(&self, n: usize) {
         self.active_workers.store(n as u64, Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tune::Meter;
+
+    #[test]
+    fn rollback_resets_display_rate_and_retries_do_not_inflate_tuning_progress() {
+        let progress = Progress::new(1, false, false, None, false);
+        progress.add_bytes(1_000);
+        let mut term = progress.term.lock().unwrap();
+        term.samples
+            .push_back((Instant::now() - Duration::from_secs(1), 1_000));
+
+        progress.bytes_done.fetch_sub(600, Relaxed);
+        assert_eq!(progress.rate(&mut term), 0.0);
+        assert_eq!(term.samples.len(), 1);
+        assert_eq!(Meter::bytes(&*progress), 1_000);
+
+        progress.add_bytes(600);
+        assert_eq!(Meter::bytes(&*progress), 1_000);
+        progress.add_bytes(100);
+        assert_eq!(Meter::bytes(&*progress), 1_100);
     }
 }

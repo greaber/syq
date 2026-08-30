@@ -2,7 +2,9 @@
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{parse_rsh, parse_size, Args, Location};
-use crate::conn::{ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, TcpCandidate};
+use crate::conn::{
+    ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, TcpCandidate, TcpPairStats,
+};
 use crate::fsops::{is_partial_name, join};
 use crate::progress::{commas, human, Progress, WorkerStatus};
 use crate::proto::*;
@@ -21,6 +23,7 @@ const MAX_ATTEMPTS: u32 = 3;
 pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 const FAST_BATCH_FILES: usize = 64;
 const FAST_BATCH_BYTES: u64 = 16 << 20;
+const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 
 pub struct Opts {
     pub block: u64,
@@ -262,6 +265,82 @@ fn print_transport_diagnostics(args: &Args, src: &Endpoint, dst: &Endpoint) {
             args.connections
         );
     }
+}
+
+fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
+    let sockets: Vec<TcpSocketStats> = pairs
+        .iter()
+        .flat_map(|pair| [pair.local, pair.peer].into_iter().flatten())
+        .collect();
+    if sockets.is_empty() {
+        return if has_ssh_data {
+            "\n  tcp statistics: unavailable (data used SSH)".into()
+        } else {
+            "\n  tcp statistics: unavailable on this platform/kernel".into()
+        };
+    }
+    // Aggregates are meaningful only when every sampled socket exposes the
+    // field. Do not turn an unsupported end into a genuine zero.
+    let sum =
+        |field: fn(&TcpSocketStats) -> Option<u64>| sockets.iter().map(field).sum::<Option<u64>>();
+    let values = |field: fn(&TcpSocketStats) -> Option<u64>| {
+        sockets.iter().map(field).collect::<Option<Vec<u64>>>()
+    };
+    let bytes_sent = sum(|stats| stats.bytes_sent);
+    let bytes_retransmitted = sum(|stats| stats.bytes_retransmitted);
+    let segments_sent = sum(|stats| stats.segments_sent);
+    let retransmissions = sum(|stats| stats.retransmissions);
+    let average_rtt =
+        values(|stats| stats.rtt_us).map(|rtts| rtts.iter().sum::<u64>() / rtts.len() as u64);
+    let min_rtt = values(|stats| stats.min_rtt_us).and_then(|rtts| rtts.into_iter().min());
+    let loss = |amount: Option<u64>, sent: Option<u64>| match amount {
+        None => "unavailable".into(),
+        Some(amount) => match sent {
+            Some(sent) if sent > 0 => format!(
+                "{} ({:.3}% of sent)",
+                commas(amount),
+                amount as f64 * 100.0 / sent as f64
+            ),
+            _ => format!("{} (percentage unavailable)", commas(amount)),
+        },
+    };
+    let average_congestion_window = values(|stats| stats.send_cwnd_bytes)
+        .map(|windows| windows.iter().sum::<u64>() / windows.len() as u64);
+    let delivery_rate = sum(|stats| stats.delivery_rate);
+    let busy = sum(|stats| stats.busy_time_us);
+    let receive_limited = sum(|stats| stats.receive_window_limited_us);
+    let send_limited = sum(|stats| stats.send_buffer_limited_us);
+    let limited_percent = |limited: Option<u64>| match (limited, busy) {
+        (Some(limited), Some(busy)) if busy > 0 => {
+            format!("{:.1}%", limited as f64 * 100.0 / busy as f64)
+        }
+        _ => "unavailable".into(),
+    };
+    let paths = pairs
+        .iter()
+        .map(|pair| pair.label.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let mut output = format!(
+        "\n  tcp connection lifetimes sampled: {} across {} path(s) ({} socket ends)\n  tcp retransmissions (loss signal): {} packets, {} bytes\n  tcp RTT: current average {}, minimum {}\n  tcp congestion: average send window {}, aggregate delivery rate {}\n  tcp window-limited time: receive {}, send-buffer {}\n  tcp ECN CE deliveries: {}",
+        pairs.len(),
+        paths,
+        sockets.len(),
+        loss(retransmissions, segments_sent),
+        loss(bytes_retransmitted, bytes_sent),
+        average_rtt.map_or_else(|| "unavailable".into(), |value| format!("{:.2} ms", value as f64 / 1000.0)),
+        min_rtt.map_or_else(|| "unavailable".into(), |value| format!("{:.2} ms", value as f64 / 1000.0)),
+        average_congestion_window.map_or_else(|| "unavailable".into(), human),
+        delivery_rate.map_or_else(|| "unavailable".into(), |value| format!("{}/s", human(value))),
+        limited_percent(receive_limited),
+        limited_percent(send_limited),
+        sum(|stats| stats.ecn_ce_delivered)
+            .map_or_else(|| "unavailable".into(), commas),
+    );
+    if has_ssh_data {
+        output.push_str("\n  ssh data connections: kernel TCP loss statistics unavailable");
+    }
+    output
 }
 
 /// The canonical form of a path (symlinks and `..` resolved the way the kernel
@@ -586,8 +665,20 @@ pub fn run(args: Args) -> Result<i32> {
     let checkpoint_slot: CheckpointSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
         Arc::new(Mutex::new(Vec::new()));
+    let transport_stats: Arc<Mutex<Vec<TcpPairStats>>> = Arc::new(Mutex::new(Vec::new()));
     let spawn_worker: Arc<dyn Fn(usize) + Send + Sync> = {
-        let (src_ep, dst_ep, sched, progress, opts, gate, workers, checkpoint_slot, bwlimit) = (
+        let (
+            src_ep,
+            dst_ep,
+            sched,
+            progress,
+            opts,
+            gate,
+            workers,
+            checkpoint_slot,
+            bwlimit,
+            transport_stats,
+        ) = (
             src_ep.clone(),
             dst_ep.clone(),
             sched.clone(),
@@ -597,10 +688,12 @@ pub fn run(args: Args) -> Result<i32> {
             workers.clone(),
             checkpoint_slot.clone(),
             bwlimit.clone(),
+            transport_stats.clone(),
         );
         let compress = args.compress;
+        let collect_tcp_stats = args.stats;
         Arc::new(move |id: usize| {
-            let (src_ep, dst_ep, sched, progress, opts, gate, checkpoint, bwlimit) = (
+            let (src_ep, dst_ep, sched, progress, opts, gate, checkpoint, bwlimit, transport_stats) = (
                 src_ep.clone(),
                 dst_ep.clone(),
                 sched.clone(),
@@ -609,43 +702,99 @@ pub fn run(args: Args) -> Result<i32> {
                 gate.clone(),
                 checkpoint_slot.clone(),
                 bwlimit.clone(),
+                transport_stats.clone(),
             );
             let h = std::thread::spawn(move || -> Result<()> {
-                let t0 = std::time::Instant::now();
-                let conns = src_ep
-                    .connect(compress)
-                    .and_then(|s| Ok((s, dst_ep.connect(compress)?)));
-                // Counted whether or not it worked: the tuner waits for every
-                // requested worker to arrive before judging, and a failed one
-                // must not stall it.
-                gate.connected.fetch_add(1, Relaxed);
-                let (src, dst) = conns?;
-                let mut w = Worker {
-                    id,
-                    src,
-                    dst,
-                    sched,
-                    progress,
-                    opts,
-                    checkpoint,
-                    bwlimit,
-                    gate,
-                    t: [0.0; 4],
-                };
-                if debug() {
-                    eprintln!(
-                        "syq: worker {id} connected in {:.2}s",
-                        t0.elapsed().as_secs_f64()
-                    );
+                let mut failures = 0u32;
+                loop {
+                    if !gate.retained(id) {
+                        gate.mark_absent(id);
+                        return Ok(());
+                    }
+                    let t0 = std::time::Instant::now();
+                    let conns = src_ep
+                        .connect(compress)
+                        .and_then(|src| Ok((src, dst_ep.connect(compress)?)));
+                    let (src, dst) = match conns {
+                        Ok(conns) => conns,
+                        Err(error) => {
+                            failures += 1;
+                            if failures >= CONNECTION_RECOVERY_ATTEMPTS {
+                                gate.mark_failed(id);
+                                return if gate.allowed(id) { Err(error) } else { Ok(()) };
+                            }
+                            gate.mark_warming(id);
+                            if !opts.quiet {
+                                eprintln!(
+                                    "syq: worker {id}: connection setup failed; retrying in {}s ({error:#})",
+                                    1 << (failures - 1)
+                                );
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                            continue;
+                        }
+                    };
+                    gate.mark_ready(id);
+                    let mut worker = Worker {
+                        id,
+                        src,
+                        dst,
+                        sched: sched.clone(),
+                        progress: progress.clone(),
+                        opts: opts.clone(),
+                        checkpoint: checkpoint.clone(),
+                        bwlimit: bwlimit.clone(),
+                        gate: gate.clone(),
+                        t: [0.0; 4],
+                    };
+                    if debug() {
+                        eprintln!(
+                            "syq: worker {id} connected in {:.2}s",
+                            t0.elapsed().as_secs_f64()
+                        );
+                    }
+                    let result = worker.run();
+                    if collect_tcp_stats {
+                        transport_stats
+                            .lock()
+                            .unwrap()
+                            .extend(worker.collect_transport_stats());
+                    }
+                    let dropped = result.is_err() && worker.transport_dead();
+                    match result {
+                        Ok(()) => {
+                            gate.mark_absent(id);
+                            return Ok(());
+                        }
+                        Err(error) if dropped => {
+                            failures += 1;
+                            progress.set_worker(id, None);
+                            if failures >= CONNECTION_RECOVERY_ATTEMPTS {
+                                gate.mark_failed(id);
+                                return Err(error);
+                            }
+                            gate.mark_warming(id);
+                            if !opts.quiet {
+                                eprintln!(
+                                    "syq: worker {id}: connection dropped; reopening in {}s ({error:#})",
+                                    1 << (failures - 1)
+                                );
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                        }
+                        Err(error) => {
+                            gate.mark_failed(id);
+                            return Err(error);
+                        }
+                    }
                 }
-                w.run()
             });
             workers.lock().unwrap().push(h);
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
     let spawn_workers = |initial: usize| {
-        for id in 0..initial {
+        for id in gate.begin_warming(initial) {
             spawn_worker(id);
         }
         if autotune {
@@ -658,7 +807,7 @@ pub fn run(args: Args) -> Result<i32> {
             let n0 = initial;
             let policy = tune::Policy::new(n0, tune::MIN, tune::MAX);
             *tuner.lock().unwrap() = Some(std::thread::spawn(move || {
-                tune::run(policy, gate, sched, progress, |id| spawn_worker(id), n0)
+                tune::run(policy, gate, sched, progress, |id| spawn_worker(id))
             }));
         }
     };
@@ -726,9 +875,22 @@ pub fn run(args: Args) -> Result<i32> {
         });
     if autotune && all_remote_endpoints_use_tcp {
         args.connections = tune::START_TCP;
-        gate.set_limit(args.connections);
+        gate.set_active(args.connections);
+    }
+    let tuning_key = autotune.then(|| tune::path_key(&src_ep, &dst_ep)).flatten();
+    let remembered_start = tuning_key.as_deref().and_then(tune::cached);
+    if let Some(remembered) = remembered_start {
+        args.connections = remembered;
+        gate.set_active(remembered);
     }
     print_transport_diagnostics(&args, &src_ep, &dst_ep);
+    if args.verbose >= 2 {
+        if let Some(remembered) = remembered_start {
+            eprintln!(
+                "syq: auto-tuning: starting with {remembered} connections remembered for this path"
+            );
+        }
+    }
     if !opts.dry_run {
         spawn_workers(args.connections);
     }
@@ -1004,7 +1166,17 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
-    let tuned = tuner.lock().unwrap().take().and_then(|t| t.join().ok());
+    let tuned = match tuner.lock().unwrap().take() {
+        Some(thread) => match thread.join() {
+            Ok(policy) => Some(policy),
+            Err(_) => {
+                progress.error("syq: auto-tuning thread panicked");
+                sched.abort();
+                None
+            }
+        },
+        None => None,
+    };
 
     let aborted = sched.is_aborted();
     let mut deleted = 0u64;
@@ -1053,6 +1225,31 @@ pub fn run(args: Args) -> Result<i32> {
     progress.clear();
 
     let errors = progress.errors.load(Relaxed);
+
+    if !aborted
+        && errors == 0
+        && !opts.dry_run
+        && !opts.verify_only
+        && scan_err.is_none()
+        && !collision
+    {
+        if let Some(policy) = tuned.as_ref().filter(|policy| policy.measured()) {
+            // A TCP failure affects later connections but leaves earlier TCP
+            // workers alive, so a changed key means the measurements may mix
+            // transports. Such a run is useful live evidence but not a safe
+            // hint for either future pure path.
+            if let Some(initial_key) = tuning_key.as_deref() {
+                let final_key = tune::path_key(&src_ep, &dst_ep);
+                if final_key.as_deref() == Some(initial_key) {
+                    tune::remember(initial_key, policy.settled());
+                } else if debug() {
+                    eprintln!(
+                        "syq: auto-tuning: transport changed during transfer; not updating cache"
+                    );
+                }
+            }
+        }
+    }
 
     // Settle an explicit checkpoint. A recording failure only makes a retry
     // recheck more files. The user-selected state persists until they remove it.
@@ -1147,8 +1344,12 @@ pub fn run(args: Args) -> Result<i32> {
                     done,
                 )
             };
+            let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
+                matches!(endpoint, Endpoint::Remote(spec) if spec.data_transport() == DataTransport::Ssh)
+            });
+            let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
             println!(
-                "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}",
+                "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
                 commas(progress.files_skipped.load(Relaxed)),
@@ -1168,7 +1369,8 @@ pub fn run(args: Args) -> Result<i32> {
                         p.peak
                     ),
                     None => args.connections.to_string(),
-                }
+                },
+                tcp_stats,
             );
         }
     }
@@ -3410,12 +3612,27 @@ struct BlockDiff {
 impl Worker {
     fn run(&mut self) -> Result<()> {
         let r = self.run_inner();
-        if r.is_err() {
-            // A dead connection here would otherwise leave peers blocked in
-            // sched.next(); wake them so the whole transfer unwinds.
+        if r.is_err() && !self.transport_dead() {
+            // Fatal local/protocol failures cannot be healed by reopening a
+            // transport. Wake peers so the whole transfer unwinds.
             self.sched.abort();
         }
         r
+    }
+
+    fn transport_dead(&self) -> bool {
+        self.src.is_dead() || self.dst.is_dead()
+    }
+
+    fn collect_transport_stats(&mut self) -> Vec<TcpPairStats> {
+        let mut stats = Vec::new();
+        if let Some(value) = self.src.transport_stats() {
+            stats.push(value);
+        }
+        if let Some(value) = self.dst.transport_stats() {
+            stats.push(value);
+        }
+        stats
     }
 
     fn run_inner(&mut self) -> Result<()> {
@@ -3459,14 +3676,31 @@ impl Worker {
                         let (fast, slow): (Vec<usize>, Vec<usize>) =
                             batch.into_iter().partition(|&i| self.fast_eligible(i));
                         if let Err(e) = self.fast_batch(&fast) {
-                            // Transport-level failure: every file in the batch is affected.
                             for &i in &fast {
                                 self.sched.ranges_ready(i, vec![]);
                             }
-                            self.file_error(fast[0], e)?;
+                            if self.transport_dead() {
+                                for &i in &slow {
+                                    self.sched.ranges_ready(i, vec![]);
+                                }
+                                for &i in fast.iter().chain(&slow) {
+                                    self.sched.requeue(i);
+                                }
+                                return Err(e);
+                            }
+                            let message = format!("{e:#}");
+                            for &i in &fast {
+                                self.file_error(i, anyhow::anyhow!(message.clone()))?;
+                            }
                         }
-                        for i in slow {
+                        for (position, &i) in slow.iter().enumerate() {
                             if let Err(e) = self.handle_file(i) {
+                                if self.transport_dead() {
+                                    for &pending in &slow[position + 1..] {
+                                        self.sched.ranges_ready(pending, vec![]);
+                                        self.sched.requeue(pending);
+                                    }
+                                }
                                 self.file_error(i, e)?;
                             }
                         }
@@ -3482,18 +3716,43 @@ impl Worker {
                     }
                 }
                 Item::Range(h) => {
-                    let idx = h.lock().unwrap().idx;
-                    let res = self.transfer_range(&h);
-                    // Remove the handle from the scheduler's in-flight set FIRST,
-                    // so a propagating error can't strand it and deadlock peers.
-                    let done = self.sched.range_done(&h);
+                    let (idx, start) = {
+                        let range = h.lock().unwrap();
+                        (range.idx, range.pos)
+                    };
+                    let mut credited = 0;
+                    let res = self.transfer_range(&h, &mut credited);
                     if let Err(e) = res {
+                        if self.transport_dead() {
+                            self.undo_progress(idx, credited);
+                            self.sched.retry_range(&h, start);
+                            return Err(e);
+                        }
+                        self.sched.range_done(&h);
                         self.file_error(idx, e)?;
+                        continue;
                     }
+                    let done = self.sched.range_done(&h);
                     if done {
                         if let Err(e) = self.finish_file(idx) {
+                            if self.transport_dead() {
+                                self.sched.requeue_finish(idx, false);
+                            }
                             self.file_error(idx, e)?;
                         }
+                    }
+                }
+                Item::Finish { idx, matched } => {
+                    let result = if matched {
+                        self.finish_matched_file(idx)
+                    } else {
+                        self.finish_file(idx)
+                    };
+                    if let Err(e) = result {
+                        if self.transport_dead() {
+                            self.sched.requeue_finish(idx, matched);
+                        }
+                        self.file_error(idx, e)?;
                     }
                 }
             }
@@ -3707,6 +3966,9 @@ impl Worker {
                 Ok(size) => size,
                 Err(error) => {
                     self.sched.ranges_ready(idx, vec![]);
+                    if self.transport_dead() {
+                        self.sched.requeue(idx);
+                    }
                     return Err(error);
                 }
             }
@@ -3729,6 +3991,14 @@ impl Worker {
                 Ok(false) => {} // not offloadable — fall through to streaming
                 Err(e) => {
                     self.sched.ranges_ready(idx, vec![]);
+                    if self.transport_dead() {
+                        // try_copy_local queues publication recovery after it
+                        // has credited the completed kernel copy. Earlier
+                        // connection failures still need the whole probe.
+                        if job.done.load(Relaxed) < job.entry.size {
+                            self.sched.requeue(idx);
+                        }
+                    }
                     return Err(e);
                 }
             }
@@ -3824,6 +4094,9 @@ impl Worker {
             Ok(result) => result,
             Err(e) => {
                 self.sched.ranges_ready(idx, vec![]);
+                if self.transport_dead() {
+                    self.sched.requeue(idx);
+                }
                 return Err(e);
             }
         };
@@ -3835,16 +4108,43 @@ impl Worker {
         self.progress.bytes_total.fetch_sub(size - to_send, Relaxed);
         match self.sched.ranges_ready(idx, ranges) {
             Some(h) => {
-                let res = self.transfer_range(&h);
+                let start = h.lock().unwrap().pos;
+                let mut credited = 0;
+                let res = self.transfer_range(&h, &mut credited);
                 if let Err(e) = res {
-                    self.file_error(idx, e)?;
+                    if self.transport_dead() {
+                        self.undo_progress(idx, credited);
+                        self.sched.retry_range(&h, start);
+                        return Err(e);
+                    }
+                    self.sched.range_done(&h);
+                    return Err(e);
                 }
                 if self.sched.range_done(&h) {
-                    self.finish_file(idx)?;
+                    if let Err(e) = self.finish_file(idx) {
+                        if self.transport_dead() {
+                            self.sched.requeue_finish(idx, false);
+                        }
+                        return Err(e);
+                    }
                 }
             }
-            None if needs_finalize => self.finish_file(idx)?,
-            None => self.finish_matched_file(idx)?,
+            None if needs_finalize => {
+                if let Err(e) = self.finish_file(idx) {
+                    if self.transport_dead() {
+                        self.sched.requeue_finish(idx, false);
+                    }
+                    return Err(e);
+                }
+            }
+            None => {
+                if let Err(e) = self.finish_matched_file(idx) {
+                    if self.transport_dead() {
+                        self.sched.requeue_finish(idx, true);
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -3885,7 +4185,12 @@ impl Worker {
                 );
                 self.progress.add_bytes(job.entry.size);
                 job.done.store(job.entry.size, Relaxed);
-                self.finish_file(idx)?;
+                if let Err(e) = self.finish_file(idx) {
+                    if self.transport_dead() {
+                        self.sched.requeue_finish(idx, false);
+                    }
+                    return Err(e);
+                }
                 Ok(true)
             }
             Response::Err(e) if e.contains("EXDEV") => Ok(false),
@@ -4030,16 +4335,15 @@ impl Worker {
         ranges
     }
 
-    fn transfer_range(&mut self, h: &RangeHandle) -> Result<()> {
-        let (idx, start, end0) = {
+    fn transfer_range(&mut self, h: &RangeHandle, credited: &mut u64) -> Result<()> {
+        let idx = {
             let g = h.lock().unwrap();
-            (g.idx, g.pos, g.end)
+            g.idx
         };
         let job = self.job(idx);
         if self.sched.is_failed(idx) {
             return Ok(());
         }
-        let _ = (start, end0);
         self.progress.set_worker(
             self.id,
             Some(WorkerStatus {
@@ -4112,12 +4416,23 @@ impl Worker {
             }
             self.progress.add_bytes(n);
             job.done.fetch_add(n, Relaxed);
+            *credited += n;
         }
         while writes_out > 0 {
             ok(self.dst.recv()?, "write")?;
             writes_out -= 1;
         }
         Ok(())
+    }
+
+    fn undo_progress(&self, idx: usize, credited: u64) {
+        if credited == 0 {
+            return;
+        }
+        self.progress.bytes_done.fetch_sub(credited, Relaxed);
+        self.sched.jobs.lock().unwrap()[idx]
+            .done
+            .fetch_sub(credited, Relaxed);
     }
 
     fn transfer_block(&self) -> u64 {
@@ -4149,7 +4464,7 @@ impl Worker {
         let mut meta = job.entry.meta();
         meta.mode = self.create_mode(&job);
         let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
-        ok(
+        let finalized = ok(
             self.dst.call(Request::Finalize {
                 path: job.dst.clone(),
                 inplace: job.inplace,
@@ -4158,7 +4473,29 @@ impl Worker {
                 flags,
             })?,
             "finalize destination",
-        )?;
+        );
+        if let Err(error) = finalized {
+            if self.transport_dead() || job.inplace {
+                return Err(error);
+            }
+            // If the response to a previous Finalize was lost, its sidecar is
+            // gone because publication already happened. Verify the final
+            // bytes before treating the retry as successful; if a sidecar is
+            // still present, preserve the real metadata/publication error.
+            let partial_missing = match ok(
+                self.dst.call(Request::ProbePartial {
+                    path: job.dst.clone(),
+                    partial_id: self.partial_id(),
+                })?,
+                "probe partial after finalize",
+            )? {
+                Response::PartialSize(size) => size.is_none(),
+                other => bail!("unexpected response {other:?}"),
+            };
+            if !partial_missing || !self.contents_match(&job)? {
+                return Err(error);
+            }
+        }
         #[cfg(debug_assertions)]
         if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_AFTER_FINALIZE_MS") {
             if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
@@ -4166,6 +4503,34 @@ impl Worker {
             }
         }
         self.complete_file(idx, job, false)
+    }
+
+    fn contents_match(&mut self, job: &FileJob) -> Result<bool> {
+        self.src.send(Request::FileHash {
+            path: job.src.clone(),
+        })?;
+        self.dst.send(Request::FileHash {
+            path: job.dst.clone(),
+        })?;
+        let source = self.src.recv();
+        let destination = self.dst.recv();
+        let source = ok(source?, "hash source after finalize")?;
+        let destination = ok(destination?, "hash destination after finalize")?;
+        match (source, destination) {
+            (
+                Response::FileHash {
+                    size: source_size,
+                    hash: source_hash,
+                },
+                Response::FileHash {
+                    size: destination_size,
+                    hash: destination_hash,
+                },
+            ) => Ok(source_size == destination_size && source_hash == destination_hash),
+            (source, destination) => {
+                bail!("unexpected responses {source:?} {destination:?}")
+            }
+        }
     }
 
     fn finish_matched_file(&mut self, idx: usize) -> Result<()> {
@@ -4262,20 +4627,27 @@ impl Worker {
             }
         })();
         self.sched.ranges_ready(idx, vec![]);
-        self.progress.add_bytes(job.entry.size);
-        job.done.store(job.entry.size, Relaxed);
         match r {
             Ok(true) => {
+                self.progress.add_bytes(job.entry.size);
+                job.done.store(job.entry.size, Relaxed);
                 self.progress.files_done.fetch_add(1, Relaxed);
                 if self.opts.verbose > 0 {
                     self.progress.println(&format!("ok      {}", job.rel));
                 }
             }
             Ok(false) => {
+                self.progress.add_bytes(job.entry.size);
+                job.done.store(job.entry.size, Relaxed);
                 self.progress.error(&format!("DIFFERS {}", job.rel));
                 self.sched.fail_file(idx);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                if self.transport_dead() {
+                    self.sched.requeue(idx);
+                }
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -4308,5 +4680,30 @@ mod tests {
                 "clean_root({given:?})"
             );
         }
+    }
+
+    #[test]
+    fn tcp_stats_distinguish_unavailable_fields_from_zero() {
+        let output = format_tcp_stats(
+            &[TcpPairStats {
+                label: "host".into(),
+                local: Some(TcpSocketStats {
+                    bytes_sent: Some(100),
+                    bytes_retransmitted: Some(0),
+                    segments_sent: Some(10),
+                    retransmissions: None,
+                    rtt_us: Some(1_000),
+                    min_rtt_us: None,
+                    ecn_ce_delivered: None,
+                    ..TcpSocketStats::default()
+                }),
+                peer: None,
+            }],
+            false,
+        );
+        assert!(output.contains("unavailable packets, 0 (0.000% of sent) bytes"));
+        assert!(output.contains("current average 1.00 ms, minimum unavailable"));
+        assert!(output.contains("receive unavailable, send-buffer unavailable"));
+        assert!(output.contains("tcp ECN CE deliveries: unavailable"));
     }
 }
