@@ -1031,6 +1031,178 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn tcp_congestion_override_is_applied_on_both_socket_ends_and_reported() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"per-socket congestion control");
+    let remote = format!("127.0.0.1:{}", t.s("dst"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "--tcp-plain",
+            "--tcp-congestion=reno",
+            "--stats",
+            "-avv",
+            "-j",
+            "1",
+        ])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("run syq with a per-socket TCP congestion override");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"per-socket congestion control");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tcp congestion control: reno (2 socket ends)"),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr
+            .contains("congestion control: remote listener reno; local data sockets request reno"),
+        "{stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rejected_tcp_congestion_override_is_fatal_instead_of_falling_back() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"must not silently fall back");
+    let remote = format!("127.0.0.1:{}", t.s("dst"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--tcp-congestion=syq_missing_cc", "-a", "-j", "1"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("run syq with an unavailable TCP congestion override");
+
+    assert!(!out.status.success());
+    assert!(!t.path("dst").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("could not apply --tcp-congestion syq_missing_cc"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("kernel rejected"), "{stderr}");
+    assert!(
+        stderr.contains("tcp_allowed_congestion_control"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("data over ssh"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_tcp_setup_failure_still_falls_back_with_congestion_notice() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"fallback remains available");
+    let remote = format!("127.0.0.1:{}", t.s("dst"));
+    let held_port = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+    let port = held_port.local_addr().unwrap().port();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "--tcp-congestion=reno",
+            &format!("--tcp-ports={port}-{port}"),
+            "-a",
+            "-j",
+            "1",
+        ])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("run syq when the requested direct TCP port is occupied");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"fallback remains available");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("data over ssh"), "{stderr}");
+    assert!(
+        stderr.contains("requested congestion control reno is not used by the SSH fallback"),
+        "{stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_remote_to_remote_forwards_tcp_congestion_override() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"direct forwarding");
+    let src = format!("hostA:{}", t.s("src"));
+    let dst = format!("hostB:{}", t.s("dst"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--tcp-congestion=reno", "--dry-run", "-avv", "-j", "1"])
+        .arg(&src)
+        .arg(&dst)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .output()
+        .expect("run direct remote-to-remote dry-run with TCP congestion override");
+
+    assert_output_ok(&out);
+    assert!(!t.path("dst").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("remote-to-remote: running on hostA"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .contains("congestion control: remote listener reno; local data sockets request reno"),
+        "{stderr}"
+    );
+    assert!(
+        fs::read_to_string(t.path("rsh.log"))
+            .unwrap()
+            .contains("--tcp-congestion=reno"),
+        "the source-side orchestrator did not receive the override"
+    );
+}
+
 #[test]
 fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it() {
     let t = Tmp::new();

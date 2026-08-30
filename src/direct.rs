@@ -144,6 +144,9 @@ pub fn run(
     if args.tcp_plain {
         remote.push("--tcp-plain".into());
     }
+    if let Some(algorithm) = &args.tcp_congestion {
+        remote.push(format!("--tcp-congestion={algorithm}"));
+    }
     remote.push(format!("--tcp-ports={}", args.tcp_ports));
     if args.progress_json && !args.quiet {
         remote.push("--progress-json".into());

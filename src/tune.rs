@@ -1054,6 +1054,7 @@ mod tests {
                 port: 1,
                 key: Some(vec![0; 32]),
                 token: vec![],
+                congestion_control: None,
                 failed: false,
                 failure: None,
                 next: Default::default(),

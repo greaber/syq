@@ -146,12 +146,13 @@ The kernel's [IP sysctl documentation][ip-sysctl] describes `tcp_rmem`,
 `tcp_wmem`, and the global socket limits. Kernel and distribution defaults
 change, which is another reason to inspect the running host.
 
-## 4. Treat congestion control and queueing as host policy
+## 4. Keep host defaults separate from per-transfer congestion experiments
 
 Inspect what the kernel supports and currently uses:
 
 ```sh
 sysctl net.ipv4.tcp_available_congestion_control
+sysctl net.ipv4.tcp_allowed_congestion_control
 sysctl net.ipv4.tcp_congestion_control
 sysctl net.core.default_qdisc
 tc qdisc show
@@ -159,10 +160,25 @@ tc qdisc show
 
 BBR with fair queueing can help some long-distance or lossy paths, but it is
 not an syq requirement and is not automatically faster on a clean LAN. Changing
-the congestion-control algorithm affects new TCP connections from every
-application. Changing `net.core.default_qdisc` alone may not replace qdiscs
-already attached to live interfaces, and virtual or multiqueue devices can have
-different behavior.
+`net.ipv4.tcp_congestion_control` affects new TCP connections from every
+application. If both endpoints already default to the wanted algorithm, syq's
+new direct TCP sockets inherit it and no application option is needed.
+
+For a scoped comparison on Linux, `syq --tcp-congestion ALGO` selects an
+algorithm only for syq's direct TCP data sockets, on both the connecting and
+listening hosts. It does not change the host default. Both kernels must have
+the algorithm registered, and an unprivileged syq process may choose only an
+entry in `net.ipv4.tcp_allowed_congestion_control`. A rejected explicit request
+stops the transfer rather than silently changing the experiment. Use a fixed
+connection count such as `-j 1` when comparing algorithms, repeat and alternate
+the runs, and inspect the effective algorithms and loss/window telemetry with
+`--stats`.
+
+Congestion control is sender-side: the server setting governs bulk downloads,
+while the uploading client setting governs bulk uploads. The per-socket option
+does not attach or replace a queueing discipline. Changing
+`net.core.default_qdisc` alone may not replace qdiscs already attached to live
+interfaces, and virtual or multiqueue devices can have different behavior.
 
 Only test these settings when network measurements point to congestion, loss,
 or queueing rather than CPU or storage. Confirm kernel support, follow the
