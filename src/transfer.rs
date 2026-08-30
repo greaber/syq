@@ -22,8 +22,25 @@ const WINDOW: usize = 4;
 const MAX_ATTEMPTS: u32 = 3;
 pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 const FAST_BATCH_FILES: usize = 128;
+// Larger batches trade filesystem overlap for fewer request/ack turns. On the
+// measured 262 ms path, 4,096 one-byte files at eight workers improved from a
+// 9.68 s to an 8.72 s median at 512; keep the change confined to high RTT TCP.
+const HIGH_RTT_FAST_BATCH_FILES: usize = 512;
+const HIGH_RTT_US: u64 = 100_000;
 const FAST_BATCH_BYTES: u64 = 16 << 20;
 const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
+
+fn fast_batch_file_limit(src_rtt_us: Option<u64>, dst_rtt_us: Option<u64>) -> usize {
+    if src_rtt_us
+        .into_iter()
+        .chain(dst_rtt_us)
+        .any(|rtt| rtt >= HIGH_RTT_US)
+    {
+        HIGH_RTT_FAST_BATCH_FILES
+    } else {
+        FAST_BATCH_FILES
+    }
+}
 
 pub struct Opts {
     pub block: u64,
@@ -36,6 +53,7 @@ pub struct Opts {
     pub verify_only: bool,
     pub inplace: bool,
     pub same_host: bool,
+    pub dst_remote: bool,
     pub dry_run: bool,
     pub quiet: bool,
     pub verbose: u8,
@@ -632,6 +650,7 @@ pub fn run(args: Args) -> Result<i32> {
         verify_only: args.verify_only,
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
+        dst_remote: dst_ep.is_remote(),
         dry_run: args.dry_run,
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
@@ -739,6 +758,8 @@ pub fn run(args: Args) -> Result<i32> {
                         }
                     };
                     gate.mark_ready(id);
+                    let fast_batch_files =
+                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us());
                     let mut worker = Worker {
                         id,
                         src,
@@ -751,6 +772,7 @@ pub fn run(args: Args) -> Result<i32> {
                         gate: gate.clone(),
                         t: [0.0; 4],
                         fast: FastTiming::default(),
+                        fast_batch_files,
                     };
                     if debug() {
                         eprintln!(
@@ -1984,6 +2006,8 @@ struct Mapped {
     dst_root: PathBytes,
     dirs: Vec<(PathBytes, PathBytes, Entry)>,
     others: Vec<Planned>,
+    dir_stats: Option<Vec<Option<Entry>>>,
+    other_stats: Option<std::collections::HashMap<PathBytes, Option<Entry>>>,
 }
 
 /// What --delete found on the destination that the source doesn't have.
@@ -2294,7 +2318,7 @@ impl Planner<'_> {
         sub: &str,
         dst_root: &[u8],
     ) -> Result<()> {
-        self.register_namespace(&batch, src_root, sub, dst_root)?;
+        let namespace_files = self.collect_namespace_files(&batch, src_root, sub, dst_root);
         if self.collision {
             return Ok(());
         }
@@ -2317,7 +2341,11 @@ impl Planner<'_> {
                 immediate.push(entry);
             }
         }
-        let mapped = self.map_batch(immediate, src_root, sub, dst_root);
+        let mut mapped = self.map_batch(immediate, src_root, sub, dst_root);
+        self.register_namespace(namespace_files, &mut mapped)?;
+        if self.collision {
+            return Ok(());
+        }
         match &mut self.buffer {
             Some(buf) => buf.push(mapped),
             None => self.apply_mapped(mapped)?,
@@ -2423,6 +2451,8 @@ impl Planner<'_> {
             dst_root: dst_root.to_vec(),
             dirs,
             others,
+            dir_stats: None,
+            other_stats: None,
         }
     }
 
@@ -2502,6 +2532,8 @@ impl Planner<'_> {
             dst_root,
             dirs,
             mut others,
+            dir_stats,
+            mut other_stats,
         } = mapped;
         let dst_root = &dst_root[..];
 
@@ -2511,6 +2543,8 @@ impl Planner<'_> {
         if !dirs.is_empty() {
             let stats = if self.destination_tree_known_missing {
                 vec![None; dirs.len()]
+            } else if let Some(stats) = dir_stats {
+                stats
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
@@ -2690,6 +2724,15 @@ impl Planner<'_> {
         }
         let stats = if self.destination_tree_known_missing {
             vec![None; others.len()]
+        } else if let Some(stats) = &mut other_stats {
+            others
+                .iter()
+                .map(|planned| {
+                    stats
+                        .remove(&planned.dst)
+                        .expect("batch plan covered every mapped leaf")
+                })
+                .collect()
         } else {
             self.stat_many_with_dry_run_overlay(
                 others.iter().map(|p| p.dst.clone()).collect(),
@@ -3037,13 +3080,13 @@ impl Planner<'_> {
         Ok(())
     }
 
-    fn register_namespace(
+    fn collect_namespace_files(
         &mut self,
         batch: &[Entry],
         src_root: &[u8],
         sub: &str,
         dst_root: &[u8],
-    ) -> Result<()> {
+    ) -> Vec<(PathBytes, String)> {
         let sub = sub.as_bytes();
         let mut files = Vec::new();
         for entry in batch {
@@ -3088,10 +3131,82 @@ impl Planner<'_> {
                 files.push((dst_path, rel));
             }
         }
+        files
+    }
+
+    fn register_namespace(
+        &mut self,
+        files: Vec<(PathBytes, String)>,
+        mapped: &mut Mapped,
+    ) -> Result<()> {
         if files.is_empty() {
             return Ok(());
         }
-        let sidecars = self.partial_paths(files.iter().map(|(path, _)| path.clone()).collect())?;
+        // Several sources are replayed only after every collision check, and
+        // dry runs may need a depth-by-depth virtual overlay. Keep their stats
+        // at the existing application point rather than caching stale or
+        // unsafe observations. Sidecar resolution still uses this request.
+        let pre_stat = self.opts.dst_remote
+            && self.buffer.is_none()
+            && !self.opts.dry_run
+            && !self.destination_tree_known_missing;
+        let directories: Vec<PathBytes> = if pre_stat {
+            mapped
+                .dirs
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let other_paths: Vec<PathBytes> = if pre_stat {
+            mapped
+                .others
+                .iter()
+                .map(|planned| planned.dst.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Sidecar resolution already costs a receiver turn for ordinary file
+        // copies. Include the destination inspection in that same turn; the
+        // receiver omits leaf stats when directory repair must happen first.
+        let partial_paths = files.iter().map(|(path, _)| path.clone()).collect();
+        let (sidecars, dir_stats, other_stats) = if pre_stat {
+            let response = self.dst.call(Request::PlanBatch {
+                partial_paths,
+                partial_id: *self
+                    .opts
+                    .partial_id
+                    .get()
+                    .expect("partial identity initialized before planning"),
+                directories: directories.clone(),
+                others: other_paths.clone(),
+            })?;
+            match ok(response, "plan destination batch")? {
+                Response::BatchPlan {
+                    partial_paths,
+                    directories: dir_stats,
+                    others: other_stats,
+                } if partial_paths.len() == files.len()
+                    && dir_stats.len() == directories.len()
+                    && other_stats
+                        .as_ref()
+                        .is_none_or(|stats| stats.len() == other_paths.len()) =>
+                {
+                    (partial_paths, dir_stats, other_stats)
+                }
+                other => bail!("unexpected response {other:?}"),
+            }
+        } else {
+            (self.partial_paths(partial_paths)?, Vec::new(), None)
+        };
+        if pre_stat {
+            mapped.dir_stats = Some(dir_stats);
+            if let Some(stats) = other_stats {
+                mapped.other_stats = Some(other_paths.into_iter().zip(stats).collect());
+            }
+        }
         for ((dst_path, file_rel), sidecar) in files.into_iter().zip(sidecars) {
             let sidecar = match sidecar {
                 Ok(sidecar) => sidecar,
@@ -3665,6 +3780,7 @@ struct Worker {
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
     t: [f64; 4],
     fast: FastTiming,
+    fast_batch_files: usize,
 }
 
 #[derive(Default)]
@@ -3749,7 +3865,7 @@ impl Worker {
                     if self.fast_eligible(idx) {
                         let target = self
                             .sched
-                            .begin_fast_batch(self.gate.active(), FAST_BATCH_FILES);
+                            .begin_fast_batch(self.gate.active(), self.fast_batch_files);
                         let mut batch = vec![idx];
                         // The fast path reads a whole batch before sending it.
                         // Keep rate-limited batches to one file so a push can't
@@ -4790,6 +4906,20 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_batch_ceiling_only_grows_on_high_rtt_tcp() {
+        assert_eq!(fast_batch_file_limit(None, None), FAST_BATCH_FILES);
+        assert_eq!(fast_batch_file_limit(Some(99_999), None), FAST_BATCH_FILES);
+        assert_eq!(
+            fast_batch_file_limit(None, Some(HIGH_RTT_US)),
+            HIGH_RTT_FAST_BATCH_FILES
+        );
+        assert_eq!(
+            fast_batch_file_limit(Some(262_000), Some(1_000)),
+            HIGH_RTT_FAST_BATCH_FILES
+        );
+    }
 
     #[test]
     fn clean_root_pins_the_edge_cases() {

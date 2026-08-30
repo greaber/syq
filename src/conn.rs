@@ -24,6 +24,11 @@ pub trait Conn: Send {
     fn is_dead(&self) -> bool {
         false
     }
+    /// Current kernel RTT estimate for a direct TCP connection. This is a
+    /// local socket query and never sends a protocol request.
+    fn tcp_rtt_us(&self) -> Option<u64> {
+        None
+    }
     /// Best-effort counters for a direct TCP data connection. Collection is
     /// deliberately observational: unavailable kernels and SSH return None.
     fn transport_stats(&mut self) -> Option<TcpPairStats> {
@@ -339,6 +344,12 @@ impl Conn for RemoteConn {
     }
     fn is_dead(&self) -> bool {
         self.dead
+    }
+    fn tcp_rtt_us(&self) -> Option<u64> {
+        self.tcp_socket
+            .as_ref()
+            .and_then(tcp_socket_stats)
+            .and_then(|stats| stats.rtt_us)
     }
     fn transport_stats(&mut self) -> Option<TcpPairStats> {
         self.transport_stats_with_timeout(TRANSPORT_STATS_TIMEOUT)

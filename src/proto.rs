@@ -212,6 +212,15 @@ pub enum Request {
         paths: Vec<PathBytes>,
         partial_id: PartialId,
     },
+    /// Resolve sidecar names and inspect an existing destination batch in one
+    /// turn. Leaf stats are returned only when every directory is still a
+    /// directory, so callers can preserve parent-before-child replacement.
+    PlanBatch {
+        partial_paths: Vec<PathBytes>,
+        partial_id: PartialId,
+        directories: Vec<PathBytes>,
+        others: Vec<PathBytes>,
+    },
     Apply(Vec<Op>),
     /// Return the size of the deterministic sidecar, if it is a regular file.
     /// The planner has already statted the final path.
@@ -331,6 +340,13 @@ pub enum Response {
     ScanDone,
     Stats(Vec<Option<Entry>>),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
+    BatchPlan {
+        partial_paths: Vec<std::result::Result<PathBytes, String>>,
+        directories: Vec<Option<Entry>>,
+        /// None means a directory was missing or a non-directory, so the
+        /// caller must apply directory changes before inspecting leaves.
+        others: Option<Vec<Option<Entry>>>,
+    },
     Applied(Vec<Option<String>>),
     PartialSize(Option<u64>),
     Hashes(Vec<u64>),
@@ -376,6 +392,23 @@ impl SizeHint for Request {
             Request::StatMany { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
+            Request::PartialPaths { paths, .. } => {
+                paths.iter().map(|path| path.len() + 8).sum::<usize>() + 32
+            }
+            Request::PlanBatch {
+                partial_paths,
+                directories,
+                others,
+                ..
+            } => {
+                partial_paths
+                    .iter()
+                    .chain(directories)
+                    .chain(others)
+                    .map(|path| path.len() + 8)
+                    .sum::<usize>()
+                    + 48
+            }
             Request::Apply(v) => v.len() * 128 + 16,
             _ => 256,
         }
@@ -398,6 +431,16 @@ impl SizeHint for Response {
             }
             Response::ScanBatch(v) => v.len() * 160 + 16,
             Response::Stats(v) => v.len() * 96 + 16,
+            Response::BatchPlan {
+                partial_paths,
+                directories,
+                others,
+            } => {
+                partial_paths.len() * 96
+                    + directories.len() * 96
+                    + others.as_ref().map_or(0, |items| items.len() * 96)
+                    + 32
+            }
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 9 + 24,
             _ => 256,
         }
