@@ -8,7 +8,7 @@ pub enum Interface {
     #[default]
     Rsync,
     NativeCp,
-    NativeCprm,
+    NativeCpPrune,
     NativeRm,
 }
 
@@ -343,7 +343,7 @@ impl Args {
         match command {
             "rsync" => Self::parse_rsync(&argv[1..]),
             "cp" => parse_native_copy(&argv[1..], false),
-            "cprm" => parse_native_copy(&argv[1..], true),
+            "cp-prune" => parse_native_copy(&argv[1..], true),
             "rm" => parse_native_rm(&argv[1..]),
             "--help" | "-h" => {
                 print_root_help();
@@ -357,7 +357,7 @@ impl Args {
             // top-level until their eventual native command shape is settled.
             "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv),
             _ => bail!(
-                "expected a command (`cp`, `cprm`, `rm`, or `rsync`); rsync-compatible syntax now starts with `syq rsync`"
+                "expected a command (`cp`, `cp-prune`, `rm`, or `rsync`); rsync-compatible syntax now starts with `syq rsync`"
             ),
         }
     }
@@ -565,7 +565,7 @@ struct NativeCopyArgs {
     /// Print transfer statistics at the end
     #[arg(long)]
     stats: bool,
-    /// Refuse all target-extra removals if more than N are planned (cprm only)
+    /// Refuse all target-extra removals if more than N are planned (cp-prune only)
     #[arg(long, value_name = "N")]
     max_delete: Option<u64>,
 
@@ -663,7 +663,7 @@ struct NativeRmArgs {
 
 fn print_root_help() {
     println!(
-        "Parallel copy with explicit native semantics\n\nUsage: syq <COMMAND> [OPTIONS]\n\nCommands:\n  cp     Copy selected objects without removing target-only objects\n  cprm   Copy, then remove target-only objects in the mapped scope\n  rm     Remove explicitly selected object trees\n  rsync  Use the retained rsync-compatible command surface\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel copy with explicit native semantics\n\nUsage: syq <COMMAND> [OPTIONS]\n\nCommands:\n  cp        Copy selected objects without removing target-only objects\n  cp-prune  Copy, then remove target-only objects in the mapped scope\n  rm        Remove explicitly selected object trees\n  rsync     Use the retained rsync-compatible command surface\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -673,12 +673,12 @@ fn native_defaults() -> Args {
 }
 
 fn parse_native_copy(argv: &[OsString], delete: bool) -> Result<Args> {
-    let command_name = if delete { "syq cprm" } else { "syq cp" };
+    let command_name = if delete { "syq cp-prune" } else { "syq cp" };
     let mut full_argv = vec![OsString::from(command_name)];
     full_argv.extend_from_slice(argv);
     let command = if delete {
         NativeCopyArgs::command()
-            .name("syq cprm")
+            .name("syq cp-prune")
             .about("Copy selected objects, then remove target-only objects in mapped scopes")
     } else {
         NativeCopyArgs::command()
@@ -738,7 +738,7 @@ fn parse_native_copy(argv: &[OsString], delete: bool) -> Result<Args> {
         bail!("--as, --as-new, and --as-existing require exactly one named source");
     }
     if !delete && parsed.max_delete.is_some() {
-        bail!("--max-delete is only valid with cprm");
+        bail!("--max-delete is only valid with cp-prune");
     }
 
     let source_endpoint = parse_native_endpoint(parsed.from.as_deref())?;
@@ -773,7 +773,7 @@ fn parse_native_copy(argv: &[OsString], delete: bool) -> Result<Args> {
 
     let mut args = native_defaults();
     args.interface = if delete {
-        Interface::NativeCprm
+        Interface::NativeCpPrune
     } else {
         Interface::NativeCp
     };

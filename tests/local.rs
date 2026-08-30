@@ -431,7 +431,7 @@ fn native_container_identity_anchors_worker_writes_and_cprm_deletions() {
     let delete_ready = t.path("delete-ready");
     let delete = spawn_native_before_guarded_mutation(
         &[
-            "cprm",
+            "cp-prune",
             "--src-src",
             &t.s("empty-source"),
             "--into-existing",
@@ -446,7 +446,7 @@ fn native_container_identity_anchors_worker_writes_and_cprm_deletions() {
     let output = delete.wait_with_output().unwrap();
     assert!(
         !output.status.success(),
-        "raced cprm unexpectedly succeeded"
+        "raced cp-prune unexpectedly succeeded"
     );
     assert_eq!(read(&t.path("mirror/extra")), b"replacement extra");
 }
@@ -950,14 +950,14 @@ fn native_copy_preserves_non_utf8_selector_bytes() {
 }
 
 #[test]
-fn native_cprm_removes_only_target_extras_after_copy() {
+fn native_cp_prune_removes_only_target_extras_after_copy() {
     let t = Tmp::new();
     write(&t.path("src/keep"), b"new content");
     write(&t.path("dst/keep"), b"old");
     write(&t.path("dst/extra"), b"extra");
 
     run_native_ok(&[
-        "cprm",
+        "cp-prune",
         "--src-src",
         &t.s("src"),
         "--into-existing",

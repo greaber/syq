@@ -138,7 +138,7 @@ syq cp project --to server --into /backup       # named object → /backup/proje
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
 syq cp report --to server --as-new /reports/final
-syq cprm --src-src build --to server --into-existing /srv/app
+syq cp-prune --src-src build --to server --into-existing /srv/app
 syq rm cache old-output
 syq rm --at server --cwd /srv --path old-output
 ```
@@ -198,7 +198,7 @@ unverified object. An exact `--as-existing` operation that would change the
 target's type is refused; use `--as` when type replacement is intended.
 
 `cp` copies or updates mapped source objects and keeps unrelated target
-objects. `cprm` uses the same mapping and transfer engine, then applies the
+objects. `cp-prune` uses the same mapping and transfer engine, then applies the
 existing safe deletion planner to remove target-only descendants in mapped
 directory scopes. It never removes a source and requires explicit placement;
 `--max-delete N` keeps its all-or-nothing deletion budget. `rm` removes the

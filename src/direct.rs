@@ -97,7 +97,7 @@ pub fn run(
     let mut remote: Vec<String> = vec![match args.interface {
         Interface::Rsync => "rsync",
         Interface::NativeCp => "cp",
-        Interface::NativeCprm => "cprm",
+        Interface::NativeCpPrune => "cp-prune",
         Interface::NativeRm => bail!("native rm cannot be a remote-to-remote transfer"),
     }
     .into()];
