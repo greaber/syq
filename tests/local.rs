@@ -480,6 +480,165 @@ fn newly_created_container_keeps_the_identity_returned_by_creation() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn missing_container_parents_are_walked_through_held_descriptors() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("source/file"), b"source");
+    fs::create_dir(t.path("outside")).unwrap();
+    let ready = t.path("created-parent-ready");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            &t.s("source"),
+            "--into-new",
+            &t.s("missing/target"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_CREATED_PARENT_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_CREATED_PARENT_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_signal(&ready);
+    fs::rename(t.path("missing"), t.path("held-parent")).unwrap();
+    symlink(t.path("outside"), t.path("missing")).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "ancestor-rebound new container succeeded"
+    );
+    assert!(t.path("held-parent/target").is_dir());
+    assert!(!t.path("outside/target").exists());
+    assert!(!t.path("outside/file").exists());
+    assert_eq!(fs::read_link(t.path("missing")).unwrap(), t.path("outside"));
+}
+
+#[cfg(debug_assertions)]
+fn swap_staging_directory(t: &Tmp) -> PathBuf {
+    let stages: Vec<_> = fs::read_dir(t.path(""))
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".syq-swap-directory-")
+        })
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(stages.len(), 1, "unexpected replacement staging dirs");
+    stages.into_iter().next().unwrap()
+}
+
+#[cfg(debug_assertions)]
+fn staged_replacement(staging: &Path) -> PathBuf {
+    let entries: Vec<_> = fs::read_dir(staging)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(entries.len(), 1, "unexpected staged replacement entries");
+    entries.into_iter().next().unwrap()
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn replacement_rejects_a_substituted_staged_object_before_exchange() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    symlink("source-target", t.path("source-link")).unwrap();
+    symlink("old-target", t.path("destination-link")).unwrap();
+    let ready = t.path("sidecar-ready");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-no-follow",
+            &t.s("source-link"),
+            "--as-existing",
+            &t.s("destination-link"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SWAP_SIDECAR_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SWAP_SIDECAR_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_signal(&ready);
+    let staging = swap_staging_directory(&t);
+    let replacement = staged_replacement(&staging);
+    fs::rename(&replacement, staging.join("syq-created")).unwrap();
+    symlink("attacker", &replacement).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!output.status.success(), "substituted sidecar succeeded");
+    assert_eq!(
+        fs::read_link(t.path("destination-link")).unwrap(),
+        Path::new("old-target")
+    );
+    assert_eq!(fs::read_link(&replacement).unwrap(), Path::new("attacker"));
+    assert_eq!(
+        fs::read_link(staging.join("syq-created")).unwrap(),
+        Path::new("source-target")
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn replacement_cleanup_rejects_a_substituted_displaced_object() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    symlink("source-target", t.path("source-link")).unwrap();
+    symlink("old-target", t.path("destination-link")).unwrap();
+    let ready = t.path("cleanup-ready");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-no-follow",
+            &t.s("source-link"),
+            "--as-existing",
+            &t.s("destination-link"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SWAP_CLEANUP_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SWAP_CLEANUP_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_signal(&ready);
+    let staging = swap_staging_directory(&t);
+    let replacement = staged_replacement(&staging);
+    fs::rename(&replacement, staging.join("displaced-target")).unwrap();
+    symlink("attacker", &replacement).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "substituted cleanup node succeeded"
+    );
+    assert_eq!(
+        fs::read_link(t.path("destination-link")).unwrap(),
+        Path::new("source-target")
+    );
+    assert_eq!(fs::read_link(&replacement).unwrap(), Path::new("attacker"));
+    assert_eq!(
+        fs::read_link(staging.join("displaced-target")).unwrap(),
+        Path::new("old-target")
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn same_type_replacement_never_rolls_back_over_a_later_publication() {
     use std::os::unix::fs::symlink;
 
@@ -523,21 +682,9 @@ fn same_type_replacement_never_rolls_back_over_a_later_publication() {
         fs::read_link(t.path("destination-link")).unwrap(),
         Path::new("later-publication")
     );
-    let retained: Vec<_> = fs::read_dir(t.path(""))
-        .unwrap()
-        .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".syq-swap-")
-        })
-        .collect();
-    assert_eq!(retained.len(), 1);
-    assert_eq!(
-        fs::read_link(retained[0].path()).unwrap(),
-        Path::new("first-racer")
-    );
+    let retained = swap_staging_directory(&t);
+    let displaced = staged_replacement(&retained);
+    assert_eq!(fs::read_link(displaced).unwrap(), Path::new("first-racer"));
 }
 
 #[test]
