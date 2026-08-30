@@ -483,17 +483,57 @@ impl RestrictedAuthority {
     ) -> Result<ReceiverModeDecision> {
         let mut state = self.state.lock().unwrap();
         if matches!(target, ReceiverModeTarget::AnyExisting) {
-            if let Some(
-                existing @ (ReceiverModeState::New(_) | ReceiverModeState::Selected { .. }),
-            ) = state.receiver_modes.get(path).copied()
-            {
-                return Ok(Self::select_receiver_mode(
-                    &mut state.receiver_modes,
-                    path,
-                    proposed,
-                    self.receiver_umask,
-                    existing,
-                ));
+            match state.receiver_modes.get(path).copied() {
+                Some(existing @ ReceiverModeState::Selected { .. })
+                | Some(existing @ ReceiverModeState::New(ReceiverModeKind::Other))
+                | Some(existing @ ReceiverModeState::New(ReceiverModeKind::RegularFile)) => {
+                    return Ok(Self::select_receiver_mode(
+                        &mut state.receiver_modes,
+                        path,
+                        proposed,
+                        self.receiver_umask,
+                        existing,
+                    ));
+                }
+                Some(ReceiverModeState::New(ReceiverModeKind::Directory)) => {
+                    let Some(metadata) = self.rooted_metadata(path)? else {
+                        return Ok(Self::select_receiver_mode(
+                            &mut state.receiver_modes,
+                            path,
+                            proposed,
+                            self.receiver_umask,
+                            ReceiverModeState::New(ReceiverModeKind::Directory),
+                        ));
+                    };
+                    if !metadata.is_dir() {
+                        bail!("receiver-managed directory target changed before authorization");
+                    }
+
+                    // Mkdir itself was constrained to 0700, so a setgid bit
+                    // observed now came from HostB's destination-parent
+                    // inheritance rather than HostA's proposed source mode.
+                    // Retain just that receiver-derived special bit and bind
+                    // the metadata operation to the observed directory.
+                    let selected =
+                        (proposed & 0o777 & !self.receiver_umask) | (metadata.mode & 0o2000);
+                    state.receiver_modes.insert(
+                        path.to_vec(),
+                        ReceiverModeState::Selected {
+                            mode: selected,
+                            kind: ReceiverModeKind::Directory,
+                        },
+                    );
+                    return Ok(ReceiverModeDecision {
+                        mode: selected,
+                        identity: Some((
+                            metadata.dev,
+                            metadata.ino,
+                            metadata.ctime,
+                            metadata.ctime_nsec,
+                        )),
+                    });
+                }
+                Some(ReceiverModeState::Existing { .. }) | None => {}
             }
         }
         let observed = self.rooted_metadata(path)?;
@@ -573,7 +613,9 @@ impl RestrictedAuthority {
             },
             ReceiverModeState::New(kind) => {
                 // New objects may inherit ordinary source permission bits, but
-                // never special bits, and HostB's own umask is authoritative.
+                // never source-proposed special bits, and HostB's own umask is
+                // authoritative. Directory setgid inheritance is added only
+                // from receiver-observed state in receiver_mode().
                 let selected = proposed & 0o777 & !receiver_umask;
                 modes.insert(
                     path.to_vec(),
@@ -2852,6 +2894,80 @@ mod tests {
             proto::Response::Applied(errors) if errors.iter().all(Option::is_some)
         ));
         assert!(!raced_file.exists());
+    }
+
+    #[test]
+    fn receiver_managed_new_directory_preserves_receiver_inherited_setgid() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let parent = root.join("target/inheriting-parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o2755)).unwrap();
+        let mut authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        authority.receiver_umask = 0o022;
+
+        let mut mkdir = Request::Apply {
+            ops: vec![Op::Mkdir {
+                path: child.as_os_str().as_bytes().to_vec(),
+                mode: 0o7777,
+                condition: proto::TargetCondition::Any,
+            }],
+            guard: None,
+        };
+        authority.authorize(&mut mkdir, false).unwrap();
+        let Request::Apply {
+            ops,
+            guard: Some(guard),
+        } = &mkdir
+        else {
+            unreachable!()
+        };
+        assert!(matches!(ops[0], Op::Mkdir { mode: 0o700, .. }));
+        assert!(crate::fsops::FsOps::new()
+            .apply(ops, Some(guard))
+            .into_iter()
+            .all(|error| error.is_none()));
+        assert_eq!(fs::metadata(&child).unwrap().mode() & 0o7777, 0o2700);
+
+        let mut metadata = Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: child.as_os_str().as_bytes().to_vec(),
+                meta: proto::Meta {
+                    // None of these source-proposed special bits are trusted.
+                    mode: 0o7777,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                },
+                flags: proto::flags::RECEIVER_MODE,
+                condition: proto::TargetCondition::Any,
+            }],
+            guard: None,
+        };
+        authority.authorize(&mut metadata, false).unwrap();
+        let Request::Apply {
+            ops,
+            guard: Some(guard),
+        } = &metadata
+        else {
+            unreachable!()
+        };
+        assert!(matches!(
+            ops[0],
+            Op::SetMeta {
+                meta: proto::Meta { mode: 0o2755, .. },
+                flags: proto::flags::MODE,
+                condition: proto::TargetCondition::MatchesFingerprint { .. },
+                ..
+            }
+        ));
+        assert!(crate::fsops::FsOps::new()
+            .apply(ops, Some(guard))
+            .into_iter()
+            .all(|error| error.is_none()));
+        assert_eq!(fs::metadata(&child).unwrap().mode() & 0o7777, 0o2755);
     }
 
     #[test]

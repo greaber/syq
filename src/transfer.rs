@@ -1969,32 +1969,36 @@ fn mkdir_root(
     condition: TargetCondition,
     restricted_receiver: bool,
 ) -> Result<Entry> {
-    let ops = mkdir_root_ops(dst_root, condition, restricted_receiver);
-    match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
-        Response::Applied(errs) => {
-            if let Some(e) = errs.into_iter().flatten().next() {
-                bail!("{e}");
+    for ops in mkdir_root_batches(dst_root, condition, restricted_receiver) {
+        match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
+            Response::Applied(errs) => {
+                if let Some(e) = errs.into_iter().flatten().next() {
+                    bail!("{e}");
+                }
             }
-            stat_one(conn, dst_root, false)?
-                .filter(|entry| entry.kind == Kind::Dir)
-                .with_context(|| format!("created target {} is not a directory", display(dst_root)))
+            other => bail!("unexpected response {other:?}"),
         }
-        other => bail!("unexpected response {other:?}"),
     }
+    stat_one(conn, dst_root, false)?
+        .filter(|entry| entry.kind == Kind::Dir)
+        .with_context(|| format!("created target {} is not a directory", display(dst_root)))
 }
 
-fn mkdir_root_ops(
+fn mkdir_root_batches(
     dst_root: &[u8],
     condition: TargetCondition,
     restricted_receiver: bool,
-) -> Vec<Op> {
-    let mut ops = vec![Op::Mkdir {
+) -> Vec<Vec<Op>> {
+    let mut batches = vec![vec![Op::Mkdir {
         path: dst_root.to_vec(),
         mode: 0o755,
         condition,
-    }];
+    }]];
     if restricted_receiver {
-        ops.push(Op::SetMeta {
+        // Keep this in a later receiver call. The restricted authority must
+        // observe the directory after Mkdir so it can distinguish HostB's
+        // kernel-inherited setgid bit from HostA's untrusted mode proposal.
+        batches.push(vec![Op::SetMeta {
             path: dst_root.to_vec(),
             meta: Meta {
                 mode: 0o755,
@@ -2005,9 +2009,9 @@ fn mkdir_root_ops(
             },
             flags: flags::RECEIVER_MODE,
             condition: TargetCondition::Any,
-        });
+        }]);
     }
-    ops
+    batches
 }
 
 /// Lexically canonical spelling of a root path: `.` components and duplicate
@@ -3470,14 +3474,21 @@ impl Planner<'_> {
                     let mut flags = flags;
                     // Without -p, existing directories retain their mode and
                     // new directories receive the source mode through the
-                    // receiving side's umask. The restricted receiver derives
-                    // or constrains this value again from its own state.
+                    // receiving side's umask. Only a signed receiver needs to
+                    // replace the proposal: an ordinary receiver's Mkdir has
+                    // already applied its local umask and any kernel-inherited
+                    // setgid bit, which a follow-up chmod must not clear.
                     if flags & flags::MODE == 0 {
-                        meta.mode = s
-                            .as_ref()
-                            .filter(|d| d.kind == Kind::Dir)
-                            .map_or(e.mode & 0o777 & !opts.umask, |d| d.mode & 0o7777);
-                        flags |= flags::RECEIVER_MODE;
+                        if opts.restricted_receiver {
+                            meta.mode = s
+                                .as_ref()
+                                .filter(|d| d.kind == Kind::Dir)
+                                .map_or(e.mode & 0o777 & !opts.umask, |d| d.mode & 0o7777);
+                            flags |= flags::RECEIVER_MODE;
+                        } else if let Some(existing) = s.as_ref().filter(|d| d.kind == Kind::Dir) {
+                            meta.mode = existing.mode & 0o7777;
+                            flags |= flags::MODE;
+                        }
                     }
                     self.deferred.push((
                         p.clone(),
@@ -5835,20 +5846,23 @@ mod tests {
 
     #[test]
     fn restricted_root_creation_includes_receiver_managed_final_mode() {
-        let ordinary = mkdir_root_ops(b"/destination", TargetCondition::Absent, false);
+        let ordinary = mkdir_root_batches(b"/destination", TargetCondition::Absent, false);
         assert_eq!(ordinary.len(), 1);
+        assert!(matches!(ordinary[0].as_slice(), [Op::Mkdir { .. }]));
 
-        let restricted = mkdir_root_ops(b"/destination", TargetCondition::Absent, true);
+        let restricted = mkdir_root_batches(b"/destination", TargetCondition::Absent, true);
+        assert_eq!(restricted.len(), 2);
         assert!(matches!(
-            restricted.as_slice(),
-            [
-                Op::Mkdir { mode: 0o755, .. },
-                Op::SetMeta {
-                    meta: Meta { mode: 0o755, .. },
-                    flags: flags::RECEIVER_MODE,
-                    ..
-                }
-            ]
+            restricted[0].as_slice(),
+            [Op::Mkdir { mode: 0o755, .. }]
+        ));
+        assert!(matches!(
+            restricted[1].as_slice(),
+            [Op::SetMeta {
+                meta: Meta { mode: 0o755, .. },
+                flags: flags::RECEIVER_MODE,
+                ..
+            }]
         ));
     }
 
