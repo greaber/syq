@@ -4,6 +4,13 @@
 //! the security-sensitive authorized-keys representation and the safe
 //! end-to-end SSH route independent from the receiver implementation so an
 //! installer cannot get ahead of the receiver's confinement boundary.
+//!
+//! Callers own the filesystem and private-key boundary that this byte-level
+//! foundation intentionally does not implement. Before exposing enrollment,
+//! a caller must generate a dedicated Ed25519 private key with a CSPRNG, store
+//! it in a trusted private directory with mode 0600, and replace
+//! `authorized_keys` atomically without following symlinks while preserving
+//! the target account's ownership and StrictModes-compatible permissions.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
@@ -123,6 +130,7 @@ fn validate_ed25519_blob(mut blob: &[u8]) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedKeyEntry {
     id: EnrollmentId,
+    key: TransportPublicKey,
     line: String,
 }
 
@@ -139,7 +147,11 @@ impl AuthorizedKeyEntry {
             key.blob,
             id.marker()
         );
-        Ok(Self { id, line })
+        Ok(Self {
+            id,
+            key: key.clone(),
+            line,
+        })
     }
 
     pub fn line(&self) -> &str {
@@ -188,20 +200,31 @@ pub fn install_authorized_key(
     entry: &AuthorizedKeyEntry,
 ) -> Result<(Vec<u8>, AuthorizedKeysChange)> {
     let marker = entry.marker();
-    let matches: Vec<&[u8]> = original
-        .split(|byte| *byte == b'\n')
-        .filter(|line| last_ascii_token(line) == Some(marker.as_bytes()))
-        .collect();
-    match matches.as_slice() {
-        [] => {}
-        [existing] if *existing == entry.line().as_bytes() => {
-            return Ok((original.to_vec(), AuthorizedKeysChange::Unchanged));
+    let mut exact = 0usize;
+    let mut marker_collision = false;
+    let mut key_collision = false;
+    for line in original.split(|byte| *byte == b'\n') {
+        if line == entry.line().as_bytes() {
+            exact += 1;
+            continue;
         }
-        [_] => bail!(
+        marker_collision |= last_ascii_token(line) == Some(marker.as_bytes());
+        key_collision |= line_contains_transport_key(line, &entry.key);
+    }
+    if exact > 1 {
+        bail!("authorized_keys contains duplicate entries for {}", marker);
+    }
+    if marker_collision {
+        bail!(
             "authorized_keys already contains a different entry for {}",
             marker
-        ),
-        _ => bail!("authorized_keys contains duplicate entries for {}", marker),
+        );
+    }
+    if key_collision {
+        bail!("receiver transport key is already authorized by another authorized_keys line");
+    }
+    if exact == 1 {
+        return Ok((original.to_vec(), AuthorizedKeysChange::Unchanged));
     }
 
     let mut updated = original.to_vec();
@@ -222,26 +245,33 @@ pub fn revoke_authorized_key(
 ) -> Result<(Vec<u8>, AuthorizedKeysChange)> {
     let marker = entry.marker();
     let mut found = 0usize;
-    let mut collision = false;
+    let mut marker_collision = false;
+    let mut key_collision = false;
     let mut updated = Vec::with_capacity(original.len());
     for line in original.split_inclusive(|byte| *byte == b'\n') {
         let without_newline = line.strip_suffix(b"\n").unwrap_or(line);
         if without_newline == entry.line().as_bytes() {
             found += 1;
         } else if last_ascii_token(without_newline) == Some(marker.as_bytes()) {
-            collision = true;
+            marker_collision = true;
             updated.extend_from_slice(line);
         } else {
+            key_collision |= line_contains_transport_key(without_newline, &entry.key);
             updated.extend_from_slice(line);
         }
     }
     if found > 1 {
         bail!("authorized_keys contains duplicate entries for {}", marker);
     }
-    if collision {
+    if marker_collision {
         bail!(
             "authorized_keys contains a different entry for {}; refusing revocation",
             marker
+        );
+    }
+    if key_collision {
+        bail!(
+            "receiver transport key is also authorized by another authorized_keys line; refusing revocation"
         );
     }
     Ok((
@@ -261,6 +291,20 @@ pub fn revoke_authorized_key(
 fn last_ascii_token(line: &[u8]) -> Option<&[u8]> {
     line.rsplit(|byte| byte.is_ascii_whitespace())
         .find(|word| !word.is_empty())
+}
+
+fn line_contains_transport_key(line: &[u8], key: &TransportPublicKey) -> bool {
+    let mut words = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|word| !word.is_empty());
+    let algorithm = key.algorithm.as_bytes();
+    let blob = key.blob.as_bytes();
+    while let Some(word) = words.next() {
+        if word == algorithm && words.next() == Some(blob) {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -354,16 +398,28 @@ pub fn enrollment_ssh_args(
         "-o".to_owned(),
         "PermitLocalCommand=no".to_owned(),
     ];
-    if let EnrollmentRoute::ProxyJump { jump } = route {
-        // -J does not apply destination command-line safety options to its
-        // implicit jump process. A fixed ProxyCommand lets us constrain that
-        // process explicitly while the inner SSH connection remains local and
-        // end-to-end with HostB.
-        args.push("-o".to_owned());
-        args.push(format!(
-            "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W '[%h]:%p' -- {}",
-            jump.as_str()
-        ));
+    match route {
+        EnrollmentRoute::Direct => {
+            // A route called direct must not inherit an implicit jump or proxy
+            // from ssh_config.
+            args.extend([
+                "-o".to_owned(),
+                "ProxyJump=none".to_owned(),
+                "-o".to_owned(),
+                "ProxyCommand=none".to_owned(),
+            ]);
+        }
+        EnrollmentRoute::ProxyJump { jump } => {
+            // -J does not apply destination command-line safety options to its
+            // implicit jump process. A fixed ProxyCommand lets us constrain that
+            // process explicitly while the inner SSH connection remains local and
+            // end-to-end with HostB.
+            args.push("-o".to_owned());
+            args.push(format!(
+                "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W '[%h]:%p' -- {}",
+                jump.as_str()
+            ));
+        }
     }
     args.push("--".to_owned());
     args.push(target.as_str().to_owned());
@@ -465,6 +521,41 @@ mod tests {
     }
 
     #[test]
+    fn install_and_revoke_refuse_any_other_authorization_for_the_transport_key() {
+        let transport = key();
+        let entry =
+            AuthorizedKeyEntry::new(id(), Path::new("/opt/syq/receiver"), &transport).unwrap();
+        let unrestricted = format!(
+            "{} {} administrator-key\n",
+            transport.algorithm, transport.blob
+        );
+        assert!(install_authorized_key(unrestricted.as_bytes(), &entry)
+            .unwrap_err()
+            .to_string()
+            .contains("already authorized"));
+
+        let other_id =
+            EnrollmentId::parse("10112233445546778899aabbccddeeff").expect("second UUID");
+        let other =
+            AuthorizedKeyEntry::new(other_id, Path::new("/opt/syq/other-receiver"), &transport)
+                .unwrap();
+        assert!(
+            install_authorized_key(format!("{}\n", other.line()).as_bytes(), &entry)
+                .unwrap_err()
+                .to_string()
+                .contains("already authorized")
+        );
+
+        let duplicate_authority = format!("{}\n{unrestricted}", entry.line());
+        assert!(
+            revoke_authorized_key(duplicate_authority.as_bytes(), &entry)
+                .unwrap_err()
+                .to_string()
+                .contains("also authorized")
+        );
+    }
+
+    #[test]
     fn revoke_removes_only_the_exact_managed_line() {
         let entry = AuthorizedKeyEntry::new(id(), Path::new("/opt/syq/receiver"), &key()).unwrap();
         let original = format!("before\n{}\nafter\n", entry.line());
@@ -548,6 +639,21 @@ mod tests {
                 "backup@hostB",
                 "/opt/syq/enroll",
             ]
+        );
+    }
+
+    #[test]
+    fn direct_route_disables_implicit_ssh_config_proxies() {
+        let target = SshEndpoint::parse("backup@hostB").unwrap();
+        let command = EnrollmentRemoteCommand::new(Path::new("/opt/syq/enroll"), &[]).unwrap();
+        let args = enrollment_ssh_args(&target, EnrollmentRoute::Direct, &command);
+        assert!(args.windows(2).any(|args| args == ["-o", "ProxyJump=none"]));
+        assert!(args
+            .windows(2)
+            .any(|args| args == ["-o", "ProxyCommand=none"]));
+        assert_eq!(
+            &args[args.len() - 3..],
+            ["--", "backup@hostB", "/opt/syq/enroll"]
         );
     }
 }
