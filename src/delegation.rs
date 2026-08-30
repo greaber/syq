@@ -19,6 +19,15 @@
 //! storage hardware that discard acknowledged writes. In particular, this core
 //! does not issue macOS `F_FULLFSYNC`, which Apple documents as the stronger
 //! power-loss barrier.
+//!
+//! Enrollment provisioning, not request handling, must create the replay
+//! namespace once beneath a stable absolute chain of trusted directories. A
+//! missing or replaced namespace is a security failure that requires explicit
+//! repair or re-enrollment; [`ReplayStore::open`] never creates it.
+//! Every path component including `/` must be root/effective-user owned and
+//! not group/world writable. On macOS this core additionally rejects any
+//! extended ACL on trusted directories, verifier inputs, the verifier binary,
+//! and replay files; enrollment must therefore provision an ACL-free chain.
 
 // This module is intentionally unreachable until path confinement is ready.
 // Keep the complete core compiled in normal builds without pretending its
@@ -30,11 +39,12 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{CString, OsStr};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -438,16 +448,55 @@ fn canonical_sshsig_armor(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+pub(crate) struct ClockObservation {
+    pub unix_seconds: i64,
+    pub monotonic: Instant,
+}
+
 pub(crate) struct ReceiverContext<'a> {
     pub enrollment_id: EnrollmentId,
     pub target_login: &'a str,
     pub expected_signer: &'a str,
-    pub now: i64,
+    pub clock: ClockObservation,
     pub clock_skew_seconds: i64,
 }
 
 impl ReceiverContext<'_> {
-    fn validate(&self, grant: &GrantV1) -> Result<()> {
+    fn wall_time_bounds_at(&self, observed_at: Instant) -> Result<(i64, i64)> {
+        let elapsed = observed_at
+            .checked_duration_since(self.clock.monotonic)
+            .ok_or_else(|| anyhow!("receiver monotonic clock moved backwards"))?;
+        let elapsed_floor = i64::try_from(elapsed.as_secs())
+            .map_err(|_| anyhow!("receiver observation duration is out of range"))?;
+        // The paired wall observation has whole-second precision. Use the
+        // lower bound for not-before/future checks and the upper bound for
+        // expiry, claims, and deadlines. That accepts neither end of the
+        // interval based on a favorable fractional-second assumption.
+        let elapsed_ceil = elapsed
+            .as_secs()
+            .checked_add(u64::from(elapsed.subsec_nanos() != 0))
+            .ok_or_else(|| anyhow!("receiver observation duration overflow"))?;
+        let elapsed_ceil = i64::try_from(elapsed_ceil)
+            .map_err(|_| anyhow!("receiver observation duration is out of range"))?;
+        let earliest = self
+            .clock
+            .unix_seconds
+            .checked_add(elapsed_floor)
+            .ok_or_else(|| anyhow!("receiver time overflow"))?;
+        let latest = self
+            .clock
+            .unix_seconds
+            .checked_add(elapsed_ceil)
+            .ok_or_else(|| anyhow!("receiver time overflow"))?;
+        Ok((earliest, latest))
+    }
+
+    fn wall_time_at(&self, observed_at: Instant) -> Result<i64> {
+        Ok(self.wall_time_bounds_at(observed_at)?.1)
+    }
+
+    fn validate_at(&self, grant: &GrantV1, observed_at: Instant) -> Result<i64> {
+        let (earliest_now, latest_now) = self.wall_time_bounds_at(observed_at)?;
         self.enrollment_id.validate()?;
         validate_identity(
             "expected target login",
@@ -461,7 +510,9 @@ impl ReceiverContext<'_> {
             MAX_SIGNER_BYTES,
             true,
         )?;
-        if !(0..=MAX_UNIX_TIMESTAMP).contains(&self.now) {
+        if !(0..=MAX_UNIX_TIMESTAMP).contains(&earliest_now)
+            || !(0..=MAX_UNIX_TIMESTAMP).contains(&latest_now)
+        {
             bail!("receiver clock is outside the supported range");
         }
         if !(0..=MAX_CLOCK_SKEW_SECS).contains(&self.clock_skew_seconds) {
@@ -476,28 +527,25 @@ impl ReceiverContext<'_> {
         if grant.signer != self.expected_signer {
             bail!("grant names an unexpected signer");
         }
-        let latest_acceptable_issue = self
-            .now
+        let latest_acceptable_issue = earliest_now
             .checked_add(self.clock_skew_seconds)
             .ok_or_else(|| anyhow!("receiver time overflow"))?;
         if grant.issued_at > latest_acceptable_issue {
             bail!("grant was issued too far in the future");
         }
-        let latest_for_start = self
-            .now
+        let latest_for_start = earliest_now
             .checked_add(self.clock_skew_seconds)
             .ok_or_else(|| anyhow!("receiver time overflow"))?;
         if latest_for_start < grant.not_before {
             bail!("grant is not yet valid");
         }
-        let earliest_for_expiry = self
-            .now
+        let earliest_for_expiry = latest_now
             .checked_sub(self.clock_skew_seconds)
             .ok_or_else(|| anyhow!("receiver time overflow"))?;
         if earliest_for_expiry > grant.not_after {
             bail!("grant has expired");
         }
-        Ok(())
+        Ok(latest_now)
     }
 }
 
@@ -534,41 +582,48 @@ impl SshsigPolicy {
             .map(|contents| store.temporary_file("revocations", contents))
             .transpose()?;
 
-        // ssh-keygen must consume the exact open snapshot in the pinned replay
-        // directory. Re-resolving ReplayStore::path would let a writable
-        // ancestor rename that directory and substitute a different policy.
-        let mut inherited_files = vec![&signature_file, &allowed_file];
-        if let Some(revocation) = &revocation_file {
-            inherited_files.push(revocation);
-        }
-        for (index, file) in inherited_files.iter().enumerate() {
-            if let Err(error) = file.set_close_on_exec(false) {
-                for previous in &inherited_files[..index] {
-                    let _ = previous.set_close_on_exec(true);
-                }
-                return Err(error).context("make verifier snapshot descriptor inheritable");
-            }
-        }
+        // Reserve CLOEXEC descriptor numbers in the parent, then map the
+        // read-only snapshots onto those numbers in the forked child only.
+        // This avoids a process-wide inheritance window while still making
+        // ssh-keygen consume the exact pinned inodes through /dev/fd.
+        let signature_child = VerifierSnapshotFd::reserve(&signature_file, 64)
+            .context("reserve signature descriptor for verifier")?;
+        let allowed_child = VerifierSnapshotFd::reserve(&allowed_file, 64)
+            .context("reserve allowed-signers descriptor for verifier")?;
+        let revocation_child = revocation_file
+            .as_ref()
+            .map(|file| VerifierSnapshotFd::reserve(file, 64))
+            .transpose()
+            .context("reserve revocation descriptor for verifier")?;
 
         let mut command = Command::new(&self.ssh_keygen);
         command
             .env_clear()
             .args(["-Y", "verify", "-f"])
-            .arg(allowed_file.inherited_path())
+            .arg(allowed_child.path())
             .args(["-I", signer, "-n", SSHSIG_NAMESPACE, "-s"])
-            .arg(signature_file.inherited_path());
-        if let Some(revocation) = &revocation_file {
-            command.arg("-r").arg(revocation.inherited_path());
+            .arg(signature_child.path());
+        if let Some(revocation) = &revocation_child {
+            command.arg("-r").arg(revocation.path());
         }
-        let spawn_result = command
+        let mut mappings = vec![signature_child.mapping(), allowed_child.mapping()];
+        if let Some(revocation) = &revocation_child {
+            mappings.push(revocation.mapping());
+        }
+        unsafe {
+            command.pre_exec(move || {
+                for (source, target) in &mappings {
+                    dup2_retry(*source, *target)?;
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn();
-        for file in inherited_files {
-            let _ = file.set_close_on_exec(true);
-        }
-        let mut child = spawn_result.context("start trusted ssh-keygen SSHSIG verifier")?;
+            .spawn()
+            .context("start trusted ssh-keygen SSHSIG verifier")?;
         let write_result = child
             .stdin
             .take()
@@ -615,9 +670,8 @@ pub(crate) fn verify_and_claim(
     policy: &SshsigPolicy,
     replay: &ReplayStore,
 ) -> Result<VerifiedGrant> {
-    let verification_started = Instant::now();
     let envelope = SignedGrantEnvelopeV1::decode(encoded)?;
-    context.validate(&envelope.grant)?;
+    context.validate_at(&envelope.grant, Instant::now())?;
     let payload = envelope.signing_payload()?;
     policy.verify(
         replay,
@@ -626,10 +680,17 @@ pub(crate) fn verify_and_claim(
         &payload,
     )?;
     let digest: [u8; 32] = Sha256::digest(&payload).into();
-    replay.claim(envelope.grant.request_id, digest, context.now)?;
+    replay.claim_after_lock(envelope.grant.request_id, digest, || {
+        context.validate_at(&envelope.grant, Instant::now())
+    })?;
     let verified_at = Instant::now();
-    let execution_deadline =
-        execution_deadline(&envelope.grant, context, verification_started, verified_at)?;
+    let verified_wall_time = context.validate_at(&envelope.grant, verified_at)?;
+    let execution_deadline = execution_deadline(
+        &envelope.grant,
+        context.clock_skew_seconds,
+        verified_wall_time,
+        verified_at,
+    )?;
     Ok(VerifiedGrant {
         grant: envelope.grant,
         execution_deadline,
@@ -638,26 +699,13 @@ pub(crate) fn verify_and_claim(
 
 fn execution_deadline(
     grant: &GrantV1,
-    context: &ReceiverContext<'_>,
-    verification_started: Instant,
+    clock_skew_seconds: i64,
+    current_wall_time: i64,
     verified_at: Instant,
 ) -> Result<Instant> {
-    let elapsed = verified_at.saturating_duration_since(verification_started);
-    // Round up: underestimating verifier/claim latency could extend authority
-    // past the signed wall-clock expiry by almost a second.
-    let elapsed_seconds = elapsed
-        .as_secs()
-        .checked_add(u64::from(elapsed.subsec_nanos() != 0))
-        .ok_or_else(|| anyhow!("receiver verification duration overflow"))?;
-    let elapsed_seconds = i64::try_from(elapsed_seconds)
-        .map_err(|_| anyhow!("receiver verification duration is out of range"))?;
-    let current_wall_time = context
-        .now
-        .checked_add(elapsed_seconds)
-        .ok_or_else(|| anyhow!("receiver time overflow after verification"))?;
     let authorization_end = grant
         .not_after
-        .checked_add(context.clock_skew_seconds)
+        .checked_add(clock_skew_seconds)
         .ok_or_else(|| anyhow!("grant authorization deadline overflow"))?;
     let remaining = authorization_end
         .checked_sub(current_wall_time)
@@ -682,30 +730,7 @@ pub(crate) struct ReplayStore {
 
 impl ReplayStore {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        if !path.is_absolute() {
-            bail!("replay state directory must be absolute");
-        }
-        match fs::DirBuilder::new().mode(0o700).create(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("create replay state directory {}", path.display()))
-            }
-        }
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .with_context(|| format!("open replay state directory {}", path.display()))?;
-        validate_private_directory(&directory, path)?;
-        // Persist the state directory entry itself. Without syncing its
-        // parent, a first claim could survive inside a directory whose name is
-        // lost by a crash, allowing the request to be redeemed again.
-        directory
-            .sync_all()
-            .with_context(|| format!("sync replay state directory {}", path.display()))?;
-        sync_parent_directory(path)?;
+        let directory = open_existing_replay_directory(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             directory: Arc::new(directory),
@@ -713,6 +738,15 @@ impl ReplayStore {
     }
 
     fn claim(&self, request: RequestId, digest: [u8; 32], claimed_at: i64) -> Result<()> {
+        self.claim_after_lock(request, digest, || Ok(claimed_at))
+    }
+
+    fn claim_after_lock(
+        &self,
+        request: RequestId,
+        digest: [u8; 32],
+        claimed_at: impl FnOnce() -> Result<i64>,
+    ) -> Result<()> {
         request.validate()?;
         let lock = openat_file(
             self.directory.as_raw_fd(),
@@ -723,6 +757,9 @@ impl ReplayStore {
         .with_context(|| format!("open replay lock in {}", self.path.display()))?;
         validate_private_file(&lock, "replay lock")?;
         flock_exclusive(lock.as_raw_fd()).context("lock replay claim store")?;
+        // Timestamp and revalidate only after a potentially queued lock wait.
+        // No stale ReceiverContext observation may authorize a later claim.
+        let claimed_at = claimed_at()?;
 
         let final_name = format!("claim-{}", request.file_component());
         if let Some(existing) = readat_optional(
@@ -746,7 +783,10 @@ impl ReplayStore {
             0o600,
         )
         .with_context(|| format!("create replay claim in {}", self.path.display()))?;
-        validate_private_file(&temporary, "temporary replay claim")?;
+        if let Err(error) = validate_private_file(&temporary, "temporary replay claim") {
+            let _ = unlinkat(self.directory.as_raw_fd(), &temporary_name);
+            return Err(error);
+        }
         let record = claim_record(request, digest, claimed_at)?;
         if let Err(error) = (|| -> io::Result<()> {
             temporary.write_all(&record)?;
@@ -783,25 +823,48 @@ impl ReplayStore {
 
     fn temporary_file(&self, label: &str, contents: &[u8]) -> Result<TemporaryStateFile> {
         let name = format!(".{label}-{}.tmp", hex(&random_array::<16>()?));
-        let mut file = openat_file(
+        let cleanup_name = name.clone();
+        let mut writable = openat_file(
             self.directory.as_raw_fd(),
             &name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0o600,
         )
         .with_context(|| format!("create private {label} file"))?;
-        validate_private_file(&file, label)?;
-        file.write_all(contents)
-            .with_context(|| format!("write private {label} file"))?;
-        file.flush()
-            .with_context(|| format!("flush private {label} file"))?;
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("rewind private {label} file"))?;
-        Ok(TemporaryStateFile {
-            directory: Arc::clone(&self.directory),
-            name,
-            file,
-        })
+        let result = (|| -> Result<TemporaryStateFile> {
+            validate_private_file(&writable, label)?;
+            writable
+                .write_all(contents)
+                .with_context(|| format!("write private {label} file"))?;
+            writable
+                .flush()
+                .with_context(|| format!("flush private {label} file"))?;
+            let file = openat_file(
+                self.directory.as_raw_fd(),
+                &name,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )
+            .with_context(|| format!("reopen private {label} file read-only"))?;
+            validate_private_file(&file, label)?;
+            let written_metadata = writable.metadata()?;
+            let read_metadata = file.metadata()?;
+            if written_metadata.dev() != read_metadata.dev()
+                || written_metadata.ino() != read_metadata.ino()
+            {
+                bail!("private {label} file changed while making a verifier snapshot");
+            }
+            drop(writable);
+            Ok(TemporaryStateFile {
+                directory: Arc::clone(&self.directory),
+                name,
+                file,
+            })
+        })();
+        if result.is_err() {
+            let _ = unlinkat(self.directory.as_raw_fd(), &cleanup_name);
+        }
+        result
     }
 }
 
@@ -812,24 +875,55 @@ struct TemporaryStateFile {
 }
 
 impl TemporaryStateFile {
-    fn inherited_path(&self) -> PathBuf {
-        PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()))
+    fn is_read_only(&self) -> io::Result<bool> {
+        descriptor_is_read_only(self.file.as_raw_fd())
     }
 
-    fn set_close_on_exec(&self, close_on_exec: bool) -> io::Result<()> {
-        let current = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETFD) };
-        if current == -1 {
+    fn is_close_on_exec(&self) -> io::Result<bool> {
+        descriptor_is_close_on_exec(self.file.as_raw_fd())
+    }
+}
+
+struct VerifierSnapshotFd {
+    source: RawFd,
+    child: File,
+}
+
+impl VerifierSnapshotFd {
+    fn reserve(snapshot: &TemporaryStateFile, minimum: libc::c_int) -> io::Result<Self> {
+        if !snapshot.is_read_only()? || !snapshot.is_close_on_exec()? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "verifier snapshot must be read-only and close-on-exec",
+            ));
+        }
+        let fd = unsafe { libc::fcntl(snapshot.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, minimum) };
+        if fd == -1 {
             return Err(io::Error::last_os_error());
         }
-        let updated = if close_on_exec {
-            current | libc::FD_CLOEXEC
-        } else {
-            current & !libc::FD_CLOEXEC
+        let reserved = Self {
+            source: snapshot.file.as_raw_fd(),
+            child: unsafe { File::from_raw_fd(fd) },
         };
-        if unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETFD, updated) } == -1 {
-            return Err(io::Error::last_os_error());
+        if !reserved.is_close_on_exec()? || !descriptor_is_read_only(reserved.child.as_raw_fd())? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "reserved verifier descriptor must be read-only and close-on-exec",
+            ));
         }
-        Ok(())
+        Ok(reserved)
+    }
+
+    fn path(&self) -> PathBuf {
+        PathBuf::from(format!("/dev/fd/{}", self.child.as_raw_fd()))
+    }
+
+    fn mapping(&self) -> (RawFd, RawFd) {
+        (self.source, self.child.as_raw_fd())
+    }
+
+    fn is_close_on_exec(&self) -> io::Result<bool> {
+        descriptor_is_close_on_exec(self.child.as_raw_fd())
     }
 }
 
@@ -850,21 +944,60 @@ fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
     if mode & 0o077 != 0 || mode & 0o700 != 0o700 {
         bail!("replay state directory must have private mode 0700");
     }
+    reject_extended_acl(directory, "replay state directory")?;
     Ok(())
 }
 
-fn sync_parent_directory(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("replay state directory has no parent"))?;
-    let parent_directory = OpenOptions::new()
+fn open_existing_replay_directory(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        bail!("replay state directory must be absolute");
+    }
+    let mut directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(parent)
-        .with_context(|| format!("open replay state parent {}", parent.display()))?;
-    parent_directory
-        .sync_all()
-        .with_context(|| format!("sync replay state parent {}", parent.display()))
+        .open("/")
+        .context("open filesystem root for replay-state validation")?;
+    validate_trusted_directory(&directory, "replay-state ancestor")?;
+
+    let mut components = path.components().peekable();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        bail!("replay state path must start at the filesystem root");
+    }
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("replay state path contains a noncanonical component");
+        };
+        let next = openat_os_file(
+            directory.as_raw_fd(),
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .with_context(|| format!("securely open replay state path {}", path.display()))?;
+        if components.peek().is_some() {
+            validate_trusted_directory(&next, "replay-state ancestor")?;
+            directory = next;
+        } else {
+            validate_private_directory(&next, path)?;
+            return Ok(next);
+        }
+    }
+    bail!("replay state path has no private leaf directory")
+}
+
+fn validate_trusted_directory(directory: &File, label: &str) -> Result<()> {
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("inspect {label}"))?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir()
+        || (metadata.uid() != 0 && metadata.uid() != effective_uid)
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        bail!("{label} must be root/target-owned and not group/world writable");
+    }
+    reject_extended_acl(directory, label)?;
+    Ok(())
 }
 
 fn validate_private_file(file: &File, label: &str) -> Result<()> {
@@ -877,6 +1010,7 @@ fn validate_private_file(file: &File, label: &str) -> Result<()> {
     {
         bail!("{label} must be a target-owned private regular file");
     }
+    reject_extended_acl(file, label)?;
     Ok(())
 }
 
@@ -889,11 +1023,11 @@ fn validate_secure_executable(path: &Path) -> Result<()> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")
         .context("open filesystem root for SSHSIG verifier validation")?;
+    validate_trusted_directory(&directory, "SSHSIG verifier ancestor")?;
     let mut components = path.components().peekable();
     if !matches!(components.next(), Some(std::path::Component::RootDir)) {
         bail!("ssh-keygen verifier path must start at the filesystem root");
     }
-    let effective_uid = unsafe { libc::geteuid() };
     while let Some(component) = components.next() {
         let std::path::Component::Normal(name) = component else {
             bail!("ssh-keygen verifier path contains a noncanonical component");
@@ -911,13 +1045,7 @@ fn validate_secure_executable(path: &Path) -> Result<()> {
                     path.display()
                 )
             })?;
-            let metadata = next.metadata()?;
-            if !metadata.is_dir()
-                || (metadata.uid() != 0 && metadata.uid() != effective_uid)
-                || metadata.permissions().mode() & 0o022 != 0
-            {
-                bail!("SSHSIG verifier ancestors must be trusted and not group/world writable");
-            }
+            validate_trusted_directory(&next, "SSHSIG verifier ancestor")?;
             directory = next;
             continue;
         }
@@ -930,6 +1058,7 @@ fn validate_secure_executable(path: &Path) -> Result<()> {
         )
         .with_context(|| format!("open trusted SSHSIG verifier {}", path.display()))?;
         let metadata = file.metadata()?;
+        let effective_uid = unsafe { libc::geteuid() };
         if !metadata.is_file()
             || (metadata.uid() != 0 && metadata.uid() != effective_uid)
             || metadata.permissions().mode() & 0o022 != 0
@@ -937,6 +1066,7 @@ fn validate_secure_executable(path: &Path) -> Result<()> {
         {
             bail!("SSHSIG verifier must be a trusted non-writable executable");
         }
+        reject_extended_acl(&file, "SSHSIG verifier")?;
         // The validated ancestor chain cannot be replaced by an untrusted OS
         // user, so Command's subsequent path resolution cannot be redirected.
         // The receiver's own effective uid is part of the trusted boundary.
@@ -964,6 +1094,7 @@ fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u
     {
         bail!("{label} must be a trusted non-writable regular file");
     }
+    reject_extended_acl(&file, label)?;
     let mut contents = Vec::new();
     Read::by_ref(&mut file)
         .take(maximum as u64 + 1)
@@ -972,6 +1103,41 @@ fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u
         bail!("{label} size is outside the supported range");
     }
     Ok(contents)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reject_extended_acl(_file: &File, _label: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn reject_extended_acl(file: &File, label: &str) -> Result<()> {
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // Apple reports a missing FILESEC_ACL as ENOENT. Clear errno first because
+    // acl_get_fd_np returns null both for that expected absence and for errors.
+    unsafe {
+        *libc::__error() = 0;
+    }
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(error).with_context(|| format!("inspect {label} extended ACL"));
+    }
+    let free_result = unsafe { acl_free(acl) };
+    if free_result != 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("release {label} extended ACL"));
+    }
+    bail!("{label} must not have an extended ACL")
 }
 
 fn claim_record(request: RequestId, digest: [u8; 32], claimed_at: i64) -> Result<Vec<u8>> {
@@ -1023,6 +1189,36 @@ fn openat_os_file(
         let fd = unsafe { libc::openat(directory, name.as_ptr(), flags, mode) };
         if fd >= 0 {
             return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn descriptor_is_read_only(fd: RawFd) -> io::Result<bool> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & libc::O_ACCMODE == libc::O_RDONLY)
+}
+
+fn descriptor_is_close_on_exec(fd: RawFd) -> io::Result<bool> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & libc::FD_CLOEXEC != 0)
+}
+
+// Called from CommandExt::pre_exec. Keep this to async-signal-safe dup2(2),
+// errno inspection, and bounded stack-only control flow.
+fn dup2_retry(source: RawFd, target: RawFd) -> io::Result<()> {
+    loop {
+        if unsafe { libc::dup2(source, target) } >= 0 {
+            return Ok(());
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -1106,6 +1302,8 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::DirBuilderExt;
     use std::process::Child;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1119,8 +1317,18 @@ mod tests {
 
     impl TestDir {
         fn new(label: &str) -> Self {
+            #[cfg(target_os = "macos")]
+            let parent = std::env::var_os("TMPDIR")
+                .or_else(|| std::env::var_os("XDG_RUNTIME_DIR"))
+                .or_else(|| std::env::var_os("HOME"));
+            #[cfg(not(target_os = "macos"))]
+            let parent = std::env::var_os("XDG_RUNTIME_DIR").or_else(|| std::env::var_os("HOME"));
+            let parent = parent
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .expect("tests require an absolute private runtime or home directory");
             for _ in 0..100 {
-                let path = std::env::temp_dir().join(format!(
+                let path = parent.join(format!(
                     "syq-delegation-{label}-{}-{}",
                     std::process::id(),
                     hex(&random_array::<12>().expect("test randomness"))
@@ -1179,7 +1387,9 @@ mod tests {
         }
 
         fn replay(&self, name: &str) -> ReplayStore {
-            ReplayStore::open(&self.directory.join(name)).expect("open replay store")
+            let path = self.directory.join(name);
+            provision_test_replay_directory(&path);
+            ReplayStore::open(&path).expect("open replay store")
         }
 
         fn policy(&self) -> SshsigPolicy {
@@ -1236,6 +1446,20 @@ mod tests {
             .expect("create private test file");
         file.write_all(contents).expect("write private test file");
         file.sync_all().expect("sync private test file");
+    }
+
+    fn provision_test_replay_directory(path: &Path) {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .expect("provision test replay directory");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn add_macos_acl(path: &Path, entry: &str) {
+        let mut command = Command::new("/bin/chmod");
+        command.env_clear().args(["+a", entry]).arg(path);
+        command_output(command, "add test extended ACL");
     }
 
     fn write_allowed_signers(path: &Path, signer: &str, public_key: &Path, certificate: bool) {
@@ -1354,11 +1578,24 @@ mod tests {
     }
 
     fn context<'a>(signer: &'a str, target: &'a str, now: i64, skew: i64) -> ReceiverContext<'a> {
+        context_at(signer, target, now, skew, Instant::now())
+    }
+
+    fn context_at<'a>(
+        signer: &'a str,
+        target: &'a str,
+        now: i64,
+        skew: i64,
+        observed_at: Instant,
+    ) -> ReceiverContext<'a> {
         ReceiverContext {
             enrollment_id: EnrollmentId::test_v4(7),
             target_login: target,
             expected_signer: signer,
-            now,
+            clock: ClockObservation {
+                unix_seconds: now,
+                monotonic: observed_at,
+            },
             clock_skew_seconds: skew,
         }
     }
@@ -1448,33 +1685,81 @@ mod tests {
                 PublicationPolicyV1::InPlace => 1,
             }
         }
-        fn append(transcript: &mut Vec<u8>, grant: &GrantV1) {
+        fn append(transcript: &mut Vec<u8>, label: &str, grant: &GrantV1) {
             // Keep operation matching exhaustive so adding a V1 operation must
             // deliberately update this schema fingerprint.
-            let operation_tag = match grant.operation {
+            let operation_tag = match &grant.operation {
                 GrantOperationV1::Copy(_) => 0,
             };
+            transcript.extend_from_slice(&(label.len() as u32).to_be_bytes());
+            transcript.extend_from_slice(label.as_bytes());
             transcript.push(operation_tag);
             let payload = signing_payload(grant).expect("encode version-one signing payload");
             transcript.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             transcript.extend_from_slice(&payload);
         }
 
+        fn append_mutation(
+            transcript: &mut Vec<u8>,
+            baseline: &GrantV1,
+            label: &str,
+            mutate: impl FnOnce(&mut GrantV1),
+        ) {
+            let mut grant = baseline.clone();
+            mutate(&mut grant);
+            append(transcript, label, &grant);
+        }
+
         let mut transcript = Vec::new();
+        transcript.extend_from_slice(b"syq-v1-schema-fingerprint-v2");
         transcript.extend_from_slice(&(SSHSIG_NAMESPACE.len() as u32).to_be_bytes());
         transcript.extend_from_slice(SSHSIG_NAMESPACE.as_bytes());
-        let mut request = 1;
+
+        let mut baseline = fixture_grant(31);
+        baseline.target_login = "backup-one".to_owned();
+        baseline.signer = "alice-one@example.test".to_owned();
+        let GrantOperationV1::Copy(copy) = &mut baseline.operation;
+        copy.destination = b"/srv/fingerprint-one".to_vec();
+        copy.policy.deletion = DeletionPolicyV1::DeleteDestinationOnly;
+        copy.limits.max_deletions = 7;
+        append(&mut transcript, "baseline", &baseline);
+
+        append_mutation(&mut transcript, &baseline, "enrollment-id", |grant| {
+            grant.enrollment_id = EnrollmentId::test_v4(8);
+        });
+        append_mutation(&mut transcript, &baseline, "target-login", |grant| {
+            grant.target_login = "backup-two".to_owned();
+        });
+        append_mutation(&mut transcript, &baseline, "signer", |grant| {
+            grant.signer = "alice-two@example.test".to_owned();
+        });
+        append_mutation(&mut transcript, &baseline, "request-id", |grant| {
+            grant.request_id = RequestId([32; 32]);
+        });
+        append_mutation(&mut transcript, &baseline, "issued-at", |grant| {
+            grant.issued_at += 1;
+        });
+        append_mutation(&mut transcript, &baseline, "not-before", |grant| {
+            grant.not_before += 1;
+        });
+        append_mutation(&mut transcript, &baseline, "not-after", |grant| {
+            grant.not_after += 1;
+        });
+        append_mutation(&mut transcript, &baseline, "destination", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.destination = b"/srv/fingerprint-two".to_vec();
+        });
+
         for placement in [
             DestinationPlacementV1::ExactPath,
             DestinationPlacementV1::DirectoryContents,
             DestinationPlacementV1::DirectoryAsChild,
         ] {
-            let mut grant = fixture_grant(request);
-            request += 1;
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.policy.placement = placement;
             transcript.push(placement_tag(placement));
-            append(&mut transcript, &grant);
+            append_mutation(&mut transcript, &baseline, "placement", |grant| {
+                let GrantOperationV1::Copy(copy) = &mut grant.operation;
+                copy.policy.placement = placement;
+            });
         }
         for existing in [
             ExistingDestinationPolicyV1::Replace,
@@ -1482,42 +1767,84 @@ mod tests {
             ExistingDestinationPolicyV1::UpdateIfOlder,
             ExistingDestinationPolicyV1::MustExist,
         ] {
-            let mut grant = fixture_grant(request);
-            request += 1;
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.policy.existing = existing;
             transcript.push(existing_tag(existing));
-            append(&mut transcript, &grant);
+            append_mutation(&mut transcript, &baseline, "existing", |grant| {
+                let GrantOperationV1::Copy(copy) = &mut grant.operation;
+                copy.policy.existing = existing;
+            });
         }
         for deletion in [
             DeletionPolicyV1::Forbid,
             DeletionPolicyV1::DeleteDestinationOnly,
         ] {
-            let mut grant = fixture_grant(request);
-            request += 1;
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.policy.deletion = deletion;
-            copy.limits.max_deletions = match deletion {
-                DeletionPolicyV1::Forbid => 0,
-                DeletionPolicyV1::DeleteDestinationOnly => 1,
-            };
             transcript.push(deletion_tag(deletion));
-            append(&mut transcript, &grant);
+            append_mutation(&mut transcript, &baseline, "deletion", |grant| {
+                let GrantOperationV1::Copy(copy) = &mut grant.operation;
+                copy.policy.deletion = deletion;
+                copy.limits.max_deletions = match deletion {
+                    DeletionPolicyV1::Forbid => 0,
+                    DeletionPolicyV1::DeleteDestinationOnly => 7,
+                };
+            });
         }
         for publication in [
             PublicationPolicyV1::AtomicStaged,
             PublicationPolicyV1::InPlace,
         ] {
-            let mut grant = fixture_grant(request);
-            request += 1;
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.policy.publication = publication;
             transcript.push(publication_tag(publication));
-            append(&mut transcript, &grant);
+            append_mutation(&mut transcript, &baseline, "publication", |grant| {
+                let GrantOperationV1::Copy(copy) = &mut grant.operation;
+                copy.policy.publication = publication;
+            });
         }
+
+        macro_rules! toggle_option {
+            ($field:ident) => {
+                append_mutation(&mut transcript, &baseline, stringify!($field), |grant| {
+                    let GrantOperationV1::Copy(copy) = &mut grant.operation;
+                    copy.options.$field = !copy.options.$field;
+                });
+            };
+        }
+        toggle_option!(recursive);
+        toggle_option!(preserve_symlinks);
+        toggle_option!(preserve_permissions);
+        toggle_option!(preserve_times);
+        toggle_option!(preserve_owner);
+        toggle_option!(preserve_group);
+        toggle_option!(preserve_devices);
+        toggle_option!(compare_existing_by_content);
+        toggle_option!(verify_after_copy);
+        toggle_option!(compressed_transport);
+
+        append_mutation(&mut transcript, &baseline, "max-entries", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.limits.max_entries += 11;
+        });
+        append_mutation(&mut transcript, &baseline, "max-total-bytes", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.limits.max_total_bytes += 13;
+        });
+        append_mutation(&mut transcript, &baseline, "max-file-bytes", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.limits.max_file_bytes += 17;
+        });
+        append_mutation(&mut transcript, &baseline, "max-connections", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.limits.max_connections += 1;
+        });
+        append_mutation(&mut transcript, &baseline, "max-deletions", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.limits.max_deletions += 1;
+        });
+        append_mutation(&mut transcript, &baseline, "max-runtime-seconds", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.limits.max_runtime_seconds += 1;
+        });
+
         assert_eq!(
             hex(&Sha256::digest(&transcript)),
-            "e39918bdef4693cbe499aeb693fddbb23ac63dde7029ed23e105b2df5eeaaab5",
+            "a9f808389731fe401c9699e55c0d5c7c6176738e5835d6ca0cddd262194655c6",
             "changing the namespace, signing bytes, or variant surface requires a new wire version"
         );
     }
@@ -1681,8 +2008,9 @@ mod tests {
             &replay,
         )
         .expect("not-before inside clock-skew allowance");
-        assert!(context(SIGNER, TARGET, NOW, MAX_CLOCK_SKEW_SECS + 1)
-            .validate(&fixture_grant(11))
+        let invalid_skew = context(SIGNER, TARGET, NOW, MAX_CLOCK_SKEW_SECS + 1);
+        assert!(invalid_skew
+            .validate_at(&fixture_grant(11), invalid_skew.clock.monotonic)
             .is_err());
     }
 
@@ -1693,22 +2021,16 @@ mod tests {
 
         let mut expiry_limited = fixture_grant(17);
         expiry_limited.not_after = NOW + 20;
-        let expiry_context = context(SIGNER, TARGET, NOW, 5);
         assert_eq!(
-            execution_deadline(&expiry_limited, &expiry_context, started, verified)
+            execution_deadline(&expiry_limited, 5, NOW + 3, verified)
                 .expect("expiry-limited deadline"),
             verified + Duration::from_secs(22)
         );
 
         let runtime_limited = fixture_grant(18);
         assert_eq!(
-            execution_deadline(
-                &runtime_limited,
-                &context(SIGNER, TARGET, NOW, 0),
-                started,
-                verified,
-            )
-            .expect("runtime-limited deadline"),
+            execution_deadline(&runtime_limited, 0, NOW + 3, verified,)
+                .expect("runtime-limited deadline"),
             verified + Duration::from_secs(300)
         );
 
@@ -1716,13 +2038,8 @@ mod tests {
         let mut rounded = fixture_grant(19);
         rounded.not_after = NOW + 5;
         assert_eq!(
-            execution_deadline(
-                &rounded,
-                &context(SIGNER, TARGET, NOW, 0),
-                started,
-                partially_elapsed,
-            )
-            .expect("subsecond verification is rounded conservatively"),
+            execution_deadline(&rounded, 0, NOW + 2, partially_elapsed)
+                .expect("subsecond verification is rounded conservatively"),
             partially_elapsed + Duration::from_secs(3)
         );
 
@@ -1730,13 +2047,50 @@ mod tests {
         expired.not_after = NOW + 1;
         let GrantOperationV1::Copy(copy) = &mut expired.operation;
         copy.limits.max_runtime_seconds = 1;
-        assert!(execution_deadline(
-            &expired,
-            &context(SIGNER, TARGET, NOW, 0),
-            started,
-            started + Duration::from_secs(2),
+        assert!(
+            execution_deadline(&expired, 0, NOW + 2, started + Duration::from_secs(2),).is_err()
+        );
+    }
+
+    #[test]
+    fn queued_clock_observation_advances_validation_claim_and_deadline() {
+        let fixture = Fixture::ordinary();
+        let replay = fixture.replay("paired-clock-replay");
+        let observed_at = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("monotonic observation in the recent past");
+        let context = context_at(SIGNER, TARGET, NOW, 0, observed_at);
+        assert!(
+            context
+                .wall_time_at(Instant::now())
+                .expect("adjust wall time")
+                >= NOW + 3
+        );
+
+        let encoded = fixture.signed(fixture_grant(22));
+        let verified = verify_and_claim(&encoded, &context, &fixture.policy(), &replay)
+            .expect("verify with a queued but still-valid clock observation");
+        assert!(verified.execution_deadline() <= Instant::now() + Duration::from_secs(300));
+        let claim = fs::read(
+            replay
+                .path
+                .join(format!("claim-{}", RequestId([22; 32]).file_component())),
         )
-        .is_err());
+        .expect("read adjusted replay claim");
+        let claimed_at = i64::from_be_bytes(claim[10..18].try_into().expect("claim timestamp"));
+        assert!(claimed_at >= NOW + 3);
+
+        let mut expired = fixture_grant(23);
+        expired.not_after = NOW + 2;
+        let GrantOperationV1::Copy(copy) = &mut expired.operation;
+        copy.limits.max_runtime_seconds = 1;
+        let encoded = fixture.signed(expired);
+        let expired_replay = fixture.replay("queued-expired-replay");
+        assert!(verify_and_claim(&encoded, &context, &fixture.policy(), &expired_replay).is_err());
+        assert!(!expired_replay
+            .path
+            .join(format!("claim-{}", RequestId([23; 32]).file_component()))
+            .exists());
     }
 
     #[test]
@@ -1779,6 +2133,7 @@ mod tests {
         let state = directory.join("state");
         let first = RequestId([13; 32]);
         let first_digest = [0x31; 32];
+        provision_test_replay_directory(&state);
         let store = ReplayStore::open(&state).expect("open replay store");
         store.claim(first, first_digest, NOW).expect("first claim");
         drop(store);
@@ -1809,6 +2164,7 @@ mod tests {
         let directory = TestDir::new("pinned-snapshot");
         let state = directory.join("state");
         let relocated = directory.join("relocated-state");
+        provision_test_replay_directory(&state);
         let store = ReplayStore::open(&state).expect("open replay store");
         fs::rename(&state, &relocated).expect("relocate open replay directory");
         fs::DirBuilder::new()
@@ -1822,8 +2178,29 @@ mod tests {
         let name = temporary.name.clone();
         assert!(relocated.join(&name).is_file());
         assert!(!state.join(&name).exists());
+        assert!(temporary
+            .is_read_only()
+            .expect("inspect snapshot access mode"));
+        assert!(temporary
+            .is_close_on_exec()
+            .expect("inspect snapshot descriptor flags"));
+        let byte = [0u8];
         assert_eq!(
-            fs::read(temporary.inherited_path()).expect("read inherited snapshot descriptor"),
+            unsafe { libc::write(temporary.file.as_raw_fd(), byte.as_ptr().cast(), byte.len(),) },
+            -1,
+            "the verifier snapshot itself must not be writable"
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        let reserved = VerifierSnapshotFd::reserve(&temporary, 64)
+            .expect("reserve child-only verifier descriptor");
+        assert!(reserved
+            .is_close_on_exec()
+            .expect("inspect reserved descriptor flags"));
+        assert!(descriptor_is_read_only(reserved.child.as_raw_fd())
+            .expect("inspect reserved access mode"));
+        assert_eq!(
+            fs::read(format!("/dev/fd/{}", temporary.file.as_raw_fd()))
+                .expect("read snapshot descriptor"),
             b"pinned policy contents"
         );
 
@@ -1834,6 +2211,13 @@ mod tests {
     #[test]
     fn replay_store_rejects_nonprivate_or_symlinked_state() {
         let directory = TestDir::new("replay-security");
+        let missing = directory.join("missing-state");
+        assert!(ReplayStore::open(&missing).is_err());
+        assert!(
+            !missing.exists(),
+            "request handling must not provision state"
+        );
+
         let public = directory.join("public-state");
         fs::DirBuilder::new()
             .mode(0o755)
@@ -1852,6 +2236,63 @@ mod tests {
     }
 
     #[test]
+    fn replay_store_rejects_writable_ancestor_rollback() {
+        let directory = TestDir::new("replay-rollback");
+        let state = directory.join("state");
+        let retained = directory.join("retained-state");
+        provision_test_replay_directory(&state);
+        let request = RequestId([21; 32]);
+        ReplayStore::open(&state)
+            .expect("open enrolled replay namespace")
+            .claim(request, [0x44; 32], NOW)
+            .expect("claim request before rollback");
+
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o770))
+            .expect("make replay ancestor group writable");
+        fs::rename(&state, &retained).expect("roll back replay namespace");
+        provision_test_replay_directory(&state);
+        assert!(ReplayStore::open(&state).is_err());
+        assert!(retained
+            .join(format!("claim-{}", request.file_component()))
+            .is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_replay_store_rejects_delete_child_and_inherited_snapshot_acls() {
+        let directory = TestDir::new("replay-acl");
+        let state = directory.join("state");
+        provision_test_replay_directory(&state);
+        add_macos_acl(&state, "everyone allow delete_child");
+        assert!(ReplayStore::open(&state).is_err());
+
+        let inherited_state = directory.join("inherited-state");
+        provision_test_replay_directory(&inherited_state);
+        let store = ReplayStore::open(&inherited_state).expect("pin ACL-free replay namespace");
+        add_macos_acl(&inherited_state, "everyone allow read,file_inherit");
+        assert!(store
+            .temporary_file("inherited-policy", b"must not be accepted")
+            .is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_verifier_and_policy_reject_any_extended_acl() {
+        let directory = TestDir::new("verifier-acl");
+        let verifier = directory.join("ssh-keygen");
+        write_private(&verifier, b"test executable");
+        fs::set_permissions(&verifier, fs::Permissions::from_mode(0o500))
+            .expect("make test verifier executable");
+        add_macos_acl(&verifier, "everyone allow execute");
+        assert!(validate_secure_executable(&verifier).is_err());
+
+        let policy = directory.join("allowed-signers");
+        write_private(&policy, b"signer ssh-ed25519 test\n");
+        add_macos_acl(&policy, "everyone allow read");
+        assert!(read_secure_regular(&policy, "test policy", 1024).is_err());
+    }
+
+    #[test]
     fn verifier_rejects_a_group_or_world_writable_ancestor() {
         validate_secure_executable(&ssh_tool("ssh-keygen"))
             .expect("system verifier chain is trusted");
@@ -1866,6 +2307,8 @@ mod tests {
         write_private(&executable, b"test executable");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))
             .expect("make test verifier executable");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o770))
+            .expect("make verifier ancestor group writable");
 
         assert!(validate_secure_executable(&executable).is_err());
     }
@@ -1907,7 +2350,9 @@ mod tests {
             SSHSIG_NAMESPACE,
             Some(&agent),
         );
-        let replay = ReplayStore::open(&directory.join("replay")).expect("open replay store");
+        let replay_path = directory.join("replay");
+        provision_test_replay_directory(&replay_path);
+        let replay = ReplayStore::open(&replay_path).expect("open replay store");
         let policy = SshsigPolicy {
             ssh_keygen: ssh_tool("ssh-keygen"),
             allowed_signers,
