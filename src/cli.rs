@@ -359,9 +359,10 @@ impl Args {
 }
 
 /// Read a --files-from list: one path per line (or NUL-separated with --from0),
-/// relative to the source root. Blank lines are dropped; `.` and empty
-/// components (so leading `/`, `./`, trailing `/`, `a//b`) are removed; `..`
-/// components and lines naming the root itself are rejected.
+/// relative to the source root. Blank entries and entries starting with `#` or
+/// `;` are dropped; `.` and empty components (so leading `/`, `./`, trailing
+/// `/`, `a//b`) are removed; `..` components and entries naming the root itself
+/// are rejected.
 fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
     use std::io::Read;
     let mut raw = Vec::new();
@@ -379,7 +380,10 @@ fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
             .collect()
     };
     for item in items {
-        if item.is_empty() {
+        // rsync treats these prefixes as comments in both line and NUL modes.
+        // A literal name remains selectable by spelling it as `./#name` or
+        // `./;name`.
+        if item.is_empty() || matches!(item.first(), Some(b'#' | b';')) {
             continue;
         }
         if item.contains(&0) {

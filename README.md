@@ -849,9 +849,11 @@ parent that resolves to a file or dangles is an error. A listed directory is cop
 its contents unless `-r` is given on the command line itself — `-a` alone
 does not count, as in rsync — so `-a -r --files-from` walks the directories
 the list names (never the implied parents).
-Blank lines are ignored, leading `/` or `./` and trailing `/` are stripped,
-and `..` components or a line that names the root itself are rejected. A listed path that doesn't exist is an
-error (exit 23) and the rest is still copied. The destination must be a directory (an
+Blank entries and entries starting with `#` or `;` are ignored in both modes;
+spell a literal comment-looking name as `./#name` or `./;name`. Leading `/` or
+`./` and trailing `/` are stripped, and `..` components or an entry that names
+the root itself are rejected. A listed path that doesn't exist is an error
+(exit 23) and the rest is still copied. The destination must be a directory (an
 existing file there is an error, never replaced). `--files-from` can't be
 combined with `-i`/`--ignore-from` or `--delete`; for a remote-to-remote copy
 it needs `--relay` (the list is read on this machine).
