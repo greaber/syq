@@ -73,6 +73,8 @@ pub struct Opts {
     pub ignore_existing: bool,
     /// --existing: never create a destination path that doesn't exist.
     pub existing: bool,
+    /// Follow foreign-owned symlinks in the operator-selected destination.
+    pub insecure_links: bool,
     /// --max-size / --min-size: regular files outside the range are not transferred.
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
@@ -82,6 +84,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     Ok(match &loc.host {
         None => Endpoint::Local,
         Some(h) => Endpoint::Remote(RemoteSpec {
+            local_process: false,
             user: loc.user.clone(),
             host: h.clone(),
             rsh: parse_rsh(&args.rsh)?,
@@ -264,7 +267,9 @@ fn print_transport_diagnostics(args: &Args, src: &Endpoint, dst: &Endpoint) {
     }
     for endpoint in [src, dst] {
         if let Endpoint::Remote(spec) = endpoint {
-            print_remote_diagnostics(spec, args);
+            if !spec.local_process {
+                print_remote_diagnostics(spec, args);
+            }
         }
     }
     let remote = src.is_remote() || dst.is_remote();
@@ -606,6 +611,16 @@ struct CheckpointShared {
 }
 type CheckpointSlot = std::sync::Arc<std::sync::OnceLock<CheckpointShared>>;
 
+#[derive(Clone, Debug)]
+struct DestinationAnchor {
+    operator_path: PathBytes,
+    request_prefix: PathBytes,
+    dev: u64,
+    ino: u64,
+    insecure_links: bool,
+}
+type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
+
 pub fn debug() -> bool {
     std::env::var_os("SYQ_DEBUG").is_some()
 }
@@ -743,14 +758,19 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     let src_ep = endpoint(&srcs[0], &args)?;
-    let dst_ep = endpoint(dst, &args)?;
+    let mut dst_ep = endpoint(dst, &args)?;
     if args.tcp_congestion.is_some() && !src_ep.is_remote() && !dst_ep.is_remote() {
         bail!("--tcp-congestion applies only to copies with a remote endpoint");
     }
+    if matches!(dst_ep, Endpoint::Local) {
+        dst_ep = Endpoint::Remote(RemoteSpec::local_receiver(args.quiet));
+    }
     // TCP data connections are the default (auto-selecting the fastest reachable
     // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
-    // Local<->local needs no data plane at all.
-    let use_tcp = !args.no_tcp && (src_ep.is_remote() || dst_ep.is_remote());
+    // A local receiver uses one child process and a loopback data listener so
+    // every worker shares its retained destination cwd without changing the
+    // orchestrator process's cwd.
+    let use_tcp = !args.no_tcp && (src_ep.has_data_server() || dst_ep.has_data_server());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
     // start conservatively until TCP reachability has been established below.
     let autotune = args.connections_default;
@@ -802,6 +822,7 @@ pub fn run(args: Args) -> Result<i32> {
         update: args.update,
         ignore_existing: args.ignore_existing,
         existing: args.existing,
+        insecure_links: args.insecure_links,
         max_size,
         min_size,
     });
@@ -821,6 +842,8 @@ pub fn run(args: Args) -> Result<i32> {
     // may spawn more workers later, so the handles live behind a mutex.
     let gate = Gate::new(args.connections);
     let checkpoint_slot: CheckpointSlot = std::sync::Arc::new(std::sync::OnceLock::new());
+    let destination_anchor: DestinationAnchorSlot = std::sync::Arc::new(std::sync::OnceLock::new());
+    let destination_anchor_required = args.restricted_grant.is_none();
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
         Arc::new(Mutex::new(Vec::new()));
     let transport_stats: Arc<Mutex<Vec<TcpPairStats>>> = Arc::new(Mutex::new(Vec::new()));
@@ -834,6 +857,7 @@ pub fn run(args: Args) -> Result<i32> {
             gate,
             workers,
             checkpoint_slot,
+            destination_anchor,
             bwlimit,
             transport_stats,
         ) = (
@@ -845,13 +869,25 @@ pub fn run(args: Args) -> Result<i32> {
             gate.clone(),
             workers.clone(),
             checkpoint_slot.clone(),
+            destination_anchor.clone(),
             bwlimit.clone(),
             transport_stats.clone(),
         );
         let compress = args.compress;
         let collect_tcp_stats = args.stats;
         Arc::new(move |id: usize| {
-            let (src_ep, dst_ep, sched, progress, opts, gate, checkpoint, bwlimit, transport_stats) = (
+            let (
+                src_ep,
+                dst_ep,
+                sched,
+                progress,
+                opts,
+                gate,
+                checkpoint,
+                destination_anchor,
+                bwlimit,
+                transport_stats,
+            ) = (
                 src_ep.clone(),
                 dst_ep.clone(),
                 sched.clone(),
@@ -859,6 +895,7 @@ pub fn run(args: Args) -> Result<i32> {
                 opts.clone(),
                 gate.clone(),
                 checkpoint_slot.clone(),
+                destination_anchor.clone(),
                 bwlimit.clone(),
                 transport_stats.clone(),
             );
@@ -873,7 +910,7 @@ pub fn run(args: Args) -> Result<i32> {
                     let conns = src_ep
                         .connect(compress)
                         .and_then(|src| Ok((src, dst_ep.connect(compress)?)));
-                    let (src, dst) = match conns {
+                    let (src, mut dst) = match conns {
                         Ok(conns) => conns,
                         Err(error) if crate::conn::is_tcp_congestion_error(&error) => {
                             gate.mark_failed(id);
@@ -896,6 +933,15 @@ pub fn run(args: Args) -> Result<i32> {
                             continue;
                         }
                     };
+                    if destination_anchor_required {
+                        let anchor = destination_anchor
+                            .get()
+                            .context("destination root was not anchored before workers started")?;
+                        if let Err(error) = anchor_worker_destination(&mut *dst, anchor) {
+                            gate.mark_failed(id);
+                            return Err(error);
+                        }
+                    }
                     gate.mark_ready(id);
                     let fast_batch_files =
                         fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us());
@@ -1064,7 +1110,7 @@ pub fn run(args: Args) -> Result<i32> {
                 .as_ref()
                 .is_some_and(|info| !info.failed),
         });
-    if autotune && all_remote_endpoints_use_tcp {
+    if autotune && all_remote_endpoints_use_tcp && (src_ep.is_remote() || dst_ep.is_remote()) {
         args.connections = tune::START_TCP;
         gate.set_active(args.connections);
     }
@@ -1082,26 +1128,27 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
-    if !opts.dry_run {
-        spawn_workers(args.connections);
-    }
-
     // One spelling for the destination root: every derived key — claims,
     // delete roots, destination-walk paths, receiver-computed sidecar names —
     // flows from this, and the receiver rebuilds paths through `Path`, which
     // silently drops `.` components and duplicate slashes. Cleaning here
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
-    let dst_root = clean_root(&dst.path);
-    let (dst_root_entry, dst_canonical) =
-        stat_and_canonicalize(&mut *dst_ctl, &dst_root, &dst.path, dst.is_remote())?;
+    let operator_dst_root = clean_root(&dst.path);
+    let (dst_root_entry, dst_canonical) = stat_and_canonicalize(
+        &mut *dst_ctl,
+        &operator_dst_root,
+        &dst.path,
+        dst.is_remote(),
+    )?;
     // A destination that is a symlink to a directory is that directory (as
     // for rsync). Use the resolved target path for all planning and metadata,
     // so ordinary in-tree symlinks can still be replaced instead of followed.
-    let (dst_root, dst_root_entry) = follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?;
-    let dst_initially_missing = dst_root_entry.is_none();
-    let dst_existed = dst_root_entry.is_some();
-    let dst_entry_is_dir = dst_root_entry
+    let (dst_root, mut dst_root_entry) =
+        follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?;
+    let mut dst_initially_missing = dst_root_entry.is_none();
+    let mut dst_existed = dst_root_entry.is_some();
+    let mut dst_entry_is_dir = dst_root_entry
         .as_ref()
         .is_some_and(|entry| entry.kind == Kind::Dir);
     match args.target_existence {
@@ -1154,6 +1201,100 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
+    if args.interface != Interface::Rsync {
+        // Native selectors are structural: validate every selected root before
+        // a missing --into target can be created. Named selectors follow their
+        // root unless --src-no-follow was used; contents selectors additionally
+        // require the resolved object to be a directory.
+        for source in srcs {
+            match stat_one(&mut *src_ctl, &source.path, source.follows_root())? {
+                Some(entry) if source.requires_directory() && entry.kind != Kind::Dir => {
+                    bail!(
+                        "contents selector {} is not a directory",
+                        display(&source.path)
+                    )
+                }
+                Some(_) => {}
+                None => bail!("source {} does not exist", display(&source.path)),
+            }
+        }
+    }
+    hold_after_target_precondition_for_test(&args)?;
+
+    // Select and retain the receiver-side directory that gives the operator's
+    // destination its meaning. Every connection later enters this exact inode
+    // and receives only paths relative to it, so replacing the external
+    // spelling after this check cannot redirect worker writes.
+    // A signed receiver instead retains and verifies its pre-enrolled root fd
+    // for every request; HostA is not authorized to manage this anchoring
+    // state itself.
+    let use_operator_anchor = args.restricted_grant.is_none();
+    let operator_directory = if dst_is_dir {
+        operator_dst_root.clone()
+    } else {
+        parent_path(&operator_dst_root)
+    };
+    let request_prefix = if dst_is_dir {
+        dst_root.clone()
+    } else {
+        operator_directory.clone()
+    };
+    // A missing single-file destination can also have a missing parent. Keep
+    // the nearest existing ancestor open so normal copies can create that
+    // parent without giving an attacker a pathname-resolution window.
+    let allow_missing = dst_root_entry.is_none();
+    let mut directory_selection = if use_operator_anchor {
+        check_operator_directory(
+            &mut *dst_ctl,
+            &operator_directory,
+            allow_missing,
+            args.insecure_links,
+        )?
+    } else {
+        None
+    };
+    if use_operator_anchor && dst_is_dir {
+        let planned_identity = dst_root_entry.as_ref().map(|entry| (entry.dev, entry.ino));
+        let selected_identity = directory_selection
+            .as_ref()
+            .map(|selection| (selection.dev, selection.ino));
+        if selected_identity != planned_identity {
+            // Another ordinary copy may create the same missing destination
+            // between the initial stat and the descriptor-retaining walk.
+            // Accept only the exact directory inode that the secure walk has
+            // already retained; later operations stay anchored to that fd.
+            let appeared = if planned_identity.is_none() {
+                stat_one(&mut *dst_ctl, &operator_dst_root, true)?
+            } else {
+                None
+            };
+            let appeared_matches_selection = appeared.as_ref().is_some_and(|entry| {
+                entry.kind == Kind::Dir && Some((entry.dev, entry.ino)) == selected_identity
+            });
+            if !appeared_matches_selection {
+                bail!(
+                    "destination directory {} changed while resolving it",
+                    display(&operator_dst_root)
+                );
+            }
+            dst_root_entry = appeared;
+            dst_initially_missing = false;
+            dst_existed = true;
+            dst_entry_is_dir = true;
+        }
+    }
+    match args.target_existence {
+        Existence::Any => {}
+        Existence::New if dst_existed => bail!(
+            "target {} appeared while resolving it, but the selected placement requires a new path",
+            display(&dst_root)
+        ),
+        Existence::Existing if !dst_existed => bail!(
+            "target {} disappeared while resolving it, but the selected placement requires an existing path",
+            display(&dst_root)
+        ),
+        Existence::New | Existence::Existing => {}
+    }
     let exact_condition = if args.placement == Placement::As {
         match args.target_existence {
             Existence::Any => TargetCondition::Any,
@@ -1180,30 +1321,14 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         TargetCondition::Any
     };
+    // Native placement additionally binds each descendant mutation to the
+    // selected container identity. Ordinary rsync copies rely on the retained
+    // operator anchor; the signed receiver injects its enrolled-root guard.
     let guard_containers = args.interface != Interface::Rsync;
     let mut container_guard = dst_root_entry
         .as_ref()
         .filter(|entry| guard_containers && entry.kind == Kind::Dir)
         .map(|entry| target_container(&dst_root, entry));
-    hold_after_target_precondition_for_test(&args)?;
-    if args.interface != Interface::Rsync {
-        // Native selectors are structural: validate every selected root before
-        // a missing --into target can be created. Named selectors follow their
-        // root unless --src-no-follow was used; contents selectors additionally
-        // require the resolved object to be a directory.
-        for source in srcs {
-            match stat_one(&mut *src_ctl, &source.path, source.follows_root())? {
-                Some(entry) if source.requires_directory() && entry.kind != Kind::Dir => {
-                    bail!(
-                        "contents selector {} is not a directory",
-                        display(&source.path)
-                    )
-                }
-                Some(_) => {}
-                None => bail!("source {} does not exist", display(&source.path)),
-            }
-        }
-    }
 
     // Reject copying a directory into itself: if the effective destination
     // resolves to (or inside) a source directory, the scanner would discover
@@ -1295,7 +1420,45 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         TargetCondition::Any
     };
-    if create_root && !multiple_distinct_sources {
+    if use_operator_anchor {
+        let create_operator_directory_now = directory_selection.is_none()
+            && !args.dry_run
+            && !args.verify_only
+            && !args.existing
+            && (!dst_is_dir || !multiple_distinct_sources);
+        if create_operator_directory_now {
+            let condition = if dst_is_dir {
+                root_create_condition
+            } else {
+                TargetCondition::Any
+            };
+            directory_selection = Some(create_operator_directory(&mut *dst_ctl, condition)?);
+        }
+        if let Some(selection) = directory_selection.take() {
+            let anchor = activate_control_destination(
+                &mut *dst_ctl,
+                selection,
+                request_prefix.clone(),
+                args.insecure_links,
+            )?;
+            if create_root {
+                mutation_root_condition = TargetCondition::Matches {
+                    dev: anchor.dev,
+                    ino: anchor.ino,
+                };
+                if guard_containers {
+                    container_guard = Some(ContainerGuard {
+                        root: dst_root.clone(),
+                        dev: anchor.dev,
+                        ino: anchor.ino,
+                    });
+                }
+            }
+            destination_anchor
+                .set(anchor)
+                .expect("destination anchor set once");
+        }
+    } else if create_root && !multiple_distinct_sources {
         let created = mkdir_root(&mut *dst_ctl, &dst_root, root_create_condition)?;
         mutation_root_condition = target_identity(&created);
         if guard_containers {
@@ -1360,6 +1523,8 @@ pub fn run(args: Args) -> Result<i32> {
         } else {
             None
         },
+        destination_anchor: &destination_anchor,
+        use_operator_anchor,
         keep_dirs: args.files_from.is_some(),
         delete_roots: Vec::new(),
         deletes: Deletes::default(),
@@ -1451,8 +1616,17 @@ pub fn run(args: Args) -> Result<i32> {
     } else if collision {
         sched.abort();
     } else {
-        // Workers have connected in parallel with the scan, but no sidecar is
-        // opened until every payload/sidecar namespace collision is known.
+        let has_file_work = !sched.jobs.lock().unwrap().is_empty();
+        if !opts.dry_run && has_file_work {
+            if use_operator_anchor && destination_anchor.get().is_none() {
+                progress.error("syq: destination root is missing and cannot be anchored");
+                sched.abort();
+            } else {
+                spawn_workers(args.connections);
+            }
+        }
+        // No worker opens a sidecar until every payload/sidecar namespace
+        // collision is known and the receiving root has been retained.
         sched.scan_done();
     }
 
@@ -1662,7 +1836,7 @@ pub fn run(args: Args) -> Result<i32> {
                 )
             };
             let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
-                matches!(endpoint, Endpoint::Remote(spec) if spec.data_transport() == DataTransport::Ssh)
+                matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
             });
             let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
             println!(
@@ -1832,6 +2006,93 @@ fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Ent
     Ok(stat_many(conn, vec![path.to_vec()], follow)?
         .pop()
         .flatten())
+}
+
+fn check_operator_directory(
+    conn: &mut dyn Conn,
+    path: &[u8],
+    allow_missing: bool,
+    insecure_links: bool,
+) -> Result<Option<DirectoryAnchor>> {
+    match ok(
+        conn.call(Request::CheckOperatorDirectory {
+            path: path.to_vec(),
+            allow_missing,
+            insecure_links,
+        })?,
+        "destination path",
+    )? {
+        Response::DirectorySelection(selection) => Ok(selection),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn create_operator_directory(
+    conn: &mut dyn Conn,
+    condition: TargetCondition,
+) -> Result<DirectoryAnchor> {
+    match ok(
+        conn.call(Request::CreateOperatorDirectory {
+            mode: 0o755,
+            require_absent: condition == TargetCondition::Absent,
+        })?,
+        "create destination directory",
+    )? {
+        Response::DirectorySelection(Some(selection)) => Ok(selection),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn activate_control_destination(
+    conn: &mut dyn Conn,
+    selection: DirectoryAnchor,
+    request_prefix: PathBytes,
+    insecure_links: bool,
+) -> Result<DestinationAnchor> {
+    let anchor = DestinationAnchor {
+        operator_path: selection.path,
+        request_prefix,
+        dev: selection.dev,
+        ino: selection.ino,
+        insecure_links,
+    };
+    match ok(
+        conn.call(Request::AnchorDestination {
+            path: None,
+            expected_dev: anchor.dev,
+            expected_ino: anchor.ino,
+            request_prefix: anchor.request_prefix.clone(),
+            insecure_links,
+        })?,
+        "anchor destination root",
+    )? {
+        Response::Ok => Ok(anchor),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn anchor_worker_destination(conn: &mut dyn Conn, anchor: &DestinationAnchor) -> Result<()> {
+    match ok(
+        conn.call(Request::AnchorDestination {
+            path: Some(anchor.operator_path.clone()),
+            expected_dev: anchor.dev,
+            expected_ino: anchor.ino,
+            request_prefix: anchor.request_prefix.clone(),
+            insecure_links: anchor.insecure_links,
+        })?,
+        "anchor worker destination root",
+    )? {
+        Response::Ok => Ok(()),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn parent_path(path: &[u8]) -> PathBytes {
+    match path.iter().rposition(|byte| *byte == b'/') {
+        Some(0) => b"/".to_vec(),
+        Some(index) => path[..index].to_vec(),
+        None => b".".to_vec(),
+    }
 }
 
 /// Fetch the destination root's entry and canonical spelling in one network
@@ -2040,13 +2301,20 @@ fn remote_data_transport(spec: &RemoteSpec) -> &'static str {
     }
 }
 
+fn real_remote_spec(endpoint: &Endpoint) -> Option<&RemoteSpec> {
+    match endpoint {
+        Endpoint::Remote(spec) if !spec.local_process => Some(spec),
+        Endpoint::Local | Endpoint::Remote(_) => None,
+    }
+}
+
 fn selected_route(src: &Endpoint, dst: &Endpoint, args: &Args) -> String {
-    let route = match (src, dst) {
-        (Endpoint::Local, Endpoint::Local) => args.plan_source_host.as_ref().map_or_else(
+    let route = match (real_remote_spec(src), real_remote_spec(dst)) {
+        (None, None) => args.plan_source_host.as_ref().map_or_else(
             || "local filesystem".to_string(),
             |host| format!("local filesystem on {host}"),
         ),
-        (Endpoint::Local, Endpoint::Remote(spec)) => match &args.plan_source_host {
+        (None, Some(spec)) => match &args.plan_source_host {
             Some(source) => format!(
                 "{} from {source} to {}",
                 remote_data_transport(spec),
@@ -2054,10 +2322,10 @@ fn selected_route(src: &Endpoint, dst: &Endpoint, args: &Args) -> String {
             ),
             None => format!("{} to {}", remote_data_transport(spec), spec.label()),
         },
-        (Endpoint::Remote(spec), Endpoint::Local) => {
+        (Some(spec), None) => {
             format!("{} from {}", remote_data_transport(spec), spec.label())
         }
-        (Endpoint::Remote(source), Endpoint::Remote(target)) => format!(
+        (Some(source), Some(target)) => format!(
             "{} from {} through this machine, {} to {}",
             remote_data_transport(source),
             source.label(),
@@ -2316,6 +2584,8 @@ struct Planner<'a> {
     /// Several sources into a destination that doesn't exist yet: create it
     /// only once the scans have been validated against each other.
     create_root: Option<(PathBytes, TargetCondition)>,
+    destination_anchor: &'a DestinationAnchorSlot,
+    use_operator_anchor: bool,
     /// --files-from: listed directories are created even without -r (which
     /// then only decides whether their contents are walked).
     keep_dirs: bool,
@@ -2918,10 +3188,34 @@ impl Planner<'_> {
             return Ok(());
         }
         if let Some((root, condition)) = self.create_root.take() {
-            let created = mkdir_root(self.dst, &root, condition)?;
-            self.mutation_root_condition = target_identity(&created);
-            if self.guard_containers {
-                self.container_guard = Some(target_container(&root, &created));
+            if self.use_operator_anchor {
+                let selection = create_operator_directory(self.dst, condition)?;
+                let anchor = activate_control_destination(
+                    self.dst,
+                    selection,
+                    root.clone(),
+                    self.opts.insecure_links,
+                )?;
+                self.mutation_root_condition = TargetCondition::Matches {
+                    dev: anchor.dev,
+                    ino: anchor.ino,
+                };
+                if self.guard_containers {
+                    self.container_guard = Some(ContainerGuard {
+                        root,
+                        dev: anchor.dev,
+                        ino: anchor.ino,
+                    });
+                }
+                self.destination_anchor
+                    .set(anchor)
+                    .expect("destination anchor set once");
+            } else {
+                let created = mkdir_root(self.dst, &root, condition)?;
+                self.mutation_root_condition = target_identity(&created);
+                if self.guard_containers {
+                    self.container_guard = Some(target_container(&root, &created));
+                }
             }
         }
         // Validated: from here on they are ordinary entries (the one that is
@@ -3105,7 +3399,9 @@ impl Planner<'_> {
                         .context("new exact target was not a directory after creation")?;
                     self.exact_condition = target_identity(&created);
                     self.mutation_root_condition = target_identity(&created);
-                    self.container_guard = Some(target_container(&self.root_path, &created));
+                    if self.guard_containers {
+                        self.container_guard = Some(target_container(&self.root_path, &created));
+                    }
                 }
                 if !new_dirs.is_empty() {
                     let n = new_dirs.len();
@@ -3655,7 +3951,8 @@ impl Planner<'_> {
         let pre_stat = self.opts.dst_remote
             && self.buffer.is_none()
             && !self.opts.dry_run
-            && !self.destination_tree_known_missing;
+            && !self.destination_tree_known_missing
+            && self.container_guard.is_none();
         let directories: Vec<PathBytes> = if pre_stat {
             mapped
                 .dirs

@@ -123,6 +123,10 @@ pub struct Args {
     /// No-op accepted for rsync compatibility (syq always uses numeric uid/gid)
     #[arg(long)]
     pub numeric_ids: bool,
+    /// Follow destination-path symlinks owned by other users. This restores
+    /// rsync's legacy behavior and is unsafe for a privileged receiver
+    #[arg(long)]
+    pub insecure_links: bool,
 
     /// Parallel connections/workers. Default for copies: auto-tuned — starts at
     /// the last settled count remembered for this host path and transport, or 16
@@ -1183,6 +1187,12 @@ mod tests {
         // As with other clap overrides, the last spelling wins.
         assert!(!args(&["-z", "--no-compress"]).compress);
         assert!(args(&["--no-compress", "-z"]).compress);
+    }
+
+    #[test]
+    fn insecure_links_is_an_explicit_opt_out() {
+        assert!(!args(&[]).insecure_links);
+        assert!(args(&["--insecure-links"]).insecure_links);
     }
 
     #[test]

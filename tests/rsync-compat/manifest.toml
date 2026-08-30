@@ -308,25 +308,25 @@ note = "An external shim deterministically shrinks a source at its first positio
 name = "symlink-race-dest"
 classification = "conformance"
 area = "security"
-position = "unimplemented"
-baseline = "fail"
+position = "compatible"
+baseline = "pass"
 platforms = ["linux"]
 run_as = "root"
-tags = ["local", "security", "destination-symlink", "known-gap"]
+tags = ["local", "security", "destination-symlink"]
 requirements = ["root", "a second uid", "symlinks"]
-note = "SYQ follows an attacker-owned symlink in an operator-named absolute destination path."
+note = "The receiver refuses an attacker-owned symlink in an operator-named absolute destination path, retains the selected directory, and continues to follow a root-owned administrative link."
 
 [[tests]]
 name = "symlink-race-relative-dest"
 classification = "conformance"
 area = "security"
-position = "unimplemented"
-baseline = "fail"
+position = "compatible"
+baseline = "pass"
 platforms = ["linux"]
 run_as = "root"
-tags = ["local", "security", "destination-symlink", "known-gap"]
+tags = ["local", "security", "destination-symlink"]
 requirements = ["root", "a second uid", "symlinks"]
-note = "SYQ follows an attacker-owned symlink in an operator-named relative destination path."
+note = "The receiver refuses an attacker-owned symlink in an operator-named relative destination path, retains the selected directory, and continues to follow a root-owned administrative link."
 
 [[tests]]
 name = "symlink-race-source"

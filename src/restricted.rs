@@ -582,6 +582,11 @@ impl RestrictedAuthority {
             Request::CopyLocal { .. } | Request::ReadRange { .. } | Request::ReadSmallBatch(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
+            Request::CheckOperatorDirectory { .. }
+            | Request::CreateOperatorDirectory { .. }
+            | Request::AnchorDestination { .. } => {
+                bail!("destination-anchor management is not valid on a root-confined receiver")
+            }
             Request::Hello { .. } => bail!("unexpected second receiver handshake"),
             Request::TransportStats | Request::Shutdown => {}
         }

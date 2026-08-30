@@ -340,8 +340,9 @@ impl Conn for LocalConn {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
+        let root = self.ops.scan_root(root)?;
         crate::scan::scan(
-            &fsops::resolve(root),
+            &fsops::resolve(&root),
             follow_root,
             ignore,
             report_ignored,
@@ -638,6 +639,10 @@ pub enum DataTransport {
 
 #[derive(Clone, Debug)]
 pub struct RemoteSpec {
+    /// Run the receiver helper as a local child. This gives local copies the
+    /// same process-local cwd anchoring as an SSH receiver while its workers
+    /// share one TCP listener instead of spawning one process each.
+    pub local_process: bool,
     pub user: Option<String>,
     pub host: String,
     pub rsh: Vec<String>,
@@ -659,7 +664,26 @@ pub struct RemoteSpec {
 }
 
 impl RemoteSpec {
+    pub fn local_receiver(quiet: bool) -> Self {
+        Self {
+            local_process: true,
+            user: None,
+            host: "127.0.0.1".into(),
+            rsh: vec!["local".into()],
+            syq_path: None,
+            auto_helper: false,
+            restricted_grant: None,
+            helper_install: Default::default(),
+            quiet,
+            tcp: Default::default(),
+            diagnostics: Default::default(),
+        }
+    }
+
     pub fn label(&self) -> String {
+        if self.local_process {
+            return "local receiver".into();
+        }
         match &self.user {
             Some(u) => format!("{u}@{}", self.host),
             None => self.host.clone(),
@@ -812,25 +836,36 @@ impl RemoteSpec {
     }
 
     fn connect_once(&self, compress: bool) -> Result<RemoteConn> {
-        let mut cmd = self.ssh_command();
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = &self.restricted_grant {
             server_args.push(format!("--restricted-grant={grant}"));
         }
-        let remote_command = if self.restricted_grant.is_some() {
-            // This text is inspected by the forced receiver through
-            // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
-            format!("syq {}", shell_words::join(&server_args))
+        let mut cmd = if self.local_process {
+            let mut command = Command::new(std::env::current_exe()?);
+            command.args(&server_args);
+            command
         } else {
-            self.program_command(&server_args)
+            let mut command = self.ssh_command();
+            let remote_command = if self.restricted_grant.is_some() {
+                // This text is inspected by the forced receiver through
+                // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
+                format!("syq {}", shell_words::join(&server_args))
+            } else {
+                self.program_command(&server_args)
+            };
+            command.arg(remote_command);
+            command
         };
-        cmd.arg(remote_command);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawn {:?}", self.rsh[0]))?;
+        let mut child = cmd.spawn().with_context(|| {
+            if self.local_process {
+                "spawn local receiver".to_string()
+            } else {
+                format!("spawn {:?}", self.rsh[0])
+            }
+        })?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (rx, reader) = spawn_reader(Box::new(stdout));
@@ -1647,6 +1682,10 @@ pub enum Endpoint {
 
 impl Endpoint {
     pub fn is_remote(&self) -> bool {
+        matches!(self, Endpoint::Remote(spec) if !spec.local_process)
+    }
+
+    pub fn has_data_server(&self) -> bool {
         matches!(self, Endpoint::Remote(_))
     }
 
@@ -1785,6 +1824,7 @@ mod tests {
     #[test]
     fn connecting_socket_congestion_rejection_is_attributed_locally() {
         let spec = RemoteSpec {
+            local_process: false,
             user: None,
             host: "remote.example".into(),
             rsh: vec!["ssh".into()],
@@ -1982,6 +2022,7 @@ mod tests {
     #[test]
     fn ssh_inherits_host_key_policy() {
         let spec = RemoteSpec {
+            local_process: false,
             user: None,
             host: "example".to_string(),
             rsh: vec!["ssh".to_string()],

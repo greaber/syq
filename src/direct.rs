@@ -307,6 +307,7 @@ pub fn run(
         None => src_host.clone(),
     };
     let spec = crate::conn::RemoteSpec {
+        local_process: false,
         user: srcs[0].user.clone(),
         host: src_host.clone(),
         rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
@@ -376,6 +377,9 @@ pub fn run(
         }
         if args.inplace {
             remote.push("--inplace".into());
+        }
+        if args.insecure_links {
+            remote.push("--insecure-links".into());
         }
         if args.delete {
             remote.push("--delete".into());

@@ -263,6 +263,32 @@ pub enum Request {
         follow: bool,
         guard: Option<ContainerGuard>,
     },
+    /// Resolve an operator-supplied destination directory component by
+    /// component, following only symlinks owned by root or this endpoint's
+    /// effective uid. A missing suffix is accepted only when requested.
+    CheckOperatorDirectory {
+        path: PathBytes,
+        allow_missing: bool,
+        insecure_links: bool,
+    },
+    /// Create the missing suffix retained by CheckOperatorDirectory, then
+    /// return the selected directory's stable identity.
+    CreateOperatorDirectory {
+        mode: u32,
+        /// Refuse a concurrently-created final directory instead of reusing
+        /// it. Intermediate directories may still be shared safely.
+        require_absent: bool,
+    },
+    /// Retain and enter the selected destination directory for this
+    /// connection. The control connection reuses its checked descriptor;
+    /// independent workers securely reopen `path` and verify its identity.
+    AnchorDestination {
+        path: Option<PathBytes>,
+        expected_dev: u64,
+        expected_ino: u64,
+        request_prefix: PathBytes,
+        insecure_links: bool,
+    },
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {
         paths: Vec<PathBytes>,
@@ -418,6 +444,9 @@ pub enum Response {
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
     Stats(Vec<Option<Entry>>),
+    /// Absolute operator spelling plus device/inode of the securely opened
+    /// directory, or None when an allowed missing suffix was reached.
+    DirectorySelection(Option<DirectoryAnchor>),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
     BatchPlan {
         partial_paths: Vec<std::result::Result<PathBytes, String>>,
@@ -448,6 +477,13 @@ pub enum Response {
     TransportStats(Option<TcpSocketStats>),
     Ok,
     Err(String),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryAnchor {
+    pub path: PathBytes,
+    pub dev: u64,
+    pub ino: u64,
 }
 
 /// Rough serialized size, so big blocks are encoded without reallocation.
