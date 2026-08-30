@@ -1166,6 +1166,29 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
+    let exact_condition = if args.placement == Placement::As {
+        match args.target_existence {
+            Existence::Any => TargetCondition::Any,
+            Existence::New => TargetCondition::Absent,
+            Existence::Existing => target_matches(
+                dst_root_entry
+                    .as_ref()
+                    .expect("existing target was validated above"),
+            ),
+        }
+    } else {
+        TargetCondition::Any
+    };
+    let mut mutation_root_condition = if args.target_existence == Existence::Existing {
+        target_identity(
+            dst_root_entry
+                .as_ref()
+                .expect("existing target was validated above"),
+        )
+    } else {
+        TargetCondition::Any
+    };
+    hold_after_target_precondition_for_test(&args)?;
     if args.interface != Interface::Rsync {
         // Native selectors are structural: validate every selected root before
         // a missing --into target can be created. Named selectors follow their
@@ -1331,13 +1354,30 @@ pub fn run(args: Args) -> Result<i32> {
         && !args.existing;
     let dry_run_creates_root =
         args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
+    let root_create_condition = if args.target_existence == Existence::New {
+        TargetCondition::Absent
+    } else {
+        TargetCondition::Any
+    };
     let create_operator_directory_now = directory_selection.is_none()
         && !args.dry_run
         && !args.verify_only
         && !args.existing
         && (!dst_is_dir || !multiple_distinct_sources);
     if create_operator_directory_now {
-        directory_selection = Some(create_operator_directory(&mut *dst_ctl)?);
+        let condition = if create_root {
+            root_create_condition
+        } else {
+            TargetCondition::Any
+        };
+        let selection = create_operator_directory(&mut *dst_ctl, condition)?;
+        if create_root {
+            mutation_root_condition = TargetCondition::Matches {
+                dev: selection.dev,
+                ino: selection.ino,
+            };
+        }
+        directory_selection = Some(selection);
     }
     if let Some(selection) = directory_selection.take() {
         let anchor = activate_control_destination(
@@ -1393,13 +1433,16 @@ pub fn run(args: Args) -> Result<i32> {
         scan_warned: false,
         max_delete_hit: false,
         delete_walk_failed: false,
+        root_path: dst_root.clone(),
+        exact_condition,
+        mutation_root_condition,
         buffer: if multiple_distinct_sources {
             Some(Vec::new())
         } else {
             None
         },
         create_root: if create_root && multiple_distinct_sources {
-            Some(dst_root.clone())
+            Some((dst_root.clone(), root_create_condition))
         } else {
             None
         },
@@ -1564,13 +1607,14 @@ pub fn run(args: Args) -> Result<i32> {
             delete_plan = DeletePlan::Skipped("source scan errors");
             progress.eprintln("syq: source scan reported errors; skipping deletions");
         } else {
-            match st.plan_deletes() {
+            match st.assert_mutation_root().and_then(|_| st.plan_deletes()) {
                 Ok(()) if st.delete_walk_failed => {
                     delete_plan = DeletePlan::Skipped("destination walk errors");
                     progress.eprintln("syq: destination walk reported errors; skipping deletions")
                 }
                 Ok(()) => {
                     delete_plan = DeletePlan::Planned(st.deletes.len());
+                    st.assert_mutation_root()?;
                     deleted = st.run_deletes()?;
                 }
                 Err(e) => {
@@ -1777,6 +1821,48 @@ fn stat_many(
     }
 }
 
+fn target_matches(entry: &Entry) -> TargetCondition {
+    TargetCondition::MatchesFingerprint {
+        dev: entry.dev,
+        ino: entry.ino,
+        ctime: entry.ctime,
+        ctime_nsec: entry.ctime_nsec,
+    }
+}
+
+fn target_identity(entry: &Entry) -> TargetCondition {
+    TargetCondition::Matches {
+        dev: entry.dev,
+        ino: entry.ino,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
+    if args.interface == Interface::Rsync || args.target_existence == Existence::Any {
+        return Ok(());
+    }
+    if let Some(ready) = std::env::var_os("SYQ_TEST_TARGET_PRECONDITION_READY_FILE") {
+        std::fs::write(&ready, b"ready").with_context(|| {
+            format!(
+                "write target-precondition-ready signal {}",
+                std::path::Path::new(&ready).display()
+            )
+        })?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_TARGET_PRECONDITION_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
+    Ok(())
+}
+
 /// Lexically canonical spelling of a root path: `.` components and duplicate
 /// or trailing slashes dropped (`dst/.` -> `dst`, `dst//x` -> `dst/x`), the
 /// leading `/` or `~` kept, a path that is nothing but dots left as `.`.
@@ -1824,9 +1910,15 @@ fn check_operator_directory(
     }
 }
 
-fn create_operator_directory(conn: &mut dyn Conn) -> Result<DirectoryAnchor> {
+fn create_operator_directory(
+    conn: &mut dyn Conn,
+    condition: TargetCondition,
+) -> Result<DirectoryAnchor> {
     match ok(
-        conn.call(Request::CreateOperatorDirectory { mode: 0o755 })?,
+        conn.call(Request::CreateOperatorDirectory {
+            mode: 0o755,
+            condition,
+        })?,
         "create destination directory",
     )? {
         Response::DirectorySelection(Some(selection)) => Ok(selection),
@@ -2339,8 +2431,9 @@ struct Planner<'a> {
     deferred_payloads: Vec<Mapped>,
     source_partials: u64,
     collision: bool,
-    /// (dst path, meta, flags, depth) for directories, applied deepest-first at the end.
-    deferred: Vec<(PathBytes, Meta, u8, usize)>,
+    /// (dst path, meta, flags, depth, root condition) for directories,
+    /// applied deepest-first at the end.
+    deferred: Vec<(PathBytes, Meta, u8, usize, TargetCondition)>,
     dirs_created: u64,
     links_created: u64,
     specials_created: u64,
@@ -2355,9 +2448,13 @@ struct Planner<'a> {
     /// Several sources: mapped batches waiting for all scans to finish
     /// (see `Mapped`). None with a single source, where batches stream.
     buffer: Option<Vec<Mapped>>,
+    /// Placement root and receiver-enforced conditions for native operations.
+    root_path: PathBytes,
+    exact_condition: TargetCondition,
+    mutation_root_condition: TargetCondition,
     /// Several sources into a destination that doesn't exist yet: create it
     /// only once the scans have been validated against each other.
-    create_root: Option<PathBytes>,
+    create_root: Option<(PathBytes, TargetCondition)>,
     destination_anchor: &'a DestinationAnchorSlot,
     /// --files-from: listed directories are created even without -r (which
     /// then only decides whether their contents are walked).
@@ -2438,6 +2535,42 @@ impl Deletes {
 }
 
 impl Planner<'_> {
+    fn exact_condition_for(&self, path: &[u8]) -> TargetCondition {
+        if path == self.root_path {
+            self.exact_condition
+        } else {
+            TargetCondition::Any
+        }
+    }
+
+    fn metadata_condition_for(&self, path: &[u8]) -> TargetCondition {
+        match self.exact_condition_for(path) {
+            condition @ TargetCondition::Matches { .. } => condition,
+            TargetCondition::MatchesFingerprint { dev, ino, .. } => {
+                TargetCondition::Matches { dev, ino }
+            }
+            TargetCondition::Any | TargetCondition::Absent => TargetCondition::Any,
+        }
+    }
+
+    fn assert_mutation_root(&mut self) -> Result<()> {
+        let (dev, ino) = match self.mutation_root_condition {
+            TargetCondition::Matches { dev, ino }
+            | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
+            TargetCondition::Any | TargetCondition::Absent => return Ok(()),
+        };
+        let current = stat_many(self.dst, vec![self.root_path.clone()], false)?
+            .pop()
+            .flatten();
+        match current {
+            Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
+            _ => bail!(
+                "target {} changed after the placement precondition was checked",
+                display(&self.root_path)
+            ),
+        }
+    }
+
     fn scan_source(
         &mut self,
         src: &mut dyn Conn,
@@ -2924,8 +3057,12 @@ impl Planner<'_> {
         if self.collision {
             return Ok(());
         }
-        if let Some(root) = self.create_root.take() {
-            let selection = create_operator_directory(self.dst)?;
+        if let Some((root, condition)) = self.create_root.take() {
+            let selection = create_operator_directory(self.dst, condition)?;
+            self.mutation_root_condition = TargetCondition::Matches {
+                dev: selection.dev,
+                ino: selection.ino,
+            };
             let anchor =
                 activate_control_destination(self.dst, selection, root, self.opts.insecure_links)?;
             self.destination_anchor
@@ -2948,6 +3085,10 @@ impl Planner<'_> {
     /// Everything after the mapping loop: stat, create directories, filter,
     /// enqueue.
     fn apply_mapped(&mut self, mapped: Mapped) -> Result<()> {
+        if self.collision {
+            return Ok(());
+        }
+        self.assert_mutation_root()?;
         let opts = self.opts;
         let Mapped {
             dst_root,
@@ -3065,34 +3206,60 @@ impl Planner<'_> {
                 // write into (0o700 not set) so apply() opens them up.
                 let new_dirs: Vec<Op> = planned
                     .iter()
-                    .filter(|(_, _, _, st)| {
-                        !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
+                    .filter(|(path, _, _, st)| {
+                        let root_must_be_new = self.exact_condition == TargetCondition::Absent
+                            && path == &self.root_path;
+                        root_must_be_new
+                            || !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
                     })
                     .map(|(p, _, e, _)| Op::Mkdir {
                         path: p.clone(),
                         mode: e.mode,
+                        condition: self.exact_condition_for(p),
                     })
                     .collect();
                 if !new_dirs.is_empty() {
                     let n = new_dirs.len();
-                    let names: Vec<PathBytes> = new_dirs
+                    let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs
                         .iter()
                         .map(|op| match op {
-                            Op::Mkdir { path, .. } => path.clone(),
+                            Op::Mkdir {
+                                path, condition, ..
+                            } => (path.clone(), *condition),
                             _ => unreachable!(),
                         })
                         .collect();
                     let errs = self.apply(new_dirs)?;
                     let mut failed = 0;
-                    for (name, err) in names.iter().zip(errs) {
+                    let mut exact_root_created = false;
+                    for ((name, condition), err) in op_info.iter().zip(errs) {
+                        let succeeded = err.is_none();
                         if let Some(err) = err {
                             failed += 1;
                             self.progress.error(&format!("syq: {err}"));
+                            if name == &self.root_path && *condition != TargetCondition::Any {
+                                self.collision = true;
+                            }
                         } else if opts.verbose > 0 {
                             self.progress.println(&format!("{}/", display(name)));
                         }
+                        if succeeded
+                            && name == &self.root_path
+                            && *condition == TargetCondition::Absent
+                        {
+                            exact_root_created = true;
+                        }
                     }
                     self.dirs_created += (n - failed) as u64;
+                    if exact_root_created {
+                        let created = stat_many(self.dst, vec![self.root_path.clone()], false)?
+                            .pop()
+                            .flatten()
+                            .filter(|entry| entry.kind == Kind::Dir)
+                            .context("new exact target was not a directory after creation")?;
+                        self.exact_condition = target_identity(&created);
+                        self.mutation_root_condition = target_identity(&created);
+                    }
                 }
                 let mut flags = opts.flags;
                 if !opts.perms {
@@ -3112,7 +3279,13 @@ impl Planner<'_> {
                             }
                         }
                     }
-                    self.deferred.push((p.clone(), meta, flags, depth));
+                    self.deferred.push((
+                        p.clone(),
+                        meta,
+                        flags,
+                        depth,
+                        self.metadata_condition_for(p),
+                    ));
                 }
             }
         }
@@ -3174,6 +3347,38 @@ impl Planner<'_> {
                 e,
                 contested,
             } = p;
+            let target_condition = self.exact_condition_for(&dst_path);
+            let target_condition_holds = match (target_condition, &dst_entry) {
+                (TargetCondition::Any, _) | (TargetCondition::Absent, None) => true,
+                (TargetCondition::Absent, Some(_)) => false,
+                (TargetCondition::Matches { dev, ino }, Some(entry)) => {
+                    entry.dev == dev && entry.ino == ino
+                }
+                (TargetCondition::Matches { .. }, None) => false,
+                (
+                    TargetCondition::MatchesFingerprint {
+                        dev,
+                        ino,
+                        ctime,
+                        ctime_nsec,
+                    },
+                    Some(entry),
+                ) => {
+                    entry.dev == dev
+                        && entry.ino == ino
+                        && entry.ctime == ctime
+                        && entry.ctime_nsec == ctime_nsec
+                }
+                (TargetCondition::MatchesFingerprint { .. }, None) => false,
+            };
+            if !target_condition_holds {
+                self.progress.error(&format!(
+                    "syq: target {} changed after the placement precondition was checked",
+                    display(&dst_path)
+                ));
+                self.collision = true;
+                continue;
+            }
             if (opts.existing || opts.ignore_existing)
                 && self.under_missing_dir(&dst_path, dst_root)
             {
@@ -3284,8 +3489,10 @@ impl Planner<'_> {
                                 meta_fixes.push((
                                     Op::SetFileMetaIfSame {
                                         path: dst_path.clone(),
-                                        expected_dev: d.dev,
-                                        expected_ino: d.ino,
+                                        condition: match target_condition {
+                                            TargetCondition::Any => target_identity(d),
+                                            condition => condition,
+                                        },
                                         meta: e.meta(),
                                         flags: ff,
                                     },
@@ -3397,8 +3604,10 @@ impl Planner<'_> {
                     ops.push(Op::Symlink {
                         path: dst_path.clone(),
                         target,
+                        condition: self.exact_condition_for(&dst_path),
                     });
                     ops.push(Op::SetMeta {
+                        condition: self.metadata_condition_for(&dst_path),
                         path: dst_path,
                         meta: e.meta(),
                         flags: opts.flags & !flags::MODE,
@@ -3460,8 +3669,10 @@ impl Planner<'_> {
                         path: dst_path.clone(),
                         mode: e.mode,
                         rdev: e.rdev,
+                        condition: self.exact_condition_for(&dst_path),
                     });
                     ops.push(Op::SetMeta {
+                        condition: self.metadata_condition_for(&dst_path),
                         path: dst_path,
                         meta: e.meta(),
                         flags: opts.flags,
@@ -3744,6 +3955,7 @@ impl Planner<'_> {
         entry: Entry,
         dst_entry: Option<Entry>,
     ) {
+        let target_condition = self.exact_condition_for(&dst);
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
@@ -3753,6 +3965,7 @@ impl Planner<'_> {
             rel_bytes,
             entry,
             dst_entry,
+            target_condition,
             attempts: 0,
             done: Arc::new(AtomicU64::new(0)),
             inplace: false,
@@ -4168,15 +4381,17 @@ impl Planner<'_> {
     }
 
     fn apply_deferred(&mut self) -> Result<()> {
+        self.assert_mutation_root()?;
         let mut d = std::mem::take(&mut self.deferred);
         d.sort_by(|a, b| b.3.cmp(&a.3));
         for chunk in d.chunks(1000) {
             let ops: Vec<Op> = chunk
                 .iter()
-                .map(|(p, m, f, _)| Op::SetMeta {
+                .map(|(p, m, f, _, condition)| Op::SetMeta {
                     path: p.clone(),
                     meta: *m,
                     flags: *f,
+                    condition: *condition,
                 })
                 .collect();
             for err in self.apply(ops)?.into_iter().flatten() {
@@ -4483,6 +4698,7 @@ impl Worker {
                 hash,
                 meta,
                 flags,
+                condition: j.target_condition,
             });
             sent.push(true);
         }
@@ -4545,7 +4761,11 @@ impl Worker {
                 None => true,
             };
             if changed {
-                if let (Some(e), true) = (now, j.attempts + 1 < MAX_ATTEMPTS) {
+                if let (Some(e), true, true) = (
+                    now,
+                    j.attempts + 1 < MAX_ATTEMPTS,
+                    j.target_condition == TargetCondition::Any,
+                ) {
                     if !self.opts.quiet {
                         self.progress.eprintln(&format!(
                             "syq: {}: changed during transfer, retrying",
@@ -4615,7 +4835,10 @@ impl Worker {
             }),
         );
 
-        let inplace = self.opts.inplace;
+        // Placement guards must be enforced by the final mutation. Stage even
+        // an explicit --inplace transfer until that checked update; an
+        // existing target is still updated through its held inode at finalize.
+        let inplace = self.opts.inplace && job.target_condition == TargetCondition::Any;
         // The planner already statted the final path. Only the deterministic
         // sidecar needs another lookup before choosing the transfer basis.
         // --inplace never uses that sidecar, so it avoids the lookup entirely.
@@ -4732,6 +4955,7 @@ impl Worker {
                             partial_id: self.partial_id(),
                             meta,
                             flags: self.opts.flags | flags::MODE,
+                            condition: job.target_condition,
                         })?,
                         "finish content-identical destination",
                     )?;
@@ -4832,7 +5056,7 @@ impl Worker {
         // Write to a partial and let finish_file rename it, so an interrupted
         // copy_file_range never leaves a final-named file the quick check could
         // mistake for complete. Only --inplace writes the final path directly.
-        let inplace = self.opts.inplace;
+        let inplace = self.opts.inplace && job.target_condition == TargetCondition::Any;
         self.set_inplace(idx, inplace);
         let mode = self.create_mode(job);
         let resp = self.dst.call(Request::CopyLocal {
@@ -4927,6 +5151,7 @@ impl Worker {
                 partial_id: self.partial_id(),
                 block: self.opts.block,
                 len: job.entry.size,
+                condition: job.target_condition,
             },
             "hash and retain destination basis",
         )?;
@@ -5141,6 +5366,7 @@ impl Worker {
                 partial_id: self.partial_id(),
                 meta,
                 flags,
+                condition: job.target_condition,
             })?,
             "finalize destination",
         );
@@ -5226,7 +5452,7 @@ impl Worker {
             None => true,
         };
         if changed {
-            if job.attempts + 1 < MAX_ATTEMPTS {
+            if job.attempts + 1 < MAX_ATTEMPTS && job.target_condition == TargetCondition::Any {
                 if let Some(e) = now {
                     if !self.opts.quiet {
                         self.progress.eprintln(&format!(

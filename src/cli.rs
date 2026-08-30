@@ -1263,9 +1263,15 @@ impl Location {
 
     fn native(
         endpoint: Option<(Option<String>, String)>,
-        path: Vec<u8>,
+        mut path: Vec<u8>,
         selection: SourceSelection,
     ) -> Location {
+        // Native trailing slashes are spelling only. Remove them before any
+        // filesystem call so `link/` cannot make lstat/remove operations
+        // traverse a symlink that the selector explicitly chose as an object.
+        while path.len() > 1 && path.ends_with(b"/") {
+            path.pop();
+        }
         let (user, host) = endpoint
             .map(|(user, host)| (user, Some(host)))
             .unwrap_or((None, None));
