@@ -149,15 +149,9 @@ fn inspect_ssh_configuration(
     compiled_defaults_only: bool,
 ) -> Result<SshConfigurationInspection> {
     let mut command = Command::new(ssh_program);
-    command.arg("-G");
+    command.args(["-G", "-vvv"]);
     if compiled_defaults_only {
         command.args(["-F", "/dev/null"]);
-    } else {
-        // OpenSSH does not retain filename quoting in `ssh -G` output. Its
-        // debug stream identifies the configuration files that contributed to
-        // this query, which lets us distinguish compiled defaults from an
-        // explicitly configured value that happens to render identically.
-        command.arg("-vvv");
     }
     if let Some(user) = explicit_user {
         command.args(["-l", user]);
@@ -177,10 +171,22 @@ fn inspect_ssh_configuration(
             }
         );
     }
+    // OpenSSH does not retain filename quoting in `ssh -G` output. Its debug
+    // stream identifies the configuration files that contributed to this
+    // query, which lets us distinguish compiled defaults from an explicitly
+    // configured value that happens to render identically. Requiring the
+    // controlled query to name /dev/null also validates that this OpenSSH's
+    // debug format is one we can use as provenance.
+    let configuration_paths = ssh_configuration_paths(&output.stderr)?;
     let known_hosts_configured = if compiled_defaults_only {
+        if configuration_paths != [PathBuf::from("/dev/null")] {
+            bail!(
+                "OpenSSH did not report /dev/null as the sole configuration source for the compiled-default query"
+            );
+        }
         KnownHostsConfigured::default()
     } else {
-        configured_known_hosts_directives(&output.stderr)?
+        configured_known_hosts_directives(&configuration_paths)?
     };
     Ok(SshConfigurationInspection {
         output: output.stdout,
@@ -194,7 +200,7 @@ struct KnownHostsConfigured {
     global: bool,
 }
 
-fn configured_known_hosts_directives(debug: &[u8]) -> Result<KnownHostsConfigured> {
+fn ssh_configuration_paths(debug: &[u8]) -> Result<Vec<PathBuf>> {
     const PREFIX: &str = "debug1: Reading configuration data ";
     let debug = std::str::from_utf8(debug).context("OpenSSH debug output was not UTF-8")?;
     let mut paths = Vec::new();
@@ -217,10 +223,13 @@ fn configured_known_hosts_directives(debug: &[u8]) -> Result<KnownHostsConfigure
             paths.push(path);
         }
     }
+    Ok(paths)
+}
 
+fn configured_known_hosts_directives(paths: &[PathBuf]) -> Result<KnownHostsConfigured> {
     let mut configured = KnownHostsConfigured::default();
     for path in paths {
-        let mut file = fs::File::open(&path)
+        let mut file = fs::File::open(path)
             .with_context(|| format!("open SSH configuration file {}", path.display()))?;
         let metadata = file
             .metadata()
@@ -1990,7 +1999,8 @@ mod tests {
             "OpenSSH test\ndebug1: Reading configuration data {}\n",
             config.display()
         );
-        let configured = configured_known_hosts_directives(debug.as_bytes()).unwrap();
+        let paths = ssh_configuration_paths(debug.as_bytes()).unwrap();
+        let configured = configured_known_hosts_directives(&paths).unwrap();
         assert!(configured.user);
         assert!(!configured.global);
     }
@@ -2024,7 +2034,8 @@ mod tests {
             "ssh -G failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let configured = configured_known_hosts_directives(&output.stderr).unwrap();
+        let paths = ssh_configuration_paths(&output.stderr).unwrap();
+        let configured = configured_known_hosts_directives(&paths).unwrap();
         assert!(configured.user);
         let error = parse_ssh_config_with_defaults(&output.stdout, Some(&defaults), &configured)
             .unwrap_err();
