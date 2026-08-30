@@ -169,6 +169,13 @@ pub struct Args {
     /// must authenticate to the destination with its own credentials
     #[arg(long, conflicts_with = "rsh")]
     pub no_forward_agent: bool,
+    /// Remote-to-remote with the default ssh: expose the unrestricted local agent to the source
+    /// host. This is a compatibility escape hatch; the default broker permits only user@hostB
+    #[arg(
+        long,
+        conflicts_with_all = ["rsh", "no_forward_agent", "detach", "relay"]
+    )]
+    pub unrestricted_agent_forwarding: bool,
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
     pub width: Option<usize>,

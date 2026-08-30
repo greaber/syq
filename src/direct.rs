@@ -6,20 +6,55 @@ use anyhow::{bail, Context, Result};
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 
+#[derive(Clone, Debug)]
+enum AgentForwarding {
+    Disabled,
+    Unrestricted,
+    Constrained { ambient: String, broker: String },
+}
+
 fn direct_command(
     rsh: &[String],
     user: Option<&str>,
     host: &str,
     remote_cmd: &str,
-    default_ssh_forward_agent: Option<bool>,
+    default_ssh_forward_agent: Option<&AgentForwarding>,
 ) -> Command {
     let mut cmd = Command::new(&rsh[0]);
     cmd.args(&rsh[1..]);
     if rsh[0].ends_with("ssh") {
         // Manage agent forwarding only for syq's implicit `ssh`. An explicit
         // -e/--rsh command is a complete user policy and is left unchanged.
-        if let Some(forward_agent) = default_ssh_forward_agent {
-            cmd.arg(if forward_agent { "-A" } else { "-a" });
+        match default_ssh_forward_agent {
+            Some(AgentForwarding::Disabled) => {
+                cmd.arg("-a");
+            }
+            Some(AgentForwarding::Unrestricted) => {
+                cmd.arg("-A");
+            }
+            Some(AgentForwarding::Constrained { ambient, broker }) => {
+                // Authenticate this local->A connection normally, but expose a
+                // different, filtered agent socket on A. Multiplexing must be
+                // off or an older master could substitute its forwarded agent.
+                cmd.args([
+                    "-o",
+                    &format!("IdentityAgent={ambient}"),
+                    "-o",
+                    &format!("ForwardAgent={broker}"),
+                    "-o",
+                    "ControlMaster=no",
+                    "-o",
+                    "ControlPath=none",
+                    "-o",
+                    "ClearAllForwardings=yes",
+                    "-x",
+                    "-k",
+                    "-T",
+                    "-o",
+                    "PermitLocalCommand=no",
+                ]);
+            }
+            None => {}
         }
         if let Some(user) = user {
             cmd.args(["-l", user]);
@@ -32,9 +67,103 @@ fn direct_command(
     cmd
 }
 
+fn source_setup_rsh(rsh: &[String], explicit_rsh: bool) -> Vec<String> {
+    let mut setup = rsh.to_vec();
+    if !explicit_rsh {
+        // Probes and helper installation never need delegated credentials.
+        setup.push("-a".into());
+    }
+    setup
+}
+
+fn destination_rsh<'a>(
+    explicit_rsh: Option<&'a str>,
+    same_host: bool,
+    agent_forwarding: Option<&AgentForwarding>,
+) -> Option<&'a str> {
+    if same_host {
+        return None;
+    }
+    if let Some(explicit) = explicit_rsh {
+        return Some(explicit);
+    }
+    match agent_forwarding {
+        // A uses the broker to authenticate to B, but B must never receive it.
+        // Force the forwarded environment socket and its advertised identities;
+        // requiring host-bound authentication prevents A from omitting B's key.
+        Some(AgentForwarding::Constrained { .. }) => Some(
+            "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no -o PubkeyAuthentication=host-bound",
+        ),
+        // The compatibility escape hatch still selects the forwarded ambient
+        // agent, but does not require host-bound authentication from OpenSSH
+        // versions that predate the constrained broker's 8.9 floor.
+        Some(AgentForwarding::Unrestricted) => {
+            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no")
+        }
+        // With no forwarded agent, preserve hostA's own IdentityAgent and
+        // authentication configuration while preventing another forwarding hop.
+        Some(AgentForwarding::Disabled) | None => Some("ssh -a"),
+    }
+}
+
+fn broker_connection_limit(connections_opt: Option<usize>, connections: usize) -> Result<usize> {
+    // A direct transfer keeps one destination control connection open beside
+    // its data workers. Automatic tuning may grow beyond the initial worker
+    // count, while an explicit -j is a fixed user-selected upper bound.
+    let data_connections = if connections_opt.is_some() {
+        connections
+    } else {
+        crate::tune::MAX
+    };
+    data_connections
+        .checked_add(1)
+        .context("SSH connection count is too large for the constrained agent broker")
+}
+
 pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     let rsh = parse_rsh(&args.rsh)?;
     let src_host = srcs[0].host.clone().unwrap();
+    let same_host = srcs[0].same_host(dst);
+    if args.detach && args.rsh.is_none() && !same_host && !args.no_forward_agent {
+        bail!(
+            "a constrained agent exists only while syq is attached; --detach requires --no-forward-agent and credentials on {src_host}, or an explicit --rsh policy"
+        );
+    }
+
+    let mut broker_guard = None;
+    let mut destination_login_user = None;
+    let default_ssh_agent_policy = if args.rsh.is_some() {
+        None
+    } else if same_host || args.no_forward_agent {
+        Some(AgentForwarding::Disabled)
+    } else if args.unrestricted_agent_forwarding {
+        Some(AgentForwarding::Unrestricted)
+    } else {
+        let source_policy = crate::agent_broker::resolve_host_policy(
+            &rsh[0],
+            srcs[0].user.as_deref(),
+            &src_host,
+            false,
+        )?;
+        let destination_policy = crate::agent_broker::resolve_host_policy(
+            &rsh[0],
+            dst.user.as_deref(),
+            dst.host.as_deref().unwrap(),
+            true,
+        )?;
+        destination_login_user = Some(destination_policy.login_user.clone());
+        let broker = crate::agent_broker::ConstrainedAgentBroker::start(
+            crate::agent_broker::BrokerPolicy::new(source_policy, destination_policy),
+            broker_connection_limit(args.connections_opt, args.connections)?,
+        )?;
+        let ambient = broker.ambient_socket().to_string_lossy().into_owned();
+        let socket = broker.socket_path().to_string_lossy().into_owned();
+        broker_guard = Some(broker);
+        Some(AgentForwarding::Constrained {
+            ambient,
+            broker: socket,
+        })
+    };
     // The follow target must reconnect the way we did: keep an explicit user.
     let src_target = match &srcs[0].user {
         Some(user) => format!("{user}@{src_host}"),
@@ -43,7 +172,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     let spec = crate::conn::RemoteSpec {
         user: srcs[0].user.clone(),
         host: src_host.clone(),
-        rsh: rsh.clone(),
+        rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
         syq_path: args.syq_path.clone(),
         auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
         helper_install: Default::default(),
@@ -157,9 +286,13 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if let Some(p) = &args.syq_path {
         remote.push(format!("--syq-path={p}"));
     }
-    if let Some(e) = &args.rsh {
+    if let Some(e) = destination_rsh(
+        args.rsh.as_deref(),
+        same_host,
+        default_ssh_agent_policy.as_ref(),
+    ) {
         remote.push("-e".into());
-        remote.push(e.clone());
+        remote.push(e.into());
     }
     remote.push("--".into());
     for s in srcs {
@@ -168,7 +301,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     // Same host (and user) on both ends: on that host this is a plain local
     // copy — no ssh back to itself, copy_file_range applies, and the
     // copy-into-itself check sees both paths on one machine.
-    let dst_str = if srcs[0].same_host(dst) {
+    let dst_str = if same_host {
         // A relative remote path is relative to the home; anchor it so the
         // orchestrator's local parse can't take it for something else.
         if dst.path.starts_with('/')
@@ -182,7 +315,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             format!("./{}", dst.path)
         }
     } else {
-        match &dst.user {
+        match destination_login_user.as_ref().or(dst.user.as_ref()) {
             Some(u) => format!("{u}@{}:{}", dst.host.as_ref().unwrap(), dst.path),
             None => format!("{}:{}", dst.host.as_ref().unwrap(), dst.path),
         }
@@ -245,19 +378,20 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         remote_cmd
     };
 
-    let default_ssh_forward_agent = args
-        .rsh
-        .is_none()
-        .then(|| !args.no_forward_agent && !srcs[0].same_host(dst));
     let make_command = || {
         direct_command(
             &rsh,
             srcs[0].user.as_deref(),
             &src_host,
             &remote_cmd,
-            default_ssh_forward_agent,
+            default_ssh_agent_policy.as_ref(),
         )
     };
+    if args.unrestricted_agent_forwarding && !args.quiet {
+        eprintln!(
+            "syq: warning: --unrestricted-agent-forwarding exposes every capability in your SSH agent to {src_host} for this transfer"
+        );
+    }
     if args.detach {
         let run = || {
             let mut cmd = make_command();
@@ -300,6 +434,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         spec.install_helper()?;
         status = run()?;
     }
+    // Keep the broker alive until the outer SSH connection and all forwarded
+    // channels have closed.
+    drop(broker_guard);
     match status.code() {
         Some(0) => Ok(0),
         // 23 (some files failed) and 25 (--max-delete refused) pass through:
@@ -313,6 +450,13 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         // be mistaken for the orchestrator.
         Some(c @ (23 | 25)) => Ok(c),
         Some(c) => {
+            if args.rsh.is_none()
+                && !args.no_forward_agent
+                && !args.unrestricted_agent_forwarding
+                && !same_host
+            {
+                bail!("remote-to-remote transfer on {src_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Retry with --relay, use --no-forward-agent with source-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", destination_login_user.as_deref().unwrap_or("the destination user"), dst.host.as_deref().unwrap_or("the destination"))
+            }
             bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
         }
         None => bail!("remote syq on {src_host} killed by signal"),
@@ -422,15 +566,86 @@ mod tests {
     #[test]
     fn default_ssh_controls_agent_forwarding_explicitly() {
         let rsh = vec!["ssh".to_string(), "-p".to_string(), "2222".to_string()];
-        let forwarded = direct_command(&rsh, Some("alice"), "source", "syq ...", Some(true));
+        let forwarded = direct_command(
+            &rsh,
+            Some("alice"),
+            "source",
+            "syq ...",
+            Some(&AgentForwarding::Unrestricted),
+        );
         let forwarded = args(&forwarded);
         assert!(forwarded.contains(&OsStr::new("-A")));
         assert!(!forwarded.contains(&OsStr::new("-a")));
 
-        let disabled = direct_command(&rsh, Some("alice"), "source", "syq ...", Some(false));
+        let disabled = direct_command(
+            &rsh,
+            Some("alice"),
+            "source",
+            "syq ...",
+            Some(&AgentForwarding::Disabled),
+        );
         let disabled = args(&disabled);
         assert!(disabled.contains(&OsStr::new("-a")));
         assert!(!disabled.contains(&OsStr::new("-A")));
+    }
+
+    #[test]
+    fn constrained_agent_is_forwarded_without_changing_source_authentication() {
+        let rsh = vec!["ssh".to_string()];
+        let policy = AgentForwarding::Constrained {
+            ambient: "/tmp/ambient-agent".into(),
+            broker: "/tmp/syq-agent".into(),
+        };
+        let command = direct_command(&rsh, None, "source", "syq ...", Some(&policy));
+        let args = args(&command);
+        assert!(args.contains(&OsStr::new("IdentityAgent=/tmp/ambient-agent")));
+        assert!(args.contains(&OsStr::new("ForwardAgent=/tmp/syq-agent")));
+        assert!(args.contains(&OsStr::new("ControlMaster=no")));
+        assert!(args.contains(&OsStr::new("ControlPath=none")));
+        assert!(args.contains(&OsStr::new("ClearAllForwardings=yes")));
+        assert!(args.contains(&OsStr::new("-x")));
+        assert!(args.contains(&OsStr::new("-k")));
+        assert!(args.contains(&OsStr::new("-T")));
+        assert!(args.contains(&OsStr::new("PermitLocalCommand=no")));
+        assert!(!args.contains(&OsStr::new("-A")));
+        assert!(!args.contains(&OsStr::new("-a")));
+    }
+
+    #[test]
+    fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
+        let rsh = vec!["ssh".to_string(), "-p".to_string(), "2222".to_string()];
+        assert_eq!(source_setup_rsh(&rsh, false), ["ssh", "-p", "2222", "-a"]);
+        assert_eq!(source_setup_rsh(&rsh, true), rsh);
+        let constrained = AgentForwarding::Constrained {
+            ambient: "/tmp/ambient-agent".into(),
+            broker: "/tmp/syq-agent".into(),
+        };
+        assert_eq!(
+            destination_rsh(None, false, Some(&constrained)),
+            Some(
+                "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no -o PubkeyAuthentication=host-bound"
+            )
+        );
+        assert_eq!(
+            destination_rsh(None, false, Some(&AgentForwarding::Unrestricted)),
+            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no")
+        );
+        assert_eq!(
+            destination_rsh(None, false, Some(&AgentForwarding::Disabled)),
+            Some("ssh -a")
+        );
+        assert_eq!(
+            destination_rsh(Some("custom-rsh"), false, None),
+            Some("custom-rsh")
+        );
+        assert_eq!(destination_rsh(None, true, Some(&constrained)), None);
+    }
+
+    #[test]
+    fn broker_capacity_covers_control_and_planned_workers() {
+        assert_eq!(broker_connection_limit(None, 8).unwrap(), 65);
+        assert_eq!(broker_connection_limit(Some(128), 128).unwrap(), 129);
+        assert!(broker_connection_limit(Some(usize::MAX), usize::MAX).is_err());
     }
 
     #[test]
