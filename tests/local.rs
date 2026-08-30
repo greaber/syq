@@ -89,6 +89,33 @@ fn run_native_ok(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+#[cfg(debug_assertions)]
+fn spawn_native_after_precondition(args: &[&str], ready: &Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_TARGET_PRECONDITION_READY_FILE", ready)
+        .env("SYQ_TEST_HOLD_TARGET_PRECONDITION_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn native command held after its target precondition")
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_signal(path: &Path) {
+    for attempt in 0..500 {
+        if path.exists() {
+            return;
+        }
+        if attempt % 100 == 0 {
+            eprintln!("waiting for test signal {}", path.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("timed out waiting for test signal {}", path.display());
+}
+
 fn run_ok(args: &[&str]) -> String {
     let out = syq(args);
     assert!(
@@ -213,6 +240,13 @@ fn native_copy_enforces_placement_preconditions_before_mutation() {
     assert!(!t.path("missing-container").exists());
     assert!(!t.path("missing-exact").exists());
 
+    write(&t.path("existing-exact"), b"old");
+    let before = fs::metadata(t.path("existing-exact")).unwrap();
+    run_native_ok(&["cp", &t.s("src"), "--as-existing", &t.s("existing-exact")]);
+    let after = fs::metadata(t.path("existing-exact")).unwrap();
+    assert_eq!(read(&t.path("existing-exact")), b"source");
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+
     let missing_source_target = t.s("missing-source-target");
     let missing_source = native_syq(&["cp", &t.s("absent"), "--into-new", &missing_source_target]);
     assert!(!missing_source.status.success());
@@ -228,6 +262,84 @@ fn native_copy_enforces_placement_preconditions_before_mutation() {
     ]);
     assert!(!not_a_directory.status.success());
     assert!(!Path::new(&contents_target).exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_placement_preconditions_are_enforced_at_mutation_time() {
+    let t = Tmp::new();
+    write(&t.path("source-file"), b"source");
+    write(&t.path("source-dir/file"), b"source");
+
+    let as_new_ready = t.path("as-new-ready");
+    let as_new = spawn_native_after_precondition(
+        &["cp", &t.s("source-file"), "--as-new", &t.s("as-new")],
+        &as_new_ready,
+    );
+    wait_for_signal(&as_new_ready);
+    write(&t.path("as-new"), b"concurrent winner");
+    let output = as_new.wait_with_output().unwrap();
+    assert!(!output.status.success(), "raced --as-new unexpectedly won");
+    assert_eq!(read(&t.path("as-new")), b"concurrent winner");
+
+    let into_new_ready = t.path("into-new-ready");
+    let into_new = spawn_native_after_precondition(
+        &["cp", &t.s("source-dir"), "--into-new", &t.s("into-new")],
+        &into_new_ready,
+    );
+    wait_for_signal(&into_new_ready);
+    write(&t.path("into-new/concurrent"), b"winner");
+    let output = into_new.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced --into-new unexpectedly accepted another directory"
+    );
+    assert_eq!(read(&t.path("into-new/concurrent")), b"winner");
+    assert!(!t.path("into-new/source-dir").exists());
+
+    write(&t.path("as-existing"), b"original");
+    let as_existing_ready = t.path("as-existing-ready");
+    let as_existing = spawn_native_after_precondition(
+        &[
+            "cp",
+            &t.s("source-file"),
+            "--as-existing",
+            &t.s("as-existing"),
+        ],
+        &as_existing_ready,
+    );
+    wait_for_signal(&as_existing_ready);
+    fs::remove_file(t.path("as-existing")).unwrap();
+    write(&t.path("as-existing"), b"concurrent replacement");
+    let output = as_existing.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced --as-existing ignored target identity"
+    );
+    assert_eq!(read(&t.path("as-existing")), b"concurrent replacement");
+
+    fs::create_dir_all(t.path("into-existing")).unwrap();
+    let into_existing_ready = t.path("into-existing-ready");
+    let into_existing = spawn_native_after_precondition(
+        &[
+            "cp",
+            "--src-src",
+            &t.s("source-dir"),
+            "--into-existing",
+            &t.s("into-existing"),
+        ],
+        &into_existing_ready,
+    );
+    wait_for_signal(&into_existing_ready);
+    fs::rename(t.path("into-existing"), t.path("displaced-directory")).unwrap();
+    write(&t.path("into-existing/concurrent"), b"winner");
+    let output = into_existing.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced --into-existing ignored target identity"
+    );
+    assert_eq!(read(&t.path("into-existing/concurrent")), b"winner");
+    assert!(!t.path("into-existing/file").exists());
 }
 
 #[test]
@@ -291,6 +403,19 @@ fn native_copy_follows_only_an_explicitly_selected_root_symlink() {
     ]);
     assert_eq!(
         fs::read_link(t.path("preserved/link")).unwrap(),
+        Path::new("real")
+    );
+
+    let link_with_slashes = format!("{}///", t.s("link"));
+    run_native_ok(&[
+        "cp",
+        "--src-no-follow",
+        &link_with_slashes,
+        "--into",
+        &t.s("preserved-with-slashes"),
+    ]);
+    assert_eq!(
+        fs::read_link(t.path("preserved-with-slashes/link")).unwrap(),
         Path::new("real")
     );
 }
@@ -383,6 +508,21 @@ fn native_rm_is_idempotent_for_duplicate_and_nested_selectors() {
     write(&t.path("tree/child/file"), b"data");
     run_native_ok(&["rm", &t.s("tree"), &t.s("tree/child"), &t.s("tree")]);
     assert!(!t.path("tree").exists());
+}
+
+#[test]
+fn native_rm_trailing_slash_removes_a_selected_symlink_not_its_referent() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real/file"), b"keep");
+    symlink("real", t.path("link")).unwrap();
+
+    let link_with_slashes = format!("{}///", t.s("link"));
+    run_native_ok(&["rm", &link_with_slashes]);
+
+    assert!(!t.path("link").exists());
+    assert_eq!(read(&t.path("real/file")), b"keep");
 }
 
 #[test]

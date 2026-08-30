@@ -294,6 +294,8 @@ mod tests {
             size: 1,
             mtime: 0,
             mtime_nsec: 0,
+            ctime: 0,
+            ctime_nsec: 0,
             mode: 0o644,
             uid: 0,
             gid: 0,

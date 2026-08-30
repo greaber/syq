@@ -314,6 +314,8 @@ pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry 
         rdev: md.rdev(),
         dev: md.dev(),
         ino: md.ino(),
+        ctime: md.ctime(),
+        ctime_nsec: md.ctime_nsec() as u32,
         link,
     }
 }
@@ -451,9 +453,33 @@ impl FsOps {
         // then apply metadata — otherwise a parallel SetMeta can beat its
         // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
         let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. });
-        let create_idx: Vec<usize> = (0..ops.len()).filter(|&i| !is_meta(&ops[i])).collect();
+        let is_guarded_create = |op: &Op| match op {
+            Op::Mkdir { condition, .. }
+            | Op::Symlink { condition, .. }
+            | Op::Mknod { condition, .. } => *condition != TargetCondition::Any,
+            _ => false,
+        };
+        let guarded_idx: Vec<usize> = (0..ops.len())
+            .filter(|&i| !is_meta(&ops[i]) && is_guarded_create(&ops[i]))
+            .collect();
+        let create_idx: Vec<usize> = (0..ops.len())
+            .filter(|&i| !is_meta(&ops[i]) && !is_guarded_create(&ops[i]))
+            .collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
         let mut out: Vec<Option<String>> = vec![None; ops.len()];
+        let gres = parallel_map(&guarded_idx, |&i| {
+            apply_one(&ops[i]).err().as_ref().map(errstr)
+        });
+        for (i, r) in guarded_idx.iter().zip(gres) {
+            out[*i] = r;
+        }
+        if guarded_idx.iter().any(|&i| out[i].is_some()) {
+            for i in create_idx.iter().chain(meta_idx.iter()) {
+                out[*i] =
+                    Some("operation skipped because the placement-root precondition failed".into());
+            }
+            return out;
+        }
         let cres = parallel_map(&create_idx, |&i| {
             apply_one(&ops[i]).err().as_ref().map(errstr)
         });
@@ -477,44 +503,92 @@ impl FsOps {
 fn apply_one(op: &Op) -> Result<()> {
     {
         match op {
-            Op::Mkdir { path, mode } => {
+            Op::Mkdir {
+                path,
+                mode,
+                condition,
+            } => {
                 let p = resolve(path);
+                if let Some(parent) = p.parent() {
+                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
                 // The orchestrator resolves an explicitly supplied root
                 // symlink. Symlinks found inside the destination tree are
                 // payload conflicts and must be replaced, never traversed.
-                match fs::symlink_metadata(&p) {
-                    Ok(md) if md.is_dir() => make_dir_writable(&p, &md),
-                    Ok(_) => {
-                        fs::remove_file(&p)?;
-                        mkdir_or_existing_dir(&p, *mode)
-                    }
-                    Err(_) => {
-                        if let Some(parent) = p.parent() {
-                            if !parent.as_os_str().is_empty() && !parent.exists() {
-                                fs::create_dir_all(parent)?;
-                            }
+                match condition {
+                    TargetCondition::Absent => mkdir(&p, *mode).map_err(Into::into),
+                    TargetCondition::Matches { .. }
+                    | TargetCondition::MatchesFingerprint { .. } => {
+                        let md = require_target_condition(&p, *condition)?
+                            .expect("matching target condition returns metadata");
+                        if !md.is_dir() {
+                            bail!(
+                                "target {} cannot change type under --as-existing",
+                                p.display()
+                            );
                         }
-                        mkdir_or_existing_dir(&p, *mode)
+                        make_dir_writable(&p, &md)
                     }
+                    TargetCondition::Any => match fs::symlink_metadata(&p) {
+                        Ok(md) if md.is_dir() => make_dir_writable(&p, &md),
+                        Ok(_) => {
+                            fs::remove_file(&p)?;
+                            mkdir_or_existing_dir(&p, *mode)
+                        }
+                        Err(_) => mkdir_or_existing_dir(&p, *mode),
+                    },
                 }
                 .with_context(|| format!("mkdir {}", p.display()))
             }
-            Op::Symlink { path, target } => {
+            Op::Symlink {
+                path,
+                target,
+                condition,
+            } => {
                 let p = resolve(path);
-                match fs::symlink_metadata(&p) {
-                    Ok(md) if md.is_dir() => fs::remove_dir(&p)?,
-                    Ok(_) => fs::remove_file(&p)?,
-                    Err(_) => {}
+                match condition {
+                    TargetCondition::Any => match fs::symlink_metadata(&p) {
+                        Ok(md) if md.is_dir() => fs::remove_dir(&p)?,
+                        Ok(_) => fs::remove_file(&p)?,
+                        Err(_) => {}
+                    },
+                    TargetCondition::Absent => {}
+                    TargetCondition::Matches { .. }
+                    | TargetCondition::MatchesFingerprint { .. } => {
+                        require_target_condition(&p, *condition)?;
+                        bail!(
+                            "target {} cannot be replaced safely under --as-existing",
+                            p.display()
+                        );
+                    }
                 }
                 std::os::unix::fs::symlink(OsStr::from_bytes(target), &p)
                     .with_context(|| format!("symlink {}", p.display()))
             }
-            Op::Mknod { path, mode, rdev } => {
+            Op::Mknod {
+                path,
+                mode,
+                rdev,
+                condition,
+            } => {
                 let p = resolve(path);
-                match fs::symlink_metadata(&p) {
-                    Ok(md) if md.is_dir() => fs::remove_dir(&p)?,
-                    Ok(_) => fs::remove_file(&p)?,
-                    Err(_) => {}
+                match condition {
+                    TargetCondition::Any => match fs::symlink_metadata(&p) {
+                        Ok(md) if md.is_dir() => fs::remove_dir(&p)?,
+                        Ok(_) => fs::remove_file(&p)?,
+                        Err(_) => {}
+                    },
+                    TargetCondition::Absent => {}
+                    TargetCondition::Matches { .. }
+                    | TargetCondition::MatchesFingerprint { .. } => {
+                        require_target_condition(&p, *condition)?;
+                        bail!(
+                            "target {} cannot be replaced safely under --as-existing",
+                            p.display()
+                        );
+                    }
                 }
                 let c = cstr(&p)?;
                 let r =
@@ -525,17 +599,36 @@ fn apply_one(op: &Op) -> Result<()> {
                 }
                 Ok(())
             }
-            Op::SetMeta { path, meta, flags } => {
+            Op::SetMeta {
+                path,
+                meta,
+                flags,
+                condition,
+            } => {
                 let p = resolve(path);
                 #[cfg(debug_assertions)]
                 fail_set_meta_for_test(&p)?;
-                set_meta_path(&p, meta, *flags)
-                    .with_context(|| format!("set metadata {}", p.display()))
+                match condition {
+                    TargetCondition::Any => set_meta_path(&p, meta, *flags),
+                    TargetCondition::Absent => {
+                        bail!("target {} appeared before metadata update", p.display())
+                    }
+                    TargetCondition::Matches { .. }
+                    | TargetCondition::MatchesFingerprint { .. } => {
+                        let file = OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                            .open(&p)
+                            .with_context(|| format!("open {} for metadata", p.display()))?;
+                        require_open_target(&file, &p, *condition)?;
+                        set_meta_file(&file, meta, *flags)
+                    }
+                }
+                .with_context(|| format!("set metadata {}", p.display()))
             }
             Op::SetFileMetaIfSame {
                 path,
-                expected_dev,
-                expected_ino,
+                condition,
                 meta,
                 flags,
             } => {
@@ -560,34 +653,21 @@ fn apply_one(op: &Op) -> Result<()> {
                 let file = match open_metadata_handle(&p) {
                     Ok(file) => file,
                     Err(open_error) => {
-                        // If the original inode is still present, preserve the
-                        // useful open error. Otherwise the planned repair is no
-                        // longer complete and must be visible as a copy error.
-                        match fs::symlink_metadata(&p) {
-                            Ok(md)
-                                if md.file_type().is_file()
-                                    && md.dev() == *expected_dev
-                                    && md.ino() == *expected_ino =>
-                            {
-                                return Err(open_error).with_context(|| {
-                                    format!("open {} for metadata repair", p.display())
-                                });
-                            }
-                            _ => {
-                                bail!("destination {} changed before metadata repair", p.display())
-                            }
-                        }
+                        // Preserve the useful open error only while the
+                        // planner's target is still present.
+                        require_target_condition(&p, *condition)?;
+                        return Err(open_error)
+                            .with_context(|| format!("open {} for metadata repair", p.display()));
                     }
                 };
                 let md = file.metadata()?;
-                if !md.file_type().is_file()
-                    || md.dev() != *expected_dev
-                    || md.ino() != *expected_ino
-                {
+                if !md.file_type().is_file() {
                     bail!("destination {} changed before metadata repair", p.display());
                 }
+                require_open_target(&file, &p, *condition)?;
                 set_meta_handle(&file, meta, *flags)
-                    .with_context(|| format!("set metadata {}", p.display()))
+                    .with_context(|| format!("set metadata {}", p.display()))?;
+                require_named_target_identity(&file, &p, *condition)
             }
             Op::Rmdir { path } => {
                 let p = resolve(path);
@@ -623,6 +703,121 @@ fn apply_one(op: &Op) -> Result<()> {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+fn require_target_condition(
+    path: &Path,
+    condition: TargetCondition,
+) -> Result<Option<fs::Metadata>> {
+    match condition {
+        TargetCondition::Any => Ok(fs::symlink_metadata(path).ok()),
+        TargetCondition::Absent => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Ok(_) => bail!(
+                "target {} appeared after the new-path precondition was checked",
+                path.display()
+            ),
+            Err(error) => Err(error).with_context(|| format!("stat {}", path.display())),
+        },
+        TargetCondition::Matches { dev, ino } => match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.dev() == dev && metadata.ino() == ino => Ok(Some(metadata)),
+            Ok(_) | Err(_) => bail!(
+                "target {} changed after the existing-path precondition was checked",
+                path.display()
+            ),
+        },
+        TargetCondition::MatchesFingerprint {
+            dev,
+            ino,
+            ctime,
+            ctime_nsec,
+        } => match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.dev() == dev
+                    && metadata.ino() == ino
+                    && metadata.ctime() == ctime
+                    && metadata.ctime_nsec() as u32 == ctime_nsec =>
+            {
+                Ok(Some(metadata))
+            }
+            Ok(_) | Err(_) => bail!(
+                "target {} changed after the existing-path precondition was checked",
+                path.display()
+            ),
+        },
+    }
+}
+
+fn require_open_target(file: &File, path: &Path, condition: TargetCondition) -> Result<()> {
+    match condition {
+        TargetCondition::Any => Ok(()),
+        TargetCondition::Absent => bail!(
+            "target {} appeared after the new-path precondition was checked",
+            path.display()
+        ),
+        TargetCondition::Matches { dev, ino } => {
+            let metadata = file.metadata()?;
+            if metadata.dev() != dev || metadata.ino() != ino {
+                bail!(
+                    "target {} changed after the existing-path precondition was checked",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        TargetCondition::MatchesFingerprint {
+            dev,
+            ino,
+            ctime,
+            ctime_nsec,
+        } => {
+            let metadata = file.metadata()?;
+            if metadata.dev() != dev
+                || metadata.ino() != ino
+                || metadata.ctime() != ctime
+                || metadata.ctime_nsec() as u32 != ctime_nsec
+            {
+                bail!(
+                    "target {} changed after the existing-path precondition was checked",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Confirm that a pathname still names the held object after this operation
+/// has intentionally changed that object's ctime.
+fn require_named_target_identity(
+    file: &File,
+    path: &Path,
+    condition: TargetCondition,
+) -> Result<()> {
+    match condition {
+        TargetCondition::Any => Ok(()),
+        TargetCondition::Absent => bail!(
+            "new-target condition cannot validate an in-place update of {}",
+            path.display()
+        ),
+        TargetCondition::Matches { dev, ino }
+        | TargetCondition::MatchesFingerprint { dev, ino, .. } => {
+            let opened = file.metadata()?;
+            let named =
+                fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+            if opened.dev() != dev
+                || opened.ino() != ino
+                || named.dev() != dev
+                || named.ino() != ino
+            {
+                bail!(
+                    "target {} changed during the existing-path update",
+                    path.display()
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -968,6 +1163,7 @@ impl FsOps {
         partial_id: &PartialId,
         block: u64,
         len: u64,
+        condition: TargetCondition,
     ) -> Result<(Vec<u64>, u64)> {
         let p = resolve(path);
         #[cfg(debug_assertions)]
@@ -976,6 +1172,7 @@ impl FsOps {
         }
         let mut file = open_existing_regular(&p, false)
             .with_context(|| format!("open {} as repair basis", p.display()))?;
+        require_open_target(&file, &p, condition)?;
         let hashes = hash_reader(&mut file, block, len)?;
         self.held_basis = Some(HeldBasis {
             path: p,
@@ -1025,10 +1222,13 @@ impl FsOps {
         partial_id: &PartialId,
         meta: &Meta,
         flags: u8,
+        condition: TargetCondition,
     ) -> Result<()> {
         let held = self.take_held_basis(path, partial_id)?;
+        require_open_target(&held.file, &held.path, condition)?;
         set_meta_file(&held.file, meta, flags)
             .with_context(|| format!("set metadata on basis {}", held.path.display()))?;
+        require_named_target_identity(&held.file, &held.path, condition)?;
         Ok(())
     }
 
@@ -1171,12 +1371,28 @@ impl FsOps {
         hash: u64,
         meta: &Meta,
         flags: u8,
+        condition: TargetCondition,
     ) -> Result<()> {
         if xxh3_64(data) != hash {
             bail!("block hash mismatch on receive");
         }
         let p = resolve(target.path);
         self.uncache(&p);
+        if matches!(
+            condition,
+            TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
+        ) {
+            let file = open_existing_regular(&p, true)?;
+            require_open_target(&file, &p, condition)?;
+            file.set_len(0)?;
+            file.write_all_at(data, 0)
+                .with_context(|| format!("write existing {}", p.display()))?;
+            file.set_len(data.len() as u64)?;
+            set_meta_file(&file, meta, flags)
+                .with_context(|| format!("set metadata {}", p.display()))?;
+            require_named_target_identity(&file, &p, condition)?;
+            return Ok(());
+        }
         let pp = partial_path(&p, target.id)?;
         self.uncache(&pp);
         if let Some(parent) = p.parent() {
@@ -1197,8 +1413,7 @@ impl FsOps {
                 bail!("put small {}: injected failure before rename", p.display());
             }
         }
-        fs::rename(&pp, &p)
-            .with_context(|| format!("rename {} to {}", pp.display(), p.display()))?;
+        publish_partial(&pp, &p, condition)?;
         drop(f);
         Ok(())
     }
@@ -1270,6 +1485,7 @@ impl FsOps {
         partial_id: &PartialId,
         meta: &Meta,
         flags: u8,
+        condition: TargetCondition,
     ) -> Result<()> {
         let p = resolve(path);
         let src = if inplace {
@@ -1285,8 +1501,43 @@ impl FsOps {
             if !f.metadata()?.file_type().is_file() {
                 bail!("destination {} is not a regular file", src.display());
             }
+            require_open_target(&f, &p, condition)?;
         } else {
             require_safe_partial(&f, &src)?;
+        }
+        if !inplace
+            && matches!(
+                condition,
+                TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
+            )
+        {
+            // Range writes cache the private sidecar write-only. Retain that
+            // descriptor while opening the same safe inode for reading, so a
+            // pathname swap cannot substitute bytes before copy-back.
+            let staged_metadata = f.metadata()?;
+            let mut staged = open_existing_regular(&src, false)?;
+            let reopened_metadata = staged.metadata()?;
+            require_safe_partial(&staged, &src)?;
+            if staged_metadata.dev() != reopened_metadata.dev()
+                || staged_metadata.ino() != reopened_metadata.ino()
+            {
+                bail!("partial {} changed before publication", src.display());
+            }
+            self.uncache(&p);
+            let mut target = open_existing_regular(&p, true)?;
+            require_open_target(&target, &p, condition)?;
+            let size = reopened_metadata.len();
+            target.set_len(0)?;
+            staged.seek(SeekFrom::Start(0))?;
+            target.seek(SeekFrom::Start(0))?;
+            io::copy(&mut staged, &mut target)
+                .with_context(|| format!("update existing {}", p.display()))?;
+            target.set_len(size)?;
+            set_meta_file(&target, meta, flags)
+                .with_context(|| format!("set metadata {}", p.display()))?;
+            require_named_target_identity(&target, &p, condition)?;
+            fs::remove_file(&src).with_context(|| format!("remove {}", src.display()))?;
+            return Ok(());
         }
         set_meta_file(&f, meta, flags)
             .with_context(|| format!("set metadata {}", src.display()))?;
@@ -1294,9 +1545,9 @@ impl FsOps {
             if fs::symlink_metadata(&p).is_ok_and(|metadata| metadata.is_dir()) {
                 bail!("destination {} is a directory", p.display());
             }
-            fs::rename(&src, &p).with_context(|| {
-                format!("publish {} as destination {}", src.display(), p.display())
-            })?;
+            publish_partial(&src, &p, condition)?;
+        } else {
+            require_named_target_identity(&f, &p, condition)?;
         }
         drop(f);
         Ok(())
@@ -1374,16 +1625,18 @@ impl FsOps {
                 partial_id,
                 block,
                 len,
+                condition,
             } => self
-                .hash_and_hold(path, partial_id, *block, *len)
+                .hash_and_hold(path, partial_id, *block, *len, *condition)
                 .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
             Request::FinishBasis {
                 path,
                 partial_id,
                 meta,
                 flags,
+                condition,
             } => self
-                .finish_basis(path, partial_id, meta, *flags)
+                .finish_basis(path, partial_id, meta, *flags, *condition)
                 .map(|_| Response::Ok),
             Request::SeedBasis {
                 path,
@@ -1414,6 +1667,7 @@ impl FsOps {
                             put.hash,
                             &put.meta,
                             put.flags,
+                            put.condition,
                         )
                         .err()
                         .map(|error| errstr(&error))
@@ -1474,8 +1728,9 @@ impl FsOps {
                 partial_id,
                 meta,
                 flags,
+                condition,
             } => self
-                .finalize(path, *inplace, partial_id, meta, *flags)
+                .finalize(path, *inplace, partial_id, meta, *flags, *condition)
                 .map(|_| Response::Ok),
             Request::FileHash { path } => self.file_hash(path),
             Request::Canonicalize { path } => {
@@ -1490,6 +1745,29 @@ impl FsOps {
         match r {
             Ok(resp) => resp,
             Err(e) => Response::Err(errstr(&e)),
+        }
+    }
+}
+
+fn publish_partial(src: &Path, dst: &Path, condition: TargetCondition) -> Result<()> {
+    match condition {
+        TargetCondition::Any => fs::rename(src, dst)
+            .with_context(|| format!("publish {} as destination {}", src.display(), dst.display())),
+        TargetCondition::Absent => {
+            // The sidecar is adjacent to the destination, so hard-linking it
+            // creates the final name atomically and fails with EEXIST instead
+            // of replacing a target that raced the planner.
+            fs::hard_link(src, dst).with_context(|| {
+                format!(
+                    "publish new {} as destination {} without replacement",
+                    src.display(),
+                    dst.display()
+                )
+            })?;
+            fs::remove_file(src).with_context(|| format!("remove {}", src.display()))
+        }
+        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
+            bail!("internal error: matched publication must update the held target inode")
         }
     }
 }

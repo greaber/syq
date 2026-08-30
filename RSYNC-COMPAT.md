@@ -34,11 +34,11 @@ python3 scripts/rsync-compat.py
 ```
 
 The manifest pins rsync commit `7c20b077` and defines one target representing
-SYQ's rsync-compatible command surface. It currently invokes native `syq`; once
-the dedicated `syq rsync` command exists, changing the target's argument list
-switches the suite without changing upstream test calls. `inventory.tsv` names
-all 351 tests at that commit; changing the pin without classifying every added
-or removed test is an error. The classifications deliberately distinguish:
+SYQ's retained `syq rsync` compatibility surface. Its configured `rsync`
+argument routes every upstream invocation through that subcommand without
+changing upstream test calls. `inventory.tsv` names all 351 tests at that
+commit; changing the pin without classifying every added or removed test is an
+error. The classifications deliberately distinguish:
 
 - relevant unmodified and adapted conformance tests;
 - user-visible features syq does not implement;

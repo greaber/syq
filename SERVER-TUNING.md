@@ -18,8 +18,8 @@ exercise the network and storage bandwidth; a tree of small files exercises
 latency and metadata performance.
 
 ```sh
-syq -avv --stats SOURCE HOST:DESTINATION
-SYQ_DEBUG=1 syq -a --stats SOURCE HOST:DESTINATION
+syq rsync -avv --stats SOURCE HOST:DESTINATION
+SYQ_DEBUG=1 syq rsync -a --stats SOURCE HOST:DESTINATION
 ```
 
 `-vv` reports the remote helper and platform, candidate TCP addresses, the
