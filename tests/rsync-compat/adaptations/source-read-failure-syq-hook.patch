@@ -1,0 +1,63 @@
+diff --git a/testsuite/source-read-failure-continues_test.py b/testsuite/source-read-failure-continues_test.py
+new file mode 100755
+index 0000000..f1a299b
+--- /dev/null
++++ b/testsuite/source-read-failure-continues_test.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""A source read failure is visible without aborting later file transfers.
++
++The upstream test uses an LD_PRELOAD shim to shrink one source after scanning
++but immediately before rsync reads it. The adapted fixture asks a debug SYQ
++build to perform the same deterministic mutation in its ReadRange operation.
++"""
++
++import os
++import subprocess
++
++from rsyncfns import (
++    SCRATCHDIR, assert_same, make_data_file, makepath, rmtree, rsync_argv,
++    test_fail,
++)
++
++
++base = SCRATCHDIR / 'source-change-size'
++src = base / 'src'
++dest = base / 'dest'
++rmtree(base)
++makepath(src, dest)
++
++changing = src / '01-changing.bin'
++later = src / '02-later.txt'
++make_data_file(changing, 1024 * 1024)
++later.write_text('later file must still transfer\n')
++existing = b'existing destination must survive\n'
++(dest / changing.name).write_bytes(existing)
++
++mark = SCRATCHDIR / 'source_shrink_read.mark'
++mark.unlink(missing_ok=True)
++env = os.environ.copy()
++env['SYQ_TEST_SHRINK_ON_READ'] = str(changing.resolve())
++env['SYQ_TEST_SHRINK_MARK'] = str(mark)
++
++# A bandwidth limit selects SYQ's userspace ReadRange path instead of the local
++# copy-file offload. One worker makes the later-file assertion deterministic.
++argv = rsync_argv('-a', '-j', '1', '--bwlimit=1048576', f'{src}/', f'{dest}/')
++print('Running:', ' '.join(argv))
++proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                      text=True, env=env)
++out = proc.stdout or ''
++print(out, end='')
++
++if not mark.exists():
++    test_fail('SYQ did not exercise the source-read mutation fixture')
++if proc.returncode == 0:
++    test_fail('SYQ hid a source read failure behind a successful exit')
++if (dest / changing.name).read_bytes() != existing:
++    test_fail('a source read failure damaged the existing destination file')
++if not (dest / later.name).is_file():
++    test_fail('a source read failure aborted the later file-list entry')
++assert_same(later, dest / later.name, label='later file')
++
++print('source-read-failure-continues: changed source failed visibly while a '
++      'later file still transferred')

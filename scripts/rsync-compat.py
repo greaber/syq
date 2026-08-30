@@ -25,6 +25,8 @@ COMPAT_DIR = ROOT / "tests" / "rsync-compat"
 MANIFEST_PATH = COMPAT_DIR / "manifest.toml"
 INVENTORY_PATH = COMPAT_DIR / "inventory.tsv"
 LEDGER_PATH = COMPAT_DIR / "LEDGER.md"
+REGRESSIONS_PATH = COMPAT_DIR / "regressions.toml"
+REGRESSIONS_LEDGER_PATH = COMPAT_DIR / "REGRESSIONS.md"
 VALID_CLASSES = {"conformance", "adapted", "unsupported", "out-of-scope", "unassessed"}
 VALID_OUTCOMES = {"pass", "fail", "skip", "xfail"}
 VALID_POSITIONS = {
@@ -49,6 +51,16 @@ POSITION_DESCRIPTIONS = {
     "test-unresolved": "The observation may reflect the fixture, harness, or an unclear test claim.",
 }
 VALID_ADAPTATION_KINDS = {"invocation", "fixture", "subset"}
+VALID_REGRESSION_PRIORITIES = {"critical", "high", "medium", "low"}
+VALID_REGRESSION_IMPACTS = {
+    "availability",
+    "correctness",
+    "data-integrity",
+    "data-loss",
+    "resource-exhaustion",
+    "security",
+}
+VALID_REGRESSION_STATUSES = {"covered", "partial", "candidate", "not-applicable"}
 RESULT_RE = re.compile(r"^(PASS|FAIL|SKIP|XFAIL)\s+([^\s(]+)")
 
 
@@ -85,7 +97,7 @@ def output(argv: list[str], *, cwd: Path | None = None) -> str:
 def load_manifest() -> dict:
     with MANIFEST_PATH.open("rb") as handle:
         data = tomllib.load(handle)
-    if data.get("schema") != 2:
+    if data.get("schema") != 3:
         raise CompatError(f"{MANIFEST_PATH}: unsupported schema {data.get('schema')!r}")
     return data
 
@@ -111,6 +123,16 @@ def load_inventory() -> dict[str, tuple[str, str | None]]:
     return inventory
 
 
+def load_regressions() -> dict:
+    with REGRESSIONS_PATH.open("rb") as handle:
+        data = tomllib.load(handle)
+    if data.get("schema") != 1:
+        raise CompatError(
+            f"{REGRESSIONS_PATH}: unsupported schema {data.get('schema')!r}"
+        )
+    return data
+
+
 def upstream_test_names(source: Path) -> set[str]:
     tree = output(
         ["git", "ls-tree", "-r", "--name-only", "HEAD", "testsuite"], cwd=source
@@ -121,6 +143,10 @@ def upstream_test_names(source: Path) -> set[str]:
         for path in tree.splitlines()
         if path.endswith(suffix)
     }
+
+
+def upstream_test_name(test: dict) -> str:
+    return test.get("upstream_test", test["name"])
 
 
 def validate_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]], source: Path) -> None:
@@ -134,16 +160,23 @@ def validate_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]
     ):
         raise CompatError(f"{MANIFEST_PATH}: target requires a name and string args")
     configured: dict[str, dict] = {}
+    configured_sources: set[str] = set()
     for test in tests:
         name = test.get("name")
         if not name or name in configured:
             raise CompatError(f"{MANIFEST_PATH}: missing or duplicate test name {name!r}")
         configured[name] = test
+        source_name = upstream_test_name(test)
+        configured_sources.add(source_name)
         classification = test.get("classification")
         if classification not in {"conformance", "adapted"}:
             raise CompatError(f"{MANIFEST_PATH}: {name}: runnable test has bad classification")
-        if name not in inventory or inventory[name][0] != classification:
+        if source_name not in inventory or inventory[source_name][0] != classification:
             raise CompatError(f"{MANIFEST_PATH}: {name}: manifest and inventory disagree")
+        if source_name != name and classification != "adapted":
+            raise CompatError(
+                f"{MANIFEST_PATH}: {name}: only adapted scenarios may name an upstream_test"
+            )
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", test.get("area", "")):
             raise CompatError(f"{MANIFEST_PATH}: {name}: missing or invalid area")
         if test.get("position") not in VALID_POSITIONS:
@@ -159,7 +192,7 @@ def validate_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]
             raise CompatError(f"{MANIFEST_PATH}: {name}: unmodified test names an adaptation")
 
     for name, (classification, reason) in inventory.items():
-        if classification in {"conformance", "adapted"} and name not in configured:
+        if classification in {"conformance", "adapted"} and name not in configured_sources:
             raise CompatError(f"{INVENTORY_PATH}: {name}: runnable test has no manifest entry")
         if classification in {"unsupported", "out-of-scope"}:
             if reason not in reasons:
@@ -178,6 +211,52 @@ def validate_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]
         if removed:
             detail.append("tests no longer upstream: " + ", ".join(removed))
         raise CompatError("pinned rsync inventory drifted; " + "; ".join(detail))
+
+
+def validate_regressions(regressions: dict, manifest: dict) -> None:
+    compat_tests = {test["name"] for test in manifest.get("tests", [])}
+    local_source = (ROOT / "tests" / "local.rs").read_text()
+    local_tests = set(re.findall(r"(?m)^fn ([a-z0-9_]+)\(\)", local_source))
+    seen: set[str] = set()
+    for item in regressions.get("regressions", []):
+        regression_id = item.get("id", "")
+        if (
+            not re.fullmatch(r"[a-z0-9][a-z0-9-]*", regression_id)
+            or regression_id in seen
+        ):
+            raise CompatError(
+                f"{REGRESSIONS_PATH}: missing, invalid, or duplicate id {regression_id!r}"
+            )
+        seen.add(regression_id)
+        if not item.get("title") or not item.get("claim") or not item.get("note"):
+            raise CompatError(f"{REGRESSIONS_PATH}: {regression_id}: missing description")
+        source_url = item.get("source", "")
+        if not source_url.startswith("https://github.com/RsyncProject/rsync/"):
+            raise CompatError(
+                f"{REGRESSIONS_PATH}: {regression_id}: source must be an official rsync URL"
+            )
+        if item.get("priority") not in VALID_REGRESSION_PRIORITIES:
+            raise CompatError(f"{REGRESSIONS_PATH}: {regression_id}: invalid priority")
+        if item.get("impact") not in VALID_REGRESSION_IMPACTS:
+            raise CompatError(f"{REGRESSIONS_PATH}: {regression_id}: invalid impact")
+        status = item.get("status")
+        if status not in VALID_REGRESSION_STATUSES:
+            raise CompatError(f"{REGRESSIONS_PATH}: {regression_id}: invalid status")
+        compat_refs = item.get("compat_tests", [])
+        local_refs = item.get("local_tests", [])
+        if not all(isinstance(name, str) for name in [*compat_refs, *local_refs]):
+            raise CompatError(f"{REGRESSIONS_PATH}: {regression_id}: test refs must be strings")
+        unknown_compat = sorted(set(compat_refs) - compat_tests)
+        unknown_local = sorted(set(local_refs) - local_tests)
+        if unknown_compat or unknown_local:
+            raise CompatError(
+                f"{REGRESSIONS_PATH}: {regression_id}: unknown test refs "
+                + ", ".join(unknown_compat + unknown_local)
+            )
+        if status in {"covered", "partial"} and not compat_refs and not local_refs:
+            raise CompatError(
+                f"{REGRESSIONS_PATH}: {regression_id}: {status} entry has no executable test"
+            )
 
 
 def verify_source(source: Path, commit: str) -> None:
@@ -422,7 +501,11 @@ def markdown_cell(value: object) -> str:
 def provenance(test: dict) -> str:
     if test["classification"] == "conformance":
         return "unmodified upstream"
-    return f"{test['adaptation_kind']} adaptation ({test['adaptation']})"
+    result = f"{test['adaptation_kind']} adaptation ({test['adaptation']})"
+    source_name = upstream_test_name(test)
+    if source_name != test["name"]:
+        result += f" of upstream {source_name}"
+    return result
 
 
 def render_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]) -> str:
@@ -509,18 +592,91 @@ def render_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]) 
     return "\n".join(lines)
 
 
+def render_regressions(regressions: dict) -> str:
+    counts = collections.Counter(
+        item["status"] for item in regressions.get("regressions", [])
+    )
+    lines = [
+        "# Historical rsync regression corpus",
+        "",
+        "This generated ledger turns selected upstream bug reports, security policy,",
+        "advisories, and regression tests into reviewable behavioral claims for SYQ.",
+        "It prioritizes security, data loss, and data integrity; it is deliberately",
+        "curated rather than a claim that every rsync issue applies to SYQ.",
+        "",
+        "Update it with:",
+        "",
+        "```sh",
+        "python3 scripts/rsync-compat.py --ledger-only --update-ledger",
+        "```",
+        "",
+        "| Status | Cases |",
+        "|---|---:|",
+    ]
+    for status in ("covered", "partial", "candidate", "not-applicable"):
+        lines.append(f"| {status} | {counts[status]} |")
+    lines.extend(
+        [
+            "",
+            "`covered` means the recorded behavioral claim has executable coverage,",
+            "not that SYQ implements every option or internal mechanism in the report.",
+            "`partial` identifies the untested remainder explicitly; `candidate` is",
+            "triaged future work; `not-applicable` records a deliberate exclusion.",
+            "",
+            "| Priority | Impact | Case | Status | Behavioral claim | Executable coverage | Note |",
+            "|---|---|---|---|---|---|---|",
+        ]
+    )
+    priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    for item in sorted(
+        regressions.get("regressions", []),
+        key=lambda row: (priority_order[row["priority"]], row["id"]),
+    ):
+        refs = [f"compat:`{name}`" for name in item.get("compat_tests", [])]
+        refs.extend(f"local:`{name}`" for name in item.get("local_tests", []))
+        source = f"[{item['id']}]({item['source']}) — {item['title']}"
+        lines.append(
+            "| "
+            + " | ".join(
+                markdown_cell(value)
+                for value in (
+                    item["priority"],
+                    item["impact"],
+                    source,
+                    item["status"],
+                    item["claim"],
+                    "; ".join(refs) or "none",
+                    item["note"],
+                )
+            )
+            + " |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def check_ledger(
     manifest: dict,
     inventory: dict[str, tuple[str, str | None]],
+    regressions: dict,
     *,
     update: bool,
 ) -> None:
     rendered = render_ledger(manifest, inventory)
+    rendered_regressions = render_regressions(regressions)
     if update:
         LEDGER_PATH.write_text(rendered)
+        REGRESSIONS_LEDGER_PATH.write_text(rendered_regressions)
     if not LEDGER_PATH.is_file() or LEDGER_PATH.read_text() != rendered:
         raise CompatError(
             f"{LEDGER_PATH} is stale; run with --ledger-only --update-ledger"
+        )
+    if (
+        not REGRESSIONS_LEDGER_PATH.is_file()
+        or REGRESSIONS_LEDGER_PATH.read_text() != rendered_regressions
+    ):
+        raise CompatError(
+            f"{REGRESSIONS_LEDGER_PATH} is stale; run with --ledger-only --update-ledger"
         )
 
 
@@ -866,6 +1022,7 @@ def main() -> int:
         raise CompatError("--report-label may contain only letters, digits, _ and -")
     manifest = load_manifest()
     inventory = load_inventory()
+    regressions = load_regressions()
     target = manifest["target"]
 
     cache = args.cache_dir.resolve()
@@ -878,7 +1035,8 @@ def main() -> int:
     else:
         source = fetch_source(cache, upstream["repository"], upstream["commit"])
     validate_ledger(manifest, inventory, source)
-    check_ledger(manifest, inventory, update=args.update_ledger)
+    validate_regressions(regressions, manifest)
+    check_ledger(manifest, inventory, regressions, update=args.update_ledger)
     if args.ledger_only:
         return 0
 
@@ -962,6 +1120,7 @@ def main() -> int:
         test_results.append(
             {
                 "name": name,
+                "upstream_test": upstream_test_name(test),
                 "classification": test["classification"],
                 "adaptation": test.get("adaptation"),
                 "adaptation_kind": test.get("adaptation_kind"),

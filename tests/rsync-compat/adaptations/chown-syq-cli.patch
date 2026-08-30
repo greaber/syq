@@ -11,9 +11,23 @@ index 116b97e..bfeb62d 100644
      my_uid = os.getuid()
      if my_uid != 0:
          # If a fakeroot binary is in the environment, re-exec ourselves
-@@ -70,4 +68,4 @@ if not chown_or_fake(name2, 5001, 5003):
+@@ -70,4 +68,18 @@ if not chown_or_fake(name2, 5001, 5003):
      test_skipped("Can't chown (probably need root)")
 
++deep = FROMDIR / 'deep'
++inner = deep / 'inner'
++inner.mkdir(parents=True)
++deep_file = inner / 'name3'
++deep_file.write_text("This is the deep file\n")
++
++for path, uid, gid in (
++    (deep_file, 5004, 5007),
++    (inner, 5005, 5008),
++    (deep, 5006, 5009),
++):
++    if not chown_or_fake(path, uid, gid):
++        test_skipped("Can't chown a nested entry (probably need root)")
++
  os.chdir(FROMDIR.parent)
 -checkit(['-aHvv', 'from/', 'to/'], FROMDIR, TODIR)
 +checkit(['-avv', 'from/', 'to/'], FROMDIR, TODIR)

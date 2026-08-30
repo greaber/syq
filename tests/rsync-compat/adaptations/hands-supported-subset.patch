@@ -1,22 +1,26 @@
 diff --git a/testsuite/hands_test.py b/testsuite/hands_test.py
-index b693cb0..293720c 100644
+index b693cb0..11dd7f5 100644
 --- a/testsuite/hands_test.py
 +++ b/testsuite/hands_test.py
-@@ -3,61 +3,34 @@
+@@ -3,52 +3,45 @@
  #
  # The canonical end-to-end transfer test: build a richly-populated source
  # tree via hands_setup() then run a series of rsync invocations covering
 -# basic operation, hard links, single-file copies, --no-whole-file delta
 -# updates and --delete cleanup. After each run the source and destination
 -# tree listings must match exactly.
-+# basic operation, single-file copies, repair, and --delete cleanup. After
-+# each run the source and destination tree listings must match exactly.
++# basic operation, single-file copies, repair, --delete cleanup, and explicit
++# multiple-source mapping. After each run the source and destination tree
++# listings must match exactly.
 
--import os
+ import os
  import shutil
++import stat
 
 -from rsyncfns import FROMDIR, TMPDIR, TODIR, checkit, hands_setup, run_rsync
-+from rsyncfns import FROMDIR, TODIR, checkit, hands_setup
++from rsyncfns import (
++    FROMDIR, TMPDIR, TODIR, checkit, hands_setup, run_rsync, verify_dirs,
++)
 
 
  hands_setup()
@@ -57,19 +61,29 @@ index b693cb0..293720c 100644
  shutil.copy(FROMDIR / 'text', TODIR / 'ThisShouldGo')
  print("Test --delete:")
 -checkit(['--delete', '-avH', DEBUG_OPTS, f'{FROMDIR}/', str(TODIR)], FROMDIR, TODIR)
--
++checkit(['--delete', '-av', f'{FROMDIR}/', str(TODIR)], FROMDIR, TODIR)
+
 -# 6. globbed copy without recursion — wipe and re-sync top-level entries by
 -# glob, then a final empty pass to compare listings.
--os.chdir(TMPDIR)
--shutil.rmtree('to', ignore_errors=True)
--for entry in TMPDIR.glob('from/*dir'):
--    if entry.is_dir():
--        shutil.rmtree(entry, ignore_errors=True)
--    else:
--        entry.unlink()
--
--# Replicate `rsync -av from/* to/` — list the from/ children explicitly.
--sources = sorted(str(p) for p in (TMPDIR / 'from').iterdir())
--run_rsync('-av', *sources, 'to/')
++# 5. multiple sources — wipe and re-sync the remaining top-level entries as
++# explicit source arguments.
+ os.chdir(TMPDIR)
+ shutil.rmtree('to', ignore_errors=True)
+ for entry in TMPDIR.glob('from/*dir'):
+@@ -60,4 +53,15 @@ for entry in TMPDIR.glob('from/*dir'):
+ # Replicate `rsync -av from/* to/` — list the from/ children explicitly.
+ sources = sorted(str(p) for p in (TMPDIR / 'from').iterdir())
+ run_rsync('-av', *sources, 'to/')
 -checkit(['-av', '--exclude=*', 'from/', 'to/'], FROMDIR, TODIR)
-+checkit(['--delete', '-av', f'{FROMDIR}/', str(TODIR)], FROMDIR, TODIR)
++
++# Explicit children do not nominate FROMDIR itself as a metadata source. Ignore
++# only that root-level difference; verify all children, types, metadata, links,
++# and contents against the source tree.
++source_root = os.stat(FROMDIR, follow_symlinks=False)
++os.chmod(TODIR, stat.S_IMODE(source_root.st_mode))
++os.utime(
++    TODIR,
++    ns=(source_root.st_atime_ns, source_root.st_mtime_ns),
++    follow_symlinks=False,
++)
++verify_dirs(FROMDIR, TODIR, label='multiple-source copy')

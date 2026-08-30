@@ -1,4 +1,4 @@
-schema = 2
+schema = 3
 
 [upstream]
 repository = "https://github.com/RsyncProject/rsync.git"
@@ -172,9 +172,9 @@ position = "compatible"
 baseline = "pass"
 platforms = ["linux"]
 run_as = "root"
-tags = ["local", "metadata", "ownership"]
+tags = ["local", "metadata", "ownership", "depth"]
 requirements = ["root", "chown"]
-note = "Archive mode preserves numeric owners and groups; rsync-only --super and -H are removed."
+note = "Archive mode preserves varied numeric owners and groups on files and directories at depth; rsync-only --super and -H are removed."
 
 [[tests]]
 name = "deep-path"
@@ -291,6 +291,20 @@ requirements = ["rsync lsh test helper"]
 note = "Remote-shell copy and follow-up deletion using SYQ's remote executable option."
 
 [[tests]]
+name = "source-read-failure-continues"
+upstream_test = "source-change-size-continues"
+classification = "adapted"
+adaptation = "source-read-failure-syq-hook"
+adaptation_kind = "fixture"
+area = "failure-isolation"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "source-change", "partial-failure", "data-integrity"]
+requirements = ["debug SYQ build"]
+note = "A deterministic source shrink during ReadRange fails visibly, preserves the existing destination, and allows a later file to transfer; rsync's exact exit code and diagnostic wording are not required."
+
+[[tests]]
 name = "symlink-race-dest"
 classification = "conformance"
 area = "security"
@@ -380,15 +394,43 @@ note = "Without -p, rerunning a copy leaves existing destination modes and execu
 [[tests]]
 name = "files-from-depth"
 classification = "adapted"
-adaptation = "files-from-core"
+adaptation = "files-from-split"
 adaptation_kind = "subset"
 area = "file-selection"
-position = "policy-open"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "files-from", "from0", "depth"]
+requirements = []
+note = "Deep line- and NUL-delimited --files-from selection agree; comment handling and unsupported filter-list cases are reported separately or omitted."
+
+[[tests]]
+name = "files-from-comments-line"
+upstream_test = "files-from-depth"
+classification = "adapted"
+adaptation = "files-from-split"
+adaptation_kind = "subset"
+area = "file-selection"
+position = "unimplemented"
 baseline = "fail"
 platforms = ["linux"]
-tags = ["local", "files-from", "from0", "known-gap"]
+tags = ["local", "files-from", "comments", "known-gap"]
 requirements = []
-note = "Deep --files-from and --from0 selection pass, but SYQ transfers entries beginning with # or ; instead of treating them as rsync comments; unsupported filter-list cases are omitted."
+note = "SYQ currently treats entries beginning with # or ; as filenames in a line-delimited --files-from list instead of rsync comments."
+
+[[tests]]
+name = "files-from-comments-from0"
+upstream_test = "files-from-depth"
+classification = "adapted"
+adaptation = "files-from-split"
+adaptation_kind = "subset"
+area = "file-selection"
+position = "unimplemented"
+baseline = "fail"
+platforms = ["linux"]
+tags = ["local", "files-from", "from0", "comments", "known-gap"]
+requirements = []
+note = "SYQ currently treats entries beginning with # or ; as filenames in a NUL-delimited --files-from list instead of rsync comments."
 
 [[tests]]
 name = "hands"
@@ -399,9 +441,9 @@ area = "end-to-end"
 position = "compatible"
 baseline = "pass"
 platforms = ["linux"]
-tags = ["local", "end-to-end", "delete"]
+tags = ["local", "end-to-end", "delete", "multiple-sources"]
 requirements = ["symlinks", "POSIX modes"]
-note = "The canonical rich-tree test covers initial copy, one-file repair, a longer destination, and deletion; hard-link preservation, delta debugging, and the filter-dependent multi-source section are omitted."
+note = "The canonical rich-tree test covers initial copy, one-file repair, a longer destination, deletion, and explicit multiple-source mapping; only destination-root metadata is normalized because no source root was transferred. Hard-link preservation and delta debugging are omitted."
 
 [[tests]]
 name = "hardlinks-deep"

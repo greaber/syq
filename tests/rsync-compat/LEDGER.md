@@ -12,9 +12,9 @@ Configured command prefix: `syq`.
 | Classification | Tests |
 |---|---:|
 | conformance | 15 |
-| adapted | 20 |
+| adapted | 21 |
 | unsupported | 133 |
-| out-of-scope | 183 |
+| out-of-scope | 182 |
 | unassessed | 0 |
 
 ## Runnable behavioral tests
@@ -24,13 +24,16 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | Area | Test | Baseline | Product position | Provenance | Circumstances | Note |
 |---|---|---|---|---|---|---|
 | deletion | `delete-deep` | pass | Compatible | subset adaptation (delete-supported-subset) | platform=linux | Deep deletion, --delete-delay/--delete-after, --existing, and --ignore-existing agree; unsupported delete timing and backup cases and SYQ's intentional --max-delete policy difference are omitted. |
-| end-to-end | `hands` | pass | Compatible | subset adaptation (hands-supported-subset) | platform=linux; symlinks; POSIX modes | The canonical rich-tree test covers initial copy, one-file repair, a longer destination, and deletion; hard-link preservation, delta debugging, and the filter-dependent multi-source section are omitted. |
-| file-selection | `files-from-depth` | fail | Policy open | subset adaptation (files-from-core) | platform=linux | Deep --files-from and --from0 selection pass, but SYQ transfers entries beginning with # or ; instead of treating them as rsync comments; unsupported filter-list cases are omitted. |
+| end-to-end | `hands` | pass | Compatible | subset adaptation (hands-supported-subset) | platform=linux; symlinks; POSIX modes | The canonical rich-tree test covers initial copy, one-file repair, a longer destination, deletion, and explicit multiple-source mapping; only destination-root metadata is normalized because no source root was transferred. Hard-link preservation and delta debugging are omitted. |
+| failure-isolation | `source-read-failure-continues` | pass | Compatible | fixture adaptation (source-read-failure-syq-hook) of upstream source-change-size-continues | platform=linux; debug SYQ build | A deterministic source shrink during ReadRange fails visibly, preserves the existing destination, and allows a later file to transfer; rsync's exact exit code and diagnostic wording are not required. |
+| file-selection | `files-from-comments-from0` | fail | Unimplemented | subset adaptation (files-from-split) of upstream files-from-depth | platform=linux | SYQ currently treats entries beginning with # or ; as filenames in a NUL-delimited --files-from list instead of rsync comments. |
+| file-selection | `files-from-comments-line` | fail | Unimplemented | subset adaptation (files-from-split) of upstream files-from-depth | platform=linux | SYQ currently treats entries beginning with # or ; as filenames in a line-delimited --files-from list instead of rsync comments. |
+| file-selection | `files-from-depth` | pass | Compatible | subset adaptation (files-from-split) | platform=linux | Deep line- and NUL-delimited --files-from selection agree; comment handling and unsupported filter-list cases are reported separately or omitted. |
 | file-selection | `files-from-path-clamp` | fail | Policy open | unmodified upstream | platform=linux | SYQ rejects parent components instead of clamping them at the source root. |
 | file-selection | `size-filter` | pass | Compatible | unmodified upstream | platform=linux | Apply --min-size and --max-size throughout a deep tree. |
 | hardlinks | `hardlinks-deep` | pass | Compatible | subset adaptation (hardlink-default) | platform=linux; hard links | Without -H, two cross-directory source names for one inode become independent destination files; unsupported hard-link preservation is omitted. |
 | metadata | `chgrp` | pass | Compatible | unmodified upstream | platform=linux; POSIX groups; chgrp | Preserve a supplementary group with -g. |
-| metadata | `chown` | pass | Compatible | subset adaptation (chown-syq-cli) | platform=linux; run-as=root; root; chown | Archive mode preserves numeric owners and groups; rsync-only --super and -H are removed. |
+| metadata | `chown` | pass | Compatible | subset adaptation (chown-syq-cli) | platform=linux; run-as=root; root; chown | Archive mode preserves varied numeric owners and groups on files and directories at depth; rsync-only --super and -H are removed. |
 | metadata | `dir-sgid` | pass | Compatible | unmodified upstream | platform=linux; POSIX modes | Honor setgid inheritance when creating destination directories. |
 | metadata | `executability` | pass | Compatible | subset adaptation (executability-default) | platform=linux; POSIX modes | Without -p, rerunning a copy leaves existing destination modes and executable bits unchanged; unsupported -E behavior is omitted. |
 | metadata | `metadata-depth` | pass | Compatible | subset adaptation (metadata-supported-subset) | platform=linux; POSIX modes and mtimes | Preserve modes and mtimes throughout a deep tree; upstream's unsupported --chmod case is omitted. |
@@ -393,7 +396,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `sender-remove-source-secure` | `rsync-daemon` |
 | `simd-checksum` | `rsync-internal` |
 | `skiplist-spec` | `rsync-internal` |
-| `source-change-size-continues` | `rsync-internal` |
 | `symlink-exclude` | `rsync-daemon` |
 | `trimslash` | `rsync-internal` |
 | `uidlist-id0-name-leak` | `rsync-internal` |

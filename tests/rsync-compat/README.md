@@ -22,10 +22,11 @@ already configured checkout at the exact pin. Reports are written as JSON,
 Markdown, static HTML, and a raw log under `target/rsync-compat/reports/`.
 
 Only the classified runnable subset is executed, not all 351 inventoried
-tests. A warm non-root Linux run selects 31 tests and takes about 11 seconds on
-the development machine; four more tests apply when run as root. A first run
-also downloads and prepares the pinned rsync checkout and may do a cold Rust
-build. The exact cold time depends mostly on network and Cargo state.
+tests. The 36 runnable upstream test sources currently produce 38 independently
+reported scenarios. A warm non-root Linux run selects 34 scenarios and takes
+about 7 seconds on the development machine; four more apply when run as root. A
+first run also downloads and prepares the pinned rsync checkout and may do a
+cold Rust build. The exact cold time depends mostly on network and Cargo state.
 
 The source checkout and prepared helpers are content-addressed and reused until
 the rsync pin, helper configuration, or adaptation patches change. Cargo uses
@@ -66,6 +67,12 @@ into one pass percentage:
 - provenance says whether the upstream test is unmodified or carries an
   `invocation`, `fixture`, or `subset` adaptation.
 
+An aggregate upstream test may be split into multiple adapted scenarios by
+giving each scenario a unique `name` and recording the original filename in
+`upstream_test`. This keeps the upstream inventory one-to-one with its source
+tree while reporting behaviorally independent pass and failure outcomes
+separately.
+
 The runner exit status is checked independently of those baselines. An ordinary
 test failure is not a harness failure when the runner reports it consistently;
 missing, duplicate, or contradictory output is. Markdown and HTML reports show
@@ -74,8 +81,15 @@ provenance, platform/user circumstances, any baseline changes, and a compact
 breakdown of unsupported user-facing feature areas. Rsync-internal tests remain
 out of the compatibility matrix.
 
-`LEDGER.md` is the generated readable inventory. Update it with
-`--ledger-only --update-ledger`; normal runs reject a stale copy.
+`LEDGER.md` is the generated readable upstream inventory. `REGRESSIONS.md` is
+a second generated ledger for a curated corpus of historical rsync bug reports,
+security advisories, and regression tests. Its source of truth,
+`regressions.toml`, links each report to a narrow behavioral claim, priority,
+applicability decision, and any executable upstream-harness or Rust integration
+tests. This keeps useful bug history without pretending rsync-protocol or
+unsupported-feature failures automatically apply to SYQ. Update both ledgers
+with `--ledger-only --update-ledger`; normal runs reject a stale copy or a test
+reference that no longer exists.
 
 ## Adaptations
 

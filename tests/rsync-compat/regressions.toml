@@ -1,0 +1,121 @@
+schema = 1
+
+[[regressions]]
+id = "rsync-security-parent-symlink-races"
+source = "https://github.com/RsyncProject/rsync/blob/7c20b077c980036a19587701cec320cc88e42a4a/SECURITY.md"
+title = "Parent-component symlink races can escape transfer roots"
+priority = "critical"
+impact = "security"
+status = "partial"
+claim = "Peer-selected source and destination paths must not be redirected outside their transfer roots by raced parent symlinks."
+compat_tests = ["sender-scan-dir-escape", "symlink-race-source", "symlink-race-dest", "symlink-race-relative-dest"]
+local_tests = ["self_copy_guard_sees_through_symlinks", "files_from_self_copy_through_symlinked_root_is_rejected"]
+note = "Source-side confinement passes. The two root-only destination tests deliberately retain expected failures for attacker-owned symlinks in operator-named destination paths, so this remains partial and highly visible."
+
+[[regressions]]
+id = "rsync-359"
+source = "https://github.com/RsyncProject/rsync/issues/359"
+title = "Self-copy with source removal destroyed the source"
+priority = "critical"
+impact = "data-loss"
+status = "partial"
+claim = "A copy whose effective source and destination are the same inode or tree must never truncate or overwrite its only good copy."
+compat_tests = []
+local_tests = ["inplace_self_copy_preserves_source", "file_onto_itself_is_allowed_noop", "copy_onto_itself_among_sources_is_order_independent"]
+note = "SYQ's supported ordinary and --inplace self-copy paths are guarded. Rsync's destructive --remove-source-files mode is not implemented, so the exact historical command is not applicable yet."
+
+[[regressions]]
+id = "rsync-ghsa-phxh-hjqv-39c9"
+source = "https://github.com/RsyncProject/rsync/security/advisories/GHSA-phxh-hjqv-39c9"
+title = "Raced ACL/xattr application could modify an inode outside the destination"
+priority = "critical"
+impact = "security"
+status = "not-applicable"
+claim = "Metadata application must remain bound to the intended destination inode."
+compat_tests = []
+local_tests = []
+note = "SYQ does not implement ACL or xattr preservation, the vulnerable metadata classes. This entry prevents that exclusion from being mistaken for an unreviewed gap if those features are added later."
+
+[[regressions]]
+id = "rsync-source-change-size-continues"
+source = "https://github.com/RsyncProject/rsync/blob/7c20b077c980036a19587701cec320cc88e42a4a/testsuite/source-change-size-continues_test.py"
+title = "A changed source aborted unrelated later transfers"
+priority = "high"
+impact = "data-integrity"
+status = "covered"
+claim = "A source that shrinks at read time must fail visibly, preserve an existing destination, and not abort unrelated later files."
+compat_tests = ["source-read-failure-continues"]
+local_tests = []
+note = "The adapted fixture deterministically mutates the source in SYQ's ReadRange path and checks all three consequences."
+
+[[regressions]]
+id = "rsync-remote-shell-newline"
+source = "https://github.com/RsyncProject/rsync/blob/7c20b077c980036a19587701cec320cc88e42a4a/testsuite/remote-shell-newline-escaping_test.py"
+title = "A newline in a remote argument could split a shell command"
+priority = "high"
+impact = "security"
+status = "covered"
+claim = "A newline-bearing remote destination must remain one quoted argument and must not execute an injected command."
+compat_tests = ["remote-shell-newline-escaping"]
+local_tests = []
+note = "The adaptation substitutes SYQ's remote option spelling without weakening the command-injection oracle."
+
+[[regressions]]
+id = "rsync-350"
+source = "https://github.com/RsyncProject/rsync/issues/350"
+title = "Valid --files-from entries were randomly rejected after a security fix"
+priority = "high"
+impact = "availability"
+status = "partial"
+claim = "Large --files-from inputs must retain every valid selected path across internal batching boundaries."
+compat_tests = ["files-from-depth"]
+local_tests = ["files_from_repeats_and_late_listed_dirs_across_chunks"]
+note = "SYQ's 1,200-entry chunk-boundary test covers its analogous planner risk. The rsync protocol-validation mechanism that caused the original remote failure is intentionally different."
+
+[[regressions]]
+id = "rsync-376"
+source = "https://github.com/RsyncProject/rsync/issues/376"
+title = "Hash-shaped --files-from entries were rejected as unrequested"
+priority = "high"
+impact = "availability"
+status = "partial"
+claim = "A large set of valid nested --files-from names must transfer completely without ordering-dependent rejection."
+compat_tests = ["files-from-depth"]
+local_tests = ["files_from_repeats_and_late_listed_dirs_across_chunks"]
+note = "Current coverage stresses chunking and late directory claims but not the original rsync wire protocol or its exact hash corpus; a remote SYQ variant would complete this case."
+
+[[regressions]]
+id = "rsync-715"
+source = "https://github.com/RsyncProject/rsync/issues/715"
+title = "Security hardening broke updates through a symlinked relative path"
+priority = "high"
+impact = "data-integrity"
+status = "candidate"
+claim = "A supported relative-path copy through a legitimate destination directory symlink must update reliably without discarding verified data."
+compat_tests = []
+local_tests = []
+note = "The reproducer depends on --relative/-R behavior that SYQ does not implement. Keep it queued for the rsync subcommand's relative-path work."
+
+[[regressions]]
+id = "rsync-959"
+source = "https://github.com/RsyncProject/rsync/issues/959"
+title = "Security hardening amplified memory use for large directory trees"
+priority = "high"
+impact = "resource-exhaustion"
+status = "candidate"
+claim = "Scanning many empty directories should use memory proportional to useful planner state, without catastrophic amplification."
+compat_tests = []
+local_tests = []
+note = "The reported 80,000-directory corpus is too large for the normal compatibility job. Add a separately budgeted scale test with an explicit memory envelope."
+
+[[regressions]]
+id = "rsync-897"
+source = "https://github.com/RsyncProject/rsync/issues/897"
+title = "Native rsync protocol reads failed after path hardening"
+priority = "medium"
+impact = "availability"
+status = "not-applicable"
+claim = "A remote protocol implementation must open module-root source files through its intended confinement model."
+compat_tests = []
+local_tests = []
+note = "The failure is specific to rsync daemon/native-protocol module roots. SYQ uses its own authenticated helper protocol, so this exact regression is outside the compatibility surface."

@@ -726,6 +726,28 @@ fn fail_set_meta_for_test(p: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+fn shrink_source_on_read_for_test(p: &Path) -> Result<()> {
+    let Some(target) = std::env::var_os("SYQ_TEST_SHRINK_ON_READ") else {
+        return Ok(());
+    };
+    if Path::new(&target) != p {
+        return Ok(());
+    }
+
+    OpenOptions::new()
+        .write(true)
+        .open(p)
+        .with_context(|| format!("open {} for injected shrink", p.display()))?
+        .set_len(0)
+        .with_context(|| format!("shrink {} for test", p.display()))?;
+    if let Some(marker) = std::env::var_os("SYQ_TEST_SHRINK_MARK") {
+        fs::write(&marker, b"shrunk\n")
+            .with_context(|| format!("write test marker {}", Path::new(&marker).display()))?;
+    }
+    Ok(())
+}
+
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
 
@@ -1233,6 +1255,8 @@ impl FsOps {
         len: u32,
     ) -> Result<Response> {
         let p = resolve(path);
+        #[cfg(debug_assertions)]
+        shrink_source_on_read_for_test(&p)?;
         let f = self.cached(&p, false, attempt, false)?;
         let mut data = vec![0u8; len as usize];
         f.read_exact_at(&mut data, off)

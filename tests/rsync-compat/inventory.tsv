@@ -317,7 +317,7 @@ sender-scan-dir-escape	conformance	-
 simd-checksum	out-of-scope	rsync-internal
 size-filter	conformance	-
 skiplist-spec	out-of-scope	rsync-internal
-source-change-size-continues	out-of-scope	rsync-internal
+source-change-size-continues	adapted	-
 sparse	unsupported	unsupported-transfer-mode
 ssh-basic	adapted	-
 stop-time	unsupported	unsupported-transfer-mode
