@@ -29,11 +29,23 @@ impl EnrollmentId {
                 ENROLLMENT_ID_BYTES * 2
             );
         }
+        let bytes = (0..ENROLLMENT_ID_BYTES)
+            .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("lowercase hexadecimal enrollment ID");
+        let version = bytes[6] >> 4;
+        if bytes[8] & 0xc0 != 0x80 || !(1..=8).contains(&version) {
+            bail!("enrollment ID must be an RFC 4122 UUID");
+        }
         Ok(Self(value.to_owned()))
     }
 
     pub fn random() -> Self {
-        let bytes = crate::crypto::random_bytes(ENROLLMENT_ID_BYTES);
+        let mut bytes = crate::crypto::random_bytes(ENROLLMENT_ID_BYTES);
+        // RFC 4122 variant, randomly generated (version 4).  The on-wire and
+        // authorized_keys spelling stays compact lowercase hexadecimal.
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
         let mut value = String::with_capacity(ENROLLMENT_ID_BYTES * 2);
         for byte in bytes {
             use std::fmt::Write as _;
@@ -349,7 +361,7 @@ pub fn enrollment_ssh_args(
         // end-to-end with HostB.
         args.push("-o".to_owned());
         args.push(format!(
-            "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W %h:%p -- {}",
+            "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W '[%h]:%p' -- {}",
             jump.as_str()
         ));
     }
@@ -378,6 +390,15 @@ mod tests {
 
     fn id() -> EnrollmentId {
         EnrollmentId::parse("00112233445566778899aabbccddeeff").unwrap()
+    }
+
+    #[test]
+    fn enrollment_ids_are_rfc_4122_uuids() {
+        let generated = EnrollmentId::random();
+        assert_eq!(generated.as_str().as_bytes()[12], b'4');
+        assert!(matches!(generated.as_str().as_bytes()[16], b'8'..=b'9' | b'a'..=b'b'));
+        assert!(EnrollmentId::parse("00112233445566770899aabbccddeeff").is_err());
+        assert!(EnrollmentId::parse("00112233445566774899aabbccddeeff").is_err());
     }
 
     #[test]
@@ -522,7 +543,7 @@ mod tests {
                 "-o",
                 "PermitLocalCommand=no",
                 "-o",
-                "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W %h:%p -- user@hostA",
+                "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W '[%h]:%p' -- user@hostA",
                 "--",
                 "backup@hostB",
                 "/opt/syq/enroll",
