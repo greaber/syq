@@ -1383,25 +1383,24 @@ impl FsOps {
             } => self
                 .copy_local(src, dst, *inplace, partial_id, *size, *mode)
                 .map(|_| Response::Ok),
-            Request::PutSmall {
-                path,
-                partial_id,
-                data,
-                hash,
-                meta,
-                flags,
-            } => self
-                .put_small(
-                    PartialTarget {
-                        path,
-                        id: partial_id,
-                    },
-                    data,
-                    *hash,
-                    meta,
-                    *flags,
-                )
-                .map(|_| Response::Ok),
+            Request::PutSmallBatch(puts) => Ok(Response::Applied(
+                puts.iter()
+                    .map(|put| {
+                        self.put_small(
+                            PartialTarget {
+                                path: &put.path,
+                                id: &put.partial_id,
+                            },
+                            &put.data,
+                            put.hash,
+                            &put.meta,
+                            put.flags,
+                        )
+                        .err()
+                        .map(|error| errstr(&error))
+                    })
+                    .collect(),
+            )),
             Request::HashBlocks {
                 path,
                 which,
@@ -1417,6 +1416,18 @@ impl FsOps {
                 off,
                 len,
             } => self.read_range(path, *attempt, *off, *len),
+            Request::ReadSmallBatch(reads) => Ok(Response::SmallBlocks(
+                reads
+                    .iter()
+                    .map(
+                        |read| match self.read_range(&read.path, read.attempt, 0, read.len) {
+                            Ok(Response::Block { data, hash, .. }) => Ok(SmallBlock { data, hash }),
+                            Ok(other) => Err(format!("unexpected response {other:?}")),
+                            Err(error) => Err(errstr(&error)),
+                        },
+                    )
+                    .collect(),
+            )),
             Request::WriteRange {
                 path,
                 inplace,

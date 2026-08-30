@@ -1036,7 +1036,8 @@ pub fn run(args: Args) -> Result<i32> {
         opts: &opts,
         completed: checkpoint_completed,
         checkpoint: checkpoint_writer,
-        destination_tree_known_missing: dst_initially_missing
+        destination_tree_known_missing: dst.is_remote()
+            && dst_initially_missing
             && !opts.ignore_existing
             && !opts.update
             && !opts.checksum,
@@ -1890,9 +1891,9 @@ struct Planner<'a> {
     completed:
         Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>>,
     checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
-    /// Once syq has observed a missing destination root, every mapped path is
-    /// missing too. Avoid re-statting thousands of impossible descendants;
-    /// receiver-side mutations still perform their normal race-safe checks.
+    /// Once syq has observed a missing remote destination root, every mapped
+    /// path is missing too. Avoid WAN round trips for impossible descendants;
+    /// local stats stay cheap and warm filesystem metadata for the writers.
     destination_tree_known_missing: bool,
     /// Mapped payload paths that look like current sidecars, and every
     /// sidecar path the current job may use. Their intersection is unsafe.
@@ -3746,6 +3747,9 @@ impl Worker {
                 }
                 Item::File(idx) => {
                     if self.fast_eligible(idx) {
+                        let target = self
+                            .sched
+                            .begin_fast_batch(self.gate.active(), FAST_BATCH_FILES);
                         let mut batch = vec![idx];
                         // The fast path reads a whole batch before sending it.
                         // Keep rate-limited batches to one file so a push can't
@@ -3753,16 +3757,16 @@ impl Worker {
                         if self.bwlimit.is_none() {
                             batch.extend(self.sched.take_small(
                                 self.opts.block,
-                                FAST_BATCH_FILES - batch.len(),
+                                target - batch.len(),
                                 FAST_BATCH_BYTES,
                             ));
                         }
                         let (fast, slow): (Vec<usize>, Vec<usize>) =
                             batch.into_iter().partition(|&i| self.fast_eligible(i));
-                        if let Err(e) = self.fast_batch(&fast) {
-                            for &i in &fast {
-                                self.sched.ranges_ready(i, vec![]);
-                            }
+                        self.sched.mark_fast(fast.len() - 1);
+                        let fast_result = self.fast_batch(&fast);
+                        self.sched.complete_fast_batch(fast.len());
+                        if let Err(e) = fast_result {
                             if self.transport_dead() {
                                 for &i in &slow {
                                     self.sched.ranges_ready(i, vec![]);
@@ -3878,38 +3882,41 @@ impl Worker {
         for j in &jobs {
             if j.entry.size > 0 {
                 self.limit(j.entry.size);
-                self.src.send(Request::ReadRange {
-                    path: j.src.clone(),
-                    attempt: j.attempts,
-                    off: 0,
-                    len: j.entry.size as u32,
-                })?;
             }
         }
-        let mut data: Vec<Result<Vec<u8>>> = Vec::with_capacity(jobs.len());
-        for j in &jobs {
-            if j.entry.size == 0 {
-                data.push(Ok(Vec::new()));
-                continue;
-            }
-            data.push(match ok(self.src.recv()?, "read") {
-                Ok(Response::Block { hash, data, .. }) => {
-                    if xxh3_64(&data) != hash {
-                        Err(anyhow::anyhow!("block hash mismatch on read"))
-                    } else {
-                        Ok(data)
-                    }
+        self.src.send(Request::ReadSmallBatch(
+            jobs.iter()
+                .map(|job| SmallRead {
+                    path: job.src.clone(),
+                    attempt: job.attempts,
+                    len: job.entry.size as u32,
+                })
+                .collect(),
+        ))?;
+        let blocks = match ok(self.src.recv()?, "read small batch")? {
+            Response::SmallBlocks(blocks) if blocks.len() == jobs.len() => blocks,
+            other => bail!("unexpected response {other:?}"),
+        };
+        let mut data: Vec<Result<Vec<u8>>> = jobs
+            .iter()
+            .zip(blocks)
+            .map(|(job, block)| match block {
+                Ok(SmallBlock { data, hash })
+                    if data.len() as u64 == job.entry.size && xxh3_64(&data) == hash =>
+                {
+                    Ok(data)
                 }
-                Ok(other) => Err(anyhow::anyhow!("unexpected response {other:?}")),
-                Err(e) => Err(e),
-            });
-        }
+                Ok(_) => Err(anyhow::anyhow!("block size or hash mismatch on read")),
+                Err(error) => Err(anyhow::anyhow!("read: {error}")),
+            })
+            .collect();
         self.fast.source += phase.elapsed().as_secs_f64();
-        // One PutSmall per file (pipelined): the server writes each small file
-        // through its sidecar and atomically renames it into place.
+        // One batch request: the server still publishes every file through its
+        // own sidecar, but framing, compression and encryption are amortized.
         let phase = std::time::Instant::now();
         let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
         let mut sent: Vec<bool> = Vec::with_capacity(jobs.len());
+        let mut puts = Vec::with_capacity(jobs.len());
         for (j, d) in jobs.iter().zip(data.iter_mut()) {
             let Ok(bytes) = d else {
                 sent.push(false);
@@ -3919,18 +3926,33 @@ impl Worker {
             let hash = xxh3_64(&bytes);
             let mut meta = j.entry.meta();
             meta.mode = self.create_mode(j);
-            self.dst.send(Request::PutSmall {
+            puts.push(SmallPut {
                 path: j.dst.clone(),
                 partial_id: self.partial_id(),
                 data: bytes,
                 hash,
                 meta,
                 flags,
-            })?;
+            });
             sent.push(true);
+        }
+        if !puts.is_empty() {
+            self.dst.send(Request::PutSmallBatch(puts))?;
         }
         self.fast.dest_send += phase.elapsed().as_secs_f64();
         let phase = std::time::Instant::now();
+        let mut applied = if sent.iter().any(|sent| *sent) {
+            match ok(self.dst.recv()?, "put small batch")? {
+                Response::Applied(results)
+                    if results.len() == sent.iter().filter(|sent| **sent).count() =>
+                {
+                    results.into_iter()
+                }
+                other => bail!("unexpected response {other:?}"),
+            }
+        } else {
+            Vec::new().into_iter()
+        };
         let mut results: Vec<Result<()>> = Vec::with_capacity(jobs.len());
         for (d, &was_sent) in data.iter_mut().zip(sent.iter()) {
             let res: Result<()> = if !was_sent {
@@ -3939,7 +3961,10 @@ impl Worker {
                     Err(e) => Err(anyhow::anyhow!("{e:#}")),
                 }
             } else {
-                ok(self.dst.recv()?, "put").map(|_| ())
+                match applied.next().flatten() {
+                    None => Ok(()),
+                    Some(error) => Err(anyhow::anyhow!("put: {error}")),
+                }
             };
             results.push(res);
         }
@@ -3955,7 +3980,6 @@ impl Worker {
             .zip(jobs.iter())
             .zip(results.into_iter().zip(now.into_iter()))
         {
-            self.sched.ranges_ready(*idx, vec![]);
             if let Err(e) = res {
                 self.progress.error(&format!("syq: {}: {e:#}", j.rel));
                 self.sched.fail_file(*idx);
@@ -4112,7 +4136,7 @@ impl Worker {
             let full = || if size > 0 { vec![(0, size)] } else { vec![] };
             // Unless --inplace was explicit, changed files are published
             // through a sidecar + atomic rename. Small new files normally take
-            // the pipelined PutSmall path instead of reaching this worker path.
+            // the batched small-file path instead of reaching this worker path.
             self.set_inplace(idx, inplace);
 
             if inplace {

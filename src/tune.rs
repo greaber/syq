@@ -954,9 +954,9 @@ pub fn run(
         gate.set_retain(retain);
         // A pipelined whole-file batch is already owned and cannot be stolen.
         // Do not repeatedly reconnect slots that drained the queue while the
-        // remaining owners finish; a retry or range requeue makes work
-        // assignable and re-enables healing on the next poll.
-        if sched.has_assignable_work() {
+        // remaining owners finish. Queued/retried work or an ordinary
+        // large-file probe re-enables healing on the next poll.
+        if sched.needs_worker_capacity() {
             for id in gate.begin_warming(retain) {
                 spawn(id);
             }

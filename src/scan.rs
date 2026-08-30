@@ -9,6 +9,12 @@ use std::fs;
 use std::path::Path;
 
 pub const BATCH: usize = 4096;
+const FIRST_BATCH: usize = 1000;
+const FIRST_BATCH_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn batch_ready(len: usize, first: bool, elapsed: std::time::Duration) -> bool {
+    len >= BATCH || (first && len >= FIRST_BATCH && elapsed >= FIRST_BATCH_MAX_DELAY)
+}
 
 /// Per-entry result of the parallel read_dir hook.
 #[derive(Clone, Default, Debug)]
@@ -69,7 +75,11 @@ pub fn scan(
     if !md.is_dir() {
         return sink(vec![root_entry]);
     }
-    let mut batch = Vec::with_capacity(BATCH);
+    // Preserve bounded first-byte progress on slow/NFS walks without splitting
+    // a small, fast scan into several serialized WAN planning round trips.
+    let mut batch = Vec::with_capacity(FIRST_BATCH);
+    let scan_started = std::time::Instant::now();
+    let mut first_batch = true;
     batch.push(root_entry);
     let mut ignored_batch: Vec<PathBytes> = Vec::new();
 
@@ -141,8 +151,9 @@ pub fn scan(
         let rel = full.strip_prefix(root).unwrap_or(&full);
         entry.path = path_bytes(rel);
         batch.push(entry);
-        if batch.len() >= BATCH {
+        if batch_ready(batch.len(), first_batch, scan_started.elapsed()) {
             sink(std::mem::replace(&mut batch, Vec::with_capacity(BATCH)))?;
+            first_batch = false;
         }
     }
     if !batch.is_empty() {
@@ -152,4 +163,17 @@ pub fn scan(
         ignored(ignored_batch)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_batch_balances_progress_and_fast_scan_batching() {
+        assert!(!batch_ready(FIRST_BATCH, true, FIRST_BATCH_MAX_DELAY / 2));
+        assert!(batch_ready(FIRST_BATCH, true, FIRST_BATCH_MAX_DELAY));
+        assert!(!batch_ready(BATCH - 1, false, FIRST_BATCH_MAX_DELAY * 10));
+        assert!(batch_ready(BATCH, false, std::time::Duration::ZERO));
+    }
 }
