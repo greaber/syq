@@ -177,11 +177,13 @@ impl Root {
         let file = open_at(
             parent.directory.as_raw_fd(),
             &parent.leaf,
-            access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
             0,
         )
         .with_context(|| format!("open confined regular file {}", path.label()))?;
         require_regular(&file, path)?;
+        clear_nonblocking(&file)
+            .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
         if truncate {
             file.set_len(0)
                 .with_context(|| format!("truncate confined file {}", path.label()))?;
@@ -190,6 +192,8 @@ impl Root {
     }
 
     /// Create a new regular leaf. Existing leaves of every type are refused.
+    /// Creation accepts only ordinary `0777` permission bits; special mode
+    /// bits require a future explicit metadata operation.
     pub(crate) fn create_file(&self, path: &RelativePath, mode: u32) -> Result<File> {
         let parent = self.resolve_parent(path)?;
         let file = open_at(
@@ -200,26 +204,30 @@ impl Root {
                 | libc::O_EXCL
                 | libc::O_NOFOLLOW
                 | libc::O_NONBLOCK
+                | libc::O_NOCTTY
                 | libc::O_CLOEXEC,
-            mode & 0o7777,
+            mode & 0o777,
         )
         .with_context(|| format!("create confined file {}", path.label()))?;
         require_regular(&file, path)?;
+        clear_nonblocking(&file)
+            .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
         Ok(file)
     }
 
     /// Create exactly one directory. Parents must already exist and be real
-    /// directories beneath this root.
+    /// directories beneath this root. Creation accepts only ordinary `0777`
+    /// permission bits.
     pub(crate) fn create_directory(&self, path: &RelativePath, mode: u32) -> Result<()> {
         let parent = self.resolve_parent(path)?;
-        let result = unsafe {
+        retry_zero(|| unsafe {
             libc::mkdirat(
                 parent.directory.as_raw_fd(),
                 parent.leaf.as_ptr(),
-                (mode & 0o7777) as libc::mode_t,
+                (mode & 0o777) as libc::mode_t,
             )
-        };
-        cvt_zero(result).with_context(|| format!("create confined directory {}", path.label()))
+        })
+        .with_context(|| format!("create confined directory {}", path.label()))
     }
 
     /// Rename one leaf to another. Both parents are resolved and retained
@@ -228,15 +236,15 @@ impl Root {
     pub(crate) fn rename(&self, source: &RelativePath, target: &RelativePath) -> Result<()> {
         let source_parent = self.resolve_parent(source)?;
         let target_parent = self.resolve_parent(target)?;
-        let result = unsafe {
+        retry_zero(|| unsafe {
             libc::renameat(
                 source_parent.directory.as_raw_fd(),
                 source_parent.leaf.as_ptr(),
                 target_parent.directory.as_raw_fd(),
                 target_parent.leaf.as_ptr(),
             )
-        };
-        cvt_zero(result).with_context(|| {
+        })
+        .with_context(|| {
             format!(
                 "rename confined path {} to {}",
                 source.label(),
@@ -264,9 +272,10 @@ impl Root {
         operation: &str,
     ) -> Result<()> {
         let parent = self.resolve_parent(path)?;
-        let result =
-            unsafe { libc::unlinkat(parent.directory.as_raw_fd(), parent.leaf.as_ptr(), flags) };
-        cvt_zero(result).with_context(|| format!("{operation} confined path {}", path.label()))
+        retry_zero(|| unsafe {
+            libc::unlinkat(parent.directory.as_raw_fd(), parent.leaf.as_ptr(), flags)
+        })
+        .with_context(|| format!("{operation} confined path {}", path.label()))
     }
 
     fn resolve_parent(&self, path: &RelativePath) -> Result<ResolvedParent> {
@@ -296,7 +305,12 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     open_at(
         parent.as_raw_fd(),
         &component_cstring(component),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_NOCTTY
+            | libc::O_CLOEXEC,
         0,
     )
 }
@@ -304,19 +318,53 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
 fn open_at(parent: RawFd, name: &CString, flags: libc::c_int, mode: u32) -> io::Result<File> {
     // `mode_t` is narrower than `int` on some platforms (including macOS),
     // so C's default argument promotions require an `int` in this variadic
-    // position. Our callers have already restricted modes to 0o7777.
-    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, mode as libc::c_int) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+    // position. Our callers have already restricted modes to 0o777.
+    loop {
+        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, mode as libc::c_int) };
+        if fd >= 0 {
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
-    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn cvt_zero(result: libc::c_int) -> io::Result<()> {
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+fn clear_nonblocking(file: &File) -> io::Result<()> {
+    let flags = loop {
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags >= 0 {
+            break flags;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
+    if flags & libc::O_NONBLOCK == 0 {
+        return Ok(());
+    }
+    loop {
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
+    loop {
+        if operation() == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -448,8 +496,12 @@ mod tests {
         let raw_name = std::ffi::OsString::from_vec(b"stage-\xff".to_vec());
         let stage_path = tree.path().join("dir").join(&raw_name);
         let mut stage = root
-            .create_file(&relative(b"dir/stage-\xff"), 0o600)
+            .create_file(&relative(b"dir/stage-\xff"), 0o7600)
             .unwrap();
+        let descriptor_flags = unsafe { libc::fcntl(stage.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(descriptor_flags, -1);
+        assert_eq!(descriptor_flags & libc::O_NONBLOCK, 0);
+        assert_eq!(stage.metadata().unwrap().permissions().mode() & 0o7000, 0);
         stage.write_all(b"payload").unwrap();
         stage.flush().unwrap();
         assert_eq!(fs::read(&stage_path).unwrap(), b"payload");
@@ -499,6 +551,7 @@ mod tests {
         let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(descriptor_flags, -1);
         assert_eq!(descriptor_flags & libc::O_ACCMODE, libc::O_WRONLY);
+        assert_eq!(descriptor_flags & libc::O_NONBLOCK, 0);
         file.write_all(b"updated").unwrap();
         drop(file);
         assert!(root
@@ -554,6 +607,7 @@ mod tests {
         fs::create_dir(&root_path).unwrap();
         fs::create_dir(root_path.join("gate")).unwrap();
         fs::create_dir(&outside).unwrap();
+        fs::write(root_path.join("gate/sentinel"), b"inside").unwrap();
         fs::write(outside.join("sentinel"), b"unchanged").unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -571,23 +625,50 @@ mod tests {
         });
 
         let root = Root::open(&root_path).unwrap();
-        let temp = relative(b"gate/work");
-        let final_path = relative(b"gate/final");
-        for _ in 0..2_000 {
-            if let Ok(mut file) = root.create_file(&temp, 0o600) {
-                let _ = file.write_all(b"inside");
-                drop(file);
-                let _ = root.rename(&temp, &final_path);
-                let _ = root.unlink(&final_path);
-                let _ = root.unlink(&temp);
+        let target = relative(b"gate/sentinel");
+        let mut successful_opens = 0usize;
+        for _ in 0..20_000 {
+            if let Ok(mut file) = root.open_regular_write(&target, true) {
+                file.write_all(b"inside").unwrap();
+                successful_opens += 1;
             }
         }
         stop.store(true, Ordering::Relaxed);
         attacker.join().unwrap();
 
+        assert!(
+            successful_opens > 0,
+            "race test never exercised a successful open"
+        );
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
-        assert!(!outside.join("work").exists());
-        assert!(!outside.join("final").exists());
+        assert_eq!(
+            fs::read(root_path.join("gate/sentinel")).unwrap(),
+            b"inside"
+        );
+    }
+
+    #[test]
+    fn special_leaf_types_fail_without_leaking_nonblocking_or_special_modes() {
+        let tree = TestDir::new("special-leaf");
+        let root = Root::open(tree.path()).unwrap();
+        let fifo_path = tree.path().join("fifo");
+        let fifo = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(root.open_regular_read(&relative(b"fifo")).is_err());
+        assert!(root.open_regular_write(&relative(b"fifo"), false).is_err());
+
+        let file = root.create_file(&relative(b"file"), 0o7777).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o7000, 0);
+        root.create_directory(&relative(b"directory"), 0o7777)
+            .unwrap();
+        assert_eq!(
+            fs::metadata(tree.path().join("directory"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7000,
+            0
+        );
     }
 
     #[test]
