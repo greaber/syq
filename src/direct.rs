@@ -213,7 +213,12 @@ fn native_placement_arg(args: &Args) -> Result<&'static str> {
     })
 }
 
-pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
+pub fn run(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    source_operand_count: usize,
+) -> Result<i32> {
     let rsh = parse_rsh(&args.rsh)?;
     let src_host = srcs[0].host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
@@ -418,12 +423,21 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if let Some(grant) = &restricted_grant {
         remote.push(format!("--restricted-grant={grant}"));
     }
+    if let Some(algorithm) = &args.tcp_congestion {
+        remote.push(format!("--tcp-congestion={algorithm}"));
+    }
     remote.push(format!("--tcp-ports={}", args.tcp_ports));
     if args.progress_json && !args.quiet {
         remote.push("--progress-json".into());
     }
     if args.dry_run {
         remote.push(format!("--plan-source-host={src_target}"));
+    }
+    if args.interface == Interface::Rsync {
+        remote.push(format!(
+            "--direct-source-operand-count={source_operand_count}"
+        ));
+        remote.push("--direct-sources-prededuplicated".into());
     }
     if args.no_progress || args.quiet {
         remote.push("--no-progress".into());

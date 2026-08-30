@@ -22,8 +22,25 @@ const WINDOW: usize = 4;
 const MAX_ATTEMPTS: u32 = 3;
 pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 const FAST_BATCH_FILES: usize = 128;
+// Larger batches trade filesystem overlap for fewer request/ack turns. On the
+// measured 262 ms path, 4,096 one-byte files at eight workers improved from a
+// 9.68 s to an 8.72 s median at 512; keep the change confined to high RTT TCP.
+const HIGH_RTT_FAST_BATCH_FILES: usize = 512;
+const HIGH_RTT_US: u64 = 100_000;
 const FAST_BATCH_BYTES: u64 = 16 << 20;
 const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
+
+fn fast_batch_file_limit(src_rtt_us: Option<u64>, dst_rtt_us: Option<u64>) -> usize {
+    if src_rtt_us
+        .into_iter()
+        .chain(dst_rtt_us)
+        .any(|rtt| rtt >= HIGH_RTT_US)
+    {
+        HIGH_RTT_FAST_BATCH_FILES
+    } else {
+        FAST_BATCH_FILES
+    }
+}
 
 pub struct Opts {
     pub block: u64,
@@ -36,6 +53,7 @@ pub struct Opts {
     pub verify_only: bool,
     pub inplace: bool,
     pub same_host: bool,
+    pub dst_remote: bool,
     pub dry_run: bool,
     pub quiet: bool,
     pub verbose: u8,
@@ -194,6 +212,13 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
                 candidate_status(candidate, fastest)
             );
         }
+        let remote = probe.congestion_control.as_deref().unwrap_or("unavailable");
+        match &args.tcp_congestion {
+            Some(requested) => eprintln!(
+                "  congestion control: remote listener {remote}; local data sockets request {requested}"
+            ),
+            None => eprintln!("  congestion control: remote listener {remote} (host default)"),
+        }
     }
 
     let route_state = if args.dry_run {
@@ -271,9 +296,13 @@ fn print_transport_diagnostics(args: &Args, src: &Endpoint, dst: &Endpoint) {
 }
 
 fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
-    let sockets: Vec<TcpSocketStats> = pairs
+    let sockets: Vec<&TcpSocketStats> = pairs
         .iter()
-        .flat_map(|pair| [pair.local, pair.peer].into_iter().flatten())
+        .flat_map(|pair| {
+            [pair.local.as_ref(), pair.peer.as_ref()]
+                .into_iter()
+                .flatten()
+        })
         .collect();
     if sockets.is_empty() {
         return if has_ssh_data {
@@ -284,10 +313,17 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
     }
     // Aggregates are meaningful only when every sampled socket exposes the
     // field. Do not turn an unsupported end into a genuine zero.
-    let sum =
-        |field: fn(&TcpSocketStats) -> Option<u64>| sockets.iter().map(field).sum::<Option<u64>>();
+    let sum = |field: fn(&TcpSocketStats) -> Option<u64>| {
+        sockets
+            .iter()
+            .map(|stats| field(stats))
+            .sum::<Option<u64>>()
+    };
     let values = |field: fn(&TcpSocketStats) -> Option<u64>| {
-        sockets.iter().map(field).collect::<Option<Vec<u64>>>()
+        sockets
+            .iter()
+            .map(|stats| field(stats))
+            .collect::<Option<Vec<u64>>>()
     };
     let bytes_sent = sum(|stats| stats.bytes_sent);
     let bytes_retransmitted = sum(|stats| stats.bytes_retransmitted);
@@ -324,11 +360,30 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
         .map(|pair| pair.label.as_str())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
+    let mut congestion_controls = std::collections::BTreeMap::<&str, usize>::new();
+    let mut unavailable_congestion_controls = 0usize;
+    for socket in &sockets {
+        match socket.congestion_control.as_deref() {
+            Some(algorithm) => *congestion_controls.entry(algorithm).or_default() += 1,
+            None => unavailable_congestion_controls += 1,
+        }
+    }
+    let mut congestion_control = congestion_controls
+        .into_iter()
+        .map(|(algorithm, count)| format!("{algorithm} ({count} socket ends)"))
+        .collect::<Vec<_>>();
+    if unavailable_congestion_controls > 0 {
+        congestion_control.push(format!(
+            "unavailable ({unavailable_congestion_controls} socket ends)"
+        ));
+    }
+    let congestion_control = congestion_control.join(", ");
     let mut output = format!(
-        "\n  tcp connection lifetimes sampled: {} across {} path(s) ({} socket ends)\n  tcp retransmissions (loss signal): {} packets, {} bytes\n  tcp RTT: current average {}, minimum {}\n  tcp congestion: average send window {}, aggregate delivery rate {}\n  tcp window-limited time: receive {}, send-buffer {}\n  tcp ECN CE deliveries: {}",
+        "\n  tcp connection lifetimes sampled: {} across {} path(s) ({} socket ends)\n  tcp congestion control: {}\n  tcp retransmissions (loss signal): {} packets, {} bytes\n  tcp RTT: current average {}, minimum {}\n  tcp congestion: average send window {}, aggregate delivery rate {}\n  tcp window-limited time: receive {}, send-buffer {}\n  tcp ECN CE deliveries: {}",
         pairs.len(),
         paths,
         sockets.len(),
+        congestion_control,
         loss(retransmissions, segments_sent),
         loss(bytes_retransmitted, bytes_sent),
         average_rtt.map_or_else(|| "unavailable".into(), |value| format!("{:.2} ms", value as f64 / 1000.0)),
@@ -585,26 +640,69 @@ pub fn run(args: Args) -> Result<i32> {
     if locs.len() < 2 {
         bail!("need at least one source and a destination");
     }
-    let (dst, srcs) = locs.split_last().unwrap();
+    let raw_source_operands = args
+        .paths
+        .split_last()
+        .map(|(_, sources)| sources)
+        .unwrap_or(&[]);
+    let (dst, original_srcs) = locs.split_last().unwrap();
     if args.restricted_grant.is_some()
-        && (args.no_tcp || args.tcp_plain || srcs[0].is_remote() || !dst.is_remote() || args.relay)
+        && (args.no_tcp
+            || args.tcp_plain
+            || original_srcs[0].is_remote()
+            || !dst.is_remote()
+            || args.relay)
     {
         bail!(
             "a signed receiver grant is valid only for a local-to-remote orchestrator using encrypted TCP data connections"
         );
     }
-    for s in srcs {
-        if !s.same_host(&srcs[0]) {
+    for source in original_srcs {
+        if !source.same_host(&original_srcs[0]) {
             bail!("all sources must be on the same host");
         }
     }
     if args.unrestricted_agent_forwarding
-        && (!srcs[0].is_remote() || !dst.is_remote() || srcs[0].same_host(dst) || args.relay)
+        && (!original_srcs[0].is_remote()
+            || !dst.is_remote()
+            || original_srcs[0].same_host(dst)
+            || args.relay)
     {
         bail!(
             "--unrestricted-agent-forwarding is only valid for a live direct transfer between two different remote hosts"
         );
     }
+    let source_operand_count = if args.locations.is_empty() {
+        args.direct_source_operand_count
+            .unwrap_or(raw_source_operands.len())
+    } else {
+        original_srcs.len()
+    };
+    if source_operand_count < original_srcs.len() {
+        bail!("invalid direct source-operand count");
+    }
+    if args.files_from.is_some() && source_operand_count > 1 {
+        bail!("--files-from takes exactly one source directory");
+    }
+    // Rsync's file-list cleanup collapses an exactly repeated source. Key that
+    // decision on the raw operands, before parsing has normalized spellings,
+    // while retaining original multiplicity for destination placement:
+    // `file file new-dest` still creates a directory like other multi-source
+    // commands.
+    let multiple_source_operands = source_operand_count > 1;
+    let srcs: Vec<Location> = if !args.locations.is_empty() || args.direct_sources_prededuplicated {
+        original_srcs.to_vec()
+    } else {
+        let mut seen_sources = std::collections::HashSet::new();
+        raw_source_operands
+            .iter()
+            .zip(original_srcs)
+            .filter(|(raw, _)| seen_sources.insert(raw.as_str()))
+            .map(|(_, source)| source.clone())
+            .collect()
+    };
+    let srcs = srcs.as_slice();
+    let multiple_distinct_sources = srcs.len() > 1;
     if let Some(checkpoint) = args.checkpoint.as_deref() {
         let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
         for source in srcs.iter().filter(|source| !source.is_remote()) {
@@ -646,6 +744,9 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let dst_ep = endpoint(dst, &args)?;
+    if args.tcp_congestion.is_some() && !src_ep.is_remote() && !dst_ep.is_remote() {
+        bail!("--tcp-congestion applies only to copies with a remote endpoint");
+    }
     // TCP data connections are the default (auto-selecting the fastest reachable
     // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
     // Local<->local needs no data plane at all.
@@ -662,11 +763,19 @@ pub fn run(args: Args) -> Result<i32> {
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
-            return crate::direct::run(&args, srcs, dst);
+            // Let the remote orchestrator observe the original source count so
+            // repeated file sources keep multi-source destination semantics.
+            return crate::direct::run(&args, srcs, dst, source_operand_count);
         }
         if !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(algorithm) = &args.tcp_congestion {
+        bail!(
+            "--tcp-congestion {algorithm} requires a Linux transfer orchestrator and Linux remote endpoints"
+        );
     }
 
     let opts = Arc::new(Opts {
@@ -680,6 +789,7 @@ pub fn run(args: Args) -> Result<i32> {
         verify_only: args.verify_only,
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
+        dst_remote: dst_ep.is_remote(),
         dry_run: args.dry_run,
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
@@ -695,10 +805,6 @@ pub fn run(args: Args) -> Result<i32> {
         max_size,
         min_size,
     });
-    if args.files_from.is_some() && srcs.len() > 1 {
-        bail!("--files-from takes exactly one source directory");
-    }
-
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let progress = Progress::new(
         args.connections,
@@ -769,6 +875,10 @@ pub fn run(args: Args) -> Result<i32> {
                         .and_then(|src| Ok((src, dst_ep.connect(compress)?)));
                     let (src, dst) = match conns {
                         Ok(conns) => conns,
+                        Err(error) if crate::conn::is_tcp_congestion_error(&error) => {
+                            gate.mark_failed(id);
+                            return Err(error);
+                        }
                         Err(error) => {
                             failures += 1;
                             if failures >= CONNECTION_RECOVERY_ATTEMPTS {
@@ -787,6 +897,8 @@ pub fn run(args: Args) -> Result<i32> {
                         }
                     };
                     gate.mark_ready(id);
+                    let fast_batch_files =
+                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us());
                     let mut worker = Worker {
                         id,
                         src,
@@ -799,6 +911,7 @@ pub fn run(args: Args) -> Result<i32> {
                         gate: gate.clone(),
                         t: [0.0; 4],
                         fast: FastTiming::default(),
+                        fast_batch_files,
                     };
                     if debug() {
                         eprintln!(
@@ -889,7 +1002,21 @@ pub fn run(args: Args) -> Result<i32> {
         let ports = parse_ports(&args.tcp_ports)?;
         for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
             if let Endpoint::Remote(spec) = ep {
-                if let Err(e) = spec.setup_tcp(&mut **ctl, args.tcp_plain, ports) {
+                if let Err(e) = spec.setup_tcp(
+                    &mut **ctl,
+                    args.tcp_plain,
+                    ports,
+                    args.tcp_congestion.as_deref(),
+                ) {
+                    if crate::conn::is_tcp_congestion_error(&e) {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "{} could not apply --tcp-congestion {}",
+                                spec.label(),
+                                args.tcp_congestion.as_deref().unwrap_or_default()
+                            )
+                        });
+                    }
                     if spec.restricted_grant.is_some() {
                         sched.abort();
                         progress.stop();
@@ -901,8 +1028,11 @@ pub fn run(args: Args) -> Result<i32> {
                         });
                     }
                     if !args.quiet || debug() {
+                        let congestion_note = crate::conn::tcp_congestion_fallback_note(
+                            args.tcp_congestion.as_deref(),
+                        );
                         eprintln!(
-                            "syq: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}); a Tailscale address or an open port is faster",
+                            "syq: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}{congestion_note}); a Tailscale address or an open port is faster",
                             spec.label(),
                             ports.0,
                             ports.1
@@ -999,11 +1129,11 @@ pub fn run(args: Args) -> Result<i32> {
         Placement::As => false,
         Placement::Rsync => match &dst_root_entry {
             Some(e) if e.kind == Kind::Dir => true,
-            Some(_) if srcs.len() > 1 => {
+            Some(_) if multiple_source_operands => {
                 bail!("destination must be a directory when copying multiple sources")
             }
             Some(_) => false,
-            None => srcs.len() > 1 || dst.copies_contents() || args.files_from.is_some(),
+            None => multiple_source_operands || dst.copies_contents() || args.files_from.is_some(),
         },
     };
     if args.placement == Placement::Into
@@ -1165,7 +1295,7 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         TargetCondition::Any
     };
-    if create_root && srcs.len() == 1 {
+    if create_root && !multiple_distinct_sources {
         let created = mkdir_root(&mut *dst_ctl, &dst_root, root_create_condition)?;
         mutation_root_condition = target_identity(&created);
         if guard_containers {
@@ -1220,12 +1350,12 @@ pub fn run(args: Args) -> Result<i32> {
         mutation_root_condition,
         container_guard,
         guard_containers,
-        buffer: if srcs.len() > 1 {
+        buffer: if multiple_distinct_sources {
             Some(Vec::new())
         } else {
             None
         },
-        create_root: if create_root && srcs.len() > 1 {
+        create_root: if create_root && multiple_distinct_sources {
             Some((dst_root.clone(), root_create_condition))
         } else {
             None
@@ -2238,6 +2368,8 @@ struct Mapped {
     dst_root: PathBytes,
     dirs: Vec<(PathBytes, PathBytes, Entry)>,
     others: Vec<Planned>,
+    dir_stats: Option<Vec<Option<Entry>>>,
+    other_stats: Option<std::collections::HashMap<PathBytes, Option<Entry>>>,
 }
 
 /// What --delete found on the destination that the source doesn't have.
@@ -2596,7 +2728,7 @@ impl Planner<'_> {
         sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
-        self.register_namespace(&batch, src_root, sub, dst_root)?;
+        let namespace_files = self.collect_namespace_files(&batch, src_root, sub, dst_root);
         if self.collision {
             return Ok(());
         }
@@ -2619,7 +2751,11 @@ impl Planner<'_> {
                 immediate.push(entry);
             }
         }
-        let mapped = self.map_batch(immediate, src_root, sub, dst_root);
+        let mut mapped = self.map_batch(immediate, src_root, sub, dst_root);
+        self.register_namespace(namespace_files, &mut mapped)?;
+        if self.collision {
+            return Ok(());
+        }
         match &mut self.buffer {
             Some(buf) => buf.push(mapped),
             None => self.apply_mapped(mapped)?,
@@ -2724,6 +2860,8 @@ impl Planner<'_> {
             dst_root: dst_root.to_vec(),
             dirs,
             others,
+            dir_stats: None,
+            other_stats: None,
         }
     }
 
@@ -2811,6 +2949,8 @@ impl Planner<'_> {
             dst_root,
             dirs,
             mut others,
+            dir_stats,
+            mut other_stats,
         } = mapped;
         let dst_root = &dst_root[..];
 
@@ -2820,6 +2960,8 @@ impl Planner<'_> {
         if !dirs.is_empty() {
             let stats = if self.destination_tree_known_missing {
                 vec![None; dirs.len()]
+            } else if let Some(stats) = dir_stats {
+                stats
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
@@ -3048,6 +3190,15 @@ impl Planner<'_> {
         }
         let stats = if self.destination_tree_known_missing {
             vec![None; others.len()]
+        } else if let Some(stats) = &mut other_stats {
+            others
+                .iter()
+                .map(|planned| {
+                    stats
+                        .remove(&planned.dst)
+                        .expect("batch plan covered every mapped leaf")
+                })
+                .collect()
         } else {
             self.stat_many_with_dry_run_overlay(
                 others.iter().map(|p| p.dst.clone()).collect(),
@@ -3436,13 +3587,13 @@ impl Planner<'_> {
         Ok(())
     }
 
-    fn register_namespace(
+    fn collect_namespace_files(
         &mut self,
         batch: &[Entry],
         src_root: &[u8],
         sub: &[u8],
         dst_root: &[u8],
-    ) -> Result<()> {
+    ) -> Vec<(PathBytes, String)> {
         let mut files = Vec::new();
         for entry in batch {
             if !self.entry_is_payload(entry) {
@@ -3486,10 +3637,83 @@ impl Planner<'_> {
                 files.push((dst_path, rel));
             }
         }
+        files
+    }
+
+    fn register_namespace(
+        &mut self,
+        files: Vec<(PathBytes, String)>,
+        mapped: &mut Mapped,
+    ) -> Result<()> {
         if files.is_empty() {
             return Ok(());
         }
-        let sidecars = self.partial_paths(files.iter().map(|(path, _)| path.clone()).collect())?;
+        // Several sources are replayed only after every collision check, and
+        // dry runs may need a depth-by-depth virtual overlay. Keep their stats
+        // at the existing application point rather than caching stale or
+        // unsafe observations. Sidecar resolution still uses this request.
+        let pre_stat = self.opts.dst_remote
+            && self.buffer.is_none()
+            && !self.opts.dry_run
+            && !self.destination_tree_known_missing;
+        let directories: Vec<PathBytes> = if pre_stat {
+            mapped
+                .dirs
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let other_paths: Vec<PathBytes> = if pre_stat {
+            mapped
+                .others
+                .iter()
+                .map(|planned| planned.dst.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Sidecar resolution already costs a receiver turn for ordinary file
+        // copies. Include the destination inspection in that same turn; the
+        // receiver omits leaf stats when directory repair must happen first.
+        let partial_paths = files.iter().map(|(path, _)| path.clone()).collect();
+        let (sidecars, dir_stats, other_stats) = if pre_stat {
+            let response = self.dst.call(Request::PlanBatch {
+                partial_paths,
+                partial_id: *self
+                    .opts
+                    .partial_id
+                    .get()
+                    .expect("partial identity initialized before planning"),
+                directories: directories.clone(),
+                others: other_paths.clone(),
+                guard: self.container_guard.clone(),
+            })?;
+            match ok(response, "plan destination batch")? {
+                Response::BatchPlan {
+                    partial_paths,
+                    directories: dir_stats,
+                    others: other_stats,
+                } if partial_paths.len() == files.len()
+                    && dir_stats.len() == directories.len()
+                    && other_stats
+                        .as_ref()
+                        .is_none_or(|stats| stats.len() == other_paths.len()) =>
+                {
+                    (partial_paths, dir_stats, other_stats)
+                }
+                other => bail!("unexpected response {other:?}"),
+            }
+        } else {
+            (self.partial_paths(partial_paths)?, Vec::new(), None)
+        };
+        if pre_stat {
+            mapped.dir_stats = Some(dir_stats);
+            if let Some(stats) = other_stats {
+                mapped.other_stats = Some(other_paths.into_iter().zip(stats).collect());
+            }
+        }
         for ((dst_path, file_rel), sidecar) in files.into_iter().zip(sidecars) {
             let sidecar = match sidecar {
                 Ok(sidecar) => sidecar,
@@ -4075,6 +4299,7 @@ struct Worker {
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
     t: [f64; 4],
     fast: FastTiming,
+    fast_batch_files: usize,
 }
 
 #[derive(Default)]
@@ -4159,7 +4384,7 @@ impl Worker {
                     if self.fast_eligible(idx) {
                         let target = self
                             .sched
-                            .begin_fast_batch(self.gate.active(), FAST_BATCH_FILES);
+                            .begin_fast_batch(self.gate.active(), self.fast_batch_files);
                         let mut batch = vec![idx];
                         // The fast path reads a whole batch before sending it.
                         // Keep rate-limited batches to one file so a push can't
@@ -5233,6 +5458,20 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_batch_ceiling_only_grows_on_high_rtt_tcp() {
+        assert_eq!(fast_batch_file_limit(None, None), FAST_BATCH_FILES);
+        assert_eq!(fast_batch_file_limit(Some(99_999), None), FAST_BATCH_FILES);
+        assert_eq!(
+            fast_batch_file_limit(None, Some(HIGH_RTT_US)),
+            HIGH_RTT_FAST_BATCH_FILES
+        );
+        assert_eq!(
+            fast_batch_file_limit(Some(262_000), Some(1_000)),
+            HIGH_RTT_FAST_BATCH_FILES
+        );
+    }
 
     #[test]
     fn clean_root_pins_the_edge_cases() {

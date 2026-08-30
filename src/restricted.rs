@@ -405,6 +405,7 @@ impl RestrictedAuthority {
                 token,
                 port_lo,
                 port_hi,
+                congestion_control,
             } => {
                 if !over_ssh {
                     bail!("TCP listener request is allowed only on the signed control connection");
@@ -420,6 +421,9 @@ impl RestrictedAuthority {
                     != (self.copy.options.tcp_port_lo, self.copy.options.tcp_port_hi)
                 {
                     bail!("TCP listener range does not match the signed grant");
+                }
+                if congestion_control.is_some() {
+                    bail!("TCP congestion override is not authorized by the signed grant");
                 }
                 let mut state = self.state.lock().unwrap();
                 if state.tcp_listener_started {
@@ -454,6 +458,22 @@ impl RestrictedAuthority {
             }
             Request::PartialPaths { paths, guard, .. } => {
                 for path in paths {
+                    self.check_observation_path(path)?;
+                }
+                *guard = Some(self.guard.clone());
+            }
+            Request::PlanBatch {
+                partial_paths,
+                directories,
+                others,
+                guard,
+                ..
+            } => {
+                for path in partial_paths
+                    .iter()
+                    .chain(directories.iter())
+                    .chain(others.iter())
+                {
                     self.check_observation_path(path)?;
                 }
                 *guard = Some(self.guard.clone());
@@ -1425,6 +1445,9 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.inplace {
         bail!("command-restricted transfers currently require atomic staged publication");
     }
+    if args.tcp_congestion.is_some() {
+        bail!("--tcp-congestion is not yet represented in the signed receiver grant");
+    }
     if args.update
         || args.ignore_existing
         || args.existing
@@ -2078,6 +2101,22 @@ mod tests {
         };
         assert_eq!(guard.root, root.as_os_str().as_bytes());
 
+        let mut plan = Request::PlanBatch {
+            partial_paths: vec![target.clone()],
+            partial_id: [3; 16],
+            directories: vec![target.clone()],
+            others: vec![target.clone()],
+            guard: None,
+        };
+        authority.authorize(&mut plan, false).unwrap();
+        let Request::PlanBatch {
+            guard: Some(guard), ..
+        } = plan
+        else {
+            panic!("authority did not guard the combined planning request")
+        };
+        assert_eq!(guard.root, root.as_os_str().as_bytes());
+
         let mut outside_stat = Request::StatMany {
             paths: vec![outside.clone()],
             follow: false,
@@ -2229,6 +2268,7 @@ mod tests {
             token: vec![8; 16],
             port_lo: 47_600,
             port_hi: 47_699,
+            congestion_control: None,
         };
         authority.authorize(&mut listener, true).unwrap();
         assert!(authority.authorize(&mut listener, true).is_err());
@@ -2242,8 +2282,19 @@ mod tests {
             token: vec![8; 16],
             port_lo: 1,
             port_hi: 2,
+            congestion_control: None,
         };
         assert!(wrong_range.authorize(&mut listener, true).is_err());
+
+        let congestion_override = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let mut listener = Request::TcpListen {
+            key: Some(vec![7; crate::crypto::KEY_LEN]),
+            token: vec![8; 16],
+            port_lo: 47_600,
+            port_hi: 47_699,
+            congestion_control: Some("reno".into()),
+        };
+        assert!(congestion_override.authorize(&mut listener, true).is_err());
 
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let mut metadata = Request::Apply {

@@ -255,6 +255,7 @@ explicitly say otherwise.
 | `--no-tcp` | Send data over the ssh connection instead of separate TCP sockets |
 | `--tcp-plain` | TCP data connections without encryption (trusted networks only) |
 | `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
+| `--tcp-congestion ALGO` | Linux: use `ALGO` on both ends of direct TCP data sockets; the host default is unchanged |
 | `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
 | `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
@@ -373,8 +374,9 @@ destination scopes or independently authenticate to hostB with the enrollment
 key.
 
 The command-restricted path requires atomic staged publication and encrypted
-TCP data connections. `--inplace`, `--no-tcp`, `--tcp-plain`, `--update`,
-`--existing`, `--ignore-existing`, native `--*-new`/`--*-existing`,
+TCP data connections. `--inplace`, `--no-tcp`, `--tcp-plain`,
+`--tcp-congestion`, `--update`, `--existing`, `--ignore-existing`, native
+`--*-new`/`--*-existing`,
 `--ignore`/`--ignore-from`, `--files-from`, `--min-size`, a nonzero
 `--bwlimit`, `--syq-path`, and `--no-bootstrap` currently fail closed because
 the receiver cannot enforce those semantics independently of hostA.
@@ -553,6 +555,9 @@ Identical to rsync:
   sources doesn't change that: it would be overwritten, so it's a conflict.
   The price is memory: every scanned entry is held until the scans are
   validated, roughly a few hundred bytes per entry across all sources.
+- An exactly repeated source operand is scanned once. It still counts toward
+  the original source count for placement, so `syq file file new-dest` creates
+  the directory `new-dest` and writes `new-dest/file`.
 - An explicitly supplied destination root that is a symlink to a directory is
   that directory (the link is kept, with or without a trailing slash). A
   symlink encountered below the destination root is payload at that path: it
@@ -941,14 +946,34 @@ AES-256-GCM records keyed by a secret exchanged over the ssh session
 reached — a firewall, typically — syq says so once and falls back to ssh data
 connections, so the default is always safe.
 
+On Linux, `--tcp-congestion ALGO` requests a congestion-control algorithm for
+both ends of every direct TCP data connection. The connecting socket is
+configured before `connect`, and the remote listener is configured before its
+port is advertised, so accepted sockets inherit the same algorithm. This is a
+per-socket override: syq does not change sysctls, load kernel modules, or alter
+queueing disciplines. Without the option, every socket keeps its host's
+default. An explicit override that either kernel rejects is a fatal error with
+the affected host and kernel error; syq never silently substitutes another
+algorithm. If the TCP route itself is unreachable, the normal warned SSH
+fallback still applies and says that the requested algorithm is not used by
+the SSH fallback.
+
+The algorithm must be registered on both Linux hosts and available to the syq
+process. Unprivileged processes may choose only entries in
+`net.ipv4.tcp_allowed_congestion_control`; inspect host prerequisites and qdisc
+state as described in [SERVER-TUNING.md](SERVER-TUNING.md). Congestion control
+is sender-side, so setting it only on a download server does not also select it
+for uploads from a client. syq can cover both directions because it owns the
+data socket on each endpoint.
+
 With `--stats`, direct TCP copies also report the kernel counters available on
-both socket ends: retransmitted packets and bytes (a packet-loss signal),
-current/minimum RTT, congestion window and delivery rate, receive-window and
-send-buffer limited time, and ECN CE deliveries. These are diagnostic telemetry
-only and do not change the tuning cache key. Unsupported fields are labeled
-unavailable rather than displayed as zero. SSH does not expose per-data-
-connection TCP counters to syq, so the statistics say they are unavailable
-when the data transport is SSH.
+both socket ends: the effective congestion-control algorithm, retransmitted
+packets and bytes (a packet-loss signal), current/minimum RTT, congestion window
+and delivery rate, receive-window and send-buffer limited time, and ECN CE
+deliveries. These are diagnostic telemetry only and do not change the tuning
+cache key. Unsupported fields are labeled unavailable rather than displayed as
+zero. SSH does not expose per-data-connection TCP counters to syq, so the
+statistics say they are unavailable when the data transport is SSH.
 
 The remote advertises every address it has (the one your ssh session arrived
 on first, then private LAN, then public, then CGNAT/Tailscale); the client

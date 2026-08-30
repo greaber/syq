@@ -51,12 +51,13 @@ product position: compatible, unimplemented, intentional divergence, undecided
 policy, or unresolved test claim. CI fails when the observation changes in
 either direction until it is reviewed, but an expected test failure is not
 misreported as a harness crash. Runner completeness and output parsing are
-checked independently. All 351 pinned tests are classified: 26 are runnable,
-141 require unsupported user-facing features, and 184 exercise rsync's own
+checked independently. All 351 pinned tests are classified: 36 are runnable,
+133 require unsupported user-facing features, and 182 exercise rsync's own
 internals, protocol, daemon, or restricted wrapper. There are no unassessed
-tests. CI runs the 22 non-root and four additional root circumstances and
-publishes JSON, Markdown, static HTML, and raw-log matrices rather than a
-headline score.
+tests. The runnable sources produce 38 independently reported scenarios. CI
+runs 34 scenarios as a non-root user, then those scenarios plus four
+root-only circumstances as root, and publishes JSON, Markdown, static HTML,
+and raw-log matrices rather than a headline score.
 
 The generated `tests/rsync-compat/LEDGER.md` is the readable per-test record;
 CI rejects it if it drifts from the manifest and inventory. An adapted test
@@ -129,10 +130,12 @@ item.
 4. **Two distinct sources mapping onto one destination file is an error.**
    Measured rsync silently keeps the first. Silent last-writer-wins (or
    first-writer-wins) on a collision is data loss with no message; syq refuses
-   and names both. *Identical* repeated sources should be deduplicated instead
-   — open issue 3. Naming the destination file itself as one of the sources
-   is a conflict too, not a licence for the other source to overwrite it.
+   and names both. Exactly repeated source operands are deduplicated before
+   scanning while retaining the original source count for placement. Naming
+   the destination file itself as one of the sources is a conflict too, not a
+   licence for the other source to overwrite it.
    *Tests: `duplicate_destination_rejected`,
+   `exactly_repeated_sources_are_deduplicated_without_changing_placement`,
    `dir_vs_file_destination_collision_rejected`,
    `cross_source_collision_is_detected_before_any_change`,
    `copy_onto_itself_among_sources_is_order_independent`,
@@ -224,14 +227,10 @@ command says what to change.
    preserve a trailing slash (`dir/` selects the directory's immediate
    children without `-r`, `dir` only the directory); accept `.`/`/` as the root
    entry (children without `-r`); add `-0` as an alias of `--from0`.
-3. **Repeated identical sources should be deduplicated**, not reported as a
-   collision (rsync scans a source given ten times once). Only for
-   byte-identical source arguments including trailing-slash mode; distinct
-   sources on one destination stay an error ("Incompatible on purpose" 4).
-4. **`-h` alone should print help**, as rsync does, while staying
+3. **`-h` alone should print help**, as rsync does, while staying
    `--human-readable` inside a cluster (`-avh`). Essentially free.
-5. **`-u` for symlinks/devices** — measure rsync, then align or record.
-6. **Cross-uid symlinks in an operator-named destination path.** Current rsync
+4. **`-u` for symlinks/devices** — measure rsync, then align or record.
+5. **Cross-uid symlinks in an operator-named destination path.** Current rsync
    refuses an absolute or relative destination component owned by another uid
    when root runs the copy, preventing an unprivileged user from redirecting a
    privileged copy outside the intended tree. syq currently follows it just as
@@ -243,6 +242,9 @@ command says what to change.
 
 ## Resolved
 
+- Exactly repeated raw source operands are deduplicated before scanning while
+  preserving the original operand count for destination placement. Distinct
+  spellings remain distinct even when parsing gives them the same endpoint.
 - Source entries named like sidecars were excluded from copies; PR #7's
   namespace preflight made them ordinary payload (rsync-compatible), and
   this branch follows it. Former open issue 4. Destination `--delete` now

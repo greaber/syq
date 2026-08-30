@@ -164,8 +164,9 @@ pub mod flags {
 /// Best-effort kernel counters for one end of a TCP data socket. `None` means
 /// the platform or returned kernel structure does not expose that field; a
 /// reported zero is therefore a genuine measurement.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TcpSocketStats {
+    pub congestion_control: Option<String>,
     pub bytes_sent: Option<u64>,
     pub bytes_retransmitted: Option<u64>,
     pub segments_sent: Option<u64>,
@@ -245,6 +246,7 @@ pub enum Request {
         token: Vec<u8>,
         port_lo: u16,
         port_hi: u16,
+        congestion_control: Option<String>,
     },
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).
     /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
@@ -269,6 +271,16 @@ pub enum Request {
     },
     Apply {
         ops: Vec<Op>,
+        guard: Option<ContainerGuard>,
+    },
+    /// Resolve sidecar names and inspect an existing destination batch in one
+    /// turn. Leaf stats are returned only when every directory is still a
+    /// directory, so callers can preserve parent-before-child replacement.
+    PlanBatch {
+        partial_paths: Vec<PathBytes>,
+        partial_id: PartialId,
+        directories: Vec<PathBytes>,
+        others: Vec<PathBytes>,
         guard: Option<ContainerGuard>,
     },
     /// Return the size of the deterministic sidecar, if it is a regular file.
@@ -394,7 +406,12 @@ pub enum Response {
     TcpListening {
         port: u16,
         addrs: Vec<(String, u32)>,
+        congestion_control: Option<String>,
     },
+    /// The peer understood the requested per-socket override but its kernel
+    /// could not honor it. Keep this distinct from ordinary TCP reachability
+    /// failures, for which the orchestrator may safely fall back to SSH.
+    TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
     /// Paths (relative to the root) pruned by the ignore patterns.
@@ -402,6 +419,13 @@ pub enum Response {
     ScanDone,
     Stats(Vec<Option<Entry>>),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
+    BatchPlan {
+        partial_paths: Vec<std::result::Result<PathBytes, String>>,
+        directories: Vec<Option<Entry>>,
+        /// None means a directory was missing or a non-directory, so the
+        /// caller must apply directory changes before inspecting leaves.
+        others: Option<Vec<Option<Entry>>>,
+    },
     Applied(Vec<Option<String>>),
     PartialSize(Option<u64>),
     Hashes(Vec<u64>),
@@ -447,6 +471,23 @@ impl SizeHint for Request {
             Request::StatMany { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
+            Request::PartialPaths { paths, .. } => {
+                paths.iter().map(|path| path.len() + 8).sum::<usize>() + 32
+            }
+            Request::PlanBatch {
+                partial_paths,
+                directories,
+                others,
+                ..
+            } => {
+                partial_paths
+                    .iter()
+                    .chain(directories)
+                    .chain(others)
+                    .map(|path| path.len() + 8)
+                    .sum::<usize>()
+                    + 48
+            }
             Request::Apply { ops, .. } => ops.len() * 128 + 16,
             _ => 256,
         }
@@ -469,6 +510,16 @@ impl SizeHint for Response {
             }
             Response::ScanBatch(v) => v.len() * 160 + 16,
             Response::Stats(v) => v.len() * 96 + 16,
+            Response::BatchPlan {
+                partial_paths,
+                directories,
+                others,
+            } => {
+                partial_paths.len() * 96
+                    + directories.len() * 96
+                    + others.as_ref().map_or(0, |items| items.len() * 96)
+                    + 32
+            }
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 9 + 24,
             _ => 256,
         }

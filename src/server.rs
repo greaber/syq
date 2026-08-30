@@ -195,6 +195,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 token,
                 port_lo,
                 port_hi,
+                congestion_control,
             } => {
                 if !over_ssh {
                     w.write_msg(&Response::Err(
@@ -209,12 +210,17 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     port_hi,
                     debug,
                     w.compress,
+                    congestion_control.as_deref(),
                     authority.clone(),
                 ) {
-                    Ok(port) => w.write_msg(&Response::TcpListening {
+                    Ok((port, congestion_control)) => w.write_msg(&Response::TcpListening {
                         port,
                         addrs: local_addrs(),
+                        congestion_control,
                     })?,
+                    Err(e) if crate::conn::is_tcp_congestion_error(&e) => {
+                        w.write_msg(&Response::TcpCongestionRejected(format!("{e:#}")))?
+                    }
                     Err(e) => w.write_msg(&Response::Err(format!("{e:#}")))?,
                 }
             }
@@ -361,6 +367,7 @@ fn local_addrs() -> Vec<(String, u32)> {
     addrs.into_iter().map(|(ip, sp, _)| (ip, sp)).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tcp_listen(
     key: Option<Vec<u8>>,
     token: Vec<u8>,
@@ -368,8 +375,9 @@ fn tcp_listen(
     hi: u16,
     debug: bool,
     compress: bool,
+    congestion_control: Option<&str>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
-) -> Result<u16> {
+) -> Result<(u16, Option<String>)> {
     let mut listener = None;
     for port in lo..=hi.max(lo) {
         if let Ok(l) = TcpListener::bind(("0.0.0.0", port)) {
@@ -380,6 +388,10 @@ fn tcp_listen(
     let Some(listener) = listener else {
         bail!("no free port in {lo}-{hi}");
     };
+    // Passive connections inherit the listener's congestion controller. Set
+    // and verify it before advertising the port so even handshake-time
+    // behavior uses the requested algorithm.
+    let congestion_control = crate::conn::configure_tcp_congestion(&listener, congestion_control)?;
     let port = listener.local_addr()?.port();
     let next_id = Arc::new(AtomicU32::new(1));
     // Bound in-flight data connections (a peer shouldn't be able to spawn
@@ -447,7 +459,7 @@ fn tcp_listen(
             });
         }
     });
-    Ok(port)
+    Ok((port, congestion_control))
 }
 
 #[allow(clippy::too_many_arguments)]
