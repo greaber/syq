@@ -63,12 +63,12 @@ note = "Honor setgid inheritance when creating destination directories."
 name = "duplicates"
 classification = "conformance"
 area = "source-mapping"
-position = "policy-open"
-baseline = "fail"
+position = "compatible"
+baseline = "pass"
 platforms = ["linux"]
-tags = ["local", "sources", "known-gap"]
+tags = ["local", "sources"]
 requirements = ["symlinks"]
-note = "SYQ still treats repeated identical sources as destination collisions."
+note = "Exactly repeated source operands are scanned and copied once while retaining multi-source destination placement."
 
 [[tests]]
 name = "files-from-path-clamp"
