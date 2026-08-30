@@ -1,6 +1,6 @@
 //! Work queue with largest-first file scheduling and range work-stealing.
 
-use crate::proto::{Entry, PathBytes};
+use crate::proto::{ContainerGuard, Entry, PathBytes};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
@@ -15,6 +15,8 @@ pub struct FileJob {
     pub dst_entry: Option<Entry>,
     /// Placement-root condition enforced by the receiver at publication.
     pub target_condition: crate::proto::TargetCondition,
+    /// Opened directory identity that anchors descendant target mutations.
+    pub container_guard: Option<ContainerGuard>,
     pub attempts: u32,
     /// Bytes of this file in place on the destination (transferred or matched).
     pub done: Arc<AtomicU64>,
