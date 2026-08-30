@@ -275,27 +275,7 @@ pub fn normalize(p: &Path) -> PathBuf {
 }
 
 pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry {
-    let ft = md.file_type();
-    let kind = if ft.is_dir() {
-        Kind::Dir
-    } else if ft.is_file() {
-        Kind::File
-    } else if ft.is_symlink() {
-        Kind::Symlink
-    } else {
-        use std::os::unix::fs::FileTypeExt;
-        if ft.is_fifo() {
-            Kind::Fifo
-        } else if ft.is_socket() {
-            Kind::Socket
-        } else if ft.is_char_device() {
-            Kind::CharDev
-        } else if ft.is_block_device() {
-            Kind::BlockDev
-        } else {
-            Kind::Other
-        }
-    };
+    let kind = metadata_kind(md);
     let link = if kind == Kind::Symlink {
         fs::read_link(full)
             .ok()
@@ -318,6 +298,30 @@ pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry 
         ctime: md.ctime(),
         ctime_nsec: md.ctime_nsec() as u32,
         link,
+    }
+}
+
+fn metadata_kind(md: &fs::Metadata) -> Kind {
+    let ft = md.file_type();
+    if ft.is_dir() {
+        Kind::Dir
+    } else if ft.is_file() {
+        Kind::File
+    } else if ft.is_symlink() {
+        Kind::Symlink
+    } else {
+        use std::os::unix::fs::FileTypeExt;
+        if ft.is_fifo() {
+            Kind::Fifo
+        } else if ft.is_socket() {
+            Kind::Socket
+        } else if ft.is_char_device() {
+            Kind::CharDev
+        } else if ft.is_block_device() {
+            Kind::BlockDev
+        } else {
+            Kind::Other
+        }
     }
 }
 
@@ -489,6 +493,10 @@ impl FsOps {
         })
     }
 
+    pub fn assess_deletes(&mut self, candidates: &[DeleteCandidate]) -> Vec<DeleteReadiness> {
+        parallel_map(candidates, assess_delete)
+    }
+
     pub fn partial_paths(
         &mut self,
         paths: &[PathBytes],
@@ -569,7 +577,9 @@ fn op_path(op: &Op) -> &[u8] {
         | Op::SetFileMetaIfSame { path, .. }
         | Op::Remove { path }
         | Op::Rmdir { path }
-        | Op::Unlink { path } => path,
+        | Op::Unlink { path }
+        | Op::UnlinkIfSame { path, .. }
+        | Op::RmdirIfSame { path, .. } => path,
     }
 }
 
@@ -794,6 +804,8 @@ fn apply_one_unrooted(op: &Op) -> Result<()> {
                 }
                 Ok(())
             }
+            Op::UnlinkIfSame { path, condition } => remove_planned(path, *condition, false),
+            Op::RmdirIfSame { path, condition } => remove_planned(path, *condition, true),
         }
     }
 }
@@ -917,6 +929,9 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
             Some(_) => root.unlink(path),
         },
         Op::Remove { .. } => bail!("recursive remove cannot use a container guard"),
+        Op::UnlinkIfSame { .. } | Op::RmdirIfSame { .. } => {
+            bail!("identity-bound remove cannot use a container guard")
+        }
     }
 }
 
@@ -1007,6 +1022,11 @@ fn file_type_bits(mode: u32) -> u32 {
 fn file_type_bits(mode: u32) -> u32 {
     mode & libc::S_IFMT as u32
 }
+
+#[cfg(target_os = "linux")]
+const STICKY_BIT: u32 = libc::S_ISVTX;
+#[cfg(not(target_os = "linux"))]
+const STICKY_BIT: u32 = libc::S_ISVTX as u32;
 
 fn exact_parent(path: &Path) -> Result<(Root, RelativePath)> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1121,6 +1141,143 @@ fn require_target_condition(
                 path.display()
             ),
         },
+    }
+}
+
+fn condition_matches_metadata(condition: TargetCondition, metadata: &fs::Metadata) -> bool {
+    match condition {
+        TargetCondition::Any => true,
+        TargetCondition::Absent => false,
+        TargetCondition::Matches { dev, ino } => metadata.dev() == dev && metadata.ino() == ino,
+        TargetCondition::MatchesFingerprint {
+            dev,
+            ino,
+            ctime,
+            ctime_nsec,
+        } => {
+            metadata.dev() == dev
+                && metadata.ino() == ino
+                && metadata.ctime() == ctime
+                && metadata.ctime_nsec() as u32 == ctime_nsec
+        }
+    }
+}
+
+fn effective_access(path: &Path, mode: libc::c_int) -> io::Result<bool> {
+    let path = cstr(path).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let result = unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+fn assess_delete(candidate: &DeleteCandidate) -> DeleteReadiness {
+    let path = resolve(&candidate.path);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A concurrent removal already produced the requested end state.
+            return DeleteReadiness::Ready;
+        }
+        Err(error) => {
+            return DeleteReadiness::Unknown(format!("cannot inspect target: {error}"));
+        }
+    };
+    if metadata_kind(&metadata) != candidate.kind
+        || !condition_matches_metadata(candidate.condition, &metadata)
+    {
+        return DeleteReadiness::Changed("object changed after selection".into());
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_metadata = match fs::metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        Ok(_) => {
+            return DeleteReadiness::NeedsForce(format!(
+                "parent {} is not a directory",
+                parent.display()
+            ));
+        }
+        Err(error) => {
+            return DeleteReadiness::Unknown(format!(
+                "cannot inspect parent {}: {error}",
+                parent.display()
+            ));
+        }
+    };
+    match effective_access(parent, libc::W_OK | libc::X_OK) {
+        Ok(true) => {}
+        Ok(false) => {
+            return DeleteReadiness::NeedsForce(format!(
+                "parent {} is not writable and searchable by the endpoint credentials",
+                parent.display()
+            ));
+        }
+        Err(error) => {
+            return DeleteReadiness::Unknown(format!(
+                "cannot assess access to parent {}: {error}",
+                parent.display()
+            ));
+        }
+    }
+
+    let euid = unsafe { libc::geteuid() };
+    if parent_metadata.mode() & STICKY_BIT != 0
+        && euid != 0
+        && u64::from(euid) != u64::from(parent_metadata.uid())
+        && u64::from(euid) != u64::from(metadata.uid())
+    {
+        return DeleteReadiness::NeedsForce(format!(
+            "sticky parent {} is owned by another user",
+            parent.display()
+        ));
+    }
+
+    // Like interactive rm, treat a non-writable selected object as protected
+    // even though unlink authority primarily comes from its parent directory.
+    if candidate.kind != Kind::Symlink {
+        match effective_access(&path, libc::W_OK) {
+            Ok(true) => {}
+            Ok(false) => {
+                return DeleteReadiness::NeedsForce(
+                    "object is write-protected for the endpoint credentials".into(),
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return DeleteReadiness::Changed("object disappeared during preflight".into());
+            }
+            Err(error) => {
+                return DeleteReadiness::Unknown(format!(
+                    "cannot assess whether the object is writable: {error}"
+                ));
+            }
+        }
+    }
+    DeleteReadiness::Ready
+}
+
+fn remove_planned(path: &[u8], condition: TargetCondition, directory: bool) -> Result<()> {
+    let path = resolve(path);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+    };
+    if metadata.is_dir() != directory || !condition_matches_metadata(condition, &metadata) {
+        bail!("{} changed after planning; not deleting it", path.display());
+    }
+    if directory {
+        fs::remove_dir(&path).with_context(|| format!("rmdir {}", path.display()))
+    } else {
+        fs::remove_file(&path).with_context(|| format!("unlink {}", path.display()))
     }
 }
 
@@ -2136,6 +2293,9 @@ impl FsOps {
         let r: Result<Response> = match req {
             Request::StatMany { paths, follow } => {
                 Ok(Response::Stats(self.stat_many(paths, *follow)))
+            }
+            Request::AssessDeletes { candidates } => {
+                Ok(Response::DeleteReadiness(self.assess_deletes(candidates)))
             }
             Request::PartialPaths { paths, partial_id } => {
                 Ok(Response::PathResults(self.partial_paths(paths, partial_id)))

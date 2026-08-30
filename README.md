@@ -196,6 +196,30 @@ directory scopes. It never removes a source and requires explicit placement;
 `--max-delete N` keeps its all-or-nothing deletion budget. `rm` removes the
 explicitly selected object trees and never follows a selected symlink.
 
+Native `rm` finishes selecting the entire population before it removes
+anything. A scan error or unreadable subtree therefore leaves every selected
+object untouched. The completed plan records leaves separately from
+directories, binds actions to the observed object identities, and removes
+directories deepest-first. If a path is replaced after planning, the new
+object is refused; an ordinary per-path failure does not stop independent
+siblings, but dependent ancestor directories are skipped. A lost execution
+connection stops scheduling further work.
+
+Before execution, `rm` prints the selected roots and counts and asks for
+approval; `-v` also prints every planned action. `--yes` skips only that
+approval. The endpoint makes a best-effort check of target and parent
+permissions (including sticky directories) for every plan member. A predicted
+write-protection or authorization failure requires `--force`, which only
+authorizes the attempt: it does not elevate privileges, change modes, suppress
+errors, or imply `--yes`. Permissions and filesystem state can still change
+after preflight, so actual failures remain visible and produce exit 23.
+
+Planning retains one compact record per selected path and delays the first
+unlink until selection and approval finish. That intentionally trades O(path
+count) memory and scan/delete overlap for a reviewable, fixed native
+population. `syq rsync --rm` retains the streaming compatibility path for
+workloads where that latency and memory tradeoff matters.
+
 The first native fidelity default recurses through directories, copies in-tree
 symlinks as objects, and retains mtimes. Owner, group, modes, special files,
 hard links, ACLs, xattrs, filtering, comparison policy, and the automation API
@@ -207,7 +231,8 @@ The native commands currently share `-n/--dry-run`, `-v`, `-q`,
 remote runtime options shown by `syq cp --help`. Remote-to-remote copies run on
 the source endpoint by default; `--relay` keeps orchestration local. Direct
 SSH command construction requires UTF-8 paths, while `--relay` carries raw path
-bytes in syq's protocol.
+bytes in syq's protocol. Native `rm` additionally has `-f/--force` and
+`-y/--yes` with the separate meanings above.
 
 ## Rsync compatibility
 

@@ -94,6 +94,25 @@ pub struct ContainerGuard {
     pub ino: u64,
 }
 
+/// One member of a completed deletion plan. The receiver uses the observed
+/// identity both while assessing readiness and immediately before mutation.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DeleteCandidate {
+    pub path: PathBytes,
+    pub kind: Kind,
+    pub condition: TargetCondition,
+}
+
+/// Best-effort preflight result from the endpoint that will perform a delete.
+/// Filesystems can still reject a later mutation, so `Ready` is not a promise.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum DeleteReadiness {
+    Ready,
+    NeedsForce(String),
+    Unknown(String),
+    Changed(String),
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct Meta {
     pub mode: u32,
@@ -178,6 +197,18 @@ pub enum Op {
     /// Remove a non-directory; a directory that has appeared there is an
     /// error, never recursed into (used by --delete for planned leaves).
     Unlink { path: PathBytes },
+    /// Remove a planned non-directory only while it still names the observed
+    /// object. A directory is always refused.
+    UnlinkIfSame {
+        path: PathBytes,
+        condition: TargetCondition,
+    },
+    /// Remove a planned empty directory only while it still names the observed
+    /// directory object.
+    RmdirIfSame {
+        path: PathBytes,
+        condition: TargetCondition,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -208,6 +239,12 @@ pub enum Request {
     StatMany {
         paths: Vec<PathBytes>,
         follow: bool,
+    },
+    /// Ask the mutation endpoint whether every planned deletion appears
+    /// permitted with its current credentials. The answer is advisory and is
+    /// revalidated by the actual operation.
+    AssessDeletes {
+        candidates: Vec<DeleteCandidate>,
     },
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {
@@ -360,6 +397,7 @@ pub enum Response {
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
     Stats(Vec<Option<Entry>>),
+    DeleteReadiness(Vec<DeleteReadiness>),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
     Applied(Vec<Option<String>>),
     Container(ContainerGuard),
@@ -398,6 +436,13 @@ impl SizeHint for Request {
             Request::StatMany { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
+            Request::AssessDeletes { candidates } => {
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.path.len() + 64)
+                    .sum::<usize>()
+                    + 16
+            }
             Request::Apply { ops, .. } => ops.len() * 128 + 16,
             _ => 256,
         }
@@ -410,6 +455,7 @@ impl SizeHint for Response {
             Response::Block { data, .. } => data.len() + 64,
             Response::ScanBatch(v) => v.len() * 160 + 16,
             Response::Stats(v) => v.len() * 96 + 16,
+            Response::DeleteReadiness(v) => v.len() * 96 + 16,
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 9 + 24,
             _ => 256,
         }

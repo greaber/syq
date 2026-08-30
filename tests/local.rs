@@ -76,6 +76,19 @@ fn native_syq(args: &[&str]) -> Output {
         .expect("run native syq command")
 }
 
+fn native_syq_with_input(args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--no-progress")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn native syq command");
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn run_native_ok(args: &[&str]) -> String {
     let out = native_syq(args);
     assert!(
@@ -131,6 +144,20 @@ fn spawn_native_after_container_creation(args: &[&str], ready: &Path) -> std::pr
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn native command held after container publication")
+}
+
+#[cfg(debug_assertions)]
+fn spawn_native_after_rm_plan(args: &[&str], ready: &Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .arg("--yes")
+        .arg("--no-progress")
+        .env("SYQ_TEST_RM_PLAN_READY_FILE", ready)
+        .env("SYQ_TEST_HOLD_RM_PLAN_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn native rm held after planning")
 }
 
 #[cfg(debug_assertions)]
@@ -767,7 +794,13 @@ fn native_direct_remote_to_remote_preserves_explicit_grammar() {
 fn native_rm_is_idempotent_for_duplicate_and_nested_selectors() {
     let t = Tmp::new();
     write(&t.path("tree/child/file"), b"data");
-    run_native_ok(&["rm", &t.s("tree"), &t.s("tree/child"), &t.s("tree")]);
+    run_native_ok(&[
+        "rm",
+        "--yes",
+        &t.s("tree"),
+        &t.s("tree/child"),
+        &t.s("tree"),
+    ]);
     assert!(!t.path("tree").exists());
 }
 
@@ -780,10 +813,153 @@ fn native_rm_trailing_slash_removes_a_selected_symlink_not_its_referent() {
     symlink("real", t.path("link")).unwrap();
 
     let link_with_slashes = format!("{}///", t.s("link"));
-    run_native_ok(&["rm", &link_with_slashes]);
+    run_native_ok(&["rm", "--yes", &link_with_slashes]);
 
     assert!(!t.path("link").exists());
     assert_eq!(read(&t.path("real/file")), b"keep");
+}
+
+#[test]
+fn native_rm_plans_and_executes_on_a_remote_endpoint() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("remote-tree/file"), b"remove remotely");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "rm",
+            "--at",
+            "remote.invalid",
+            "--path",
+            &t.s("remote-tree"),
+            "--yes",
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--connections",
+            "1",
+            "--no-progress",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .output()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(!t.path("remote-tree").exists());
+}
+
+#[test]
+fn native_rm_shows_its_plan_and_requires_separate_approval() {
+    let t = Tmp::new();
+    write(&t.path("tree/file"), b"keep until approved");
+
+    let declined = native_syq_with_input(&["rm", &t.s("tree")], b"no\n");
+    assert_output_ok(&declined);
+    assert!(t.path("tree/file").exists());
+    let stdout = String::from_utf8_lossy(&declined.stdout);
+    let stderr = String::from_utf8_lossy(&declined.stderr);
+    assert!(stdout.contains("syq rm plan: 2 entries"), "{stdout}");
+    assert!(stdout.contains("removal cancelled"), "{stdout}");
+    assert!(
+        stderr.contains("Approve removal of 2 planned entries"),
+        "{stderr}"
+    );
+
+    run_native_ok(&["rm", "--yes", &t.s("tree")]);
+    assert!(!t.path("tree").exists());
+}
+
+#[test]
+fn native_rm_dry_run_needs_no_approval() {
+    let t = Tmp::new();
+    write(&t.path("tree/file"), b"keep");
+
+    let output = native_syq(&["rm", "--dry-run", &t.s("tree")]);
+    assert_output_ok(&output);
+    assert!(t.path("tree/file").exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("would remove 2 entries"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Approve removal"));
+}
+
+#[test]
+fn native_rm_requires_force_for_a_write_protected_entry() {
+    let t = Tmp::new();
+    write(&t.path("protected"), b"protected");
+    fs::set_permissions(t.path("protected"), fs::Permissions::from_mode(0o444)).unwrap();
+
+    let refused = native_syq(&["rm", "--yes", &t.s("protected")]);
+    assert!(!refused.status.success());
+    assert!(t.path("protected").exists());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("require --force"));
+
+    // Force authorizes the attempt, but it does not also approve the plan.
+    let declined = native_syq_with_input(&["rm", "--force", &t.s("protected")], b"n\n");
+    assert_output_ok(&declined);
+    assert!(t.path("protected").exists());
+
+    run_native_ok(&["rm", "--force", "--yes", &t.s("protected")]);
+    assert!(!t.path("protected").exists());
+}
+
+#[test]
+fn native_rm_force_does_not_elevate_or_suppress_execution_errors() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("locked/file"), b"keep");
+    fs::set_permissions(t.path("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = native_syq(&["rm", "--force", "--yes", &t.s("locked/file")]);
+    assert_eq!(output.status.code(), Some(23));
+    assert!(t.path("locked/file").exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("forcing removal"), "{stderr}");
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+
+    fs::set_permissions(t.path("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn native_rm_planning_error_mutates_nothing() {
+    let t = Tmp::new();
+    write(&t.path("selected"), b"keep");
+
+    let output = native_syq(&["rm", "--yes", &t.s("selected"), &t.s("missing")]);
+    assert!(!output.status.success());
+    assert!(t.path("selected").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("deleting nothing"));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_rm_refuses_a_replaced_leaf_and_continues_an_independent_sibling() {
+    let t = Tmp::new();
+    write(&t.path("tree/raced"), b"old population");
+    write(&t.path("tree/sibling"), b"remove me");
+    let ready = t.path("rm-plan-ready");
+
+    let child = spawn_native_after_rm_plan(&["rm", &t.s("tree")], &ready);
+    wait_for_signal(&ready);
+    fs::remove_file(t.path("tree/raced")).unwrap();
+    write(&t.path("tree/raced/new-child"), b"new population");
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(read(&t.path("tree/raced/new-child")), b"new population");
+    assert!(!t.path("tree/sibling").exists());
+    assert!(t.path("tree").is_dir());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("changed after planning; not deleting"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("because a descendant deletion failed"),
+        "{stderr}"
+    );
 }
 
 #[test]

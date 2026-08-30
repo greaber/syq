@@ -59,6 +59,15 @@ pub struct Args {
     /// mode leaves this empty and parses `paths` with rsync's colon rules.
     #[arg(skip)]
     pub locations: Vec<Location>,
+    /// Native removal may attempt entries that planning identifies as
+    /// write-protected or likely unauthorized. This never changes credentials,
+    /// permissions, or error handling.
+    #[arg(skip)]
+    pub rm_force: bool,
+    /// Native removal may execute its completed plan without an interactive
+    /// confirmation. This is intentionally independent of `rm_force`.
+    #[arg(skip)]
+    pub rm_yes: bool,
 
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
@@ -608,6 +617,12 @@ struct NativeRmArgs {
     /// Preview removals without changing anything
     #[arg(short = 'n', long)]
     dry_run: bool,
+    /// Attempt write-protected or likely unauthorized removals
+    #[arg(short = 'f', long)]
+    force: bool,
+    /// Execute the completed plan without asking for approval
+    #[arg(short = 'y', long)]
+    yes: bool,
     /// Increase verbosity
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -836,6 +851,8 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     args.paths.clear();
     args.rm = true;
     args.dry_run = parsed.dry_run;
+    args.rm_force = parsed.force;
+    args.rm_yes = parsed.yes;
     args.verbose = parsed.verbose;
     args.quiet = parsed.quiet;
     args.connections_opt = parsed.connections;
