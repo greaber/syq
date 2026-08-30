@@ -7,7 +7,7 @@ python3 scripts/rsync-compat.py --ledger-only --update-ledger
 ```
 
 Pinned rsync commit: `7c20b077c980036a19587701cec320cc88e42a4a`.
-Configured command prefix: `syq`.
+Configured command prefix: `syq rsync`.
 
 | Classification | Tests |
 |---|---:|

@@ -9,7 +9,7 @@ helpers = ["tls", "trimslash", "t_unsafe", "t_chmod_secure", "t_secure_relpath",
 [target]
 name = "rsync"
 args = ["rsync"]
-description = "The rsync-compatible command surface; currently routed through native SYQ until the syq rsync subcommand exists"
+description = "The retained rsync-compatible command surface under the syq rsync subcommand"
 
 [reasons]
 rsync-internal = "Exercises rsync's implementation, build, helper programs, or test harness rather than command-line filesystem semantics."

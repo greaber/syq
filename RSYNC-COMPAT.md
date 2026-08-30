@@ -1,8 +1,8 @@
 # rsync compatibility
 
-syq has an rsync-shaped command line. This file is the tracked record of how
-far that goes: what behaves the same, what differs and why, what rsync has
-that syq doesn't, and the open issues. `README.md` is the user-facing
+`syq rsync` is syq's retained rsync-shaped command surface. This file is the
+tracked record of how far that goes: what behaves the same, what differs and
+why, what rsync has that syq doesn't, and the open issues. `README.md` is the user-facing
 contract; when the two disagree, fix one of them.
 
 Each entry says whether it was **measured** (run against upstream rsync —
@@ -34,11 +34,11 @@ python3 scripts/rsync-compat.py
 ```
 
 The manifest pins rsync commit `7c20b077` and defines one target representing
-SYQ's rsync-compatible command surface. It currently invokes native `syq`; once
-the dedicated `syq rsync` command exists, changing the target's argument list
-switches the suite without changing upstream test calls. `inventory.tsv` names
-all 351 tests at that commit; changing the pin without classifying every added
-or removed test is an error. The classifications deliberately distinguish:
+SYQ's retained `syq rsync` compatibility surface. Its configured `rsync`
+argument routes every upstream invocation through that subcommand without
+changing upstream test calls. `inventory.tsv` names all 351 tests at that
+commit; changing the pin without classifying every added or removed test is an
+error. The classifications deliberately distinguish:
 
 - relevant unmodified and adapted conformance tests;
 - user-visible features syq does not implement;

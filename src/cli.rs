@@ -34,6 +34,7 @@ pub enum SourceSelection {
     Rsync,
     Named,
     Contents,
+    NamedNoFollow,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -229,6 +230,23 @@ pub struct Args {
     /// must authenticate to the destination with its own credentials
     #[arg(long, conflicts_with = "rsh")]
     pub no_forward_agent: bool,
+    /// Remote-to-remote with the default ssh: expose the unrestricted local agent to the source
+    /// host. This is a compatibility escape hatch; the default broker permits only user@hostB
+    #[arg(
+        long,
+        conflicts_with_all = ["rsh", "no_forward_agent", "detach", "relay"]
+    )]
+    pub unrestricted_agent_forwarding: bool,
+    /// Remote-to-remote: use only the live destination-bound agent broker and
+    /// do not create or use a command-restricted receiver enrollment
+    #[arg(
+        long,
+        conflicts_with_all = ["rsh", "no_forward_agent", "unrestricted_agent_forwarding", "detach", "relay"]
+    )]
+    pub agent_broker_only: bool,
+    /// Signed receiver grant forwarded to the source-host orchestrator
+    #[arg(long, hide = true)]
+    pub restricted_grant: Option<String>,
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
     pub width: Option<usize>,
@@ -474,7 +492,7 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp        Copy selected objects without removing target-only objects\n  cp-prune  Copy, then remove target-only objects in the mapped scope\n  rm        Remove explicitly selected object trees\n  rsync     Use the retained rsync-shaped command surface\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects without removing target-only objects\n  cp-prune     Copy, then remove target-only objects in the mapped scope\n  rm           Remove explicitly selected object trees\n  rsync        Use the retained rsync-shaped command surface\n  enroll       Pre-enroll a command-restricted remote destination\n  enrollments  List local command-restricted enrollments\n  revoke       Revoke a command-restricted enrollment\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -665,15 +683,21 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         );
     };
     if placement == Placement::As
-        && (locations.len() != 1 || locations[0].selection != SourceSelection::Named)
+        && (locations.len() != 1
+            || !matches!(
+                locations[0].selection,
+                SourceSelection::Named | SourceSelection::NamedNoFollow
+            ))
     {
         bail!("--as, --as-new, and --as-existing require exactly one ordinary source object");
     }
     if placement == Placement::Into {
-        for source in locations
-            .iter()
-            .filter(|source| source.selection == SourceSelection::Named)
-        {
+        for source in locations.iter().filter(|source| {
+            matches!(
+                source.selection,
+                SourceSelection::Named | SourceSelection::NamedNoFollow
+            )
+        }) {
             if native_basename(&source.path).is_none() {
                 bail!(
                     "named source {:?} has no target basename; use --src-src to select directory contents",
@@ -701,6 +725,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.delete = interface == Interface::NativeCpPrune;
     args.max_delete = max_delete;
     apply_native_operational(&mut args, parsed.operational);
+    apply_internal_native_direct(&mut args)?;
     Ok(args)
 }
 
@@ -726,9 +751,9 @@ fn lower_native_selection(
 ) -> Result<Vec<Location>> {
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
     for (id, selection, paths) in [
-        ("sources", SourceSelection::Named, &parsed.sources),
-        ("src", SourceSelection::Named, &parsed.src),
-        ("srcs", SourceSelection::Named, &parsed.srcs),
+        ("sources", SourceSelection::NamedNoFollow, &parsed.sources),
+        ("src", SourceSelection::NamedNoFollow, &parsed.src),
+        ("srcs", SourceSelection::NamedNoFollow, &parsed.srcs),
         ("src_src", SourceSelection::Contents, &parsed.src_src),
         ("src_srcs", SourceSelection::Contents, &parsed.src_srcs),
     ] {
@@ -775,6 +800,34 @@ fn apply_native_operational(args: &mut Args, operational: NativeOperationalArgs)
     args.verbose = operational.verbose;
     args.quiet = operational.quiet;
     args.connections_opt = operational.connections;
+}
+
+/// Direct remote-to-remote execution needs a few automatically derived engine
+/// controls on the source host. Keep them out of the native command grammar:
+/// they are carried by the internal launcher environment, so public native
+/// parsing remains the strict allowlist above.
+fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
+    let utf8 = |name: &str| -> Result<Option<String>> {
+        std::env::var_os(name)
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))
+            })
+            .transpose()
+    };
+    args.restricted_grant = utf8("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT")?;
+    args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
+    args.rsh = utf8("SYQ_INTERNAL_NATIVE_RSH")?;
+    if let Some(width) = utf8("SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH")? {
+        args.width = Some(
+            width
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid internal native progress width"))?,
+        );
+        args.progress = true;
+    }
+    Ok(())
 }
 
 fn command_label(interface: Interface) -> &'static str {
@@ -1165,7 +1218,7 @@ mod tests {
         assert_eq!(args.locations.len(), 2);
         assert_eq!(args.locations[0].host.as_deref(), Some("source.test"));
         assert_eq!(args.locations[0].path, b"base/one");
-        assert_eq!(args.locations[0].selection, SourceSelection::Named);
+        assert_eq!(args.locations[0].selection, SourceSelection::NamedNoFollow);
         assert_eq!(args.locations[1].host.as_deref(), Some("target.test"));
         assert_eq!(args.locations[1].path, b"dest");
     }
@@ -1233,9 +1286,12 @@ impl Location {
 
     fn native(
         endpoint: Option<(Option<String>, String)>,
-        path: Vec<u8>,
+        mut path: Vec<u8>,
         selection: SourceSelection,
     ) -> Location {
+        while path.len() > 1 && path.ends_with(b"/") {
+            path.pop();
+        }
         let (user, host) = endpoint
             .map(|(user, host)| (user, Some(host)))
             .unwrap_or((None, None));
@@ -1255,7 +1311,7 @@ impl Location {
     pub fn copies_contents(&self) -> bool {
         match self.selection {
             SourceSelection::Contents => true,
-            SourceSelection::Named => false,
+            SourceSelection::Named | SourceSelection::NamedNoFollow => false,
             SourceSelection::Rsync => {
                 let p = self.path.as_slice();
                 p.ends_with(b"/")
@@ -1271,6 +1327,15 @@ impl Location {
     /// spelling keeps its existing scan-time behavior.
     pub fn requires_directory(&self) -> bool {
         self.selection == SourceSelection::Contents
+    }
+
+    pub fn follows_root(&self) -> bool {
+        match self.selection {
+            SourceSelection::Named => true,
+            SourceSelection::Contents => true,
+            SourceSelection::NamedNoFollow => false,
+            SourceSelection::Rsync => self.copies_contents(),
+        }
     }
 
     pub fn basename(&self) -> Vec<u8> {

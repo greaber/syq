@@ -1,15 +1,21 @@
+mod agent_broker;
 mod bwlimit;
 mod checkpoint;
 mod cli;
 mod conn;
 mod crypto;
+mod delegation;
 mod direct;
+pub mod enrollment;
 mod fsops;
 mod identity;
 mod progress;
 mod proto;
 mod remote_helper;
+mod restricted;
 mod rm;
+#[allow(dead_code)]
+mod rooted;
 mod scan;
 mod sched;
 mod server;
@@ -52,20 +58,17 @@ fn main() {
     tune_allocator();
     raise_nofile();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if argv.get(1).is_some_and(|arg| arg == "--build-identity") {
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--build-identity") {
         println!("{}", identity::build());
         return;
     }
     // Compatibility with the 0.1.0 standalone updater. New code uses the
     // release/build identity above and never interprets this as a protocol.
-    if argv.get(1).is_some_and(|arg| arg == "--remote-helper-id") {
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--remote-helper-id") {
         println!("{}", identity::legacy_helper_id());
         return;
     }
-    if argv
-        .get(1)
-        .is_some_and(|arg| arg == "--release-manifest-signing-payload")
-    {
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--release-manifest-signing-payload") {
         if argv.len() != 3 {
             eprintln!("syq: --release-manifest-signing-payload requires one manifest path");
             std::process::exit(2);
@@ -76,12 +79,64 @@ fn main() {
         }
         return;
     }
-    if argv.get(1).is_some_and(|arg| arg == "--server") {
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-install") {
+        if argv.len() != 2 {
+            eprintln!("syq: restricted installer takes no command-line arguments");
+            std::process::exit(2);
+        }
+        if let Err(error) = restricted::remote_install() {
+            eprintln!("syq restricted installer: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-revoke") {
+        if argv.len() != 2 {
+            eprintln!("syq: restricted revoker takes no command-line arguments");
+            std::process::exit(2);
+        }
+        if let Err(error) = restricted::remote_revoke() {
+            eprintln!("syq restricted revoker: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-receiver") {
+        let enrollment = argv
+            .get(2)
+            .and_then(|argument| argument.to_str())
+            .and_then(|argument| argument.strip_prefix("--enrollment="));
+        if argv.len() != 3 || enrollment.is_none() {
+            eprintln!("syq: restricted receiver requires exactly --enrollment=ID");
+            std::process::exit(2);
+        }
+        if let Err(error) = restricted::run_receiver(enrollment.unwrap()) {
+            eprintln!("syq restricted receiver: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // Keep accepting the historical root spelling for managed helpers. A
+    // compatibility wrapper whose public prefix is `syq rsync` naturally
+    // turns its remote `--server` launch into `syq rsync --server`.
+    let server_mode = argv.get(1).and_then(|arg| arg.to_str()) == Some("--server")
+        || (argv.get(1).and_then(|arg| arg.to_str()) == Some("rsync")
+            && argv.get(2).and_then(|arg| arg.to_str()) == Some("--server"));
+    if server_mode {
         if let Err(e) = server::run() {
             eprintln!("syq server: {e:#}");
             std::process::exit(1);
         }
         return;
+    }
+    if let Some(result) = restricted::dispatch_management(&argv) {
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("syq: {error:#}");
+                std::process::exit(1);
+            }
+        }
     }
     let mut args = match cli::Args::parse_args() {
         Ok(a) => a,

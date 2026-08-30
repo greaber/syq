@@ -1,4 +1,5 @@
-//! `syq rsync --rm` and native `syq rm`: recursive removal with N parallel connections. Files are
+//! `syq rsync --rm` and native `syq rm`: recursive removal with N parallel
+//! connections. Files are
 //! unlinked in batches spread across workers; directories are removed
 //! deepest-first, each depth level in parallel.
 
@@ -14,10 +15,6 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 const BATCH: usize = 200;
-
-fn display(path: &[u8]) -> String {
-    String::from_utf8_lossy(path).into_owned()
-}
 
 struct Pool {
     tx: Mutex<Option<mpsc::Sender<Vec<Op>>>>,
@@ -83,7 +80,9 @@ fn worker(
                 _ => Vec::new(),
             })
             .collect();
-        let res = conn.call(Request::Apply(ops)).and_then(|r| ok(r, "remove"));
+        let res = conn
+            .call(Request::Apply { ops, guard: None })
+            .and_then(|r| ok(r, "remove"));
         match res {
             Ok(Response::Applied(errs)) => {
                 for (name, err) in names.iter().zip(errs) {
@@ -130,20 +129,17 @@ fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
             raw = &raw[..raw.len() - 1];
         }
         let last = raw.rsplit(|byte| *byte == b'/').next().unwrap_or(b"");
+        let shown = String::from_utf8_lossy(&l.path);
         if raw.is_empty() || l.path == b"/" {
-            bail!(
-                "refusing to remove the filesystem root {:?}",
-                display(&l.path)
-            );
+            bail!("refusing to remove the filesystem root {shown:?}");
         }
         if raw == b"~" {
-            bail!("refusing to remove {:?}", display(&l.path));
+            bail!("refusing to remove {shown:?}");
         }
         if last == b"." || last == b".." {
             bail!(
-                "\"{}\" may not be removed: its final path component is \"{}\"",
-                display(&l.path),
-                display(last)
+                "\"{shown}\" may not be removed: its final path component is {:?}",
+                String::from_utf8_lossy(last)
             );
         }
     }
@@ -230,7 +226,10 @@ pub fn run(args: Args) -> Result<i32> {
                 for e in entries {
                     if contents && e.path.is_empty() {
                         if e.kind != Kind::Dir {
-                            bail!("contents selector {} is not a directory", display(&root));
+                            bail!(
+                                "contents selector {} is not a directory",
+                                String::from_utf8_lossy(&root)
+                            );
                         }
                         continue;
                     }
