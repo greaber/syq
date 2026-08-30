@@ -194,7 +194,11 @@ private staging directory held by descriptor, and syq checks the identities
 of both objects after the exchange and again before cleanup. If either object
 changes, syq reports failure and retains the staging directory under a
 `.syq-swap-directory-*` recovery name instead of publishing or deleting an
-unverified object. An exact `--as-existing` operation that would change the
+unverified object. After a successful exchange, syq removes the displaced
+object through the held staging descriptor but conservatively retains the now
+empty random `0700` staging directory. POSIX has no descriptor-bound `rmdir`,
+and deleting its mutable parent name would introduce a check/delete race. An
+exact `--as-existing` operation that would change the
 target's type is refused; use `--as` when type replacement is intended.
 
 `cp` copies or updates mapped source objects and keeps unrelated target

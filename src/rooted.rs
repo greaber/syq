@@ -395,36 +395,8 @@ impl Root {
         mode: u32,
         staging_label: &str,
     ) -> Result<Self> {
-        if component.is_empty() || component == b"." || component == b".." || component.contains(&0)
-        {
-            bail!("invalid explicit directory component");
-        }
-        let leaf = component_cstring(component);
-        let (temporary, directory, identity) =
-            create_temporary_directory(self.directory.as_raw_fd(), mode, staging_label)?;
-        if let Err(error) = rename_noreplace(
-            self.directory.as_raw_fd(),
-            &temporary,
-            self.directory.as_raw_fd(),
-            &leaf,
-        ) {
-            drop(directory);
-            return Err(error).with_context(|| {
-                format!(
-                    "publish explicit directory component {} (staging directory {} retained)",
-                    String::from_utf8_lossy(component),
-                    String::from_utf8_lossy(temporary.as_bytes())
-                )
-            });
-        }
-        let named = metadata_at(self.directory.as_raw_fd(), &leaf)
-            .context("verify published explicit directory component")?;
-        if named.dev != identity.dev || named.ino != identity.ino || !named.is_dir() {
-            bail!(
-                "explicit directory component {} changed during publication",
-                String::from_utf8_lossy(component)
-            );
-        }
+        let directory =
+            create_published_directory_noreplace(&self.directory, component, mode, staging_label)?;
         Self::from_directory(directory)
     }
 
@@ -604,7 +576,7 @@ impl Root {
             );
         }
         hold_after_swap_precondition_for_test()?;
-        let (staging_name, staging_directory, staging_identity) =
+        let (staging_name, staging_directory, _staging_identity) =
             create_temporary_directory(parent.directory.as_raw_fd(), 0o700, "swap-directory")?;
         let replacement = random_staging_name("replacement")?;
         create(staging_directory.as_raw_fd(), &replacement)
@@ -668,23 +640,13 @@ impl Root {
         }
         unlink_at(staging_directory.as_raw_fd(), &replacement, 0)
             .with_context(|| format!("remove displaced confined path {}", path.label()))?;
-        let named_staging = metadata_at(parent.directory.as_raw_fd(), &staging_name)
-            .context("verify replacement staging directory before cleanup")?;
-        if named_staging.dev != staging_identity.dev
-            || named_staging.ino != staging_identity.ino
-            || !named_staging.is_dir()
-        {
-            bail!(
-                "replacement staging directory for {} changed before cleanup",
-                path.label()
-            );
-        }
-        unlink_at(
-            parent.directory.as_raw_fd(),
-            &staging_name,
-            libc::AT_REMOVEDIR,
-        )
-        .with_context(|| format!("remove replacement staging directory for {}", path.label()))
+        hold_after_swap_cleanup_for_test()?;
+        // POSIX has no descriptor-relative operation that removes the directory
+        // referred to by `staging_directory`. Checking `staging_name` and then
+        // calling unlinkat(AT_REMOVEDIR) would let another writer rebind the
+        // name between those operations and make us delete an unrelated empty
+        // directory. Retain syq's now-empty random 0700 directory instead.
+        Ok(())
     }
 
     /// Rename one leaf to another. Both parents are resolved and retained
@@ -756,6 +718,40 @@ impl Root {
         }
         self.resolve_parent(path)
     }
+}
+
+pub(crate) fn create_published_directory_noreplace(
+    parent: &File,
+    component: &[u8],
+    mode: u32,
+    staging_label: &str,
+) -> Result<File> {
+    if component.is_empty() || component == b"." || component == b".." || component.contains(&0) {
+        bail!("invalid explicit directory component");
+    }
+    let leaf = component_cstring(component);
+    let (temporary, directory, identity) =
+        create_temporary_directory(parent.as_raw_fd(), mode, staging_label)?;
+    if let Err(error) = rename_noreplace(parent.as_raw_fd(), &temporary, parent.as_raw_fd(), &leaf)
+    {
+        drop(directory);
+        return Err(error).with_context(|| {
+            format!(
+                "publish explicit directory component {} (staging directory {} retained)",
+                String::from_utf8_lossy(component),
+                String::from_utf8_lossy(temporary.as_bytes())
+            )
+        });
+    }
+    let named = metadata_at(parent.as_raw_fd(), &leaf)
+        .context("verify published explicit directory component")?;
+    if named.dev != identity.dev || named.ino != identity.ino || !named.is_dir() {
+        bail!(
+            "explicit directory component {} changed during publication",
+            String::from_utf8_lossy(component)
+        );
+    }
+    Ok(directory)
 }
 
 struct ResolvedParent {
@@ -1099,6 +1095,24 @@ fn hold_before_swap_cleanup_for_test() -> Result<()> {
 
 #[cfg(not(debug_assertions))]
 fn hold_before_swap_cleanup_for_test() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_swap_cleanup_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_SWAP_STAGING_RETAINED_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_SWAP_STAGING_RETAINED_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_swap_cleanup_for_test() -> Result<()> {
     Ok(())
 }
 

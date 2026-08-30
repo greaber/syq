@@ -2,7 +2,9 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::proto::*;
-use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
+use crate::rooted::{
+    create_published_directory_noreplace, RelativePath, Root, RootIdentity, RootMetadata,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -57,11 +59,7 @@ impl OperatorDirectorySelection {
         })
     }
 
-    fn create_missing(
-        &mut self,
-        mode: u32,
-        condition: TargetCondition,
-    ) -> Result<DirectoryAnchor> {
+    fn create_missing(&mut self, mode: u32, condition: TargetCondition) -> Result<DirectoryAnchor> {
         if !matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
             bail!("creating a missing operator directory requires an any or absent condition");
         }
@@ -92,13 +90,28 @@ impl OperatorDirectorySelection {
                     // components start at 0777 (subject to umask), while the
                     // requested mode applies to the selected destination root.
                     let component_mode = if self.missing.is_empty() { mode } else { 0o777 };
-                    match mkdir_operator_directory_at(
+                    match create_published_directory_noreplace(
                         &self.directory,
                         &component,
                         component_mode,
+                        "operator-directory",
                     ) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        Ok(directory) => {
+                            if final_component {
+                                hold_after_created_container_for_test(&resolve(&self.path))?;
+                            } else {
+                                hold_after_created_operator_parent_for_test()?;
+                            }
+                            self.directory = directory;
+                            continue;
+                        }
+                        Err(error)
+                            if error
+                                .downcast_ref::<io::Error>()
+                                .is_some_and(|error| {
+                                    error.kind() == io::ErrorKind::AlreadyExists
+                                }) =>
+                        {
                             if final_component && condition == TargetCondition::Absent {
                                 bail!(
                                     "target {} appeared after the new-path precondition was checked",
@@ -115,7 +128,7 @@ impl OperatorDirectorySelection {
                                 Err(error) => return Err(error.into()),
                             }
                         }
-                        Err(error) => return Err(error.into()),
+                        Err(error) => return Err(error),
                     }
                 }
                 Err(error) => return Err(error.into()),
@@ -124,6 +137,42 @@ impl OperatorDirectorySelection {
         }
         self.anchor()
     }
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_created_operator_parent_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_CREATED_PARENT_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_CREATED_PARENT_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_created_operator_parent_for_test() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_operator_parent_prefix_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_PARENT_PREFIX_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARENT_PREFIX_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_operator_parent_prefix_for_test() -> Result<()> {
+    Ok(())
 }
 
 /// Resolve an operator-selected directory with rsync's ownership rule:
@@ -166,6 +215,14 @@ fn select_operator_directory(
         let metadata = match operator_lstat_at(&directory, &component) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound && allow_missing => {
+                if remaining.iter().any(|component| component == b"..") {
+                    bail!(
+                        "refusing to create missing destination component {:?} before `..` in {}",
+                        OsStr::from_bytes(&component),
+                        path.display()
+                    );
+                }
+                hold_after_operator_parent_prefix_for_test()?;
                 remaining.push_front(component);
                 let selection = OperatorDirectorySelection {
                     path: path_bytes(&path),
@@ -257,26 +314,6 @@ fn open_operator_directory_fd(parent: libc::c_int, component: &CStr) -> Result<F
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error.into());
-        }
-    }
-}
-
-fn mkdir_operator_directory_at(parent: &File, component: &[u8], mode: u32) -> io::Result<()> {
-    let component = CString::new(component).expect("path component was checked for NUL");
-    loop {
-        let result = unsafe {
-            libc::mkdirat(
-                parent.as_raw_fd(),
-                component.as_ptr(),
-                (mode & 0o7777) as libc::mode_t,
-            )
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
         }
     }
 }
@@ -921,7 +958,11 @@ impl FsOps {
                     map(path)?;
                 }
             }
-            Request::Apply { ops, .. } => {
+            Request::Apply { ops, guard } => {
+                let guarded = guard.is_some();
+                if let Some(guard) = guard {
+                    guard.root = self.initial_absolute(&guard.root);
+                }
                 for op in ops {
                     let path = match op {
                         Op::Mkdir { path, .. }
@@ -933,20 +974,30 @@ impl FsOps {
                         | Op::Rmdir { path }
                         | Op::Unlink { path } => path,
                     };
+                    if guarded {
+                        *path = self.initial_absolute(path);
+                    } else {
+                        map(path)?;
+                    }
+                }
+            }
+            Request::ProbePartial { path, guard, .. }
+            | Request::Prepare { path, guard, .. }
+            | Request::HashAndHold { path, guard, .. }
+            | Request::FinishBasis { path, guard, .. }
+            | Request::SeedBasis { path, guard, .. }
+            | Request::HashBlocks { path, guard, .. }
+            | Request::WriteRange { path, guard, .. }
+            | Request::Finalize { path, guard, .. }
+            | Request::FileHash { path, guard, .. } => {
+                if let Some(guard) = guard {
+                    *path = self.initial_absolute(path);
+                    guard.root = self.initial_absolute(&guard.root);
+                } else {
                     map(path)?;
                 }
             }
-            Request::ProbePartial { path, .. }
-            | Request::Prepare { path, .. }
-            | Request::HashAndHold { path, .. }
-            | Request::FinishBasis { path, .. }
-            | Request::SeedBasis { path, .. }
-            | Request::HashBlocks { path, .. }
-            | Request::ReadRange { path, .. }
-            | Request::WriteRange { path, .. }
-            | Request::Finalize { path, .. }
-            | Request::FileHash { path, .. }
-            | Request::Canonicalize { path } => map(path)?,
+            Request::ReadRange { path, .. } | Request::Canonicalize { path } => map(path)?,
             Request::CopyLocal { src, dst, .. } => {
                 *src = self.initial_absolute(src);
                 map(dst)?;
@@ -958,7 +1009,12 @@ impl FsOps {
             }
             Request::PutSmallBatch(puts) => {
                 for put in puts {
-                    map(&mut put.path)?;
+                    if let Some(guard) = &mut put.guard {
+                        put.path = self.initial_absolute(&put.path);
+                        guard.root = self.initial_absolute(&guard.root);
+                    } else {
+                        map(&mut put.path)?;
+                    }
                 }
             }
             Request::Hello { .. }
@@ -968,30 +1024,6 @@ impl FsOps {
             | Request::AnchorDestination { .. }
             | Request::TransportStats
             | Request::Shutdown => {}
-        }
-        match &mut req {
-            Request::Apply { guard, .. }
-            | Request::ProbePartial { guard, .. }
-            | Request::Prepare { guard, .. }
-            | Request::HashAndHold { guard, .. }
-            | Request::FinishBasis { guard, .. }
-            | Request::SeedBasis { guard, .. }
-            | Request::HashBlocks { guard, .. }
-            | Request::WriteRange { guard, .. }
-            | Request::Finalize { guard, .. }
-            | Request::FileHash { guard, .. } => {
-                if let Some(guard) = guard {
-                    map(&mut guard.root)?;
-                }
-            }
-            Request::PutSmallBatch(puts) => {
-                for put in puts {
-                    if let Some(guard) = &mut put.guard {
-                        map(&mut guard.root)?;
-                    }
-                }
-            }
-            _ => {}
         }
         Ok(req)
     }
@@ -1023,6 +1055,10 @@ impl FsOps {
                 directories,
                 others,
             },
+            Response::Container(mut guard) => {
+                guard.root = self.destination_full(&guard.root);
+                Response::Container(guard)
+            }
             response => response,
         }
     }
@@ -1460,13 +1496,19 @@ fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> 
 }
 
 fn relative_under(root: &Path, target: &Path) -> Result<RelativePath> {
-    let relative = target.strip_prefix(root).with_context(|| {
-        format!(
-            "target {} is outside guarded root {}",
-            target.display(),
-            root.display()
-        )
-    })?;
+    let relative = if root == Path::new(".") && target == Path::new(".") {
+        Path::new("")
+    } else if root == Path::new(".") && target.is_relative() {
+        target
+    } else {
+        target.strip_prefix(root).with_context(|| {
+            format!(
+                "target {} is outside guarded root {}",
+                target.display(),
+                root.display()
+            )
+        })?
+    };
     RelativePath::new(relative.as_os_str().as_bytes())
 }
 
@@ -1998,7 +2040,11 @@ impl FsOps {
         guard: Option<&ContainerGuard>,
     ) -> Result<Response> {
         let p = resolve(path);
-        let pp = self.partial_path(&p, partial_id)?;
+        let pp = if guard.is_some() {
+            partial_path(&p, partial_id)?
+        } else {
+            self.partial_path(&p, partial_id)?
+        };
         let partial_size = if let Some(guard) = guard {
             let target = guarded_target(path, guard)?;
             let relative = relative_under(&target.root_path, &pp)?;
@@ -2363,7 +2409,11 @@ impl FsOps {
         guard: Option<&ContainerGuard>,
     ) -> Result<()> {
         let mut held = self.take_held_basis(path, partial_id)?;
-        let pp = self.partial_path(&held.path, partial_id)?;
+        let pp = if guard.is_some() {
+            partial_path(&held.path, partial_id)?
+        } else {
+            self.partial_path(&held.path, partial_id)?
+        };
         let dst = if let Some(guard) = guard {
             let target = guarded_target(path, guard)?;
             let relative = relative_under(&target.root_path, &pp)?;
@@ -2582,7 +2632,11 @@ impl FsOps {
     ) -> Result<Vec<u64>> {
         let final_path = resolve(path);
         let selected = if which == Which::Partial {
-            self.partial_path(&final_path, partial_id)?
+            if guard.is_some() {
+                partial_path(&final_path, partial_id)?
+            } else {
+                self.partial_path(&final_path, partial_id)?
+            }
         } else {
             final_path
         };
@@ -2647,6 +2701,8 @@ impl FsOps {
         let p = resolve(target.path);
         let p = if inplace {
             p
+        } else if target.guard.is_some() {
+            partial_path(&p, target.id)?
         } else {
             self.partial_path(&p, target.id)?
         };
@@ -3476,12 +3532,8 @@ mod tests {
         assert!(first_anchor.is_none());
         assert!(second_anchor.is_none());
 
-        let first_anchor = first
-            .create_missing(0o755, TargetCondition::Any)
-            .unwrap();
-        let second_anchor = second
-            .create_missing(0o755, TargetCondition::Any)
-            .unwrap();
+        let first_anchor = first.create_missing(0o755, TargetCondition::Any).unwrap();
+        let second_anchor = second.create_missing(0o755, TargetCondition::Any).unwrap();
         assert_eq!(
             (first_anchor.dev, first_anchor.ino),
             (second_anchor.dev, second_anchor.ino)

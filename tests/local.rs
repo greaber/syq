@@ -375,7 +375,7 @@ fn native_placement_preconditions_are_enforced_at_mutation_time() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn native_container_identity_anchors_worker_writes_and_cprm_deletions() {
+fn native_container_identity_anchors_worker_writes_and_cp_prune_deletions() {
     let t = Tmp::new();
     write(&t.path("source/file"), b"source");
 
@@ -734,6 +734,50 @@ fn replacement_cleanup_rejects_a_substituted_displaced_object() {
     assert_eq!(
         fs::read_link(staging.join("displaced-target")).unwrap(),
         Path::new("old-target")
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn replacement_never_deletes_a_rebound_staging_directory_name() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    symlink("source-target", t.path("source-link")).unwrap();
+    symlink("old-target", t.path("destination-link")).unwrap();
+    let ready = t.path("staging-retained-ready");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-no-follow",
+            &t.s("source-link"),
+            "--as-existing",
+            &t.s("destination-link"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SWAP_STAGING_RETAINED_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SWAP_STAGING_RETAINED_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_signal(&ready);
+    let staging = swap_staging_directory(&t);
+    let retained = t.path("syq-retained-staging");
+    fs::rename(&staging, &retained).unwrap();
+    fs::create_dir(&staging).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_output_ok(&output);
+    assert_eq!(
+        fs::read_link(t.path("destination-link")).unwrap(),
+        Path::new("source-target")
+    );
+    assert!(retained.is_dir(), "syq's held staging directory was lost");
+    assert!(
+        staging.is_dir(),
+        "a directory rebound at the staging name was deleted"
     );
 }
 
@@ -5407,7 +5451,7 @@ fn exact_payload_sidecar_collision_with_dot_destination_fails_before_publication
         b"deliberate collision",
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let output = compat_command()
         .args(args)
         .arg("--no-progress")
         .current_dir(t.path("dst"))
@@ -6423,7 +6467,7 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
         fs::create_dir_all(t.path("outside")).unwrap();
         let ready = t.path("anchor-ready");
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        let mut command = compat_command();
         command.args(["-a", "-j", "1", &t.s("src/"), &t.s("dst/")]);
         if no_tcp {
             command.arg("--no-tcp");
