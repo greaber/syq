@@ -1079,11 +1079,45 @@ fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u
     if !path.is_absolute() {
         bail!("{label} path must be absolute");
     }
-    let mut file = OpenOptions::new()
+    let mut directory = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("open {label} {}", path.display()))?;
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .with_context(|| format!("open filesystem root for {label} validation"))?;
+    validate_trusted_directory(&directory, &format!("{label} ancestor"))?;
+
+    let mut components = path.components().peekable();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        bail!("{label} path must start at the filesystem root");
+    }
+    let mut file = loop {
+        let Some(component) = components.next() else {
+            bail!("{label} path has no regular-file component");
+        };
+        let std::path::Component::Normal(name) = component else {
+            bail!("{label} path contains a noncanonical component");
+        };
+        if components.peek().is_some() {
+            let next = openat_os_file(
+                directory.as_raw_fd(),
+                name,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+            .with_context(|| format!("securely open {label} ancestor in {}", path.display()))?;
+            validate_trusted_directory(&next, &format!("{label} ancestor"))?;
+            directory = next;
+            continue;
+        }
+
+        break openat_os_file(
+            directory.as_raw_fd(),
+            name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .with_context(|| format!("open trusted {label} {}", path.display()))?;
+    };
     let metadata = file.metadata()?;
     let effective_uid = unsafe { libc::geteuid() };
     if !metadata.file_type().is_file()
@@ -2311,6 +2345,47 @@ mod tests {
             .expect("make verifier ancestor group writable");
 
         assert!(validate_secure_executable(&executable).is_err());
+    }
+
+    #[test]
+    fn policy_files_reject_a_writable_ancestor_rollback() {
+        let directory = TestDir::new("policy-rollback");
+        let ancestor = directory.join("unsafe");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&ancestor)
+            .expect("create policy ancestor");
+
+        for name in ["allowed-signers", "revocations"] {
+            write_private(&ancestor.join(name), b"current policy\n");
+            write_private(
+                &ancestor.join(format!("{name}.retained")),
+                b"retained policy\n",
+            );
+        }
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o770))
+            .expect("make policy ancestor group writable");
+
+        for name in ["allowed-signers", "revocations"] {
+            let active = ancestor.join(name);
+            let replaced = ancestor.join(format!("{name}.replaced"));
+            let retained = ancestor.join(format!("{name}.retained"));
+            fs::rename(&active, &replaced).expect("remove current policy inode");
+            fs::rename(&retained, &active).expect("restore retained policy inode");
+        }
+
+        assert!(read_secure_regular(
+            &ancestor.join("allowed-signers"),
+            "allowed-signers policy",
+            MAX_POLICY_BYTES,
+        )
+        .is_err());
+        assert!(read_secure_regular(
+            &ancestor.join("revocations"),
+            "SSHSIG revocation policy",
+            MAX_REVOCATION_BYTES,
+        )
+        .is_err());
     }
 
     #[test]
