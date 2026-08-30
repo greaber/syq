@@ -1,15 +1,65 @@
 use anyhow::{bail, Result};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Interface {
+    #[default]
+    Rsync,
+    NativeCp,
+    NativeCprm,
+    NativeRm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    #[default]
+    Rsync,
+    Into,
+    As,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Existence {
+    #[default]
+    Any,
+    New,
+    Existing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceSelection {
+    #[default]
+    Rsync,
+    Named,
+    Contents,
+    NamedNoFollow,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "syq",
+    name = "syq rsync",
     version,
-    about = "Parallel copy with an rsync-shaped interface",
+    about = "Rsync-compatible copy syntax and semantics",
     disable_help_flag = true,
-    override_usage = "syq [OPTIONS] SRC... DEST\n       syq [OPTIONS] [USER@]HOST:SRC... DEST\n       syq [OPTIONS] SRC... [USER@]HOST:DEST\n       syq --self-update"
+    override_usage = "syq rsync [OPTIONS] SRC... DEST\n       syq rsync [OPTIONS] [USER@]HOST:SRC... DEST\n       syq rsync [OPTIONS] SRC... [USER@]HOST:DEST"
 )]
 pub struct Args {
+    /// Which public command produced this execution request.
+    #[arg(skip)]
+    pub interface: Interface,
+    /// Explicit native placement; compatibility mode derives it from rsync syntax.
+    #[arg(skip)]
+    pub placement: Placement,
+    /// Existence precondition attached to the native placement.
+    #[arg(skip)]
+    pub target_existence: Existence,
+    /// Native parsing keeps endpoint and raw Unix path bytes separate. Compatibility
+    /// mode leaves this empty and parses `paths` with rsync's colon rules.
+    #[arg(skip)]
+    pub locations: Vec<Location>,
+
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
@@ -171,7 +221,7 @@ pub struct Args {
     /// ssh session) and return; progress goes to a log you can watch with --follow
     #[arg(long)]
     pub detach: bool,
-    /// Follow a detached transfer: syq --follow HOST:LOGFILE
+    /// Follow a detached transfer: syq rsync --follow HOST:LOGFILE
     #[arg(long)]
     pub follow: bool,
     /// Remote-to-remote: relay data through this machine instead of running on the source host
@@ -181,6 +231,23 @@ pub struct Args {
     /// must authenticate to the destination with its own credentials
     #[arg(long, conflicts_with = "rsh")]
     pub no_forward_agent: bool,
+    /// Remote-to-remote with the default ssh: expose the unrestricted local agent to the source
+    /// host. This is a compatibility escape hatch; the default broker permits only user@hostB
+    #[arg(
+        long,
+        conflicts_with_all = ["rsh", "no_forward_agent", "detach", "relay"]
+    )]
+    pub unrestricted_agent_forwarding: bool,
+    /// Remote-to-remote: use only the live destination-bound agent broker and
+    /// do not create or use a command-restricted receiver enrollment
+    #[arg(
+        long,
+        conflicts_with_all = ["rsh", "no_forward_agent", "unrestricted_agent_forwarding", "detach", "relay"]
+    )]
+    pub agent_broker_only: bool,
+    /// Signed receiver grant forwarded to the source-host orchestrator
+    #[arg(long, hide = true)]
+    pub restricted_grant: Option<String>,
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
     pub width: Option<usize>,
@@ -282,10 +349,51 @@ impl Args {
     /// --ignore-from patterns in the order they were given (later lines win, as in
     /// a .gitignore file).
     pub fn parse_args() -> Result<Args> {
-        use clap::{CommandFactory, FromArgMatches};
-        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
+        let Some(command) = argv.first().and_then(|arg| arg.to_str()) else {
+            if argv.is_empty() {
+                print_root_help();
+                std::process::exit(0);
+            }
+            bail!("command name is not valid UTF-8");
+        };
+        match command {
+            "rsync" => Self::parse_rsync(&argv[1..]),
+            "cp" => parse_native_copy(&argv[1..], false),
+            "cprm" => parse_native_copy(&argv[1..], true),
+            "rm" => parse_native_rm(&argv[1..]),
+            "--help" | "-h" => {
+                print_root_help();
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("syq {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            // Product lifecycle switches predate the command grammar and remain
+            // top-level until their eventual native command shape is settled.
+            "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv),
+            _ => bail!(
+                "expected a command (`cp`, `cprm`, `rm`, or `rsync`); rsync-compatible syntax now starts with `syq rsync`"
+            ),
+        }
+    }
+
+    fn parse_rsync(argv: &[OsString]) -> Result<Args> {
+        let argv: Vec<String> = argv
+            .iter()
+            .map(|arg| {
+                arg.clone()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("rsync-compatible arguments must be valid UTF-8"))
+            })
+            .collect::<Result<_>>()?;
         reject_unsupported_rsync_flags(&argv)?;
-        let m = Args::command().get_matches();
+        let mut full_argv = vec!["syq rsync".to_string()];
+        full_argv.extend(argv);
+        let m = Args::command()
+            .try_get_matches_from(full_argv)
+            .unwrap_or_else(|error| error.exit());
         let mut args = Args::from_arg_matches(&m)?;
         args.bwlimit_bytes = args
             .bwlimit
@@ -374,6 +482,471 @@ impl Args {
         }
         f
     }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "syq cp",
+    about = "Copy selected objects with explicit endpoint and placement semantics"
+)]
+struct NativeCopyArgs {
+    /// Source endpoint ([USER@]HOST); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    from: Option<String>,
+    /// Resolve relative source selectors from DIR at the source endpoint
+    #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
+    cwd: Option<OsString>,
+    /// Select a named source object (repeatable; follows a top-level symlink)
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    src: Vec<OsString>,
+    /// Select a directory's contents (repeatable)
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    src_src: Vec<OsString>,
+    /// Select a named source without following a top-level symlink (repeatable)
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    src_no_follow: Vec<OsString>,
+
+    /// Target endpoint ([USER@]HOST); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    to: Option<String>,
+    /// Put selected names inside DIR, creating DIR if necessary
+    #[arg(
+        long,
+        value_name = "DIR",
+        group = "placement",
+        allow_hyphen_values = true
+    )]
+    into: Option<OsString>,
+    /// Put selected names inside a new DIR
+    #[arg(
+        long,
+        value_name = "DIR",
+        group = "placement",
+        allow_hyphen_values = true
+    )]
+    into_new: Option<OsString>,
+    /// Put selected names inside an existing directory
+    #[arg(
+        long,
+        value_name = "DIR",
+        group = "placement",
+        allow_hyphen_values = true
+    )]
+    into_existing: Option<OsString>,
+    /// Map the single named source exactly to PATH
+    #[arg(
+        long,
+        value_name = "PATH",
+        group = "placement",
+        allow_hyphen_values = true
+    )]
+    r#as: Option<OsString>,
+    /// Map the single named source exactly to a new PATH
+    #[arg(
+        long,
+        value_name = "PATH",
+        group = "placement",
+        allow_hyphen_values = true
+    )]
+    as_new: Option<OsString>,
+    /// Map the single named source exactly to an existing PATH
+    #[arg(
+        long,
+        value_name = "PATH",
+        group = "placement",
+        allow_hyphen_values = true
+    )]
+    as_existing: Option<OsString>,
+
+    /// Resolve and preview the operation without changing anything
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+    /// Increase verbosity (-v lists paths; -vv includes transport diagnostics)
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    /// Suppress non-error output
+    #[arg(short = 'q', long)]
+    quiet: bool,
+    /// Use a fixed number of parallel connections/workers
+    #[arg(short = 'j', long = "connections", value_name = "N")]
+    connections: Option<usize>,
+    /// Show progress
+    #[arg(long, overrides_with = "no_progress")]
+    progress: bool,
+    /// Never show progress
+    #[arg(long)]
+    no_progress: bool,
+    /// Emit progress telemetry as JSON on stderr
+    #[arg(long)]
+    progress_json: bool,
+    /// Print transfer statistics at the end
+    #[arg(long)]
+    stats: bool,
+    /// Refuse all target-extra removals if more than N are planned (cprm only)
+    #[arg(long, value_name = "N")]
+    max_delete: Option<u64>,
+
+    /// Relay a remote-to-remote transfer through this machine
+    #[arg(long)]
+    relay: bool,
+    /// Run a remote-to-remote transfer detached on the source endpoint
+    #[arg(long)]
+    detach: bool,
+    /// Disable transport compression
+    #[arg(long)]
+    no_compress: bool,
+    /// Send data over SSH instead of separate TCP connections
+    #[arg(long)]
+    no_tcp: bool,
+    /// Use unencrypted TCP data connections
+    #[arg(long)]
+    tcp_plain: bool,
+    /// Port range used for TCP data connections
+    #[arg(long, value_name = "LO-HI")]
+    tcp_ports: Option<String>,
+    /// Remote shell command (default: ssh)
+    #[arg(long, value_name = "COMMAND")]
+    rsh: Option<String>,
+    /// Use this exact syq executable on remote endpoints
+    #[arg(long, value_name = "PATH")]
+    syq_path: Option<String>,
+    /// Require syq on the remote PATH instead of installing a managed helper
+    #[arg(long)]
+    no_bootstrap: bool,
+    /// Disable SSH-agent forwarding for direct remote-to-remote transfers
+    #[arg(long, conflicts_with = "rsh")]
+    no_forward_agent: bool,
+    /// Use only the live destination-bound broker; do not auto-enroll a
+    /// command-restricted receiver
+    #[arg(long, conflicts_with_all = ["rsh", "no_forward_agent"])]
+    agent_broker_only: bool,
+    /// Signed receiver grant forwarded to a remote orchestrator
+    #[arg(long, hide = true)]
+    restricted_grant: Option<String>,
+    /// Original source endpoint for a remotely orchestrated dry-run summary
+    #[arg(long, hide = true)]
+    plan_source_host: Option<String>,
+    /// Terminal width for a remotely orchestrated progress display
+    #[arg(long, hide = true)]
+    width: Option<usize>,
+
+    /// Named source objects (shorthand for --src)
+    #[arg(value_name = "PATH")]
+    sources: Vec<OsString>,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "syq rm", about = "Remove explicitly selected object trees")]
+struct NativeRmArgs {
+    /// Endpoint ([USER@]HOST); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    at: Option<String>,
+    /// Resolve relative paths from DIR at the selected endpoint
+    #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
+    cwd: Option<OsString>,
+    /// Select a path to remove (repeatable)
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    path: Vec<OsString>,
+    /// Preview removals without changing anything
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+    /// Increase verbosity
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    /// Suppress non-error output
+    #[arg(short = 'q', long)]
+    quiet: bool,
+    /// Use a fixed number of parallel workers
+    #[arg(short = 'j', long = "connections", value_name = "N")]
+    connections: Option<usize>,
+    /// Show progress
+    #[arg(long, overrides_with = "no_progress")]
+    progress: bool,
+    /// Never show progress
+    #[arg(long)]
+    no_progress: bool,
+    /// Emit progress telemetry as JSON on stderr
+    #[arg(long)]
+    progress_json: bool,
+    /// Disable transport compression
+    #[arg(long)]
+    no_compress: bool,
+    /// Remote shell command (default: ssh)
+    #[arg(long, value_name = "COMMAND")]
+    rsh: Option<String>,
+    /// Use this exact syq executable on a remote endpoint
+    #[arg(long, value_name = "PATH")]
+    syq_path: Option<String>,
+    /// Require syq on the remote PATH instead of installing a managed helper
+    #[arg(long)]
+    no_bootstrap: bool,
+    /// Selected paths (shorthand for --path)
+    #[arg(value_name = "PATH")]
+    paths: Vec<OsString>,
+}
+
+fn print_root_help() {
+    println!(
+        "Parallel copy with explicit native semantics\n\nUsage: syq <COMMAND> [OPTIONS]\n\nCommands:\n  cp           Copy selected objects without removing target-only objects\n  cprm         Copy, then remove target-only objects in the mapped scope\n  rm           Remove explicitly selected object trees\n  rsync        Use the retained rsync-compatible command surface\n  enroll       Pre-enroll a command-restricted remote destination\n  enrollments  List local command-restricted enrollments\n  revoke       Revoke a command-restricted enrollment\n\nRun `syq <COMMAND> --help` for command-specific help."
+    );
+}
+
+fn native_defaults() -> Args {
+    Args::try_parse_from(["syq rsync", "source", "destination"])
+        .expect("internal compatibility defaults must parse")
+}
+
+fn parse_native_copy(argv: &[OsString], delete: bool) -> Result<Args> {
+    let command_name = if delete { "syq cprm" } else { "syq cp" };
+    let mut full_argv = vec![OsString::from(command_name)];
+    full_argv.extend_from_slice(argv);
+    let command = if delete {
+        NativeCopyArgs::command()
+            .name("syq cprm")
+            .about("Copy selected objects, then remove target-only objects in mapped scopes")
+    } else {
+        NativeCopyArgs::command()
+    };
+    let matches = command
+        .try_get_matches_from(full_argv)
+        .unwrap_or_else(|error| error.exit());
+    let parsed = NativeCopyArgs::from_arg_matches(&matches)?;
+
+    let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
+    if let Some(indices) = matches.indices_of("sources") {
+        ordered.extend(
+            indices
+                .zip(parsed.sources.iter().cloned())
+                .map(|(index, path)| (index, SourceSelection::Named, path)),
+        );
+    }
+    for (id, selection, paths) in [
+        ("src", SourceSelection::Named, &parsed.src),
+        ("src_src", SourceSelection::Contents, &parsed.src_src),
+        (
+            "src_no_follow",
+            SourceSelection::NamedNoFollow,
+            &parsed.src_no_follow,
+        ),
+    ] {
+        if let Some(indices) = matches.indices_of(id) {
+            ordered.extend(
+                indices
+                    .zip(paths.iter().cloned())
+                    .map(|(index, path)| (index, selection, path)),
+            );
+        }
+    }
+    ordered.sort_by_key(|(index, _, _)| *index);
+    if ordered.is_empty() {
+        bail!("{command_name} needs at least one source selector");
+    }
+
+    let placements = [
+        (parsed.into, Placement::Into, Existence::Any),
+        (parsed.into_new, Placement::Into, Existence::New),
+        (parsed.into_existing, Placement::Into, Existence::Existing),
+        (parsed.r#as, Placement::As, Existence::Any),
+        (parsed.as_new, Placement::As, Existence::New),
+        (parsed.as_existing, Placement::As, Existence::Existing),
+    ];
+    let Some((target, placement, target_existence)) = placements
+        .into_iter()
+        .find_map(|(path, placement, existence)| path.map(|p| (p, placement, existence)))
+    else {
+        bail!("{command_name} requires one of --into, --into-new, --into-existing, --as, --as-new, or --as-existing");
+    };
+    if placement == Placement::As
+        && (ordered.len() != 1 || ordered[0].1 == SourceSelection::Contents)
+    {
+        bail!("--as, --as-new, and --as-existing require exactly one named source");
+    }
+    if !delete && parsed.max_delete.is_some() {
+        bail!("--max-delete is only valid with cprm");
+    }
+
+    let source_endpoint = parse_native_endpoint(parsed.from.as_deref())?;
+    let target_endpoint = parse_native_endpoint(parsed.to.as_deref())?;
+    let cwd = parsed.cwd.as_deref().map(OsStrExt::as_bytes);
+    let mut locations = Vec::with_capacity(ordered.len() + 1);
+    for (_, selection, path) in ordered {
+        let path = qualify_source(cwd, path.into_vec());
+        if path.is_empty() {
+            bail!("source selectors may not be empty");
+        }
+        if placement == Placement::Into
+            && selection != SourceSelection::Contents
+            && native_basename(&path).is_none()
+        {
+            bail!(
+                "named source {:?} has no target basename; select a path ending in a named object or use --src-src for directory contents",
+                String::from_utf8_lossy(&path)
+            );
+        }
+        locations.push(Location::native(source_endpoint.clone(), path, selection));
+    }
+    let target = target.into_vec();
+    if target.is_empty() {
+        bail!("target paths may not be empty");
+    }
+    locations.push(Location::native(
+        target_endpoint,
+        target,
+        SourceSelection::Named,
+    ));
+
+    let mut args = native_defaults();
+    args.interface = if delete {
+        Interface::NativeCprm
+    } else {
+        Interface::NativeCp
+    };
+    args.placement = placement;
+    args.target_existence = target_existence;
+    args.locations = locations;
+    args.paths.clear();
+    // Structural traversal and symlink objects are part of native copy, while
+    // ownership, group, modes, special files, and richer fidelity profiles are
+    // left to the still-open preservation design. Mtime is retained so normal
+    // quick-check reruns remain useful.
+    args.recursive = true;
+    args.links = true;
+    args.times = true;
+    args.delete = delete;
+    args.max_delete = parsed.max_delete;
+    args.dry_run = parsed.dry_run;
+    args.verbose = parsed.verbose;
+    args.quiet = parsed.quiet;
+    args.connections_opt = parsed.connections;
+    args.progress = parsed.progress;
+    args.no_progress = parsed.no_progress;
+    args.progress_json = parsed.progress_json;
+    args.stats = parsed.stats;
+    args.relay = parsed.relay;
+    args.detach = parsed.detach;
+    args.no_compress = parsed.no_compress;
+    args.no_tcp = parsed.no_tcp;
+    args.tcp_plain = parsed.tcp_plain;
+    if let Some(ports) = parsed.tcp_ports {
+        args.tcp_ports = ports;
+    }
+    args.rsh = parsed.rsh;
+    args.syq_path = parsed.syq_path;
+    args.no_bootstrap = parsed.no_bootstrap;
+    args.no_forward_agent = parsed.no_forward_agent;
+    args.agent_broker_only = parsed.agent_broker_only;
+    args.restricted_grant = parsed.restricted_grant;
+    args.plan_source_host = parsed.plan_source_host;
+    args.width = parsed.width;
+    Ok(args)
+}
+
+fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
+    let mut full_argv = vec![OsString::from("syq rm")];
+    full_argv.extend_from_slice(argv);
+    let matches = NativeRmArgs::command()
+        .try_get_matches_from(full_argv)
+        .unwrap_or_else(|error| error.exit());
+    let parsed = NativeRmArgs::from_arg_matches(&matches)?;
+    let mut ordered: Vec<(usize, OsString)> = Vec::new();
+    if let Some(indices) = matches.indices_of("paths") {
+        ordered.extend(indices.zip(parsed.paths.iter().cloned()));
+    }
+    if let Some(indices) = matches.indices_of("path") {
+        ordered.extend(indices.zip(parsed.path.iter().cloned()));
+    }
+    ordered.sort_by_key(|(index, _)| *index);
+    if ordered.is_empty() {
+        bail!("syq rm needs at least one path selector");
+    }
+    let endpoint = parse_native_endpoint(parsed.at.as_deref())?;
+    let cwd = parsed.cwd.as_deref().map(OsStrExt::as_bytes);
+    let mut locations = Vec::with_capacity(ordered.len());
+    for (_, path) in ordered {
+        let path = qualify_source(cwd, path.into_vec());
+        if path.is_empty() {
+            bail!("path selectors may not be empty");
+        }
+        locations.push(Location::native(
+            endpoint.clone(),
+            path,
+            SourceSelection::NamedNoFollow,
+        ));
+    }
+
+    let mut args = native_defaults();
+    args.interface = Interface::NativeRm;
+    args.locations = locations;
+    args.paths.clear();
+    args.rm = true;
+    args.dry_run = parsed.dry_run;
+    args.verbose = parsed.verbose;
+    args.quiet = parsed.quiet;
+    args.connections_opt = parsed.connections;
+    args.progress = parsed.progress;
+    args.no_progress = parsed.no_progress;
+    args.progress_json = parsed.progress_json;
+    args.no_compress = parsed.no_compress;
+    args.rsh = parsed.rsh;
+    args.syq_path = parsed.syq_path;
+    args.no_bootstrap = parsed.no_bootstrap;
+    Ok(args)
+}
+
+fn qualify_source(cwd: Option<&[u8]>, path: Vec<u8>) -> Vec<u8> {
+    let Some(cwd) = cwd else {
+        return path;
+    };
+    if path.starts_with(b"/") || path == b"~" || path.starts_with(b"~/") {
+        return path;
+    }
+    crate::fsops::join(cwd, &path)
+}
+
+fn trim_trailing_slashes(mut path: &[u8]) -> &[u8] {
+    while path.ends_with(b"/") {
+        path = &path[..path.len() - 1];
+    }
+    path
+}
+
+fn native_basename(path: &[u8]) -> Option<&[u8]> {
+    let name = trim_trailing_slashes(path)
+        .rsplit(|byte| *byte == b'/')
+        .next()?;
+    (!name.is_empty() && name != b"." && name != b"..").then_some(name)
+}
+
+fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<(Option<String>, String)>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let (user, host) = match spec.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() => (Some(user.to_string()), host),
+        Some(_) => bail!("empty user in endpoint {spec:?}"),
+        None => (None, spec),
+    };
+    let bracketed = host.starts_with('[') && host.ends_with(']');
+    if host.starts_with('[') != host.ends_with(']') {
+        bail!("mismatched brackets in endpoint {spec:?}");
+    }
+    if host.contains(':') && !bracketed {
+        bail!(
+            "endpoint {spec:?} contains `:`; pass paths separately and write IPv6 hosts in brackets"
+        );
+    }
+    let host = if bracketed {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+    if host.is_empty() {
+        bail!("empty host in endpoint {spec:?}");
+    }
+    if host.contains('/') {
+        bail!("endpoint {spec:?} contains a path; pass paths separately with --cwd and source/placement arguments");
+    }
+    Ok(Some((user, host.to_string())))
 }
 
 /// Read a --files-from list: one path per line (or NUL-separated with --from0),
@@ -659,7 +1232,8 @@ pub struct Location {
     pub user: Option<String>,
     pub host: Option<String>,
     /// Path as given (may be relative to the remote home).
-    pub path: String,
+    pub path: Vec<u8>,
+    pub selection: SourceSelection,
 }
 
 impl Location {
@@ -681,7 +1255,8 @@ impl Location {
             return Ok(Location {
                 user: None,
                 host: None,
-                path: s.to_string(),
+                path: s.as_bytes().to_vec(),
+                selection: SourceSelection::Rsync,
             });
         };
         let (hostpart, path) = (&s[..c], &s[c + 1..]);
@@ -707,8 +1282,31 @@ impl Location {
         Ok(Location {
             user,
             host: Some(host),
-            path,
+            path: path.into_bytes(),
+            selection: SourceSelection::Rsync,
         })
+    }
+
+    fn native(
+        endpoint: Option<(Option<String>, String)>,
+        mut path: Vec<u8>,
+        selection: SourceSelection,
+    ) -> Location {
+        // Native trailing slashes are spelling only. Remove them before any
+        // filesystem call so `link/` cannot make lstat/remove operations
+        // traverse a symlink that the selector explicitly chose as an object.
+        while path.len() > 1 && path.ends_with(b"/") {
+            path.pop();
+        }
+        let (user, host) = endpoint
+            .map(|(user, host)| (user, Some(host)))
+            .unwrap_or((None, None));
+        Location {
+            user,
+            host,
+            path,
+            selection,
+        }
     }
 
     pub fn is_remote(&self) -> bool {
@@ -717,15 +1315,37 @@ impl Location {
 
     /// rsync trailing-slash semantics: "copy the contents" rather than the dir.
     pub fn copies_contents(&self) -> bool {
-        let p = self.path.as_str();
-        p.ends_with('/') || p == "." || p == ".." || p.ends_with("/.") || p.ends_with("/..")
+        match self.selection {
+            SourceSelection::Contents => true,
+            SourceSelection::Named | SourceSelection::NamedNoFollow => false,
+            SourceSelection::Rsync => {
+                let p = self.path.as_slice();
+                p.ends_with(b"/")
+                    || p == b"."
+                    || p == b".."
+                    || p.ends_with(b"/.")
+                    || p.ends_with(b"/..")
+            }
+        }
     }
 
-    pub fn basename(&self) -> String {
-        let p = self.path.trim_end_matches('/');
-        match p.rsplit('/').next() {
-            Some(b) if !b.is_empty() => b.to_string(),
-            _ => p.to_string(),
+    pub fn follows_root(&self) -> bool {
+        match self.selection {
+            SourceSelection::Named | SourceSelection::Contents => true,
+            SourceSelection::NamedNoFollow => false,
+            SourceSelection::Rsync => self.copies_contents(),
+        }
+    }
+
+    pub fn requires_directory(&self) -> bool {
+        self.selection == SourceSelection::Contents
+    }
+
+    pub fn basename(&self) -> Vec<u8> {
+        let p = trim_trailing_slashes(&self.path);
+        match p.rsplit(|byte| *byte == b'/').next() {
+            Some(b) if !b.is_empty() => b.to_vec(),
+            _ => p.to_vec(),
         }
     }
 

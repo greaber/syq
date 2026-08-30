@@ -1,7 +1,7 @@
 //! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
-use crate::cli::{parse_rsh, parse_size, Args, Location};
+use crate::cli::{parse_rsh, parse_size, Args, Existence, Interface, Location, Placement};
 use crate::conn::{
     ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, TcpCandidate, TcpPairStats,
 };
@@ -54,6 +54,7 @@ pub struct Opts {
     pub inplace: bool,
     pub same_host: bool,
     pub dst_remote: bool,
+    pub restricted_receiver: bool,
     pub dry_run: bool,
     pub quiet: bool,
     pub verbose: u8,
@@ -89,7 +90,10 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             host: h.clone(),
             rsh: parse_rsh(&args.rsh)?,
             syq_path: args.syq_path.clone(),
-            auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
+            auto_helper: args.restricted_grant.is_none()
+                && args.syq_path.is_none()
+                && !args.no_bootstrap,
+            restricted_grant: args.restricted_grant.clone(),
             helper_install: Default::default(),
             quiet: args.quiet,
             tcp: Default::default(),
@@ -109,7 +113,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
     }
 }
 
-fn parse_ports(s: &str) -> Result<(u16, u16)> {
+pub(crate) fn parse_ports(s: &str) -> Result<(u16, u16)> {
     let (a, b) = s.split_once('-').unwrap_or((s, s));
     let lo: u16 = a
         .trim()
@@ -407,15 +411,14 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
 /// does), normalized by the endpoint that holds it. Used for the job identity —
 /// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job — and for
 /// the copy-into-itself check.
-fn canonical_path(ctl: &mut dyn Conn, path: &str, remote: bool) -> Result<std::path::PathBuf> {
+fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::path::PathBuf> {
     if !remote {
-        return Ok(crate::fsops::normalize(&crate::fsops::resolve(
-            path.as_bytes(),
-        )));
+        return Ok(crate::fsops::normalize(&crate::fsops::resolve(path)));
     }
     match ok(
         ctl.call(Request::Canonicalize {
-            path: path.as_bytes().to_vec(),
+            path: path.to_vec(),
+            guard: None,
         })?,
         "canonicalize",
     )? {
@@ -425,8 +428,17 @@ fn canonical_path(ctl: &mut dyn Conn, path: &str, remote: bool) -> Result<std::p
 }
 
 /// Encode the content/metadata-affecting options into the job identity.
-fn semantic_flags(opts: &Opts, args: &Args) -> String {
-    serde_json::json!({
+fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
+    let source_modes: Vec<&str> = srcs
+        .iter()
+        .map(|source| match source.selection {
+            crate::cli::SourceSelection::Rsync => "rsync",
+            crate::cli::SourceSelection::Named => "named-follow",
+            crate::cli::SourceSelection::Contents => "contents-follow",
+            crate::cli::SourceSelection::NamedNoFollow => "named-no-follow",
+        })
+        .collect();
+    let mut flags = serde_json::json!({
         "partial_format": 1,
         "recursive": opts.recursive,
         "links": opts.links,
@@ -438,8 +450,16 @@ fn semantic_flags(opts: &Opts, args: &Args) -> String {
         "inplace": args.inplace,
         "block_size": opts.block,
         "ignore": opts.ignore,
-    })
-    .to_string()
+    });
+    // Keep the established compatibility identity byte-for-byte stable so an
+    // upgrade does not orphan resumable sidecars or checkpoints.
+    if srcs
+        .iter()
+        .any(|source| source.selection != crate::cli::SourceSelection::Rsync)
+    {
+        flags["source_modes"] = serde_json::json!(source_modes);
+    }
+    flags.to_string()
 }
 
 /// The endpoint half of a job identity: `user@host` (the user matters — two
@@ -456,7 +476,16 @@ fn endpoint_identity(l: &Location) -> String {
 struct DestinationRoot<'a> {
     path: &'a [u8],
     existed: bool,
-    is_dir: bool,
+    is_container: bool,
+    entry_is_dir: bool,
+    exact: bool,
+}
+
+struct SourceMapping<'a> {
+    follow_root: bool,
+    contents: bool,
+    require_directory: bool,
+    sub: &'a [u8],
 }
 
 fn copy_identity(
@@ -487,7 +516,7 @@ fn copy_identity(
         &src_roots,
         &endpoint_identity(dst),
         &dst_root,
-        &semantic_flags(opts, args),
+        &semantic_flags(opts, args, srcs),
     ))
 }
 
@@ -525,13 +554,13 @@ fn checkpoint_setup(
                 display(dst.path)
             );
         }
-        if dst.is_dir {
+        if dst.entry_is_dir {
             for source in srcs.iter().filter(|source| !source.copies_contents()) {
                 let basename = source.basename();
                 if basename.is_empty() {
                     continue;
                 }
-                let prefix = basename.as_bytes();
+                let prefix = basename.as_slice();
                 let has_completed_path = loaded.completed.keys().any(|completed| {
                     completed == prefix
                         || completed
@@ -608,7 +637,7 @@ fn read_umask() -> u32 {
 pub fn run(args: Args) -> Result<i32> {
     let mut args = args;
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
-    let block = parse_size(&args.block_size)?.clamp(64 * 1024, 64 << 20);
+    let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
     let min_split = parse_size(&args.min_split)?;
     let max_size = args.max_size.as_deref().map(parse_size).transpose()?;
     let min_size = args.min_size.as_deref().map(parse_size).transpose()?;
@@ -616,26 +645,57 @@ pub fn run(args: Args) -> Result<i32> {
         .then_some(args.bwlimit_bytes)
         .map(BandwidthLimit::new)
         .map(Arc::new);
-    let locs: Vec<Location> = args
-        .paths
-        .iter()
-        .map(|p| Location::parse(p))
-        .collect::<Result<_>>()?;
+    let locs: Vec<Location> = if args.locations.is_empty() {
+        args.paths
+            .iter()
+            .map(|p| Location::parse(p))
+            .collect::<Result<_>>()?
+    } else {
+        args.locations.clone()
+    };
     if locs.len() < 2 {
         bail!("need at least one source and a destination");
     }
-    let (_, raw_source_operands) = args.paths.split_last().unwrap();
+    let raw_source_operands = args
+        .paths
+        .split_last()
+        .map(|(_, sources)| sources)
+        .unwrap_or(&[]);
     let (dst, original_srcs) = locs.split_last().unwrap();
-    let source_operand_count = args
-        .direct_source_operand_count
-        .unwrap_or(raw_source_operands.len());
-    if source_operand_count < original_srcs.len() {
-        bail!("invalid direct source-operand count");
+    if args.restricted_grant.is_some()
+        && (args.no_tcp
+            || args.tcp_plain
+            || original_srcs[0].is_remote()
+            || !dst.is_remote()
+            || args.relay)
+    {
+        bail!(
+            "a signed receiver grant is valid only for a local-to-remote orchestrator using encrypted TCP data connections"
+        );
     }
-    for s in original_srcs {
-        if !s.same_host(&original_srcs[0]) {
+    for source in original_srcs {
+        if !source.same_host(&original_srcs[0]) {
             bail!("all sources must be on the same host");
         }
+    }
+    if args.unrestricted_agent_forwarding
+        && (!original_srcs[0].is_remote()
+            || !dst.is_remote()
+            || original_srcs[0].same_host(dst)
+            || args.relay)
+    {
+        bail!(
+            "--unrestricted-agent-forwarding is only valid for a live direct transfer between two different remote hosts"
+        );
+    }
+    let source_operand_count = if args.locations.is_empty() {
+        args.direct_source_operand_count
+            .unwrap_or(raw_source_operands.len())
+    } else {
+        original_srcs.len()
+    };
+    if source_operand_count < original_srcs.len() {
+        bail!("invalid direct source-operand count");
     }
     if args.files_from.is_some() && source_operand_count > 1 {
         bail!("--files-from takes exactly one source directory");
@@ -646,7 +706,7 @@ pub fn run(args: Args) -> Result<i32> {
     // `file file new-dest` still creates a directory like other multi-source
     // commands.
     let multiple_source_operands = source_operand_count > 1;
-    let srcs: Vec<Location> = if args.direct_sources_prededuplicated {
+    let srcs: Vec<Location> = if !args.locations.is_empty() || args.direct_sources_prededuplicated {
         original_srcs.to_vec()
     } else {
         let mut seen_sources = std::collections::HashSet::new();
@@ -662,7 +722,7 @@ pub fn run(args: Args) -> Result<i32> {
     if let Some(checkpoint) = args.checkpoint.as_deref() {
         let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
         for source in srcs.iter().filter(|source| !source.is_remote()) {
-            let root = crate::fsops::normalize(&crate::fsops::resolve(source.path.as_bytes()));
+            let root = crate::fsops::normalize(&crate::fsops::resolve(&source.path));
             if checkpoint.starts_with(&root) {
                 bail!(
                     "checkpoint {} must not be inside local source {}",
@@ -672,7 +732,7 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
         if !dst.is_remote() {
-            let root = crate::fsops::normalize(&crate::fsops::resolve(dst.path.as_bytes()));
+            let root = crate::fsops::normalize(&crate::fsops::resolve(&dst.path));
             if checkpoint.starts_with(&root) {
                 bail!(
                     "checkpoint {} must not be inside local destination {}",
@@ -690,7 +750,10 @@ pub fn run(args: Args) -> Result<i32> {
             if !s.copies_contents() {
                 let base = s.basename();
                 if !base.is_empty() && !seen.insert(base.clone()) {
-                    bail!("two sources named {base:?} map to the same destination; rename one or copy them separately");
+                    bail!(
+                        "two sources named {:?} map to the same destination; rename one or copy them separately",
+                        display(&base)
+                    );
                 }
             }
         }
@@ -748,6 +811,7 @@ pub fn run(args: Args) -> Result<i32> {
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         dst_remote: dst_ep.is_remote(),
+        restricted_receiver: args.restricted_grant.is_some(),
         dry_run: args.dry_run,
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
@@ -781,6 +845,7 @@ pub fn run(args: Args) -> Result<i32> {
     let gate = Gate::new(args.connections);
     let checkpoint_slot: CheckpointSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let destination_anchor: DestinationAnchorSlot = std::sync::Arc::new(std::sync::OnceLock::new());
+    let destination_anchor_required = args.restricted_grant.is_none();
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
         Arc::new(Mutex::new(Vec::new()));
     let transport_stats: Arc<Mutex<Vec<TcpPairStats>>> = Arc::new(Mutex::new(Vec::new()));
@@ -870,12 +935,14 @@ pub fn run(args: Args) -> Result<i32> {
                             continue;
                         }
                     };
-                    let anchor = destination_anchor
-                        .get()
-                        .context("destination root was not anchored before workers started")?;
-                    if let Err(error) = anchor_worker_destination(&mut *dst, anchor) {
-                        gate.mark_failed(id);
-                        return Err(error);
+                    if destination_anchor_required {
+                        let anchor = destination_anchor
+                            .get()
+                            .context("destination root was not anchored before workers started")?;
+                        if let Err(error) = anchor_worker_destination(&mut *dst, anchor) {
+                            gate.mark_failed(id);
+                            return Err(error);
+                        }
                     }
                     gate.mark_ready(id);
                     let fast_batch_files =
@@ -998,6 +1065,16 @@ pub fn run(args: Args) -> Result<i32> {
                             )
                         });
                     }
+                    if spec.restricted_grant.is_some() {
+                        sched.abort();
+                        progress.stop();
+                        return Err(e).with_context(|| {
+                            format!(
+                                "{}: a signed receiver uses its one SSH authorization for the control connection, so encrypted TCP data connections are required",
+                                spec.label()
+                            )
+                        });
+                    }
                     if !args.quiet || debug() {
                         let congestion_note = crate::conn::tcp_congestion_fallback_note(
                             args.tcp_congestion.as_deref(),
@@ -1059,7 +1136,7 @@ pub fn run(args: Args) -> Result<i32> {
     // silently drops `.` components and duplicate slashes. Cleaning here
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
-    let operator_dst_root = clean_root(dst.path.as_bytes());
+    let operator_dst_root = clean_root(&dst.path);
     let (dst_root_entry, dst_canonical) = stat_and_canonicalize(
         &mut *dst_ctl,
         &operator_dst_root,
@@ -1072,15 +1149,51 @@ pub fn run(args: Args) -> Result<i32> {
     let (dst_root, mut dst_root_entry) =
         follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?;
     let mut dst_initially_missing = dst_root_entry.is_none();
-    let mut dst_existed = !dst_initially_missing;
-    let dst_is_dir = match &dst_root_entry {
-        Some(e) if e.kind == Kind::Dir => true,
-        Some(_) if multiple_source_operands => {
-            bail!("destination must be a directory when copying multiple sources")
+    let mut dst_existed = dst_root_entry.is_some();
+    let mut dst_entry_is_dir = dst_root_entry
+        .as_ref()
+        .is_some_and(|entry| entry.kind == Kind::Dir);
+    match args.target_existence {
+        Existence::Any => {}
+        Existence::New if dst_existed => bail!(
+            "target {} already exists, but the selected placement requires a new path",
+            display(&dst_root)
+        ),
+        Existence::Existing if !dst_existed => bail!(
+            "target {} does not exist, but the selected placement requires an existing path",
+            display(&dst_root)
+        ),
+        Existence::New | Existence::Existing => {}
+    }
+    let dst_is_dir = match args.placement {
+        Placement::Into => {
+            if dst_existed && !dst_entry_is_dir {
+                bail!(
+                    "--into target {} exists but is not a directory",
+                    display(&dst_root)
+                );
+            }
+            true
         }
-        Some(_) => false,
-        None => multiple_source_operands || dst.copies_contents() || args.files_from.is_some(),
+        Placement::As => false,
+        Placement::Rsync => match &dst_root_entry {
+            Some(e) if e.kind == Kind::Dir => true,
+            Some(_) if multiple_source_operands => {
+                bail!("destination must be a directory when copying multiple sources")
+            }
+            Some(_) => false,
+            None => multiple_source_operands || dst.copies_contents() || args.files_from.is_some(),
+        },
     };
+    if args.placement == Placement::Into
+        && args.target_existence == Existence::Existing
+        && !dst_entry_is_dir
+    {
+        bail!(
+            "--into-existing target {} is not an existing directory",
+            display(&dst_root)
+        );
+    }
     if args.files_from.is_some() {
         if let Some(e) = dst_root_entry.as_ref().filter(|e| e.kind != Kind::Dir) {
             bail!(
@@ -1090,11 +1203,34 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
+    if args.interface != Interface::Rsync {
+        // Native selectors are structural: validate every selected root before
+        // a missing --into target can be created. Named selectors follow their
+        // root unless --src-no-follow was used; contents selectors additionally
+        // require the resolved object to be a directory.
+        for source in srcs {
+            match stat_one(&mut *src_ctl, &source.path, source.follows_root())? {
+                Some(entry) if source.requires_directory() && entry.kind != Kind::Dir => {
+                    bail!(
+                        "contents selector {} is not a directory",
+                        display(&source.path)
+                    )
+                }
+                Some(_) => {}
+                None => bail!("source {} does not exist", display(&source.path)),
+            }
+        }
+    }
+    hold_after_target_precondition_for_test(&args)?;
 
     // Select and retain the receiver-side directory that gives the operator's
     // destination its meaning. Every connection later enters this exact inode
     // and receives only paths relative to it, so replacing the external
     // spelling after this check cannot redirect worker writes.
+    // A signed receiver instead retains and verifies its pre-enrolled root fd
+    // for every request; HostA is not authorized to manage this anchoring
+    // state itself.
+    let use_operator_anchor = args.restricted_grant.is_none();
     let operator_directory = if dst_is_dir {
         operator_dst_root.clone()
     } else {
@@ -1109,13 +1245,17 @@ pub fn run(args: Args) -> Result<i32> {
     // the nearest existing ancestor open so normal copies can create that
     // parent without giving an attacker a pathname-resolution window.
     let allow_missing = dst_root_entry.is_none();
-    let mut directory_selection = check_operator_directory(
-        &mut *dst_ctl,
-        &operator_directory,
-        allow_missing,
-        args.insecure_links,
-    )?;
-    if dst_is_dir {
+    let mut directory_selection = if use_operator_anchor {
+        check_operator_directory(
+            &mut *dst_ctl,
+            &operator_directory,
+            allow_missing,
+            args.insecure_links,
+        )?
+    } else {
+        None
+    };
+    if use_operator_anchor && dst_is_dir {
         let planned_identity = dst_root_entry.as_ref().map(|entry| (entry.dev, entry.ino));
         let selected_identity = directory_selection
             .as_ref()
@@ -1142,8 +1282,55 @@ pub fn run(args: Args) -> Result<i32> {
             dst_root_entry = appeared;
             dst_initially_missing = false;
             dst_existed = true;
+            dst_entry_is_dir = true;
         }
     }
+    match args.target_existence {
+        Existence::Any => {}
+        Existence::New if dst_existed => bail!(
+            "target {} appeared while resolving it, but the selected placement requires a new path",
+            display(&dst_root)
+        ),
+        Existence::Existing if !dst_existed => bail!(
+            "target {} disappeared while resolving it, but the selected placement requires an existing path",
+            display(&dst_root)
+        ),
+        Existence::New | Existence::Existing => {}
+    }
+    let exact_condition = if args.placement == Placement::As {
+        match args.target_existence {
+            Existence::Any => TargetCondition::Any,
+            Existence::New => TargetCondition::Absent,
+            Existence::Existing => target_matches(
+                dst_root_entry
+                    .as_ref()
+                    .expect("existing target was validated above"),
+            ),
+        }
+    } else {
+        TargetCondition::Any
+    };
+    let mut mutation_root_condition = if args.target_existence == Existence::Existing
+        && dst_root_entry
+            .as_ref()
+            .is_some_and(|entry| entry.kind == Kind::Dir)
+    {
+        target_identity(
+            dst_root_entry
+                .as_ref()
+                .expect("existing target was validated above"),
+        )
+    } else {
+        TargetCondition::Any
+    };
+    // Native placement additionally binds each descendant mutation to the
+    // selected container identity. Ordinary rsync copies rely on the retained
+    // operator anchor; the signed receiver injects its enrolled-root guard.
+    let guard_containers = args.interface != Interface::Rsync;
+    let mut container_guard = dst_root_entry
+        .as_ref()
+        .filter(|entry| guard_containers && entry.kind == Kind::Dir)
+        .map(|entry| target_container(&dst_root, entry));
 
     // Reject copying a directory into itself: if the effective destination
     // resolves to (or inside) a source directory, the scanner would discover
@@ -1160,30 +1347,32 @@ pub fn run(args: Args) -> Result<i32> {
             // Only a directory source can trigger the recurse-into-itself trap.
             // Judge the source the way the scan will: --files-from and
             // trailing-slash sources are followed through a symlinked root.
-            let follow_root = args.files_from.is_some() || s.copies_contents();
-            let src_is_dir = matches!(stat_one(&mut *src_ctl, s.path.as_bytes(), follow_root)?, Some(ref e) if e.kind == Kind::Dir);
+            let follow_root = args.files_from.is_some() || s.follows_root();
+            let src_is_dir = matches!(stat_one(&mut *src_ctl, &s.path, follow_root)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
             }
             let sn = canonical_path(&mut *src_ctl, &s.path, remote)?;
             // Effective destination(s): the destination itself, plus
-            // destination/basename only when the destination is really an
-            // existing directory (so a bare source lands inside it).
+            // destination/basename when placement uses it as a container.
             let mut effs = vec![canonical_path(&mut *src_ctl, &dst.path, remote)?];
             if dst_is_dir && !s.copies_contents() && args.files_from.is_none() {
                 let base = s.basename();
                 if !base.is_empty() {
-                    let joined = format!("{}/{}", dst.path.trim_end_matches('/'), base);
+                    let joined = join(dst.path.strip_suffix(b"/").unwrap_or(&dst.path), &base);
                     effs.push(canonical_path(&mut *src_ctl, &joined, remote)?);
                 }
             }
             for eff in effs {
                 if eff == sn {
-                    bail!("source and destination are the same directory {:?}", s.path);
+                    bail!(
+                        "source and destination are the same directory {:?}",
+                        display(&s.path)
+                    );
                 } else if eff.starts_with(&sn) {
                     bail!(
                         "destination {:?} maps inside source {:?} — that would copy the directory into itself",
-                        dst.path, s.path
+                        display(&dst.path), display(&s.path)
                     );
                 }
             }
@@ -1209,7 +1398,9 @@ pub fn run(args: Args) -> Result<i32> {
         DestinationRoot {
             path: &dst_root,
             existed: dst_existed,
-            is_dir: dst_is_dir,
+            is_container: dst_is_dir,
+            entry_is_dir: dst_entry_is_dir,
+            exact: args.placement == Placement::As,
         },
         &mut *dst_ctl,
         &identity,
@@ -1226,24 +1417,60 @@ pub fn run(args: Args) -> Result<i32> {
         && !args.existing;
     let dry_run_creates_root =
         args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
-    let create_operator_directory_now = directory_selection.is_none()
-        && !args.dry_run
-        && !args.verify_only
-        && !args.existing
-        && (!dst_is_dir || !multiple_distinct_sources);
-    if create_operator_directory_now {
-        directory_selection = Some(create_operator_directory(&mut *dst_ctl)?);
-    }
-    if let Some(selection) = directory_selection.take() {
-        let anchor = activate_control_destination(
+    let root_create_condition = if args.target_existence == Existence::New {
+        TargetCondition::Absent
+    } else {
+        TargetCondition::Any
+    };
+    if use_operator_anchor {
+        let create_operator_directory_now = directory_selection.is_none()
+            && !args.dry_run
+            && !args.verify_only
+            && !args.existing
+            && (!dst_is_dir || !multiple_distinct_sources);
+        if create_operator_directory_now {
+            let condition = if dst_is_dir {
+                root_create_condition
+            } else {
+                TargetCondition::Any
+            };
+            directory_selection = Some(create_operator_directory(&mut *dst_ctl, condition)?);
+        }
+        if let Some(selection) = directory_selection.take() {
+            let anchor = activate_control_destination(
+                &mut *dst_ctl,
+                selection,
+                request_prefix.clone(),
+                args.insecure_links,
+            )?;
+            if create_root {
+                mutation_root_condition = TargetCondition::Matches {
+                    dev: anchor.dev,
+                    ino: anchor.ino,
+                };
+                if guard_containers {
+                    container_guard = Some(ContainerGuard {
+                        root: dst_root.clone(),
+                        dev: anchor.dev,
+                        ino: anchor.ino,
+                    });
+                }
+            }
+            destination_anchor
+                .set(anchor)
+                .expect("destination anchor set once");
+        }
+    } else if create_root && !multiple_distinct_sources {
+        let created = mkdir_root(
             &mut *dst_ctl,
-            selection,
-            request_prefix.clone(),
-            args.insecure_links,
+            &dst_root,
+            root_create_condition,
+            opts.restricted_receiver,
         )?;
-        destination_anchor
-            .set(anchor)
-            .expect("destination anchor set once");
+        mutation_root_condition = target_identity(&created);
+        if guard_containers {
+            container_guard = Some(target_container(&dst_root, &created));
+        }
     }
     let checkpoint_completed = checkpoint_state
         .as_ref()
@@ -1288,17 +1515,23 @@ pub fn run(args: Args) -> Result<i32> {
         scan_warned: false,
         max_delete_hit: false,
         delete_walk_failed: false,
+        root_path: dst_root.clone(),
+        exact_condition,
+        mutation_root_condition,
+        container_guard,
+        guard_containers,
         buffer: if multiple_distinct_sources {
             Some(Vec::new())
         } else {
             None
         },
         create_root: if create_root && multiple_distinct_sources {
-            Some(dst_root.clone())
+            Some((dst_root.clone(), root_create_condition))
         } else {
             None
         },
         destination_anchor: &destination_anchor,
+        use_operator_anchor,
         keep_dirs: args.files_from.is_some(),
         delete_roots: Vec::new(),
         deletes: Deletes::default(),
@@ -1317,7 +1550,7 @@ pub fn run(args: Args) -> Result<i32> {
         let src = &srcs[0];
         match st.scan_files_from(
             &mut *src_ctl,
-            src.path.as_bytes(),
+            &src.path,
             &dst_root,
             &args.files_from_lines,
             args.recursive_explicit,
@@ -1330,25 +1563,32 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     for src in srcs.iter().filter(|_| args.files_from.is_none()) {
-        let src_root = src.path.as_bytes().to_vec();
-        let follow = src.copies_contents();
+        let src_root = src.path.clone();
+        let contents = src.copies_contents();
+        let follow_root = src.follows_root();
         // A bare directory source goes to dest/basename even when dest doesn't
         // exist yet; a non-directory source only does so when dest is a directory
         // (decided once the root entry is seen).
-        let sub = if follow {
-            String::new()
+        let sub = if contents || args.placement == Placement::As {
+            Vec::new()
         } else {
             src.basename()
         };
         match st.scan_source(
             &mut *src_ctl,
             &src_root,
-            follow,
-            &sub,
+            SourceMapping {
+                follow_root,
+                contents,
+                require_directory: src.requires_directory(),
+                sub: &sub,
+            },
             DestinationRoot {
                 path: &dst_root,
                 existed: dst_existed,
-                is_dir: dst_is_dir,
+                is_container: dst_is_dir,
+                entry_is_dir: dst_entry_is_dir,
+                exact: args.placement == Placement::As,
             },
         ) {
             Ok(mapping) => dry_run_mappings.push(mapping),
@@ -1385,7 +1625,7 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         let has_file_work = !sched.jobs.lock().unwrap().is_empty();
         if !opts.dry_run && has_file_work {
-            if destination_anchor.get().is_none() {
+            if use_operator_anchor && destination_anchor.get().is_none() {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
             } else {
@@ -1452,13 +1692,14 @@ pub fn run(args: Args) -> Result<i32> {
             delete_plan = DeletePlan::Skipped("source scan errors");
             progress.eprintln("syq: source scan reported errors; skipping deletions");
         } else {
-            match st.plan_deletes() {
+            match st.assert_mutation_root().and_then(|_| st.plan_deletes()) {
                 Ok(()) if st.delete_walk_failed => {
                     delete_plan = DeletePlan::Skipped("destination walk errors");
                     progress.eprintln("syq: destination walk reported errors; skipping deletions")
                 }
                 Ok(()) => {
                     delete_plan = DeletePlan::Planned(st.deletes.len());
+                    st.assert_mutation_root()?;
                     deleted = st.run_deletes()?;
                 }
                 Err(e) => {
@@ -1659,10 +1900,142 @@ fn stat_many(
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    match ok(conn.call(Request::StatMany { paths, follow })?, "stat")? {
+    match ok(
+        conn.call(Request::StatMany {
+            paths,
+            follow,
+            guard: None,
+        })?,
+        "stat",
+    )? {
         Response::Stats(v) => Ok(v),
         other => bail!("unexpected response {other:?}"),
     }
+}
+
+fn target_matches(entry: &Entry) -> TargetCondition {
+    TargetCondition::MatchesFingerprint {
+        dev: entry.dev,
+        ino: entry.ino,
+        ctime: entry.ctime,
+        ctime_nsec: entry.ctime_nsec,
+    }
+}
+
+fn target_identity(entry: &Entry) -> TargetCondition {
+    TargetCondition::Matches {
+        dev: entry.dev,
+        ino: entry.ino,
+    }
+}
+
+fn target_container(root: &[u8], entry: &Entry) -> ContainerGuard {
+    ContainerGuard {
+        root: root.to_vec(),
+        dev: entry.dev,
+        ino: entry.ino,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
+    if args.interface == Interface::Rsync || args.target_existence == Existence::Any {
+        return Ok(());
+    }
+    if let Some(ready) = std::env::var_os("SYQ_TEST_TARGET_PRECONDITION_READY_FILE") {
+        std::fs::write(&ready, b"ready").with_context(|| {
+            format!(
+                "write target-precondition-ready signal {}",
+                std::path::Path::new(&ready).display()
+            )
+        })?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_TARGET_PRECONDITION_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
+    Ok(())
+}
+
+fn mkdir_root(
+    conn: &mut dyn Conn,
+    dst_root: &[u8],
+    condition: TargetCondition,
+    restricted_receiver: bool,
+) -> Result<Entry> {
+    for ops in mkdir_root_batches(dst_root, condition, restricted_receiver) {
+        match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
+            Response::Applied(errs) => {
+                if let Some(e) = errs.into_iter().flatten().next() {
+                    bail!("{e}");
+                }
+            }
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+    stat_one(conn, dst_root, false)?
+        .filter(|entry| entry.kind == Kind::Dir)
+        .with_context(|| format!("created target {} is not a directory", display(dst_root)))
+}
+
+fn mkdir_root_batches(
+    dst_root: &[u8],
+    condition: TargetCondition,
+    restricted_receiver: bool,
+) -> Vec<Vec<Op>> {
+    let mut batches = vec![vec![Op::Mkdir {
+        path: dst_root.to_vec(),
+        mode: 0o755,
+        condition,
+    }]];
+    if restricted_receiver {
+        // Keep this in a later receiver call. The restricted authority must
+        // observe the directory after Mkdir so it can distinguish HostB's
+        // kernel-inherited setgid bit from HostA's untrusted mode proposal.
+        batches.push(vec![Op::SetMeta {
+            path: dst_root.to_vec(),
+            meta: Meta {
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: flags::RECEIVER_MODE,
+            condition: TargetCondition::Any,
+        }]);
+    }
+    batches
+}
+
+fn directory_creation_batches(ops: Vec<Op>, restricted_receiver: bool) -> Vec<Vec<Op>> {
+    if ops.is_empty() {
+        return Vec::new();
+    }
+    if !restricted_receiver {
+        return vec![ops];
+    }
+
+    // A restricted receiver authorizes the whole request before executing any
+    // operation in it. Send parents first so receiver-side mode policy can
+    // inspect every child path without depending on an unexecuted Mkdir from
+    // the same request. Siblings retain the existing parallel batch behavior.
+    let mut by_depth: std::collections::BTreeMap<usize, Vec<Op>> =
+        std::collections::BTreeMap::new();
+    for op in ops {
+        let Op::Mkdir { path, .. } = &op else {
+            unreachable!("directory creation batch contains a non-Mkdir operation")
+        };
+        let depth = path.iter().filter(|&&byte| byte == b'/').count();
+        by_depth.entry(depth).or_default().push(op);
+    }
+    by_depth.into_values().collect()
 }
 
 /// Lexically canonical spelling of a root path: `.` components and duplicate
@@ -1712,9 +2085,15 @@ fn check_operator_directory(
     }
 }
 
-fn create_operator_directory(conn: &mut dyn Conn) -> Result<DirectoryAnchor> {
+fn create_operator_directory(
+    conn: &mut dyn Conn,
+    condition: TargetCondition,
+) -> Result<DirectoryAnchor> {
     match ok(
-        conn.call(Request::CreateOperatorDirectory { mode: 0o755 })?,
+        conn.call(Request::CreateOperatorDirectory {
+            mode: 0o755,
+            require_absent: condition == TargetCondition::Absent,
+        })?,
         "create destination directory",
     )? {
         Response::DirectorySelection(Some(selection)) => Ok(selection),
@@ -1780,21 +2159,23 @@ fn parent_path(path: &[u8]) -> PathBytes {
 fn stat_and_canonicalize(
     conn: &mut dyn Conn,
     stat_path: &[u8],
-    canonical_path: &str,
+    canonical_path: &[u8],
     remote: bool,
 ) -> Result<(Option<Entry>, std::path::PathBuf)> {
     if !remote {
         return Ok((
             stat_one(conn, stat_path, false)?,
-            crate::fsops::normalize(&crate::fsops::resolve(canonical_path.as_bytes())),
+            crate::fsops::normalize(&crate::fsops::resolve(canonical_path)),
         ));
     }
     conn.send(Request::StatMany {
         paths: vec![stat_path.to_vec()],
         follow: false,
+        guard: None,
     })?;
     conn.send(Request::Canonicalize {
-        path: canonical_path.as_bytes().to_vec(),
+        path: canonical_path.to_vec(),
+        guard: None,
     })?;
     // Consume both replies before interpreting either endpoint error so the
     // reusable control stream cannot be left one response behind.
@@ -1928,6 +2309,14 @@ fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
             && (source.mtime, source.mtime_nsec) != (destination.mtime, destination.mtime_nsec))
 }
 
+fn publication_metadata_flags(requested: u8) -> u8 {
+    if requested & flags::MODE != 0 {
+        requested
+    } else {
+        requested | flags::RECEIVER_MODE
+    }
+}
+
 fn display_location(loc: &Location, path: &[u8]) -> String {
     let path = display(path);
     let Some(host) = &loc.host else {
@@ -1947,10 +2336,10 @@ fn display_location(loc: &Location, path: &[u8]) -> String {
 fn display_plan_source(loc: &Location, args: &Args) -> String {
     if !loc.is_remote() {
         if let Some(host) = &args.plan_source_host {
-            return format!("{host}:{}", display(loc.path.as_bytes()));
+            return format!("{host}:{}", display(&loc.path));
         }
     }
-    display_location(loc, loc.path.as_bytes())
+    display_location(loc, &loc.path)
 }
 
 fn display_plan_target(loc: &Location, path: &[u8], args: &Args) -> String {
@@ -2227,8 +2616,9 @@ struct Planner<'a> {
     deferred_payloads: Vec<Mapped>,
     source_partials: u64,
     collision: bool,
-    /// (dst path, meta, flags, depth) for directories, applied deepest-first at the end.
-    deferred: Vec<(PathBytes, Meta, u8, usize)>,
+    /// (dst path, meta, flags, depth, root condition) for directories,
+    /// applied deepest-first at the end.
+    deferred: Vec<(PathBytes, Meta, u8, usize, TargetCondition)>,
     dirs_created: u64,
     links_created: u64,
     specials_created: u64,
@@ -2243,16 +2633,23 @@ struct Planner<'a> {
     /// Several sources: mapped batches waiting for all scans to finish
     /// (see `Mapped`). None with a single source, where batches stream.
     buffer: Option<Vec<Mapped>>,
+    /// Placement root and receiver-enforced conditions for native operations.
+    root_path: PathBytes,
+    exact_condition: TargetCondition,
+    mutation_root_condition: TargetCondition,
+    container_guard: Option<ContainerGuard>,
+    guard_containers: bool,
     /// Several sources into a destination that doesn't exist yet: create it
     /// only once the scans have been validated against each other.
-    create_root: Option<PathBytes>,
+    create_root: Option<(PathBytes, TargetCondition)>,
     destination_anchor: &'a DestinationAnchorSlot,
+    use_operator_anchor: bool,
     /// --files-from: listed directories are created even without -r (which
     /// then only decides whether their contents are walked).
     keep_dirs: bool,
     /// (destination directory, its path relative to the transfer root) for every
     /// directory source; --delete removes extras inside these.
-    delete_roots: Vec<(PathBytes, String)>,
+    delete_roots: Vec<(PathBytes, PathBytes)>,
     deletes: Deletes,
     dry_run_changes: DryRunChanges,
 }
@@ -2326,35 +2723,80 @@ impl Deletes {
 }
 
 impl Planner<'_> {
+    fn exact_condition_for(&self, path: &[u8]) -> TargetCondition {
+        if path == self.root_path {
+            self.exact_condition
+        } else {
+            TargetCondition::Any
+        }
+    }
+
+    fn metadata_condition_for(&self, path: &[u8]) -> TargetCondition {
+        match self.exact_condition_for(path) {
+            condition @ TargetCondition::Matches { .. } => condition,
+            TargetCondition::MatchesFingerprint { dev, ino, .. } => {
+                TargetCondition::Matches { dev, ino }
+            }
+            TargetCondition::Any | TargetCondition::Absent => TargetCondition::Any,
+        }
+    }
+
+    fn assert_mutation_root(&mut self) -> Result<()> {
+        let (dev, ino) = match self.mutation_root_condition {
+            TargetCondition::Matches { dev, ino }
+            | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
+            TargetCondition::Any | TargetCondition::Absent => return Ok(()),
+        };
+        let current = stat_many(self.dst, vec![self.root_path.clone()], false)?
+            .pop()
+            .flatten();
+        match current {
+            Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
+            _ => bail!(
+                "target {} changed after the placement precondition was checked",
+                display(&self.root_path)
+            ),
+        }
+    }
+
     fn scan_source(
         &mut self,
         src: &mut dyn Conn,
         src_root: &[u8],
-        follow: bool,
-        sub: &str,
+        source: SourceMapping<'_>,
         destination: DestinationRoot<'_>,
     ) -> Result<DryRunMapping> {
+        let SourceMapping {
+            follow_root,
+            contents,
+            require_directory,
+            sub,
+        } = source;
         let dst_root = destination.path;
-        let dst_is_dir = destination.is_dir;
+        let dst_is_dir = destination.is_container;
         let dst_existed = destination.existed;
         let mut first = true;
-        let mut sub = sub.to_string();
+        let mut sub = sub.to_vec();
         let mut skip_all = false;
         let mut mapping = None;
         let ignore = self.opts.ignore.clone();
-        scan_into_planner(self, src, src_root, follow, &ignore, |pl, batch| {
+        scan_into_planner(self, src, src_root, follow_root, &ignore, |pl, batch| {
             if skip_all {
                 return Ok(());
             }
             if first {
                 first = false;
                 if let Some(root) = batch.first() {
+                    if require_directory && root.kind != Kind::Dir {
+                        bail!("contents selector {} is not a directory", display(src_root));
+                    }
                     if pl.opts.dry_run
                         && root.kind == Kind::Dir
-                        && !follow
+                        && !contents
                         && pl.opts.recursive
                         && dst_existed
-                        && !dst_is_dir
+                        && !destination.entry_is_dir
+                        && !destination.exact
                         && !pl.opts.existing
                     {
                         bail!(
@@ -2364,15 +2806,19 @@ impl Planner<'_> {
                         );
                     }
                     if root.kind != Kind::Dir && !dst_is_dir {
-                        sub = String::new();
+                        sub.clear();
                     }
                     mapping = Some(DryRunMapping {
-                        target: join(dst_root, sub.as_bytes()),
-                        semantics: match (root.kind, follow, dst_is_dir) {
-                            (Kind::Dir, true, _) => "directory contents",
-                            (Kind::Dir, false, _) => "directory as child",
-                            (_, _, true) => "entry inside destination directory",
-                            _ => "exact destination path",
+                        target: join(dst_root, &sub),
+                        semantics: if destination.exact {
+                            "exact destination path"
+                        } else {
+                            match (root.kind, contents, dst_is_dir) {
+                                (Kind::Dir, true, _) => "directory contents",
+                                (Kind::Dir, false, _) => "directory as child",
+                                (_, _, true) => "entry inside destination directory",
+                                _ => "exact destination path",
+                            }
                         },
                     });
                     if root.kind == Kind::Dir && !pl.opts.recursive {
@@ -2384,8 +2830,7 @@ impl Planner<'_> {
                         return Ok(());
                     }
                     if root.kind == Kind::Dir {
-                        pl.delete_roots
-                            .push((join(dst_root, sub.as_bytes()), sub.clone()));
+                        pl.delete_roots.push((join(dst_root, &sub), sub.clone()));
                     }
                 }
             }
@@ -2565,7 +3010,7 @@ impl Planner<'_> {
                 }
             }
             self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            self.handle_batch(batch, src_root, "", dst_root)?;
+            self.handle_batch(batch, src_root, b"", dst_root)?;
             for rel in subtrees {
                 self.scan_subtree(src, src_root, &rel, dst_root, &mut emitted)?;
             }
@@ -2600,7 +3045,7 @@ impl Planner<'_> {
                 })
                 .collect();
             pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            pl.handle_batch(batch, src_root, "", dst_root)
+            pl.handle_batch(batch, src_root, b"", dst_root)
         })
     }
 
@@ -2608,7 +3053,7 @@ impl Planner<'_> {
         &mut self,
         batch: Vec<Entry>,
         src_root: &[u8],
-        sub: &str,
+        sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
         let namespace_files = self.collect_namespace_files(&batch, src_root, sub, dst_root);
@@ -2621,7 +3066,7 @@ impl Planner<'_> {
         let mut immediate = Vec::with_capacity(batch.len());
         let mut deferred = Vec::new();
         for entry in batch {
-            let dst_rel = join(sub.as_bytes(), &entry.path);
+            let dst_rel = join(sub, &entry.path);
             let reserved_leaf = dst_rel.is_empty()
                 && entry.kind != Kind::Dir
                 && dst_root
@@ -2681,20 +3126,19 @@ impl Planner<'_> {
         &mut self,
         batch: Vec<Entry>,
         src_root: &[u8],
-        sub: &str,
+        sub: &[u8],
         dst_root: &[u8],
     ) -> Mapped {
         let opts = self.opts;
-        let sub_b = sub.as_bytes();
         let mut dirs: Vec<(PathBytes, PathBytes, Entry)> = Vec::new();
         let mut others: Vec<Planned> = Vec::new();
         for e in batch {
             if e.kind == Kind::Dir && !opts.recursive && !self.keep_dirs {
                 continue;
             }
-            let dst_rel = join(sub_b, &e.path);
+            let dst_rel = join(sub, &e.path);
             let dst = join(dst_root, &dst_rel);
-            let rel = self.rel_name(src_root, sub_b, &e.path);
+            let rel = self.rel_name(src_root, sub, &e.path);
             // Every source entry claims its destination here, before any
             // decision about it: that blocks two sources from mapping onto one
             // path, and it is what makes --delete safe — whatever happens
@@ -2801,13 +3245,37 @@ impl Planner<'_> {
         if self.collision {
             return Ok(());
         }
-        if let Some(root) = self.create_root.take() {
-            let selection = create_operator_directory(self.dst)?;
-            let anchor =
-                activate_control_destination(self.dst, selection, root, self.opts.insecure_links)?;
-            self.destination_anchor
-                .set(anchor)
-                .expect("destination anchor set once");
+        if let Some((root, condition)) = self.create_root.take() {
+            if self.use_operator_anchor {
+                let selection = create_operator_directory(self.dst, condition)?;
+                let anchor = activate_control_destination(
+                    self.dst,
+                    selection,
+                    root.clone(),
+                    self.opts.insecure_links,
+                )?;
+                self.mutation_root_condition = TargetCondition::Matches {
+                    dev: anchor.dev,
+                    ino: anchor.ino,
+                };
+                if self.guard_containers {
+                    self.container_guard = Some(ContainerGuard {
+                        root,
+                        dev: anchor.dev,
+                        ino: anchor.ino,
+                    });
+                }
+                self.destination_anchor
+                    .set(anchor)
+                    .expect("destination anchor set once");
+            } else {
+                let created =
+                    mkdir_root(self.dst, &root, condition, self.opts.restricted_receiver)?;
+                self.mutation_root_condition = target_identity(&created);
+                if self.guard_containers {
+                    self.container_guard = Some(target_container(&root, &created));
+                }
+            }
         }
         // Validated: from here on they are ordinary entries (the one that is
         // the destination file skips itself; the other is written).
@@ -2825,6 +3293,10 @@ impl Planner<'_> {
     /// Everything after the mapping loop: stat, create directories, filter,
     /// enqueue.
     fn apply_mapped(&mut self, mapped: Mapped) -> Result<()> {
+        if self.collision {
+            return Ok(());
+        }
+        self.assert_mutation_root()?;
         let opts = self.opts;
         let Mapped {
             dst_root,
@@ -2940,31 +3412,76 @@ impl Planner<'_> {
                 planned.retain(|(_, dst_rel, _, _)| self.invalidate_completion(dst_rel));
                 // Create new dirs; also "create" existing ones we can't yet
                 // write into (0o700 not set) so apply() opens them up.
-                let new_dirs: Vec<Op> = planned
+                let mut new_dirs: Vec<Op> = planned
                     .iter()
-                    .filter(|(_, _, _, st)| {
-                        !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
+                    .filter(|(path, _, _, st)| {
+                        let root_must_be_new = self.exact_condition == TargetCondition::Absent
+                            && path == &self.root_path;
+                        root_must_be_new
+                            || !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
                     })
                     .map(|(p, _, e, _)| Op::Mkdir {
                         path: p.clone(),
                         mode: e.mode,
+                        condition: self.exact_condition_for(p),
                     })
                     .collect();
-                if !new_dirs.is_empty() {
+                if let Some(root_index) = new_dirs.iter().position(|op| {
+                    matches!(
+                        op,
+                        Op::Mkdir {
+                            path,
+                            condition: TargetCondition::Absent,
+                            ..
+                        } if path == &self.root_path
+                    )
+                }) {
+                    // Establish the new authority directory by itself. Every
+                    // descendant operation after this point carries the
+                    // identity returned by that atomic mkdir.
+                    let root_op = new_dirs.remove(root_index);
+                    let error = self.apply(vec![root_op])?.into_iter().next().flatten();
+                    if let Some(error) = error {
+                        self.progress.error(&format!("syq: {error}"));
+                        self.collision = true;
+                        return Ok(());
+                    }
+                    self.dirs_created += 1;
+                    if opts.verbose > 0 {
+                        self.progress
+                            .println(&format!("{}/", display(&self.root_path)));
+                    }
+                    let created = stat_many(self.dst, vec![self.root_path.clone()], false)?
+                        .pop()
+                        .flatten()
+                        .filter(|entry| entry.kind == Kind::Dir)
+                        .context("new exact target was not a directory after creation")?;
+                    self.exact_condition = target_identity(&created);
+                    self.mutation_root_condition = target_identity(&created);
+                    if self.guard_containers {
+                        self.container_guard = Some(target_container(&self.root_path, &created));
+                    }
+                }
+                for new_dirs in directory_creation_batches(new_dirs, opts.restricted_receiver) {
                     let n = new_dirs.len();
-                    let names: Vec<PathBytes> = new_dirs
+                    let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs
                         .iter()
                         .map(|op| match op {
-                            Op::Mkdir { path, .. } => path.clone(),
+                            Op::Mkdir {
+                                path, condition, ..
+                            } => (path.clone(), *condition),
                             _ => unreachable!(),
                         })
                         .collect();
                     let errs = self.apply(new_dirs)?;
                     let mut failed = 0;
-                    for (name, err) in names.iter().zip(errs) {
+                    for ((name, condition), err) in op_info.iter().zip(errs) {
                         if let Some(err) = err {
                             failed += 1;
                             self.progress.error(&format!("syq: {err}"));
+                            if name == &self.root_path && *condition != TargetCondition::Any {
+                                self.collision = true;
+                            }
                         } else if opts.verbose > 0 {
                             self.progress.println(&format!("{}/", display(name)));
                         }
@@ -2979,17 +3496,31 @@ impl Planner<'_> {
                     let depth = p.iter().filter(|&&c| c == b'/').count();
                     let mut meta = e.meta();
                     let mut flags = flags;
-                    // An existing directory we had to open up (u+rwx) gets its
-                    // own mode back at the end when nothing else sets it.
+                    // Without -p, existing directories retain their mode and
+                    // new directories receive the source mode through the
+                    // receiving side's umask. Only a signed receiver needs to
+                    // replace the proposal: an ordinary receiver's Mkdir has
+                    // already applied its local umask and any kernel-inherited
+                    // setgid bit, which a follow-up chmod must not clear.
                     if flags & flags::MODE == 0 {
-                        if let Some(d) = s {
-                            if d.kind == Kind::Dir && d.mode & 0o700 != 0o700 {
-                                meta.mode = d.mode & 0o7777;
-                                flags |= flags::MODE;
-                            }
+                        if opts.restricted_receiver {
+                            meta.mode = s
+                                .as_ref()
+                                .filter(|d| d.kind == Kind::Dir)
+                                .map_or(e.mode & 0o777 & !opts.umask, |d| d.mode & 0o7777);
+                            flags |= flags::RECEIVER_MODE;
+                        } else if let Some(existing) = s.as_ref().filter(|d| d.kind == Kind::Dir) {
+                            meta.mode = existing.mode & 0o7777;
+                            flags |= flags::MODE;
                         }
                     }
-                    self.deferred.push((p.clone(), meta, flags, depth));
+                    self.deferred.push((
+                        p.clone(),
+                        meta,
+                        flags,
+                        depth,
+                        self.metadata_condition_for(p),
+                    ));
                 }
             }
         }
@@ -3051,6 +3582,38 @@ impl Planner<'_> {
                 e,
                 contested,
             } = p;
+            let target_condition = self.exact_condition_for(&dst_path);
+            let target_condition_holds = match (target_condition, &dst_entry) {
+                (TargetCondition::Any, _) | (TargetCondition::Absent, None) => true,
+                (TargetCondition::Absent, Some(_)) => false,
+                (TargetCondition::Matches { dev, ino }, Some(entry)) => {
+                    entry.dev == dev && entry.ino == ino
+                }
+                (TargetCondition::Matches { .. }, None) => false,
+                (
+                    TargetCondition::MatchesFingerprint {
+                        dev,
+                        ino,
+                        ctime,
+                        ctime_nsec,
+                    },
+                    Some(entry),
+                ) => {
+                    entry.dev == dev
+                        && entry.ino == ino
+                        && entry.ctime == ctime
+                        && entry.ctime_nsec == ctime_nsec
+                }
+                (TargetCondition::MatchesFingerprint { .. }, None) => false,
+            };
+            if !target_condition_holds {
+                self.progress.error(&format!(
+                    "syq: target {} changed after the placement precondition was checked",
+                    display(&dst_path)
+                ));
+                self.collision = true;
+                continue;
+            }
             if (opts.existing || opts.ignore_existing)
                 && self.under_missing_dir(&dst_path, dst_root)
             {
@@ -3161,8 +3724,10 @@ impl Planner<'_> {
                                 meta_fixes.push((
                                     Op::SetFileMetaIfSame {
                                         path: dst_path.clone(),
-                                        expected_dev: d.dev,
-                                        expected_ino: d.ino,
+                                        condition: match target_condition {
+                                            TargetCondition::Any => target_identity(d),
+                                            condition => condition,
+                                        },
                                         meta: e.meta(),
                                         flags: ff,
                                     },
@@ -3274,8 +3839,13 @@ impl Planner<'_> {
                     ops.push(Op::Symlink {
                         path: dst_path.clone(),
                         target,
+                        condition: self.exact_condition_for(&dst_path),
                     });
                     ops.push(Op::SetMeta {
+                        // Apply runs successful leaf creation/replacement
+                        // before metadata; a failed guarded replacement skips
+                        // this phase entirely.
+                        condition: TargetCondition::Any,
                         path: dst_path,
                         meta: e.meta(),
                         flags: opts.flags & !flags::MODE,
@@ -3337,11 +3907,19 @@ impl Planner<'_> {
                         path: dst_path.clone(),
                         mode: e.mode,
                         rdev: e.rdev,
+                        condition: self.exact_condition_for(&dst_path),
                     });
+                    let mut meta = e.meta();
+                    let mut flags = opts.flags;
+                    if flags & flags::MODE == 0 {
+                        meta.mode = e.mode & 0o777 & !opts.umask;
+                        flags |= flags::RECEIVER_MODE;
+                    }
                     ops.push(Op::SetMeta {
+                        condition: TargetCondition::Any,
                         path: dst_path,
-                        meta: e.meta(),
-                        flags: opts.flags,
+                        meta,
+                        flags,
                     });
                     self.specials_created += 1;
                 }
@@ -3382,10 +3960,9 @@ impl Planner<'_> {
         &mut self,
         batch: &[Entry],
         src_root: &[u8],
-        sub: &str,
+        sub: &[u8],
         dst_root: &[u8],
     ) -> Vec<(PathBytes, String)> {
-        let sub = sub.as_bytes();
         let mut files = Vec::new();
         for entry in batch {
             if !self.entry_is_payload(entry) {
@@ -3447,7 +4024,8 @@ impl Planner<'_> {
         let pre_stat = self.opts.dst_remote
             && self.buffer.is_none()
             && !self.opts.dry_run
-            && !self.destination_tree_known_missing;
+            && !self.destination_tree_known_missing
+            && self.container_guard.is_none();
         let directories: Vec<PathBytes> = if pre_stat {
             mapped
                 .dirs
@@ -3480,6 +4058,7 @@ impl Planner<'_> {
                     .expect("partial identity initialized before planning"),
                 directories: directories.clone(),
                 others: other_paths.clone(),
+                guard: self.container_guard.clone(),
             })?;
             match ok(response, "plan destination batch")? {
                 Response::BatchPlan {
@@ -3622,6 +4201,7 @@ impl Planner<'_> {
         entry: Entry,
         dst_entry: Option<Entry>,
     ) {
+        let target_condition = self.exact_condition_for(&dst);
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
@@ -3631,6 +4211,8 @@ impl Planner<'_> {
             rel_bytes,
             entry,
             dst_entry,
+            target_condition,
+            container_guard: self.container_guard.clone(),
             attempts: 0,
             done: Arc::new(AtomicU64::new(0)),
             inplace: false,
@@ -3685,7 +4267,7 @@ impl Planner<'_> {
         };
         for (root, sub) in roots.clone() {
             // Every root is walked with its own -i anchoring. A root nested in
-            // this one (`syq --delete a b/ dst`: dst/a inside dst) is left to
+            // this one (`syq rsync --delete a b/ dst`: dst/a inside dst) is left to
             // its own walk, so its patterns apply and nothing is deleted twice.
             let nested: Vec<PathBytes> = roots
                 .iter()
@@ -3741,7 +4323,7 @@ impl Planner<'_> {
                             }
                             None => {}
                         }
-                        let dst_rel = join(sub.as_bytes(), &e.path);
+                        let dst_rel = join(&sub, &e.path);
                         let rel = display(&dst_rel);
                         let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
                         // The only sidecar-patterned files that are not extras
@@ -4030,6 +4612,7 @@ impl Planner<'_> {
                     .partial_id
                     .get()
                     .expect("partial identity initialized before planning"),
+                guard: None,
             })?,
             "compute sidecar paths",
         )? {
@@ -4039,22 +4622,30 @@ impl Planner<'_> {
     }
 
     fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<String>>> {
-        match ok(self.dst.call(Request::Apply(ops))?, "apply")? {
+        match ok(
+            self.dst.call(Request::Apply {
+                ops,
+                guard: self.container_guard.clone(),
+            })?,
+            "apply",
+        )? {
             Response::Applied(v) => Ok(v),
             other => bail!("unexpected response {other:?}"),
         }
     }
 
     fn apply_deferred(&mut self) -> Result<()> {
+        self.assert_mutation_root()?;
         let mut d = std::mem::take(&mut self.deferred);
         d.sort_by(|a, b| b.3.cmp(&a.3));
         for chunk in d.chunks(1000) {
             let ops: Vec<Op> = chunk
                 .iter()
-                .map(|(p, m, f, _)| Op::SetMeta {
+                .map(|(p, m, f, _, condition)| Op::SetMeta {
                     path: p.clone(),
                     meta: *m,
                     flags: *f,
+                    condition: *condition,
                 })
                 .collect();
             for err in self.apply(ops)?.into_iter().flatten() {
@@ -4342,7 +4933,7 @@ impl Worker {
         // One batch request: the server still publishes every file through its
         // own sidecar, but framing, compression and encryption are amortized.
         let phase = std::time::Instant::now();
-        let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
+        let flags = publication_metadata_flags(self.opts.flags);
         let mut sent: Vec<bool> = Vec::with_capacity(jobs.len());
         let mut puts = Vec::with_capacity(jobs.len());
         for (j, d) in jobs.iter().zip(data.iter_mut()) {
@@ -4361,6 +4952,8 @@ impl Worker {
                 hash,
                 meta,
                 flags,
+                condition: j.target_condition,
+                guard: j.container_guard.clone(),
             });
             sent.push(true);
         }
@@ -4423,7 +5016,11 @@ impl Worker {
                 None => true,
             };
             if changed {
-                if let (Some(e), true) = (now, j.attempts + 1 < MAX_ATTEMPTS) {
+                if let (Some(e), true, true) = (
+                    now,
+                    j.attempts + 1 < MAX_ATTEMPTS,
+                    j.target_condition == TargetCondition::Any,
+                ) {
                     if !self.opts.quiet {
                         self.progress.eprintln(&format!(
                             "syq: {}: changed during transfer, retrying",
@@ -4493,7 +5090,12 @@ impl Worker {
             }),
         );
 
-        let inplace = self.opts.inplace;
+        // Placement guards must be enforced by the final mutation. Stage even
+        // an explicit --inplace transfer until that checked update; an
+        // existing target is still updated through its held inode at finalize.
+        let inplace = self.opts.inplace
+            && job.target_condition == TargetCondition::Any
+            && job.container_guard.is_none();
         // The planner already statted the final path. Only the deterministic
         // sidecar needs another lookup before choosing the transfer basis.
         // --inplace never uses that sidecar, so it avoids the lookup entirely.
@@ -4504,6 +5106,7 @@ impl Worker {
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
                     partial_id: self.partial_id(),
+                    guard: None,
                 })?,
                 "probe partial",
             )? {
@@ -4530,6 +5133,7 @@ impl Worker {
             && self.bwlimit.is_none()
             && job.entry.size > 0
             && partial_size.is_none()
+            && job.container_guard.is_none()
         {
             match self.try_copy_local(idx, &job) {
                 Ok(true) => {
@@ -4575,6 +5179,7 @@ impl Worker {
                         inplace: true,
                         partial_id: self.partial_id(),
                         mode: self.create_mode(&job),
+                        guard: job.container_guard.clone(),
                     })?,
                     "prepare",
                 )?;
@@ -4591,6 +5196,7 @@ impl Worker {
                         inplace: false,
                         partial_id: self.partial_id(),
                         mode: self.create_mode(&job),
+                        guard: job.container_guard.clone(),
                     })?,
                     "prepare",
                 )?;
@@ -4609,7 +5215,9 @@ impl Worker {
                             path: job.dst.clone(),
                             partial_id: self.partial_id(),
                             meta,
-                            flags: self.opts.flags | flags::MODE,
+                            flags: publication_metadata_flags(self.opts.flags),
+                            condition: job.target_condition,
+                            guard: job.container_guard.clone(),
                         })?,
                         "finish content-identical destination",
                     )?;
@@ -4620,6 +5228,7 @@ impl Worker {
                         path: job.dst.clone(),
                         partial_id: self.partial_id(),
                         len: size,
+                        guard: job.container_guard.clone(),
                     })?,
                     "seed partial from destination basis",
                 )?;
@@ -4632,6 +5241,7 @@ impl Worker {
                     inplace: false,
                     partial_id: self.partial_id(),
                     mode: self.create_mode(&job),
+                    guard: job.container_guard.clone(),
                 })?,
                 "prepare",
             )?;
@@ -4710,7 +5320,9 @@ impl Worker {
         // Write to a partial and let finish_file rename it, so an interrupted
         // copy_file_range never leaves a final-named file the quick check could
         // mistake for complete. Only --inplace writes the final path directly.
-        let inplace = self.opts.inplace;
+        let inplace = self.opts.inplace
+            && job.target_condition == TargetCondition::Any
+            && job.container_guard.is_none();
         self.set_inplace(idx, inplace);
         let mode = self.create_mode(job);
         let resp = self.dst.call(Request::CopyLocal {
@@ -4789,6 +5401,7 @@ impl Worker {
                 partial_id: self.partial_id(),
                 block: self.opts.block,
                 len: job.entry.size,
+                guard: None,
             },
             "hash destination",
         )
@@ -4805,6 +5418,8 @@ impl Worker {
                 partial_id: self.partial_id(),
                 block: self.opts.block,
                 len: job.entry.size,
+                condition: job.target_condition,
+                guard: job.container_guard.clone(),
             },
             "hash and retain destination basis",
         )?;
@@ -4829,6 +5444,7 @@ impl Worker {
             partial_id: self.partial_id(),
             block,
             len: size,
+            guard: None,
         })?;
         self.dst.send(destination_request)?;
         // Both requests are in flight. Always consume both responses before
@@ -4953,6 +5569,7 @@ impl Worker {
                 off,
                 hash,
                 data,
+                guard: job.container_guard.clone(),
             })?;
             self.t[1] += t0.elapsed().as_secs_f64();
             writes_out += 1;
@@ -5011,7 +5628,7 @@ impl Worker {
         let job = self.job(idx);
         let mut meta = job.entry.meta();
         meta.mode = self.create_mode(&job);
-        let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
+        let flags = publication_metadata_flags(self.opts.flags);
         let finalized = ok(
             self.dst.call(Request::Finalize {
                 path: job.dst.clone(),
@@ -5019,6 +5636,8 @@ impl Worker {
                 partial_id: self.partial_id(),
                 meta,
                 flags,
+                condition: job.target_condition,
+                guard: job.container_guard.clone(),
             })?,
             "finalize destination",
         );
@@ -5034,6 +5653,7 @@ impl Worker {
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
                     partial_id: self.partial_id(),
+                    guard: None,
                 })?,
                 "probe partial after finalize",
             )? {
@@ -5056,9 +5676,11 @@ impl Worker {
     fn contents_match(&mut self, job: &FileJob) -> Result<bool> {
         self.src.send(Request::FileHash {
             path: job.src.clone(),
+            guard: None,
         })?;
         self.dst.send(Request::FileHash {
             path: job.dst.clone(),
+            guard: None,
         })?;
         let source = self.src.recv();
         let destination = self.dst.recv();
@@ -5104,7 +5726,7 @@ impl Worker {
             None => true,
         };
         if changed {
-            if job.attempts + 1 < MAX_ATTEMPTS {
+            if job.attempts + 1 < MAX_ATTEMPTS && job.target_condition == TargetCondition::Any {
                 if let Some(e) = now {
                     if !self.opts.quiet {
                         self.progress.eprintln(&format!(
@@ -5156,9 +5778,11 @@ impl Worker {
         let r = (|| -> Result<bool> {
             self.src.send(Request::FileHash {
                 path: job.src.clone(),
+                guard: None,
             })?;
             self.dst.send(Request::FileHash {
                 path: job.dst.clone(),
+                guard: None,
             })?;
             // Keep both reusable connections aligned even if one endpoint
             // reports an ordinary per-file error.
@@ -5242,6 +5866,70 @@ mod tests {
                 "clean_root({given:?})"
             );
         }
+    }
+
+    #[test]
+    fn restricted_root_creation_includes_receiver_managed_final_mode() {
+        let ordinary = mkdir_root_batches(b"/destination", TargetCondition::Absent, false);
+        assert_eq!(ordinary.len(), 1);
+        assert!(matches!(ordinary[0].as_slice(), [Op::Mkdir { .. }]));
+
+        let restricted = mkdir_root_batches(b"/destination", TargetCondition::Absent, true);
+        assert_eq!(restricted.len(), 2);
+        assert!(matches!(
+            restricted[0].as_slice(),
+            [Op::Mkdir { mode: 0o755, .. }]
+        ));
+        assert!(matches!(
+            restricted[1].as_slice(),
+            [Op::SetMeta {
+                meta: Meta { mode: 0o755, .. },
+                flags: flags::RECEIVER_MODE,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn restricted_directory_creation_batches_put_parents_before_children() {
+        let mkdir = |path: &[u8]| Op::Mkdir {
+            path: path.to_vec(),
+            mode: 0o755,
+            condition: TargetCondition::Any,
+        };
+        let ops = vec![
+            mkdir(b"/destination/a/b"),
+            mkdir(b"/destination/c"),
+            mkdir(b"/destination/a"),
+            mkdir(b"/destination/c/d"),
+        ];
+
+        let ordinary = directory_creation_batches(ops.clone(), false);
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].len(), 4);
+
+        let restricted = directory_creation_batches(ops, true);
+        assert_eq!(restricted.len(), 2);
+        fn paths(batch: &[Op]) -> Vec<&[u8]> {
+            batch
+                .iter()
+                .map(|op| match op {
+                    Op::Mkdir { path, .. } => path.as_slice(),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        }
+        assert_eq!(
+            paths(&restricted[0]),
+            vec![b"/destination/c".as_slice(), b"/destination/a".as_slice()]
+        );
+        assert_eq!(
+            paths(&restricted[1]),
+            vec![
+                b"/destination/a/b".as_slice(),
+                b"/destination/c/d".as_slice()
+            ]
+        );
     }
 
     #[test]

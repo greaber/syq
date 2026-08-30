@@ -68,7 +68,29 @@ impl Drop for RequestReader {
 }
 
 pub fn run() -> Result<()> {
-    serve(io::stdin(), io::stdout().lock(), true, None, None, None)
+    serve(
+        io::stdin(),
+        io::stdout().lock(),
+        true,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
+    let result = serve(
+        io::stdin(),
+        io::stdout().lock(),
+        true,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&authority)),
+    );
+    authority.close_control();
+    result
 }
 
 /// Serve one connection. `over_ssh` connections may set up a TCP listener;
@@ -80,6 +102,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     expect_token: Option<Vec<u8>>,
     authed: Option<&std::sync::atomic::AtomicBool>,
     tcp_socket: Option<TcpStream>,
+    authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
 ) -> Result<()> {
     let mut r = FrameReader::new(r);
     let mut w = FrameWriter::new(w, false);
@@ -111,6 +134,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 )))?;
                 bail!("build identity mismatch");
             }
+            if let Some(authority) = &authority {
+                authority.validate_hello(compress)?;
+            }
             w.compress = compress;
             w.write_msg(&Response::HelloOk {
                 identity: expected_identity.to_string(),
@@ -130,13 +156,19 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let (mut blocks, mut bytes) = (0u64, 0u64);
     loop {
         let t0 = std::time::Instant::now();
-        let req: Request = match reader.recv() {
+        let mut req: Request = match reader.recv() {
             Ok(Ok(req)) => req,
             Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => break,
         };
         t[0] += t0.elapsed().as_secs_f64();
+        if let Some(authority) = &authority {
+            if let Err(error) = authority.authorize(&mut req, over_ssh) {
+                w.write_msg(&Response::Err(format!("{error:#}")))?;
+                continue;
+            }
+        }
         match &req {
             Request::WriteRange { data, .. } => {
                 blocks += 1;
@@ -179,6 +211,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     debug,
                     w.compress,
                     congestion_control.as_deref(),
+                    authority.clone(),
                 ) {
                     Ok((port, congestion_control)) => w.write_msg(&Response::TcpListening {
                         port,
@@ -196,9 +229,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 follow_root,
                 ignore,
                 report_ignored,
+                guard,
             } => {
                 let root = match ops.scan_root(&root) {
-                    Ok(root) => fsops::resolve(&root),
+                    Ok(root) => root,
                     Err(error) => {
                         w.write_msg(&Response::Err(format!("{error:#}")))?;
                         continue;
@@ -208,21 +242,37 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 // writer borrow suffices.
                 let warns = std::cell::RefCell::new(Vec::new());
                 let wref = std::cell::RefCell::new(&mut w);
-                let res = crate::scan::scan(
-                    &root,
-                    follow_root,
-                    &ignore,
-                    report_ignored,
-                    &mut |batch| {
-                        let mut w = wref.borrow_mut();
-                        for m in warns.borrow_mut().drain(..) {
-                            w.write_msg(&Response::ScanWarn(m))?;
-                        }
-                        Ok(w.write_msg(&Response::ScanBatch(batch))?)
-                    },
-                    &mut |paths| Ok(wref.borrow_mut().write_msg(&Response::ScanIgnored(paths))?),
-                    &mut |msg| warns.borrow_mut().push(msg),
-                );
+                let mut sink = |batch| {
+                    let mut w = wref.borrow_mut();
+                    for m in warns.borrow_mut().drain(..) {
+                        w.write_msg(&Response::ScanWarn(m))?;
+                    }
+                    Ok(w.write_msg(&Response::ScanBatch(batch))?)
+                };
+                let mut ignored =
+                    |paths| Ok(wref.borrow_mut().write_msg(&Response::ScanIgnored(paths))?);
+                let res = if let Some(guard) = guard {
+                    crate::scan::scan_rooted(
+                        &root,
+                        follow_root,
+                        &ignore,
+                        report_ignored,
+                        &guard,
+                        &mut sink,
+                        &mut ignored,
+                        &mut |msg| warns.borrow_mut().push(msg),
+                    )
+                } else {
+                    crate::scan::scan(
+                        &fsops::resolve(&root),
+                        follow_root,
+                        &ignore,
+                        report_ignored,
+                        &mut sink,
+                        &mut ignored,
+                        &mut |msg| warns.borrow_mut().push(msg),
+                    )
+                };
                 for m in warns.borrow_mut().drain(..) {
                     w.write_msg(&Response::ScanWarn(m))?;
                 }
@@ -324,6 +374,7 @@ fn local_addrs() -> Vec<(String, u32)> {
     addrs.into_iter().map(|(ip, sp, _)| (ip, sp)).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tcp_listen(
     key: Option<Vec<u8>>,
     token: Vec<u8>,
@@ -332,6 +383,7 @@ fn tcp_listen(
     debug: bool,
     compress: bool,
     congestion_control: Option<&str>,
+    authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
 ) -> Result<(u16, Option<String>)> {
     let mut listener = None;
     for port in lo..=hi.max(lo) {
@@ -355,21 +407,57 @@ fn tcp_listen(
     let live = Arc::new(AtomicU32::new(0));
     let seen: Arc<std::sync::Mutex<std::collections::HashSet<u32>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-    const MAX_LIVE: u32 = 256;
+    let max_live = authority
+        .as_ref()
+        .map(|authority| u32::from(authority.maximum_connections()))
+        .unwrap_or(256);
+    if authority.is_some() {
+        listener.set_nonblocking(true)?;
+    }
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
+        loop {
+            if authority
+                .as_ref()
+                .is_some_and(|authority| !authority.control_is_open())
+            {
+                break;
+            }
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error)
+                    if authority.is_some() && error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(_) => continue,
+            };
             let id = next_id.fetch_add(1, Relaxed);
-            if live.load(Relaxed) >= MAX_LIVE {
+            if live.load(Relaxed) >= max_live {
                 if debug {
-                    eprintln!("syq server (tcp): refusing connection, {MAX_LIVE} already live");
+                    eprintln!("syq server (tcp): refusing connection, {max_live} already live");
                 }
                 continue; // drop; stream closes
             }
             live.fetch_add(1, Relaxed);
-            let (key, token, live, seen) = (key.clone(), token.clone(), live.clone(), seen.clone());
+            let (key, token, live, seen, authority) = (
+                key.clone(),
+                token.clone(),
+                live.clone(),
+                seen.clone(),
+                authority.clone(),
+            );
             std::thread::spawn(move || {
-                if let Err(e) = serve_tcp(stream, id, key, token, debug, compress, &seen) {
+                if let Err(e) = serve_tcp(
+                    stream,
+                    id,
+                    key,
+                    token,
+                    debug,
+                    compress,
+                    &seen,
+                    authority.clone(),
+                ) {
                     if debug {
                         eprintln!("syq server (tcp {id}): {e:#}");
                     }
@@ -381,6 +469,7 @@ fn tcp_listen(
     Ok((port, congestion_control))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_tcp(
     stream: TcpStream,
     id: u32,
@@ -389,6 +478,7 @@ fn serve_tcp(
     _debug: bool,
     _compress: bool,
     seen: &std::sync::Mutex<std::collections::HashSet<u32>>,
+    authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     // Scanners and stray connections must not hold a thread forever.
@@ -398,6 +488,18 @@ fn serve_tcp(
     let mut idbuf = [0u8; 4];
     (&stream).read_exact(&mut idbuf)?;
     let conn_id = u32::from_be_bytes(idbuf);
+    if let Some(authority) = &authority {
+        authority.acquire_connection()?;
+    }
+    struct ConnectionPermit(Option<Arc<crate::restricted::RestrictedAuthority>>);
+    impl Drop for ConnectionPermit {
+        fn drop(&mut self) {
+            if let Some(authority) = &self.0 {
+                authority.release_connection();
+            }
+        }
+    }
+    let _permit = ConnectionPermit(authority.clone());
     let _ = id;
     // Each client connection id is single-use: a replayed record stream carries
     // the original id (it must, to decrypt) and is rejected here.
@@ -430,6 +532,7 @@ fn serve_tcp(
         Some(token),
         Some(&authed),
         Some(stream.try_clone()?),
+        authority,
     );
     if res.is_err() && !authed.load(std::sync::atomic::Ordering::SeqCst) {
         seen.lock().unwrap().remove(&conn_id);
@@ -533,6 +636,7 @@ mod tests {
                 None,
                 None,
                 Some(socket),
+                None,
             )
             .unwrap();
         });

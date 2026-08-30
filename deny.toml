@@ -10,6 +10,9 @@ targets = [
 [advisories]
 unmaintained = "workspace"
 yanked = "warn"
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "rsa is used only to parse SSH public credentials and verify signatures; syq never performs the vulnerable RSA private-key decryption or signing operations" },
+]
 
 [licenses]
 confidence-threshold = 0.93

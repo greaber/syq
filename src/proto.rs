@@ -9,8 +9,24 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
+pub const MIN_HASH_BLOCK_BYTES: u64 = 64 * 1024;
+pub const MAX_HASH_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
+// Postcard encodes a u64 as a base-128 varint of at most ten bytes.
+const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 10;
+const HASH_RESPONSE_OVERHEAD: u64 = 24;
 const COMPRESS_MIN: usize = 512;
 const COMPRESS_LEVEL: i32 = 1;
+
+pub fn hash_response_fits(block: u64, len: u64) -> bool {
+    if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
+        return false;
+    }
+    let entries = len.div_ceil(block);
+    entries
+        .checked_mul(HASH_RESPONSE_BYTES_PER_ENTRY)
+        .and_then(|bytes| bytes.checked_add(HASH_RESPONSE_OVERHEAD))
+        .is_some_and(|bytes| bytes < MAX_FRAME as u64)
+}
 
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
@@ -46,6 +62,10 @@ pub struct Entry {
     /// Device and inode, for detecting src==dst (same file / hardlink / alias).
     pub dev: u64,
     pub ino: u64,
+    /// Status-change time completes the identity fingerprint used to detect an
+    /// unlink/recreate race that happens to reuse the same inode number.
+    pub ctime: i64,
+    pub ctime_nsec: u32,
     pub link: Option<PathBytes>,
 }
 
@@ -59,6 +79,35 @@ impl Entry {
             mtime_nsec: self.mtime_nsec,
         }
     }
+}
+
+/// A target condition carried to the receiver that performs the mutation.
+/// `Absent` is enforced with no-replace creation/publication; the matching
+/// variants bind an existing-target operation to the object the planner saw.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TargetCondition {
+    #[default]
+    Any,
+    Absent,
+    Matches {
+        dev: u64,
+        ino: u64,
+    },
+    MatchesFingerprint {
+        dev: u64,
+        ino: u64,
+        ctime: i64,
+        ctime_nsec: u32,
+    },
+}
+
+/// Stable authority boundary for every descendant mutation in a guarded
+/// native placement.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ContainerGuard {
+    pub root: PathBytes,
+    pub dev: u64,
+    pub ino: u64,
 }
 
 /// One whole-file read in the pipelined small-file path.
@@ -79,6 +128,8 @@ pub struct SmallPut {
     pub hash: u64,
     pub meta: Meta,
     pub flags: u8,
+    pub condition: TargetCondition,
+    pub guard: Option<ContainerGuard>,
 }
 
 /// Contents and integrity hash for one successful `SmallRead`.
@@ -104,6 +155,12 @@ pub mod flags {
     pub const OWNER: u8 = 2;
     pub const GROUP: u8 = 4;
     pub const TIMES: u8 = 8;
+    /// A mode proposed by ordinary destination creation/restoration semantics,
+    /// rather than source-mode preservation requested with `-p`. Restricted
+    /// receivers replace it with a mode derived from receiver state and umask,
+    /// including any receiver-observed directory setgid inheritance.
+    pub const RECEIVER_MODE: u8 = 16;
+    pub const MODE_MASK: u8 = MODE | RECEIVER_MODE;
 }
 
 /// Best-effort kernel counters for one end of a TCP data socket. `None` means
@@ -139,44 +196,41 @@ pub enum Op {
     Mkdir {
         path: PathBytes,
         mode: u32,
+        condition: TargetCondition,
     },
     Symlink {
         path: PathBytes,
         target: PathBytes,
+        condition: TargetCondition,
     },
     Mknod {
         path: PathBytes,
         mode: u32,
         rdev: u64,
+        condition: TargetCondition,
     },
     SetMeta {
         path: PathBytes,
         meta: Meta,
         flags: u8,
+        condition: TargetCondition,
     },
-    /// Apply metadata to a regular file only if the path still names the inode
-    /// observed by the planner. A concurrent rename makes this a no-op.
+    /// Apply metadata to a regular file only if the path still satisfies the
+    /// planner's condition.
     SetFileMetaIfSame {
         path: PathBytes,
-        expected_dev: u64,
-        expected_ino: u64,
+        condition: TargetCondition,
         meta: Meta,
         flags: u8,
     },
     /// Remove whatever currently occupies the path, recursively when it is a
     /// directory. Planned deletion uses Unlink/Rmdir instead.
-    Remove {
-        path: PathBytes,
-    },
+    Remove { path: PathBytes },
     /// Remove an empty directory.
-    Rmdir {
-        path: PathBytes,
-    },
+    Rmdir { path: PathBytes },
     /// Remove a non-directory; a directory that has appeared there is an
     /// error, never recursed into (used by --delete for planned leaves).
-    Unlink {
-        path: PathBytes,
-    },
+    Unlink { path: PathBytes },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -203,11 +257,13 @@ pub enum Request {
         follow_root: bool,
         ignore: Vec<String>,
         report_ignored: bool,
+        guard: Option<ContainerGuard>,
     },
     /// lstat each path; with `follow`, stat through symlinks instead.
     StatMany {
         paths: Vec<PathBytes>,
         follow: bool,
+        guard: Option<ContainerGuard>,
     },
     /// Resolve an operator-supplied destination directory component by
     /// component, following only symlinks owned by root or this endpoint's
@@ -221,6 +277,9 @@ pub enum Request {
     /// return the selected directory's stable identity.
     CreateOperatorDirectory {
         mode: u32,
+        /// Refuse a concurrently-created final directory instead of reusing
+        /// it. Intermediate directories may still be shared safely.
+        require_absent: bool,
     },
     /// Retain and enter the selected destination directory for this
     /// connection. The control connection reuses its checked descriptor;
@@ -236,6 +295,11 @@ pub enum Request {
     PartialPaths {
         paths: Vec<PathBytes>,
         partial_id: PartialId,
+        guard: Option<ContainerGuard>,
+    },
+    Apply {
+        ops: Vec<Op>,
+        guard: Option<ContainerGuard>,
     },
     /// Resolve sidecar names and inspect an existing destination batch in one
     /// turn. Leaf stats are returned only when every directory is still a
@@ -245,13 +309,14 @@ pub enum Request {
         partial_id: PartialId,
         directories: Vec<PathBytes>,
         others: Vec<PathBytes>,
+        guard: Option<ContainerGuard>,
     },
-    Apply(Vec<Op>),
     /// Return the size of the deterministic sidecar, if it is a regular file.
     /// The planner has already statted the final path.
     ProbePartial {
         path: PathBytes,
         partial_id: PartialId,
+        guard: Option<ContainerGuard>,
     },
     /// Create/adjust the write target for `path` with the given final size.
     /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
@@ -262,6 +327,7 @@ pub enum Request {
         inplace: bool,
         partial_id: PartialId,
         mode: u32,
+        guard: Option<ContainerGuard>,
     },
     /// Hash an existing final file and retain that open inode as the repair
     /// basis until FinishBasis or SeedBasis consumes it.
@@ -270,6 +336,8 @@ pub enum Request {
         partial_id: PartialId,
         block: u64,
         len: u64,
+        condition: TargetCondition,
+        guard: Option<ContainerGuard>,
     },
     /// Apply metadata through the retained basis descriptor. If another job
     /// renamed over the final path meanwhile, its complete file remains the
@@ -279,12 +347,15 @@ pub enum Request {
         partial_id: PartialId,
         meta: Meta,
         flags: u8,
+        condition: TargetCondition,
+        guard: Option<ContainerGuard>,
     },
     /// Seed this job's sidecar from the retained basis descriptor.
     SeedBasis {
         path: PathBytes,
         partial_id: PartialId,
         len: u64,
+        guard: Option<ContainerGuard>,
     },
     /// In-kernel copy of a same-machine file (copy_file_range: reflink / NFS
     /// server-side copy when possible). Err("EXDEV") tells the caller to fall
@@ -303,6 +374,7 @@ pub enum Request {
         partial_id: PartialId,
         block: u64,
         len: u64,
+        guard: Option<ContainerGuard>,
     },
     ReadRange {
         path: PathBytes,
@@ -321,6 +393,7 @@ pub enum Request {
         hash: u64,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+        guard: Option<ContainerGuard>,
     },
     Finalize {
         path: PathBytes,
@@ -328,16 +401,20 @@ pub enum Request {
         partial_id: PartialId,
         meta: Meta,
         flags: u8,
+        condition: TargetCondition,
+        guard: Option<ContainerGuard>,
     },
     /// Verify and atomically publish a complete small-file batch in one frame.
     PutSmallBatch(Vec<SmallPut>),
     FileHash {
         path: PathBytes,
+        guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
     /// existing prefix resolved), for a stable job identity.
     Canonicalize {
         path: PathBytes,
+        guard: Option<ContainerGuard>,
     },
     /// Kernel TCP_INFO/TCP_CONNECTION_INFO for this end of a direct data
     /// socket. SSH data transports report None at the orchestrator instead of
@@ -449,7 +526,7 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 48
             }
-            Request::Apply(v) => v.len() * 128 + 16,
+            Request::Apply { ops, .. } => ops.len() * 128 + 16,
             _ => 256,
         }
     }
@@ -513,7 +590,14 @@ impl<W: Write> FrameWriter<W> {
                 }
             }
         }
-        let len = (body.len() + 1) as u32;
+        let len = body
+            .len()
+            .checked_add(1)
+            .filter(|len| *len <= MAX_FRAME)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "outgoing frame exceeds limit")
+            })?;
         self.w.write_all(&len.to_le_bytes())?;
         self.w.write_all(&[flag])?;
         self.w.write_all(&body)?;

@@ -1,7 +1,8 @@
 # syq
 
-`syq` is a parallel file copier with an rsync-shaped command line. It scans
-source and destination, works out what differs, and moves the data over
+`syq` is a parallel file copier with an explicit native command line and a
+retained rsync-compatibility subcommand. It scans source and destination, works
+out what differs, and moves the data over
 **N independent connections at once** — encrypted TCP by default, authenticated
 over ssh, falling back to ssh's own channels when a direct port can't be
 reached — splitting large files into ranges
@@ -127,35 +128,107 @@ Git-derived identity when an explicit source-built helper is used.
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
   (the musl target also works if `musl-gcc` is installed, which `zstd-sys` needs).
 
-## Usage
+## Native commands
+
+Native syntax starts with an operation and keeps endpoints, selectors, and
+target placement in separate arguments:
+
+```sh
+syq cp project --to server --into /backup       # named object → /backup/project
+syq cp --src-src project --to server --into /app # project contents → /app
+syq cp --from server --cwd /data --src a --src b --into ./data
+syq cp report --to server --as-new /reports/final
+syq cprm --src-src build --to server --into-existing /srv/app
+syq rm cache old-output
+syq rm --at server --cwd /srv --path old-output
+```
+
+`--from [USER@]HOST` selects one source endpoint and `--to [USER@]HOST`
+selects one target endpoint; omission means local. A local path containing `:`
+stays local because native mode never guesses endpoints from path text.
+`--cwd DIR`/`-C DIR` changes where relative source selectors are resolved at
+the source endpoint. Absolute selectors ignore it.
+
+Bare paths and repeatable `--src PATH` select named objects. A named directory
+keeps its basename at the target; a trailing slash is ordinary path spelling
+and has no semantic effect. `--src-src DIR` selects a directory's contents and
+merges them directly into the target container. `--src-no-follow PATH` selects
+a top-level symlink object itself; bare paths and `--src` follow a top-level
+symlink while retaining its written basename. Symlinks found while traversing
+a directory are copied as symlinks and are never followed. Singular selector
+options consume their next argument even when it begins with `-`, so every Unix
+filename is expressible without losing raw path bytes.
+
+Placement is always explicit in this initial native surface:
+
+| Placement | Mapping | Target precondition |
+|---|---|---|
+| `--into DIR` | Put selected names inside `DIR` | Use or create the directory |
+| `--into-new DIR` | Put selected names inside `DIR` | Must not exist |
+| `--into-existing DIR` | Put selected names inside `DIR` | Must already be a directory |
+| `--as PATH` | Map one named source exactly to `PATH` | Create or update the path |
+| `--as-new PATH` | Map one named source exactly to `PATH` | Must not exist |
+| `--as-existing PATH` | Map one named source exactly to `PATH` | Must exist |
+
+The receiver enforces `new` and `existing` again when it mutates the target,
+not only during planning. New targets use no-replace creation or publication.
+Existing containers must remain the same directory object: every descendant
+mutation reopens that identity and uses descriptor-relative filesystem calls,
+so replacing the container path makes the operation fail without touching its
+replacement. An exact existing regular file is updated through the object that
+passed preflight, preserving its inode (and therefore updating any hard-link
+aliases). Existing symlinks and special files can be atomically replaced by
+the same type. An exact `--as-existing` operation that would change the
+target's type is refused; use `--as` when type replacement is intended.
+
+`cp` copies or updates mapped source objects and keeps unrelated target
+objects. `cprm` uses the same mapping and transfer engine, then applies the
+existing safe deletion planner to remove target-only descendants in mapped
+directory scopes. It never removes a source and requires explicit placement;
+`--max-delete N` keeps its all-or-nothing deletion budget. `rm` removes the
+explicitly selected object trees and never follows a selected symlink.
+
+The first native fidelity default recurses through directories, copies in-tree
+symlinks as objects, and retains mtimes. Owner, group, modes, special files,
+hard links, ACLs, xattrs, filtering, comparison policy, and the automation API
+are intentionally not frozen by this first grammar. Use `syq rsync` when the
+current compatibility options for those capabilities are needed.
+
+The native commands currently share `-n/--dry-run`, `-v`, `-q`,
+`-j/--connections`, `--progress`, `--no-progress`, `--progress-json`, and the
+remote runtime options shown by `syq cp --help`. Remote-to-remote copies run on
+the source endpoint by default; `--relay` keeps orchestration local. Direct
+SSH command construction requires UTF-8 paths, while `--relay` carries raw path
+bytes in syq's protocol.
+
+## Rsync compatibility
+
+The complete previous command surface remains available under `syq rsync`:
 
 ```
-syq [OPTIONS] SRC... DEST
-syq [OPTIONS] [USER@]HOST:SRC... DEST
-syq [OPTIONS] SRC... [USER@]HOST:DEST
+syq rsync [OPTIONS] SRC... DEST
+syq rsync [OPTIONS] [USER@]HOST:SRC... DEST
+syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 ```
 
 ```sh
-syq -av project/ server:backup/project/       # push
-syq -av server:data/ ./data/                  # pull
-syq -a /mnt/nfs/tree /local/tree              # local → local (parallel scan and copy)
-syq -a hostA:big/ hostB:big/                  # remote → remote: runs on hostA, data goes A → B directly
-syq -a --relay hostA:big/ hostB:big/          # ...or relay through this machine if A can't reach B
-syq -av -j 16 bigdir server:dest              # 16 parallel connections
-syq -a --bwlimit 50M src server:dst            # cap all connections at 50 MiB/s total
-syq -a -e 'ssh -p 2222 -i ~/.ssh/other' src host:dst
-syq -a --dry-run -v src host:dst              # show what would be copied
-syq -ac src host:dst                          # skip the quick check; compare blocks, repair differences
-syq -a --verify-only src host:dst             # compare only; transfer nothing
-syq -a src newhost:dst                        # the matching remote helper is automatic
-syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for later runs
+syq rsync -av project/ server:backup/project/       # push
+syq rsync -av server:data/ ./data/                  # pull
+syq rsync -a /mnt/nfs/tree /local/tree              # local → local
+syq rsync -a hostA:big/ hostB:big/                  # direct remote → remote
+syq rsync -a --relay hostA:big/ hostB:big/          # relay when A cannot reach B
+syq rsync -av -j 16 bigdir server:dest              # fixed parallelism
+syq rsync -a --dry-run -v src host:dst              # preview
+syq rsync -a --verify-only src host:dst             # compare only
 ```
 
-### Options
+The sections below document this retained compatibility surface unless they
+explicitly say otherwise.
+
+### Compatibility options
 
 | Option | Meaning |
 |---|---|
-| `--self-update` | Install the newest signed release (standalone installer builds only) |
 | `-a`, `--archive` | Same as `-rlptgoD` |
 | `-r` `-l` `-p` `-t` `-g` `-o` `-D` | Recursive; symlinks as symlinks; perms; mtimes; group; owner; devices and specials |
 | `-v`, `-vv` | `-v` lists files as they complete; for copies, `-vv` also explains remote helpers, candidate TCP addresses, the planned transport, and initial concurrency |
@@ -177,7 +250,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--verify-only` | Hash every file in the run's scope on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
 | `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
-| `-e CMD`, `--rsh CMD` | Remote shell command; controls agent forwarding when set (default `ssh`) |
+| `-e CMD`, `--rsh CMD` | Remote shell command; bypasses automatic broker, receiver, and enrollment setup and controls agent forwarding itself (default `ssh`) |
 | `--syq-path PATH` | Use this exact remote `syq` instead of the managed helper |
 | `--no-bootstrap` | Require `syq` on the remote `PATH`; do not install a managed helper |
 | `--no-tcp` | Send data over the ssh connection instead of separate TCP sockets |
@@ -197,14 +270,18 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--from0` | `--files-from` entries are NUL-separated |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
-| `--no-forward-agent` | Remote-to-remote with default `ssh`: disable agent forwarding (conflicts with `-e`) |
+| `--no-forward-agent` | Remote-to-remote with default `ssh`: give hostA no agent; it must have credentials for hostB (conflicts with `-e`) |
+| `--agent-broker-only` | Remote-to-remote: use destination-bound authentication without installing or using the command-restricted receiver |
+| `--unrestricted-agent-forwarding` | Remote-to-remote compatibility escape hatch: expose the complete local agent to hostA instead of the constrained broker |
 | `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session; prints the follow target even with `-q` |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
-Like rsync, `-q` suppresses non-error output: progress, summaries, warnings,
-notices, and `-v` file listings are hidden. Copy failures are still written to
-stderr and reflected in the exit status.
+Like rsync, `-q` suppresses ordinary non-error output: progress, summaries,
+notices, and `-v` file listings are hidden. The warning that
+`--unrestricted-agent-forwarding` exposes the complete ambient agent is never
+hidden by `-q`. Copy failures are still written to stderr and reflected in the
+exit status.
 
 `--bwlimit` is one approximate limit shared by every `-j` worker, not a
 per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
@@ -222,35 +299,245 @@ does not change file contents, hashes, resume offsets, or `--bwlimit` accounting
 
 ### Remote-to-remote
 
-`syq hostA:src hostB:dst` starts the orchestrator *on hostA* over `ssh -A`
-(agent forwarding), which then pushes to hostB with N connections, so data
-flows A → B directly. Matching helpers are installed automatically on both
-hosts. HostA must be able to ssh to hostB (with your forwarded agent, or its
-own keys). Progress and `-v` output are streamed back. If hostA can't reach
-hostB, `--relay` keeps the orchestrator here and routes every byte A → you → B
-— always works, at half the bandwidth.
-`syq hostA:src hostA:dst` (same host and user on both ends) simply runs a
+`syq rsync hostA:src hostB:dst` starts the orchestrator *on hostA*, which then pushes
+to hostB with N connections, so data flows A → B directly. Matching helpers
+are installed automatically on both hosts. Progress and `-v` output are
+streamed back. If hostA can't reach hostB, `--relay` keeps the orchestrator
+here and routes every byte A → you → B — always works, at half the bandwidth.
+`syq rsync hostA:src hostA:dst` (same host and user on both ends) simply runs a
 local copy on hostA and disables agent forwarding.
 
-Agent forwarding does not copy private keys to hostA, but a process that can
-access the forwarded socket while the SSH connection is alive can ask the
-agent to authenticate on its behalf. Pass `--no-forward-agent` to use `ssh -a`
-and override any `ForwardAgent yes` in SSH configuration; hostA must then have
-its own credentials for hostB. With an explicit `-e/--rsh`, SYQ adds neither
-`-A` nor `-a`, so include the desired agent-forwarding policy in that command;
-`--no-forward-agent` therefore conflicts with `-e`. `--relay` also avoids
-exposing the agent to hostA, at the cost of routing the file data through this
-machine.
+With implicit OpenSSH, the default combines a pre-enrolled forced receiver on
+hostB with a temporary local agent broker. The first transfer to a destination
+parent generates an Ed25519 enrollment key locally, uploads the exact running
+syq as `~/.local/libexec/syq-receiver` on hostB, and appends one managed
+`restrict,command=...` line to hostB's `authorized_keys`. The private enrollment
+key stays under `~/.local/state/syq/restricted/` on the local machine and is
+never copied to hostA. HostB keeps only its forced public key, SSHSIG verifier
+policy, and replay state under `~/.local/share/syq/restricted/`. Before
+publishing the forced key, syq verifies that the installed receiver is a
+regular executable and that it and every path ancestor are trusted-owner- or
+root-owned, non-writable by other users, and free of non-owner ACL grants.
 
-Like rsync, SYQ leaves host-key checking to `ssh` and therefore inherits the
-user's SSH configuration and OpenSSH defaults. First contact therefore fails
-when `ssh` cannot interactively confirm an unknown host. If accepting and
-recording a new host key is appropriate, opt in explicitly with
-`-e 'ssh -o StrictHostKeyChecking=accept-new'`.
+Enrollment first tries local→hostB directly. If that network path is
+unavailable, it retries through hostA with OpenSSH `ProxyJump`; hostA gets only
+`ssh -W` byte forwarding and cannot see the encrypted hostB session, an agent
+socket, or the enrollment key. The destination parent must already exist.
+Enrollment is durable, is reused for later destination leaves sharing that
+parent, and is reported as an intentional remote state change. The local
+OpenSSH client has ordinary command authority on hostB during this initial
+installation, whether the connection is direct or tunneled through hostA. That
+one setup session is the bootstrap trust boundary; later transfers use only the
+forced key. Syq generates the special key automatically, and its
+`syq-enrollment:ID` marker makes the managed `authorized_keys` line
+recognizable to users, administrators, and monitoring tools.
 
-Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
-launched it: syq starts it on hostA, returns, and writes progress to a log on
-hostA. Reattach with `syq --follow hostA:LOG` to stream that progress.
+For each transfer, the local machine signs a typed request naming the exact
+destination, login, copy semantics, hash block size, TCP port range, limits,
+validity interval, and a fresh one-time nonce. The temporary broker advertises
+only that enrollment key to hostA and releases its signature only after
+validating this path:
+
+```text
+trusted hostA session -> configured-user@trusted-hostB session
+```
+
+The broker verifies OpenSSH session-bind signatures for both hosts and strictly checks
+the final host-bound authentication request's session ID, destination login
+user, host key, selected credential, and signature algorithm. Key addition,
+removal, raw or legacy signing, unknown extensions, and extra forwarding hops
+are refused. The A → B client is forced to use host-bound public-key
+authentication. The forced receiver verifies and durably claims the signed
+request before starting syq's protocol. Every destination scan, stat, hash,
+sidecar operation, metadata change, write, and deletion is rewritten onto the
+enrolled root descriptor. Descendant symlinks are payload, never traversal.
+HostA cannot replace that guard, widen the destination, add an unsigned
+preservation option, exceed signed entry/byte/deletion/connection limits, or
+replay the request. Source-permission preservation and ordinary non-`-p`
+creation/restoration use distinct protocol flags and signed policy. For
+non-`-p` requests, existing objects retain the mode observed on hostB; new
+objects accept only ordinary permission bits masked by hostB's umask. HostA
+cannot supply special bits or turn this path into chmod authority over existing
+objects. A new directory does retain a setgid bit inherited from its destination
+parent by hostB's kernel; that bit is read from the newly created inode and is
+not accepted from HostA's mode proposal. Preserved modes are bound to the
+receiver-observed inode fingerprint; atomic publication fails if that object
+changes instead of carrying its mode onto a replacement. Hash requests must use
+the signed block size, and the receiver rejects any request whose hash vector
+could exceed the protocol frame
+limit.
+Encrypted token-authenticated TCP workers inherit the same authority. The
+receiver permits one encrypted listener in the signed port range and closes it
+when the forced control session ends or the grant expires; after redemption
+there is no second SSH authentication or silent SSH fallback.
+
+This preferred path gives hostA neither a credential nor an ambient-agent
+capability. The local ambient agent—including a YubiKey—is used for the
+local→hostA login and ordinary enrollment SSH sessions, but hostA never gets
+access to it.
+
+The restriction protects hostB; it does not make hostA a trustworthy source.
+A compromised hostA can omit source files, alter their contents, lie about
+source metadata, or stop the transfer. It still cannot escape the signed
+destination scopes or independently authenticate to hostB with the enrollment
+key.
+
+The command-restricted path requires atomic staged publication and encrypted
+TCP data connections. `--inplace`, `--no-tcp`, `--tcp-plain`,
+`--tcp-congestion`, `--update`, `--existing`, `--ignore-existing`, native
+`--*-new`/`--*-existing`,
+`--ignore`/`--ignore-from`, `--files-from`, `--min-size`, a nonzero
+`--bwlimit`, `--syq-path`, and `--no-bootstrap` currently fail closed because
+the receiver cannot enforce those semantics independently of hostA.
+`--max-size` is enforced as a signed per-file limit, but is refused together
+with deletion because filtered source files could otherwise make hostA's
+deletion plan ambiguous. Explicit `-j` values above 64 are also refused; auto
+tuning may use up to that signed ceiling.
+
+`--dry-run` and `--verify-only` are cryptographically read-only: the signed
+grant marks them as such and the receiver rejects every mutation even if hostA
+sends one. They use an existing enrollment but do not install one; run
+`syq enroll` first when previewing or verifying a new destination.
+Destination-root symlinks are also refused in this mode; enroll the explicit
+referent so the signed pathname and opened root identify the same object.
+
+One conservative rsync-shaped edge fails safely: for a named recursive source
+such as `hostA:dir` and a destination path whose existence changes rsync's
+placement meaning, the grant authorizes the existing-directory interpretation.
+If that destination does not exist, creation of children at the alternate
+exact-path interpretation is denied. Use a trailing slash (`hostA:dir/`), the
+native `--as`/`--into` placement spelling, or create the destination directory
+first when that distinction matters.
+
+Use `syq enroll [USER@]HOST:DEST [--via [USER@]HOST]` to pre-enroll,
+`syq enrollments` to list local enrollments, and `syq revoke ID [--via ...]` to
+remove the forced key and both sides' per-enrollment state. Before changing
+hostB, syq durably records a pending enrollment and its private key locally. If
+the installation response is lost, the next enrollment of the same endpoint
+and destination retries the same ID safely; `syq enrollments` labels that state
+`pending`, and `syq revoke` can remove either pending or active state. Running
+`syq enroll` again for an active destination also refreshes the installed
+receiver to the exact local syq binary. Revocation leaves that shared binary
+because other enrollments may use it. It prevents new receiver sessions. A
+session that already claimed its signed request can finish an operation already
+in progress; later protocol requests are rejected once the signed execution
+deadline expires rather than forcibly interrupting a filesystem syscall.
+
+`--agent-broker-only` explicitly selects the authentication-only compromise.
+It installs no receiver. HostA may list a sanitized snapshot of the ambient
+agent's supported public identities with comments removed, but the broker signs
+only for the exact hostA→user@hostB path above. Key changes, raw or legacy
+signing, unknown extensions, and extra hops are refused; successful ambient
+signatures are verified before release.
+
+In broker-only mode, use OpenSSH 10.5 or newer for the ambient agent if relying
+on its existing per-key destination constraints as an additional layer.
+OpenSSH 10.5 fixed an
+interaction in which a locked agent refused session-bind requests, allowing
+operations intended to be local—including use of destination-restricted
+keys—to occur remotely ([OpenSSH 10.5 release notes](https://www.openssh.com/txt/release-10.5);
+CVE-2026-73281). Syq cannot query an agent's version and does not count that
+extra layer as part of its own mandatory path restriction.
+
+In broker-only mode, private keys remain in the original agent, so
+hardware-backed, PIV/OpenPGP-agent, and desktop-agent identities continue to handle their own
+touch/PIN/approval behavior. For a user certificate selected by hostB's local
+`CertificateFile`, syq exposes only that exact certificate in place of its
+matching raw agent identity, validates the exact certificate-bearing host-bound
+request, and translates only the agent request's outer credential back to the
+matching raw key. This supports the common arrangement where a YubiKey or other
+agent lists the private key while a centrally managed certificate is a local
+file. When no `CertificateFile` is explicitly configured, syq also follows
+OpenSSH's implicit `<IdentityFile>-cert.pub` convention. An OpenSSH agent may
+itself reject certificate translation when the raw key has
+`ssh-add -h` destination constraints but the certificate was not associated
+with the agent; that combination fails closed. Loading the certificate into the
+agent avoids translation. The broker socket and every open channel are closed
+when the attached transfer ends; SIGINT and SIGTERM also remove its private
+socket directory. Stalled broker and ambient-agent operations
+time out after two minutes, long enough for ordinary hardware-token approval
+while preventing idle clients from holding worker slots indefinitely.
+
+Broker-only mode restricts *where and as whom* hostA may authenticate; stock
+OpenSSH does not bind the subsequent command. A compromised hostA still receives the
+authority of that destination account for the transfer's lifetime. Command or
+filesystem restrictions require destination-side policy such as a forced syq
+receiver. This is not a signed grant: it adds no timestamp, expiry, or replay
+cache beyond the live SSH sessions and the broker socket's lifetime.
+
+The constrained path requires OpenSSH 8.9 or newer session-bind and host-bound
+authentication support on the local machine, hostA, and hostB; a local
+`SSH_AUTH_SOCK`; and exact plain host keys for both hosts in the effective local
+`known_hosts` files. Host-certificate/CA-only trust is refused until syq can
+validate certificate principals and validity as strictly as OpenSSH. Static
+`HostKeyAlgorithms` and `RequiredRSASize` policy is enforced. A configured
+`KnownHostsCommand` or `RevokedHostKeys` KRL is refused because the broker does
+not yet reproduce those dynamic or external revocation checks. Local
+`CertificateFile` and implicit `IdentityFile` certificate expansion supports the
+ordinary OpenSSH percent tokens except `%C`; named-user tildes are also refused
+rather than guessed. Credential and host-key algorithms that syq's SSH library
+cannot cryptographically verify are removed or refused rather than failing only
+after a signing request. OpenSSH's `ssh -G` output does not preserve quoting for
+custom known-hosts filenames. Syq uses OpenSSH's debug provenance to inspect the
+configuration files OpenSSH actually read for the host. It accepts the compiled
+default list only when none of those files contains the corresponding
+known-hosts directive; an explicitly configured value that renders exactly like
+the defaults is still treated as configured. Otherwise syq accepts one absolute
+whitespace-free configured file per
+`UserKnownHostsFile`/`GlobalKnownHostsFile` directive. Ambiguous custom
+multi-file or whitespace-containing values fail closed.
+
+The local configuration resolves hostB's login user, network hostname, port,
+and host-key algorithms, and syq passes those values explicitly to hostA. The
+inner client reads no hostA SSH configuration, disables all identity and
+certificate files and PKCS#11 providers, and permits only public-key
+authentication through its forwarded `SSH_AUTH_SOCK`. Its ordinary
+`known_hosts` lookup is disabled because the broker independently validates
+the session-bound host key against the stricter local policy before releasing
+a signature. Thus hostA's `IdentityFile`, `CertificateFile`, `IdentityAgent`,
+`IdentitiesOnly`, proxy, and multiplexing configuration cannot accidentally
+bypass the broker. This does not revoke unrelated credentials that an already
+privileged hostA possessed before syq; the preferred threat model is precisely
+that hostA has no independent hostB credential. Connection
+multiplexing is disabled for the outer session
+so a pre-existing master cannot substitute another forwarded agent. Configured
+port forwards, X11 and GSS credential delegation, PTY allocation, and
+`LocalCommand` are also disabled on that session.
+
+Session binding identifies a host by its host key, not by a DNS name or network
+address. The configured name chooses the locally trusted key set, but an
+endpoint that shares hostB's private host key is intentionally equivalent to
+hostB for this broker. Deployments requiring distinct host identities must not
+reuse host private keys between them.
+
+Pass `--no-forward-agent` to give hostA no agent at all; hostA must then have
+its own credentials for hostB, and its own `IdentityAgent` configuration is
+left intact. `--unrestricted-agent-forwarding` is a
+conspicuous compatibility escape hatch that exposes the complete ambient agent
+to hostA for the attached transfer without imposing the constrained path's
+host-bound authentication requirement. With an explicit `-e/--rsh`, syq
+creates no broker and adds neither `-A` nor `-a`, so that command is the
+complete agent policy; `--no-forward-agent`, `--agent-broker-only`, and the
+unrestricted escape hatch therefore conflict with `-e`. `--relay` also avoids exposing authentication to
+hostA, at the cost of routing file data through this machine.
+
+SYQ uses the user's SSH configuration to resolve the login user, host-key name,
+port, static known-hosts files, host-key algorithms, RSA size, and configured or
+implicit user certificates. The default constrained broker requires already
+recorded exact keys for hostA and hostB before connecting; it never learns a key
+through hostA or silently accepts one. Dynamic `KnownHostsCommand`, external
+`RevokedHostKeys`, and host-certificate trust are currently refused as described
+above. If first-contact trust is appropriate, establish it with ordinary SSH
+(directly or through the configured jump path) before starting the transfer.
+An explicit `-e 'ssh -o StrictHostKeyChecking=accept-new'` bypasses the broker
+and leaves that policy to the supplied command.
+
+Add `--detach --no-forward-agent` to let a remote-to-remote transfer outlive
+the ssh session that launched it: syq starts it on hostA, returns, and writes
+progress to a log on hostA. HostA needs its own hostB credential because a
+temporary local broker cannot survive detachment. An explicit `--rsh` may
+provide another persistent authentication policy. Reattach with
+`syq --follow hostA:LOG` to stream that progress.
 An explicit `--checkpoint` path belongs to the machine running the
 orchestrator: normally the invoking machine, but hostA for a direct or detached
 remote-to-remote copy (`--relay` keeps it local).
@@ -259,13 +546,13 @@ remote-to-remote copy (`--relay` keeps it local).
 
 Identical to rsync:
 
-- `syq -a src dest` copies the directory itself → `dest/src`. `dest` is
+- `syq rsync -a src dest` copies the directory itself → `dest/src`. `dest` is
   created if missing.
 - An existing non-directory `dest` cannot be the parent of that `dest/src`
   mapping; dry-run rejects it instead of presenting an impossible summary.
   With `--existing`, both dry-run and the real command skip the whole mapping
   as a no-op because creating `dest/src` is outside the selected scope.
-- `syq -a src/ dest` copies the *contents* of `src` into `dest`. `src/.` and
+- `syq rsync -a src/ dest` copies the *contents* of `src` into `dest`. `src/.` and
   `.` behave the same way.
 - A single file source goes to `dest/file` if `dest` is an existing directory,
   otherwise `dest` is the new filename.
@@ -465,7 +752,7 @@ Only when repeated destination metadata lookups are themselves too expensive
 should you opt in to a checkpoint:
 
 ```sh
-syq -a --checkpoint ./copy.state huge-tree/ host:huge-tree/
+syq rsync -a --checkpoint ./copy.state huge-tree/ host:huge-tree/
 # after an interruption, run the identical command again
 ```
 
@@ -737,7 +1024,7 @@ or start transfer workers, and verbosity does not change dry-run's success or
 failure. The reported route is therefore a plan for a real transfer, not a
 claim that a worker data connection was completed.
 
-Remote→remote (`syq hostA:src hostB:dst`) works the same way: the orchestrator
+Remote→remote (`syq rsync hostA:src hostB:dst`) works the same way: the orchestrator
 on hostA connects to hostB's listener. Diagnostics are relative to that active
 orchestrator: the existing status message identifies hostA, and the detailed
 remote block describes hostB. If both paths are on hostA, `-vv` reports a local
@@ -765,11 +1052,11 @@ both are applied in command-line order with gitignore semantics (last match
 wins, `!` re-includes), so anything you'd write in a `.gitignore` works here:
 
 ```sh
-syq -a -i node_modules -i .git src/ host:dst/   # a name matches at any depth
-syq -a -i '*.o' -i /build src/ host:dst/         # glob; leading / anchors to the root
-syq -a -i 'logs/*' -i '!logs/keep/' src/ dst/    # everything in logs/ except keep/
-syq -a --ignore-from .gitignore -i '!dist/' repo/ host:repo/
-syq -a -i '*' -i '!*/' -i '!*.jpg' photos/ bak/  # copy only *.jpg
+syq rsync -a -i node_modules -i .git src/ host:dst/   # a name matches at any depth
+syq rsync -a -i '*.o' -i /build src/ host:dst/         # glob; leading / anchors to the root
+syq rsync -a -i 'logs/*' -i '!logs/keep/' src/ dst/    # everything in logs/ except keep/
+syq rsync -a --ignore-from .gitignore -i '!dist/' repo/ host:repo/
+syq rsync -a -i '*' -i '!*/' -i '!*.jpg' photos/ bak/  # copy only *.jpg
 ```
 
 Rules of thumb (they're git's): `foo` matches a file or directory named `foo`
@@ -789,11 +1076,11 @@ nothing to act on. Ignore the siblings instead (`logs/*`, which does not cross
 
 ## Deleting extras (`--delete`)
 
-`syq -a --delete src/ host:dst/` makes `dst` look like `src`: after the
+`syq rsync -a --delete src/ host:dst/` makes `dst` look like `src`: after the
 transfer, anything under a destination directory that the source doesn't
 have is removed. The rules are simpler than rsync's, deliberately:
 
-- **Scope.** Only inside directories the sources map onto: `syq --delete a b
+- **Scope.** Only inside directories the sources map onto: `syq rsync --delete a b
   dst/` cleans `dst/a` and `dst/b`, never `dst/c`. A single-file source deletes
   nothing.
 - **Ignored means out of scope, on both sides.** The `-i` patterns are applied
@@ -870,7 +1157,7 @@ the same command would transfer and nothing else.
 
 ## Copying a list (`--files-from`)
 
-`syq -a --files-from list.txt host:src/ dst/` copies only the paths named in
+`syq rsync -a --files-from list.txt host:src/ dst/` copies only the paths named in
 `list.txt`, one per line (`--from0`: NUL-separated; `-` reads stdin), each
 relative to the single source directory, to the same relative path under the
 destination. The source is not walked, which is the point on a slow
@@ -893,7 +1180,7 @@ it needs `--relay` (the list is read on this machine).
 
 ## Parallel removal (`--rm`)
 
-`syq --rm [-j N] [-n] [-v] PATH...` removes trees the way syq copies them:
+`syq rsync --rm [-j N] [-n] [-v] PATH...` removes trees the way syq copies them:
 a parallel scan, files unlinked in batches across N workers, directories
 removed deepest-first with each level in parallel. Symlinks are removed, not
 followed. If a scanned non-directory is replaced by a directory before its
@@ -918,7 +1205,7 @@ exception described above.
 
 ## NFS
 
-Local↔NFS copies are a local→local syq run (`syq -a -j16 /raid/x /mnt/nfs/x`)
+Local↔NFS copies are a local→local syq run (`syq rsync -a -j16 /raid/x /mnt/nfs/x`)
 and benefit from the same parallelism: measured on a 20 Gbit NFSv4.2 mount,
 reads of one 4 GB file 858 MiB/s with `-j8` vs ~400 MB/s for `cp`; 20,000
 small files written in 28 s vs 72 s for `cp -r`. Writes of a *single* file
@@ -944,11 +1231,13 @@ fix for that.
   unauthenticated clients; see [Server performance tuning](SERVER-TUNING.md).
   Auto-tuning starts at 16 for TCP data, or 8 for ssh data, and only opens more
   once they have been shown to pay.
-- Direct remote→remote with a *forwarded* agent authenticates every session
-  through your machine; over a slow link that dominates setup time. Keys on the
-  source host avoid it.
+- Preferred direct remote→remote uses one enrollment-key authentication for the
+  hostB control connection, then encrypted token-authenticated TCP workers.
+  `--agent-broker-only` instead authenticates every hostB SSH connection
+  through your ambient agent; over a slow link or with a confirming hardware
+  key, those round trips can dominate setup time.
 - Measured on two 160-core hosts on a 20 Gbit LAN: a single ssh stream tops out
-  around 450–550 MB/s; `syq -j8` into tmpfs reached ~1.2–1.3 GiB/s (the raw
+  around 450–550 MB/s; `syq rsync -j8` into tmpfs reached ~1.2–1.3 GiB/s (the raw
   multi-stream ssh ceiling), while writes to the destination's ext4 NVMe capped
   everything, rsync included, at ~600 MB/s. Check the disk before blaming the
   network.
