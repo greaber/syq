@@ -7,12 +7,12 @@
 //! `O_DIRECTORY | O_NOFOLLOW`; leaf operations are performed relative to a
 //! held parent descriptor. There is no pathname fallback.
 //!
-//! Native guarded placements use these operations for every descendant
-//! mutation; the unrestricted rsync-shaped implementation remains separate.
-//! Existing roots, regular-file I/O, leaf creation/replacement, metadata, and
-//! non-recursive unlink/rmdir are supported. Recursive removal and missing-root
-//! creation stay outside this layer. Roots and directory components must be
-//! openable with `O_RDONLY | O_DIRECTORY`.
+//! Native guarded placements and signed receivers use these operations for
+//! descendant mutation and inspection; the unrestricted implementation remains
+//! separate. Existing roots, directory scans, regular-file I/O, leaf
+//! creation/replacement, metadata, and non-recursive unlink/rmdir are supported.
+//! Recursive removal and missing-root creation stay outside this layer. Roots
+//! and directory components must be openable with `O_RDONLY | O_DIRECTORY`.
 //!
 //! Linux currently uses the same component walk as other Unix platforms. An
 //! `openat2` fast path should be added only with tests proving that it has
@@ -70,6 +70,13 @@ pub(crate) struct RootMetadata {
     pub(crate) mode: u32,
     pub(crate) nlink: u64,
     pub(crate) len: u64,
+    pub(crate) mtime: i64,
+    pub(crate) mtime_nsec: u32,
+    pub(crate) ctime: i64,
+    pub(crate) ctime_nsec: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) rdev: u64,
 }
 
 impl RootMetadata {
@@ -303,12 +310,18 @@ impl Root {
     }
 
     pub(crate) fn metadata(&self, path: &RelativePath) -> Result<RootMetadata> {
+        if path.is_empty() {
+            return root_metadata_from_std(&self.directory.metadata()?);
+        }
         let parent = self.resolve_parent(path)?;
         metadata_at(parent.directory.as_raw_fd(), &parent.leaf)
             .with_context(|| format!("stat confined path {}", path.label()))
     }
 
     pub(crate) fn metadata_optional(&self, path: &RelativePath) -> Result<Option<RootMetadata>> {
+        if path.is_empty() {
+            return self.metadata(path).map(Some);
+        }
         let parent = self.resolve_parent(path)?;
         match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
             Ok(metadata) => Ok(Some(metadata)),
@@ -316,6 +329,76 @@ impl Root {
             Err(error) => {
                 Err(error).with_context(|| format!("stat confined path {}", path.label()))
             }
+        }
+    }
+
+    /// List raw names from an opened descendant directory. The fdopendir walk
+    /// owns a duplicate descriptor and never reconstructs a pathname.
+    pub(crate) fn read_directory(&self, path: &RelativePath) -> Result<Vec<Vec<u8>>> {
+        let directory = self.open_directory(path)?;
+        let duplicated = retry_fd(|| unsafe { libc::dup(directory.as_raw_fd()) })?;
+        let stream = unsafe { libc::fdopendir(duplicated) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            let _ = unsafe { libc::close(duplicated) };
+            return Err(error).context("open confined directory stream");
+        }
+        struct DirectoryStream(*mut libc::DIR);
+        impl Drop for DirectoryStream {
+            fn drop(&mut self) {
+                let _ = unsafe { libc::closedir(self.0) };
+            }
+        }
+        let stream = DirectoryStream(stream);
+        let mut names = Vec::new();
+        loop {
+            set_errno(0);
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                let errno = get_errno();
+                if errno != 0 {
+                    return Err(io::Error::from_raw_os_error(errno))
+                        .context("read confined directory");
+                }
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                names.push(name.to_vec());
+            }
+        }
+        Ok(names)
+    }
+
+    pub(crate) fn read_link(&self, path: &RelativePath) -> Result<Vec<u8>> {
+        let parent = self.resolve_parent(path)?;
+        let mut buffer = vec![0u8; 256];
+        loop {
+            let read = loop {
+                let result = unsafe {
+                    libc::readlinkat(
+                        parent.directory.as_raw_fd(),
+                        parent.leaf.as_ptr(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if result >= 0 {
+                    break result as usize;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error).context("read confined symlink");
+                }
+            };
+            if read < buffer.len() {
+                buffer.truncate(read);
+                return Ok(buffer);
+            }
+            if buffer.len() >= 1024 * 1024 {
+                bail!("confined symlink target exceeds size limit");
+            }
+            buffer.resize(buffer.len() * 2, 0);
         }
     }
 
@@ -615,6 +698,19 @@ fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
     }
 }
 
+fn retry_fd(mut operation: impl FnMut() -> libc::c_int) -> io::Result<libc::c_int> {
+    loop {
+        let descriptor = operation();
+        if descriptor >= 0 {
+            return Ok(descriptor);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     retry_zero(|| unsafe {
@@ -626,7 +722,91 @@ fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
         mode: stat_mode(&stat),
         nlink: stat_nlink(&stat),
         len: stat.st_size as u64,
+        mtime: stat_mtime(&stat),
+        mtime_nsec: stat_mtime_nsec(&stat),
+        ctime: stat_ctime(&stat),
+        ctime_nsec: stat_ctime_nsec(&stat),
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        rdev: stat_rdev(&stat),
     })
+}
+
+fn root_metadata_from_std(metadata: &std::fs::Metadata) -> Result<RootMetadata> {
+    Ok(RootMetadata {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        nlink: metadata.nlink(),
+        len: metadata.len(),
+        mtime: metadata.mtime(),
+        mtime_nsec: u32::try_from(metadata.mtime_nsec()).context("negative mtime nanoseconds")?,
+        ctime: metadata.ctime(),
+        ctime_nsec: u32::try_from(metadata.ctime_nsec()).context("negative ctime nanoseconds")?,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        rdev: metadata.rdev(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn stat_mtime(stat: &libc::stat) -> i64 {
+    stat.st_mtime
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_mtime(stat: &libc::stat) -> i64 {
+    stat.st_mtimespec.tv_sec
+}
+
+#[cfg(target_os = "linux")]
+fn stat_mtime_nsec(stat: &libc::stat) -> u32 {
+    stat.st_mtime_nsec as u32
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_mtime_nsec(stat: &libc::stat) -> u32 {
+    stat.st_mtimespec.tv_nsec as u32
+}
+
+#[cfg(target_os = "linux")]
+fn stat_ctime(stat: &libc::stat) -> i64 {
+    stat.st_ctime
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_ctime(stat: &libc::stat) -> i64 {
+    stat.st_ctimespec.tv_sec
+}
+
+#[cfg(target_os = "linux")]
+fn stat_ctime_nsec(stat: &libc::stat) -> u32 {
+    stat.st_ctime_nsec as u32
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_ctime_nsec(stat: &libc::stat) -> u32 {
+    stat.st_ctimespec.tv_nsec as u32
+}
+
+#[cfg(target_os = "linux")]
+fn set_errno(value: libc::c_int) {
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(target_os = "linux")]
+fn get_errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn set_errno(value: libc::c_int) {
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(target_os = "macos")]
+fn get_errno() -> libc::c_int {
+    unsafe { *libc::__error() }
 }
 
 #[cfg(target_os = "linux")]
@@ -652,6 +832,16 @@ fn stat_mode(stat: &libc::stat) -> u32 {
 #[cfg(target_os = "linux")]
 fn stat_nlink(stat: &libc::stat) -> u64 {
     stat.st_nlink
+}
+
+#[cfg(target_os = "linux")]
+fn stat_rdev(stat: &libc::stat) -> u64 {
+    stat.st_rdev
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_rdev(stat: &libc::stat) -> u64 {
+    stat.st_rdev as u64
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -76,34 +76,85 @@ fn source_setup_rsh(rsh: &[String], explicit_rsh: bool) -> Vec<String> {
     setup
 }
 
-fn destination_rsh<'a>(
-    explicit_rsh: Option<&'a str>,
+fn destination_rsh(
+    explicit_rsh: Option<&str>,
     same_host: bool,
     agent_forwarding: Option<&AgentForwarding>,
-) -> Option<&'a str> {
+    constrained_rsh: Option<&str>,
+) -> Option<String> {
     if same_host {
         return None;
     }
     if let Some(explicit) = explicit_rsh {
-        return Some(explicit);
+        return Some(explicit.to_owned());
     }
     match agent_forwarding {
         // A uses the broker to authenticate to B, but B must never receive it.
-        // Force the forwarded environment socket and its advertised identities;
-        // requiring host-bound authentication prevents A from omitting B's key.
-        Some(AgentForwarding::Constrained { .. }) => Some(
-            "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no -o PubkeyAuthentication=host-bound",
-        ),
+        // The generated command ignores A's SSH configuration and identity
+        // files, then uses only the forwarded socket with host-bound auth.
+        Some(AgentForwarding::Constrained { .. }) => constrained_rsh.map(str::to_owned),
         // The compatibility escape hatch still selects the forwarded ambient
         // agent, but does not require host-bound authentication from OpenSSH
         // versions that predate the constrained broker's 8.9 floor.
         Some(AgentForwarding::Unrestricted) => {
-            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no")
+            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no".into())
         }
         // With no forwarded agent, preserve hostA's own IdentityAgent and
         // authentication configuration while preventing another forwarding hop.
-        Some(AgentForwarding::Disabled) | None => Some("ssh -a"),
+        Some(AgentForwarding::Disabled) | None => Some("ssh -a".into()),
     }
+}
+
+fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
+    shell_words::join([
+        "ssh".to_owned(),
+        "-F".to_owned(),
+        "/dev/null".to_owned(),
+        "-a".to_owned(),
+        "-x".to_owned(),
+        "-k".to_owned(),
+        "-T".to_owned(),
+        "-o".to_owned(),
+        "IdentityAgent=SSH_AUTH_SOCK".to_owned(),
+        "-o".to_owned(),
+        "IdentitiesOnly=no".to_owned(),
+        "-o".to_owned(),
+        "IdentityFile=none".to_owned(),
+        "-o".to_owned(),
+        "CertificateFile=none".to_owned(),
+        "-o".to_owned(),
+        "PKCS11Provider=none".to_owned(),
+        "-o".to_owned(),
+        "PubkeyAuthentication=host-bound".to_owned(),
+        "-o".to_owned(),
+        "PreferredAuthentications=publickey".to_owned(),
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "ControlMaster=no".to_owned(),
+        "-o".to_owned(),
+        "ControlPath=none".to_owned(),
+        "-o".to_owned(),
+        "ClearAllForwardings=yes".to_owned(),
+        "-o".to_owned(),
+        "PermitLocalCommand=no".to_owned(),
+        "-o".to_owned(),
+        "ProxyJump=none".to_owned(),
+        "-o".to_owned(),
+        "ProxyCommand=none".to_owned(),
+        "-o".to_owned(),
+        "StrictHostKeyChecking=no".to_owned(),
+        "-o".to_owned(),
+        "UserKnownHostsFile=/dev/null".to_owned(),
+        "-o".to_owned(),
+        "GlobalKnownHostsFile=/dev/null".to_owned(),
+        "-o".to_owned(),
+        "UpdateHostKeys=no".to_owned(),
+        "-o".to_owned(),
+        format!("HostKeyAlgorithms={host_key_algorithms}"),
+        "-p".to_owned(),
+        port.to_string(),
+    ])
 }
 
 fn broker_connection_limit(connections_opt: Option<usize>, connections: usize) -> Result<usize> {
@@ -128,8 +179,13 @@ fn utf8_path(path: &[u8], role: &str) -> Result<String> {
     })
 }
 
-fn endpoint_arg(location: &Location, login_user: Option<&str>) -> String {
-    let host = location.host.as_deref().expect("remote endpoint");
+fn endpoint_arg(
+    location: &Location,
+    login_user: Option<&str>,
+    connection_host: Option<&str>,
+) -> String {
+    let host =
+        connection_host.unwrap_or_else(|| location.host.as_deref().expect("remote endpoint"));
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
@@ -165,6 +221,10 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
 
     let mut broker_guard = None;
     let mut destination_login_user = None;
+    let mut destination_connection_host = None;
+    let mut constrained_rsh = None;
+    let mut restricted_destination_path = None;
+    let mut restricted_grant = None;
     let default_ssh_agent_policy = if args.rsh.is_some() {
         None
     } else if same_host || args.no_forward_agent {
@@ -182,13 +242,48 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             &rsh[0],
             dst.user.as_deref(),
             dst.host.as_deref().unwrap(),
-            true,
+            args.agent_broker_only,
         )?;
         destination_login_user = Some(destination_policy.login_user.clone());
-        let broker = crate::agent_broker::ConstrainedAgentBroker::start(
-            crate::agent_broker::BrokerPolicy::new(source_policy, destination_policy),
-            broker_connection_limit(args.connections_opt, args.connections)?,
-        )?;
+        destination_connection_host = Some(destination_policy.connection_host().to_owned());
+        constrained_rsh = Some(constrained_destination_rsh(
+            destination_policy.port(),
+            &destination_policy.host_key_algorithms(),
+        ));
+        let prepared = (!args.agent_broker_only)
+            .then(|| {
+                crate::restricted::prepare_transfer(
+                    args,
+                    srcs,
+                    dst,
+                    &source_policy.login_user,
+                    &destination_policy.login_user,
+                    !args.dry_run,
+                )
+            })
+            .transpose()
+            .context(
+                "prepare command-restricted destination enrollment; use --agent-broker-only to explicitly request authentication-only confinement",
+            )?;
+        let policy = crate::agent_broker::BrokerPolicy::new(source_policy, destination_policy);
+        let limit = broker_connection_limit(args.connections_opt, args.connections)?;
+        let broker = if let Some(prepared) = prepared {
+            restricted_destination_path = Some(prepared.canonical_destination);
+            restricted_grant = Some(prepared.grant);
+            if !args.quiet {
+                eprintln!(
+                    "syq: using command-restricted destination enrollment {}",
+                    prepared.enrollment_id
+                );
+            }
+            crate::agent_broker::ConstrainedAgentBroker::start_with_private_key(
+                policy,
+                limit,
+                prepared.private_key,
+            )?
+        } else {
+            crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?
+        };
         let ambient = broker.ambient_socket().to_string_lossy().into_owned();
         let socket = broker.socket_path().to_string_lossy().into_owned();
         broker_guard = Some(broker);
@@ -208,6 +303,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
         syq_path: args.syq_path.clone(),
         auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
+        restricted_grant: None,
         helper_install: Default::default(),
         quiet: args.quiet,
         tcp: Default::default(),
@@ -315,6 +411,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.tcp_plain {
         remote.push("--tcp-plain".into());
     }
+    if let Some(grant) = &restricted_grant {
+        remote.push(format!("--restricted-grant={grant}"));
+    }
     remote.push(format!("--tcp-ports={}", args.tcp_ports));
     if args.progress_json && !args.quiet {
         remote.push("--progress-json".into());
@@ -335,13 +434,14 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         args.rsh.as_deref(),
         same_host,
         default_ssh_agent_policy.as_ref(),
+        constrained_rsh.as_deref(),
     ) {
         remote.push(if args.interface == Interface::Rsync {
             "-e".into()
         } else {
             "--rsh".into()
         });
-        remote.push(e.into());
+        remote.push(e);
     }
 
     if args.interface == Interface::Rsync {
@@ -349,7 +449,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         for source in srcs {
             remote.push(utf8_path(&source.path, "source path")?);
         }
-        let dst_path = utf8_path(&dst.path, "target path")?;
+        let dst_path = restricted_destination_path
+            .clone()
+            .unwrap_or(utf8_path(&dst.path, "target path")?);
         let dst_arg = if srcs[0].same_host(dst) {
             if dst.path.starts_with(b"/")
                 || dst.path == b"~"
@@ -362,9 +464,17 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
                 format!("./{dst_path}")
             }
         } else {
+            let host = destination_connection_host
+                .as_deref()
+                .unwrap_or_else(|| dst.host.as_deref().unwrap());
+            let host = if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_owned()
+            };
             match destination_login_user.as_deref().or(dst.user.as_deref()) {
-                Some(user) => format!("{user}@{}:{dst_path}", dst.host.as_ref().unwrap()),
-                None => format!("{}:{dst_path}", dst.host.as_ref().unwrap()),
+                Some(user) => format!("{user}@{host}:{dst_path}"),
+                None => format!("{host}:{dst_path}"),
             }
         };
         remote.push(dst_arg);
@@ -382,10 +492,18 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
         }
         if !srcs[0].same_host(dst) {
             remote.push("--to".into());
-            remote.push(endpoint_arg(dst, destination_login_user.as_deref()));
+            remote.push(endpoint_arg(
+                dst,
+                destination_login_user.as_deref(),
+                destination_connection_host.as_deref(),
+            ));
         }
         remote.push(native_placement_arg(args)?.into());
-        remote.push(utf8_path(&dst.path, "target path")?);
+        remote.push(
+            restricted_destination_path
+                .clone()
+                .unwrap_or(utf8_path(&dst.path, "target path")?),
+        );
     }
 
     if args.detach {
@@ -454,7 +572,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
             default_ssh_agent_policy.as_ref(),
         )
     };
-    if args.unrestricted_agent_forwarding && !args.quiet {
+    if args.unrestricted_agent_forwarding {
         eprintln!(
             "syq: warning: --unrestricted-agent-forwarding exposes every capability in your SSH agent to {src_host} for this transfer"
         );
@@ -688,25 +806,44 @@ mod tests {
             ambient: "/tmp/ambient-agent".into(),
             broker: "/tmp/syq-agent".into(),
         };
+        let hardened = constrained_destination_rsh(2222, "ssh-ed25519");
         assert_eq!(
-            destination_rsh(None, false, Some(&constrained)),
-            Some(
-                "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no -o PubkeyAuthentication=host-bound"
-            )
+            destination_rsh(None, false, Some(&constrained), Some(&hardened)),
+            Some(hardened.clone())
+        );
+        let hardened_words = shell_words::split(&hardened).unwrap();
+        for required in [
+            "/dev/null",
+            "IdentityAgent=SSH_AUTH_SOCK",
+            "IdentityFile=none",
+            "CertificateFile=none",
+            "PKCS11Provider=none",
+            "PubkeyAuthentication=host-bound",
+            "PreferredAuthentications=publickey",
+            "BatchMode=yes",
+            "ProxyJump=none",
+            "ProxyCommand=none",
+            "HostKeyAlgorithms=ssh-ed25519",
+            "2222",
+        ] {
+            assert!(hardened_words.iter().any(|word| word == required));
+        }
+        assert_eq!(
+            destination_rsh(None, false, Some(&AgentForwarding::Unrestricted), None),
+            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no".into())
         );
         assert_eq!(
-            destination_rsh(None, false, Some(&AgentForwarding::Unrestricted)),
-            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no")
+            destination_rsh(None, false, Some(&AgentForwarding::Disabled), None),
+            Some("ssh -a".into())
         );
         assert_eq!(
-            destination_rsh(None, false, Some(&AgentForwarding::Disabled)),
-            Some("ssh -a")
+            destination_rsh(Some("custom-rsh"), false, None, None),
+            Some("custom-rsh".into())
         );
         assert_eq!(
-            destination_rsh(Some("custom-rsh"), false, None),
-            Some("custom-rsh")
+            destination_rsh(None, true, Some(&constrained), Some(&hardened)),
+            None
         );
-        assert_eq!(destination_rsh(None, true, Some(&constrained)), None);
     }
 
     #[test]
@@ -714,6 +851,19 @@ mod tests {
         assert_eq!(broker_connection_limit(None, 8).unwrap(), 65);
         assert_eq!(broker_connection_limit(Some(128), 128).unwrap(), 129);
         assert!(broker_connection_limit(Some(usize::MAX), usize::MAX).is_err());
+    }
+
+    #[test]
+    fn resolved_destination_replaces_host_a_ssh_aliases() {
+        let destination = Location::parse("alias:/archive").unwrap();
+        assert_eq!(
+            endpoint_arg(&destination, Some("backup"), Some("vault.internal")),
+            "backup@vault.internal"
+        );
+        assert_eq!(
+            endpoint_arg(&destination, Some("backup"), Some("2001:db8::1")),
+            "backup@[2001:db8::1]"
+        );
     }
 
     #[test]

@@ -45,6 +45,7 @@ ssh-agent-lib = { version = "0.6", default-features = false }
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "p384", "p521", "rsa"] }
 tempfile = "3"
 signature = "2"
+signal-hook = "0.3.18"
 
 [profile.release]
 opt-level = 3

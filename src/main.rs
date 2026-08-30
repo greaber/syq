@@ -12,6 +12,7 @@ mod identity;
 mod progress;
 mod proto;
 mod remote_helper;
+mod restricted;
 mod rm;
 #[allow(dead_code)]
 mod rooted;
@@ -78,6 +79,43 @@ fn main() {
         }
         return;
     }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-install") {
+        if argv.len() != 2 {
+            eprintln!("syq: restricted installer takes no command-line arguments");
+            std::process::exit(2);
+        }
+        if let Err(error) = restricted::remote_install() {
+            eprintln!("syq restricted installer: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-revoke") {
+        if argv.len() != 2 {
+            eprintln!("syq: restricted revoker takes no command-line arguments");
+            std::process::exit(2);
+        }
+        if let Err(error) = restricted::remote_revoke() {
+            eprintln!("syq restricted revoker: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-receiver") {
+        let enrollment = argv
+            .get(2)
+            .and_then(|argument| argument.to_str())
+            .and_then(|argument| argument.strip_prefix("--enrollment="));
+        if argv.len() != 3 || enrollment.is_none() {
+            eprintln!("syq: restricted receiver requires exactly --enrollment=ID");
+            std::process::exit(2);
+        }
+        if let Err(error) = restricted::run_receiver(enrollment.unwrap()) {
+            eprintln!("syq restricted receiver: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Keep accepting the historical root spelling for managed helpers. A
     // compatibility wrapper whose public prefix is `syq rsync` naturally
     // turns its remote `--server` launch into `syq rsync --server`.
@@ -90,6 +128,15 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+    if let Some(result) = restricted::dispatch_management(&argv) {
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("syq: {error:#}");
+                std::process::exit(1);
+            }
+        }
     }
     let mut args = match cli::Args::parse_args() {
         Ok(a) => a,

@@ -7,16 +7,16 @@
 //! user. The broker never accepts key-management or opaque signing requests.
 
 use anyhow::{anyhow, bail, Context, Result};
-use signature::Verifier;
+use signature::{Signer, Verifier};
 use ssh_agent_lib::proto::extension::{MessageExtension, SessionBind};
 use ssh_agent_lib::proto::{Extension, Identity, PublicCredential, Request, Response, SignRequest};
 use ssh_agent_lib::ssh_encoding::{Decode, Encode};
 use ssh_agent_lib::ssh_key::{
     certificate::{CertType, Certificate},
     public::KeyData,
-    Algorithm, PublicKey,
+    Algorithm, PrivateKey, PublicKey,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -26,7 +26,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -42,9 +42,49 @@ const SSH_AGENT_FAILURE: &[u8] = &[5];
 const SSH_AGENT_SUCCESS: &[u8] = &[6];
 const SSH_AGENT_EXTENSION_FAILURE: &[u8] = &[28];
 
+static SIGNAL_CLEANUP_PATHS: OnceLock<Arc<Mutex<HashSet<PathBuf>>>> = OnceLock::new();
+static SIGNAL_CLEANUP_THREAD: OnceLock<()> = OnceLock::new();
+
+fn register_signal_cleanup(path: &Path) -> Result<()> {
+    let paths = SIGNAL_CLEANUP_PATHS
+        .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
+        .clone();
+    if SIGNAL_CLEANUP_THREAD.get().is_none() {
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+        ])
+        .context("register constrained-agent signal cleanup")?;
+        let cleanup_paths = paths.clone();
+        thread::Builder::new()
+            .name("syq-agent-signal-cleanup".into())
+            .spawn(move || {
+                if let Some(signal) = signals.forever().next() {
+                    let paths: Vec<_> = cleanup_paths.lock().unwrap().iter().cloned().collect();
+                    for path in paths {
+                        let _ = std::fs::remove_dir_all(path);
+                    }
+                    let _ = signal_hook::low_level::emulate_default_handler(signal);
+                }
+            })
+            .context("start constrained-agent signal cleanup")?;
+        let _ = SIGNAL_CLEANUP_THREAD.set(());
+    }
+    paths.lock().unwrap().insert(path.to_path_buf());
+    Ok(())
+}
+
+fn unregister_signal_cleanup(path: &Path) {
+    if let Some(paths) = SIGNAL_CLEANUP_PATHS.get() {
+        paths.lock().unwrap().remove(path);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HostPolicy {
     pub login_user: String,
+    connection_host: String,
+    port: u16,
     host_keys: Vec<KeyData>,
     known_hosts_name: String,
     host_key_algorithms: Vec<String>,
@@ -53,6 +93,18 @@ pub struct HostPolicy {
 }
 
 impl HostPolicy {
+    pub(crate) fn connection_host(&self) -> &str {
+        &self.connection_host
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) fn host_key_algorithms(&self) -> String {
+        self.host_key_algorithms.join(",")
+    }
+
     fn authorizes_binding(&self, binding: &SessionBind) -> bool {
         key_is_cryptographically_verifiable(&binding.host_key)
             && signature_algorithm_is_cryptographically_verifiable(&binding.signature.algorithm())
@@ -129,6 +181,8 @@ pub fn resolve_host_policy(
     };
     Ok(HostPolicy {
         login_user: config.user,
+        connection_host: config.hostname,
+        port: config.port,
         host_keys,
         known_hosts_name: config.lookup,
         host_key_algorithms: config.host_key_algorithms,
@@ -934,8 +988,43 @@ impl ConstrainedAgentBroker {
         Self::start_with_socket(ambient, policy, max_connections)
     }
 
+    /// Start a destination-bound broker which advertises and signs only with
+    /// one local private key. The ambient agent remains available solely for
+    /// authenticating the outer local-to-delegate SSH connection.
+    pub fn start_with_private_key(
+        policy: BrokerPolicy,
+        max_connections: usize,
+        private_key: PrivateKey,
+    ) -> Result<Self> {
+        if private_key.is_encrypted() || private_key.algorithm() != Algorithm::Ed25519 {
+            bail!("restricted transport credential must be an unencrypted Ed25519 key");
+        }
+        let ambient = std::env::var_os("SSH_AUTH_SOCK")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .context(
+                "SSH_AUTH_SOCK is not set; authenticating to the source host still needs the local SSH agent",
+            )?;
+        Self::start_with_backend(
+            ambient,
+            SigningBackend::Private(Arc::new(private_key)),
+            policy,
+            max_connections,
+        )
+    }
+
     fn start_with_socket(
         ambient_socket: PathBuf,
+        policy: BrokerPolicy,
+        max_connections: usize,
+    ) -> Result<Self> {
+        let backend = SigningBackend::Ambient(ambient_socket.clone());
+        Self::start_with_backend(ambient_socket, backend, policy, max_connections)
+    }
+
+    fn start_with_backend(
+        ambient_socket: PathBuf,
+        backend: SigningBackend,
         policy: BrokerPolicy,
         max_connections: usize,
     ) -> Result<Self> {
@@ -965,26 +1054,33 @@ impl ConstrainedAgentBroker {
             .with_context(|| format!("bind constrained agent at {}", socket_path.display()))?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        register_signal_cleanup(socket_dir.path())?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(ConnectionRegistry::default());
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_connections = Arc::clone(&connections);
-        let thread_ambient = ambient_socket.clone();
+        let backend = Arc::new(backend);
         let policy = Arc::new(policy);
         let listener_thread = thread::Builder::new()
             .name("syq-agent-listener".into())
             .spawn(move || {
                 accept_connections(
                     listener,
-                    thread_ambient,
+                    backend,
                     policy,
                     max_connections,
                     thread_shutdown,
                     thread_connections,
                 )
-            })
-            .context("start constrained-agent listener")?;
+            });
+        let listener_thread = match listener_thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                unregister_signal_cleanup(socket_dir.path());
+                return Err(error).context("start constrained-agent listener");
+            }
+        };
 
         Ok(Self {
             ambient_socket,
@@ -1030,12 +1126,13 @@ impl Drop for ConstrainedAgentBroker {
         if let Some(listener) = self.listener_thread.take() {
             let _ = listener.join();
         }
+        unregister_signal_cleanup(self._socket_dir.path());
     }
 }
 
 fn accept_connections(
     listener: UnixListener,
-    ambient_socket: PathBuf,
+    backend: Arc<SigningBackend>,
     policy: Arc<BrokerPolicy>,
     max_connections: usize,
     shutdown: Arc<AtomicBool>,
@@ -1053,7 +1150,7 @@ fn accept_connections(
                 let Ok(stream) = connections.track(stream) else {
                     continue;
                 };
-                let worker_ambient = ambient_socket.clone();
+                let worker_backend = Arc::clone(&backend);
                 let worker_policy = Arc::clone(&policy);
                 let worker_connections = Arc::clone(&connections);
                 match thread::Builder::new()
@@ -1061,7 +1158,7 @@ fn accept_connections(
                     .spawn(move || {
                         let _ = serve_client(
                             stream,
-                            &worker_ambient,
+                            &worker_backend,
                             &worker_policy,
                             worker_connections,
                         );
@@ -1242,7 +1339,7 @@ impl BindState {
 
 fn serve_client(
     mut downstream: TrackedStream,
-    ambient_socket: &Path,
+    backend: &SigningBackend,
     policy: &BrokerPolicy,
     connections: Arc<ConnectionRegistry>,
 ) -> Result<()> {
@@ -1255,15 +1352,8 @@ fn serve_client(
         };
         match message_id {
             11 if frame.len() == 1 && !state.bindings.is_empty() => {
-                let response = upstream_request(
-                    &mut upstream,
-                    ambient_socket,
-                    &connections,
-                    &state.bindings,
-                    &frame,
-                    UpstreamResponse::Identities,
-                )?;
-                let identities = decode_identities_response(&response)?;
+                let identities =
+                    backend.identities(&mut upstream, &connections, &state.bindings, &frame)?;
                 let identities =
                     sanitize_identities(identities, &policy.destination.user_certificates);
                 let response = encode_identities_response(&identities.advertised)?;
@@ -1286,18 +1376,13 @@ fn serve_client(
                     write_frame(&mut downstream, SSH_AGENT_FAILURE)?;
                     break;
                 }
-                let upstream_frame = translated_sign_request(
+                let response = backend.sign(
+                    &mut upstream,
+                    &connections,
+                    &state.bindings,
                     &request,
                     &identities.ambient,
                     &policy.destination.user_certificates,
-                )?;
-                let response = upstream_request(
-                    &mut upstream,
-                    ambient_socket,
-                    &connections,
-                    &state.bindings,
-                    &upstream_frame,
-                    UpstreamResponse::Signature,
                 )?;
                 if verify_agent_sign_response(
                     &response,
@@ -1315,14 +1400,16 @@ fn serve_client(
                 let binding = parse_session_bind(&frame);
                 match binding.and_then(|binding| {
                     state.add(policy, binding)?;
-                    if let Some(stream) = upstream.as_mut() {
-                        replay_session_bind(
-                            stream,
-                            state
-                                .bindings
-                                .last()
-                                .context("missing validated session-bind")?,
-                        )?;
+                    if matches!(backend, SigningBackend::Ambient(_)) {
+                        if let Some(stream) = upstream.as_mut() {
+                            replay_session_bind(
+                                stream,
+                                state
+                                    .bindings
+                                    .last()
+                                    .context("missing validated session-bind")?,
+                            )?;
+                        }
                     }
                     Ok(())
                 }) {
@@ -1379,6 +1466,76 @@ fn parse_session_bind(frame: &[u8]) -> Result<SessionBind> {
 enum UpstreamResponse {
     Identities,
     Signature,
+}
+
+enum SigningBackend {
+    Ambient(PathBuf),
+    Private(Arc<PrivateKey>),
+}
+
+impl SigningBackend {
+    fn identities(
+        &self,
+        upstream: &mut Option<TrackedStream>,
+        connections: &Arc<ConnectionRegistry>,
+        bindings: &[SessionBind],
+        request: &[u8],
+    ) -> Result<Vec<Identity>> {
+        match self {
+            Self::Ambient(socket) => {
+                let response = upstream_request(
+                    upstream,
+                    socket,
+                    connections,
+                    bindings,
+                    request,
+                    UpstreamResponse::Identities,
+                )?;
+                decode_identities_response(&response)
+            }
+            Self::Private(private) => Ok(vec![Identity {
+                credential: private.public_key().key_data().clone().into(),
+                comment: String::new(),
+            }]),
+        }
+    }
+
+    fn sign(
+        &self,
+        upstream: &mut Option<TrackedStream>,
+        connections: &Arc<ConnectionRegistry>,
+        bindings: &[SessionBind],
+        request: &SignRequest,
+        ambient_identities: &[Identity],
+        certificates: &[Certificate],
+    ) -> Result<Vec<u8>> {
+        match self {
+            Self::Ambient(socket) => {
+                let frame = translated_sign_request(request, ambient_identities, certificates)?;
+                upstream_request(
+                    upstream,
+                    socket,
+                    connections,
+                    bindings,
+                    &frame,
+                    UpstreamResponse::Signature,
+                )
+            }
+            Self::Private(private) => {
+                let expected = PublicCredential::Key(private.public_key().key_data().clone());
+                if request.flags != 0 || !credentials_equal_on_wire(&request.credential, &expected)
+                {
+                    bail!("sign request did not select the enrolled transport credential");
+                }
+                let signature = private
+                    .try_sign(&request.data)
+                    .context("sign destination authentication with transport credential")?;
+                let mut response = Vec::new();
+                Response::SignResponse(signature).encode(&mut response)?;
+                Ok(response)
+            }
+        }
+    }
 }
 
 fn upstream_request(
@@ -1757,6 +1914,8 @@ mod tests {
         let algorithm = key.algorithm().as_str().to_string();
         HostPolicy {
             login_user: user.into(),
+            connection_host: name.into(),
+            port: 22,
             host_keys: vec![key],
             known_hosts_name: name.into(),
             host_key_algorithms: vec![algorithm],
@@ -2444,6 +2603,46 @@ mod tests {
     }
 
     #[test]
+    fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
+        let temp = tempfile::tempdir().unwrap();
+        let known_hosts = temp.path().join("known_hosts");
+        let config = temp.path().join("ssh_config");
+        let ssh = temp.path().join("ssh");
+        let ssh_keygen = temp.path().join("ssh-keygen");
+        let (_, host_key) = key(54);
+        let public = PublicKey::new(host_key.clone(), "").to_openssh().unwrap();
+        std::fs::write(&known_hosts, format!("stable-vault {public}\n")).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "Host vault\n  User backup\n  HostName vault.internal\n  Port 2222\n  HostKeyAlias stable-vault\n  UserKnownHostsFile {}\n  GlobalKnownHostsFile none\n  HostKeyAlgorithms ssh-ed25519\n  IdentityFile none\n",
+                known_hosts.display()
+            ),
+        )
+        .unwrap();
+        let quoted_config = shell_words::quote(config.to_str().unwrap());
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = /dev/null ]; then exec ssh \"$@\"; fi\ndone\nexec ssh -F {quoted_config} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(&ssh_keygen, "#!/bin/sh\nexec ssh-keygen \"$@\"\n").unwrap();
+        for program in [&ssh, &ssh_keygen] {
+            std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let resolved = resolve_host_policy(ssh.to_str().unwrap(), None, "vault", false).unwrap();
+        assert_eq!(resolved.login_user, "backup");
+        assert_eq!(resolved.connection_host(), "vault.internal");
+        assert_eq!(resolved.port(), 2222);
+        assert_eq!(resolved.known_hosts_name, "stable-vault");
+        assert_eq!(resolved.host_keys, [host_key]);
+        assert!(resolved.user_certificates.is_empty());
+    }
+
+    #[test]
     fn signature_algorithm_and_flags_must_match_key_blob() {
         let mut rsa = Vec::new();
         b"ssh-rsa".as_slice().encode(&mut rsa).unwrap();
@@ -2887,5 +3086,85 @@ mod tests {
             tracked.stream.write_timeout().unwrap(),
             Some(BROKER_IO_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn private_backend_advertises_and_signs_only_the_transport_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let ambient_socket = temp.path().join("ambient.sock");
+        let _ambient = UnixListener::bind(&ambient_socket).unwrap();
+        let (source_private, source) = key(51);
+        let (destination_private, destination) = key(52);
+        let (transport, transport_public) = key(53);
+        let transport = PrivateKey::from(transport);
+        let broker = ConstrainedAgentBroker::start_with_backend(
+            ambient_socket,
+            SigningBackend::Private(Arc::new(transport)),
+            policy(source.clone(), destination.clone()),
+            TEST_BROKER_CONNECTIONS,
+        )
+        .unwrap();
+        let mut client = UnixStream::connect(broker.socket_path()).unwrap();
+
+        write_frame(
+            &mut client,
+            &bind_request(binding(
+                &source_private,
+                source.clone(),
+                b"source-private-backend",
+                true,
+            )),
+        )
+        .unwrap();
+        assert!(matches!(read_response(&mut client), Response::Success));
+        write_frame(&mut client, &[11]).unwrap();
+        let Response::IdentitiesAnswer(identities) = read_response(&mut client) else {
+            panic!("expected transport identity")
+        };
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].credential.key_data(), &transport_public);
+
+        write_frame(
+            &mut client,
+            &bind_request(binding(
+                &destination_private,
+                destination.clone(),
+                b"destination-private-backend",
+                false,
+            )),
+        )
+        .unwrap();
+        assert!(matches!(read_response(&mut client), Response::Success));
+        let request = sign_request(
+            b"destination-private-backend",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            transport_public.clone(),
+            &destination,
+        );
+        let data = request.data.clone();
+        write_frame(&mut client, &encode_request(Request::SignRequest(request))).unwrap();
+        let Response::SignResponse(signature) = read_response(&mut client) else {
+            panic!("expected transport signature")
+        };
+        transport_public.verify(&data, &signature).unwrap();
+
+        // OpenSSH must not be able to extend the already-authorized path after
+        // receiving a signature. A late bind is an extra forwarding hop.
+        write_frame(
+            &mut client,
+            &bind_request(binding(
+                &source_private,
+                source,
+                b"late-third-session",
+                true,
+            )),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_response(&mut client),
+            Response::ExtensionFailure
+        ));
+        assert_closed(&mut client);
     }
 }

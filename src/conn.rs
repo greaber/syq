@@ -358,6 +358,7 @@ impl Conn for RemoteConn {
             follow_root,
             ignore: ignore.to_vec(),
             report_ignored,
+            guard: None,
         })?;
         let mut saw_root = false;
         loop {
@@ -487,6 +488,10 @@ pub struct RemoteSpec {
     pub syq_path: Option<String>,
     /// Install and use the versioned helper rather than resolving `syq` on PATH.
     pub auto_helper: bool,
+    /// One-time signed authorization for a command-restricted receiver. It is
+    /// sent only on the SSH control connection; authenticated TCP workers are
+    /// children of that already-authorized receiver.
+    pub restricted_grant: Option<String>,
     /// Serializes a first-use install across control and worker clones.
     pub helper_install: std::sync::Arc<std::sync::Mutex<bool>>,
     /// `-q`: suppress the "falling back to ssh" notice.
@@ -652,7 +657,18 @@ impl RemoteSpec {
 
     fn connect_once(&self, compress: bool) -> Result<RemoteConn> {
         let mut cmd = self.ssh_command();
-        cmd.arg(self.program_command(&["--server".into()]));
+        let mut server_args = vec!["--server".into()];
+        if let Some(grant) = &self.restricted_grant {
+            server_args.push(format!("--restricted-grant={grant}"));
+        }
+        let remote_command = if self.restricted_grant.is_some() {
+            // This text is inspected by the forced receiver through
+            // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
+            format!("syq {}", shell_words::join(&server_args))
+        } else {
+            self.program_command(&server_args)
+        };
+        cmd.arg(remote_command);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -1413,6 +1429,14 @@ impl Endpoint {
                     match spec.connect_tcp(&info, compress) {
                         Ok(c) => return Ok(Box::new(c)),
                         Err(e) => {
+                            if spec.restricted_grant.is_some() {
+                                return Err(e).with_context(|| {
+                                    format!(
+                                        "{}: signed receiver TCP data connection failed; its one-time SSH grant cannot be replayed as a fallback",
+                                        spec.label()
+                                    )
+                                });
+                            }
                             let mut g = spec.tcp.lock().unwrap();
                             if let Some(i) = g.as_mut() {
                                 if !i.failed {
@@ -1425,6 +1449,12 @@ impl Endpoint {
                             }
                         }
                     }
+                }
+                if spec.restricted_grant.is_some() {
+                    bail!(
+                        "{}: signed receiver has no authorized TCP data connection",
+                        spec.label()
+                    );
                 }
                 Ok(Box::new(spec.connect(compress)?))
             }
@@ -1644,6 +1674,7 @@ mod tests {
             rsh: vec!["ssh".to_string()],
             syq_path: None,
             auto_helper: false,
+            restricted_grant: None,
             helper_install: Default::default(),
             quiet: false,
             tcp: Default::default(),

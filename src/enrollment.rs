@@ -1,16 +1,15 @@
 //! Restricted-receiver enrollment primitives.
 //!
-//! This module deliberately contains no user-facing installer yet.  It keeps
-//! the security-sensitive authorized-keys representation and the safe
-//! end-to-end SSH route independent from the receiver implementation so an
-//! installer cannot get ahead of the receiver's confinement boundary.
+//! This module keeps the security-sensitive authorized-keys representation
+//! and safe end-to-end SSH route independent from the user-facing lifecycle in
+//! `restricted`. The separation lets enrollment reuse these narrow primitives
+//! without making free-form shell commands part of the authorization model.
 //!
-//! Callers own the filesystem and private-key boundary that this byte-level
-//! foundation intentionally does not implement. Before exposing enrollment,
-//! a caller must generate a dedicated Ed25519 private key with a CSPRNG, store
-//! it in a trusted private directory with mode 0600, and replace
-//! `authorized_keys` atomically without following symlinks while preserving
-//! the target account's ownership and StrictModes-compatible permissions.
+//! The caller owns the filesystem and private-key boundary: it must generate a
+//! dedicated Ed25519 private key with a CSPRNG, store it in a trusted private
+//! directory with mode 0600, and replace `authorized_keys` atomically without
+//! following symlinks while preserving the target account's ownership and
+//! StrictModes-compatible permissions. `restricted` implements that contract.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
@@ -21,10 +20,19 @@ const ED25519_ALGORITHM: &str = "ssh-ed25519";
 const ED25519_KEY_BYTES: usize = 32;
 const COMMENT_PREFIX: &str = "syq-enrollment:";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnrollmentId(String);
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EnrollmentId(pub(crate) [u8; ENROLLMENT_ID_BYTES]);
 
 impl EnrollmentId {
+    #[cfg(test)]
+    pub(crate) fn test_v4(last: u8) -> Self {
+        let mut bytes = [0u8; ENROLLMENT_ID_BYTES];
+        bytes[6] = 0x40;
+        bytes[8] = 0x80;
+        bytes[15] = last;
+        Self(bytes)
+    }
+
     pub fn parse(value: &str) -> Result<Self> {
         if value.len() != ENROLLMENT_ID_BYTES * 2
             || !value
@@ -36,15 +44,16 @@ impl EnrollmentId {
                 ENROLLMENT_ID_BYTES * 2
             );
         }
-        let bytes = (0..ENROLLMENT_ID_BYTES)
-            .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("lowercase hexadecimal enrollment ID");
+        let mut bytes = [0u8; ENROLLMENT_ID_BYTES];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .expect("lowercase hexadecimal enrollment ID");
+        }
         let version = bytes[6] >> 4;
         if bytes[8] & 0xc0 != 0x80 || !(1..=8).contains(&version) {
             bail!("enrollment ID must be an RFC 4122 UUID");
         }
-        Ok(Self(value.to_owned()))
+        Ok(Self(bytes))
     }
 
     pub fn random() -> Self {
@@ -53,20 +62,28 @@ impl EnrollmentId {
         // authorized_keys spelling stays compact lowercase hexadecimal.
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        let mut value = String::with_capacity(ENROLLMENT_ID_BYTES * 2);
-        for byte in bytes {
-            use std::fmt::Write as _;
-            write!(&mut value, "{byte:02x}").expect("write to String");
-        }
-        Self(value)
+        Self(bytes.try_into().expect("fixed enrollment ID length"))
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub(crate) fn validate(self) -> Result<()> {
+        let version = self.0[6] >> 4;
+        if self.0[8] & 0xc0 != 0x80 || !(1..=8).contains(&version) {
+            bail!("enrollment ID must be an RFC 4122 UUID");
+        }
+        Ok(())
     }
 
     fn marker(&self) -> String {
-        format!("{COMMENT_PREFIX}{}", self.0)
+        format!("{COMMENT_PREFIX}{self}")
+    }
+}
+
+impl std::fmt::Display for EnrollmentId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -137,10 +154,7 @@ pub struct AuthorizedKeyEntry {
 impl AuthorizedKeyEntry {
     pub fn new(id: EnrollmentId, receiver_path: &Path, key: &TransportPublicKey) -> Result<Self> {
         let receiver = safe_receiver_path(receiver_path)?;
-        let command = format!(
-            "{receiver} --restricted-receiver --enrollment={}",
-            id.as_str()
-        );
+        let command = format!("{receiver} --restricted-receiver --enrollment={}", id);
         let line = format!(
             "restrict,command=\"{command}\" {} {} {}",
             key.algorithm,
@@ -382,6 +396,14 @@ pub fn enrollment_ssh_args(
     route: EnrollmentRoute<'_>,
     remote_command: &EnrollmentRemoteCommand,
 ) -> Vec<String> {
+    enrollment_ssh_args_raw(target, route, remote_command.as_str())
+}
+
+pub(crate) fn enrollment_ssh_args_raw(
+    target: &SshEndpoint,
+    route: EnrollmentRoute<'_>,
+    remote_command: &str,
+) -> Vec<String> {
     let mut args = vec![
         "-a".to_owned(),
         "-x".to_owned(),
@@ -423,7 +445,7 @@ pub fn enrollment_ssh_args(
     }
     args.push("--".to_owned());
     args.push(target.as_str().to_owned());
-    args.push(remote_command.as_str().to_owned());
+    args.push(remote_command.to_owned());
     args
 }
 
@@ -451,8 +473,9 @@ mod tests {
     #[test]
     fn enrollment_ids_are_rfc_4122_uuids() {
         let generated = EnrollmentId::random();
-        assert_eq!(generated.as_str().as_bytes()[12], b'4');
-        assert!(matches!(generated.as_str().as_bytes()[16], b'8'..=b'9' | b'a'..=b'b'));
+        let generated = generated.to_string();
+        assert_eq!(generated.as_bytes()[12], b'4');
+        assert!(matches!(generated.as_bytes()[16], b'8'..=b'9' | b'a'..=b'b'));
         assert!(EnrollmentId::parse("00112233445566770899aabbccddeeff").is_err());
         assert!(EnrollmentId::parse("00112233445566774899aabbccddeeff").is_err());
     }

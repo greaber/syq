@@ -68,7 +68,10 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             host: h.clone(),
             rsh: parse_rsh(&args.rsh)?,
             syq_path: args.syq_path.clone(),
-            auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
+            auto_helper: args.restricted_grant.is_none()
+                && args.syq_path.is_none()
+                && !args.no_bootstrap,
+            restricted_grant: args.restricted_grant.clone(),
             helper_install: Default::default(),
             quiet: args.quiet,
             tcp: Default::default(),
@@ -88,7 +91,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
     }
 }
 
-fn parse_ports(s: &str) -> Result<(u16, u16)> {
+pub(crate) fn parse_ports(s: &str) -> Result<(u16, u16)> {
     let (a, b) = s.split_once('-').unwrap_or((s, s));
     let lo: u16 = a
         .trim()
@@ -354,6 +357,7 @@ fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::
     match ok(
         ctl.call(Request::Canonicalize {
             path: path.to_vec(),
+            guard: None,
         })?,
         "canonicalize",
     )? {
@@ -578,6 +582,13 @@ pub fn run(args: Args) -> Result<i32> {
         bail!("need at least one source and a destination");
     }
     let (dst, srcs) = locs.split_last().unwrap();
+    if args.restricted_grant.is_some()
+        && (args.no_tcp || args.tcp_plain || srcs[0].is_remote() || !dst.is_remote() || args.relay)
+    {
+        bail!(
+            "a signed receiver grant is valid only for a local-to-remote orchestrator using encrypted TCP data connections"
+        );
+    }
     for s in srcs {
         if !s.same_host(&srcs[0]) {
             bail!("all sources must be on the same host");
@@ -876,6 +887,16 @@ pub fn run(args: Args) -> Result<i32> {
         for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
             if let Endpoint::Remote(spec) = ep {
                 if let Err(e) = spec.setup_tcp(&mut **ctl, args.tcp_plain, ports) {
+                    if spec.restricted_grant.is_some() {
+                        sched.abort();
+                        progress.stop();
+                        return Err(e).with_context(|| {
+                            format!(
+                                "{}: a signed receiver uses its one SSH authorization for the control connection, so encrypted TCP data connections are required",
+                                spec.label()
+                            )
+                        });
+                    }
                     if !args.quiet || debug() {
                         eprintln!(
                             "syq: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}); a Tailscale address or an open port is faster",
@@ -1551,7 +1572,14 @@ fn stat_many(
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    match ok(conn.call(Request::StatMany { paths, follow })?, "stat")? {
+    match ok(
+        conn.call(Request::StatMany {
+            paths,
+            follow,
+            guard: None,
+        })?,
+        "stat",
+    )? {
         Response::Stats(v) => Ok(v),
         other => bail!("unexpected response {other:?}"),
     }
@@ -3914,6 +3942,7 @@ impl Planner<'_> {
                     .partial_id
                     .get()
                     .expect("partial identity initialized before planning"),
+                guard: None,
             })?,
             "compute sidecar paths",
         )? {
@@ -4334,6 +4363,7 @@ impl Worker {
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
                     partial_id: self.partial_id(),
+                    guard: None,
                 })?,
                 "probe partial",
             )? {
@@ -4628,6 +4658,7 @@ impl Worker {
                 partial_id: self.partial_id(),
                 block: self.opts.block,
                 len: job.entry.size,
+                guard: None,
             },
             "hash destination",
         )
@@ -4670,6 +4701,7 @@ impl Worker {
             partial_id: self.partial_id(),
             block,
             len: size,
+            guard: None,
         })?;
         self.dst.send(destination_request)?;
         // Both requests are in flight. Always consume both responses before
@@ -4878,6 +4910,7 @@ impl Worker {
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
                     partial_id: self.partial_id(),
+                    guard: None,
                 })?,
                 "probe partial after finalize",
             )? {
@@ -4900,9 +4933,11 @@ impl Worker {
     fn contents_match(&mut self, job: &FileJob) -> Result<bool> {
         self.src.send(Request::FileHash {
             path: job.src.clone(),
+            guard: None,
         })?;
         self.dst.send(Request::FileHash {
             path: job.dst.clone(),
+            guard: None,
         })?;
         let source = self.src.recv();
         let destination = self.dst.recv();
@@ -5000,9 +5035,11 @@ impl Worker {
         let r = (|| -> Result<bool> {
             self.src.send(Request::FileHash {
                 path: job.src.clone(),
+                guard: None,
             })?;
             self.dst.send(Request::FileHash {
                 path: job.dst.clone(),
+                guard: None,
             })?;
             // Keep both reusable connections aligned even if one endpoint
             // reports an ordinary per-file error.

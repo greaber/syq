@@ -22,6 +22,35 @@ const COMMON_NAME_MAX: usize = 255;
 const COMPACT_HASH_BYTES: usize = 10;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
+#[cfg(target_os = "linux")]
+const MODE_DIR: u32 = libc::S_IFDIR;
+#[cfg(not(target_os = "linux"))]
+const MODE_DIR: u32 = libc::S_IFDIR as u32;
+#[cfg(target_os = "linux")]
+const MODE_FILE: u32 = libc::S_IFREG;
+#[cfg(not(target_os = "linux"))]
+const MODE_FILE: u32 = libc::S_IFREG as u32;
+#[cfg(target_os = "linux")]
+const MODE_LINK: u32 = libc::S_IFLNK;
+#[cfg(not(target_os = "linux"))]
+const MODE_LINK: u32 = libc::S_IFLNK as u32;
+#[cfg(target_os = "linux")]
+const MODE_FIFO: u32 = libc::S_IFIFO;
+#[cfg(not(target_os = "linux"))]
+const MODE_FIFO: u32 = libc::S_IFIFO as u32;
+#[cfg(target_os = "linux")]
+const MODE_SOCKET: u32 = libc::S_IFSOCK;
+#[cfg(not(target_os = "linux"))]
+const MODE_SOCKET: u32 = libc::S_IFSOCK as u32;
+#[cfg(target_os = "linux")]
+const MODE_CHAR: u32 = libc::S_IFCHR;
+#[cfg(not(target_os = "linux"))]
+const MODE_CHAR: u32 = libc::S_IFCHR as u32;
+#[cfg(target_os = "linux")]
+const MODE_BLOCK: u32 = libc::S_IFBLK;
+#[cfg(not(target_os = "linux"))]
+const MODE_BLOCK: u32 = libc::S_IFBLK as u32;
+
 pub fn resolve(p: &[u8]) -> PathBuf {
     if p.is_empty() {
         return PathBuf::from(".");
@@ -161,7 +190,7 @@ pub fn partial_path(final_: &Path, partial_id: &PartialId) -> Result<PathBuf> {
     partial_path_with_name_max(final_, partial_id, name_max(parent))
 }
 
-fn partial_path_with_name_max(
+pub(crate) fn partial_path_with_name_max(
     final_: &Path,
     partial_id: &PartialId,
     component_limit: usize,
@@ -321,6 +350,45 @@ pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry 
     }
 }
 
+pub(crate) fn rooted_entry(
+    root: &Root,
+    relative: &RelativePath,
+    path: PathBytes,
+    metadata: RootMetadata,
+) -> Result<Entry> {
+    let kind = match metadata.file_type() {
+        MODE_DIR => Kind::Dir,
+        MODE_FILE => Kind::File,
+        MODE_LINK => Kind::Symlink,
+        MODE_FIFO => Kind::Fifo,
+        MODE_SOCKET => Kind::Socket,
+        MODE_CHAR => Kind::CharDev,
+        MODE_BLOCK => Kind::BlockDev,
+        _ => Kind::Other,
+    };
+    let link = if kind == Kind::Symlink {
+        Some(root.read_link(relative)?)
+    } else {
+        None
+    };
+    Ok(Entry {
+        path,
+        kind,
+        size: if kind == Kind::File { metadata.len } else { 0 },
+        mtime: metadata.mtime,
+        mtime_nsec: metadata.mtime_nsec,
+        mode: metadata.mode,
+        uid: metadata.uid,
+        gid: metadata.gid,
+        rdev: metadata.rdev,
+        dev: metadata.dev,
+        ino: metadata.ino,
+        ctime: metadata.ctime,
+        ctime_nsec: metadata.ctime_nsec,
+        link,
+    })
+}
+
 pub fn lstat_entry(rel: PathBytes, full: &Path) -> io::Result<Entry> {
     let md = fs::symlink_metadata(full)?;
     Ok(entry_from_meta(rel, full, &md))
@@ -457,7 +525,22 @@ impl FsOps {
 
     /// Batches are statted on several threads: on network filesystems each
     /// lstat is a round trip and the planner would otherwise starve the workers.
-    pub fn stat_many(&mut self, paths: &[PathBytes], follow: bool) -> Vec<Option<Entry>> {
+    pub fn stat_many(
+        &mut self,
+        paths: &[PathBytes],
+        follow: bool,
+        guard: Option<&ContainerGuard>,
+    ) -> Vec<Option<Entry>> {
+        if let Some(guard) = guard {
+            if follow {
+                return vec![None; paths.len()];
+            }
+            return parallel_map(paths, |path| {
+                let target = guarded_target(path, guard).ok()?;
+                let metadata = target.root.metadata(&target.relative).ok()?;
+                rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok()
+            });
+        }
         parallel_map(paths, |p| {
             let full = resolve(p);
             let md = if follow {
@@ -473,10 +556,19 @@ impl FsOps {
         &mut self,
         paths: &[PathBytes],
         partial_id: &PartialId,
+        guard: Option<&ContainerGuard>,
     ) -> Vec<std::result::Result<PathBytes, String>> {
         parallel_map(paths, |path| {
+            if let Some(guard) = guard {
+                guarded_target(path, guard).map_err(|error| format!("{error:#}"))?;
+            }
             let requested = Path::new(OsStr::from_bytes(path));
-            partial_path(&resolve(path), partial_id)
+            let resolved = if guard.is_some() {
+                partial_path_with_name_max(&resolve(path), partial_id, COMMON_NAME_MAX)
+            } else {
+                partial_path(&resolve(path), partial_id)
+            };
+            resolved
                 .map(|resolved| {
                     let name = resolved.file_name().expect("partial always has a name");
                     let parent = requested.parent().unwrap_or_else(|| Path::new(""));
@@ -1304,9 +1396,24 @@ fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<u64>>
 }
 
 impl FsOps {
-    pub fn probe_partial(&mut self, path: &[u8], partial_id: &PartialId) -> Result<Response> {
+    pub fn probe_partial(
+        &mut self,
+        path: &[u8],
+        partial_id: &PartialId,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Response> {
         let p = resolve(path);
         let pp = partial_path(&p, partial_id)?;
+        if let Some(guard) = guard {
+            let target = guarded_target(path, guard)?;
+            let relative = relative_under(&target.root_path, &pp)?;
+            let partial_size = target
+                .root
+                .metadata_optional(&relative)?
+                .filter(|metadata| is_safe_rooted_partial(*metadata))
+                .map(|metadata| metadata.len);
+            return Ok(Response::PartialSize(partial_size));
+        }
         let partial_size = match fs::symlink_metadata(&pp) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Ok(metadata) if is_safe_partial(&metadata) => Some(metadata.len()),
@@ -1869,6 +1976,7 @@ impl FsOps {
         partial_id: &PartialId,
         block: u64,
         len: u64,
+        guard: Option<&ContainerGuard>,
     ) -> Result<Vec<u64>> {
         let p = resolve(path);
         let p = if which == Which::Partial {
@@ -1876,6 +1984,19 @@ impl FsOps {
         } else {
             p
         };
+        if let Some(guard) = guard {
+            let target = guarded_target(path, guard)?;
+            let relative = relative_under(&target.root_path, &p)?;
+            let mut file = target.root.open_regular_read(&relative)?;
+            if which == Which::Partial && !is_safe_rooted_partial(target.root.metadata(&relative)?)
+            {
+                bail!(
+                    "partial {} is not a singly-linked regular file",
+                    p.display()
+                );
+            }
+            return hash_reader(&mut file, block, len);
+        }
         let mut f = open_existing_regular(&p, false)?;
         if which == Which::Partial {
             require_safe_partial(&f, &p)?;
@@ -2051,9 +2172,14 @@ impl FsOps {
         Ok(())
     }
 
-    pub fn file_hash(&mut self, path: &[u8]) -> Result<Response> {
+    pub fn file_hash(&mut self, path: &[u8], guard: Option<&ContainerGuard>) -> Result<Response> {
         let p = resolve(path);
-        let mut f = open_existing_regular(&p, false)?;
+        let mut f = if let Some(guard) = guard {
+            let target = guarded_target(path, guard)?;
+            target.root.open_regular_read(&target.relative)?
+        } else {
+            open_existing_regular(&p, false)?
+        };
         let mut h = Xxh3::new();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
@@ -2081,14 +2207,30 @@ impl FsOps {
             self.held_basis.take();
         }
         let r: Result<Response> = match req {
-            Request::StatMany { paths, follow } => {
-                Ok(Response::Stats(self.stat_many(paths, *follow)))
-            }
-            Request::PartialPaths { paths, partial_id } => {
-                Ok(Response::PathResults(self.partial_paths(paths, partial_id)))
-            }
+            Request::StatMany {
+                paths,
+                follow,
+                guard,
+            } => Ok(Response::Stats(self.stat_many(
+                paths,
+                *follow,
+                guard.as_ref(),
+            ))),
+            Request::PartialPaths {
+                paths,
+                partial_id,
+                guard,
+            } => Ok(Response::PathResults(self.partial_paths(
+                paths,
+                partial_id,
+                guard.as_ref(),
+            ))),
             Request::Apply { ops, guard } => Ok(Response::Applied(self.apply(ops, guard.as_ref()))),
-            Request::ProbePartial { path, partial_id } => self.probe_partial(path, partial_id),
+            Request::ProbePartial {
+                path,
+                partial_id,
+                guard,
+            } => self.probe_partial(path, partial_id, guard.as_ref()),
             Request::Prepare {
                 path,
                 size,
@@ -2166,8 +2308,9 @@ impl FsOps {
                 partial_id,
                 block,
                 len,
+                guard,
             } => self
-                .hash_blocks(path, *which, partial_id, *block, *len)
+                .hash_blocks(path, *which, partial_id, *block, *len, guard.as_ref())
                 .map(Response::Hashes),
             Request::ReadRange {
                 path,
@@ -2219,9 +2362,14 @@ impl FsOps {
                     },
                 )
                 .map(|_| Response::Ok),
-            Request::FileHash { path } => self.file_hash(path),
-            Request::Canonicalize { path } => {
-                Ok(Response::Path(path_bytes(&normalize(&resolve(path)))))
+            Request::FileHash { path, guard } => self.file_hash(path, guard.as_ref()),
+            Request::Canonicalize { path, guard } => {
+                if let Some(guard) = guard {
+                    guarded_target(path, guard)
+                        .map(|target| Response::Path(path_bytes(&target.label)))
+                } else {
+                    Ok(Response::Path(path_bytes(&normalize(&resolve(path)))))
+                }
             }
             Request::Hello { .. }
             | Request::Scan { .. }

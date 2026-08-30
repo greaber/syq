@@ -207,16 +207,19 @@ pub enum Request {
         follow_root: bool,
         ignore: Vec<String>,
         report_ignored: bool,
+        guard: Option<ContainerGuard>,
     },
     /// lstat each path; with `follow`, stat through symlinks instead.
     StatMany {
         paths: Vec<PathBytes>,
         follow: bool,
+        guard: Option<ContainerGuard>,
     },
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {
         paths: Vec<PathBytes>,
         partial_id: PartialId,
+        guard: Option<ContainerGuard>,
     },
     Apply {
         ops: Vec<Op>,
@@ -227,6 +230,7 @@ pub enum Request {
     ProbePartial {
         path: PathBytes,
         partial_id: PartialId,
+        guard: Option<ContainerGuard>,
     },
     /// Create/adjust the write target for `path` with the given final size.
     /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
@@ -284,6 +288,7 @@ pub enum Request {
         partial_id: PartialId,
         block: u64,
         len: u64,
+        guard: Option<ContainerGuard>,
     },
     ReadRange {
         path: PathBytes,
@@ -327,11 +332,13 @@ pub enum Request {
     },
     FileHash {
         path: PathBytes,
+        guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
     /// existing prefix resolved), for a stable job identity.
     Canonicalize {
         path: PathBytes,
+        guard: Option<ContainerGuard>,
     },
     /// Kernel TCP_INFO/TCP_CONNECTION_INFO for this end of a direct data
     /// socket. SSH data transports report None at the orchestrator instead of

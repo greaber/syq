@@ -1,9 +1,9 @@
-//! Experimental signed receiver authorization core.
+//! Signed receiver authorization core.
 //!
-//! Nothing in this module is reachable from the CLI or `--server`. In
-//! particular, successfully verifying and claiming a grant does not authorize
-//! a filesystem request. The future receiver entrypoint must integrate
-//! root-anchored path confinement before it may consume `VerifiedGrant`.
+//! The forced receiver verifies and claims a grant here, then converts the
+//! resulting `VerifiedGrant` into `restricted::RestrictedAuthority`. That
+//! separate type binds every protocol request to the enrolled filesystem root;
+//! verification by itself remains deliberately incapable of filesystem access.
 //!
 //! The wire representation deliberately signs a typed, canonical binary grant
 //! rather than a command line. The signature is an OpenSSH SSHSIG in the fixed
@@ -32,15 +32,11 @@
 //! extended ACL on trusted directories, verifier inputs, the verifier binary,
 //! and replay files; enrollment must therefore provision an ACL-free chain.
 
-// This module is intentionally unreachable until path confinement is ready.
-// Keep the complete core compiled in normal builds without pretending its
-// currently-private entry points are production dead code.
-#![allow(dead_code)]
-
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ssh_key::{HashAlg, LineEnding, PrivateKey};
 use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -79,27 +75,7 @@ const CLAIM_MAGIC: &[u8; 8] = b"SYQCLM\0\0";
 const CLAIM_VERSION: u16 = 1;
 const CLAIM_RECORD_LEN: usize = CLAIM_MAGIC.len() + 2 + 8 + 32 + 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct EnrollmentId([u8; 16]);
-
-impl EnrollmentId {
-    #[cfg(test)]
-    fn test_v4(last: u8) -> Self {
-        let mut bytes = [0u8; 16];
-        bytes[6] = 0x40;
-        bytes[8] = 0x80;
-        bytes[15] = last;
-        Self(bytes)
-    }
-
-    fn validate(self) -> Result<()> {
-        let version = self.0[6] >> 4;
-        if self.0[8] & 0xc0 != 0x80 || !(1..=8).contains(&version) {
-            bail!("enrollment ID is not an RFC 4122 UUID");
-        }
-        Ok(())
-    }
-}
+use crate::enrollment::EnrollmentId;
 
 /// A one-redemption nonce generated independently for every signed request.
 /// It is intentionally not constructible from `proto::PartialId`.
@@ -133,11 +109,20 @@ pub(crate) enum GrantOperationV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CopyOperationV1 {
     /// Canonically spelled absolute target path. This is only a signed name;
-    /// future authorization must resolve it beneath the enrolled root handle.
+    /// receiver authorization resolves it beneath the enrolled root handle.
     pub destination: Vec<u8>,
+    /// Exact receiver-side mutation roots derived locally from the source
+    /// spellings. A scope may authorize the named object alone or its subtree.
+    pub mutation_scopes: Vec<MutationScopeV1>,
     pub policy: CopyPolicyV1,
     pub options: CopyOptionsV1,
     pub limits: CopyLimitsV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MutationScopeV1 {
+    pub path: Vec<u8>,
+    pub descendants: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,8 +170,11 @@ pub(crate) struct CopyOptionsV1 {
     pub preserve_group: bool,
     pub preserve_devices: bool,
     pub compare_existing_by_content: bool,
-    pub verify_after_copy: bool,
+    pub dry_run: bool,
+    pub verify_only: bool,
     pub compressed_transport: bool,
+    pub tcp_port_lo: u16,
+    pub tcp_port_hi: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +235,21 @@ impl GrantV1 {
 impl CopyOperationV1 {
     fn validate(&self, validity: i64) -> Result<()> {
         validate_absolute_path(&self.destination)?;
+        if self.mutation_scopes.is_empty() || self.mutation_scopes.len() > 1024 {
+            bail!("copy mutation-scope count is outside the supported range");
+        }
+        for scope in &self.mutation_scopes {
+            validate_absolute_path(&scope.path)?;
+            if scope.descendants && !self.options.recursive {
+                bail!("nonrecursive copy cannot authorize descendant mutations");
+            }
+            if scope.path != self.destination
+                && !(scope.path.starts_with(&self.destination)
+                    && scope.path.get(self.destination.len()) == Some(&b'/'))
+            {
+                bail!("copy mutation scope is outside the requested destination");
+            }
+        }
         let limits = &self.limits;
         if limits.max_entries == 0 || limits.max_entries > MAX_ENTRIES {
             bail!("copy max-entries is outside the supported range");
@@ -265,6 +268,9 @@ impl CopyOperationV1 {
         }
         if limits.max_runtime_seconds == 0 || i64::from(limits.max_runtime_seconds) > validity {
             bail!("copy max-runtime exceeds the signed validity interval");
+        }
+        if self.options.tcp_port_hi < self.options.tcp_port_lo {
+            bail!("copy TCP port range is reversed");
         }
         match self.policy.deletion {
             DeletionPolicyV1::Forbid if limits.max_deletions != 0 => {
@@ -351,6 +357,20 @@ impl SignedGrantEnvelopeV1 {
     fn signing_payload(&self) -> Result<Vec<u8>> {
         signing_payload(&self.grant)
     }
+}
+
+pub(crate) fn sign_grant(grant: GrantV1, private_key: &PrivateKey) -> Result<Vec<u8>> {
+    if private_key.is_encrypted() {
+        bail!("cannot sign a grant with an encrypted transport key");
+    }
+    let payload = signing_payload(&grant)?;
+    let signature = private_key
+        .sign(SSHSIG_NAMESPACE, HashAlg::Sha256, &payload)
+        .context("sign restricted transfer grant")?
+        .to_pem(LineEnding::LF)
+        .context("encode restricted transfer SSHSIG")?
+        .into_bytes();
+    SignedGrantEnvelopeV1 { grant, signature }.encode()
 }
 
 fn signing_payload(grant: &GrantV1) -> Result<Vec<u8>> {
@@ -497,6 +517,7 @@ impl ReceiverContext<'_> {
         Ok((earliest, latest))
     }
 
+    #[cfg(test)]
     fn wall_time_at(&self, observed_at: Instant) -> Result<i64> {
         Ok(self.wall_time_bounds_at(observed_at)?.1)
     }
@@ -570,7 +591,7 @@ impl SshsigPolicy {
         signature: &[u8],
         payload: &[u8],
     ) -> Result<()> {
-        validate_secure_executable(&self.ssh_keygen)?;
+        validate_secure_executable(&self.ssh_keygen, "SSHSIG verifier")?;
         let allowed = read_secure_regular(
             &self.allowed_signers,
             "allowed-signers policy",
@@ -679,9 +700,39 @@ fn wait_for_verifier(
         .take()
         .ok_or_else(|| anyhow!("SSHSIG verifier stderr unavailable"))?;
     let payload = payload.to_vec();
-    let writer = thread::spawn(move || stdin.write_all(&payload));
-    let stdout_reader = thread::spawn(move || read_verifier_output(stdout));
-    let stderr_reader = thread::spawn(move || read_verifier_output(stderr));
+    let writer = match thread::Builder::new()
+        .name("syq-sshsig-input".into())
+        .spawn(move || stdin.write_all(&payload))
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            terminate_verifier(&mut child, process_group);
+            return Err(error).context("start SSHSIG verifier input worker");
+        }
+    };
+    let stdout_reader = match thread::Builder::new()
+        .name("syq-sshsig-output".into())
+        .spawn(move || read_verifier_output(stdout))
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            terminate_verifier(&mut child, process_group);
+            let _ = writer.join();
+            return Err(error).context("start SSHSIG verifier output worker");
+        }
+    };
+    let stderr_reader = match thread::Builder::new()
+        .name("syq-sshsig-diagnostic".into())
+        .spawn(move || read_verifier_output(stderr))
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            terminate_verifier(&mut child, process_group);
+            let _ = writer.join();
+            let _ = stdout_reader.join();
+            return Err(error).context("start SSHSIG verifier diagnostic worker");
+        }
+    };
 
     let status = loop {
         match child.try_wait() {
@@ -740,10 +791,8 @@ fn read_verifier_output(mut output: impl Read) -> io::Result<Vec<u8>> {
 }
 
 /// Evidence that the signature, target binding, time bounds, and one-time
-/// replay claim all succeeded. This type intentionally has no conversion into
-/// existing `server::Request` authorization. A future executor must enforce
-/// `execution_deadline`; successful verification does not grant an unbounded
-/// interval in which to start or continue the operation.
+/// replay claim all succeeded. The restricted receiver consumes this into its
+/// independently enforced request authority and monotonic execution deadline.
 #[derive(Debug)]
 pub(crate) struct VerifiedGrant {
     #[allow(dead_code)]
@@ -752,8 +801,13 @@ pub(crate) struct VerifiedGrant {
 }
 
 impl VerifiedGrant {
+    #[cfg(test)]
     pub(crate) fn execution_deadline(&self) -> Instant {
         self.execution_deadline
+    }
+
+    pub(crate) fn into_parts(self) -> (GrantV1, Instant) {
+        (self.grant, self.execution_deadline)
     }
 }
 
@@ -831,6 +885,7 @@ impl ReplayStore {
         })
     }
 
+    #[cfg(test)]
     fn claim(&self, request: RequestId, digest: [u8; 32], claimed_at: i64) -> Result<()> {
         self.claim_after_lock(request, digest, || Ok(claimed_at))
     }
@@ -1056,6 +1111,46 @@ fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_private_directory_path(path: &Path) -> Result<()> {
+    let directory = open_trusted_directory_path(path, "private directory")?;
+    validate_private_directory(&directory, path)
+}
+
+pub(crate) fn validate_trusted_directory_path(path: &Path) -> Result<()> {
+    let directory = open_trusted_directory_path(path, "trusted directory")?;
+    validate_trusted_directory(&directory, "trusted directory")
+}
+
+fn open_trusted_directory_path(path: &Path, label: &str) -> Result<File> {
+    validate_canonical_trusted_path(path, label)?;
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .with_context(|| format!("open filesystem root for {label}"))?;
+    validate_trusted_directory(&directory, label)?;
+    let mut components = path.components().peekable();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        bail!("{label} path must start at the filesystem root");
+    }
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("{label} path contains a noncanonical component");
+        };
+        directory = openat_os_file(
+            directory.as_raw_fd(),
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .with_context(|| format!("securely open {label} {}", path.display()))?;
+        if components.peek().is_some() {
+            validate_trusted_directory(&directory, label)?;
+        }
+    }
+    Ok(directory)
+}
+
 fn open_existing_replay_directory(path: &Path) -> Result<File> {
     validate_canonical_trusted_path(path, "replay state directory")?;
     let mut directory = OpenOptions::new()
@@ -1120,21 +1215,21 @@ fn validate_private_file(file: &File, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_secure_executable(path: &Path) -> Result<()> {
-    validate_canonical_trusted_path(path, "ssh-keygen verifier")?;
+pub(crate) fn validate_secure_executable(path: &Path, label: &str) -> Result<()> {
+    validate_canonical_trusted_path(path, label)?;
     let mut directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")
-        .context("open filesystem root for SSHSIG verifier validation")?;
-    validate_trusted_directory(&directory, "SSHSIG verifier ancestor")?;
+        .with_context(|| format!("open filesystem root for {label} validation"))?;
+    validate_trusted_directory(&directory, &format!("{label} ancestor"))?;
     let mut components = path.components().peekable();
     if !matches!(components.next(), Some(std::path::Component::RootDir)) {
-        bail!("ssh-keygen verifier path must start at the filesystem root");
+        bail!("{label} path must start at the filesystem root");
     }
     while let Some(component) = components.next() {
         let std::path::Component::Normal(name) = component else {
-            bail!("ssh-keygen verifier path contains a noncanonical component");
+            bail!("{label} path contains a noncanonical component");
         };
         if components.peek().is_some() {
             let next = openat_os_file(
@@ -1143,13 +1238,8 @@ fn validate_secure_executable(path: &Path) -> Result<()> {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0,
             )
-            .with_context(|| {
-                format!(
-                    "securely open SSHSIG verifier ancestor in {}",
-                    path.display()
-                )
-            })?;
-            validate_trusted_directory(&next, "SSHSIG verifier ancestor")?;
+            .with_context(|| format!("securely open {label} ancestor in {}", path.display()))?;
+            validate_trusted_directory(&next, &format!("{label} ancestor"))?;
             directory = next;
             continue;
         }
@@ -1160,7 +1250,7 @@ fn validate_secure_executable(path: &Path) -> Result<()> {
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         )
-        .with_context(|| format!("open trusted SSHSIG verifier {}", path.display()))?;
+        .with_context(|| format!("open trusted {label} {}", path.display()))?;
         let metadata = file.metadata()?;
         let effective_uid = unsafe { libc::geteuid() };
         if !metadata.is_file()
@@ -1168,18 +1258,18 @@ fn validate_secure_executable(path: &Path) -> Result<()> {
             || metadata.permissions().mode() & 0o022 != 0
             || metadata.permissions().mode() & 0o111 == 0
         {
-            bail!("SSHSIG verifier must be a trusted non-writable executable");
+            bail!("{label} must be a trusted non-writable executable");
         }
-        reject_extended_acl(&file, "SSHSIG verifier")?;
+        reject_extended_acl(&file, label)?;
         // The validated ancestor chain cannot be replaced by an untrusted OS
         // user, so Command's subsequent path resolution cannot be redirected.
         // The receiver's own effective uid is part of the trusted boundary.
         return Ok(());
     }
-    bail!("ssh-keygen verifier path has no executable component")
+    bail!("{label} path has no executable component")
 }
 
-fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>> {
     validate_canonical_trusted_path(path, label)?;
     let mut directory = OpenOptions::new()
         .read(true)
@@ -1712,6 +1802,10 @@ mod tests {
             not_after: NOW + 600,
             operation: GrantOperationV1::Copy(CopyOperationV1 {
                 destination: b"/srv/archive/project".to_vec(),
+                mutation_scopes: vec![MutationScopeV1 {
+                    path: b"/srv/archive/project".to_vec(),
+                    descendants: true,
+                }],
                 policy: CopyPolicyV1 {
                     placement: DestinationPlacementV1::ExactPath,
                     existing: ExistingDestinationPolicyV1::Replace,
@@ -1727,8 +1821,11 @@ mod tests {
                     preserve_group: false,
                     preserve_devices: false,
                     compare_existing_by_content: true,
-                    verify_after_copy: true,
+                    dry_run: false,
+                    verify_only: true,
                     compressed_transport: false,
+                    tcp_port_lo: 47_600,
+                    tcp_port_hi: 47_699,
                 },
                 limits: CopyLimitsV1 {
                     max_entries: 10_000,
@@ -1822,6 +1919,24 @@ mod tests {
     }
 
     #[test]
+    fn in_process_transport_key_signature_is_accepted_by_openssh() {
+        let fixture = Fixture::ordinary();
+        let keypair = ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]);
+        let private = PrivateKey::new(keypair.into(), "syq-test").unwrap();
+        let public = private.public_key().to_openssh().unwrap();
+        fs::write(&fixture.allowed_signers, format!("{SIGNER} {public}\n")).unwrap();
+        let replay = fixture.replay("in-process-signature-replay");
+        let encoded = sign_grant(fixture_grant(44), &private).unwrap();
+        verify_and_claim(
+            &encoded,
+            &context(SIGNER, TARGET, NOW, 0),
+            &fixture.policy(),
+            &replay,
+        )
+        .expect("OpenSSH must accept the in-process SSHSIG");
+    }
+
+    #[test]
     fn version_one_grant_encoding_is_frozen() {
         fn placement_tag(value: DestinationPlacementV1) -> u8 {
             match value {
@@ -1885,6 +2000,10 @@ mod tests {
         baseline.signer = "alice-one@example.test".to_owned();
         let GrantOperationV1::Copy(copy) = &mut baseline.operation;
         copy.destination = b"/srv/fingerprint-one".to_vec();
+        copy.mutation_scopes = vec![MutationScopeV1 {
+            path: copy.destination.clone(),
+            descendants: true,
+        }];
         copy.policy.deletion = DeletionPolicyV1::DeleteDestinationOnly;
         copy.limits.max_deletions = 7;
         append(&mut transcript, "baseline", &baseline);
@@ -1913,7 +2032,21 @@ mod tests {
         append_mutation(&mut transcript, &baseline, "destination", |grant| {
             let GrantOperationV1::Copy(copy) = &mut grant.operation;
             copy.destination = b"/srv/fingerprint-two".to_vec();
+            copy.mutation_scopes[0].path = copy.destination.clone();
         });
+        append_mutation(&mut transcript, &baseline, "mutation-scope-path", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.mutation_scopes[0].path = b"/srv/fingerprint-one/child".to_vec();
+        });
+        append_mutation(
+            &mut transcript,
+            &baseline,
+            "mutation-scope-descendants",
+            |grant| {
+                let GrantOperationV1::Copy(copy) = &mut grant.operation;
+                copy.mutation_scopes[0].descendants = false;
+            },
+        );
 
         for placement in [
             DestinationPlacementV1::ExactPath,
@@ -1971,7 +2104,13 @@ mod tests {
                 });
             };
         }
-        toggle_option!(recursive);
+        append_mutation(&mut transcript, &baseline, "recursive", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.options.recursive = false;
+            for scope in &mut copy.mutation_scopes {
+                scope.descendants = false;
+            }
+        });
         toggle_option!(preserve_symlinks);
         toggle_option!(preserve_permissions);
         toggle_option!(preserve_times);
@@ -1979,8 +2118,17 @@ mod tests {
         toggle_option!(preserve_group);
         toggle_option!(preserve_devices);
         toggle_option!(compare_existing_by_content);
-        toggle_option!(verify_after_copy);
+        toggle_option!(dry_run);
+        toggle_option!(verify_only);
         toggle_option!(compressed_transport);
+        append_mutation(&mut transcript, &baseline, "tcp-port-lo", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.options.tcp_port_lo += 1;
+        });
+        append_mutation(&mut transcript, &baseline, "tcp-port-hi", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.options.tcp_port_hi += 1;
+        });
 
         append_mutation(&mut transcript, &baseline, "max-entries", |grant| {
             let GrantOperationV1::Copy(copy) = &mut grant.operation;
@@ -2009,7 +2157,7 @@ mod tests {
 
         assert_eq!(
             hex(&Sha256::digest(&transcript)),
-            "a9f808389731fe401c9699e55c0d5c7c6176738e5835d6ca0cddd262194655c6",
+            "8e10dfd0d24b5167ab7391cd38537ea23a263bc85f67bd5cc8ed29be972e1252",
             "changing the namespace, signing bytes, or variant surface requires a new wire version"
         );
     }
@@ -2066,7 +2214,7 @@ mod tests {
             .expect("decode signed request");
         let mut altered = original.grant;
         let GrantOperationV1::Copy(copy) = &mut altered.operation;
-        copy.options.verify_after_copy = false;
+        copy.options.verify_only = false;
         let tampered = raw_envelope(&altered, &original.signature);
         assert!(verify_and_claim(
             &tampered,
@@ -2459,7 +2607,7 @@ mod tests {
         fs::set_permissions(&verifier, fs::Permissions::from_mode(0o500))
             .expect("make test verifier executable");
         add_macos_acl(&verifier, "everyone allow execute");
-        assert!(validate_secure_executable(&verifier).is_err());
+        assert!(validate_secure_executable(&verifier, "test verifier").is_err());
 
         let policy = directory.join("allowed-signers");
         write_private(&policy, b"signer ssh-ed25519 test\n");
@@ -2469,7 +2617,7 @@ mod tests {
 
     #[test]
     fn verifier_rejects_a_group_or_world_writable_ancestor() {
-        validate_secure_executable(&ssh_tool("ssh-keygen"))
+        validate_secure_executable(&ssh_tool("ssh-keygen"), "test verifier")
             .expect("system verifier chain is trusted");
 
         let directory = TestDir::new("verifier-ancestor");
@@ -2485,7 +2633,7 @@ mod tests {
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o770))
             .expect("make verifier ancestor group writable");
 
-        assert!(validate_secure_executable(&executable).is_err());
+        assert!(validate_secure_executable(&executable, "test verifier").is_err());
     }
 
     #[test]
@@ -2579,10 +2727,9 @@ mod tests {
             revocation_file: None,
         };
 
-        assert!(
-            verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay,)
-                .is_err()
-        );
+        let error = verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
+            .expect_err("a key listed only for another principal must fail");
+        assert!(error.to_string().starts_with("SSHSIG verification failed"));
     }
 
     #[test]
@@ -2596,13 +2743,14 @@ mod tests {
         policy.revocation_file = Some(revocations);
         let replay = fixture.replay("revoked-replay");
 
-        assert!(verify_and_claim(
+        let error = verify_and_claim(
             &fixture.signed(fixture_grant(25)),
             &context(SIGNER, TARGET, NOW, 0),
             &policy,
             &replay,
         )
-        .is_err());
+        .expect_err("a revoked signer must fail");
+        assert!(error.to_string().starts_with("SSHSIG verification failed"));
     }
 
     #[test]
@@ -2665,10 +2813,9 @@ mod tests {
             revocation_file: None,
         };
 
-        assert!(
-            verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay,)
-                .is_err()
-        );
+        let error = verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
+            .expect_err("a certificate without the expected principal must fail");
+        assert!(error.to_string().starts_with("SSHSIG verification failed"));
     }
 
     #[test]
@@ -2699,9 +2846,8 @@ mod tests {
             revocation_file: None,
         };
 
-        assert!(
-            verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay,)
-                .is_err()
-        );
+        let error = verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
+            .expect_err("a certificate signed by a non-authority entry must fail");
+        assert!(error.to_string().starts_with("SSHSIG verification failed"));
     }
 }

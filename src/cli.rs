@@ -226,6 +226,16 @@ pub struct Args {
         conflicts_with_all = ["rsh", "no_forward_agent", "detach", "relay"]
     )]
     pub unrestricted_agent_forwarding: bool,
+    /// Remote-to-remote: use only the live destination-bound agent broker and
+    /// do not create or use a command-restricted receiver enrollment
+    #[arg(
+        long,
+        conflicts_with_all = ["rsh", "no_forward_agent", "unrestricted_agent_forwarding", "detach", "relay"]
+    )]
+    pub agent_broker_only: bool,
+    /// Signed receiver grant forwarded to the source-host orchestrator
+    #[arg(long, hide = true)]
+    pub restricted_grant: Option<String>,
     /// Terminal width for the progress display (internal; used for remote-to-remote)
     #[arg(long, hide = true)]
     pub width: Option<usize>,
@@ -588,6 +598,13 @@ struct NativeCopyArgs {
     /// Disable SSH-agent forwarding for direct remote-to-remote transfers
     #[arg(long, conflicts_with = "rsh")]
     no_forward_agent: bool,
+    /// Use only the live destination-bound broker; do not auto-enroll a
+    /// command-restricted receiver
+    #[arg(long, conflicts_with_all = ["rsh", "no_forward_agent"])]
+    agent_broker_only: bool,
+    /// Signed receiver grant forwarded to a remote orchestrator
+    #[arg(long, hide = true)]
+    restricted_grant: Option<String>,
     /// Original source endpoint for a remotely orchestrated dry-run summary
     #[arg(long, hide = true)]
     plan_source_host: Option<String>,
@@ -652,7 +669,7 @@ struct NativeRmArgs {
 
 fn print_root_help() {
     println!(
-        "Parallel copy with explicit native semantics\n\nUsage: syq <COMMAND> [OPTIONS]\n\nCommands:\n  cp     Copy selected objects without removing target-only objects\n  cprm   Copy, then remove target-only objects in the mapped scope\n  rm     Remove explicitly selected object trees\n  rsync  Use the retained rsync-compatible command surface\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel copy with explicit native semantics\n\nUsage: syq <COMMAND> [OPTIONS]\n\nCommands:\n  cp           Copy selected objects without removing target-only objects\n  cprm         Copy, then remove target-only objects in the mapped scope\n  rm           Remove explicitly selected object trees\n  rsync        Use the retained rsync-compatible command surface\n  enroll       Pre-enroll a command-restricted remote destination\n  enrollments  List local command-restricted enrollments\n  revoke       Revoke a command-restricted enrollment\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -799,6 +816,8 @@ fn parse_native_copy(argv: &[OsString], delete: bool) -> Result<Args> {
     args.syq_path = parsed.syq_path;
     args.no_bootstrap = parsed.no_bootstrap;
     args.no_forward_agent = parsed.no_forward_agent;
+    args.agent_broker_only = parsed.agent_broker_only;
+    args.restricted_grant = parsed.restricted_grant;
     args.plan_source_host = parsed.plan_source_host;
     args.width = parsed.width;
     Ok(args)
