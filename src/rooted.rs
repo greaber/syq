@@ -164,7 +164,7 @@ impl Root {
     /// Open an existing regular file for mutation. Truncation occurs only after
     /// the opened descriptor has been verified as a regular file.
     pub(crate) fn open_regular_write(&self, path: &RelativePath, truncate: bool) -> Result<File> {
-        self.open_regular(path, libc::O_RDWR, truncate)
+        self.open_regular(path, libc::O_WRONLY, truncate)
     }
 
     fn open_regular(
@@ -334,7 +334,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -471,6 +471,44 @@ mod tests {
         root.unlink(&relative(b"dir/final")).unwrap();
         root.remove_directory(&relative(b"dir")).unwrap();
         assert!(!tree.path().join("dir").exists());
+    }
+
+    #[test]
+    fn owner_write_only_regular_file_can_be_written_without_escaping_root() {
+        let tree = TestDir::new("write-only");
+        let root_path = tree.path().join("root");
+        let outside = tree.path().join("outside");
+        fs::create_dir(&root_path).unwrap();
+        fs::create_dir(&outside).unwrap();
+
+        let inside = root_path.join("inside");
+        let sentinel = outside.join("sentinel");
+        fs::write(&inside, b"initial").unwrap();
+        fs::write(&sentinel, b"outside").unwrap();
+        fs::set_permissions(&inside, fs::Permissions::from_mode(0o200)).unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o200)).unwrap();
+        assert_eq!(fs::metadata(&inside).unwrap().uid(), unsafe {
+            libc::geteuid()
+        });
+        symlink(&outside, root_path.join("escape")).unwrap();
+
+        let root = Root::open(&root_path).unwrap();
+        let mut file = root
+            .open_regular_write(&relative(b"inside"), false)
+            .unwrap();
+        let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(descriptor_flags, -1);
+        assert_eq!(descriptor_flags & libc::O_ACCMODE, libc::O_WRONLY);
+        file.write_all(b"updated").unwrap();
+        drop(file);
+        assert!(root
+            .open_regular_write(&relative(b"escape/sentinel"), false)
+            .is_err());
+
+        fs::set_permissions(&inside, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&inside).unwrap(), b"updated");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
     }
 
     #[test]
