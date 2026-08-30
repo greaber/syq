@@ -858,7 +858,7 @@ fn validate_claim_record(record: &[u8], request: RequestId, digest: [u8; 32]) ->
     Ok(())
 }
 
-fn openat_file(directory: RawFd, name: &str, flags: i32, mode: libc::mode_t) -> io::Result<File> {
+fn openat_file(directory: RawFd, name: &str, flags: i32, mode: libc::c_int) -> io::Result<File> {
     let name = CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in state filename"))?;
     loop {
@@ -1259,6 +1259,16 @@ mod tests {
         let GrantOperationV1::Copy(copy) = &mut excessive.operation;
         copy.limits.max_total_bytes = u64::MAX;
         assert!(signing_payload(&excessive).is_err());
+    }
+
+    #[test]
+    fn version_one_grant_encoding_is_frozen() {
+        let bytes = canonical_grant_bytes(&fixture_grant(1)).expect("encode version-one grant");
+        assert_eq!(
+            hex(&Sha256::digest(&bytes)),
+            "14e187e3648784c1878d887e8b70bead312874ae6296e492907232481b9af1b6",
+            "changing these bytes requires a new wire version"
+        );
     }
 
     #[test]
