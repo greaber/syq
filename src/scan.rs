@@ -8,7 +8,7 @@ use jwalk::WalkDirGeneric;
 use std::fs;
 use std::path::Path;
 
-pub const BATCH: usize = 1000;
+pub const BATCH: usize = 4096;
 
 /// Per-entry result of the parallel read_dir hook.
 #[derive(Clone, Default, Debug)]

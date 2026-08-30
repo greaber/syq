@@ -924,8 +924,32 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         });
     }
     drop(tx);
-    for (i, reachable) in rx {
+
+    // A public SSH target is the known-good fallback. Once it connects, give
+    // higher-priority advertised NICs a short grace period, then stop waiting
+    // for unroutable private/overlay addresses to consume their full timeout.
+    // A genuinely faster LAN path will have completed well before a WAN
+    // fallback plus this grace period.
+    let overall_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+    let mut fallback_deadline: Option<std::time::Instant> = None;
+    let mut remaining = candidates.len();
+    while remaining > 0 {
+        let deadline = fallback_deadline
+            .map(|deadline| deadline.min(overall_deadline))
+            .unwrap_or(overall_deadline);
+        let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        let Ok((i, reachable)) = rx.recv_timeout(wait) else {
+            break;
+        };
+        remaining -= 1;
         candidates[i].reachable = reachable;
+        if reachable && candidates[i].source == DataAddressSource::SshTarget {
+            fallback_deadline.get_or_insert_with(|| {
+                std::time::Instant::now() + std::time::Duration::from_millis(100)
+            });
+        }
     }
 }
 

@@ -131,6 +131,22 @@ impl Sched {
             && g.finishes.is_empty()
     }
 
+    /// Whether another worker could claim useful work right now. Whole-file
+    /// probes are deliberately excluded: a fast small-file batch already has
+    /// an owner, so replacing a worker that retired after draining the queue
+    /// only creates an idle connection. A retry will put the file back in
+    /// `files`, at which point replacement becomes useful again.
+    pub fn has_assignable_work(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        !g.files.is_empty()
+            || !g.ranges.is_empty()
+            || !g.finishes.is_empty()
+            || g.inflight.iter().any(|handle| {
+                let range = handle.lock().unwrap();
+                range.pos < range.end
+            })
+    }
+
     /// Whether enough splittable activity remains to measure `n` workers.
     /// `minimum_activity` is derived from the observed aggregate rate and the
     /// time needed for a complete sampling window; queued files add the same
@@ -338,6 +354,21 @@ mod tests {
         assert!(sched.work_left_for(2, 1_200, 512));
         assert!(!sched.work_left_for(2, 1_300, 512));
         assert!(!sched.work_left_for(3, 1_000, 512));
+    }
+
+    #[test]
+    fn claimed_small_files_do_not_request_replacement_capacity() {
+        let sched = Sched::new(64, 128);
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            inner.scan_done = true;
+            inner.probing = 2;
+        }
+        assert!(!sched.finished());
+        assert!(!sched.has_assignable_work());
+
+        sched.inner.lock().unwrap().files.push((100, Reverse(0)));
+        assert!(sched.has_assignable_work());
     }
 
     #[test]
