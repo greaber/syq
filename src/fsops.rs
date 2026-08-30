@@ -76,7 +76,25 @@ impl OperatorDirectorySelection {
                     // components start at 0777 (subject to umask), while the
                     // requested mode applies to the selected destination root.
                     let component_mode = if self.missing.is_empty() { mode } else { 0o777 };
-                    mkdir_operator_directory_at(&self.directory, &component, component_mode)?;
+                    match mkdir_operator_directory_at(
+                        &self.directory,
+                        &component,
+                        component_mode,
+                    ) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                            match operator_lstat_at(&self.directory, &component) {
+                                Ok(metadata)
+                                    if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR => {}
+                                Ok(_) => bail!(
+                                    "destination path component {:?} appeared with an unsafe type while creating the destination",
+                                    OsStr::from_bytes(&component)
+                                ),
+                                Err(error) => return Err(error.into()),
+                            }
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -221,7 +239,7 @@ fn open_operator_directory_fd(parent: libc::c_int, component: &CStr) -> Result<F
     }
 }
 
-fn mkdir_operator_directory_at(parent: &File, component: &[u8], mode: u32) -> Result<()> {
+fn mkdir_operator_directory_at(parent: &File, component: &[u8], mode: u32) -> io::Result<()> {
     let component = CString::new(component).expect("path component was checked for NUL");
     loop {
         let result = unsafe {
@@ -236,7 +254,7 @@ fn mkdir_operator_directory_at(parent: &File, component: &[u8], mode: u32) -> Re
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error.into());
+            return Err(error);
         }
     }
 }
@@ -2462,6 +2480,28 @@ mod tests {
 
         assert!(dir.join("selected-and-moved/missing/deeper").is_dir());
         assert!(!dir.join("outside/missing").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_operator_directory_creation_reuses_the_real_directory() {
+        let dir = test_dir();
+        fs::create_dir_all(dir.join("parent")).unwrap();
+        let selected = dir.join("parent/missing/deeper");
+        let (mut first, first_anchor) =
+            select_operator_directory(selected.as_os_str().as_bytes(), true, false).unwrap();
+        let (mut second, second_anchor) =
+            select_operator_directory(selected.as_os_str().as_bytes(), true, false).unwrap();
+        assert!(first_anchor.is_none());
+        assert!(second_anchor.is_none());
+
+        let first_anchor = first.create_missing(0o755).unwrap();
+        let second_anchor = second.create_missing(0o755).unwrap();
+        assert_eq!(
+            (first_anchor.dev, first_anchor.ino),
+            (second_anchor.dev, second_anchor.ino)
+        );
+
         fs::remove_dir_all(&dir).unwrap();
     }
 

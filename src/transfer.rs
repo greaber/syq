@@ -1069,10 +1069,10 @@ pub fn run(args: Args) -> Result<i32> {
     // A destination that is a symlink to a directory is that directory (as
     // for rsync). Use the resolved target path for all planning and metadata,
     // so ordinary in-tree symlinks can still be replaced instead of followed.
-    let (dst_root, dst_root_entry) =
+    let (dst_root, mut dst_root_entry) =
         follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?;
-    let dst_initially_missing = dst_root_entry.is_none();
-    let dst_existed = !dst_initially_missing;
+    let mut dst_initially_missing = dst_root_entry.is_none();
+    let mut dst_existed = !dst_initially_missing;
     let dst_is_dir = match &dst_root_entry {
         Some(e) if e.kind == Kind::Dir => true,
         Some(_) if multiple_source_operands => {
@@ -1121,10 +1121,27 @@ pub fn run(args: Args) -> Result<i32> {
             .as_ref()
             .map(|selection| (selection.dev, selection.ino));
         if selected_identity != planned_identity {
-            bail!(
-                "destination directory {} changed while resolving it",
-                display(&operator_dst_root)
-            );
+            // Another ordinary copy may create the same missing destination
+            // between the initial stat and the descriptor-retaining walk.
+            // Accept only the exact directory inode that the secure walk has
+            // already retained; later operations stay anchored to that fd.
+            let appeared = if planned_identity.is_none() {
+                stat_one(&mut *dst_ctl, &operator_dst_root, true)?
+            } else {
+                None
+            };
+            let appeared_matches_selection = appeared.as_ref().is_some_and(|entry| {
+                entry.kind == Kind::Dir && Some((entry.dev, entry.ino)) == selected_identity
+            });
+            if !appeared_matches_selection {
+                bail!(
+                    "destination directory {} changed while resolving it",
+                    display(&operator_dst_root)
+                );
+            }
+            dst_root_entry = appeared;
+            dst_initially_missing = false;
+            dst_existed = true;
         }
     }
 
