@@ -636,17 +636,20 @@ pub fn run(args: Args) -> Result<i32> {
     if locs.len() < 2 {
         bail!("need at least one source and a destination");
     }
-    let (_, raw_source_operands) = args.paths.split_last().unwrap();
+    let raw_source_operands = args
+        .paths
+        .split_last()
+        .map(|(_, sources)| sources)
+        .unwrap_or(&[]);
     let (dst, original_srcs) = locs.split_last().unwrap();
+    let local_source_operand_count = if args.locations.is_empty() {
+        raw_source_operands.len()
+    } else {
+        original_srcs.len()
+    };
     let source_operand_count = args
         .direct_source_operand_count
-        .unwrap_or_else(|| {
-            if args.locations.is_empty() {
-                raw_source_operands.len()
-            } else {
-                original_srcs.len()
-            }
-        });
+        .unwrap_or(local_source_operand_count);
     if source_operand_count < original_srcs.len() {
         bail!("invalid direct source-operand count");
     }
@@ -664,19 +667,18 @@ pub fn run(args: Args) -> Result<i32> {
     // `file file new-dest` still creates a directory like other multi-source
     // commands.
     let multiple_source_operands = source_operand_count > 1;
-    let srcs: Vec<Location> = if args.interface != Interface::Rsync
-        || args.direct_sources_prededuplicated
-    {
-        original_srcs.to_vec()
-    } else {
-        let mut seen_sources = std::collections::HashSet::new();
-        raw_source_operands
-            .iter()
-            .zip(original_srcs)
-            .filter(|(raw, _)| seen_sources.insert(raw.as_str()))
-            .map(|(_, source)| source.clone())
-            .collect()
-    };
+    let srcs: Vec<Location> =
+        if args.interface != Interface::Rsync || args.direct_sources_prededuplicated {
+            original_srcs.to_vec()
+        } else {
+            let mut seen_sources = std::collections::HashSet::new();
+            raw_source_operands
+                .iter()
+                .zip(original_srcs)
+                .filter(|(raw, _)| seen_sources.insert(raw.as_str()))
+                .map(|(_, source)| source.clone())
+                .collect()
+        };
     let srcs = srcs.as_slice();
     let multiple_distinct_sources = srcs.len() > 1;
     if let Some(checkpoint) = args.checkpoint.as_deref() {
@@ -1099,9 +1101,7 @@ pub fn run(args: Args) -> Result<i32> {
                 bail!("destination must be a directory when copying multiple sources")
             }
             Some(_) => false,
-            None => {
-                multiple_source_operands || dst.copies_contents() || args.files_from.is_some()
-            }
+            None => multiple_source_operands || dst.copies_contents() || args.files_from.is_some(),
         },
     };
     if args.placement == Placement::Into
