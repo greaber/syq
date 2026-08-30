@@ -44,6 +44,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 ssh-agent-lib = { version = "0.6", default-features = false }
 ssh-key = { version = "0.6.7", features = ["p256", "rsa"] }
 tempfile = "3"
+signature = "2"
 
 [profile.release]
 opt-level = 3
@@ -54,4 +55,3 @@ strip = "symbols"
 
 [dev-dependencies]
 libc = "0.2"
-signature = "2"

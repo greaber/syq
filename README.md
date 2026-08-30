@@ -242,25 +242,56 @@ It verifies OpenSSH session-bind signatures for both hosts and strictly checks
 the final host-bound authentication request's session ID, destination login
 user, host key, selected credential, and signature algorithm. Key addition,
 removal, raw or legacy signing, unknown extensions, and extra forwarding hops
-are refused. Private keys remain in the original agent, so hardware-backed,
-PIV/OpenPGP agent, and desktop-agent identities continue to handle their own
-touch/PIN/approval behavior. The broker socket and every open channel are
-closed when the attached transfer ends.
+are refused. The A → B client is forced to use host-bound public-key
+authentication. Validated session binds are also replayed to the ambient agent,
+so a stock OpenSSH agent's existing per-key destination constraints remain an
+additional restriction; agents that do not implement session binding may reject
+that extension and continue under the broker's mandatory checks. Successful
+ambient signatures are verified before release.
+
+Private keys remain in the original agent, so hardware-backed, PIV/OpenPGP
+agent, and desktop-agent identities continue to handle their own
+touch/PIN/approval behavior. For a user certificate selected by hostB's local
+`CertificateFile`, syq exposes only that exact certificate in place of its
+matching raw agent identity, validates the exact certificate-bearing host-bound
+request, and translates only the agent request's outer credential back to the
+matching raw key. This supports the common arrangement where a YubiKey or other
+agent lists the private key while a centrally managed certificate is a local
+file. An OpenSSH agent may itself reject that translation when the raw key has
+`ssh-add -h` destination constraints but the certificate was not associated
+with the agent; that combination fails closed. Loading the certificate into the
+agent avoids translation. The broker socket and every open channel are closed
+when the attached transfer ends.
 
 This restricts *where and as whom* hostA may authenticate; stock OpenSSH does
 not bind the subsequent command. A compromised hostA still receives the
 authority of that destination account for the transfer's lifetime. Command or
 filesystem restrictions require destination-side policy such as a forced syq
-receiver.
+receiver. This is not a signed grant: it adds no timestamp, expiry, or replay
+cache beyond the live SSH sessions and the broker socket's lifetime.
 
-The constrained path currently requires OpenSSH session-bind and host-bound
-authentication support, a local `SSH_AUTH_SOCK`, and exact plain host keys for
-both hosts in the effective local `known_hosts` files. Host-certificate/CA-only
-trust is refused until syq can validate certificate principals and validity as
-strictly as OpenSSH. The local configuration resolves hostB's login user, and
-syq passes it explicitly to hostA. Connection multiplexing is disabled for the
-outer session so a pre-existing master cannot substitute another forwarded
-agent.
+The constrained path requires OpenSSH 8.9 or newer session-bind and host-bound
+authentication support on the local machine, hostA, and hostB; a local
+`SSH_AUTH_SOCK`; and exact plain host keys for both hosts in the effective local
+`known_hosts` files. Host-certificate/CA-only trust is refused until syq can
+validate certificate principals and validity as strictly as OpenSSH. Static
+`HostKeyAlgorithms` and `RequiredRSASize` policy is enforced. A configured
+`KnownHostsCommand` or `RevokedHostKeys` KRL is refused because the broker does
+not yet reproduce those dynamic or external revocation checks. Local
+`CertificateFile` expansion supports the ordinary OpenSSH percent tokens except
+`%C`; named-user tildes are also refused rather than guessed.
+
+The local configuration resolves hostB's login user, and syq passes it
+explicitly to hostA. Connection multiplexing is disabled for the outer session
+so a pre-existing master cannot substitute another forwarded agent. Configured
+port forwards, X11 and GSS credential delegation, PTY allocation, and
+`LocalCommand` are also disabled on that session.
+
+Session binding identifies a host by its host key, not by a DNS name or network
+address. The configured name chooses the locally trusted key set, but an
+endpoint that shares hostB's private host key is intentionally equivalent to
+hostB for this broker. Deployments requiring distinct host identities must not
+reuse host private keys between them.
 
 Pass `--no-forward-agent` to give hostA no agent at all; hostA must then have
 its own credentials for hostB. `--unrestricted-agent-forwarding` is a
@@ -271,13 +302,16 @@ policy; `--no-forward-agent` and the unrestricted escape hatch therefore
 conflict with `-e`. `--relay` also avoids exposing authentication to hostA, at
 the cost of routing file data through this machine.
 
-SYQ inherits the user's SSH configuration and OpenSSH host-key checking. The
-default constrained broker additionally requires already recorded exact keys
-for hostA and hostB before connecting; it never learns a key through hostA or
-silently accepts one. If first-contact trust is appropriate, establish it with
-ordinary SSH (directly or through the configured jump path) before starting
-the transfer. An explicit `-e 'ssh -o StrictHostKeyChecking=accept-new'`
-bypasses the broker and leaves that policy to the supplied command.
+SYQ uses the user's SSH configuration to resolve the login user, host-key name,
+port, static known-hosts files, host-key algorithms, RSA size, and configured
+user certificates. The default constrained broker requires already recorded
+exact keys for hostA and hostB before connecting; it never learns a key through
+hostA or silently accepts one. Dynamic `KnownHostsCommand`, external
+`RevokedHostKeys`, and host-certificate trust are currently refused as described
+above. If first-contact trust is appropriate, establish it with ordinary SSH
+(directly or through the configured jump path) before starting the transfer.
+An explicit `-e 'ssh -o StrictHostKeyChecking=accept-new'` bypasses the broker
+and leaves that policy to the supplied command.
 
 Add `--detach --no-forward-agent` to let a remote-to-remote transfer outlive
 the ssh session that launched it: syq starts it on hostA, returns, and writes

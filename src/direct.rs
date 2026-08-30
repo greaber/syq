@@ -45,6 +45,13 @@ fn direct_command(
                     "ControlMaster=no",
                     "-o",
                     "ControlPath=none",
+                    "-o",
+                    "ClearAllForwardings=yes",
+                    "-x",
+                    "-k",
+                    "-T",
+                    "-o",
+                    "PermitLocalCommand=no",
                 ]);
             }
             None => {}
@@ -71,7 +78,23 @@ fn source_setup_rsh(rsh: &[String], explicit_rsh: bool) -> Vec<String> {
 
 fn destination_rsh(explicit_rsh: Option<&str>, same_host: bool) -> Option<&str> {
     // A uses the broker to authenticate to B, but B must never receive it.
-    (!same_host).then_some(explicit_rsh.unwrap_or("ssh -a"))
+    // Requiring host-bound public-key authentication prevents a compromised A
+    // from downgrading the agent request to one that omits B's host key.
+    (!same_host).then_some(explicit_rsh.unwrap_or("ssh -a -o PubkeyAuthentication=host-bound"))
+}
+
+fn broker_connection_limit(connections_opt: Option<usize>, connections: usize) -> Result<usize> {
+    // A direct transfer keeps one destination control connection open beside
+    // its data workers. Automatic tuning may grow beyond the initial worker
+    // count, while an explicit -j is a fixed user-selected upper bound.
+    let data_connections = if connections_opt.is_some() {
+        connections
+    } else {
+        crate::tune::MAX
+    };
+    data_connections
+        .checked_add(1)
+        .context("SSH connection count is too large for the constrained agent broker")
 }
 
 pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
@@ -93,16 +116,22 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     } else if args.unrestricted_agent_forwarding {
         Some(AgentForwarding::Unrestricted)
     } else {
-        let source_policy =
-            crate::agent_broker::resolve_host_policy(&rsh[0], srcs[0].user.as_deref(), &src_host)?;
+        let source_policy = crate::agent_broker::resolve_host_policy(
+            &rsh[0],
+            srcs[0].user.as_deref(),
+            &src_host,
+            false,
+        )?;
         let destination_policy = crate::agent_broker::resolve_host_policy(
             &rsh[0],
             dst.user.as_deref(),
             dst.host.as_deref().unwrap(),
+            true,
         )?;
         destination_login_user = Some(destination_policy.login_user.clone());
         let broker = crate::agent_broker::ConstrainedAgentBroker::start(
             crate::agent_broker::BrokerPolicy::new(source_policy, destination_policy),
+            broker_connection_limit(args.connections_opt, args.connections)?,
         )?;
         let ambient = broker.ambient_socket().to_string_lossy().into_owned();
         let socket = broker.socket_path().to_string_lossy().into_owned();
@@ -546,6 +575,11 @@ mod tests {
         assert!(args.contains(&OsStr::new("ForwardAgent=/tmp/syq-agent")));
         assert!(args.contains(&OsStr::new("ControlMaster=no")));
         assert!(args.contains(&OsStr::new("ControlPath=none")));
+        assert!(args.contains(&OsStr::new("ClearAllForwardings=yes")));
+        assert!(args.contains(&OsStr::new("-x")));
+        assert!(args.contains(&OsStr::new("-k")));
+        assert!(args.contains(&OsStr::new("-T")));
+        assert!(args.contains(&OsStr::new("PermitLocalCommand=no")));
         assert!(!args.contains(&OsStr::new("-A")));
         assert!(!args.contains(&OsStr::new("-a")));
     }
@@ -555,12 +589,22 @@ mod tests {
         let rsh = vec!["ssh".to_string(), "-p".to_string(), "2222".to_string()];
         assert_eq!(source_setup_rsh(&rsh, false), ["ssh", "-p", "2222", "-a"]);
         assert_eq!(source_setup_rsh(&rsh, true), rsh);
-        assert_eq!(destination_rsh(None, false), Some("ssh -a"));
+        assert_eq!(
+            destination_rsh(None, false),
+            Some("ssh -a -o PubkeyAuthentication=host-bound")
+        );
         assert_eq!(
             destination_rsh(Some("custom-rsh"), false),
             Some("custom-rsh")
         );
         assert_eq!(destination_rsh(None, true), None);
+    }
+
+    #[test]
+    fn broker_capacity_covers_control_and_planned_workers() {
+        assert_eq!(broker_connection_limit(None, 8).unwrap(), 65);
+        assert_eq!(broker_connection_limit(Some(128), 128).unwrap(), 129);
+        assert!(broker_connection_limit(Some(usize::MAX), usize::MAX).is_err());
     }
 
     #[test]

@@ -7,12 +7,17 @@
 //! user. The broker never accepts key-management or opaque signing requests.
 
 use anyhow::{anyhow, bail, Context, Result};
+use signature::Verifier;
 use ssh_agent_lib::proto::extension::{MessageExtension, SessionBind};
-use ssh_agent_lib::proto::{Request, Response, SignRequest};
+use ssh_agent_lib::proto::{Extension, Identity, PublicCredential, Request, Response, SignRequest};
 use ssh_agent_lib::ssh_encoding::{Decode, Encode};
-use ssh_agent_lib::ssh_key::{public::KeyData, PublicKey};
+use ssh_agent_lib::ssh_key::{
+    certificate::{CertType, Certificate},
+    public::KeyData,
+    PublicKey,
+};
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{CStr, OsString};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -27,10 +32,6 @@ use std::time::Duration;
 /// Agent messages are normally only a few KiB. This accommodates large
 /// identity lists without allowing a peer to force an unbounded allocation.
 const MAX_AGENT_FRAME: usize = 256 * 1024;
-/// syq establishes at most 32 SSH handshakes concurrently. Keep a hard broker
-/// cap as a second bound against a source host that opens idle agent channels.
-const MAX_BROKER_CONNECTIONS: usize = 32;
-
 const SSH_AGENT_FAILURE: &[u8] = &[5];
 const SSH_AGENT_SUCCESS: &[u8] = &[6];
 const SSH_AGENT_EXTENSION_FAILURE: &[u8] = &[28];
@@ -40,6 +41,28 @@ pub struct HostPolicy {
     pub login_user: String,
     host_keys: Vec<KeyData>,
     known_hosts_name: String,
+    host_key_algorithms: Vec<String>,
+    required_rsa_size: usize,
+    user_certificates: Vec<Certificate>,
+}
+
+impl HostPolicy {
+    fn authorizes_binding(&self, binding: &SessionBind) -> bool {
+        self.host_keys.contains(&binding.host_key)
+            && self
+                .host_key_algorithms
+                .iter()
+                .any(|allowed| allowed == binding.signature.algorithm().as_str())
+            && binding.host_key.rsa().is_none_or(|rsa| {
+                rsa.n.as_positive_bytes().is_some_and(|modulus| {
+                    let bits = modulus
+                        .first()
+                        .map(|first| modulus.len() * 8 - first.leading_zeros() as usize)
+                        .unwrap_or(0);
+                    bits >= self.required_rsa_size
+                })
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +88,7 @@ pub fn resolve_host_policy(
     ssh_program: &str,
     explicit_user: Option<&str>,
     host: &str,
+    load_user_certificates: bool,
 ) -> Result<HostPolicy> {
     let mut command = Command::new(ssh_program);
     command.arg("-G");
@@ -89,7 +113,8 @@ pub fn resolve_host_policy(
     let config = parse_ssh_config(&output.stdout)
         .with_context(|| format!("parse `ssh -G` output for {host}"))?;
     let keygen = ssh_keygen_for(ssh_program);
-    let (host_keys, saw_ca) = read_known_host_keys(&keygen, &config.lookup, &config.files)?;
+    let (mut host_keys, saw_ca) = read_known_host_keys(&keygen, &config.lookup, &config.files)?;
+    host_keys.retain(|key| configured_host_key_allowed(&config, key));
     if host_keys.is_empty() {
         if saw_ca {
             bail!(
@@ -97,22 +122,38 @@ pub fn resolve_host_policy(
             );
         }
         bail!(
-            "no exact trusted host key for {host} ({}) was found in the configured known_hosts files; connect once with ssh to record it, use --relay, or use --no-forward-agent with credentials on the source host",
+            "no exact trusted host key for {host} ({}) allowed by HostKeyAlgorithms and RequiredRSASize was found in the configured known_hosts files; connect once with ssh to record it, use --relay, or use --no-forward-agent with credentials on the source host",
             config.lookup
         );
     }
+    let user_certificates = if load_user_certificates {
+        let certificate_paths = certificate_paths(&config, host)?;
+        read_user_certificates(&certificate_paths)?
+    } else {
+        Vec::new()
+    };
     Ok(HostPolicy {
         login_user: config.user,
         host_keys,
         known_hosts_name: config.lookup,
+        host_key_algorithms: config.host_key_algorithms,
+        required_rsa_size: config.required_rsa_size,
+        user_certificates,
     })
 }
 
 #[derive(Debug)]
 struct EffectiveSshConfig {
     user: String,
+    hostname: String,
+    port: u16,
+    host_key_alias: Option<String>,
+    proxy_jump: Option<String>,
     lookup: String,
     files: Vec<PathBuf>,
+    host_key_algorithms: Vec<String>,
+    required_rsa_size: usize,
+    certificate_files: Vec<String>,
 }
 
 fn parse_ssh_config(output: &[u8]) -> Result<EffectiveSshConfig> {
@@ -121,7 +162,11 @@ fn parse_ssh_config(output: &[u8]) -> Result<EffectiveSshConfig> {
     let mut hostname = None;
     let mut port = None;
     let mut hostkey_alias = None;
+    let mut proxy_jump = None;
     let mut files = Vec::new();
+    let mut host_key_algorithms = None;
+    let mut required_rsa_size = None;
+    let mut certificate_files = Vec::new();
     for line in output.lines() {
         let Some((name, value)) = line.split_once(' ') else {
             continue;
@@ -132,6 +177,33 @@ fn parse_ssh_config(output: &[u8]) -> Result<EffectiveSshConfig> {
             "hostname" => hostname = Some(value.to_string()),
             "port" => port = Some(value.parse::<u16>().context("invalid SSH port")?),
             "hostkeyalias" if value != "none" => hostkey_alias = Some(value.to_string()),
+            "proxyjump" if value != "none" => proxy_jump = Some(value.to_string()),
+            "hostkeyalgorithms" => {
+                let algorithms: Vec<_> = value
+                    .split(',')
+                    .filter(|algorithm| !algorithm.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if algorithms.is_empty() {
+                    bail!("empty HostKeyAlgorithms in `ssh -G` output");
+                }
+                host_key_algorithms = Some(algorithms);
+            }
+            "requiredrsasize" => {
+                required_rsa_size =
+                    Some(value.parse::<usize>().context("invalid RequiredRSASize")?);
+            }
+            "knownhostscommand" if value != "none" => {
+                bail!(
+                    "KnownHostsCommand is configured as {value:?}; constrained agent forwarding cannot safely reproduce dynamic OpenSSH host-key policy"
+                );
+            }
+            "revokedhostkeys" if value != "none" => {
+                bail!(
+                    "RevokedHostKeys is configured as {value:?}; constrained agent forwarding does not yet query OpenSSH KRL revocations"
+                );
+            }
+            "certificatefile" if value != "none" => certificate_files.push(value.to_string()),
             "userknownhostsfile" | "globalknownhostsfile" => {
                 for path in value
                     .split_ascii_whitespace()
@@ -153,18 +225,243 @@ fn parse_ssh_config(output: &[u8]) -> Result<EffectiveSshConfig> {
         .filter(|value| !value.is_empty())
         .context("missing SSH hostname")?;
     let port = port.context("missing SSH port")?;
-    let lookup = match hostkey_alias {
-        Some(alias) => alias,
-        None if port == 22 => hostname,
+    let lookup = match &hostkey_alias {
+        Some(alias) => alias.clone(),
+        None if port == 22 => hostname.clone(),
         None => format!("[{hostname}]:{port}"),
     };
     files.sort();
     files.dedup();
     Ok(EffectiveSshConfig {
         user,
+        hostname,
+        port,
+        host_key_alias: hostkey_alias,
+        proxy_jump,
         lookup,
         files,
+        host_key_algorithms: host_key_algorithms.context("missing SSH HostKeyAlgorithms")?,
+        required_rsa_size: required_rsa_size.context("missing SSH RequiredRSASize")?,
+        certificate_files,
     })
+}
+
+fn configured_host_key_allowed(config: &EffectiveSshConfig, key: &KeyData) -> bool {
+    if let Some(rsa) = key.rsa() {
+        let Some(modulus) = rsa.n.as_positive_bytes() else {
+            return false;
+        };
+        let bits = modulus
+            .first()
+            .map(|first| modulus.len() * 8 - first.leading_zeros() as usize)
+            .unwrap_or(0);
+        if bits < config.required_rsa_size {
+            return false;
+        }
+        return config.host_key_algorithms.iter().any(|algorithm| {
+            matches!(
+                algorithm.as_str(),
+                "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512"
+            )
+        });
+    }
+    let algorithm = key.algorithm();
+    config
+        .host_key_algorithms
+        .iter()
+        .any(|allowed| allowed == algorithm.as_str())
+}
+
+fn certificate_paths(config: &EffectiveSshConfig, original_host: &str) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for configured in &config.certificate_files {
+        let expanded = expand_certificate_path(configured, config, original_host)
+            .with_context(|| format!("expand CertificateFile {configured:?}"))?;
+        if !paths.contains(&expanded) {
+            paths.push(expanded);
+        }
+    }
+    Ok(paths)
+}
+
+fn expand_certificate_path(
+    configured: &str,
+    config: &EffectiveSshConfig,
+    original_host: &str,
+) -> Result<PathBuf> {
+    let configured = expand_environment(configured)?;
+    let needs_account = configured == "~"
+        || configured.starts_with("~/")
+        || configured.contains("%d")
+        || configured.contains("%u");
+    let account = needs_account
+        .then(local_account)
+        .transpose()?
+        .unwrap_or_default();
+    let home = account.home;
+    let configured = if configured == "~" {
+        home.clone()
+    } else if let Some(rest) = configured.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else if configured.starts_with('~') {
+        bail!("CertificateFile uses an unsupported named-user tilde");
+    } else {
+        configured
+    };
+
+    let host_key_name = config.host_key_alias.as_deref().unwrap_or(original_host);
+    let mut expanded = String::with_capacity(configured.len());
+    let mut chars = configured.chars();
+    while let Some(character) = chars.next() {
+        if character != '%' {
+            expanded.push(character);
+            continue;
+        }
+        let token = chars.next().context("trailing '%' in CertificateFile")?;
+        match token {
+            '%' => expanded.push('%'),
+            'd' => expanded.push_str(&home),
+            'h' => expanded.push_str(&config.hostname),
+            'i' => expanded.push_str(&unsafe { libc::getuid() }.to_string()),
+            'j' => expanded.push_str(config.proxy_jump.as_deref().unwrap_or("")),
+            'k' => expanded.push_str(host_key_name),
+            'L' => {
+                let hostname = local_hostname()?;
+                expanded.push_str(
+                    hostname
+                        .split_once('.')
+                        .map_or(hostname.as_str(), |(short, _)| short),
+                );
+            }
+            'l' => expanded.push_str(&local_hostname()?),
+            'n' => expanded.push_str(original_host),
+            'p' => expanded.push_str(&config.port.to_string()),
+            'r' => expanded.push_str(&config.user),
+            'u' => expanded.push_str(&account.username),
+            'C' => bail!(
+                "CertificateFile uses OpenSSH's %C connection hash, which syq cannot reproduce safely"
+            ),
+            other => bail!("unsupported CertificateFile token %{other}"),
+        }
+    }
+    Ok(PathBuf::from(expanded))
+}
+
+#[derive(Default)]
+struct LocalAccount {
+    username: String,
+    home: String,
+}
+
+fn local_account() -> Result<LocalAccount> {
+    const MAX_ACCOUNT_BUFFER: usize = 1024 * 1024;
+
+    let uid = unsafe { libc::getuid() };
+    let configured_size = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut size = if configured_size > 0 {
+        configured_size as usize
+    } else {
+        16 * 1024
+    }
+    .clamp(1024, MAX_ACCOUNT_BUFFER);
+    loop {
+        let mut entry = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0u8; size];
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && size < MAX_ACCOUNT_BUFFER {
+            size = size.saturating_mul(2).min(MAX_ACCOUNT_BUFFER);
+            continue;
+        }
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status)).context("look up local SSH user");
+        }
+        if result.is_null() {
+            bail!("local SSH user for uid {uid} was not found");
+        }
+        if entry.pw_name.is_null() || entry.pw_dir.is_null() {
+            bail!("local SSH account record for uid {uid} was incomplete");
+        }
+        let username = unsafe { CStr::from_ptr(entry.pw_name) }
+            .to_str()
+            .context("local SSH username was not UTF-8")?
+            .to_string();
+        let home = unsafe { CStr::from_ptr(entry.pw_dir) }
+            .to_str()
+            .context("local SSH home directory was not UTF-8")?
+            .to_string();
+        return Ok(LocalAccount { username, home });
+    }
+}
+
+fn expand_environment(configured: &str) -> Result<String> {
+    let mut expanded = String::with_capacity(configured.len());
+    let mut rest = configured;
+    while let Some(start) = rest.find("${") {
+        expanded.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .context("unterminated environment variable in CertificateFile")?;
+        let name = &after[..end];
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        {
+            bail!("invalid environment variable in CertificateFile");
+        }
+        let value = std::env::var(name)
+            .with_context(|| format!("CertificateFile environment variable {name} is unset"))?;
+        expanded.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    expanded.push_str(rest);
+    Ok(expanded)
+}
+
+fn local_hostname() -> Result<String> {
+    let mut bytes = [0u8; 256];
+    if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return Err(io::Error::last_os_error()).context("read local hostname");
+    }
+    let length = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("local hostname exceeded 255 bytes")?;
+    String::from_utf8(bytes[..length].to_vec()).context("local hostname was not UTF-8")
+}
+
+fn read_user_certificates(paths: &[PathBuf]) -> Result<Vec<Certificate>> {
+    let mut certificates = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let certificate = Certificate::read_file(path)
+            .with_context(|| format!("read user CertificateFile {}", path.display()))?;
+        if certificate.cert_type() != CertType::User {
+            bail!(
+                "CertificateFile {} is not a user certificate",
+                path.display()
+            );
+        }
+        certificate
+            .verify_signature()
+            .with_context(|| format!("verify CertificateFile {}", path.display()))?;
+        if !certificates.contains(&certificate) {
+            certificates.push(certificate);
+        }
+    }
+    Ok(certificates)
 }
 
 fn ssh_keygen_for(ssh_program: &str) -> OsString {
@@ -286,17 +583,24 @@ impl std::fmt::Debug for ConstrainedAgentBroker {
 }
 
 impl ConstrainedAgentBroker {
-    pub fn start(policy: BrokerPolicy) -> Result<Self> {
+    pub fn start(policy: BrokerPolicy, max_connections: usize) -> Result<Self> {
         let ambient = std::env::var_os("SSH_AUTH_SOCK")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .context(
                 "SSH_AUTH_SOCK is not set; constrained direct remote-to-remote authentication needs a local SSH agent (or use --relay/--no-forward-agent)",
             )?;
-        Self::start_with_socket(ambient, policy)
+        Self::start_with_socket(ambient, policy, max_connections)
     }
 
-    fn start_with_socket(ambient_socket: PathBuf, policy: BrokerPolicy) -> Result<Self> {
+    fn start_with_socket(
+        ambient_socket: PathBuf,
+        policy: BrokerPolicy,
+        max_connections: usize,
+    ) -> Result<Self> {
+        if max_connections == 0 {
+            bail!("constrained agent broker needs at least one connection slot");
+        }
         if !ambient_socket.is_absolute() {
             bail!("SSH_AUTH_SOCK must be an absolute Unix socket path");
         }
@@ -334,6 +638,7 @@ impl ConstrainedAgentBroker {
                     listener,
                     thread_ambient,
                     policy,
+                    max_connections,
                     thread_shutdown,
                     thread_connections,
                 )
@@ -391,6 +696,7 @@ fn accept_connections(
     listener: UnixListener,
     ambient_socket: PathBuf,
     policy: Arc<BrokerPolicy>,
+    max_connections: usize,
     shutdown: Arc<AtomicBool>,
     connections: Arc<ConnectionRegistry>,
 ) {
@@ -399,7 +705,7 @@ fn accept_connections(
         reap_workers(&mut workers);
         match listener.accept() {
             Ok((stream, _)) => {
-                if workers.len() >= MAX_BROKER_CONNECTIONS {
+                if workers.len() >= max_connections {
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
@@ -525,10 +831,8 @@ impl BindState {
             .verify_signature()
             .context("invalid session-bind host-key signature")?;
         match self.bindings.len() {
-            0 if binding.is_forwarding && policy.delegate.host_keys.contains(&binding.host_key) => {
-            }
-            1 if !binding.is_forwarding
-                && policy.destination.host_keys.contains(&binding.host_key) => {}
+            0 if binding.is_forwarding && policy.delegate.authorizes_binding(&binding) => {}
+            1 if !binding.is_forwarding && policy.destination.authorizes_binding(&binding) => {}
             0 => bail!(
                 "first session-bind did not identify trusted delegate {}",
                 policy.delegate.known_hosts_name
@@ -596,6 +900,7 @@ fn serve_client(
 ) -> Result<()> {
     let mut state = BindState::default();
     let mut upstream: Option<TrackedStream> = None;
+    let mut ambient_identities: Option<Vec<Identity>> = None;
     while let Some(frame) = read_frame(&mut downstream)? {
         let Some(message_id) = frame.first().copied() else {
             break;
@@ -606,9 +911,14 @@ fn serve_client(
                     &mut upstream,
                     ambient_socket,
                     &connections,
+                    &state.bindings,
                     &frame,
                     UpstreamResponse::Identities,
                 )?;
+                let identities = decode_identities_response(&response)?;
+                ambient_identities = Some(identities.clone());
+                let response =
+                    add_configured_certificates(identities, &policy.destination.user_certificates)?;
                 write_frame(&mut downstream, &response)?;
             }
             13 => {
@@ -621,18 +931,66 @@ fn serve_client(
                     write_frame(&mut downstream, SSH_AGENT_FAILURE)?;
                     break;
                 }
+                if ambient_identities.is_none() {
+                    let response = upstream_request(
+                        &mut upstream,
+                        ambient_socket,
+                        &connections,
+                        &state.bindings,
+                        &[11],
+                        UpstreamResponse::Identities,
+                    )?;
+                    ambient_identities = Some(decode_identities_response(&response)?);
+                }
+                if authorize_selected_credential(
+                    &request.credential,
+                    &policy.destination.user_certificates,
+                )
+                .is_err()
+                {
+                    write_frame(&mut downstream, SSH_AGENT_FAILURE)?;
+                    break;
+                }
+                let upstream_frame = translated_sign_request(
+                    &request,
+                    ambient_identities.as_deref().unwrap_or_default(),
+                    &policy.destination.user_certificates,
+                )?;
                 let response = upstream_request(
                     &mut upstream,
                     ambient_socket,
                     &connections,
-                    &frame,
+                    &state.bindings,
+                    &upstream_frame,
                     UpstreamResponse::Signature,
                 )?;
+                if verify_agent_sign_response(
+                    &response,
+                    request.credential.key_data(),
+                    &request.data,
+                )
+                .is_err()
+                {
+                    write_frame(&mut downstream, SSH_AGENT_FAILURE)?;
+                    break;
+                }
                 write_frame(&mut downstream, &response)?;
             }
             27 => {
                 let binding = parse_session_bind(&frame);
-                match binding.and_then(|binding| state.add(policy, binding)) {
+                match binding.and_then(|binding| {
+                    state.add(policy, binding)?;
+                    if let Some(stream) = upstream.as_mut() {
+                        replay_session_bind(
+                            stream,
+                            state
+                                .bindings
+                                .last()
+                                .context("missing validated session-bind")?,
+                        )?;
+                    }
+                    Ok(())
+                }) {
                     Ok(()) => write_frame(&mut downstream, SSH_AGENT_SUCCESS)?,
                     Err(_) => {
                         write_frame(&mut downstream, SSH_AGENT_EXTENSION_FAILURE)?;
@@ -692,6 +1050,7 @@ fn upstream_request(
     upstream: &mut Option<TrackedStream>,
     ambient_socket: &Path,
     connections: &Arc<ConnectionRegistry>,
+    bindings: &[SessionBind],
     request: &[u8],
     expected: UpstreamResponse,
 ) -> Result<Vec<u8>> {
@@ -702,13 +1061,154 @@ fn upstream_request(
                 ambient_socket.display()
             )
         })?;
-        *upstream = Some(connections.track(stream)?);
+        let mut stream = connections.track(stream)?;
+        for binding in bindings {
+            replay_session_bind(&mut stream, binding)?;
+        }
+        *upstream = Some(stream);
     }
     let stream = upstream.as_mut().context("ambient SSH agent unavailable")?;
     write_frame(stream, request)?;
     let response = read_frame(stream)?.context("ambient SSH agent closed without a response")?;
     validate_upstream_response(&response, expected)?;
     Ok(response)
+}
+
+fn replay_session_bind(stream: &mut TrackedStream, binding: &SessionBind) -> Result<()> {
+    let request = Request::Extension(Extension::new_message(binding.clone())?);
+    let mut frame = Vec::new();
+    request.encode(&mut frame)?;
+    write_frame(stream, &frame)?;
+    let response = read_frame(stream)?.context("ambient SSH agent closed during session-bind")?;
+    let mut input = response.as_slice();
+    let response = Response::decode(&mut input).context("decode ambient session-bind response")?;
+    if !input.is_empty() {
+        bail!("trailing bytes in ambient session-bind response");
+    }
+    match response {
+        // OpenSSH accepts and enforces the binding. Agents that do not
+        // implement session-bind commonly reject it but remain usable; syq's
+        // own broker policy is still mandatory for every downstream request.
+        Response::Success | Response::Failure | Response::ExtensionFailure => Ok(()),
+        _ => bail!("ambient agent returned an unexpected session-bind response"),
+    }
+}
+
+fn decode_identities_response(frame: &[u8]) -> Result<Vec<Identity>> {
+    let mut input = frame;
+    let response = Response::decode(&mut input).context("decode ambient identities response")?;
+    if !input.is_empty() {
+        bail!("trailing bytes in ambient identities response");
+    }
+    match response {
+        Response::IdentitiesAnswer(identities) => Ok(identities),
+        Response::Failure => Ok(Vec::new()),
+        _ => bail!("ambient agent returned an unexpected identities response"),
+    }
+}
+
+fn add_configured_certificates(
+    identities: Vec<Identity>,
+    certificates: &[Certificate],
+) -> Result<Vec<u8>> {
+    let ambient_raw_keys: Vec<_> = identities
+        .iter()
+        .filter_map(|identity| match &identity.credential {
+            PublicCredential::Key(key) => Some(key.clone()),
+            PublicCredential::Cert(_) => None,
+        })
+        .collect();
+    let mut identities: Vec<_> = identities
+        .into_iter()
+        .filter(|identity| {
+            let covered = certificates
+                .iter()
+                .any(|certificate| certificate.public_key() == identity.credential.key_data());
+            !covered
+                || certificates.iter().any(|certificate| {
+                    identity.credential == PublicCredential::Cert(Box::new(certificate.clone()))
+                })
+        })
+        .collect();
+    for certificate in certificates {
+        let credential = PublicCredential::Cert(Box::new(certificate.clone()));
+        if identities
+            .iter()
+            .any(|identity| identity.credential == credential)
+        {
+            continue;
+        }
+        if ambient_raw_keys.contains(certificate.public_key()) {
+            identities.push(Identity {
+                credential,
+                comment: format!("syq CertificateFile {}", certificate.key_id()),
+            });
+        }
+    }
+    let mut frame = Vec::new();
+    Response::IdentitiesAnswer(identities).encode(&mut frame)?;
+    Ok(frame)
+}
+
+fn authorize_selected_credential(
+    credential: &PublicCredential,
+    certificates: &[Certificate],
+) -> Result<()> {
+    let covered_by_certificate_file = certificates
+        .iter()
+        .any(|certificate| certificate.public_key() == credential.key_data());
+    match credential {
+        PublicCredential::Key(_) if covered_by_certificate_file => {
+            bail!("raw key is covered by a configured CertificateFile")
+        }
+        PublicCredential::Cert(certificate)
+            if covered_by_certificate_file && !certificates.contains(certificate.as_ref()) =>
+        {
+            bail!("certificate was not an exact configured CertificateFile")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn translated_sign_request(
+    request: &SignRequest,
+    ambient_identities: &[Identity],
+    certificates: &[Certificate],
+) -> Result<Vec<u8>> {
+    let mut translated = request.clone();
+    if let PublicCredential::Cert(certificate) = &request.credential {
+        let ambient_has_exact_certificate = ambient_identities
+            .iter()
+            .any(|identity| identity.credential == request.credential);
+        let configured_locally = certificates.contains(certificate.as_ref());
+        let ambient_has_raw_key = ambient_identities.iter().any(|identity| {
+            matches!(
+                &identity.credential,
+                PublicCredential::Key(key) if key == certificate.public_key()
+            )
+        });
+        if !ambient_has_exact_certificate && configured_locally && ambient_has_raw_key {
+            translated.credential = PublicCredential::Key(certificate.public_key().clone());
+        }
+    }
+    let mut frame = Vec::new();
+    Request::SignRequest(translated).encode(&mut frame)?;
+    Ok(frame)
+}
+
+fn verify_agent_sign_response(frame: &[u8], key: &KeyData, data: &[u8]) -> Result<()> {
+    let mut input = frame;
+    let response = Response::decode(&mut input).context("decode ambient signature response")?;
+    if !input.is_empty() {
+        bail!("trailing bytes in ambient signature response");
+    }
+    match response {
+        Response::SignResponse(signature) => key
+            .verify(data, &signature)
+            .context("ambient agent returned an invalid signature"),
+        Response::Failure => Ok(()),
+        _ => bail!("ambient agent returned an unexpected signature response"),
+    }
 }
 
 fn validate_upstream_response(frame: &[u8], expected: UpstreamResponse) -> Result<()> {
@@ -869,6 +1369,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Instant;
 
+    const TEST_BROKER_CONNECTIONS: usize = 4;
+
     fn key(seed: u8) -> (Ed25519Keypair, KeyData) {
         let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
         let public = KeyData::Ed25519(keypair.public);
@@ -876,10 +1378,14 @@ mod tests {
     }
 
     fn host_policy(user: &str, name: &str, key: KeyData) -> HostPolicy {
+        let algorithm = key.algorithm().as_str().to_string();
         HostPolicy {
             login_user: user.into(),
             host_keys: vec![key],
             known_hosts_name: name.into(),
+            host_key_algorithms: vec![algorithm],
+            required_rsa_size: 1024,
+            user_certificates: Vec::new(),
         }
     }
 
@@ -927,7 +1433,11 @@ mod tests {
             value.encode(&mut data).unwrap();
         }
         data.push(1);
-        b"ssh-ed25519".as_slice().encode(&mut data).unwrap();
+        let algorithm = match credential {
+            PublicCredential::Key(key) => key.algorithm().as_str().to_string(),
+            PublicCredential::Cert(certificate) => certificate.algorithm().to_certificate_type(),
+        };
+        algorithm.as_bytes().encode(&mut data).unwrap();
         credential_blob.as_slice().encode(&mut data).unwrap();
         host_key_blob.as_slice().encode(&mut data).unwrap();
         data
@@ -940,13 +1450,37 @@ mod tests {
         identity: KeyData,
         host_key: &KeyData,
     ) -> SignRequest {
-        let credential = identity.into();
+        sign_request_for_credential(session_id, user, method, identity.into(), host_key)
+    }
+
+    fn sign_request_for_credential(
+        session_id: &[u8],
+        user: &[u8],
+        method: &[u8],
+        credential: PublicCredential,
+        host_key: &KeyData,
+    ) -> SignRequest {
         let data = hostbound_data(session_id, user, method, &credential, host_key);
         SignRequest {
             credential,
             data,
             flags: 0,
         }
+    }
+
+    fn user_certificate(subject: &KeyData, ca_seed: u8, key_id: &str) -> Certificate {
+        let ca =
+            ssh_agent_lib::ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[ca_seed; 32]));
+        let mut builder = ssh_agent_lib::ssh_key::certificate::Builder::new(
+            vec![ca_seed; 16],
+            subject.clone(),
+            0,
+            4_000_000_000,
+        )
+        .unwrap();
+        builder.key_id(key_id).unwrap();
+        builder.valid_principal("backup").unwrap();
+        builder.sign(&ca).unwrap()
     }
 
     fn read_response(stream: &mut UnixStream) -> Response {
@@ -981,6 +1515,7 @@ mod tests {
             while let Some(frame) = read_frame(&mut stream).unwrap() {
                 sent.send(frame.clone()).unwrap();
                 let response = match frame.first() {
+                    Some(27) => Response::ExtensionFailure,
                     Some(11) => Response::IdentitiesAnswer(vec![Identity {
                         credential: KeyData::Ed25519(identity.public).into(),
                         comment: "hardware-backed test key".into(),
@@ -1002,11 +1537,12 @@ mod tests {
     #[test]
     fn parses_effective_host_lookup_and_files() {
         let config = parse_ssh_config(
-            b"host alias\nuser backup\nhostname vault.internal\nport 2222\nuserknownhostsfile /tmp/one /tmp/two\nglobalknownhostsfile none\n",
+            b"host alias\nuser backup\nhostname vault.internal\nport 2222\nuserknownhostsfile /tmp/one /tmp/two\nglobalknownhostsfile none\nhostkeyalgorithms ssh-ed25519,rsa-sha2-512\nrequiredrsasize 3072\n",
         )
         .unwrap();
         assert_eq!(config.user, "backup");
         assert_eq!(config.lookup, "[vault.internal]:2222");
+        assert_eq!(config.required_rsa_size, 3072);
         assert_eq!(
             config.files,
             [PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
@@ -1016,10 +1552,159 @@ mod tests {
     #[test]
     fn host_key_alias_is_used_verbatim() {
         let config = parse_ssh_config(
-            b"user backup\nhostname vault.internal\nport 2222\nhostkeyalias stable-vault\nuserknownhostsfile /tmp/known\n",
+            b"user backup\nhostname vault.internal\nport 2222\nhostkeyalias stable-vault\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\nrequiredrsasize 1024\n",
         )
         .unwrap();
         assert_eq!(config.lookup, "stable-vault");
+    }
+
+    #[test]
+    fn dynamic_and_external_revocation_host_policies_fail_closed() {
+        for policy in [
+            "knownhostscommand /usr/local/bin/known-host %h",
+            "revokedhostkeys /etc/ssh/revoked.krl",
+        ] {
+            let config = format!(
+                "user backup\nhostname vault.internal\nport 22\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\nrequiredrsasize 1024\n{policy}\n"
+            );
+            let error = parse_ssh_config(config.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("constrained agent forwarding"));
+        }
+    }
+
+    #[test]
+    fn host_key_algorithms_and_required_rsa_size_are_enforced() {
+        use ssh_agent_lib::ssh_key::{public::RsaPublicKey, Mpint};
+
+        let config = parse_ssh_config(
+            b"user backup\nhostname vault.internal\nport 22\nuserknownhostsfile /tmp/known\nhostkeyalgorithms rsa-sha2-512\nrequiredrsasize 3072\n",
+        )
+        .unwrap();
+        let rsa = KeyData::Rsa(RsaPublicKey {
+            e: Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+            n: Mpint::from_positive_bytes(&[0x80; 256]).unwrap(),
+        });
+        assert!(!configured_host_key_allowed(&config, &rsa));
+        let mut config = config;
+        config.required_rsa_size = 2048;
+        assert!(configured_host_key_allowed(&config, &rsa));
+        let (_, ed25519) = key(50);
+        assert!(!configured_host_key_allowed(&config, &ed25519));
+    }
+
+    #[test]
+    fn certificate_paths_expand_effective_remote_tokens() {
+        let config = parse_ssh_config(
+            b"user backup\nhostname vault.internal\nport 2222\nhostkeyalias stable-vault\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\nrequiredrsasize 1024\ncertificatefile /tmp/%r@%h:%p-%k-%n-cert.pub\n",
+        )
+        .unwrap();
+        assert_eq!(
+            certificate_paths(&config, "vault-alias").unwrap(),
+            [PathBuf::from(
+                "/tmp/backup@vault.internal:2222-stable-vault-vault-alias-cert.pub"
+            )]
+        );
+    }
+
+    #[test]
+    fn configured_certificate_is_advertised_and_translated_only_for_its_raw_key() {
+        let (raw_private, raw_key) = key(61);
+        let certificate = user_certificate(&raw_key, 62, "central-cert");
+        let ambient = vec![Identity {
+            credential: PublicCredential::Key(raw_key.clone()),
+            comment: "YubiKey raw key".into(),
+        }];
+        let response =
+            add_configured_certificates(ambient.clone(), std::slice::from_ref(&certificate))
+                .unwrap();
+        let advertised = decode_identities_response(&response).unwrap();
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(
+            advertised[0].credential,
+            PublicCredential::Cert(Box::new(certificate.clone()))
+        );
+        assert!(authorize_selected_credential(
+            &PublicCredential::Key(raw_key.clone()),
+            std::slice::from_ref(&certificate)
+        )
+        .is_err());
+
+        let request = SignRequest {
+            credential: PublicCredential::Cert(Box::new(certificate.clone())),
+            data: b"host-bound request containing the exact certificate".to_vec(),
+            flags: 0,
+        };
+        let translated =
+            translated_sign_request(&request, &ambient, std::slice::from_ref(&certificate))
+                .unwrap();
+        let translated = parse_sign_request(&translated).unwrap();
+        assert_eq!(
+            translated.credential,
+            PublicCredential::Key(raw_key.clone())
+        );
+        assert_eq!(translated.data, request.data);
+        authorize_selected_credential(&request.credential, std::slice::from_ref(&certificate))
+            .unwrap();
+        let mut valid_response = Vec::new();
+        Response::SignResponse(raw_private.try_sign(&request.data).unwrap())
+            .encode(&mut valid_response)
+            .unwrap();
+        verify_agent_sign_response(&valid_response, &raw_key, &request.data).unwrap();
+        let (wrong_private, _) = key(64);
+        let mut invalid_response = Vec::new();
+        Response::SignResponse(wrong_private.try_sign(&request.data).unwrap())
+            .encode(&mut invalid_response)
+            .unwrap();
+        assert!(verify_agent_sign_response(&invalid_response, &raw_key, &request.data).is_err());
+
+        let (source_private, source) = key(65);
+        let (destination_private, destination) = key(66);
+        let mut broker_policy = policy(source.clone(), destination.clone());
+        broker_policy.destination.user_certificates = vec![certificate.clone()];
+        let mut state = BindState::default();
+        state
+            .add(
+                &broker_policy,
+                binding(&source_private, source, b"source-cert-session", true),
+            )
+            .unwrap();
+        state
+            .add(
+                &broker_policy,
+                binding(
+                    &destination_private,
+                    destination.clone(),
+                    b"destination-cert-session",
+                    false,
+                ),
+            )
+            .unwrap();
+        let certificate_request = sign_request_for_credential(
+            b"destination-cert-session",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            PublicCredential::Cert(Box::new(certificate.clone())),
+            &destination,
+        );
+        state
+            .authorize(&broker_policy, &certificate_request)
+            .unwrap();
+        let mut mismatched_outer = certificate_request.clone();
+        mismatched_outer.credential = PublicCredential::Key(raw_key.clone());
+        assert!(state.authorize(&broker_policy, &mismatched_outer).is_err());
+
+        let unrelated = user_certificate(&raw_key, 63, "not-configured");
+        let request = SignRequest {
+            credential: PublicCredential::Cert(Box::new(unrelated.clone())),
+            data: Vec::new(),
+            flags: 0,
+        };
+        assert!(authorize_selected_credential(&request.credential, &[certificate]).is_err());
+        let untranslated = translated_sign_request(&request, &ambient, &[]).unwrap();
+        assert_eq!(
+            parse_sign_request(&untranslated).unwrap().credential,
+            request.credential
+        );
     }
 
     #[test]
@@ -1099,6 +1784,20 @@ mod tests {
         let (destination_private, destination) = key(2);
         let (other_private, other) = key(3);
         let policy = policy(source.clone(), destination.clone());
+
+        let mut disallowed_algorithm = policy.clone();
+        disallowed_algorithm.delegate.host_key_algorithms = vec!["rsa-sha2-512".into()];
+        assert!(BindState::default()
+            .add(
+                &disallowed_algorithm,
+                binding(
+                    &source_private,
+                    source.clone(),
+                    b"disallowed-algorithm",
+                    true,
+                ),
+            )
+            .is_err());
 
         let mut state = BindState::default();
         assert!(state
@@ -1220,6 +1919,7 @@ mod tests {
         let broker = ConstrainedAgentBroker::start_with_socket(
             ambient_socket,
             policy(source.clone(), destination.clone()),
+            TEST_BROKER_CONNECTIONS,
         )
         .unwrap();
         let broker_path = broker.socket_path().to_path_buf();
@@ -1233,11 +1933,8 @@ mod tests {
         );
         let mut client = UnixStream::connect(&broker_path).unwrap();
 
-        write_frame(
-            &mut client,
-            &bind_request(binding(&source_private, source, b"source-session", true)),
-        )
-        .unwrap();
+        let source_bind = bind_request(binding(&source_private, source, b"source-session", true));
+        write_frame(&mut client, &source_bind).unwrap();
         assert!(matches!(read_response(&mut client), Response::Success));
 
         write_frame(&mut client, &[11]).unwrap();
@@ -1246,19 +1943,18 @@ mod tests {
         };
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].comment, "hardware-backed test key");
+        assert_eq!(requests.recv().unwrap(), source_bind);
         assert_eq!(requests.recv().unwrap(), vec![11]);
 
-        write_frame(
-            &mut client,
-            &bind_request(binding(
-                &destination_private,
-                destination.clone(),
-                b"destination-session",
-                false,
-            )),
-        )
-        .unwrap();
+        let destination_bind = bind_request(binding(
+            &destination_private,
+            destination.clone(),
+            b"destination-session",
+            false,
+        ));
+        write_frame(&mut client, &destination_bind).unwrap();
         assert!(matches!(read_response(&mut client), Response::Success));
+        assert_eq!(requests.recv().unwrap(), destination_bind);
         let request = sign_request(
             b"destination-session",
             b"backup",
@@ -1291,6 +1987,7 @@ mod tests {
         let broker = ConstrainedAgentBroker::start_with_socket(
             ambient_socket,
             policy(source, destination.clone()),
+            TEST_BROKER_CONNECTIONS,
         )
         .unwrap();
 
@@ -1338,12 +2035,15 @@ mod tests {
         let _ambient = UnixListener::bind(&ambient_socket).unwrap();
         let (_, source) = key(41);
         let (_, destination) = key(42);
-        let broker =
-            ConstrainedAgentBroker::start_with_socket(ambient_socket, policy(source, destination))
-                .unwrap();
+        let broker = ConstrainedAgentBroker::start_with_socket(
+            ambient_socket,
+            policy(source, destination),
+            TEST_BROKER_CONNECTIONS,
+        )
+        .unwrap();
         let path = broker.socket_path().to_path_buf();
         let mut clients = Vec::new();
-        for _ in 0..MAX_BROKER_CONNECTIONS {
+        for _ in 0..TEST_BROKER_CONNECTIONS {
             let mut client = UnixStream::connect(&path).unwrap();
             client.write_all(&[0]).unwrap(); // keep each worker waiting on its header
             clients.push(client);
@@ -1355,7 +2055,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
-            < MAX_BROKER_CONNECTIONS
+            < TEST_BROKER_CONNECTIONS
             && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(5));
@@ -1367,7 +2067,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .len(),
-            MAX_BROKER_CONNECTIONS
+            TEST_BROKER_CONNECTIONS
         );
         let mut excess = UnixStream::connect(&path).unwrap();
         excess
