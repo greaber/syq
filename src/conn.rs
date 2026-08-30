@@ -1552,6 +1552,8 @@ mod tests {
             rdev: 0,
             dev: 0,
             ino: 0,
+            ctime: 0,
+            ctime_nsec: 0,
             link: None,
         }
     }

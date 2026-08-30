@@ -170,6 +170,14 @@ Placement is always explicit in this initial native surface:
 | `--as-new PATH` | Map one named source exactly to `PATH` | Must not exist |
 | `--as-existing PATH` | Map one named source exactly to `PATH` | Must exist |
 
+The receiver enforces `new` and `existing` again when it mutates the target,
+not only during planning. New targets use no-replace creation or publication.
+Existing containers must remain the same directory object; an exact existing
+regular file is updated through the object that passed preflight, preserving
+its inode (and therefore updating any hard-link aliases). An exact
+`--as-existing` operation that would change the target's type is refused; use
+`--as` when replacement is intended.
+
 `cp` copies or updates mapped source objects and keeps unrelated target
 objects. `cprm` uses the same mapping and transfer engine, then applies the
 existing safe deletion planner to remove target-only descendants in mapped
