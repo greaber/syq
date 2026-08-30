@@ -673,7 +673,8 @@ queueing disciplines. Without the option, every socket keeps its host's
 default. An explicit override that either kernel rejects is a fatal error with
 the affected host and kernel error; syq never silently substitutes another
 algorithm. If the TCP route itself is unreachable, the normal warned SSH
-fallback still applies and says that the requested algorithm was not used.
+fallback still applies and says that the requested algorithm is not used by
+the SSH fallback.
 
 The algorithm must be registered on both Linux hosts and available to the syq
 process. Unprivileged processes may choose only entries in

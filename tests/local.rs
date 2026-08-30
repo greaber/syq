@@ -1145,7 +1145,7 @@ fn ordinary_tcp_setup_failure_still_falls_back_with_congestion_notice() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("data over ssh"), "{stderr}");
     assert!(
-        stderr.contains("requested congestion control reno was not used"),
+        stderr.contains("requested congestion control reno is not used by the SSH fallback"),
         "{stderr}"
     );
 }

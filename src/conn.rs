@@ -82,7 +82,9 @@ pub(crate) fn is_tcp_congestion_error(error: &anyhow::Error) -> bool {
 
 pub(crate) fn tcp_congestion_fallback_note(requested: Option<&str>) -> String {
     requested
-        .map(|algorithm| format!("; requested congestion control {algorithm} was not used"))
+        .map(|algorithm| {
+            format!("; requested congestion control {algorithm} is not used by the SSH fallback")
+        })
         .unwrap_or_default()
 }
 
@@ -1786,11 +1788,11 @@ mod tests {
     }
 
     #[test]
-    fn tcp_fallback_note_reports_an_unused_override() {
+    fn tcp_fallback_note_scopes_the_unused_override_to_ssh() {
         assert_eq!(tcp_congestion_fallback_note(None), "");
         assert_eq!(
             tcp_congestion_fallback_note(Some("reno")),
-            "; requested congestion control reno was not used"
+            "; requested congestion control reno is not used by the SSH fallback"
         );
     }
 
