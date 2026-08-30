@@ -30,10 +30,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
+use std::path::{Component, Path};
 
 #[cfg(target_os = "linux")]
 const DIRECTORY_SEARCH_FLAGS: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
@@ -301,38 +298,129 @@ impl Root {
         cvt_zero(result).with_context(|| format!("create confined directory {}", path.label()))
     }
 
-    /// Create a directory under a private temporary name, open that exact
-    /// inode, then publish it without replacing anything. The returned
-    /// identity comes from the descriptor held across publication, never from
-    /// a later lookup of the public path.
-    pub(crate) fn create_directory_noreplace(
+    /// Create a directory whose explicit path may have missing parents.
+    /// Existing components are opened, and missing components are created,
+    /// relative to the preceding held directory descriptor. The identity of
+    /// the final directory therefore cannot be rebound through a later lookup
+    /// of any public ancestor pathname.
+    pub(crate) fn create_path_directory_noreplace(path: &Path, mode: u32) -> Result<RootIdentity> {
+        let mut components: Vec<_> = path.components().collect();
+        let mut current = if path.is_absolute() {
+            if matches!(components.first(), Some(Component::RootDir)) {
+                components.remove(0);
+            }
+            Self::open(Path::new("/"))?
+        } else {
+            Self::open(Path::new("."))?
+        };
+
+        let leaf = components
+            .pop()
+            .context("new container path has no leaf name")?;
+        let Component::Normal(leaf) = leaf else {
+            bail!("new container path must end in a normal path component");
+        };
+
+        for component in components {
+            current = match component {
+                Component::CurDir => continue,
+                Component::ParentDir => current.open_explicit_directory(b"..")?,
+                Component::Normal(name) => match current.open_explicit_directory(name.as_bytes()) {
+                    Ok(directory) => directory,
+                    Err(error) if is_not_found(&error) => {
+                        let directory = current.create_child_directory_noreplace(
+                            name.as_bytes(),
+                            0o777,
+                            "parent-directory",
+                        )?;
+                        hold_after_created_parent_for_test()?;
+                        directory
+                    }
+                    Err(error) => return Err(error),
+                },
+                Component::RootDir | Component::Prefix(_) => {
+                    bail!("unexpected root component in new container path")
+                }
+            };
+        }
+
+        current
+            .create_child_directory_noreplace(leaf.as_bytes(), mode, "new-directory")
+            .map(|directory| directory.identity)
+    }
+
+    fn open_explicit_directory(&self, component: &[u8]) -> Result<Self> {
+        let directory = open_at(
+            self.directory.as_raw_fd(),
+            &component_cstring(component),
+            DIRECTORY_SEARCH_FLAGS | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0,
+        )
+        .with_context(|| {
+            format!(
+                "open explicit directory component {}",
+                String::from_utf8_lossy(component)
+            )
+        })?;
+        Self::from_directory(directory).with_context(|| {
+            format!(
+                "validate explicit directory component {}",
+                String::from_utf8_lossy(component)
+            )
+        })
+    }
+
+    fn create_child_directory_noreplace(
         &self,
-        path: &RelativePath,
+        component: &[u8],
         mode: u32,
-    ) -> Result<RootIdentity> {
-        let parent = self.resolve_parent(path)?;
-        let (temporary, directory, identity) = create_temporary_directory(&parent, mode)?;
+        staging_label: &str,
+    ) -> Result<Self> {
+        if component.is_empty() || component == b"." || component == b".." || component.contains(&0)
+        {
+            bail!("invalid explicit directory component");
+        }
+        let leaf = component_cstring(component);
+        let (temporary, directory, identity) =
+            create_temporary_directory(self.directory.as_raw_fd(), mode, staging_label)?;
         if let Err(error) = rename_noreplace(
-            parent.directory.as_raw_fd(),
+            self.directory.as_raw_fd(),
             &temporary,
-            parent.directory.as_raw_fd(),
-            &parent.leaf,
+            self.directory.as_raw_fd(),
+            &leaf,
         ) {
-            // Do not unlink by name here. A hostile writer could replace even
-            // an unguessable staging name between validation and unlink. The
-            // empty recovery directory is safer than deleting an object syq
-            // did not create.
             drop(directory);
             return Err(error).with_context(|| {
                 format!(
-                    "publish new confined directory {} (staging directory {} retained)",
-                    path.label(),
+                    "publish explicit directory component {} (staging directory {} retained)",
+                    String::from_utf8_lossy(component),
                     String::from_utf8_lossy(temporary.as_bytes())
                 )
             });
         }
-        drop(directory);
-        Ok(identity)
+        let named = metadata_at(self.directory.as_raw_fd(), &leaf)
+            .context("verify published explicit directory component")?;
+        if named.dev != identity.dev || named.ino != identity.ino || !named.is_dir() {
+            bail!(
+                "explicit directory component {} changed during publication",
+                String::from_utf8_lossy(component)
+            );
+        }
+        Self::from_directory(directory)
+    }
+
+    fn from_directory(directory: File) -> Result<Self> {
+        let metadata = directory.metadata().context("stat held directory")?;
+        if !metadata.is_dir() {
+            bail!("held object is not a directory");
+        }
+        Ok(Self {
+            identity: RootIdentity {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            directory,
+        })
     }
 
     pub(crate) fn metadata(&self, path: &RelativePath) -> Result<RootMetadata> {
@@ -497,36 +585,87 @@ impl Root {
             );
         }
         hold_after_swap_precondition_for_test()?;
-        let temporary = create_temporary(&parent, create)?;
+        let (staging_name, staging_directory, staging_identity) =
+            create_temporary_directory(parent.directory.as_raw_fd(), 0o700, "swap-directory")?;
+        let replacement = random_staging_name("replacement")?;
+        create(staging_directory.as_raw_fd(), &replacement)
+            .context("create replacement in private staging directory")?;
+        let created = metadata_at(staging_directory.as_raw_fd(), &replacement)
+            .context("stat replacement in private staging directory")?;
+        hold_after_swap_sidecar_creation_for_test()?;
+        let named_before_exchange = metadata_at(staging_directory.as_raw_fd(), &replacement)
+            .context("restat replacement before publication")?;
+        if named_before_exchange.dev != created.dev
+            || named_before_exchange.ino != created.ino
+            || named_before_exchange.file_type() != created.file_type()
+        {
+            bail!(
+                "replacement for confined target {} changed before publication; recovery directory {} retained",
+                path.label(),
+                String::from_utf8_lossy(staging_name.as_bytes())
+            );
+        }
         if let Err(error) = rename_exchange(
-            parent.directory.as_raw_fd(),
-            &temporary,
+            staging_directory.as_raw_fd(),
+            &replacement,
             parent.directory.as_raw_fd(),
             &parent.leaf,
         ) {
-            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
-            return Err(error)
-                .with_context(|| format!("atomically replace confined path {}", path.label()));
+            return Err(error).with_context(|| {
+                format!(
+                    "atomically replace confined path {} (recovery directory {} retained)",
+                    path.label(),
+                    String::from_utf8_lossy(staging_name.as_bytes())
+                )
+            });
         }
-        let swapped = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
-        if swapped.dev != expected_dev
-            || swapped.ino != expected_ino
-            || swapped.file_type() != expected_type
+        let published = metadata_at(parent.directory.as_raw_fd(), &parent.leaf)?;
+        let displaced = metadata_at(staging_directory.as_raw_fd(), &replacement)?;
+        if published.dev != created.dev
+            || published.ino != created.ino
+            || published.file_type() != created.file_type()
+            || displaced.dev != expected_dev
+            || displaced.ino != expected_ino
+            || displaced.file_type() != expected_type
         {
             hold_after_swap_mismatch_for_test()?;
-            // A second exchange would be an unsafe rollback: another writer
-            // could replace the destination after the check, causing its new
-            // object to be displaced and then unlinked. Preserve the raced
-            // inode at the staging name and leave every later destination
-            // publication untouched.
             bail!(
-                "confined target {} changed during replacement; displaced object retained at {}",
+                "confined target {} changed during replacement; recovery directory {} retained",
                 path.label(),
-                String::from_utf8_lossy(temporary.as_bytes())
+                String::from_utf8_lossy(staging_name.as_bytes())
             );
         }
-        unlink_at(parent.directory.as_raw_fd(), &temporary, 0)
-            .with_context(|| format!("remove replaced confined path {}", path.label()))
+        hold_before_swap_cleanup_for_test()?;
+        let displaced_before_unlink = metadata_at(staging_directory.as_raw_fd(), &replacement)?;
+        if displaced_before_unlink.dev != expected_dev
+            || displaced_before_unlink.ino != expected_ino
+            || displaced_before_unlink.file_type() != expected_type
+        {
+            bail!(
+                "displaced confined target {} changed before cleanup; recovery directory {} retained",
+                path.label(),
+                String::from_utf8_lossy(staging_name.as_bytes())
+            );
+        }
+        unlink_at(staging_directory.as_raw_fd(), &replacement, 0)
+            .with_context(|| format!("remove displaced confined path {}", path.label()))?;
+        let named_staging = metadata_at(parent.directory.as_raw_fd(), &staging_name)
+            .context("verify replacement staging directory before cleanup")?;
+        if named_staging.dev != staging_identity.dev
+            || named_staging.ino != staging_identity.ino
+            || !named_staging.is_dir()
+        {
+            bail!(
+                "replacement staging directory for {} changed before cleanup",
+                path.label()
+            );
+        }
+        unlink_at(
+            parent.directory.as_raw_fd(),
+            &staging_name,
+            libc::AT_REMOVEDIR,
+        )
+        .with_context(|| format!("remove replacement staging directory for {}", path.label()))
     }
 
     /// Rename one leaf to another. Both parents are resolved and retained
@@ -637,6 +776,14 @@ fn cvt_zero(result: libc::c_int) -> io::Result<()> {
     }
 }
 
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+    })
+}
+
 fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     let result =
@@ -695,70 +842,45 @@ fn unlink_at(parent: RawFd, name: &CString, flags: libc::c_int) -> io::Result<()
     cvt_zero(unsafe { libc::unlinkat(parent, name.as_ptr(), flags) })
 }
 
-fn create_temporary(
-    parent: &ResolvedParent,
-    create: impl Fn(RawFd, &CString) -> io::Result<()>,
-) -> Result<CString> {
-    for _ in 0..32 {
-        let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
-        let name = CString::new(format!(".syq-swap-{}-{counter}", std::process::id()))
-            .expect("generated swap name contains no NUL");
-        match create(parent.directory.as_raw_fd(), &name) {
-            Ok(()) => return Ok(name),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error).context("create replacement sidecar"),
-        }
-    }
-    bail!("could not allocate a replacement sidecar name")
-}
-
 fn create_temporary_directory(
-    parent: &ResolvedParent,
+    parent: RawFd,
     mode: u32,
+    label: &str,
 ) -> Result<(CString, File, RootIdentity)> {
     for _ in 0..32 {
-        let mut random = [0u8; 16];
-        getrandom::fill(&mut random).context("generate new-directory staging name")?;
-        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let name = CString::new(format!(".syq-new-directory-{suffix}"))
-            .expect("generated directory name contains no NUL");
-        let result = unsafe {
-            libc::mkdirat(
-                parent.directory.as_raw_fd(),
-                name.as_ptr(),
-                (mode & 0o7777) as libc::mode_t,
-            )
-        };
+        let name = random_staging_name(label)?;
+        let result =
+            unsafe { libc::mkdirat(parent, name.as_ptr(), (mode & 0o7777) as libc::mode_t) };
         if result != 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::AlreadyExists {
                 continue;
             }
-            return Err(error).context("create new-directory staging inode");
+            return Err(error).with_context(|| format!("create {label} staging inode"));
         }
 
         // The unpredictable name prevents a target-path racer from selecting
         // this inode. Record it immediately, open it without following, and
         // require both names to agree before publication.
-        let created = metadata_at(parent.directory.as_raw_fd(), &name)
-            .context("stat new-directory staging inode")?;
+        let created =
+            metadata_at(parent, &name).with_context(|| format!("stat {label} staging inode"))?;
         let directory = open_at(
-            parent.directory.as_raw_fd(),
+            parent,
             &name,
             DIRECTORY_SEARCH_FLAGS | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         )
-        .context("open new-directory staging inode")?;
+        .with_context(|| format!("open {label} staging inode"))?;
         let opened = root_metadata(&directory.metadata()?);
-        let named = metadata_at(parent.directory.as_raw_fd(), &name)
-            .context("restat new-directory staging inode")?;
+        let named =
+            metadata_at(parent, &name).with_context(|| format!("restat {label} staging inode"))?;
         if !created.is_dir()
             || opened.dev != created.dev
             || opened.ino != created.ino
             || named.dev != created.dev
             || named.ino != created.ino
         {
-            bail!("new-directory staging inode changed before publication");
+            bail!("{label} staging inode changed before publication");
         }
         return Ok((
             name,
@@ -769,7 +891,14 @@ fn create_temporary_directory(
             },
         ));
     }
-    bail!("could not allocate a new-directory staging name")
+    bail!("could not allocate a {label} staging name")
+}
+
+fn random_staging_name(label: &str) -> Result<CString> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).with_context(|| format!("generate {label} staging name"))?;
+    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    CString::new(format!(".syq-{label}-{suffix}")).context("generated staging name contains NUL")
 }
 
 #[cfg(target_os = "linux")]
@@ -901,6 +1030,24 @@ fn hold_after_swap_precondition_for_test() -> Result<()> {
 }
 
 #[cfg(debug_assertions)]
+fn hold_after_swap_sidecar_creation_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_SWAP_SIDECAR_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_SWAP_SIDECAR_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_swap_sidecar_creation_for_test() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 fn hold_after_swap_mismatch_for_test() -> Result<()> {
     if let Some(ready) = std::env::var_os("SYQ_TEST_SWAP_MISMATCH_READY_FILE") {
         std::fs::write(&ready, b"ready")?;
@@ -915,6 +1062,42 @@ fn hold_after_swap_mismatch_for_test() -> Result<()> {
 
 #[cfg(not(debug_assertions))]
 fn hold_after_swap_mismatch_for_test() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn hold_before_swap_cleanup_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_SWAP_CLEANUP_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_SWAP_CLEANUP_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_before_swap_cleanup_for_test() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn hold_after_created_parent_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_CREATED_PARENT_READY_FILE") {
+        std::fs::write(&ready, b"ready")?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_CREATED_PARENT_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_after_created_parent_for_test() -> Result<()> {
     Ok(())
 }
 

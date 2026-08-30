@@ -1060,16 +1060,11 @@ impl FsOps {
 
     fn create_container(&mut self, path: &[u8], mode: u32) -> Result<ContainerGuard> {
         let target = resolve(path);
-        if let Some(parent) = target.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("create parent {}", parent.display()))?;
-            }
-        }
-        let (parent, relative) = exact_parent(&target)?;
         // The container has to remain writable while descendants are copied.
-        // Deferred directory metadata restores the requested final mode.
-        let identity = parent.create_directory_noreplace(&relative, (mode & 0o7777) | 0o700)?;
+        // Deferred directory metadata restores the requested final mode. The
+        // whole explicit path is walked through held descriptors, including
+        // parents that have to be created.
+        let identity = Root::create_path_directory_noreplace(&target, (mode & 0o7777) | 0o700)?;
         hold_after_created_container_for_test(&target)?;
         Ok(ContainerGuard {
             root: path.to_vec(),
