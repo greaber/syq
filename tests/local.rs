@@ -427,6 +427,72 @@ fn native_rm_is_idempotent_for_exact_duplicate_selectors() {
 }
 
 #[test]
+fn native_rm_deduplicates_relative_and_absolute_aliases() {
+    let t = Tmp::new();
+    for file in 0..1_000 {
+        write(&t.path(&format!("tree/file-{file}")), b"data");
+    }
+
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s(""),
+        "--src",
+        "tree",
+        "--src",
+        &t.s("tree"),
+    ]);
+
+    assert!(!t.path("tree").exists());
+}
+
+#[test]
+fn native_rm_deduplicates_parent_component_aliases() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("pad")).unwrap();
+    for file in 0..1_000 {
+        write(&t.path(&format!("tree/file-{file}")), b"data");
+    }
+
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s(""),
+        "--src",
+        "pad/../tree",
+        "--src",
+        "tree",
+    ]);
+
+    assert!(!t.path("tree").exists());
+}
+
+#[test]
+fn native_rm_deduplicates_contents_selectors_through_symlink_aliases() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    for file in 0..1_000 {
+        write(&t.path(&format!("tree/file-{file}")), b"data");
+    }
+    symlink("tree", t.path("link-a")).unwrap();
+    symlink("tree", t.path("link-b")).unwrap();
+
+    run_native_ok(&[
+        "rm",
+        "--src-src",
+        &t.s("link-a"),
+        "--src-src",
+        &t.s("link-b"),
+    ]);
+
+    assert!(t.path("tree").is_dir());
+    assert_eq!(fs::read_dir(t.path("tree")).unwrap().count(), 0);
+    assert!(t.path("link-a").is_symlink());
+    assert!(t.path("link-b").is_symlink());
+}
+
+#[test]
 fn native_rm_serializes_same_path_selection_modes() {
     let t = Tmp::new();
     for trial in 0..5 {

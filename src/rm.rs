@@ -178,10 +178,50 @@ fn selection_order(selection: SourceSelection) -> u8 {
     }
 }
 
-/// Give each distinct lexical path-and-mode selector one scan. Exact aliases
+fn canonical_query(location: &Location) -> (PathBytes, Option<PathBytes>) {
+    if location.follows_root() {
+        return (location.path.clone(), None);
+    }
+
+    match location.path.iter().rposition(|byte| *byte == b'/') {
+        Some(0) => (b"/".to_vec(), Some(location.path[1..].to_vec())),
+        Some(separator) => (
+            location.path[..separator].to_vec(),
+            Some(location.path[separator + 1..].to_vec()),
+        ),
+        None => (b".".to_vec(), Some(location.path.clone())),
+    }
+}
+
+/// Resolve each selector root once on its endpoint before scanning. Contents
+/// selectors follow the root; named selectors preserve their final component
+/// so selecting a symlink still selects the link itself.
+fn canonicalize_native_rm_locations(ctl: &mut dyn Conn, locs: &mut [Location]) -> Result<()> {
+    let queries: Vec<(PathBytes, Option<PathBytes>)> = locs.iter().map(canonical_query).collect();
+    for (path, _) in &queries {
+        ctl.send(Request::Canonicalize {
+            path: path.clone(),
+            guard: None,
+        })?;
+    }
+
+    for (location, (_, leaf)) in locs.iter_mut().zip(queries) {
+        let canonical = match ok(ctl.recv()?, "canonicalize removal selector")? {
+            Response::Path(path) => path,
+            other => bail!("unexpected response {other:?}"),
+        };
+        location.path = match leaf {
+            Some(leaf) => join(&canonical, &leaf),
+            None => canonical,
+        };
+    }
+    Ok(())
+}
+
+/// Give each distinct resolved path-and-mode selector one scan. Exact aliases
 /// in the same mode are deduplicated. Cross-mode selectors remain independent,
-/// and overlapping roots are ordered so they can be serialized without one
-/// selection mutating the namespace beneath another.
+/// and overlapping roots are ordered so one selection cannot mutate the
+/// namespace beneath another while it is being scanned.
 fn normalize_native_rm_locations(locs: Vec<Location>) -> (Vec<Location>, bool) {
     let mut identities = HashSet::new();
     let mut normalized: Vec<(Location, SelectorKey)> = Vec::with_capacity(locs.len());
@@ -201,7 +241,7 @@ fn normalize_native_rm_locations(locs: Vec<Location>) -> (Vec<Location>, bool) {
     });
     if overlaps {
         // Descendants precede ancestors. At one path, contents precedes the
-        // named object so a selected symlink remains usable for that scan.
+        // named object so a selected directory remains usable for that scan.
         normalized.sort_by(|(left_location, left), (right_location, right)| {
             right
                 .components
@@ -273,19 +313,20 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     check_rm_safety(&locs, &args)?;
-    let serialize_selectors = if args.interface == Interface::NativeRm {
-        let (normalized, overlaps) = normalize_native_rm_locations(locs);
-        locs = normalized;
-        overlaps
-    } else {
-        false
-    };
     let mut args = args;
     let ep = endpoint(&locs[0], &args)?;
     if args.connections_default && !ep.is_remote() {
         args.connections = crate::transfer::LOCAL_DEFAULT_CONNECTIONS;
     }
     let mut ctl = connect_ctl(&ep, &args)?;
+    let serialize_selectors = if args.interface == Interface::NativeRm {
+        canonicalize_native_rm_locations(&mut *ctl, &mut locs)?;
+        let (normalized, overlaps) = normalize_native_rm_locations(locs);
+        locs = normalized;
+        overlaps
+    } else {
+        false
+    };
 
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let verbose = !args.quiet && args.verbose > 0;
