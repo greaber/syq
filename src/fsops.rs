@@ -1338,6 +1338,26 @@ impl FsOps {
             Request::PartialPaths { paths, partial_id } => {
                 Ok(Response::PathResults(self.partial_paths(paths, partial_id)))
             }
+            Request::PlanBatch {
+                partial_paths,
+                partial_id,
+                directories,
+                others,
+            } => {
+                let partial_paths = self.partial_paths(partial_paths, partial_id);
+                let directories = self.stat_many(directories, false);
+                let safe_to_stat_others = directories.iter().all(|entry| {
+                    entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 == 0o700)
+                });
+                let others = safe_to_stat_others.then(|| self.stat_many(others, false));
+                Ok(Response::BatchPlan {
+                    partial_paths,
+                    directories,
+                    others,
+                })
+            }
             Request::Apply(ops) => Ok(Response::Applied(self.apply(ops))),
             Request::ProbePartial { path, partial_id } => self.probe_partial(path, partial_id),
             Request::Prepare {
@@ -1838,6 +1858,66 @@ mod tests {
         assert!(errs[1].is_none() && !dir.join("f").exists());
         assert!(errs[2].is_none(), "a vanished leaf is not an error");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_batch_only_stats_leaves_below_ready_directories() {
+        let root = test_dir();
+        let ready = root.join("ready");
+        let leaf = ready.join("leaf");
+        fs::create_dir_all(&ready).unwrap();
+        fs::write(&leaf, b"data").unwrap();
+        let mut ops = FsOps::new();
+        let request = |directory: &Path| Request::PlanBatch {
+            partial_paths: vec![path_bytes(&leaf)],
+            partial_id: [7; 16],
+            directories: vec![path_bytes(directory)],
+            others: vec![path_bytes(&leaf)],
+        };
+
+        let Response::BatchPlan {
+            partial_paths,
+            directories,
+            others,
+        } = ops.handle(&request(&ready))
+        else {
+            panic!("expected a batch plan");
+        };
+        assert!(partial_paths[0].is_ok());
+        assert_eq!(directories[0].as_ref().unwrap().kind, Kind::Dir);
+        assert_eq!(others.unwrap()[0].as_ref().unwrap().kind, Kind::File);
+
+        let Response::BatchPlan {
+            directories,
+            others,
+            ..
+        } = ops.handle(&request(&root.join("missing")))
+        else {
+            panic!("expected a batch plan");
+        };
+        assert!(directories[0].is_none());
+        assert!(
+            others.is_none(),
+            "leaf stats must wait for directory repair"
+        );
+
+        fs::set_permissions(&ready, fs::Permissions::from_mode(0o500)).unwrap();
+        let Response::BatchPlan {
+            directories,
+            others,
+            ..
+        } = ops.handle(&request(&ready))
+        else {
+            panic!("expected a batch plan");
+        };
+        assert_eq!(directories[0].as_ref().unwrap().kind, Kind::Dir);
+        assert!(
+            others.is_none(),
+            "leaf stats must wait until the directory is writable"
+        );
+        fs::set_permissions(&ready, fs::Permissions::from_mode(0o700)).unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
