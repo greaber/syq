@@ -1273,7 +1273,7 @@ fn set_meta_handle(file: &File, meta: &Meta, flags: u8) -> Result<()> {
             Err(io::Error::last_os_error())
         }
     })?;
-    if flags & flags::MODE != 0 {
+    if flags & flags::MODE_MASK != 0 {
         let current = file.metadata()?.mode() & 0o7777;
         let wanted = meta.mode & 0o7777;
         if current != wanted || (flags & (flags::OWNER | flags::GROUP) != 0 && wanted & 0o6000 != 0)
@@ -1368,7 +1368,10 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 /// bytes it has and empty hashes for the missing blocks, matching both source
 /// and destination behavior through one implementation.
 fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<u64>> {
-    let n = len.div_ceil(block) as usize;
+    if !hash_response_fits(block, len) {
+        bail!("hash block size or response count is outside protocol limits");
+    }
+    let n = usize::try_from(len.div_ceil(block)).context("hash count exceeds this platform")?;
     let mut hashes = Vec::with_capacity(n);
     let mut buf = vec![0u8; block as usize];
     let mut remaining = len;
@@ -2607,7 +2610,7 @@ fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
     apply_owner(flags, meta, |uid, gid| {
         std::os::unix::fs::fchown(f, uid, gid)
     })?;
-    if flags & flags::MODE != 0 {
+    if flags & flags::MODE_MASK != 0 {
         // On network filesystems every setattr is a round trip; skip it when
         // the mode is already right (but always run it after a chown that could
         // have cleared setuid/setgid bits we need to restore).
@@ -2637,7 +2640,7 @@ fn set_meta_path(p: &Path, meta: &Meta, flags: u8) -> Result<()> {
     apply_owner(flags, meta, |uid, gid| {
         std::os::unix::fs::lchown(p, uid, gid)
     })?;
-    if flags & flags::MODE != 0 && !is_link {
+    if flags & flags::MODE_MASK != 0 && !is_link {
         fs::set_permissions(p, fs::Permissions::from_mode(meta.mode & 0o7777))?;
     }
     if flags & flags::TIMES != 0 {
@@ -2892,16 +2895,21 @@ mod tests {
 
     #[test]
     fn shared_block_hasher_handles_short_readers_consistently() {
-        let data = b"abcdefghij";
-        let hashes = hash_reader(&mut &data[..], 4, 16).unwrap();
+        let block = MIN_HASH_BLOCK_BYTES as usize;
+        let mut data = vec![b'a'; block];
+        data.extend(vec![b'b'; block]);
+        data.extend(b"tail");
+        let hashes = hash_reader(&mut &data[..], block as u64, (block * 4) as u64).unwrap();
         assert_eq!(
             hashes,
             vec![
-                xxh3_64(b"abcd"),
-                xxh3_64(b"efgh"),
-                xxh3_64(b"ij"),
+                xxh3_64(&vec![b'a'; block]),
+                xxh3_64(&vec![b'b'; block]),
+                xxh3_64(b"tail"),
                 xxh3_64(b""),
             ]
         );
+        assert!(hash_reader(&mut &b"x"[..], 0, 1).is_err());
+        assert!(hash_reader(&mut &b"x"[..], 1, 1).is_err());
     }
 }

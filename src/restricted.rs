@@ -277,13 +277,21 @@ impl RestrictedAuthority {
     }
 
     fn check_flags(&self, flags: u8) -> Result<()> {
-        let known =
-            proto::flags::MODE | proto::flags::OWNER | proto::flags::GROUP | proto::flags::TIMES;
+        let known = proto::flags::MODE_MASK
+            | proto::flags::OWNER
+            | proto::flags::GROUP
+            | proto::flags::TIMES;
         if flags & !known != 0 {
             bail!("request contains unknown metadata flags");
         }
+        if flags & proto::flags::MODE_MASK == proto::flags::MODE_MASK {
+            bail!("request cannot mix source and receiver-managed mode flags");
+        }
         if flags & proto::flags::MODE != 0 && !self.copy.options.preserve_permissions {
             bail!("request tries to preserve permissions not authorized by the grant");
+        }
+        if flags & proto::flags::RECEIVER_MODE != 0 && !self.copy.options.receiver_managed_modes {
+            bail!("request tries to apply receiver-managed modes not authorized by the grant");
         }
         if flags & proto::flags::OWNER != 0 && !self.copy.options.preserve_owner {
             bail!("request tries to preserve ownership not authorized by the grant");
@@ -293,6 +301,19 @@ impl RestrictedAuthority {
         }
         if flags & proto::flags::TIMES != 0 && !self.copy.options.preserve_times {
             bail!("request tries to preserve timestamps not authorized by the grant");
+        }
+        Ok(())
+    }
+
+    fn check_hash_request(&self, block: u64, len: u64) -> Result<()> {
+        if block != self.copy.limits.hash_block_bytes {
+            bail!("hash block size does not match the signed grant");
+        }
+        if len > self.copy.limits.max_file_bytes {
+            bail!("signed grant per-file byte limit exceeded");
+        }
+        if !proto::hash_response_fits(block, len) {
+            bail!("hash response would exceed protocol limits");
         }
         Ok(())
     }
@@ -450,20 +471,24 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::HashBlocks {
-                path, len, guard, ..
+                path,
+                block,
+                len,
+                guard,
+                ..
             } => {
-                if *len > self.copy.limits.max_file_bytes {
-                    bail!("signed grant per-file byte limit exceeded");
-                }
+                self.check_hash_request(*block, *len)?;
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
             }
             Request::HashAndHold {
-                path, len, guard, ..
+                path,
+                block,
+                len,
+                guard,
+                ..
             } => {
-                if *len > self.copy.limits.max_file_bytes {
-                    bail!("signed grant per-file byte limit exceeded");
-                }
+                self.check_hash_request(*block, *len)?;
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
             }
@@ -1538,6 +1563,7 @@ fn grant_for(
                 recursive: args.recursive,
                 preserve_symlinks: args.links,
                 preserve_permissions: args.perms,
+                receiver_managed_modes: !args.perms,
                 preserve_times: args.times,
                 preserve_owner: args.owner,
                 preserve_group: args.group,
@@ -1559,6 +1585,8 @@ fn grant_for(
                     .transpose()?
                     .unwrap_or(DEFAULT_MAX_BYTES)
                     .min(DEFAULT_MAX_BYTES),
+                hash_block_bytes: crate::cli::parse_size(&args.block_size)?
+                    .clamp(proto::MIN_HASH_BLOCK_BYTES, proto::MAX_HASH_BLOCK_BYTES),
                 max_connections: u16::try_from(if args.connections_opt.is_some() {
                     args.connections
                 } else {
@@ -1602,7 +1630,7 @@ pub(crate) fn prepare_transfer(
         None => {
             if !allow_enrollment {
                 bail!(
-                    "dry-run will not install a receiver enrollment; pre-enroll this destination with `syq enroll` or explicitly use --agent-broker-only"
+                    "read-only operations will not install a receiver enrollment; pre-enroll this destination with `syq enroll` or explicitly use --agent-broker-only"
                 );
             }
             let jump = endpoint(
@@ -1902,6 +1930,7 @@ mod tests {
                     recursive: true,
                     preserve_symlinks: true,
                     preserve_permissions: false,
+                    receiver_managed_modes: true,
                     preserve_times: false,
                     preserve_owner: false,
                     preserve_group: false,
@@ -1917,6 +1946,7 @@ mod tests {
                     max_entries: 8,
                     max_total_bytes: maximum_bytes,
                     max_file_bytes: maximum_bytes,
+                    hash_block_bytes: 4 << 20,
                     max_connections: 2,
                     max_deletions: u64::from(deletion != DeletionPolicyV1::Forbid) * 2,
                     max_runtime_seconds: 60,
@@ -2081,7 +2111,7 @@ mod tests {
                 mtime: 0,
                 mtime_nsec: 0,
             },
-            flags: 0,
+            flags: proto::flags::RECEIVER_MODE,
             condition: proto::TargetCondition::Any,
             guard: Some(ContainerGuard {
                 root: outside,
@@ -2109,6 +2139,83 @@ mod tests {
             guard: None,
         };
         assert!(authority.authorize(&mut write, false).is_err());
+    }
+
+    #[test]
+    fn grant_distinguishes_receiver_modes_from_source_permission_preservation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let target = root.join("target").as_os_str().as_bytes().to_vec();
+        let metadata = |flags| Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: target.clone(),
+                meta: proto::Meta {
+                    mode: 0o640,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                },
+                flags,
+                condition: proto::TargetCondition::Any,
+            }],
+            guard: None,
+        };
+
+        let receiver_modes = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let mut receiver_mode = metadata(proto::flags::RECEIVER_MODE);
+        receiver_modes.authorize(&mut receiver_mode, false).unwrap();
+        let mut source_mode = metadata(proto::flags::MODE);
+        assert!(receiver_modes.authorize(&mut source_mode, false).is_err());
+        let mut mixed = metadata(proto::flags::MODE_MASK);
+        assert!(receiver_modes.authorize(&mut mixed, false).is_err());
+
+        let mut source_modes = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        source_modes.copy.options.preserve_permissions = true;
+        source_modes.copy.options.receiver_managed_modes = false;
+        let mut source_mode = metadata(proto::flags::MODE);
+        source_modes.authorize(&mut source_mode, false).unwrap();
+        let mut receiver_mode = metadata(proto::flags::RECEIVER_MODE);
+        assert!(source_modes.authorize(&mut receiver_mode, false).is_err());
+    }
+
+    #[test]
+    fn signed_hash_block_and_response_bounds_are_enforced() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let mut authority = test_authority(&root, DeletionPolicyV1::Forbid, DEFAULT_MAX_BYTES);
+        let target = root.join("target").as_os_str().as_bytes().to_vec();
+        let request = |block, len| Request::HashBlocks {
+            path: target.clone(),
+            which: proto::Which::Final,
+            partial_id: [0; 16],
+            block,
+            len,
+            guard: None,
+        };
+
+        let mut valid = request(4 << 20, 8 << 20);
+        authority.authorize(&mut valid, false).unwrap();
+        for block in [0, 1, 8 << 20] {
+            let mut altered = request(block, 8 << 20);
+            assert!(authority.authorize(&mut altered, false).is_err());
+        }
+
+        authority.copy.limits.hash_block_bytes = proto::MIN_HASH_BLOCK_BYTES;
+        let excessive_entries = proto::MAX_FRAME as u64 / 10 + 1;
+        let mut excessive = request(
+            proto::MIN_HASH_BLOCK_BYTES,
+            excessive_entries * proto::MIN_HASH_BLOCK_BYTES,
+        );
+        assert_eq!(
+            authority
+                .authorize(&mut excessive, false)
+                .unwrap_err()
+                .to_string(),
+            "hash response would exceed protocol limits"
+        );
     }
 
     #[test]

@@ -1432,35 +1432,217 @@ fn serve_client(
 }
 
 fn parse_sign_request(frame: &[u8]) -> Result<SignRequest> {
-    let mut input = frame;
-    let request = Request::decode(&mut input).context("decode sign request")?;
+    // ssh-agent-lib's nested Vec decoder allocates from the encoded u32 before
+    // it notices that the bytes are absent. Walk every attacker-controlled
+    // length as a borrowed slice before invoking its typed decoders.
+    let mut input = SshCursor::new(frame);
+    if input.byte()? != 13 {
+        bail!("not a sign request");
+    }
+    let encoded_credential = input.string()?;
+    validate_public_credential_wire(encoded_credential)?;
+    let mut credential_input = encoded_credential;
+    let credential = PublicCredential::decode(&mut credential_input)
+        .context("decode bounded sign-request credential")?;
+    if !credential_input.is_empty() {
+        bail!("trailing bytes in sign-request credential");
+    }
+    let data = input.string()?.to_vec();
+    let flags = u32::from_be_bytes(
+        input
+            .fixed(4)?
+            .try_into()
+            .map_err(|_| anyhow!("invalid sign-request flags"))?,
+    );
     if !input.is_empty() {
         bail!("trailing bytes in sign request");
     }
-    match request {
-        Request::SignRequest(request) => Ok(request),
-        _ => bail!("not a sign request"),
-    }
+    Ok(SignRequest {
+        credential,
+        data,
+        flags,
+    })
 }
 
 fn parse_session_bind(frame: &[u8]) -> Result<SessionBind> {
-    let mut input = frame;
-    let request = Request::decode(&mut input).context("decode agent extension")?;
-    if !input.is_empty() {
-        bail!("trailing bytes in agent extension");
-    }
-    let Request::Extension(extension) = request else {
+    let mut input = SshCursor::new(frame);
+    if input.byte()? != 27 {
         bail!("not an agent extension");
-    };
-    if extension.name != SessionBind::NAME {
+    }
+    if input.string()? != SessionBind::NAME.as_bytes() {
         bail!("unsupported agent extension");
     }
-    let mut details = extension.details.as_ref();
-    let binding = SessionBind::decode(&mut details).context("decode session-bind")?;
-    if !details.is_empty() {
+
+    let encoded_host_key = input.string()?;
+    validate_key_wire(encoded_host_key)?;
+    let mut host_key_input = encoded_host_key;
+    let host_key =
+        KeyData::decode(&mut host_key_input).context("decode bounded session host key")?;
+    if !host_key_input.is_empty() {
+        bail!("trailing bytes in session host key");
+    }
+    let session_id = input.string()?.to_vec();
+    let encoded_signature = input.string()?;
+    validate_signature_wire(encoded_signature)?;
+    let mut signature_input = encoded_signature;
+    let signature = ssh_agent_lib::ssh_key::Signature::decode(&mut signature_input)
+        .context("decode bounded session signature")?;
+    if !signature_input.is_empty() {
+        bail!("trailing bytes in session signature");
+    }
+    let is_forwarding = input.byte()? != 0;
+    if !input.is_empty() {
         bail!("trailing bytes in session-bind");
     }
-    Ok(binding)
+    Ok(SessionBind {
+        host_key,
+        session_id,
+        signature,
+        is_forwarding,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum WireKeyKind {
+    Dsa,
+    Ecdsa,
+    Ed25519,
+    Rsa,
+    SkEcdsa,
+    SkEd25519,
+}
+
+fn plain_wire_key_kind(algorithm: &[u8]) -> Result<WireKeyKind> {
+    match algorithm {
+        b"ssh-dss" => Ok(WireKeyKind::Dsa),
+        b"ecdsa-sha2-nistp256" | b"ecdsa-sha2-nistp384" | b"ecdsa-sha2-nistp521" => {
+            Ok(WireKeyKind::Ecdsa)
+        }
+        b"ssh-ed25519" => Ok(WireKeyKind::Ed25519),
+        b"ssh-rsa" | b"rsa-sha2-256" | b"rsa-sha2-512" => Ok(WireKeyKind::Rsa),
+        b"sk-ecdsa-sha2-nistp256@openssh.com" => Ok(WireKeyKind::SkEcdsa),
+        b"sk-ssh-ed25519@openssh.com" => Ok(WireKeyKind::SkEd25519),
+        _ => bail!("unsupported SSH key algorithm"),
+    }
+}
+
+fn certificate_wire_key_kind(algorithm: &[u8]) -> Result<WireKeyKind> {
+    match algorithm {
+        b"ssh-dss-cert-v01@openssh.com" => Ok(WireKeyKind::Dsa),
+        b"ecdsa-sha2-nistp256-cert-v01@openssh.com"
+        | b"ecdsa-sha2-nistp384-cert-v01@openssh.com"
+        | b"ecdsa-sha2-nistp521-cert-v01@openssh.com" => Ok(WireKeyKind::Ecdsa),
+        b"ssh-ed25519-cert-v01@openssh.com" => Ok(WireKeyKind::Ed25519),
+        b"ssh-rsa-cert-v01@openssh.com" => Ok(WireKeyKind::Rsa),
+        b"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com" => Ok(WireKeyKind::SkEcdsa),
+        b"sk-ssh-ed25519-cert-v01@openssh.com" => Ok(WireKeyKind::SkEd25519),
+        _ => bail!("unsupported SSH certificate algorithm"),
+    }
+}
+
+fn validate_key_fields(input: &mut SshCursor<'_>, kind: WireKeyKind) -> Result<()> {
+    let field_count = match kind {
+        WireKeyKind::Dsa => 4,
+        WireKeyKind::Ecdsa | WireKeyKind::Rsa | WireKeyKind::SkEd25519 => 2,
+        WireKeyKind::Ed25519 => 1,
+        WireKeyKind::SkEcdsa => 3,
+    };
+    for _ in 0..field_count {
+        input.string()?;
+    }
+    Ok(())
+}
+
+fn validate_key_wire(encoded: &[u8]) -> Result<()> {
+    let mut input = SshCursor::new(encoded);
+    let kind = plain_wire_key_kind(input.string()?)?;
+    validate_key_fields(&mut input, kind)?;
+    if !input.is_empty() {
+        bail!("trailing bytes in SSH key");
+    }
+    Ok(())
+}
+
+fn validate_string_sequence(encoded: &[u8]) -> Result<()> {
+    let mut input = SshCursor::new(encoded);
+    while !input.is_empty() {
+        input.string()?;
+    }
+    Ok(())
+}
+
+fn validate_certificate_options(encoded: &[u8]) -> Result<()> {
+    let mut input = SshCursor::new(encoded);
+    while !input.is_empty() {
+        input.string()?;
+        let data = input.string()?;
+        if !data.is_empty() {
+            let mut nested = SshCursor::new(data);
+            nested.string()?;
+            if !nested.is_empty() {
+                bail!("trailing bytes in SSH certificate option");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_signature_wire(encoded: &[u8]) -> Result<()> {
+    let mut input = SshCursor::new(encoded);
+    let algorithm = input.string()?;
+    let signature = input.string()?;
+    if matches!(
+        algorithm,
+        b"ecdsa-sha2-nistp256"
+            | b"ecdsa-sha2-nistp384"
+            | b"ecdsa-sha2-nistp521"
+            | b"sk-ecdsa-sha2-nistp256@openssh.com"
+    ) {
+        let mut components = SshCursor::new(signature);
+        components.string()?;
+        components.string()?;
+        if !components.is_empty() {
+            bail!("trailing bytes in ECDSA signature");
+        }
+    }
+    if matches!(
+        algorithm,
+        b"sk-ecdsa-sha2-nistp256@openssh.com" | b"sk-ssh-ed25519@openssh.com"
+    ) {
+        input.fixed(5)?;
+    }
+    if !input.is_empty() {
+        bail!("trailing bytes in SSH signature");
+    }
+    Ok(())
+}
+
+fn validate_public_credential_wire(encoded: &[u8]) -> Result<()> {
+    let mut input = SshCursor::new(encoded);
+    let algorithm = input.string()?;
+    if algorithm.ends_with(b"-cert-v01@openssh.com") {
+        let kind = certificate_wire_key_kind(algorithm)?;
+        input.string()?; // nonce
+        validate_key_fields(&mut input, kind)?;
+        input.fixed(8)?; // serial
+        input.fixed(4)?; // certificate type
+        input.string()?; // key ID
+        validate_string_sequence(input.string()?)?; // principals
+        input.fixed(8)?; // valid after
+        input.fixed(8)?; // valid before
+        validate_certificate_options(input.string()?)?;
+        validate_certificate_options(input.string()?)?;
+        input.string()?; // reserved
+        validate_key_wire(input.string()?)?; // signing key
+        validate_signature_wire(input.string()?)?;
+    } else {
+        let kind = plain_wire_key_kind(algorithm)?;
+        validate_key_fields(&mut input, kind)?;
+    }
+    if !input.is_empty() {
+        bail!("trailing bytes in SSH credential");
+    }
+    Ok(())
 }
 
 enum UpstreamResponse {
@@ -1864,6 +2046,19 @@ impl<'a> SshCursor<'a> {
         Ok(value)
     }
 
+    fn fixed(&mut self, length: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .context("SSH field offset overflow")?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .context("truncated SSH field")?;
+        self.offset = end;
+        Ok(value)
+    }
+
     fn string(&mut self) -> Result<&'a [u8]> {
         let end = self
             .offset
@@ -1948,6 +2143,10 @@ mod tests {
 
     fn bind_request(binding: SessionBind) -> Vec<u8> {
         encode_request(Request::Extension(Extension::new_message(binding).unwrap()))
+    }
+
+    fn ssh_string_len_at(bytes: &[u8], offset: usize) -> usize {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize
     }
 
     fn hostbound_data(
@@ -3013,6 +3212,44 @@ mod tests {
             .write_all(&((MAX_AGENT_FRAME as u32) + 1).to_be_bytes())
             .unwrap();
         assert!(read_frame(&mut oversized).unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_nested_lengths_are_rejected_before_agent_decode_allocates() {
+        let (host_private, host_key) = key(34);
+        let valid_bind = bind_request(binding(
+            &host_private,
+            host_key.clone(),
+            b"bounded-session",
+            false,
+        ));
+
+        let mut extension_name = valid_bind.clone();
+        extension_name[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_session_bind(&extension_name).is_err());
+
+        let extension_name_len = ssh_string_len_at(&valid_bind, 1);
+        let host_key_offset = 1 + 4 + extension_name_len;
+        let session_id_offset =
+            host_key_offset + 4 + ssh_string_len_at(&valid_bind, host_key_offset);
+        let mut session_bind = valid_bind;
+        session_bind[session_id_offset..session_id_offset + 4]
+            .copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_session_bind(&session_bind).is_err());
+
+        let (_, identity) = key(35);
+        let sign_request = sign_request(
+            b"bounded-sign",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            identity,
+            &host_key,
+        );
+        let mut sign_frame = encode_request(Request::SignRequest(sign_request));
+        let credential_len = ssh_string_len_at(&sign_frame, 1);
+        let data_offset = 1 + 4 + credential_len;
+        sign_frame[data_offset..data_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_sign_request(&sign_frame).is_err());
     }
 
     #[test]

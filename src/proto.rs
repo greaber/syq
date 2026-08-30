@@ -9,8 +9,24 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
+pub const MIN_HASH_BLOCK_BYTES: u64 = 64 * 1024;
+pub const MAX_HASH_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
+// Postcard encodes a u64 as a base-128 varint of at most ten bytes.
+const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 10;
+const HASH_RESPONSE_OVERHEAD: u64 = 24;
 const COMPRESS_MIN: usize = 512;
 const COMPRESS_LEVEL: i32 = 1;
+
+pub fn hash_response_fits(block: u64, len: u64) -> bool {
+    if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
+        return false;
+    }
+    let entries = len.div_ceil(block);
+    entries
+        .checked_mul(HASH_RESPONSE_BYTES_PER_ENTRY)
+        .and_then(|bytes| bytes.checked_add(HASH_RESPONSE_OVERHEAD))
+        .is_some_and(|bytes| bytes < MAX_FRAME as u64)
+}
 
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
@@ -139,6 +155,10 @@ pub mod flags {
     pub const OWNER: u8 = 2;
     pub const GROUP: u8 = 4;
     pub const TIMES: u8 = 8;
+    /// A mode selected by ordinary destination creation/restoration semantics,
+    /// rather than source-mode preservation requested with `-p`.
+    pub const RECEIVER_MODE: u8 = 16;
+    pub const MODE_MASK: u8 = MODE | RECEIVER_MODE;
 }
 
 /// Best-effort kernel counters for one end of a TCP data socket. `None` means
@@ -481,7 +501,14 @@ impl<W: Write> FrameWriter<W> {
                 }
             }
         }
-        let len = (body.len() + 1) as u32;
+        let len = body
+            .len()
+            .checked_add(1)
+            .filter(|len| *len <= MAX_FRAME)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "outgoing frame exceeds limit")
+            })?;
         self.w.write_all(&len.to_le_bytes())?;
         self.w.write_all(&[flag])?;
         self.w.write_all(&body)?;

@@ -331,9 +331,10 @@ forced key. Syq generates the special key automatically, and its
 recognizable to users, administrators, and monitoring tools.
 
 For each transfer, the local machine signs a typed request naming the exact
-destination, login, copy semantics, TCP port range, limits, validity interval,
-and a fresh one-time nonce. The temporary broker advertises only that enrollment key to
-hostA and releases its signature only after validating this path:
+destination, login, copy semantics, hash block size, TCP port range, limits,
+validity interval, and a fresh one-time nonce. The temporary broker advertises
+only that enrollment key to hostA and releases its signature only after
+validating this path:
 
 ```text
 trusted hostA session -> configured-user@trusted-hostB session
@@ -350,10 +351,15 @@ sidecar operation, metadata change, write, and deletion is rewritten onto the
 enrolled root descriptor. Descendant symlinks are payload, never traversal.
 HostA cannot replace that guard, widen the destination, add an unsigned
 preservation option, exceed signed entry/byte/deletion/connection limits, or
-replay the request. Encrypted token-authenticated TCP workers inherit the same
-authority. The receiver permits one encrypted listener in the signed port
-range and closes it when the forced control session ends or the grant expires;
-after redemption there is no second SSH authentication or silent SSH fallback.
+replay the request. Source-permission preservation and the modes syq must apply
+for ordinary destination creation/restoration use distinct protocol flags and
+distinct signed policy, so default non-`-p` publication works without silently
+granting `-p`. Hash requests must use the signed block size, and the receiver
+rejects any request whose hash vector could exceed the protocol frame limit.
+Encrypted token-authenticated TCP workers inherit the same authority. The
+receiver permits one encrypted listener in the signed port range and closes it
+when the forced control session ends or the grant expires; after redemption
+there is no second SSH authentication or silent SSH fallback.
 
 This preferred path gives hostA neither a credential nor an ambient-agent
 capability. The local ambient agent—including a YubiKey—is used for the

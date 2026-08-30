@@ -165,6 +165,7 @@ pub(crate) struct CopyOptionsV1 {
     pub recursive: bool,
     pub preserve_symlinks: bool,
     pub preserve_permissions: bool,
+    pub receiver_managed_modes: bool,
     pub preserve_times: bool,
     pub preserve_owner: bool,
     pub preserve_group: bool,
@@ -182,6 +183,7 @@ pub(crate) struct CopyLimitsV1 {
     pub max_entries: u64,
     pub max_total_bytes: u64,
     pub max_file_bytes: u64,
+    pub hash_block_bytes: u64,
     pub max_connections: u16,
     pub max_deletions: u64,
     pub max_runtime_seconds: u32,
@@ -262,6 +264,14 @@ impl CopyOperationV1 {
         }
         if limits.max_file_bytes > limits.max_total_bytes {
             bail!("copy max-file-bytes exceeds max-total-bytes");
+        }
+        if self.options.preserve_permissions == self.options.receiver_managed_modes {
+            bail!(
+                "copy must authorize exactly one of source-mode preservation or receiver-managed modes"
+            );
+        }
+        if !crate::proto::hash_response_fits(limits.hash_block_bytes, 0) {
+            bail!("copy hash block size is outside protocol limits");
         }
         if limits.max_connections == 0 || limits.max_connections > MAX_CONNECTIONS {
             bail!("copy max-connections is outside the supported range");
@@ -1816,6 +1826,7 @@ mod tests {
                     recursive: true,
                     preserve_symlinks: true,
                     preserve_permissions: true,
+                    receiver_managed_modes: false,
                     preserve_times: true,
                     preserve_owner: false,
                     preserve_group: false,
@@ -1831,6 +1842,7 @@ mod tests {
                     max_entries: 10_000,
                     max_total_bytes: 1 << 30,
                     max_file_bytes: 1 << 29,
+                    hash_block_bytes: 4 << 20,
                     max_connections: 8,
                     max_deletions: 0,
                     max_runtime_seconds: 300,
@@ -1991,7 +2003,7 @@ mod tests {
         }
 
         let mut transcript = Vec::new();
-        transcript.extend_from_slice(b"syq-v1-schema-fingerprint-v2");
+        transcript.extend_from_slice(b"syq-v1-schema-fingerprint-v3");
         transcript.extend_from_slice(&(SSHSIG_NAMESPACE.len() as u32).to_be_bytes());
         transcript.extend_from_slice(SSHSIG_NAMESPACE.as_bytes());
 
@@ -2112,7 +2124,11 @@ mod tests {
             }
         });
         toggle_option!(preserve_symlinks);
-        toggle_option!(preserve_permissions);
+        append_mutation(&mut transcript, &baseline, "mode-policy", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.options.preserve_permissions = !copy.options.preserve_permissions;
+            copy.options.receiver_managed_modes = !copy.options.receiver_managed_modes;
+        });
         toggle_option!(preserve_times);
         toggle_option!(preserve_owner);
         toggle_option!(preserve_group);
@@ -2142,6 +2158,10 @@ mod tests {
             let GrantOperationV1::Copy(copy) = &mut grant.operation;
             copy.limits.max_file_bytes += 17;
         });
+        append_mutation(&mut transcript, &baseline, "hash-block-bytes", |grant| {
+            let GrantOperationV1::Copy(copy) = &mut grant.operation;
+            copy.limits.hash_block_bytes += 19;
+        });
         append_mutation(&mut transcript, &baseline, "max-connections", |grant| {
             let GrantOperationV1::Copy(copy) = &mut grant.operation;
             copy.limits.max_connections += 1;
@@ -2157,7 +2177,7 @@ mod tests {
 
         assert_eq!(
             hex(&Sha256::digest(&transcript)),
-            "8e10dfd0d24b5167ab7391cd38537ea23a263bc85f67bd5cc8ed29be972e1252",
+            "a9cc942c273619558102e526873bc0ae0e3bc6a65917fdc1e9d9e7e62688000a",
             "changing the namespace, signing bytes, or variant surface requires a new wire version"
         );
     }

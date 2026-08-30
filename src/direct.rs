@@ -171,6 +171,10 @@ fn broker_connection_limit(connections_opt: Option<usize>, connections: usize) -
         .context("SSH connection count is too large for the constrained agent broker")
 }
 
+fn automatic_enrollment_allowed(dry_run: bool, verify_only: bool) -> bool {
+    !(dry_run || verify_only)
+}
+
 fn utf8_path(path: &[u8], role: &str) -> Result<String> {
     String::from_utf8(path.to_vec()).map_err(|_| {
         anyhow::anyhow!(
@@ -258,7 +262,7 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
                     dst,
                     &source_policy.login_user,
                     &destination_policy.login_user,
-                    !args.dry_run,
+                    automatic_enrollment_allowed(args.dry_run, args.verify_only),
                 )
             })
             .transpose()
@@ -851,6 +855,14 @@ mod tests {
         assert_eq!(broker_connection_limit(None, 8).unwrap(), 65);
         assert_eq!(broker_connection_limit(Some(128), 128).unwrap(), 129);
         assert!(broker_connection_limit(Some(usize::MAX), usize::MAX).is_err());
+    }
+
+    #[test]
+    fn read_only_operations_never_allow_automatic_enrollment() {
+        assert!(automatic_enrollment_allowed(false, false));
+        assert!(!automatic_enrollment_allowed(true, false));
+        assert!(!automatic_enrollment_allowed(false, true));
+        assert!(!automatic_enrollment_allowed(true, true));
     }
 
     #[test]

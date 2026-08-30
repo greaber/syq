@@ -566,7 +566,7 @@ fn read_umask() -> u32 {
 pub fn run(args: Args) -> Result<i32> {
     let mut args = args;
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
-    let block = parse_size(&args.block_size)?.clamp(64 * 1024, 64 << 20);
+    let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
     let min_split = parse_size(&args.min_split)?;
     let max_size = args.max_size.as_deref().map(parse_size).transpose()?;
     let min_size = args.min_size.as_deref().map(parse_size).transpose()?;
@@ -1860,6 +1860,14 @@ fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
             && (source.mtime, source.mtime_nsec) != (destination.mtime, destination.mtime_nsec))
 }
 
+fn publication_metadata_flags(requested: u8) -> u8 {
+    if requested & flags::MODE != 0 {
+        requested
+    } else {
+        requested | flags::RECEIVER_MODE
+    }
+}
+
 fn display_location(loc: &Location, path: &[u8]) -> String {
     let path = display(path);
     let Some(host) = &loc.host else {
@@ -2997,7 +3005,7 @@ impl Planner<'_> {
                         if let Some(d) = s {
                             if d.kind == Kind::Dir && d.mode & 0o700 != 0o700 {
                                 meta.mode = d.mode & 0o7777;
-                                flags |= flags::MODE;
+                                flags |= flags::RECEIVER_MODE;
                             }
                         }
                     }
@@ -4330,7 +4338,7 @@ impl Worker {
         // One batch request: the server still publishes every file through its
         // own sidecar, but framing, compression and encryption are amortized.
         let phase = std::time::Instant::now();
-        let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
+        let flags = publication_metadata_flags(self.opts.flags);
         let mut sent: Vec<bool> = Vec::with_capacity(jobs.len());
         let mut puts = Vec::with_capacity(jobs.len());
         for (j, d) in jobs.iter().zip(data.iter_mut()) {
@@ -4612,7 +4620,7 @@ impl Worker {
                             path: job.dst.clone(),
                             partial_id: self.partial_id(),
                             meta,
-                            flags: self.opts.flags | flags::MODE,
+                            flags: publication_metadata_flags(self.opts.flags),
                             condition: job.target_condition,
                             guard: job.container_guard.clone(),
                         })?,
@@ -5025,7 +5033,7 @@ impl Worker {
         let job = self.job(idx);
         let mut meta = job.entry.meta();
         meta.mode = self.create_mode(&job);
-        let flags = self.opts.flags | flags::MODE; // set the computed mode explicitly
+        let flags = publication_metadata_flags(self.opts.flags);
         let finalized = ok(
             self.dst.call(Request::Finalize {
                 path: job.dst.clone(),
