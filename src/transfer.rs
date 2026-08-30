@@ -1004,7 +1004,11 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         TargetCondition::Any
     };
-    let mut mutation_root_condition = if args.target_existence == Existence::Existing {
+    let mut mutation_root_condition = if args.target_existence == Existence::Existing
+        && dst_root_entry
+            .as_ref()
+            .is_some_and(|entry| entry.kind == Kind::Dir)
+    {
         target_identity(
             dst_root_entry
                 .as_ref()
@@ -1013,6 +1017,11 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         TargetCondition::Any
     };
+    let guard_containers = args.interface != Interface::Rsync;
+    let mut container_guard = dst_root_entry
+        .as_ref()
+        .filter(|entry| guard_containers && entry.kind == Kind::Dir)
+        .map(|entry| target_container(&dst_root, entry));
     hold_after_target_precondition_for_test(&args)?;
     if args.interface != Interface::Rsync {
         // Native selectors are structural: validate every selected root before
@@ -1118,6 +1127,9 @@ pub fn run(args: Args) -> Result<i32> {
     if create_root && srcs.len() == 1 {
         let created = mkdir_root(&mut *dst_ctl, &dst_root, root_create_condition)?;
         mutation_root_condition = target_identity(&created);
+        if guard_containers {
+            container_guard = Some(target_container(&dst_root, &created));
+        }
     }
 
     let checkpoint_completed = checkpoint_state
@@ -1161,6 +1173,8 @@ pub fn run(args: Args) -> Result<i32> {
         root_path: dst_root.clone(),
         exact_condition,
         mutation_root_condition,
+        container_guard,
+        guard_containers,
         buffer: if srcs.len() > 1 {
             Some(Vec::new())
         } else {
@@ -1552,6 +1566,14 @@ fn target_identity(entry: &Entry) -> TargetCondition {
     }
 }
 
+fn target_container(root: &[u8], entry: &Entry) -> ContainerGuard {
+    ContainerGuard {
+        root: root.to_vec(),
+        dev: entry.dev,
+        ino: entry.ino,
+    }
+}
+
 #[cfg(debug_assertions)]
 fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
     if args.interface == Interface::Rsync || args.target_existence == Existence::Any {
@@ -1580,11 +1602,14 @@ fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
 
 fn mkdir_root(conn: &mut dyn Conn, dst_root: &[u8], condition: TargetCondition) -> Result<Entry> {
     match ok(
-        conn.call(Request::Apply(vec![Op::Mkdir {
-            path: dst_root.to_vec(),
-            mode: 0o755,
-            condition,
-        }]))?,
+        conn.call(Request::Apply {
+            ops: vec![Op::Mkdir {
+                path: dst_root.to_vec(),
+                mode: 0o755,
+                condition,
+            }],
+            guard: None,
+        })?,
         "mkdir",
     )? {
         Response::Applied(errs) => {
@@ -2053,6 +2078,8 @@ struct Planner<'a> {
     root_path: PathBytes,
     exact_condition: TargetCondition,
     mutation_root_condition: TargetCondition,
+    container_guard: Option<ContainerGuard>,
+    guard_containers: bool,
     /// Several sources into a destination that doesn't exist yet: create it
     /// only once the scans have been validated against each other.
     create_root: Option<(PathBytes, TargetCondition)>,
@@ -2652,6 +2679,9 @@ impl Planner<'_> {
         if let Some((root, condition)) = self.create_root.take() {
             let created = mkdir_root(self.dst, &root, condition)?;
             self.mutation_root_condition = target_identity(&created);
+            if self.guard_containers {
+                self.container_guard = Some(target_container(&root, &created));
+            }
         }
         // Validated: from here on they are ordinary entries (the one that is
         // the destination file skips itself; the other is written).
@@ -2780,7 +2810,7 @@ impl Planner<'_> {
                 planned.retain(|(_, dst_rel, _, _)| self.invalidate_completion(dst_rel));
                 // Create new dirs; also "create" existing ones we can't yet
                 // write into (0o700 not set) so apply() opens them up.
-                let new_dirs: Vec<Op> = planned
+                let mut new_dirs: Vec<Op> = planned
                     .iter()
                     .filter(|(path, _, _, st)| {
                         let root_must_be_new = self.exact_condition == TargetCondition::Absent
@@ -2794,6 +2824,40 @@ impl Planner<'_> {
                         condition: self.exact_condition_for(p),
                     })
                     .collect();
+                if let Some(root_index) = new_dirs.iter().position(|op| {
+                    matches!(
+                        op,
+                        Op::Mkdir {
+                            path,
+                            condition: TargetCondition::Absent,
+                            ..
+                        } if path == &self.root_path
+                    )
+                }) {
+                    // Establish the new authority directory by itself. Every
+                    // descendant operation after this point carries the
+                    // identity returned by that atomic mkdir.
+                    let root_op = new_dirs.remove(root_index);
+                    let error = self.apply(vec![root_op])?.into_iter().next().flatten();
+                    if let Some(error) = error {
+                        self.progress.error(&format!("syq: {error}"));
+                        self.collision = true;
+                        return Ok(());
+                    }
+                    self.dirs_created += 1;
+                    if opts.verbose > 0 {
+                        self.progress
+                            .println(&format!("{}/", display(&self.root_path)));
+                    }
+                    let created = stat_many(self.dst, vec![self.root_path.clone()], false)?
+                        .pop()
+                        .flatten()
+                        .filter(|entry| entry.kind == Kind::Dir)
+                        .context("new exact target was not a directory after creation")?;
+                    self.exact_condition = target_identity(&created);
+                    self.mutation_root_condition = target_identity(&created);
+                    self.container_guard = Some(target_container(&self.root_path, &created));
+                }
                 if !new_dirs.is_empty() {
                     let n = new_dirs.len();
                     let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs
@@ -2807,9 +2871,7 @@ impl Planner<'_> {
                         .collect();
                     let errs = self.apply(new_dirs)?;
                     let mut failed = 0;
-                    let mut exact_root_created = false;
                     for ((name, condition), err) in op_info.iter().zip(errs) {
-                        let succeeded = err.is_none();
                         if let Some(err) = err {
                             failed += 1;
                             self.progress.error(&format!("syq: {err}"));
@@ -2819,23 +2881,8 @@ impl Planner<'_> {
                         } else if opts.verbose > 0 {
                             self.progress.println(&format!("{}/", display(name)));
                         }
-                        if succeeded
-                            && name == &self.root_path
-                            && *condition == TargetCondition::Absent
-                        {
-                            exact_root_created = true;
-                        }
                     }
                     self.dirs_created += (n - failed) as u64;
-                    if exact_root_created {
-                        let created = stat_many(self.dst, vec![self.root_path.clone()], false)?
-                            .pop()
-                            .flatten()
-                            .filter(|entry| entry.kind == Kind::Dir)
-                            .context("new exact target was not a directory after creation")?;
-                        self.exact_condition = target_identity(&created);
-                        self.mutation_root_condition = target_identity(&created);
-                    }
                 }
                 let mut flags = opts.flags;
                 if !opts.perms {
@@ -3170,7 +3217,10 @@ impl Planner<'_> {
                         condition: self.exact_condition_for(&dst_path),
                     });
                     ops.push(Op::SetMeta {
-                        condition: self.metadata_condition_for(&dst_path),
+                        // Apply runs successful leaf creation/replacement
+                        // before metadata; a failed guarded replacement skips
+                        // this phase entirely.
+                        condition: TargetCondition::Any,
                         path: dst_path,
                         meta: e.meta(),
                         flags: opts.flags & !flags::MODE,
@@ -3235,7 +3285,7 @@ impl Planner<'_> {
                         condition: self.exact_condition_for(&dst_path),
                     });
                     ops.push(Op::SetMeta {
-                        condition: self.metadata_condition_for(&dst_path),
+                        condition: TargetCondition::Any,
                         path: dst_path,
                         meta: e.meta(),
                         flags: opts.flags,
@@ -3457,6 +3507,7 @@ impl Planner<'_> {
             entry,
             dst_entry,
             target_condition,
+            container_guard: self.container_guard.clone(),
             attempts: 0,
             done: Arc::new(AtomicU64::new(0)),
             inplace: false,
@@ -3865,7 +3916,13 @@ impl Planner<'_> {
     }
 
     fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<String>>> {
-        match ok(self.dst.call(Request::Apply(ops))?, "apply")? {
+        match ok(
+            self.dst.call(Request::Apply {
+                ops,
+                guard: self.container_guard.clone(),
+            })?,
+            "apply",
+        )? {
             Response::Applied(v) => Ok(v),
             other => bail!("unexpected response {other:?}"),
         }
@@ -4141,6 +4198,7 @@ impl Worker {
                 meta,
                 flags,
                 condition: j.target_condition,
+                guard: j.container_guard.clone(),
             })?;
             sent.push(true);
         }
@@ -4256,7 +4314,9 @@ impl Worker {
         // Placement guards must be enforced by the final mutation. Stage even
         // an explicit --inplace transfer until that checked update; an
         // existing target is still updated through its held inode at finalize.
-        let inplace = self.opts.inplace && job.target_condition == TargetCondition::Any;
+        let inplace = self.opts.inplace
+            && job.target_condition == TargetCondition::Any
+            && job.container_guard.is_none();
         // The planner already statted the final path. Only the deterministic
         // sidecar needs another lookup before choosing the transfer basis.
         // --inplace never uses that sidecar, so it avoids the lookup entirely.
@@ -4293,6 +4353,7 @@ impl Worker {
             && self.bwlimit.is_none()
             && job.entry.size > 0
             && partial_size.is_none()
+            && job.container_guard.is_none()
         {
             match self.try_copy_local(idx, &job) {
                 Ok(true) => {
@@ -4338,6 +4399,7 @@ impl Worker {
                         inplace: true,
                         partial_id: self.partial_id(),
                         mode: self.create_mode(&job),
+                        guard: job.container_guard.clone(),
                     })?,
                     "prepare",
                 )?;
@@ -4354,6 +4416,7 @@ impl Worker {
                         inplace: false,
                         partial_id: self.partial_id(),
                         mode: self.create_mode(&job),
+                        guard: job.container_guard.clone(),
                     })?,
                     "prepare",
                 )?;
@@ -4374,6 +4437,7 @@ impl Worker {
                             meta,
                             flags: self.opts.flags | flags::MODE,
                             condition: job.target_condition,
+                            guard: job.container_guard.clone(),
                         })?,
                         "finish content-identical destination",
                     )?;
@@ -4384,6 +4448,7 @@ impl Worker {
                         path: job.dst.clone(),
                         partial_id: self.partial_id(),
                         len: size,
+                        guard: job.container_guard.clone(),
                     })?,
                     "seed partial from destination basis",
                 )?;
@@ -4396,6 +4461,7 @@ impl Worker {
                     inplace: false,
                     partial_id: self.partial_id(),
                     mode: self.create_mode(&job),
+                    guard: job.container_guard.clone(),
                 })?,
                 "prepare",
             )?;
@@ -4474,7 +4540,9 @@ impl Worker {
         // Write to a partial and let finish_file rename it, so an interrupted
         // copy_file_range never leaves a final-named file the quick check could
         // mistake for complete. Only --inplace writes the final path directly.
-        let inplace = self.opts.inplace && job.target_condition == TargetCondition::Any;
+        let inplace = self.opts.inplace
+            && job.target_condition == TargetCondition::Any
+            && job.container_guard.is_none();
         self.set_inplace(idx, inplace);
         let mode = self.create_mode(job);
         let resp = self.dst.call(Request::CopyLocal {
@@ -4570,6 +4638,7 @@ impl Worker {
                 block: self.opts.block,
                 len: job.entry.size,
                 condition: job.target_condition,
+                guard: job.container_guard.clone(),
             },
             "hash and retain destination basis",
         )?;
@@ -4718,6 +4787,7 @@ impl Worker {
                 off,
                 hash,
                 data,
+                guard: job.container_guard.clone(),
             })?;
             self.t[1] += t0.elapsed().as_secs_f64();
             writes_out += 1;
@@ -4785,6 +4855,7 @@ impl Worker {
                 meta,
                 flags,
                 condition: job.target_condition,
+                guard: job.container_guard.clone(),
             })?,
             "finalize destination",
         );

@@ -85,6 +85,15 @@ pub enum TargetCondition {
     },
 }
 
+/// Stable authority boundary for every descendant mutation in a guarded
+/// native placement.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ContainerGuard {
+    pub root: PathBytes,
+    pub dev: u64,
+    pub ino: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct Meta {
     pub mode: u32,
@@ -211,7 +220,10 @@ pub enum Request {
         paths: Vec<PathBytes>,
         partial_id: PartialId,
     },
-    Apply(Vec<Op>),
+    Apply {
+        ops: Vec<Op>,
+        guard: Option<ContainerGuard>,
+    },
     /// Return the size of the deterministic sidecar, if it is a regular file.
     /// The planner has already statted the final path.
     ProbePartial {
@@ -227,6 +239,7 @@ pub enum Request {
         inplace: bool,
         partial_id: PartialId,
         mode: u32,
+        guard: Option<ContainerGuard>,
     },
     /// Hash an existing final file and retain that open inode as the repair
     /// basis until FinishBasis or SeedBasis consumes it.
@@ -236,6 +249,7 @@ pub enum Request {
         block: u64,
         len: u64,
         condition: TargetCondition,
+        guard: Option<ContainerGuard>,
     },
     /// Apply metadata through the retained basis descriptor. If another job
     /// renamed over the final path meanwhile, its complete file remains the
@@ -246,12 +260,14 @@ pub enum Request {
         meta: Meta,
         flags: u8,
         condition: TargetCondition,
+        guard: Option<ContainerGuard>,
     },
     /// Seed this job's sidecar from the retained basis descriptor.
     SeedBasis {
         path: PathBytes,
         partial_id: PartialId,
         len: u64,
+        guard: Option<ContainerGuard>,
     },
     /// In-kernel copy of a same-machine file (copy_file_range: reflink / NFS
     /// server-side copy when possible). Err("EXDEV") tells the caller to fall
@@ -286,6 +302,7 @@ pub enum Request {
         hash: u64,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+        guard: Option<ContainerGuard>,
     },
     Finalize {
         path: PathBytes,
@@ -294,6 +311,7 @@ pub enum Request {
         meta: Meta,
         flags: u8,
         condition: TargetCondition,
+        guard: Option<ContainerGuard>,
     },
     /// Whole small file in one request: verify, write a sidecar, then rename it
     /// atomically over the final path. This preserves small-file pipelining
@@ -307,6 +325,7 @@ pub enum Request {
         meta: Meta,
         flags: u8,
         condition: TargetCondition,
+        guard: Option<ContainerGuard>,
     },
     FileHash {
         path: PathBytes,
@@ -378,7 +397,7 @@ impl SizeHint for Request {
             Request::StatMany { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
-            Request::Apply(v) => v.len() * 128 + 16,
+            Request::Apply { ops, .. } => ops.len() * 128 + 16,
             _ => 256,
         }
     }
