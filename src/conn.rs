@@ -24,6 +24,11 @@ pub trait Conn: Send {
     fn is_dead(&self) -> bool {
         false
     }
+    /// Current kernel RTT estimate for a direct TCP connection. This is a
+    /// local socket query and never sends a protocol request.
+    fn tcp_rtt_us(&self) -> Option<u64> {
+        None
+    }
     /// Best-effort counters for a direct TCP data connection. Collection is
     /// deliberately observational: unavailable kernels and SSH return None.
     fn transport_stats(&mut self) -> Option<TcpPairStats> {
@@ -339,6 +344,12 @@ impl Conn for RemoteConn {
     }
     fn is_dead(&self) -> bool {
         self.dead
+    }
+    fn tcp_rtt_us(&self) -> Option<u64> {
+        self.tcp_socket
+            .as_ref()
+            .and_then(tcp_socket_stats)
+            .and_then(|stats| stats.rtt_us)
     }
     fn transport_stats(&mut self) -> Option<TcpPairStats> {
         self.transport_stats_with_timeout(TRANSPORT_STATS_TIMEOUT)
@@ -904,28 +915,65 @@ fn helper_needs_install(e: &anyhow::Error) -> bool {
 /// Concurrently probe which (addr, speed) entries accept a TCP connection on
 /// `port`, preserving the server's priority order. Used once per endpoint.
 fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
-    let (tx, rx) = std::sync::mpsc::channel();
+    // Resolve candidate names in parallel. More importantly, probe every
+    // resolved socket address in parallel too: a dual-stack name must not
+    // spend the whole candidate budget timing out on IPv6 before trying IPv4.
+    let (resolved_tx, resolved_rx) = std::sync::mpsc::channel();
     for (i, candidate) in candidates.iter().enumerate() {
-        let tx = tx.clone();
-        let addr = candidate.address.clone();
+        let tx = resolved_tx.clone();
+        let address = candidate.address.clone();
         std::thread::spawn(move || {
-            // Try every resolved address (a dual-stack name may return IPv6
-            // first while the listener is IPv4-only): reachable if any connects.
-            let ok = (addr.as_str(), port)
+            let addrs = (address.as_str(), port)
                 .to_socket_addrs()
-                .map(|it| {
-                    it.into_iter().any(|sa| {
-                        TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1000))
-                            .is_ok()
-                    })
-                })
-                .unwrap_or(false);
-            let _ = tx.send((i, ok));
+                .map(|addresses| addresses.collect())
+                .unwrap_or_default();
+            let _ = tx.send((i, addrs));
         });
     }
+    drop(resolved_tx);
+    let mut resolved = vec![Vec::new(); candidates.len()];
+    for _ in 0..candidates.len() {
+        let Ok((i, addrs)) = resolved_rx.recv() else {
+            break;
+        };
+        resolved[i] = addrs;
+    }
+
+    let timeout = std::time::Duration::from_millis(1000);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut remaining: Vec<usize> = resolved.iter().map(Vec::len).collect();
+    let mut undetermined = remaining.iter().filter(|&&count| count > 0).count();
+    let mut determined = vec![false; candidates.len()];
+    for (i, addrs) in resolved.into_iter().enumerate() {
+        for addr in addrs {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((i, TcpStream::connect_timeout(&addr, timeout).is_ok()));
+            });
+        }
+    }
     drop(tx);
-    for (i, reachable) in rx {
-        candidates[i].reachable = reachable;
+
+    // Every path gets its complete bounded probe window. Do not cut off a
+    // higher-bandwidth path merely because the public SSH fallback connected
+    // first; a higher-latency rail may still be the better transfer path.
+    let deadline = std::time::Instant::now() + timeout + std::time::Duration::from_millis(100);
+    while undetermined > 0 {
+        let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        let Ok((i, reachable)) = rx.recv_timeout(wait) else {
+            break;
+        };
+        if determined[i] {
+            continue;
+        }
+        remaining[i] -= 1;
+        if reachable || remaining[i] == 0 {
+            candidates[i].reachable = reachable;
+            determined[i] = true;
+            undetermined -= 1;
+        }
     }
 }
 

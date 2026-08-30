@@ -866,7 +866,9 @@ it needs `--relay` (the list is read on this machine).
 `syq --rm [-j N] [-n] [-v] PATH...` removes trees the way syq copies them:
 a parallel scan, files unlinked in batches across N workers, directories
 removed deepest-first with each level in parallel. Symlinks are removed, not
-followed. Remote paths (`host:path`) work. It refuses `/`, `.` and `~`. On
+followed. If a scanned non-directory is replaced by a directory before its
+batch runs, SYQ reports the type change and never recurses into the new
+directory. Remote paths (`host:path`) work. It refuses `/`, `.` and `~`. On
 NFS, where every unlink is a round trip, `-j32` removed 20,000 files in 2.5 s
 versus 9.7 s for `rm -rf`; on a local SSD `rm -rf` is already fast and syq is
 no faster.

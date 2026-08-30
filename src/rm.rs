@@ -75,7 +75,7 @@ fn worker(
         let names: Vec<PathBytes> = ops
             .iter()
             .map(|o| match o {
-                Op::Remove { path } | Op::Rmdir { path } => path.clone(),
+                Op::Remove { path } | Op::Rmdir { path } | Op::Unlink { path } => path.clone(),
                 _ => Vec::new(),
             })
             .collect();
@@ -225,7 +225,20 @@ pub fn run(args: Args) -> Result<i32> {
                             println!("{}", String::from_utf8_lossy(&full));
                         }
                     } else {
-                        batch.push(Op::Remove { path: full });
+                        #[cfg(debug_assertions)]
+                        {
+                            if let Some(ready) = std::env::var_os("SYQ_TEST_RM_LEAF_READY_FILE") {
+                                std::fs::write(&ready, b"ready")?;
+                            }
+                            if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_RM_LEAF_MS") {
+                                if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                                }
+                            }
+                        }
+                        // The scan selected a non-directory. Do not broaden that
+                        // decision if a directory appears here before execution.
+                        batch.push(Op::Unlink { path: full });
                         if batch.len() >= BATCH {
                             pool.submit(std::mem::replace(&mut batch, Vec::with_capacity(BATCH)));
                         }
