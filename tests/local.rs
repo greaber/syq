@@ -2473,6 +2473,74 @@ fn duplicate_destination_rejected() {
 }
 
 #[test]
+fn exactly_repeated_sources_are_deduplicated_without_changing_placement() {
+    let t = Tmp::new();
+    write(&t.path("tree/name1"), b"data");
+    std::os::unix::fs::symlink("name1", t.path("tree/name2")).unwrap();
+    let tree = t.s("tree/");
+    let so = run_ok(&["-avv", &tree, &tree, &tree, &t.s("tree-dest/")]);
+    assert_eq!(transferred(&so), 1, "{so}");
+    assert_eq!(read(&t.path("tree-dest/name1")), b"data");
+    assert_eq!(
+        fs::read_link(t.path("tree-dest/name2")).unwrap(),
+        std::path::Path::new("name1")
+    );
+
+    // Deduplicating the work must not turn an originally multi-source command
+    // into single-source placement: repeated files still land inside a
+    // directory destination, including when that destination is missing.
+    write(&t.path("one/file"), b"one");
+    let file = t.s("one/file");
+    run_ok(&["-a", &file, &file, &t.s("file-dest")]);
+    assert!(t.path("file-dest").is_dir());
+    assert_eq!(read(&t.path("file-dest/file")), b"one");
+}
+
+#[test]
+fn direct_remote_dedup_uses_raw_operands_and_preserves_original_placement() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    write(&t.path("source-file"), b"payload");
+
+    let source = format!("fake:{}", t.s("source-file"));
+    let destination = format!("fake:{}", t.s("deduplicated"));
+    let repeated = remote_syq(
+        &t,
+        &rsh,
+        &["-a", "--no-bootstrap", &source, &source, &destination],
+    );
+    assert_output_ok(&repeated);
+    assert!(t.path("deduplicated").is_dir());
+    assert_eq!(read(&t.path("deduplicated/source-file")), b"payload");
+
+    // Bracket removal makes these Locations equal after parsing, but the raw
+    // operands are distinct and must still reach collision detection on the
+    // source-side orchestrator.
+    let bracketed_source = format!("[fake]:{}", t.s("source-file"));
+    let conflicting_destination = format!("fake:{}", t.s("conflict"));
+    let distinct = remote_syq(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--no-bootstrap",
+            &source,
+            &bracketed_source,
+            &conflicting_destination,
+        ],
+    );
+    assert!(!distinct.status.success());
+    assert!(
+        stderr_of(&distinct).contains("two sources named"),
+        "{}",
+        stderr_of(&distinct)
+    );
+    assert!(!t.path("conflict").exists());
+}
+
+#[test]
 fn checksum_repair_shrinks_longer_destination() {
     let t = Tmp::new();
     write(&t.path("src"), b"abc");

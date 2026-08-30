@@ -1,0 +1,205 @@
+diff --git a/testsuite/source-read-failure-continues_test.py b/testsuite/source-read-failure-continues_test.py
+new file mode 100755
+index 0000000..68e8bf4
+--- /dev/null
++++ b/testsuite/source-read-failure-continues_test.py
+@@ -0,0 +1,199 @@
++#!/usr/bin/env python3
++"""A source read failure is visible without aborting later file transfers.
++
++This fixture uses an external LD_PRELOAD shim to shrink one source after SYQ
++has scanned it but immediately before its first positioned read. It works with
++ordinary release binaries and keeps destructive mutation out of SYQ itself.
++"""
++
++import os
++import shlex
++import shutil
++import subprocess
++import sys
++
++from rsyncfns import (
++    SCRATCHDIR, assert_same, make_data_file, makepath, rmtree, rsync_argv,
++    test_fail, test_skipped,
++)
++
++
++SHIM_C = r'''
++#define _GNU_SOURCE 1
++#include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++static char target_path[PATH_MAX];
++static int triggered;
++static int resolving;
++
++__attribute__((constructor))
++static void mark_loaded(void)
++{
++    const char *mark = getenv("SYQ_SHRINK_LOAD_MARK");
++    int fd;
++
++    if (!mark || !*mark)
++        return;
++    fd = open(mark, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++    if (fd >= 0) {
++        (void)write(fd, "loaded\n", 7);
++        (void)close(fd);
++    }
++}
++
++static void init_target(void)
++{
++    const char *env;
++
++    if (target_path[0])
++        return;
++    env = getenv("SYQ_SHRINK_TARGET");
++    if (!env || !*env)
++        return;
++    if (!realpath(env, target_path)) {
++        strncpy(target_path, env, sizeof target_path - 1);
++        target_path[sizeof target_path - 1] = '\0';
++    }
++}
++
++static int fd_is_target(int fd)
++{
++    char procpath[64];
++    char actual[PATH_MAX];
++    ssize_t n;
++
++    init_target();
++    if (!target_path[0])
++        return 0;
++    snprintf(procpath, sizeof procpath, "/proc/self/fd/%d", fd);
++    n = readlink(procpath, actual, sizeof actual - 1);
++    if (n < 0)
++        return 0;
++    actual[n] = '\0';
++    return strcmp(actual, target_path) == 0;
++}
++
++ssize_t pread64(int fd, void *buf, size_t count, off64_t offset)
++{
++    static ssize_t (*real_pread64)(int, void *, size_t, off64_t);
++
++    if (!real_pread64) {
++        real_pread64 = (ssize_t (*)(int, void *, size_t, off64_t))
++            dlsym(RTLD_NEXT, "pread64");
++        if (!real_pread64) {
++            errno = EIO;
++            return -1;
++        }
++    }
++
++    if (!triggered && !resolving) {
++        resolving = 1;
++        if (fd_is_target(fd)) {
++            const char *mark = getenv("SYQ_SHRINK_MARK");
++            triggered = 1;
++            if (truncate(target_path, 0) == 0 && mark && *mark) {
++                int mfd = open(mark, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++                if (mfd >= 0) {
++                    (void)write(mfd, "shrunk\n", 7);
++                    (void)close(mfd);
++                }
++            }
++        }
++        resolving = 0;
++    }
++
++    return real_pread64(fd, buf, count, offset);
++}
++'''
++
++
++def compiler():
++    cc = os.environ.get('CC')
++    if cc:
++        return shlex.split(cc)
++    for name in ('cc', 'gcc', 'clang'):
++        path = shutil.which(name)
++        if path:
++            return [path]
++    return None
++
++
++def build_shim():
++    if not sys.platform.startswith('linux'):
++        test_skipped('source-size-change fixture requires LD_PRELOAD and '
++                     '/proc/self/fd')
++    cc = compiler()
++    if not cc:
++        test_skipped('no C compiler available to build the source-read shim')
++
++    cfile = SCRATCHDIR / 'source_shrink_pread.c'
++    sofile = SCRATCHDIR / 'source_shrink_pread.so'
++    cfile.write_text(SHIM_C)
++    proc = subprocess.run(
++        cc + ['-shared', '-fPIC', '-O2', '-Wall', '-Wextra',
++              '-o', str(sofile), str(cfile), '-ldl'],
++        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    if proc.returncode != 0 or not sofile.is_file():
++        test_skipped('could not build the source-read shim:\n'
++                     + (proc.stdout or '').strip())
++    return sofile
++
++
++base = SCRATCHDIR / 'source-change-size'
++src = base / 'src'
++dest = base / 'dest'
++rmtree(base)
++makepath(src, dest)
++
++changing = src / '01-changing.bin'
++later = src / '02-later.txt'
++make_data_file(changing, 1024 * 1024)
++later.write_text('later file must still transfer\n')
++existing = b'existing destination must survive\n'
++(dest / changing.name).write_bytes(existing)
++
++shim = build_shim()
++mark = SCRATCHDIR / 'source_shrink_pread.mark'
++load_mark = SCRATCHDIR / 'source_shrink_load.mark'
++mark.unlink(missing_ok=True)
++load_mark.unlink(missing_ok=True)
++env = os.environ.copy()
++env['LD_PRELOAD'] = str(shim)
++env['SYQ_SHRINK_TARGET'] = str(changing.resolve())
++env['SYQ_SHRINK_MARK'] = str(mark)
++env['SYQ_SHRINK_LOAD_MARK'] = str(load_mark)
++
++# A bandwidth limit selects SYQ's userspace ReadRange path instead of the local
++# copy-file offload. One worker makes the later-file assertion deterministic.
++argv = rsync_argv('-a', '-j', '1', '--bwlimit=1048576', f'{src}/', f'{dest}/')
++print('Running:', ' '.join(argv))
++proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                      text=True, env=env)
++out = proc.stdout or ''
++print(out, end='')
++
++if not load_mark.exists():
++    test_skipped('source-read shim was not loaded; SYQ may be static or the '
++                 'platform ignored LD_PRELOAD')
++if not mark.exists():
++    test_fail('source-read shim loaded but did not intercept the changing '
++              'source file')
++if proc.returncode == 0:
++    test_fail('SYQ hid a source read failure behind a successful exit')
++if (dest / changing.name).read_bytes() != existing:
++    test_fail('a source read failure damaged the existing destination file')
++if not (dest / later.name).is_file():
++    test_fail('a source read failure aborted the later file-list entry')
++assert_same(later, dest / later.name, label='later file')
++
++print('source-read-failure-continues: changed source failed visibly while a '
++      'later file still transferred')

@@ -144,6 +144,35 @@ deleted file mode 100644
 
         self.assertEqual(result.stdout, "rsync|-a|src|dst\n")
 
+    def test_adapted_scenario_provenance_names_its_upstream_source(self) -> None:
+        test = {
+            "name": "alpha-subcase",
+            "upstream_test": "alpha",
+            "classification": "adapted",
+            "adaptation_kind": "subset",
+            "adaptation": "alpha-split",
+        }
+
+        self.assertEqual(
+            rsync_compat.provenance(test),
+            "subset adaptation (alpha-split) of upstream alpha",
+        )
+
+    def test_unmodified_test_is_its_own_upstream_source(self) -> None:
+        test = {"name": "alpha", "classification": "conformance"}
+
+        self.assertEqual(rsync_compat.upstream_test_name(test), "alpha")
+
+    def test_historical_regression_refs_resolve(self) -> None:
+        manifest = rsync_compat.load_manifest()
+        regressions = rsync_compat.load_regressions()
+
+        rsync_compat.validate_regressions(regressions, manifest)
+        rendered = rsync_compat.render_regressions(regressions)
+
+        self.assertIn("rsync-359", rendered)
+        self.assertIn("source-read-failure-continues", rendered)
+
     def test_stream_command_replaces_non_utf8_output(self) -> None:
         returncode, log = rsync_compat.stream_command(
             [sys.executable, "-c", "import os; os.write(1, b'before\\xffafter\\n')"],

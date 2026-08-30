@@ -276,6 +276,9 @@ Identical to rsync:
   sources doesn't change that: it would be overwritten, so it's a conflict.
   The price is memory: every scanned entry is held until the scans are
   validated, roughly a few hundred bytes per entry across all sources.
+- An exactly repeated source operand is scanned once. It still counts toward
+  the original source count for placement, so `syq file file new-dest` creates
+  the directory `new-dest` and writes `new-dest/file`.
 - An explicitly supplied destination root that is a symlink to a directory is
   that directory (the link is kept, with or without a trailing slash). A
   symlink encountered below the destination root is payload at that path: it

@@ -1,4 +1,4 @@
-schema = 2
+schema = 3
 
 [upstream]
 repository = "https://github.com/RsyncProject/rsync.git"
@@ -63,12 +63,12 @@ note = "Honor setgid inheritance when creating destination directories."
 name = "duplicates"
 classification = "conformance"
 area = "source-mapping"
-position = "policy-open"
-baseline = "fail"
+position = "compatible"
+baseline = "pass"
 platforms = ["linux"]
-tags = ["local", "sources", "known-gap"]
+tags = ["local", "sources"]
 requirements = ["symlinks"]
-note = "SYQ still treats repeated identical sources as destination collisions."
+note = "Exactly repeated source operands are scanned and copied once while retaining multi-source destination placement."
 
 [[tests]]
 name = "files-from-path-clamp"
@@ -172,9 +172,9 @@ position = "compatible"
 baseline = "pass"
 platforms = ["linux"]
 run_as = "root"
-tags = ["local", "metadata", "ownership"]
+tags = ["local", "metadata", "ownership", "depth"]
 requirements = ["root", "chown"]
-note = "Archive mode preserves numeric owners and groups; rsync-only --super and -H are removed."
+note = "Archive mode preserves varied numeric owners and groups on files and directories at depth; rsync-only --super and -H are removed."
 
 [[tests]]
 name = "deep-path"
@@ -291,6 +291,20 @@ requirements = ["rsync lsh test helper"]
 note = "Remote-shell copy and follow-up deletion using SYQ's remote executable option."
 
 [[tests]]
+name = "source-read-failure-continues"
+upstream_test = "source-change-size-continues"
+classification = "adapted"
+adaptation = "source-read-failure-preload"
+adaptation_kind = "fixture"
+area = "failure-isolation"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "source-change", "partial-failure", "data-integrity"]
+requirements = ["C compiler", "LD_PRELOAD", "/proc/self/fd"]
+note = "An external shim deterministically shrinks a source at its first positioned read. The failure remains visible, preserves the existing destination, and allows a later file to transfer; rsync's exact exit code and diagnostic wording are not required."
+
+[[tests]]
 name = "symlink-race-dest"
 classification = "conformance"
 area = "security"
@@ -337,3 +351,148 @@ platforms = ["linux"]
 tags = ["local", "update", "depth"]
 requirements = ["symlinks"]
 note = "-u skips a newer deep destination, updates an older one, and still replaces a type mismatch."
+
+[[tests]]
+name = "compare"
+classification = "adapted"
+adaptation = "compare-supported-subset"
+adaptation_kind = "subset"
+area = "quick-check"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "checksum", "quick-check", "depth"]
+requirements = ["POSIX mtimes"]
+note = "At depth, the default size-and-mtime check skips a stealth change, -c repairs it, and an mtime change triggers the default transfer; unsupported -I, --size-only, and --modify-window cases are omitted."
+
+[[tests]]
+name = "delete-deep"
+classification = "adapted"
+adaptation = "delete-supported-subset"
+adaptation_kind = "subset"
+area = "deletion"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "delete", "existing", "depth"]
+requirements = []
+note = "Deep deletion, --delete-delay/--delete-after, --existing, and --ignore-existing agree; unsupported delete timing and backup cases and SYQ's intentional --max-delete policy difference are omitted."
+
+[[tests]]
+name = "executability"
+classification = "adapted"
+adaptation = "executability-default"
+adaptation_kind = "subset"
+area = "metadata"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "modes"]
+requirements = ["POSIX modes"]
+note = "Without -p, rerunning a copy leaves existing destination modes and executable bits unchanged; unsupported -E behavior is omitted."
+
+[[tests]]
+name = "files-from-depth"
+classification = "adapted"
+adaptation = "files-from-split"
+adaptation_kind = "subset"
+area = "file-selection"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "files-from", "from0", "depth"]
+requirements = []
+note = "Deep line- and NUL-delimited --files-from selection agree; comment handling and unsupported filter-list cases are reported separately or omitted."
+
+[[tests]]
+name = "files-from-comments-line"
+upstream_test = "files-from-depth"
+classification = "adapted"
+adaptation = "files-from-split"
+adaptation_kind = "subset"
+area = "file-selection"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "files-from", "comments"]
+requirements = []
+note = "Entries beginning with # or ; are ignored as rsync comments in a line-delimited --files-from list."
+
+[[tests]]
+name = "files-from-comments-from0"
+upstream_test = "files-from-depth"
+classification = "adapted"
+adaptation = "files-from-split"
+adaptation_kind = "subset"
+area = "file-selection"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "files-from", "from0", "comments"]
+requirements = []
+note = "Entries beginning with # or ; are ignored as rsync comments in a NUL-delimited --files-from list."
+
+[[tests]]
+name = "hands"
+classification = "adapted"
+adaptation = "hands-supported-subset"
+adaptation_kind = "subset"
+area = "end-to-end"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "end-to-end", "delete", "multiple-sources"]
+requirements = ["symlinks", "POSIX modes"]
+note = "The canonical rich-tree test covers initial copy, one-file repair, a longer destination, deletion, and explicit multiple-source mapping; only destination-root metadata is normalized because no source root was transferred. Hard-link preservation and delta debugging are omitted."
+
+[[tests]]
+name = "hardlinks-deep"
+classification = "adapted"
+adaptation = "hardlink-default"
+adaptation_kind = "subset"
+area = "hardlinks"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "hardlinks", "depth"]
+requirements = ["hard links"]
+note = "Without -H, two cross-directory source names for one inode become independent destination files; unsupported hard-link preservation is omitted."
+
+[[tests]]
+name = "links"
+classification = "adapted"
+adaptation = "links-preserve-subset"
+adaptation_kind = "subset"
+area = "symlinks"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "symlinks", "depth"]
+requirements = ["symlinks"]
+note = "-l preserves both file and directory symlinks several levels deep; unsupported -L and -k cases are omitted."
+
+[[tests]]
+name = "remote-shell-newline-escaping"
+classification = "adapted"
+adaptation = "remote-shell-syq-cli"
+adaptation_kind = "invocation"
+area = "security"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["remote", "ssh", "security", "argument-quoting"]
+requirements = ["rsync lsh test helper"]
+note = "A newline-bearing remote destination cannot split SYQ's quoted remote command and execute an injected shell command."
+
+[[tests]]
+name = "unsafe-links"
+classification = "adapted"
+adaptation = "unsafe-links-default"
+adaptation_kind = "subset"
+area = "symlinks"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "symlinks", "path-escape"]
+requirements = ["symlinks"]
+note = "Default -a preserves both in-tree and lexically escaping symlinks without following them; unsupported copy-links variants are omitted."

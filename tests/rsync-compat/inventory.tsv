@@ -47,7 +47,7 @@ chroot-receiver-write-inner-module	out-of-scope	rsync-daemon
 chroot-special-inner-module	out-of-scope	rsync-daemon
 clean-fname-collapse	out-of-scope	rsync-internal
 clean-fname-underflow	out-of-scope	rsync-internal
-compare	unsupported	unsupported-transfer-mode
+compare	adapted	-
 compress-options	unsupported	unsupported-transfer-mode
 compress-zlib-insert	out-of-scope	rsync-internal
 connect-prog-host-quoting	out-of-scope	rsync-daemon
@@ -125,7 +125,7 @@ deep-path	adapted	-
 delay-updates	unsupported	unsupported-transfer-mode
 delay-updates-deep	unsupported	unsupported-transfer-mode
 delete	unsupported	unsupported-filters
-delete-deep	unsupported	unsupported-alt-dest
+delete-deep	adapted	-
 delete-missing-args-files-from	unsupported	unsupported-transfer-mode
 dest-symlinked-dir	conformance	-
 devices	unsupported	unsupported-hardlinks
@@ -138,12 +138,12 @@ exclude	unsupported	unsupported-filters
 exclude-implied-trailing-backslash	unsupported	unsupported-filters
 exclude-lsh	unsupported	unsupported-filters
 excludefrom-symlink	unsupported	unsupported-filters
-executability	unsupported	unsupported-metadata
+executability	adapted	-
 fake-super-acl-xattr	unsupported	unsupported-xattrs
 fake-super-backup-fifo-regression	unsupported	unsupported-xattrs
 file-to-file-mkpath-dry-run	unsupported	unsupported-transfer-mode
 files-from	unsupported	unsupported-transfer-mode
-files-from-depth	unsupported	unsupported-filters
+files-from-depth	adapted	-
 files-from-leak	out-of-scope	rsync-daemon
 files-from-path-clamp	conformance	-
 filter-depth	unsupported	unsupported-filters
@@ -155,9 +155,9 @@ fuzzy	unsupported	unsupported-transfer-mode
 fuzzy-basis	unsupported	unsupported-transfer-mode
 git-set-file-times-python-compat-regression	out-of-scope	rsync-internal
 growing-file	adapted	-
-hands	unsupported	unsupported-hardlinks
+hands	adapted	-
 hardlinks	unsupported	unsupported-hardlinks
-hardlinks-deep	unsupported	unsupported-hardlinks
+hardlinks-deep	adapted	-
 hashsearch-chain	out-of-scope	rsync-internal
 hashtable-overflow	out-of-scope	rsync-internal
 highfd-hang	conformance	-
@@ -181,7 +181,7 @@ link-dest-module-escape	unsupported	unsupported-alt-dest
 link-dest-pathroot	unsupported	unsupported-alt-dest
 link-dest-relative-basis	unsupported	unsupported-alt-dest
 link-dest-symlink-enotsup	unsupported	unsupported-alt-dest
-links	unsupported	unsupported-transfer-mode
+links	adapted	-
 log-control-chars	unsupported	unsupported-transfer-mode
 log-file-symlink	unsupported	unsupported-transfer-mode
 longdir	adapted	-
@@ -267,7 +267,7 @@ relative-mkpath-dir-symlink	unsupported	unsupported-relative
 relative-mkpath-symlink	unsupported	unsupported-relative
 relative-symlinked-parent	unsupported	unsupported-relative
 relative-symlinked-parent-dotdot	unsupported	unsupported-relative
-remote-shell-newline-escaping	out-of-scope	rsync-internal
+remote-shell-newline-escaping	adapted	-
 rename-fullpath-symlink-race	unsupported	unsupported-transfer-mode
 rename-mixed-parent-escape-poc	out-of-scope	rsync-internal
 rename-mixed-parent-symlink-race	out-of-scope	rsync-internal
@@ -317,7 +317,7 @@ sender-scan-dir-escape	conformance	-
 simd-checksum	out-of-scope	rsync-internal
 size-filter	conformance	-
 skiplist-spec	out-of-scope	rsync-internal
-source-change-size-continues	out-of-scope	rsync-internal
+source-change-size-continues	adapted	-
 sparse	unsupported	unsupported-transfer-mode
 ssh-basic	adapted	-
 stop-time	unsupported	unsupported-transfer-mode
@@ -340,7 +340,7 @@ temp-dir-symlink-injection	unsupported	unsupported-transfer-mode
 trimslash	out-of-scope	rsync-internal
 uidlist-id0-name-leak	out-of-scope	rsync-internal
 unsafe-byname	out-of-scope	rsync-internal
-unsafe-links	unsupported	unsupported-transfer-mode
+unsafe-links	adapted	-
 update	adapted	-
 variety	out-of-scope	rsync-wire
 variety-symlink-traversal	out-of-scope	rsync-wire

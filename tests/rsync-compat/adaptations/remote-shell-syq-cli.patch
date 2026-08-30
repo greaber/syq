@@ -1,0 +1,32 @@
+diff --git a/testsuite/remote-shell-newline-escaping_test.py b/testsuite/remote-shell-newline-escaping_test.py
+index 89b2814..4f712b6 100644
+--- a/testsuite/remote-shell-newline-escaping_test.py
++++ b/testsuite/remote-shell-newline-escaping_test.py
+@@ -8,6 +8,7 @@
+
+-import os
+ import subprocess
+
+-from rsyncfns import SCRATCHDIR, SRCDIR, rmtree, rsync_argv, test_fail, rsh_cmd
++from rsyncfns import (
++    SCRATCHDIR, rmtree, rsync_argv, rsync_path_arg, test_fail, rsh_cmd,
++)
+
+@@ -20,10 +21,12 @@ sentinel = base / 'pwned'
+
+-env = os.environ.copy()
+-env['RSYNC_RSH'] = rsh_cmd(None, '--no-cd')
+-dest = f"lh:{base}/dest\ntouch {sentinel}\n#"
+-subprocess.run(rsync_argv('-a', f'{src}/', dest),
+-               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
++shell = rsh_cmd(None, '--no-cd')
++dest = f"localhost:{base}/dest\ntouch {sentinel}\n#"
++subprocess.run(
++    rsync_argv('-a', '-e', shell, f'--syq-path={rsync_path_arg()}',
++               f'{src}/', dest),
++    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
++)
+
+ # Without the fix, lsh.sh's eval splits on the newline: the first line runs the
+ # server into base/dest and the second runs `touch <sentinel>`.  With the newline
+ # quoted the whole string is one literal (invalid) destination, so neither effect
