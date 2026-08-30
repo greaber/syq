@@ -1996,6 +1996,42 @@ mod tests {
     }
 
     #[test]
+    fn openssh_quoted_default_collision_is_rejected_end_to_end() {
+        let defaults_output =
+            inspect_ssh_configuration("ssh", None, "unused.example", true).unwrap();
+        let defaults = KnownHostsDefaults::from_openssh(&defaults_output.output).unwrap();
+        assert!(!defaults.user.rendered.contains(['"', '\\', '\n', '\r']));
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("ssh_config");
+        std::fs::write(
+            &config,
+            format!(
+                "Host *\n  UserKnownHostsFile \"{}\"\n",
+                defaults.user.rendered
+            ),
+        )
+        .unwrap();
+        let output = Command::new("ssh")
+            .args(["-G", "-vvv", "-F"])
+            .arg(&config)
+            .args(["--", "unused.example"])
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ssh -G failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let configured = configured_known_hosts_directives(&output.stderr).unwrap();
+        assert!(configured.user);
+        let error = parse_ssh_config_with_defaults(&output.stdout, Some(&defaults), &configured)
+            .unwrap_err();
+        assert!(error.to_string().contains("ambiguous known_hosts"));
+    }
+
+    #[test]
     fn pre_required_rsa_size_config_uses_historical_default() {
         let config = parse_ssh_config(
             b"user backup\nhostname vault.internal\nport 22\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\n",
