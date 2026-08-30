@@ -3638,6 +3638,53 @@ fn no_forward_agent_conflicts_with_explicit_rsh() {
     assert!(!t.path("dst").exists());
 }
 
+#[test]
+fn unrestricted_agent_forwarding_is_an_explicit_live_direct_only_escape_hatch() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    for conflicting in [
+        &["--unrestricted-agent-forwarding", "-e", "ssh -A"][..],
+        &["--unrestricted-agent-forwarding", "--no-forward-agent"],
+        &["--unrestricted-agent-forwarding", "--detach"],
+        &["--unrestricted-agent-forwarding", "--relay"],
+    ] {
+        let (src, dst) = (t.s("src"), t.s("dst"));
+        let mut argv = conflicting.to_vec();
+        argv.extend([src.as_str(), dst.as_str()]);
+        let out = syq(&argv);
+        assert_eq!(out.status.code(), Some(2), "{conflicting:?}");
+        assert!(
+            stderr_of(&out).contains("cannot be used with"),
+            "{conflicting:?}: {}",
+            stderr_of(&out)
+        );
+    }
+    for (src, dst) in [
+        (t.s("src"), "hostB:dst".to_string()),
+        ("hostA:src".to_string(), t.s("dst")),
+        ("same:src".to_string(), "same:dst".to_string()),
+    ] {
+        let out = syq(&["--unrestricted-agent-forwarding", &src, &dst]);
+        assert_eq!(out.status.code(), Some(1), "{src} -> {dst}");
+        assert!(
+            stderr_of(&out).contains("only valid for a live direct transfer"),
+            "{}",
+            stderr_of(&out)
+        );
+    }
+}
+
+#[test]
+fn detached_implicit_ssh_requires_source_host_credentials() {
+    let out = syq(&["--detach", "hostA:src", "hostB:dst"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("--detach requires --no-forward-agent"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
 // Ordinary copies keep no historical completion state: the current destination
 // determines what a later invocation repairs.
 #[test]

@@ -1,3 +1,4 @@
+mod agent_broker;
 mod bwlimit;
 mod checkpoint;
 mod cli;

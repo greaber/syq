@@ -556,6 +556,13 @@ pub fn run(args: Args) -> Result<i32> {
             bail!("all sources must be on the same host");
         }
     }
+    if args.unrestricted_agent_forwarding
+        && (!srcs[0].is_remote() || !dst.is_remote() || srcs[0].same_host(dst) || args.relay)
+    {
+        bail!(
+            "--unrestricted-agent-forwarding is only valid for a live direct transfer between two different remote hosts"
+        );
+    }
     if let Some(checkpoint) = args.checkpoint.as_deref() {
         let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
         for source in srcs.iter().filter(|source| !source.is_remote()) {

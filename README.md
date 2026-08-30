@@ -176,7 +176,7 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--verify-only` | Hash every file in the run's scope on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
 | `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
-| `-e CMD`, `--rsh CMD` | Remote shell command; controls agent forwarding when set (default `ssh`) |
+| `-e CMD`, `--rsh CMD` | Remote shell command; bypasses syq's constrained-agent setup and controls agent forwarding itself (default `ssh`) |
 | `--syq-path PATH` | Use this exact remote `syq` instead of the managed helper |
 | `--no-bootstrap` | Require `syq` on the remote `PATH`; do not install a managed helper |
 | `--no-tcp` | Send data over the ssh connection instead of separate TCP sockets |
@@ -195,7 +195,8 @@ syq -a --checkpoint ./copy.state src host:dst # keep completed-file state for la
 | `--from0` | `--files-from` entries are NUL-separated |
 | `--rm` | Remove the given paths recursively and in parallel (see below) |
 | `--relay` | Remote-to-remote: route data through this machine instead of running on the source host |
-| `--no-forward-agent` | Remote-to-remote with default `ssh`: disable agent forwarding (conflicts with `-e`) |
+| `--no-forward-agent` | Remote-to-remote with default `ssh`: give hostA no agent; it must have credentials for hostB (conflicts with `-e`) |
+| `--unrestricted-agent-forwarding` | Remote-to-remote compatibility escape hatch: expose the complete local agent to hostA instead of the constrained broker |
 | `--detach` | Remote-to-remote: run the transfer detached on the source host so it survives losing this ssh session; prints the follow target even with `-q` |
 | `--follow HOST:LOG` | Attach to a detached transfer's log and stream its progress |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
@@ -220,35 +221,70 @@ does not change file contents, hashes, resume offsets, or `--bwlimit` accounting
 
 ### Remote-to-remote
 
-`syq hostA:src hostB:dst` starts the orchestrator *on hostA* over `ssh -A`
-(agent forwarding), which then pushes to hostB with N connections, so data
-flows A → B directly. Matching helpers are installed automatically on both
-hosts. HostA must be able to ssh to hostB (with your forwarded agent, or its
-own keys). Progress and `-v` output are streamed back. If hostA can't reach
-hostB, `--relay` keeps the orchestrator here and routes every byte A → you → B
-— always works, at half the bandwidth.
+`syq hostA:src hostB:dst` starts the orchestrator *on hostA*, which then pushes
+to hostB with N connections, so data flows A → B directly. Matching helpers
+are installed automatically on both hosts. Progress and `-v` output are
+streamed back. If hostA can't reach hostB, `--relay` keeps the orchestrator
+here and routes every byte A → you → B — always works, at half the bandwidth.
 `syq hostA:src hostA:dst` (same host and user on both ends) simply runs a
 local copy on hostA and disables agent forwarding.
 
-Agent forwarding does not copy private keys to hostA, but a process that can
-access the forwarded socket while the SSH connection is alive can ask the
-agent to authenticate on its behalf. Pass `--no-forward-agent` to use `ssh -a`
-and override any `ForwardAgent yes` in SSH configuration; hostA must then have
-its own credentials for hostB. With an explicit `-e/--rsh`, SYQ adds neither
-`-A` nor `-a`, so include the desired agent-forwarding policy in that command;
-`--no-forward-agent` therefore conflicts with `-e`. `--relay` also avoids
-exposing the agent to hostA, at the cost of routing the file data through this
-machine.
+With implicit OpenSSH, the default is a temporary local agent broker rather
+than unrestricted `ssh -A`. HostA may list the ambient agent's public
+identities, but the broker releases a signature only after validating exactly
+this path:
 
-Like rsync, SYQ leaves host-key checking to `ssh` and therefore inherits the
-user's SSH configuration and OpenSSH defaults. First contact therefore fails
-when `ssh` cannot interactively confirm an unknown host. If accepting and
-recording a new host key is appropriate, opt in explicitly with
-`-e 'ssh -o StrictHostKeyChecking=accept-new'`.
+```text
+trusted hostA session -> configured-user@trusted-hostB session
+```
 
-Add `--detach` to let a remote-to-remote transfer outlive the ssh session that
-launched it: syq starts it on hostA, returns, and writes progress to a log on
-hostA. Reattach with `syq --follow hostA:LOG` to stream that progress.
+It verifies OpenSSH session-bind signatures for both hosts and strictly checks
+the final host-bound authentication request's session ID, destination login
+user, host key, selected credential, and signature algorithm. Key addition,
+removal, raw or legacy signing, unknown extensions, and extra forwarding hops
+are refused. Private keys remain in the original agent, so hardware-backed,
+PIV/OpenPGP agent, and desktop-agent identities continue to handle their own
+touch/PIN/approval behavior. The broker socket and every open channel are
+closed when the attached transfer ends.
+
+This restricts *where and as whom* hostA may authenticate; stock OpenSSH does
+not bind the subsequent command. A compromised hostA still receives the
+authority of that destination account for the transfer's lifetime. Command or
+filesystem restrictions require destination-side policy such as a forced syq
+receiver.
+
+The constrained path currently requires OpenSSH session-bind and host-bound
+authentication support, a local `SSH_AUTH_SOCK`, and exact plain host keys for
+both hosts in the effective local `known_hosts` files. Host-certificate/CA-only
+trust is refused until syq can validate certificate principals and validity as
+strictly as OpenSSH. The local configuration resolves hostB's login user, and
+syq passes it explicitly to hostA. Connection multiplexing is disabled for the
+outer session so a pre-existing master cannot substitute another forwarded
+agent.
+
+Pass `--no-forward-agent` to give hostA no agent at all; hostA must then have
+its own credentials for hostB. `--unrestricted-agent-forwarding` is a
+conspicuous compatibility escape hatch that exposes the complete ambient agent
+to hostA for the attached transfer. With an explicit `-e/--rsh`, syq creates no
+broker and adds neither `-A` nor `-a`, so that command is the complete agent
+policy; `--no-forward-agent` and the unrestricted escape hatch therefore
+conflict with `-e`. `--relay` also avoids exposing authentication to hostA, at
+the cost of routing file data through this machine.
+
+SYQ inherits the user's SSH configuration and OpenSSH host-key checking. The
+default constrained broker additionally requires already recorded exact keys
+for hostA and hostB before connecting; it never learns a key through hostA or
+silently accepts one. If first-contact trust is appropriate, establish it with
+ordinary SSH (directly or through the configured jump path) before starting
+the transfer. An explicit `-e 'ssh -o StrictHostKeyChecking=accept-new'`
+bypasses the broker and leaves that policy to the supplied command.
+
+Add `--detach --no-forward-agent` to let a remote-to-remote transfer outlive
+the ssh session that launched it: syq starts it on hostA, returns, and writes
+progress to a log on hostA. HostA needs its own hostB credential because a
+temporary local broker cannot survive detachment. An explicit `--rsh` may
+provide another persistent authentication policy. Reattach with
+`syq --follow hostA:LOG` to stream that progress.
 An explicit `--checkpoint` path belongs to the machine running the
 orchestrator: normally the invoking machine, but hostA for a direct or detached
 remote-to-remote copy (`--relay` keeps it local).
@@ -907,9 +943,10 @@ fix for that.
   unauthenticated clients; see [Server performance tuning](SERVER-TUNING.md).
   Auto-tuning starts at 16 for TCP data, or 8 for ssh data, and only opens more
   once they have been shown to pay.
-- Direct remote→remote with a *forwarded* agent authenticates every session
-  through your machine; over a slow link that dominates setup time. Keys on the
-  source host avoid it.
+- Direct remote→remote with the constrained broker authenticates every hostB
+  session through your ambient agent; over a slow link that dominates setup
+  time. `--no-forward-agent` with a narrowly scoped key on the source host
+  avoids that round trip.
 - Measured on two 160-core hosts on a 20 Gbit LAN: a single ssh stream tops out
   around 450–550 MB/s; `syq -j8` into tmpfs reached ~1.2–1.3 GiB/s (the raw
   multi-stream ssh ceiling), while writes to the destination's ext4 NVMe capped
