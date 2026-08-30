@@ -468,6 +468,28 @@ fn native_rm_deduplicates_parent_component_aliases() {
 }
 
 #[test]
+fn native_rm_does_not_resolve_through_a_missing_prefix() {
+    let t = Tmp::new();
+    write(&t.path("named-victim"), b"keep");
+    write(&t.path("contents-victim/file"), b"keep");
+
+    for (selector, victim) in [("--src", "named-victim"), ("--src-src", "contents-victim")] {
+        let alias = format!("missing/../{victim}");
+        let output = native_syq(&["rm", "--cwd", &t.s(""), selector, &alias]);
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert_eq!(read(&t.path("named-victim")), b"keep");
+    assert_eq!(read(&t.path("contents-victim/file")), b"keep");
+}
+
+#[test]
 fn native_rm_deduplicates_contents_selectors_through_symlink_aliases() {
     use std::os::unix::fs::symlink;
 

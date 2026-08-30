@@ -198,15 +198,28 @@ fn canonical_query(location: &Location) -> (PathBytes, Option<PathBytes>) {
 /// so selecting a symlink still selects the link itself.
 fn canonicalize_native_rm_locations(ctl: &mut dyn Conn, locs: &mut [Location]) -> Result<()> {
     let queries: Vec<(PathBytes, Option<PathBytes>)> = locs.iter().map(canonical_query).collect();
-    for (path, _) in &queries {
-        ctl.send(Request::Canonicalize {
-            path: path.clone(),
+    let existing = match ok(
+        ctl.call(Request::StatMany {
+            paths: queries.iter().map(|(path, _)| path.clone()).collect(),
+            follow: true,
             guard: None,
-        })?;
-    }
+        })?,
+        "inspect removal selectors",
+    )? {
+        Response::Stats(entries) if entries.len() == queries.len() => entries,
+        other => bail!("unexpected response {other:?}"),
+    };
 
-    for (location, (_, leaf)) in locs.iter_mut().zip(queries) {
-        let canonical = match ok(ctl.recv()?, "canonicalize removal selector")? {
+    for ((location, (path, leaf)), entry) in locs.iter_mut().zip(queries).zip(existing) {
+        // Keep an unresolvable spelling intact so the ordinary streaming scan
+        // reports its error; normalize() intentionally accepts missing tails.
+        if entry.is_none() {
+            continue;
+        }
+        let canonical = match ok(
+            ctl.call(Request::Canonicalize { path, guard: None })?,
+            "canonicalize removal selector",
+        )? {
             Response::Path(path) => path,
             other => bail!("unexpected response {other:?}"),
         };
