@@ -78,9 +78,11 @@ fn source_setup_rsh(rsh: &[String], explicit_rsh: bool) -> Vec<String> {
 
 fn destination_rsh(explicit_rsh: Option<&str>, same_host: bool) -> Option<&str> {
     // A uses the broker to authenticate to B, but B must never receive it.
-    // Requiring host-bound public-key authentication prevents a compromised A
-    // from downgrading the agent request to one that omits B's host key.
-    (!same_host).then_some(explicit_rsh.unwrap_or("ssh -a -o PubkeyAuthentication=host-bound"))
+    // Force the forwarded environment socket and its advertised identities;
+    // requiring host-bound authentication prevents A from omitting B's key.
+    (!same_host).then_some(explicit_rsh.unwrap_or(
+        "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no -o PubkeyAuthentication=host-bound",
+    ))
 }
 
 fn broker_connection_limit(connections_opt: Option<usize>, connections: usize) -> Result<usize> {
@@ -591,7 +593,9 @@ mod tests {
         assert_eq!(source_setup_rsh(&rsh, true), rsh);
         assert_eq!(
             destination_rsh(None, false),
-            Some("ssh -a -o PubkeyAuthentication=host-bound")
+            Some(
+                "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no -o PubkeyAuthentication=host-bound"
+            )
         );
         assert_eq!(
             destination_rsh(Some("custom-rsh"), false),

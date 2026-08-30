@@ -230,9 +230,9 @@ here and routes every byte A → you → B — always works, at half the bandwid
 local copy on hostA and disables agent forwarding.
 
 With implicit OpenSSH, the default is a temporary local agent broker rather
-than unrestricted `ssh -A`. HostA may list the ambient agent's public
-identities, but the broker releases a signature only after validating exactly
-this path:
+than unrestricted `ssh -A`. HostA may list a sanitized snapshot of the ambient
+agent's supported public identities, but the broker signs only with an exact
+credential from that snapshot and only after validating this path:
 
 ```text
 trusted hostA session -> configured-user@trusted-hostB session
@@ -243,11 +243,19 @@ the final host-bound authentication request's session ID, destination login
 user, host key, selected credential, and signature algorithm. Key addition,
 removal, raw or legacy signing, unknown extensions, and extra forwarding hops
 are refused. The A → B client is forced to use host-bound public-key
-authentication. Validated session binds are also replayed to the ambient agent,
-so a stock OpenSSH agent's existing per-key destination constraints remain an
-additional restriction; agents that do not implement session binding may reject
-that extension and continue under the broker's mandatory checks. Successful
-ambient signatures are verified before release.
+authentication. Validated session binds are also replayed to the ambient agent.
+The broker's checks are independent of whether that agent enforces the replayed
+bindings; agents that do not implement session binding may reject the extension
+and continue under the broker's mandatory checks. Successful ambient signatures
+are verified before release.
+
+Use OpenSSH 10.5 or newer for the ambient agent if relying on its existing
+per-key destination constraints as an additional layer. OpenSSH 10.5 fixed an
+interaction in which a locked agent refused session-bind requests, allowing
+operations intended to be local—including use of destination-restricted
+keys—to occur remotely ([OpenSSH 10.5 release notes](https://www.openssh.com/txt/release-10.5);
+CVE-2026-73281). Syq cannot query an agent's version and does not count that
+extra layer as part of its own mandatory path restriction.
 
 Private keys remain in the original agent, so hardware-backed, PIV/OpenPGP
 agent, and desktop-agent identities continue to handle their own
@@ -257,7 +265,9 @@ matching raw agent identity, validates the exact certificate-bearing host-bound
 request, and translates only the agent request's outer credential back to the
 matching raw key. This supports the common arrangement where a YubiKey or other
 agent lists the private key while a centrally managed certificate is a local
-file. An OpenSSH agent may itself reject that translation when the raw key has
+file. When no `CertificateFile` is explicitly configured, syq also follows
+OpenSSH's implicit `<IdentityFile>-cert.pub` convention. An OpenSSH agent may
+itself reject certificate translation when the raw key has
 `ssh-add -h` destination constraints but the certificate was not associated
 with the agent; that combination fails closed. Loading the certificate into the
 agent avoids translation. The broker socket and every open channel are closed
@@ -278,11 +288,17 @@ validate certificate principals and validity as strictly as OpenSSH. Static
 `HostKeyAlgorithms` and `RequiredRSASize` policy is enforced. A configured
 `KnownHostsCommand` or `RevokedHostKeys` KRL is refused because the broker does
 not yet reproduce those dynamic or external revocation checks. Local
-`CertificateFile` expansion supports the ordinary OpenSSH percent tokens except
-`%C`; named-user tildes are also refused rather than guessed.
+`CertificateFile` and implicit `IdentityFile` certificate expansion supports the
+ordinary OpenSSH percent tokens except `%C`; named-user tildes are also refused
+rather than guessed. Credential and host-key algorithms that syq's SSH library
+cannot cryptographically verify are removed or refused rather than failing only
+after a signing request.
 
 The local configuration resolves hostB's login user, and syq passes it
-explicitly to hostA. Connection multiplexing is disabled for the outer session
+explicitly to hostA. The inner client is forced to use its forwarded
+`SSH_AUTH_SOCK` with agent identities enabled, so hostA's `IdentityAgent` or
+`IdentitiesOnly` configuration cannot bypass the broker. Connection
+multiplexing is disabled for the outer session
 so a pre-existing master cannot substitute another forwarded agent. Configured
 port forwards, X11 and GSS credential delegation, PTY allocation, and
 `LocalCommand` are also disabled on that session.
@@ -303,10 +319,10 @@ conflict with `-e`. `--relay` also avoids exposing authentication to hostA, at
 the cost of routing file data through this machine.
 
 SYQ uses the user's SSH configuration to resolve the login user, host-key name,
-port, static known-hosts files, host-key algorithms, RSA size, and configured
-user certificates. The default constrained broker requires already recorded
-exact keys for hostA and hostB before connecting; it never learns a key through
-hostA or silently accepts one. Dynamic `KnownHostsCommand`, external
+port, static known-hosts files, host-key algorithms, RSA size, and configured or
+implicit user certificates. The default constrained broker requires already
+recorded exact keys for hostA and hostB before connecting; it never learns a key
+through hostA or silently accepts one. Dynamic `KnownHostsCommand`, external
 `RevokedHostKeys`, and host-certificate trust are currently refused as described
 above. If first-contact trust is appropriate, establish it with ordinary SSH
 (directly or through the configured jump path) before starting the transfer.
