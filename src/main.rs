@@ -3,6 +3,7 @@ mod checkpoint;
 mod cli;
 mod conn;
 mod crypto;
+mod delegation;
 mod direct;
 mod fsops;
 mod identity;
