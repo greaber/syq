@@ -70,10 +70,13 @@ yourself may use the base64 form for such names.
 
 Because a mapping is plain data, the pipeline
 `syq map … | <transform> | syq cp --mapping - …` covers, as one-liners,
-things that otherwise need dedicated flags or custom copy scripts:
+things that otherwise need dedicated flags or custom copy scripts.
+Re-running any of these converges like an ordinary syq copy: what
+already landed is skipped.
 
-Lowercase every destination name (a migration to a case-insensitive
-filesystem — collisions refused, not overwritten):
+### Lowercase every destination name
+
+A migration to a case-insensitive filesystem:
 
 ```sh
 syq map --src-src src \
@@ -81,21 +84,72 @@ syq map --src-src src \
   | syq cp --mapping - -C src --to nas --into /pub
 ```
 
-Repartition into `YEAR/MM/` folders by modification time:
+```text
+src/                          nas:/pub/ afterwards
+├── Berlin/                   ├── berlin/
+│   ├── IMG_1234.JPG          │   ├── img_1234.jpg
+│   └── IMG_1235.JPG          │   └── img_1235.jpg
+└── Notes.TXT                 └── notes.txt
+```
+
+If `src` also contained `notes.TXT`, the run is refused before any
+transfer: two entries claim `notes.txt`.
+
+rsync has no rename option, so its closest equivalent is a symlink
+staging farm, dereferenced on the way out:
+
+```sh
+find src -type f | while read -r f; do
+  d="staging/$(printf %s "${f#src/}" | tr '[:upper:]' '[:lower:]')"
+  mkdir -p "$(dirname "$d")" && ln -sf "$(realpath "$f")" "$d"
+done
+rsync -aL staging/ nas:/pub/
+```
+
+— where `ln -sf` resolves the case-fold collision silently,
+last writer wins, and the farm must be rebuilt and cleaned up around
+every run.
+
+### Repartition into `YEAR/MM/` folders by modification time
 
 ```sh
 syq map --src-src photos \
-  | jq '.dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value' \
+  | jq 'select(.kind == "file")
+        | .dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value' \
   | syq cp --mapping - -C photos --to nas --into /archive
 ```
 
-Only files of at least 1 MiB:
+The `select` keeps only file entries; the `2024/07/` directories no
+entry names are created implicitly.
+
+```text
+photos/                          nas:/archive/ afterwards
+├── IMG_1234.JPG   (July 2024)   ├── 2024/
+├── IMG_8812.JPG   (Nov 2024)    │   ├── 07/IMG_1234.JPG
+└── clip.mp4       (Jan 2025)    │   └── 11/IMG_8812.JPG
+                                 └── 2025/
+                                     └── 01/clip.mp4
+```
+
+The rsync equivalent is a hardlink farm maintained beside the photos —
+`ln` each file into `farm/YEAR/MM/`, `rsync -a farm/ nas:/archive/` —
+which needs a writable staging tree on the same filesystem and its own
+lifecycle (rebuild after changes, clean up after runs).
+
+### Only files of at least 1 MiB
 
 ```sh
 syq map --src-src data \
   | jq 'select(.kind != "file" or .size >= 1048576)' \
   | syq cp --mapping - -C data --to nas --into /big
 ```
+
+rsync spells this exact transform as a dedicated flag:
+`rsync -a --min-size=1M data/ nas:/big/`. That is the pattern in
+miniature: a few transforms earned rsync flags over the years
+(`--min-size`, `--iconv`); most never will — there is no
+`--lowercase` and no `--partition-by-date` — but as mapping transforms
+they are all the same one-line shape.
 
 ## Producing a mapping yourself
 
@@ -114,6 +168,14 @@ up front:
 
 ```sh
 syq cp --mapping pairs.ndjson -C photos --to nas --into /archive
+```
+
+where `pairs.ndjson` is whatever your program emitted, one claim per
+line:
+
+```json
+{"src":{"encoding":"utf-8","value":"IMG_1234.JPG"},"dst":{"encoding":"utf-8","value":"2024/07/berlin/IMG_1234.JPG"}}
+{"src":{"encoding":"utf-8","value":"IMG_8812.JPG"},"dst":{"encoding":"utf-8","value":"2024/11/oslo/IMG_8812.JPG"}}
 ```
 
 For the patterns people build today with hardlink or symlink staging
