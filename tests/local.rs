@@ -11,6 +11,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -58,7 +59,7 @@ fn syq(args: &[&str]) -> Output {
     compat_command()
         .args(args)
         .arg("--no-progress")
-        .output()
+        .run()
         .expect("run syq")
 }
 
@@ -72,7 +73,7 @@ fn native_syq(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(args)
         .arg("-q")
-        .output()
+        .run()
         .expect("run native syq command")
 }
 
@@ -153,7 +154,7 @@ fn janky_cat_concatenates_files_and_stdin() {
         .args(["cat", &t.s("first"), "-", &t.s("last")])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
+        .start()
         .unwrap();
     child.stdin.take().unwrap().write_all(b"middle").unwrap();
     let output = child.wait_with_output().unwrap();
@@ -169,7 +170,7 @@ fn janky_cat_reports_missing_inputs_and_keeps_going() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cat", &t.s("missing"), &t.s("present")])
-        .output()
+        .run()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(1));
@@ -189,7 +190,7 @@ fn janky_cat_is_slow_and_absent_from_help() {
     let started = std::time::Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cat", &t.s("one-byte")])
-        .output()
+        .run()
         .unwrap();
     let elapsed = started.elapsed();
 
@@ -202,7 +203,7 @@ fn janky_cat_is_slow_and_absent_from_help() {
 
     let help = Command::new(env!("CARGO_BIN_EXE_syq"))
         .arg("--help")
-        .output()
+        .run()
         .unwrap();
     assert_output_ok(&help);
     assert!(
@@ -246,7 +247,7 @@ fn native_copy_distinguishes_named_contents_and_exact_placement() {
             "--as",
             &t.s("planned-exact"),
         ])
-        .output()
+        .run()
         .unwrap();
     assert_output_ok(&output);
     let plan = String::from_utf8_lossy(&output.stdout);
@@ -417,7 +418,7 @@ fn native_copy_preserves_non_utf8_selector_bytes() {
         .arg("--as-new")
         .arg(t.path("copied"))
         .arg("-q")
-        .output()
+        .run()
         .unwrap();
     assert_output_ok(&out);
     assert_eq!(read(&t.path("copied")), b"raw path");
@@ -429,7 +430,7 @@ fn native_copy_preserves_non_utf8_selector_bytes() {
         .arg("--src")
         .arg(&name)
         .arg("-q")
-        .output()
+        .run()
         .unwrap();
     assert_output_ok(&out);
     assert!(!Path::new(&source).exists());
@@ -459,7 +460,7 @@ fn native_rejects_transport_configuration() {
     for option in ["--rsh", "--syq-path", "--no-tcp", "--relay"] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(["cp", option, "value", "source", "--into", "target"])
-            .output()
+            .run()
             .unwrap();
         assert_eq!(out.status.code(), Some(2), "{option}");
         assert!(
@@ -613,7 +614,7 @@ fn native_rm_double_verbose_logs_base_symlink_hops_and_final_identity() {
             "--src-file",
             "link",
         ])
-        .output()
+        .run()
         .unwrap();
     assert_output_ok(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -803,7 +804,7 @@ fn native_rm_overlapping_dry_run_does_not_deduplicate() {
             "--src-dir",
             "tree/child",
         ])
-        .output()
+        .run()
         .unwrap();
     assert_output_ok(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -818,7 +819,7 @@ fn top_level_rsync_syntax_is_rejected_without_mutation() {
     write(&t.path("src"), b"data");
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["-a", &t.s("src"), &t.s("dst")])
-        .output()
+        .run()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("syq rsync"));
@@ -840,7 +841,7 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let mut child = command.spawn().unwrap();
+    let mut child = command.start().unwrap();
     let partial = (0..300).find_map(|_| {
         let mut partials = partial_files(dir);
         if partials.len() == 1 {
@@ -855,9 +856,51 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
     partial.expect("copy never created its job-scoped partial")
 }
 
+/// Keeps executable fixtures from being written while a child is forked.
+///
+/// Tests run in parallel threads of one process. A child forked by one test
+/// inherits every open descriptor until it execs, including a wrapper script
+/// another test is still writing. If that child is slow to exec under load,
+/// the wrapper's own exec fails with ETXTBSY ("Text file busy"). Writers take
+/// the exclusive side; every spawn takes the shared side, and both `spawn`
+/// and `output` only return once the child has exec'd, so no un-exec'd child
+/// can hold a fixture open when its writer proceeds.
+static PROCESS_IMAGE_LOCK: RwLock<()> = RwLock::new(());
+
 fn executable(p: &Path, body: &[u8]) {
+    let _writing = PROCESS_IMAGE_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     write(p, body);
     fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `Command::output` and `Command::spawn` with the fork under
+/// [`PROCESS_IMAGE_LOCK`]. Use these instead of the inherent methods
+/// everywhere in this file. The lock covers only the spawn: several tests
+/// race a child against filesystem changes, so waiting for it must not hold
+/// other tests back. `run` captures stdout and stderr and closes stdin like
+/// `Command::output`; a test that feeds stdin uses `start`.
+trait Launch {
+    fn run(&mut self) -> std::io::Result<Output>;
+    fn start(&mut self) -> std::io::Result<std::process::Child>;
+}
+
+impl Launch for Command {
+    fn run(&mut self) -> std::io::Result<Output> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()?
+            .wait_with_output()
+    }
+
+    fn start(&mut self) -> std::io::Result<std::process::Child> {
+        let _spawning = PROCESS_IMAGE_LOCK
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.spawn()
+    }
 }
 
 /// A remote shell that executes the supplied command locally with an isolated
@@ -914,7 +957,7 @@ fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
 
 fn remote_syq(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
     remote_syq_command(t, rsh, args)
-        .output()
+        .run()
         .expect("run syq through fake remote shell")
 }
 
@@ -955,7 +998,7 @@ fn cached_local_helper(t: &Tmp) -> PathBuf {
 fn binary_identity(argument: &str) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .arg(argument)
-        .output()
+        .run()
         .unwrap();
     assert!(out.status.success());
     String::from_utf8(out.stdout).unwrap().trim().to_string()
@@ -1160,7 +1203,7 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     let mut cmd = remote_syq_command(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
     let out = cmd
         .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("corrupt-release.gz"))
-        .output()
+        .run()
         .unwrap();
 
     assert_output_ok(&out);
@@ -1229,7 +1272,7 @@ fn remote_manifest_cannot_inject_digest_protocol_framing() {
             "FAKE_REMOTE_RELEASE_ARCHIVE",
             t.path("alternate-release.gz"),
         )
-        .output()
+        .run()
         .unwrap();
 
     assert_output_ok(&out);
@@ -1276,7 +1319,7 @@ fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
             "FAKE_REMOTE_RELEASE_MANIFEST",
             t.path("tampered-remote-manifest.json"),
         )
-        .output()
+        .run()
         .unwrap();
 
     assert_output_ok(&out);
@@ -1339,7 +1382,7 @@ fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
     let mut cmd = remote_syq_command(&t, &rsh, &["-a", &t.s("src"), &remote]);
     let out = cmd
         .env("FAKE_REMOTE_PATH", t.path("remote-bin"))
-        .output()
+        .run()
         .unwrap();
 
     assert_output_ok(&out);
@@ -1522,7 +1565,7 @@ fn rsync_subcommand_wrapper_can_start_the_remote_server() {
             &remote,
         ],
     )
-    .output()
+    .run()
     .expect("run through an rsync-prefixed remote wrapper");
 
     assert_output_ok(&out);
@@ -1578,7 +1621,7 @@ fn double_verbose_dry_run_reports_tcp_without_extra_connection() {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"))
-        .output()
+        .run()
         .expect("run double-verbose dry-run over TCP");
 
     assert_output_ok(&out);
@@ -1645,7 +1688,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .output()
+        .run()
         .expect("run double-verbose dry-run with TCP fallback");
 
     assert_output_ok(&out);
@@ -1695,7 +1738,7 @@ fn single_verbose_keeps_file_listing_semantics() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .output()
+        .run()
         .expect("run single-verbose remote copy");
 
     assert_output_ok(&out);
@@ -1726,7 +1769,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .output()
+        .run()
         .expect("dry-run syq over encrypted TCP through fake remote shell");
     assert_output_ok(&dry);
     assert!(!t.path("dst").exists());
@@ -1750,7 +1793,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"))
-        .output()
+        .run()
         .expect("run syq over TCP through fake remote shell");
 
     assert_output_ok(&out);
@@ -1804,7 +1847,7 @@ fn tcp_congestion_override_is_applied_on_both_socket_ends_and_reported() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .output()
+        .run()
         .expect("run syq with a per-socket TCP congestion override");
 
     assert_output_ok(&out);
@@ -1844,7 +1887,7 @@ fn rejected_tcp_congestion_override_is_fatal_instead_of_falling_back() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .output()
+        .run()
         .expect("run syq with an unavailable TCP congestion override");
 
     assert!(!out.status.success());
@@ -1892,7 +1935,7 @@ fn ordinary_tcp_setup_failure_still_falls_back_with_congestion_notice() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .output()
+        .run()
         .expect("run syq when the requested direct TCP port is occupied");
 
     assert_output_ok(&out);
@@ -1928,7 +1971,7 @@ fn direct_remote_to_remote_forwards_tcp_congestion_override() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .output()
+        .run()
         .expect("run direct remote-to-remote dry-run with TCP congestion override");
 
     assert_output_ok(&out);
@@ -1983,7 +2026,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
             .env("SYQ_TUNING_CACHE", &cache)
-            .output()
+            .run()
             .unwrap()
     };
     write(&t.path("src"), b"remembered start");
@@ -2036,7 +2079,7 @@ fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
     )
     .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
     .env("SYQ_TEST_DROP_MARKER", &marker)
-    .output()
+    .run()
     .unwrap();
 
     assert_output_ok(&out);
@@ -2099,7 +2142,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
         .env("SYQ_TEST_DROP_AFTER_N_REQUESTS", "32")
         .env("SYQ_TEST_DROP_MARKER", &marker)
-        .output()
+        .run()
         .unwrap();
 
     assert_output_ok(&out);
@@ -2150,7 +2193,7 @@ fn lost_finalize_response_is_verified_after_reconnect() {
     )
     .env("SYQ_TEST_DROP_AFTER_REQUEST", "finalize")
     .env("SYQ_TEST_DROP_MARKER", &marker)
-    .output()
+    .run()
     .unwrap();
 
     assert_output_ok(&out);
@@ -3102,7 +3145,7 @@ fn rm_rejects_parent_traversal() {
         .args(["--rm", ".."])
         .arg("--no-progress")
         .current_dir(t.path("parent/child"))
-        .output()
+        .run()
         .unwrap();
     assert!(!out.status.success());
     // The sibling outside child must survive.
@@ -3138,7 +3181,7 @@ fn rm_never_recurses_into_directory_that_replaced_scanned_leaf() {
         .env("SYQ_TEST_HOLD_RM_LEAF_MS", "1000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .start()
         .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -3470,7 +3513,7 @@ fn small_file_failure_never_publishes_partial_contents() {
     let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "/f")
-        .output()
+        .run()
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
     assert!(
@@ -3814,7 +3857,7 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
 
     let implicit = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["foo", "bar", "dst"])
-        .output()
+        .run()
         .unwrap();
     assert_eq!(implicit.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&implicit.stderr).contains("expected a command"));
@@ -3884,7 +3927,7 @@ fn native_as_file_over_directory_fails_the_same_in_dry_run_and_execution() {
         if dry_run {
             command.arg("--dry-run");
         }
-        let output = command.output().unwrap();
+        let output = command.run().unwrap();
         assert!(!output.status.success(), "dry_run={dry_run}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("existing directory"), "{stderr}");
@@ -5060,7 +5103,7 @@ fn ordinary_copy_needs_no_writable_history_directory() {
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("XDG_STATE_HOME", t.s("not-a-directory"))
         .env("HOME", t.s("not-a-directory"))
-        .output()
+        .run()
         .unwrap();
     assert!(
         out.status.success(),
@@ -5090,7 +5133,7 @@ fn checkpoint_is_explicit_retained_and_source_sensitive() {
             &t.s("dest/"),
         ])
         .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .output()
+        .run()
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
     assert!(t.path("copy.checkpoint").is_file());
@@ -5190,7 +5233,7 @@ fn checkpoint_tombstone_precedes_destination_deletion() {
             &t.s("dst/"),
         ])
         .env("SYQ_TEST_HOLD_AFTER_DELETE_MS", "10000")
-        .spawn()
+        .start()
         .unwrap();
     for _ in 0..300 {
         if !t.path("dst/f").exists() {
@@ -5283,7 +5326,7 @@ fn checkpoint_skip_still_detects_collision() {
             &t.s("dest/"),
         ])
         .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .output()
+        .run()
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
     assert_eq!(read(&t.path("dest/x")), b"from A");
@@ -5499,7 +5542,7 @@ fn exact_payload_sidecar_collision_with_dot_destination_fails_before_publication
         .args(args)
         .arg("--no-progress")
         .current_dir(t.path("dst"))
-        .output()
+        .run()
         .unwrap();
 
     assert!(!output.status.success());
@@ -5557,7 +5600,7 @@ fn root_meta_failure_is_visible() {
     let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst")])
         .env("SYQ_TEST_FAIL_SETMETA", "dst")
-        .output()
+        .run()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(23), "stderr: {err}");
@@ -5589,7 +5632,7 @@ fn checkpoint_records_quick_check_only_after_meta_repair() {
             &t.s("dst/"),
         ])
         .env("SYQ_TEST_FAIL_SETMETA", "f")
-        .output()
+        .run()
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
     assert_eq!(
@@ -5689,7 +5732,7 @@ fn checkpoint_identity_is_spelling_independent() {
             &t.s("dst/"),
         ])
         .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .output()
+        .run()
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
     fs::remove_file(t.path("dst/f")).unwrap();
@@ -5725,7 +5768,7 @@ fn existing_checkpoint_with_missing_destination_fails() {
             &t.s("dest/"),
         ])
         .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .output()
+        .run()
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
     assert!(t.path("copy.checkpoint").is_file());
@@ -5807,7 +5850,7 @@ fn concurrent_copies_union() {
     let spawn = |src: &str| {
         compat_command()
             .args(["-a", "--no-progress", &t.s(src), &t.s("dest/")])
-            .spawn()
+            .start()
             .unwrap()
     };
     let (mut a, mut b) = (spawn("A/"), spawn("B/"));
@@ -5843,7 +5886,7 @@ fn different_jobs_use_distinct_partial_inodes() {
             &t.s("out"),
         ])
         .env("SYQ_TEST_HOLD_PARTIAL_MS", "2000")
-        .spawn()
+        .start()
         .unwrap();
     let first_partial = (0..300).find_map(|_| {
         let mut partials = partial_files(&t.0);
@@ -5908,7 +5951,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
         ])
         .env("SYQ_TEST_BASIS_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
-        .spawn()
+        .start()
         .unwrap();
     let held = (0..300).any(|_| {
         if ready.exists() {
@@ -5964,7 +6007,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
         ])
         .env("SYQ_TEST_BASIS_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
-        .spawn()
+        .start()
         .unwrap();
     let held = (0..300).any(|_| {
         if ready.exists() {
@@ -6017,7 +6060,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
         ])
         .env("SYQ_TEST_BASIS_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
-        .spawn()
+        .start()
         .unwrap();
     let held = (0..300).any(|_| {
         if ready.exists() {
@@ -6078,7 +6121,7 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
         .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
         .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_QUICK_META_MS", "2000")
-        .spawn()
+        .start()
         .unwrap();
     let held = (0..300).any(|_| {
         if ready.exists() {
@@ -6140,7 +6183,7 @@ fn quick_check_metadata_open_reports_concurrent_fifo_without_blocking() {
         .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
         .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_QUICK_META_MS", "1000")
-        .spawn()
+        .start()
         .unwrap();
     let held = (0..300).any(|_| {
         if ready.exists() {
@@ -6231,7 +6274,7 @@ fn unchmodable_interrupted_partial_is_replaced() {
         .args(args)
         .arg("--no-progress")
         .env("SYQ_TEST_FAIL_PARTIAL_CHMOD", "1")
-        .output()
+        .run()
         .unwrap();
 
     assert_output_ok(&out);
@@ -6255,7 +6298,7 @@ fn writable_interrupted_partial_is_made_private_before_reuse() {
         .args(args)
         .arg("--no-progress")
         .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000")
-        .spawn()
+        .start()
         .unwrap();
     for _ in 0..300 {
         if fs::metadata(&partial).unwrap().mode() & 0o7777 == 0o600 {
@@ -6281,7 +6324,7 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
     let out = compat_command()
         .args(["-a", "-j", "1", "--no-progress", &t.s("src"), &t.s("dst")])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
-        .output()
+        .run()
         .unwrap();
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), contents);
@@ -6378,7 +6421,7 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
         .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .start()
         .unwrap();
     for _ in 0..200 {
         if t.path("dst").exists() {
@@ -6421,7 +6464,7 @@ fn changed_source_retry_still_uses_copy_file_range() {
         .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .start()
         .unwrap();
     for _ in 0..200 {
         if t.path("dst").exists() {
@@ -6522,7 +6565,7 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
             .env("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS", "1000")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .start()
             .unwrap();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -6641,7 +6684,7 @@ fn checkpoint_records_metadata_only_reconcile() {
             &t.s("dst/"),
         ])
         .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .output()
+        .run()
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
     assert_eq!(
@@ -7149,7 +7192,7 @@ fn files_from_rejections_and_stdin() {
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .spawn()
+        .start()
         .unwrap();
     child.stdin.take().unwrap().write_all(b"b\n").unwrap();
     let out = child.wait_with_output().unwrap();
@@ -7382,7 +7425,7 @@ fn delete_halts_when_checkpoint_intents_cannot_be_persisted() {
             Ok(())
         });
     }
-    let out = cmd.output().unwrap();
+    let out = cmd.run().unwrap();
     assert_eq!(
         out.status.code(),
         Some(23),
