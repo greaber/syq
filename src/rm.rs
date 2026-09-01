@@ -1,7 +1,8 @@
-//! `syq rsync --rm` and native `syq rm`: recursive removal with N parallel
-//! connections. Files are
-//! unlinked in batches spread across workers; directories are removed
-//! deepest-first, each depth level in parallel.
+//! Removal command orchestration.
+//!
+//! `syq rsync --rm` retains the compatibility engine with N parallel endpoint
+//! connections. Native `syq rm` delegates one descriptor-rooted operation to
+//! the endpoint, whose in-process worker pool owns all pinned handles.
 
 use crate::cli::{Args, Interface, Location, SourceSelection};
 use crate::conn::{ok, Conn, Endpoint};
@@ -10,7 +11,7 @@ use crate::progress::{commas, Progress};
 use crate::proto::*;
 use crate::transfer::{connect_ctl, endpoint};
 use anyhow::{bail, Result};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
@@ -146,136 +147,6 @@ fn check_rm_safety(locs: &[Location], _args: &Args) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct SelectorKey {
-    absolute: bool,
-    components: Vec<Vec<u8>>,
-}
-
-impl SelectorKey {
-    fn new(path: &[u8]) -> Self {
-        Self {
-            absolute: path.starts_with(b"/"),
-            components: path
-                .split(|byte| *byte == b'/')
-                .filter(|component| !component.is_empty() && *component != b".")
-                .map(<[u8]>::to_vec)
-                .collect(),
-        }
-    }
-
-    fn is_strict_ancestor_of(&self, other: &Self) -> bool {
-        self.absolute == other.absolute
-            && self.components.len() < other.components.len()
-            && other.components.starts_with(&self.components)
-    }
-}
-
-fn selection_order(selection: SourceSelection) -> u8 {
-    match selection {
-        SourceSelection::Contents => 0,
-        SourceSelection::Named | SourceSelection::NamedNoFollow | SourceSelection::Rsync => 1,
-    }
-}
-
-fn canonical_query(location: &Location) -> (PathBytes, Option<PathBytes>) {
-    if location.follows_root() {
-        return (location.path.clone(), None);
-    }
-
-    match location.path.iter().rposition(|byte| *byte == b'/') {
-        Some(0) => (b"/".to_vec(), Some(location.path[1..].to_vec())),
-        Some(separator) => (
-            location.path[..separator].to_vec(),
-            Some(location.path[separator + 1..].to_vec()),
-        ),
-        None => (b".".to_vec(), Some(location.path.clone())),
-    }
-}
-
-/// Resolve each selector root once on its endpoint before scanning. Contents
-/// selectors follow the root; named selectors preserve their final component
-/// so selecting a symlink still selects the link itself.
-fn canonicalize_native_rm_locations(ctl: &mut dyn Conn, locs: &mut [Location]) -> Result<()> {
-    let queries: Vec<(PathBytes, Option<PathBytes>)> = locs.iter().map(canonical_query).collect();
-    let existing = match ok(
-        ctl.call(Request::StatMany {
-            paths: queries.iter().map(|(path, _)| path.clone()).collect(),
-            follow: true,
-            guard: None,
-        })?,
-        "inspect removal selectors",
-    )? {
-        Response::Stats(entries) if entries.len() == queries.len() => entries,
-        other => bail!("unexpected response {other:?}"),
-    };
-
-    for ((location, (path, leaf)), entry) in locs.iter_mut().zip(queries).zip(existing) {
-        // Keep an unresolvable spelling intact so the ordinary streaming scan
-        // reports its error; normalize() intentionally accepts missing tails.
-        if entry.is_none() {
-            continue;
-        }
-        let canonical = match ok(
-            ctl.call(Request::Canonicalize { path, guard: None })?,
-            "canonicalize removal selector",
-        )? {
-            Response::Path(path) => path,
-            other => bail!("unexpected response {other:?}"),
-        };
-        location.path = match leaf {
-            Some(leaf) => join(&canonical, &leaf),
-            None => canonical,
-        };
-    }
-    Ok(())
-}
-
-/// Give each distinct resolved path-and-mode selector one scan. Exact aliases
-/// in the same mode are deduplicated. Cross-mode selectors remain independent,
-/// and overlapping roots are ordered so one selection cannot mutate the
-/// namespace beneath another while it is being scanned.
-fn normalize_native_rm_locations(locs: Vec<Location>) -> (Vec<Location>, bool) {
-    let mut identities = HashSet::new();
-    let mut normalized: Vec<(Location, SelectorKey)> = Vec::with_capacity(locs.len());
-    for location in locs {
-        let key = SelectorKey::new(&location.path);
-        let identity = (key.clone(), location.selection);
-        if !identities.insert(identity) {
-            continue;
-        }
-        normalized.push((location, key));
-    }
-
-    let overlaps = normalized.iter().enumerate().any(|(index, (_, key))| {
-        normalized[index + 1..].iter().any(|(_, other)| {
-            key == other || key.is_strict_ancestor_of(other) || other.is_strict_ancestor_of(key)
-        })
-    });
-    if overlaps {
-        // Descendants precede ancestors. At one path, contents precedes the
-        // named object so a selected directory remains usable for that scan.
-        normalized.sort_by(|(left_location, left), (right_location, right)| {
-            right
-                .components
-                .len()
-                .cmp(&left.components.len())
-                .then_with(|| left.cmp(right))
-                .then_with(|| {
-                    selection_order(left_location.selection)
-                        .cmp(&selection_order(right_location.selection))
-                })
-        });
-    }
-    (
-        normalized
-            .into_iter()
-            .map(|(location, _)| location)
-            .collect(),
-        overlaps,
-    )
-}
-
 fn remove_pending_directories(
     dirs: &mut BTreeMap<usize, Vec<PathBytes>>,
     args: &Args,
@@ -312,7 +183,10 @@ fn remove_pending_directories(
 }
 
 pub fn run(args: Args) -> Result<i32> {
-    let mut locs: Vec<Location> = if args.locations.is_empty() {
+    if args.interface == Interface::NativeRm {
+        return run_native(args);
+    }
+    let locs: Vec<Location> = if args.locations.is_empty() {
         args.paths
             .iter()
             .map(|p| Location::parse(p))
@@ -332,14 +206,6 @@ pub fn run(args: Args) -> Result<i32> {
         args.connections = crate::transfer::LOCAL_DEFAULT_CONNECTIONS;
     }
     let mut ctl = connect_ctl(&ep, &args)?;
-    let serialize_selectors = if args.interface == Interface::NativeRm {
-        canonicalize_native_rm_locations(&mut *ctl, &mut locs)?;
-        let (normalized, overlaps) = normalize_native_rm_locations(locs);
-        locs = normalized;
-        overlaps
-    } else {
-        false
-    };
 
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let verbose = !args.quiet && args.verbose > 0;
@@ -385,9 +251,6 @@ pub fn run(args: Args) -> Result<i32> {
 
     // Directories by depth, removed after all files are gone.
     let mut dirs: BTreeMap<usize, Vec<PathBytes>> = BTreeMap::new();
-    // A dry run cannot make a descendant disappear before its ancestor is
-    // scanned, so suppress entries already reported by an overlapping root.
-    let mut dry_run_seen = (serialize_selectors && args.dry_run).then(HashSet::new);
     let mut scan_err = None;
     for l in &locs {
         let root = l.path.clone();
@@ -410,11 +273,6 @@ pub fn run(args: Args) -> Result<i32> {
                         continue;
                     }
                     let full = join(&root, &e.path);
-                    if let Some(seen) = dry_run_seen.as_mut() {
-                        if !seen.insert(SelectorKey::new(&full)) {
-                            continue;
-                        }
-                    }
                     progress.files_total.fetch_add(1, Relaxed);
                     if e.kind == Kind::Dir {
                         let depth = full.iter().filter(|&&c| c == b'/').count();
@@ -451,10 +309,6 @@ pub fn run(args: Args) -> Result<i32> {
         );
         pool.submit(batch);
         let error = res.err();
-        if serialize_selectors {
-            pool.wait_idle();
-            remove_pending_directories(&mut dirs, &args, &pool, &progress, verbose);
-        }
         if let Some(e) = error {
             scan_err = Some(e);
             break;
@@ -477,6 +331,109 @@ pub fn run(args: Args) -> Result<i32> {
         progress.error(&format!("syq: {e:#}"));
     }
     let errors = progress.errors.load(Relaxed) + if pool.is_aborted() { 1 } else { 0 };
+    if !args.quiet {
+        println!(
+            "syq: {} {} entries in {}{}",
+            if args.dry_run {
+                "would remove"
+            } else {
+                "removed"
+            },
+            commas(progress.files_done.load(Relaxed)),
+            crate::progress::hms(progress.start.elapsed().as_secs_f64()),
+            if errors > 0 {
+                format!(", {errors} errors")
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(if errors > 0 { 23 } else { 0 })
+}
+
+fn run_native(mut args: Args) -> Result<i32> {
+    let locs = &args.locations;
+    for location in locs {
+        if !location.same_host(&locs[0]) {
+            bail!("all paths must be on the same host");
+        }
+    }
+    let endpoint = endpoint(&locs[0], &args)?;
+    if args.connections_default && !endpoint.is_remote() {
+        args.connections = crate::transfer::LOCAL_DEFAULT_CONNECTIONS;
+    }
+    let selections = locs
+        .iter()
+        .map(|location| NativeRemoveSelection {
+            path: location.path.clone(),
+            kind: match location.selection {
+                SourceSelection::Contents => NativeRemoveKind::Contents,
+                SourceSelection::File => NativeRemoveKind::File,
+                SourceSelection::Directory => NativeRemoveKind::Directory,
+                SourceSelection::Named | SourceSelection::NamedNoFollow => NativeRemoveKind::Any,
+                SourceSelection::Rsync => unreachable!("native selector uses rsync semantics"),
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut connection = connect_ctl(&endpoint, &args)?;
+    let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
+    let verbose = !args.quiet && args.verbose > 0;
+    let trace_resolution = !args.quiet && args.verbose > 1;
+    let progress = Progress::new(
+        args.connections,
+        show_progress,
+        args.progress,
+        args.width,
+        !args.quiet && args.progress_json,
+    );
+    let progress = {
+        let mut value = Arc::try_unwrap(progress).ok().expect("fresh progress");
+        value.rm = true;
+        Arc::new(value)
+    };
+    progress.scan_done.store(true, Relaxed);
+    let ticker = progress.spawn_ticker();
+
+    let result = connection.native_remove(
+        args.native_rm_cwd.as_deref(),
+        args.native_rm_root.as_deref(),
+        &selections,
+        args.native_rm_follow,
+        args.dry_run,
+        args.connections,
+        &mut |messages| {
+            if trace_resolution {
+                for message in messages {
+                    progress.println(&format!("syq: resolve: {message}"));
+                }
+            }
+            Ok(())
+        },
+        &mut |outcomes| {
+            for outcome in outcomes {
+                progress.files_total.fetch_add(1, Relaxed);
+                if let Some(error) = outcome.error {
+                    progress.error(&format!(
+                        "syq: remove {:?}: {error}",
+                        String::from_utf8_lossy(&outcome.path)
+                    ));
+                } else {
+                    progress.files_done.fetch_add(1, Relaxed);
+                    if verbose {
+                        progress.println(&String::from_utf8_lossy(&outcome.path));
+                    }
+                }
+            }
+            Ok(())
+        },
+    );
+    progress.stop();
+    if let Some(ticker) = ticker {
+        let _ = ticker.join();
+    }
+    progress.clear();
+    result?;
+    let errors = progress.errors.load(Relaxed);
     if !args.quiet {
         println!(
             "syq: {} {} entries in {}{}",

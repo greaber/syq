@@ -1039,6 +1039,7 @@ impl FsOps {
             }
             Request::Hello { .. }
             | Request::TcpListen { .. }
+            | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }
@@ -3164,6 +3165,7 @@ impl FsOps {
             }
             Request::Hello { .. }
             | Request::Scan { .. }
+            | Request::NativeRemove { .. }
             | Request::TransportStats
             | Request::Shutdown
             | Request::TcpListen { .. } => Err(anyhow!("unexpected request")),

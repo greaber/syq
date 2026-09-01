@@ -69,6 +69,28 @@ pub struct Entry {
     pub link: Option<PathBytes>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NativeRemoveKind {
+    Any,
+    Contents,
+    File,
+    Directory,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NativeRemoveSelection {
+    pub path: PathBytes,
+    pub kind: NativeRemoveKind,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NativeRemoveOutcome {
+    /// Diagnostic spelling rooted at the selector base, never a pathname used
+    /// to rediscover the selected object.
+    pub path: PathBytes,
+    pub error: Option<String>,
+}
+
 impl Entry {
     pub fn meta(&self) -> Meta {
         Meta {
@@ -259,6 +281,17 @@ pub enum Request {
         report_ignored: bool,
         guard: Option<ContainerGuard>,
     },
+    /// Resolve all native removal selectors to endpoint-owned handles before
+    /// mutation, then remove through those handles using an endpoint-local
+    /// worker pool.
+    NativeRemove {
+        cwd: Option<PathBytes>,
+        root: Option<PathBytes>,
+        selections: Vec<NativeRemoveSelection>,
+        follow_symlinks: bool,
+        dry_run: bool,
+        workers: usize,
+    },
     /// lstat each path; with `follow`, stat through symlinks instead.
     StatMany {
         paths: Vec<PathBytes>,
@@ -445,6 +478,9 @@ pub enum Response {
     /// Paths (relative to the root) pruned by the ignore patterns.
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
+    NativeRemoveTrace(Vec<String>),
+    NativeRemoveBatch(Vec<NativeRemoveOutcome>),
+    NativeRemoveDone,
     Stats(Vec<Option<Entry>>),
     /// Absolute operator spelling plus device/inode of the securely opened
     /// directory, or None when an allowed missing suffix was reached.
@@ -527,6 +563,13 @@ impl SizeHint for Request {
                     + 48
             }
             Request::Apply { ops, .. } => ops.len() * 128 + 16,
+            Request::NativeRemove { selections, .. } => {
+                selections
+                    .iter()
+                    .map(|selection| selection.path.len() + 8)
+                    .sum::<usize>()
+                    + 64
+            }
             _ => 256,
         }
     }
@@ -547,6 +590,14 @@ impl SizeHint for Response {
                     + 16
             }
             Response::ScanBatch(v) => v.len() * 160 + 16,
+            Response::NativeRemoveBatch(v) => {
+                v.iter()
+                    .map(|outcome| {
+                        outcome.path.len() + outcome.error.as_ref().map_or(0, String::len) + 16
+                    })
+                    .sum::<usize>()
+                    + 16
+            }
             Response::Stats(v) => v.len() * 96 + 16,
             Response::BatchPlan {
                 partial_paths,

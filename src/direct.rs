@@ -507,6 +507,8 @@ pub fn run(
             remote.push(
                 match source.selection {
                     SourceSelection::Contents => "--src-src",
+                    SourceSelection::File => "--src-file",
+                    SourceSelection::Directory => "--src-dir",
                     SourceSelection::Named
                     | SourceSelection::NamedNoFollow
                     | SourceSelection::Rsync => "--src",

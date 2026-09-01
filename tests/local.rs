@@ -6,7 +6,7 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -336,10 +336,10 @@ fn native_copy_named_selector_preserves_a_root_symlink() {
 #[test]
 fn native_copy_preserves_non_utf8_selector_bytes() {
     let t = Tmp::new();
-    let mut source = t.0.as_os_str().as_bytes().to_vec();
-    source.extend_from_slice(b"/non-utf8-");
-    source.push(0xff);
-    let source = std::ffi::OsString::from_vec(source);
+    let mut name = b"non-utf8-".to_vec();
+    name.push(0xff);
+    let name = std::ffi::OsString::from_vec(name);
+    let source = t.path("").join(&name);
     write(Path::new(&source), b"raw path");
 
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -355,8 +355,10 @@ fn native_copy_preserves_non_utf8_selector_bytes() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .arg("rm")
+        .arg("--cwd")
+        .arg(t.path(""))
         .arg("--src")
-        .arg(&source)
+        .arg(&name)
         .arg("-q")
         .output()
         .unwrap();
@@ -400,262 +402,260 @@ fn native_rejects_transport_configuration() {
 }
 
 #[test]
-fn native_rm_trailing_slash_removes_a_selected_symlink_not_its_referent() {
+fn native_rm_refuses_a_symlink_before_mutating_any_selector() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
     write(&t.path("real/file"), b"keep");
+    write(&t.path("victim"), b"keep");
     symlink("real", t.path("link")).unwrap();
 
-    let link_with_slashes = format!("{}///", t.s("link"));
-    run_native_ok(&["rm", &link_with_slashes]);
-
-    assert!(!t.path("link").exists());
+    let output = native_syq(&["rm", "--cwd", &t.s(""), "--src", "victim", "--src", "link"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pass --follow"));
+    assert_eq!(read(&t.path("victim")), b"keep");
     assert_eq!(read(&t.path("real/file")), b"keep");
+    assert!(t.path("link").is_symlink());
 }
 
 #[test]
-fn native_rm_is_idempotent_for_exact_duplicate_selectors() {
-    let t = Tmp::new();
-    for trial in 0..8 {
-        let relative = format!("duplicate-{trial}");
-        write(&t.path(&relative), b"data");
-        let path = t.s(&relative);
-        run_native_ok(&["rm", "--src", &path, "--src", &path]);
-        assert!(!t.path(&relative).exists());
-    }
-}
-
-#[test]
-fn native_rm_deduplicates_relative_and_absolute_aliases() {
-    let t = Tmp::new();
-    for file in 0..1_000 {
-        write(&t.path(&format!("tree/file-{file}")), b"data");
-    }
-
-    run_native_ok(&[
-        "rm",
-        "--cwd",
-        &t.s(""),
-        "--src",
-        "tree",
-        "--src",
-        &t.s("tree"),
-    ]);
-
-    assert!(!t.path("tree").exists());
-}
-
-#[test]
-fn native_rm_deduplicates_parent_component_aliases() {
-    let t = Tmp::new();
-    fs::create_dir(t.path("pad")).unwrap();
-    for file in 0..1_000 {
-        write(&t.path(&format!("tree/file-{file}")), b"data");
-    }
-
-    run_native_ok(&[
-        "rm",
-        "--cwd",
-        &t.s(""),
-        "--src",
-        "pad/../tree",
-        "--src",
-        "tree",
-    ]);
-
-    assert!(!t.path("tree").exists());
-}
-
-#[test]
-fn native_rm_does_not_resolve_through_a_missing_prefix() {
-    let t = Tmp::new();
-    write(&t.path("named-victim"), b"keep");
-    write(&t.path("contents-victim/file"), b"keep");
-
-    for (selector, victim) in [("--src", "named-victim"), ("--src-src", "contents-victim")] {
-        let alias = format!("missing/../{victim}");
-        let output = native_syq(&["rm", "--cwd", &t.s(""), selector, &alias]);
-        assert_eq!(
-            output.status.code(),
-            Some(23),
-            "stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    assert_eq!(read(&t.path("named-victim")), b"keep");
-    assert_eq!(read(&t.path("contents-victim/file")), b"keep");
-}
-
-#[test]
-fn native_rm_deduplicates_contents_selectors_through_symlink_aliases() {
+fn native_rm_follow_removes_the_terminal_object_and_leaves_the_link() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
-    for file in 0..1_000 {
-        write(&t.path(&format!("tree/file-{file}")), b"data");
-    }
-    symlink("tree", t.path("link-a")).unwrap();
-    symlink("tree", t.path("link-b")).unwrap();
+    write(&t.path("real/file"), b"remove");
+    symlink("real", t.path("link")).unwrap();
 
-    run_native_ok(&[
-        "rm",
-        "--src-src",
-        &t.s("link-a"),
-        "--src-src",
-        &t.s("link-b"),
-    ]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--src-dir", "link"]);
 
-    assert!(t.path("tree").is_dir());
-    assert_eq!(fs::read_dir(t.path("tree")).unwrap().count(), 0);
+    assert!(t.path("link").is_symlink());
+    assert!(!t.path("real").exists());
+}
+
+#[test]
+fn native_rm_follow_contents_empties_the_terminal_directory_and_keeps_the_link() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real/file"), b"remove");
+    symlink("real", t.path("link")).unwrap();
+
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--src-src", "link"]);
+
+    assert!(t.path("link").is_symlink());
+    assert!(t.path("real").is_dir());
+    assert!(listing(&t.path("real")).is_empty());
+}
+
+#[test]
+fn native_rm_follow_resolves_a_complete_link_chain_without_removing_links() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("terminal"), b"remove");
+    symlink("terminal", t.path("link-b")).unwrap();
+    symlink("link-b", t.path("link-a")).unwrap();
+
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--src-file", "link-a"]);
+
     assert!(t.path("link-a").is_symlink());
     assert!(t.path("link-b").is_symlink());
+    assert!(!t.path("terminal").exists());
 }
 
 #[test]
-fn native_rm_serializes_same_path_selection_modes() {
-    let t = Tmp::new();
-    for trial in 0..5 {
-        let relative = format!("overlap-{trial}");
-        for file in 0..1_000 {
-            write(&t.path(&format!("{relative}/file-{file}")), b"data");
-        }
-        let path = t.s(&relative);
-        if trial % 2 == 0 {
-            run_native_ok(&["rm", "--src", &path, "--src-src", &path]);
-        } else {
-            run_native_ok(&["rm", "--src-src", &path, "--src", &path]);
-        }
-        assert!(!t.path(&relative).exists());
-    }
-}
-
-#[test]
-fn native_rm_preserves_both_same_path_modes_for_symlink_roots() {
+fn native_rm_double_verbose_logs_base_symlink_hops_and_final_identity() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
-    for contents_first in [false, true] {
-        let suffix = u8::from(contents_first);
-        let referent = format!("referent-{suffix}");
-        let link = format!("link-{suffix}");
-        for file in 0..1_000 {
-            write(&t.path(&format!("{referent}/file-{file}")), b"data");
-        }
-        symlink(&referent, t.path(&link)).unwrap();
-        let path = t.s(&link);
-
-        if contents_first {
-            run_native_ok(&["rm", "--src-src", &path, "--src", &path]);
-        } else {
-            run_native_ok(&["rm", "--src", &path, "--src-src", &path]);
-        }
-
-        assert!(!t.path(&link).exists());
-        assert!(t.path(&referent).is_dir());
-        assert_eq!(fs::read_dir(t.path(&referent)).unwrap().count(), 0);
-    }
-}
-
-#[test]
-fn native_rm_same_path_file_modes_keep_current_stop_on_scan_error() {
-    let t = Tmp::new();
-    for contents_first in [false, true] {
-        let relative = format!("file-modes-{}", u8::from(contents_first));
-        write(&t.path(&relative), b"data");
-        let path = t.s(&relative);
-        let output = if contents_first {
-            native_syq(&["rm", "--src-src", &path, "--src", &path])
-        } else {
-            native_syq(&["rm", "--src", &path, "--src-src", &path])
-        };
-
-        assert_eq!(output.status.code(), Some(23));
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("is not a directory"),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(read(&t.path(&relative)), b"data");
-    }
-}
-
-#[test]
-fn native_rm_serializes_nested_and_lexically_aliased_selectors() {
-    let t = Tmp::new();
-    for trial in 0..5 {
-        let relative = format!("nested-{trial}");
-        for file in 0..1_000 {
-            write(&t.path(&format!("{relative}/child/file-{file}")), b"data");
-        }
-        write(&t.path(&format!("{relative}/sibling")), b"data");
-
-        let tree = t.s(&relative);
-        let tree_alias = format!("{}/./{relative}", t.s(""));
-        let child = format!("{tree}/child");
-        if trial % 2 == 0 {
-            run_native_ok(&["rm", "--src", &tree_alias, "--src", &child]);
-        } else {
-            run_native_ok(&["rm", "--src", &child, "--src", &tree_alias]);
-        }
-        assert!(!t.path(&relative).exists());
-    }
-}
-
-#[test]
-fn native_rm_nested_selector_through_selected_symlink_removes_both() {
-    use std::os::unix::fs::symlink;
-
-    let t = Tmp::new();
-    write(&t.path("real/child/file"), b"data");
+    write(&t.path("real"), b"keep");
     symlink("real", t.path("link")).unwrap();
-
-    run_native_ok(&["rm", "--src", &t.s("link"), "--src", &t.s("link/child")]);
-
-    assert!(!t.path("link").exists());
-    assert!(!t.path("real/child").exists());
-    assert!(t.path("real").is_dir());
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "rm",
+            "--dry-run",
+            "-vv",
+            "--cwd",
+            &t.s(""),
+            "--follow",
+            "--src-file",
+            "link",
+        ])
+        .output()
+        .unwrap();
+    assert_output_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--cwd") && stdout.contains("pinned as"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("symlink") && stdout.contains("->"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("resolved to non-directory"), "{stdout}");
+    assert_eq!(read(&t.path("real")), b"keep");
 }
 
 #[test]
-fn native_rm_serializes_all_nested_selector_mode_combinations() {
-    let t = Tmp::new();
-    for ancestor_named in [false, true] {
-        for child_named in [false, true] {
-            for descendant_first in [false, true] {
-                let relative = format!(
-                    "modes-{}-{}-{}",
-                    u8::from(ancestor_named),
-                    u8::from(child_named),
-                    u8::from(descendant_first)
-                );
-                write(&t.path(&format!("{relative}/child/file")), b"data");
-                write(&t.path(&format!("{relative}/sibling")), b"data");
-                let tree = t.s(&relative);
-                let child = format!("{tree}/child");
-                let ancestor_flag = if ancestor_named { "--src" } else { "--src-src" };
-                let child_flag = if child_named { "--src" } else { "--src-src" };
-                if descendant_first {
-                    run_native_ok(&["rm", child_flag, &child, ancestor_flag, &tree]);
-                } else {
-                    run_native_ok(&["rm", ancestor_flag, &tree, child_flag, &child]);
-                }
+fn native_rm_never_follows_symlinks_found_inside_a_selected_directory() {
+    use std::os::unix::fs::symlink;
 
-                if ancestor_named {
-                    assert!(!t.path(&relative).exists());
-                } else {
-                    assert!(t.path(&relative).is_dir());
-                    assert_eq!(fs::read_dir(t.path(&relative)).unwrap().count(), 0);
-                }
-            }
-        }
+    let t = Tmp::new();
+    write(&t.path("outside/keep"), b"keep");
+    write(&t.path("tree/file"), b"remove");
+    symlink("../outside", t.path("tree/link")).unwrap();
+
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--src-dir", "tree"]);
+
+    assert!(!t.path("tree").exists());
+    assert_eq!(read(&t.path("outside/keep")), b"keep");
+}
+
+#[test]
+fn native_rm_duplicate_selectors_are_idempotent_without_deduplication() {
+    let t = Tmp::new();
+    write(&t.path("duplicate"), b"data");
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s(""),
+        "--src",
+        "duplicate",
+        "--src",
+        "duplicate",
+    ]);
+    assert!(!t.path("duplicate").exists());
+}
+
+#[test]
+fn native_rm_missing_selectors_succeed() {
+    let t = Tmp::new();
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--src", "absent"]);
+}
+
+#[test]
+fn native_rm_rejects_absolute_dot_and_dotdot_selectors_before_mutation() {
+    let t = Tmp::new();
+    for bad in [t.s("other"), "a/./other".into(), "a/../other".into()] {
+        write(&t.path("victim"), b"keep");
+        let output = native_syq(&["rm", "--cwd", &t.s(""), "--src", "victim", "--src", &bad]);
+        assert!(!output.status.success(), "accepted selector {bad:?}");
+        assert_eq!(read(&t.path("victim")), b"keep");
     }
 }
 
 #[test]
-fn native_rm_nested_dry_run_reports_each_entry_once() {
+fn native_rm_root_rejects_base_symlinks_and_symlink_excursions() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("root/victim"), b"keep");
+    fs::create_dir_all(t.path("root/inside")).unwrap();
+    symlink("root", t.path("root-link")).unwrap();
+    symlink("../../root/inside", t.path("root/escape")).unwrap();
+
+    let base_link = native_syq(&[
+        "rm",
+        "--root",
+        &t.s("root-link"),
+        "--follow",
+        "--src",
+        "victim",
+    ]);
+    assert!(!base_link.status.success());
+
+    let excursion = native_syq(&[
+        "rm",
+        "--root",
+        &t.s("root"),
+        "--follow",
+        "--src",
+        "victim",
+        "--src-src",
+        "escape",
+    ]);
+    assert!(!excursion.status.success());
+    assert_eq!(read(&t.path("root/victim")), b"keep");
+}
+
+#[test]
+fn native_rm_root_allows_following_a_symlink_that_stays_inside() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("root/inside/file"), b"remove");
+    symlink("inside", t.path("root/link")).unwrap();
+
+    run_native_ok(&[
+        "rm",
+        "--root",
+        &t.s("root"),
+        "--follow",
+        "--src-src",
+        "link",
+    ]);
+    assert!(t.path("root/link").is_symlink());
+    assert!(listing(&t.path("root/inside")).is_empty());
+}
+
+#[test]
+fn native_rm_cwd_and_root_are_mutually_exclusive() {
+    let output = native_syq(&["rm", "--cwd", ".", "--root", ".", "--src", "victim"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn native_rm_typed_selectors_check_every_type_before_mutation() {
+    let t = Tmp::new();
+    write(&t.path("file"), b"data");
+    write(&t.path("directory/child"), b"data");
+    write(&t.path("victim"), b"keep");
+
+    let wrong = native_syq(&[
+        "rm",
+        "--cwd",
+        &t.s(""),
+        "--src",
+        "victim",
+        "--src-file",
+        "directory",
+    ]);
+    assert!(!wrong.status.success());
+    assert_eq!(read(&t.path("victim")), b"keep");
+
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s(""),
+        "--src-file",
+        "file",
+        "--src-dir",
+        "directory",
+    ]);
+    assert!(!t.path("file").exists());
+    assert!(!t.path("directory").exists());
+}
+
+#[test]
+fn native_rm_overlapping_pinned_selections_are_idempotent() {
+    let t = Tmp::new();
+    write(&t.path("tree/child/file"), b"data");
+    write(&t.path("tree/sibling"), b"data");
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s(""),
+        "--src-dir",
+        "tree",
+        "--src-dir",
+        "tree/child",
+    ]);
+    assert!(!t.path("tree").exists());
+}
+
+#[test]
+fn native_rm_overlapping_dry_run_does_not_deduplicate() {
     let t = Tmp::new();
     write(&t.path("tree/child/file"), b"data");
     write(&t.path("tree/sibling"), b"data");
@@ -664,16 +664,18 @@ fn native_rm_nested_dry_run_reports_each_entry_once() {
         .args([
             "rm",
             "--dry-run",
-            "--src",
-            &t.s("tree"),
-            "--src",
-            &t.s("tree/child"),
+            "--cwd",
+            &t.s(""),
+            "--src-dir",
+            "tree",
+            "--src-dir",
+            "tree/child",
         ])
         .output()
         .unwrap();
     assert_output_ok(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("would remove 4 entries"), "{stdout}");
+    assert!(stdout.contains("would remove 6 entries"), "{stdout}");
     assert!(t.path("tree/child/file").exists());
     assert!(t.path("tree/sibling").exists());
 }
@@ -2999,7 +3001,7 @@ fn rm_never_recurses_into_directory_that_replaced_scanned_leaf() {
     write(&t.path("killme/leaf"), b"old");
     let ready = t.path("rm-leaf-ready");
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["rm", "-j", "1", &t.s("killme"), "-q"])
+        .args(["rsync", "--rm", "-j", "1", &t.s("killme"), "-q"])
         .env("SYQ_TEST_RM_LEAF_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_RM_LEAF_MS", "1000")
         .stdout(Stdio::piped())
@@ -3569,8 +3571,8 @@ fn native_rm_matches_rsync_rm_and_contents_keeps_root() {
     }
 
     run_ok(&["--rm", &t.s("rsync")]);
-    run_native_ok(&["rm", "--src", &t.s("native")]);
-    run_native_ok(&["rm", "--src-src", &t.s("contents")]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--src", "native"]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--src-src", "contents"]);
 
     assert!(!t.path("rsync").exists());
     assert!(!t.path("native").exists());
@@ -3582,10 +3584,10 @@ fn native_rm_matches_rsync_rm_and_contents_keeps_root() {
 fn native_rm_contents_requires_a_directory() {
     let t = Tmp::new();
     write(&t.path("file"), b"keep");
-    let out = native_syq(&["rm", "--src-src", &t.s("file")]);
+    let out = native_syq(&["rm", "--cwd", &t.s(""), "--src-src", "file"]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("is not a directory"),
+        String::from_utf8_lossy(&out.stderr).contains("must resolve to a directory"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

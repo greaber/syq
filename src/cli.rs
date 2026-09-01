@@ -35,6 +35,8 @@ pub enum SourceSelection {
     Named,
     Contents,
     NamedNoFollow,
+    File,
+    Directory,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -58,6 +60,16 @@ pub struct Args {
     /// Native parsing keeps endpoints separate from raw Unix path bytes.
     #[arg(skip)]
     pub locations: Vec<Location>,
+    /// Endpoint-side base for native removal. Unlike copy's `--cwd`, this is
+    /// not joined into selector strings by the orchestrator.
+    #[arg(skip)]
+    pub native_rm_cwd: Option<Vec<u8>>,
+    /// Symlink-free containment boundary for native removal.
+    #[arg(skip)]
+    pub native_rm_root: Option<Vec<u8>>,
+    /// Permit symlinks while resolving the native removal base/selectors.
+    #[arg(skip)]
+    pub native_rm_follow: bool,
 
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
@@ -522,6 +534,49 @@ struct NativeSelectionArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct NativeRmSelectionArgs {
+    /// Source endpoint ([USER@]HOST); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    from: Option<String>,
+    /// Resolve relative selectors from DIR at the source endpoint
+    #[arg(
+        short = 'C',
+        long,
+        value_name = "DIR",
+        allow_hyphen_values = true,
+        conflicts_with = "root"
+    )]
+    cwd: Option<OsString>,
+    /// Confine resolution and removal beneath symlink-free DIR
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    root: Option<OsString>,
+    /// Follow symlinks while resolving --cwd and source selectors
+    #[arg(long)]
+    follow: bool,
+    /// Select an object without constraining its terminal type (repeatable)
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    src: Vec<OsString>,
+    /// Select a directory's contents, retaining the directory (repeatable)
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    src_src: Vec<OsString>,
+    /// Select a non-directory terminal object (repeatable)
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    src_file: Vec<OsString>,
+    /// Select a directory tree (repeatable)
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    src_dir: Vec<OsString>,
+    /// Select several objects without constraining their terminal type
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    srcs: Vec<OsString>,
+    /// Select the contents of several directories
+    #[arg(long, value_name = "DIR", num_args = 1..)]
+    src_srcs: Vec<OsString>,
+    /// Selected objects (shorthand for --src)
+    #[arg(value_name = "PATH")]
+    sources: Vec<OsString>,
+}
+
+#[derive(clap::Args, Debug)]
 struct NativeOperationalArgs {
     /// Resolve and preview the operation without changing anything
     #[arg(short = 'n', long)]
@@ -629,12 +684,12 @@ struct NativeCopyPruneCommand {
 #[command(
     name = "syq rm",
     version,
-    about = "Remove selected object trees with the current streaming removal engine",
-    override_usage = "syq rm [OPTIONS] [--src PATH | --src-src DIR | PATH]..."
+    about = "Remove endpoint-resolved object trees without following symlinks by default",
+    override_usage = "syq rm [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeRmCommand {
     #[command(flatten)]
-    selection: NativeSelectionArgs,
+    selection: NativeRmSelectionArgs,
     #[command(flatten)]
     operational: NativeOperationalArgs,
 }
@@ -736,10 +791,67 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
     let parsed = NativeRmCommand::from_arg_matches(&matches)?;
-    let locations = lower_native_selection(&parsed.selection, &matches)?;
+    let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
+    for (id, selection, paths) in [
+        (
+            "sources",
+            SourceSelection::NamedNoFollow,
+            &parsed.selection.sources,
+        ),
+        ("src", SourceSelection::NamedNoFollow, &parsed.selection.src),
+        (
+            "srcs",
+            SourceSelection::NamedNoFollow,
+            &parsed.selection.srcs,
+        ),
+        (
+            "src_src",
+            SourceSelection::Contents,
+            &parsed.selection.src_src,
+        ),
+        (
+            "src_srcs",
+            SourceSelection::Contents,
+            &parsed.selection.src_srcs,
+        ),
+        (
+            "src_file",
+            SourceSelection::File,
+            &parsed.selection.src_file,
+        ),
+        (
+            "src_dir",
+            SourceSelection::Directory,
+            &parsed.selection.src_dir,
+        ),
+    ] {
+        if let Some(indices) = matches.indices_of(id) {
+            ordered.extend(
+                indices
+                    .zip(paths.iter().cloned())
+                    .map(|(index, path)| (index, selection, path)),
+            );
+        }
+    }
+    ordered.sort_by_key(|(index, _, _)| *index);
+    if ordered.is_empty() {
+        bail!("syq rm needs at least one source selector");
+    }
+    let endpoint = parse_native_endpoint(parsed.selection.from.as_deref())?;
+    let locations = ordered
+        .into_iter()
+        .map(|(_, selection, path)| {
+            let path = trim_native_trailing_slashes(path.into_vec());
+            validate_native_rm_selector(&path)?;
+            Ok(Location::native(endpoint.clone(), path, selection))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut args = native_engine_defaults();
     args.interface = Interface::NativeRm;
     args.locations = locations;
+    args.native_rm_cwd = parsed.selection.cwd.map(OsStringExt::into_vec);
+    args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
+    args.native_rm_follow = parsed.selection.follow;
     args.rm = true;
     apply_native_operational(&mut args, parsed.operational);
     Ok(args)
@@ -854,6 +966,31 @@ fn trim_native_trailing_slashes(mut path: Vec<u8>) -> Vec<u8> {
         path.pop();
     }
     path
+}
+
+fn validate_native_rm_selector(path: &[u8]) -> Result<()> {
+    if path.is_empty() {
+        bail!("source selectors may not be empty");
+    }
+    if path.starts_with(b"/") {
+        bail!(
+            "source selector {:?} must be relative",
+            String::from_utf8_lossy(path)
+        );
+    }
+    if path.contains(&0) {
+        bail!("source selector contains NUL");
+    }
+    if path
+        .split(|byte| *byte == b'/')
+        .any(|component| component == b"." || component == b"..")
+    {
+        bail!(
+            "source selector {:?} contains forbidden `.` or `..` component",
+            String::from_utf8_lossy(path)
+        );
+    }
+    Ok(())
 }
 
 fn native_basename(path: &[u8]) -> Option<&[u8]> {
@@ -1311,7 +1448,10 @@ impl Location {
     pub fn copies_contents(&self) -> bool {
         match self.selection {
             SourceSelection::Contents => true,
-            SourceSelection::Named | SourceSelection::NamedNoFollow => false,
+            SourceSelection::Named
+            | SourceSelection::NamedNoFollow
+            | SourceSelection::File
+            | SourceSelection::Directory => false,
             SourceSelection::Rsync => {
                 let p = self.path.as_slice();
                 p.ends_with(b"/")
@@ -1326,7 +1466,10 @@ impl Location {
     /// Native contents selectors must name directories; rsync's trailing-slash
     /// spelling keeps its existing scan-time behavior.
     pub fn requires_directory(&self) -> bool {
-        self.selection == SourceSelection::Contents
+        matches!(
+            self.selection,
+            SourceSelection::Contents | SourceSelection::Directory
+        )
     }
 
     pub fn follows_root(&self) -> bool {
@@ -1334,6 +1477,7 @@ impl Location {
             SourceSelection::Named => true,
             SourceSelection::Contents => true,
             SourceSelection::NamedNoFollow => false,
+            SourceSelection::File | SourceSelection::Directory => true,
             SourceSelection::Rsync => self.copies_contents(),
         }
     }

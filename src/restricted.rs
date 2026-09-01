@@ -1022,6 +1022,9 @@ impl RestrictedAuthority {
             | Request::AnchorDestination { .. } => {
                 bail!("destination-anchor management is not valid on a root-confined receiver")
             }
+            Request::NativeRemove { .. } => {
+                bail!("native removal is not valid on a command-restricted destination")
+            }
             Request::Hello { .. } => bail!("unexpected second receiver handshake"),
             Request::TransportStats | Request::Shutdown => {}
         }

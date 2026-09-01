@@ -47,6 +47,18 @@ pub trait Conn: Send {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn native_remove(
+        &mut self,
+        cwd: Option<&[u8]>,
+        root: Option<&[u8]>,
+        selections: &[NativeRemoveSelection],
+        follow_symlinks: bool,
+        dry_run: bool,
+        workers: usize,
+        trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -351,6 +363,29 @@ impl Conn for LocalConn {
             warn,
         )
     }
+
+    fn native_remove(
+        &mut self,
+        cwd: Option<&[u8]>,
+        root: Option<&[u8]>,
+        selections: &[NativeRemoveSelection],
+        follow_symlinks: bool,
+        dry_run: bool,
+        workers: usize,
+        trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        crate::native_rm::remove(
+            cwd,
+            root,
+            selections,
+            follow_symlinks,
+            dry_run,
+            workers,
+            trace,
+            sink,
+        )
+    }
 }
 
 pub struct RemoteConn {
@@ -529,6 +564,39 @@ impl Conn for RemoteConn {
                 Response::ScanDone => bail!("{}: remote scan returned no root entry", self.label),
                 Response::Err(e) => bail!("{}: scan: {e}", self.label),
                 other => bail!("{}: unexpected response during scan: {other:?}", self.label),
+            }
+        }
+    }
+
+    fn native_remove(
+        &mut self,
+        cwd: Option<&[u8]>,
+        root: Option<&[u8]>,
+        selections: &[NativeRemoveSelection],
+        follow_symlinks: bool,
+        dry_run: bool,
+        workers: usize,
+        trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        self.send(Request::NativeRemove {
+            cwd: cwd.map(<[u8]>::to_vec),
+            root: root.map(<[u8]>::to_vec),
+            selections: selections.to_vec(),
+            follow_symlinks,
+            dry_run,
+            workers,
+        })?;
+        loop {
+            match self.recv()? {
+                Response::NativeRemoveTrace(messages) => trace(messages)?,
+                Response::NativeRemoveBatch(outcomes) => sink(outcomes)?,
+                Response::NativeRemoveDone => return Ok(()),
+                Response::Err(error) => bail!("{}: remove: {error}", self.label),
+                other => bail!(
+                    "{}: unexpected response during native removal: {other:?}",
+                    self.label
+                ),
             }
         }
     }

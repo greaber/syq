@@ -436,6 +436,8 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
             crate::cli::SourceSelection::Named => "named-follow",
             crate::cli::SourceSelection::Contents => "contents-follow",
             crate::cli::SourceSelection::NamedNoFollow => "named-no-follow",
+            crate::cli::SourceSelection::File => "file",
+            crate::cli::SourceSelection::Directory => "directory",
         })
         .collect();
     let mut flags = serde_json::json!({

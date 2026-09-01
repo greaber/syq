@@ -9,6 +9,7 @@ mod direct;
 pub mod enrollment;
 mod fsops;
 mod identity;
+mod native_rm;
 mod progress;
 mod proto;
 mod remote_helper;
