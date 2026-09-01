@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -69,22 +70,30 @@ def run(
         for index, argument in enumerate(args)
     )
     argv = (executable_text, *argument_text)
-    completed = subprocess.run(
+    process = subprocess.Popen(
         argv,
         cwd=cwd,
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
         shell=False,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise
     result = Result(
         argv=argv,
-        returncode=completed.returncode,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
+        returncode=process.returncode,
+        stdout=stdout,
+        stderr=stderr,
     )
     if check and result.returncode != 0:
         raise SyqProcessError(result)

@@ -41,6 +41,9 @@ verified binary.
 `run()` raises `SyqProcessError` for a nonzero process status by default. The
 exception retains the complete result, including stdout and stderr as bytes.
 Pass `check=False` when the caller wants to interpret the status directly.
+When `timeout` expires, the SDK kills and reaps syq's local process group,
+including child processes such as SSH transports, before raising
+`subprocess.TimeoutExpired`.
 
 ## Custom executable override
 

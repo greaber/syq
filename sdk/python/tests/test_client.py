@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,6 +24,17 @@ case "$1" in
     printf 'partial'
     printf 'failed' >&2
     exit 23
+    ;;
+  spawn-descendant)
+    (
+      printf 'ready' > "$2.ready"
+      sleep 1
+      printf 'survived' > "$2"
+    ) &
+    while [ ! -f "$2.ready" ]; do
+      sleep 0.01
+    done
+    sleep 30
     ;;
   *)
     exit 2
@@ -80,6 +93,20 @@ class ClientTests(unittest.TestCase):
     def test_nonzero_result_can_be_returned(self) -> None:
         result = syq.run(["fail"], executable=self.executable, check=False)
         self.assertEqual(result.returncode, 23)
+
+    def test_timeout_stops_spawned_descendants(self) -> None:
+        marker = Path(self.temporary_directory.name) / "descendant-marker"
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            syq.run(
+                ["spawn-descendant", marker],
+                executable=self.executable,
+                timeout=0.5,
+            )
+
+        self.assertTrue(marker.with_suffix(".ready").exists())
+        time.sleep(0.75)
+        self.assertFalse(marker.exists())
 
     def test_one_string_is_not_treated_as_an_argument_sequence(self) -> None:
         with self.assertRaisesRegex(TypeError, "individual arguments"):
