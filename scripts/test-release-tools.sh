@@ -85,6 +85,34 @@ expect_failure 'release directory contains missing or unexpected files' \
 expect_failure 'does not match Cargo.toml version' \
   "$script_dir/package-release.sh" v99.99.99 "$first"
 
+# crates.io reruns accept only the exact package checksum, distinguish a
+# missing version with exit 3, and fail closed on registry errors.
+source_crate="$work/syq-0.1.0.crate"
+printf 'source crate\n' > "$source_crate"
+source_checksum=$(sha256sum "$source_crate" | awk '{print $1}')
+crate_response="$work/crate-response.json"
+jq -n --arg checksum "$source_checksum" \
+  '{version:{num:"0.1.0",checksum:$checksum}}' > "$crate_response"
+SYQ_TEST_CRATES_IO_RESPONSE="$crate_response" SYQ_TEST_CRATES_IO_STATUS=200 \
+  "$script_dir/verify-crates-io-package.sh" 0.1.0 "$source_crate" >/dev/null
+
+set +e
+SYQ_TEST_CRATES_IO_RESPONSE="$crate_response" SYQ_TEST_CRATES_IO_STATUS=404 \
+  "$script_dir/verify-crates-io-package.sh" 0.1.0 "$source_crate" \
+  > "$work/crate-missing.out" 2>&1
+missing_status=$?
+set -e
+test "$missing_status" -eq 3
+grep -F 'is not published on crates.io' "$work/crate-missing.out" >/dev/null
+
+jq -n '{version:{num:"0.1.0",checksum:("a" * 64)}}' > "$crate_response"
+expect_failure 'differs from the package assembled from this tag' env \
+  SYQ_TEST_CRATES_IO_RESPONSE="$crate_response" SYQ_TEST_CRATES_IO_STATUS=200 \
+  "$script_dir/verify-crates-io-package.sh" 0.1.0 "$source_crate"
+expect_failure 'returned HTTP 500' env \
+  SYQ_TEST_CRATES_IO_RESPONSE="$crate_response" SYQ_TEST_CRATES_IO_STATUS=500 \
+  "$script_dir/verify-crates-io-package.sh" 0.1.0 "$source_crate"
+
 # Run the same signing operation used by the release workflow, verify the
 # result independently, and prove that a mismatched configured public key is
 # rejected without modifying the manifest.

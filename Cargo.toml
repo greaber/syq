@@ -7,6 +7,7 @@ description = "Parallel file copy with an explicit native CLI and rsync compatib
 license = "MIT"
 repository = "https://github.com/greaber/syq"
 readme = "README.md"
+publish = ["crates-io"]
 keywords = ["copy", "rsync", "ssh", "parallel", "transfer"]
 categories = ["command-line-utilities", "filesystem"]
 include = [
@@ -49,6 +50,9 @@ signal-hook = "0.4.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socket2 = "0.6"
+
+[build-dependencies]
+serde_json = "1"
 
 [profile.release]
 opt-level = 3
