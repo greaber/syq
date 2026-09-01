@@ -49,14 +49,15 @@ Some setups mix the roles (see the seedbox pipeline below).
   tree, `-H` overhead, incremental recursion disabled, hardlink support
   required on both ends, the original tree frozen during reorganization,
   manual cleanup afterwards.
-- **Photo tools ship the farm workflow as a feature.**
+- **A photo tool ships the farm workflow as its documented purpose.**
   [`photo_reorganize`](https://github.com/jpdaigle/photo_reorganize)
   builds a date-layout hardlink farm *expressly* so that plain rsync can
-  mirror a restructured view of a photo collection;
-  [phockup](https://github.com/ivandokov/phockup) and
-  [PhotoSort](https://github.com/0xCCF4/PhotoSort) offer
-  move/copy/hardlink placement actions. These are placement engines
-  maintaining a permanent farm as an rsync adapter.
+  mirror a restructured view of a photo collection — direct adapter
+  evidence. [phockup](https://github.com/ivandokov/phockup) and
+  [PhotoSort](https://github.com/0xCCF4/PhotoSort) are weaker, indirect
+  evidence: they are placement engines offering move/copy/hardlink
+  actions, but their documentation does not describe maintaining a farm
+  for a sync tool to consume.
 - **Media pipelines chain placement-engine → farm → sync tool.**
   FileBot's rename actions include symlink and hardlink modes
   ([FileBot forum](https://www.filebot.net/forums/viewtopic.php?t=11758));
@@ -90,16 +91,22 @@ Some setups mix the roles (see the seedbox pipeline below).
 
 ## Evidence: where farm consumption breaks
 
-- **Cloud and object-store destinations.** rclone ignores symlinks by
-  default; its `--links`/`--copy-links` semantics and `.rclonelink`
-  marker objects are recurring support topics
+- **Cloud and object-store destinations — for symlink *fidelity*, not
+  placement.** rclone ignores symlinks by default; its
+  `--links`/`--copy-links` semantics and `.rclonelink` marker objects
+  are recurring support topics
   ([1](https://forum.rclone.org/t/rclone-not-handling-symlinks-as-symlinks/48369),
   [2](https://forum.rclone.org/t/problem-with-symlinks-and-links/23840)).
-  Object stores have no symlink concept and generally no rename
-  primitive (a "rename" is a server-side copy), so a symlink farm cannot
-  be expressed at the destination and dereferencing at upload is forced.
-  The farm workaround degrades hardest exactly where placement must be
-  final at upload time.
+  Important scoping: this does *not* make a source-side farm unusable as
+  an adapter — `rclone copy -L farm/ remote:` dereferences locally and
+  the destination only ever sees plain objects
+  ([rclone local backend](https://rclone.org/local/)). The forum pain is
+  mostly about preserving symlinks in backups, a different problem. What
+  object stores do add is that placement must be final at upload time
+  (no rename primitive; a "rename" is a paid server-side copy) — but the
+  farm satisfies that via local dereference too, so object stores are
+  not by themselves a farm-vs-mapping differentiator for ordinary
+  placement.
 - **Global dereferencing is blunt.** Consuming a farm with `-L`
   dereferences *every* link, so a tree that itself contains symlinks
   that should arrive as symlinks cannot be expressed;
@@ -144,10 +151,11 @@ the incumbent solution is actually fine.
   after upload — there it was pure transfer scaffolding.
 - **rclone symlink threads**: much of the forum pain is about symlink
   *fidelity in backups* (a different problem), and for the adapter use
-  `rclone copy -L farm/` works for simple cases. This item is weaker as
-  mapping evidence than it first appears; its real content is that
-  object stores cannot express farms at the destination, which matters
-  only if syq ever targets object-store endpoints.
+  `rclone copy -L farm/` works: the links are dereferenced locally and
+  the destination sees only plain objects. This item is weaker as
+  mapping evidence than it first appears; what survives of it is only
+  the global-dereference bluntness (symlink-bearing content) that
+  applies everywhere, not an object-store-specific gap.
 
 ## Reading
 
@@ -163,9 +171,11 @@ mapping input v1, and the photo/media farms partly pay for themselves
 as local views. What survives as the demand profile for mapping input:
 **recurring convergent restructure-transfer** where the destination
 layout is the authoritative one and a farm is unavailable or
-inexpressible — remote or read-only sources, symlink-bearing content,
-fragments from distributed producers, and (if ever supported)
-object-store destinations. Whether that profile contains a
+unattractive — a remote source host with no writable staging location
+or shell access (a farm can otherwise live in any writable directory
+and point across filesystems, including into read-only content),
+symlink-bearing content, and fragments from distributed producers.
+Whether that profile contains a
 killer example is the open product question tracked in the design
 discussion; this survey establishes that the problem is real, the
 incumbents are costly, and the honest bar for the feature is the
@@ -175,6 +185,10 @@ A forward-looking note on object stores: if syq ever grows
 S3-compatible endpoints (an open strategic question with its own
 constraints — no atomic rename, no native symlinks, different resume
 and verification models; see `current-plans/rclone-pain-points.md`),
-mapping input is the natural interface there, because the farm
-workaround is not merely clunky but inexpressible at the destination
-and re-placement after upload is a paid copy.
+mapping input remains the natural *interface* there — placement must be
+final at upload time since re-placement is a paid server-side copy —
+but a local farm consumed with dereferencing serves ordinary placement
+at object stores too, so the argument for syq there rests on the same
+residual differentiators as elsewhere plus whatever the endpoint itself
+adds (convergence semantics, verification, exact accounting), not on
+farms being unusable.
