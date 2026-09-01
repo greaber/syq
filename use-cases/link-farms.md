@@ -108,19 +108,68 @@ Some setups mix the roles (see the seedbox pipeline below).
   staging location and (for the rename-propagation trick) hardlink
   support on both ends.
 
+## Steelman: the case that no new tool is needed
+
+Each adapter item re-examined with the strongest available argument that
+the incumbent solution is actually fine.
+
+- **Per-pair rsync loops**: for a one-shot migration you can also
+  transfer with names unchanged and run a cheap rename pass at the
+  destination afterwards — renames are nearly free locally, and rsync
+  keeps its delta/resume for the bulk transfer. This works. What it
+  cannot do is *converge*: on the next run rsync compares against the
+  renamed destination, sees nothing matching, and retransfers
+  everything. The steelman fully covers one-shot jobs; only recurring
+  synchronization survives as demand.
+- **Rename propagation to an existing mirror (Lincoln Loop)**: the
+  steelman wins outright, and not only because the need is rare. The
+  workaround's essential ingredient is destination-side content reuse —
+  the receiver reconstructs the new layout from hardlink identity
+  without retransfer. Mapping input as proposed does **not** provide
+  that: syq would compare each source file against its (empty) new
+  destination path and retransfer the tree, because the content at the
+  old destination paths is invisible without a rename-detection or
+  content-reuse feature. For this scenario the incumbent hack beats the
+  proposed feature.
+- **Photo farm tools**: the farm is cheap (hardlinks), the workflow is
+  two cron lines, and the farm doubles as a browsable local
+  date-organized view — partially links-as-product, which mapping input
+  does not replace. The farm arguably dominates unless the source is
+  remote, the filesystem lacks hardlinks (FAT/exFAT cards, some network
+  mounts), or the permanent farm's drift and hygiene costs bite.
+- **Seedbox pipelines**: most such users need the local media-layout
+  view anyway (Plex reads local or mounted files), so the farm exists
+  regardless and mapping input adds little. The exception is
+  cloud-serving setups like the surveyed gist, which unlink the farm
+  after upload — there it was pure transfer scaffolding.
+- **rclone symlink threads**: much of the forum pain is about symlink
+  *fidelity in backups* (a different problem), and for the adapter use
+  `rclone copy -L farm/` works for simple cases. This item is weaker as
+  mapping evidence than it first appears; its real content is that
+  object stores cannot express farms at the destination, which matters
+  only if syq ever targets object-store endpoints.
+
 ## Reading
 
 The adapter pattern is widespread, named, and tool-supported: people
 build and maintain link farms *because* rsync-family tools have no
-mapping input. That demonstrates demand for the underlying capability —
-restructure while transferring, with delta/resume/verification — while
-the documented costs (farm lifecycle and hygiene, duplicate staging
-state, global-dereference hazards, per-pair invocation loops,
-object-store impedance) are what a first-class mapping input would
-remove. Whether a mapping *format* beats a farm for a given audience is
-a separate product question tracked in the design discussion; this
-survey establishes only that the problem is real and the incumbent
-solutions are costly.
+mapping input, and the documented costs (farm lifecycle and hygiene,
+duplicate staging state, global-dereference hazards, per-pair
+invocation loops) are real. After the steelman, though, the demand is
+narrower than a first reading suggests: one-shot migrations are
+adequately served by transfer-then-rename or a throwaway farm, mirror
+rename propagation is *better* served by the hardlink trick than by
+mapping input v1, and the photo/media farms partly pay for themselves
+as local views. What survives as the demand profile for mapping input:
+**recurring convergent restructure-transfer** where the destination
+layout is the authoritative one and a farm is unavailable or
+inexpressible — remote or read-only sources, symlink-bearing content,
+fragments from distributed producers, and (if ever supported)
+object-store destinations. Whether that profile contains a
+killer example is the open product question tracked in the design
+discussion; this survey establishes that the problem is real, the
+incumbents are costly, and the honest bar for the feature is the
+narrowed profile, not the broad pattern.
 
 A forward-looking note on object stores: if syq ever grows
 S3-compatible endpoints (an open strategic question with its own
