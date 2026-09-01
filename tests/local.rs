@@ -6331,6 +6331,25 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
     assert!(partial_files(&t.0).is_empty());
 }
 
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_nfs_exdev_uses_sequential_receiver_fallback() {
+    let t = Tmp::new();
+    let contents = vec![b'x'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_NFS", "1")
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn long_basename_partial_is_truncated_and_resumed() {

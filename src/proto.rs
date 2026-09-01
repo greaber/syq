@@ -390,9 +390,9 @@ pub enum Request {
         len: u64,
         guard: Option<ContainerGuard>,
     },
-    /// In-kernel copy of a same-machine file (copy_file_range: reflink / NFS
-    /// server-side copy when possible). Err("EXDEV") tells the caller to fall
-    /// back to the normal read/write path.
+    /// Receiver-side copy of a same-machine file (copy_file_range when
+    /// possible, sequential userspace fallback for an NFS destination).
+    /// Err("EXDEV") tells the caller to use the normal streaming path.
     CopyLocal {
         src: PathBytes,
         dst: PathBytes,

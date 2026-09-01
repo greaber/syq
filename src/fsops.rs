@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -21,6 +23,15 @@ const FD_CACHE_MAX: usize = 16;
 const COMMON_NAME_MAX: usize = 255;
 const COMPACT_HASH_BYTES: usize = 10;
 const NAME_MAX_CACHE_CAP: usize = 1024;
+
+#[cfg(target_os = "linux")]
+fn is_nfs_file(file: &File) -> bool {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    unsafe {
+        libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) == 0
+            && stats.assume_init().f_type as u32 == libc::NFS_SUPER_MAGIC as u32
+    }
+}
 
 #[cfg(target_os = "linux")]
 const MODE_DIR: u32 = libc::S_IFDIR;
@@ -2496,10 +2507,10 @@ impl FsOps {
         Ok(())
     }
 
-    /// Copy a whole file in the kernel via copy_file_range. Falls back with a
-    /// distinct "EXDEV" error when the kernel can't offload (different mounts
-    /// without server-side copy, or an unsupported filesystem) so the caller
-    /// can use the normal streaming path.
+    /// Copy a whole same-machine file without routing its bytes through the
+    /// transport. Prefer copy_file_range; when a cross-mount copy into NFS
+    /// cannot be offloaded, use one sequential userspace writer instead. Other
+    /// unsupported filesystems return "EXDEV" for the parallel streaming path.
     #[cfg(target_os = "linux")]
     pub fn copy_local(
         &mut self,
@@ -2553,15 +2564,22 @@ impl FsOps {
             }
             d
         };
+        let destination_is_nfs = is_nfs_file(&d)
+            || cfg!(debug_assertions) && std::env::var_os("SYQ_TEST_COPY_LOCAL_NFS").is_some();
+        let mut userspace_fallback = false;
         #[cfg(debug_assertions)]
         if !inplace && std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
-            drop(d);
-            fs::remove_file(&target).with_context(|| format!("remove {}", target.display()))?;
-            bail!("EXDEV");
+            if destination_is_nfs {
+                userspace_fallback = true;
+            } else {
+                drop(d);
+                fs::remove_file(&target).with_context(|| format!("remove {}", target.display()))?;
+                bail!("EXDEV");
+            }
         }
         let mut off: i64 = 0;
         let mut remaining = size;
-        while remaining > 0 {
+        while remaining > 0 && !userspace_fallback {
             let n = unsafe {
                 libc::copy_file_range(
                     s.as_raw_fd(),
@@ -2582,6 +2600,10 @@ impl FsOps {
                         libc::EXDEV | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL
                     )
                 {
+                    if destination_is_nfs {
+                        userspace_fallback = true;
+                        continue;
+                    }
                     if inplace {
                         drop(d);
                         let _ = fs::remove_file(&target);
@@ -2606,6 +2628,28 @@ impl FsOps {
                 break; // source shorter than expected; finalize what we have
             }
             remaining -= n as u64;
+        }
+        if userspace_fallback {
+            let mut source = &s;
+            let mut destination = &d;
+            source.seek(SeekFrom::Start(0))?;
+            destination.seek(SeekFrom::Start(0))?;
+            let mut buffer = vec![0u8; 1 << 20];
+            let mut remaining = size;
+            while remaining > 0 {
+                let want = remaining.min(buffer.len() as u64) as usize;
+                let n = source
+                    .read(&mut buffer[..want])
+                    .with_context(|| format!("read {}", sp.display()))?;
+                if n == 0 {
+                    bail!("source shortened while copying {}", sp.display());
+                }
+                destination
+                    .write_all(&buffer[..n])
+                    .with_context(|| format!("write {}", target.display()))?;
+                remaining -= n as u64;
+            }
+            d.set_len(size)?;
         }
         Ok(())
     }
@@ -2736,6 +2780,10 @@ impl FsOps {
         off: u64,
         len: u32,
     ) -> Result<Response> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_READ_RANGE").is_some() {
+            bail!("test read-range failure");
+        }
         let p = resolve(path);
         let f = self.cached(&p, false, attempt, false)?;
         let mut data = vec![0u8; len as usize];

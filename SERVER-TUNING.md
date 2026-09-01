@@ -205,8 +205,11 @@ drops with `ip -s link` and the vendor's tools.
   tuner can reduce active workers during longer runs, but short jobs may finish
   before it measures the slowdown.
 - NVMe, RAID, NFS, and other high-latency filesystems often benefit from
-  parallelism. NFS mount choices such as `nconnect` are client and server
-  policy; see the [NFS notes](README.md#nfs) and test with disposable data.
+  parallelism across files. A same-machine copy into one NFS file is the
+  exception: when kernel offload is unavailable, syq uses one sequential
+  receiver-side writer to avoid per-inode contention. NFS mount choices such
+  as `nconnect` are client and server policy; see the
+  [NFS notes](README.md#nfs) and test with disposable data.
 - Compression trades network bytes for CPU. Compare with and without `-z` when
   either the link or CPU is near saturation.
 - `--bwlimit` is the appropriate control when the goal is coexistence with

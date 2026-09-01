@@ -5115,8 +5115,9 @@ impl Worker {
                 }
             }
         };
-        // Same-machine copy: let the kernel move the bytes (reflink / NFS
-        // server-side copy) instead of streaming them through userspace.
+        // Same-machine copy: let the receiver move the bytes directly (kernel
+        // offload, or one sequential writer for cross-mount NFS) instead of
+        // framing, hashing and scheduling them through the transport.
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
         if self.opts.same_host
@@ -5304,13 +5305,15 @@ impl Worker {
         self.sched.jobs.lock().unwrap()[idx].inplace = v;
     }
 
-    /// Attempt an in-kernel same-host copy. Ok(true) = done; Ok(false) =
-    /// kernel can't offload, caller should stream; Err = real failure.
+    /// Attempt a receiver-side same-host copy. Ok(true) = done; Ok(false) =
+    /// receiver cannot use its direct path, so the caller should stream;
+    /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
     fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
         // Write to a partial and let finish_file rename it, so an interrupted
-        // copy_file_range never leaves a final-named file the quick check could
-        // mistake for complete. Only --inplace writes the final path directly.
+        // A receiver-side copy never leaves a final-named file the quick check
+        // could mistake for complete. Only --inplace writes the final path
+        // directly.
         let inplace = self.opts.inplace
             && job.target_condition == TargetCondition::Any
             && job.container_guard.is_none();
