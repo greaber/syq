@@ -904,9 +904,11 @@ fn stat_mode(stat: &libc::stat) -> u32 {
     stat.st_mode as u32
 }
 
-#[cfg(target_os = "linux")]
+/// `st_nlink` is `u64` on x86-64 Linux, `u32` on AArch64 Linux, and `u16`
+/// on macOS, so the cast is only redundant on one of the release targets.
+#[allow(clippy::unnecessary_cast)]
 fn stat_nlink(stat: &libc::stat) -> u64 {
-    stat.st_nlink
+    stat.st_nlink as u64
 }
 
 #[cfg(target_os = "linux")]
@@ -917,11 +919,6 @@ fn stat_rdev(stat: &libc::stat) -> u64 {
 #[cfg(not(target_os = "linux"))]
 fn stat_rdev(stat: &libc::stat) -> u64 {
     stat.st_rdev as u64
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stat_nlink(stat: &libc::stat) -> u64 {
-    stat.st_nlink as u64
 }
 
 fn unlink_at(parent: RawFd, name: &CString, flags: libc::c_int) -> io::Result<()> {

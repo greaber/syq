@@ -43,6 +43,16 @@ jobs:
       - run: scripts/test-secret-tools.sh
       - run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-assets.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-homebrew-formula.sh scripts/test-secret-tools.sh
 
+  # The release workflow builds on this runner; libc field types differ from
+  # x86-64 (st_nlink is u32 here), so check it before a tag can fail.
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo check --locked --all-targets
+
   macos:
     runs-on: macos-14
     steps:
