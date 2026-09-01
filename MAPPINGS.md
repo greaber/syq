@@ -95,20 +95,24 @@ src/                          nas:/pub/ afterwards
 If `src` also contained `notes.TXT`, the run is refused before any
 transfer: two entries claim `notes.txt`.
 
-rsync has no rename option, so its closest equivalent is a symlink
-staging farm, dereferenced on the way out:
+For a one-shot copy, GNU tar can do this rename more simply:
 
 ```sh
-find src -type f | while read -r f; do
-  d="staging/$(printf %s "${f#src/}" | tr '[:upper:]' '[:lower:]')"
-  mkdir -p "$(dirname "$d")" && ln -sf "$(realpath "$f")" "$d"
-done
-rsync -aL staging/ nas:/pub/
+tar -C src -cf - --transform='s/.*/\L&/' . | ssh nas 'tar -C /pub -xf -'
 ```
 
-— where `ln -sf` resolves the case-fold collision silently,
-last writer wins, and the farm must be rebuilt and cleaned up around
-every run.
+Use that when it fits. Where it stops fitting: the case-fold collision
+above extracts with exit 0 and the last writer silently wins (measured,
+not speculated); every run resends every byte, and an interrupted pipe
+leaves truncated files in place; the stream is one connection,
+unverified; the transform sees only the *name*, so the mtime- and
+size-based examples below are out of its reach; and it rewrites symlink
+targets by default, which breaks links pointing outside the tree.
+rsync itself has no rename option at all — keeping rsync's delta and
+resume means a symlink staging farm (`ln -sf` into a lowercased
+`staging/` tree, then `rsync -aL staging/ nas:/pub/`), where `-f`
+again resolves collisions silently and the farm must be rebuilt and
+cleaned up around every run.
 
 ### Repartition into `YEAR/MM/` folders by modification time
 
@@ -186,8 +190,14 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
 
 - `--mapping` replaces source selectors on `syq cp`; it composes with
   `-C`, `--to`, `--into` (and the other `--into-*` placement
-  preconditions), `-n`, `-v`, `-q`, and `-j`. It is part of the native
-  surface only; `syq rsync` is unchanged.
+  preconditions), `-n`, `-v`, `-q`, and `-j`. It conflicts with `--as`:
+  an exact single-path placement cannot host a manifest — each entry's
+  `dst` already is its own `--as`. It is part of the native surface
+  only; `syq rsync` is unchanged.
+- `syq map` accepts any `syq cp` invocation, including
+  `report --as /reports/final`, which emits that single resolved entry.
+  The typed `rm` selectors (`--src-dir`, `--src-file`) are not part of
+  the copy grammar.
 - Fidelity is the native default (`-rlt`). There is no per-entry
   policy: preservation and comparison behavior stay global.
 - An entry claims exactly one object. A `dir` entry claims the
