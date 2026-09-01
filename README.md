@@ -257,6 +257,24 @@ native mode. Remote-to-remote copies still use the ordinary automatic
 transport. Native raw path bytes are relayed through syq's protocol when they
 cannot be represented in a direct remote shell command.
 
+## Mappings
+
+Placement can also be data instead of flags: `syq map` prints the resolved
+selection and placement of a command as JSON lines, and `syq cp --mapping`
+executes such a manifest — a generalized `--as` covering many entries, each
+with its own destination. Between the two, any tool that edits JSON can
+reshape a transfer:
+
+```sh
+syq map --src-src photos \
+  | jq '.dst.value |= ascii_downcase' \
+  | syq cp --mapping - -C photos --to nas --into /pub
+```
+
+Conflicting destinations are refused before any byte moves. See
+[MAPPINGS.md](MAPPINGS.md) for the format, more one-line transforms, and
+limits.
+
 ## Rsync compatibility
 
 The complete previous command surface remains available under `syq rsync`:
@@ -1232,7 +1250,9 @@ the root itself are rejected. A listed path that doesn't exist is an error
 (exit 23) and the rest is still copied. The destination must be a directory (an
 existing file there is an error, never replaced). `--files-from` can't be
 combined with `--ignore`/`--ignore-from` or `--delete`; for a remote-to-remote copy
-it needs `--relay` (the list is read on this machine).
+it needs `--relay` (the list is read on this machine). To also choose each
+entry's destination path, use a native mapping instead (see
+[MAPPINGS.md](MAPPINGS.md)).
 
 ## Parallel removal (`--rm`)
 
