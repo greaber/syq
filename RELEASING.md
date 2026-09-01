@@ -137,8 +137,12 @@ connection, so enable it only for a trusted release host rather than globally.
 3. Approve the protected `release` environment for the publishing job, then
    approve it again when the separate Homebrew tap job is ready. The workflow
    first verifies that the annotated tag's signature is valid and that it
-   directly targets the workflow commit, and that this commit is reachable
-   from protected `master`. It then builds static GNU Linux x86-64/ARM64
+   directly targets the workflow commit, that this commit is reachable
+   from protected `master`, and that the `rust`, `macos`, and `linux-arm64`
+   checks all succeeded on that exact commit. Pull requests are checked
+   against their own head rather than the merged result, so wait for the
+   post-merge `ci` run on `master` to finish before tagging; a red or
+   still-running `master` cannot be released. It then builds static GNU Linux x86-64/ARM64
    binaries and native macOS Apple Silicon/Intel binaries, embeds an Ed25519
    signature over the manifest's RFC 8785 canonical JSON, verifies the exact
    asset inventory, creates provenance attestations, uploads a draft, checks
