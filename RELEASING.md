@@ -125,9 +125,19 @@ connection, so enable it only for a trusted release host rather than globally.
    release notes and merge through the protected branch. Peer compatibility is
    the immutable release identity, so there is no separate protocol number to
    maintain.
-2. Create and push a signed annotated tag matching the package version. Its
-   signing key and email must be configured on your GitHub account so GitHub
-   reports the tag-object signature as verified:
+2. Wait for the post-merge `ci` run on `master` to succeed for the release
+   commit. Pull requests are checked against their own head rather than the
+   merged result, and the release workflow refuses a commit whose `rust`,
+   `macos`, and `linux-arm64` checks have not all succeeded, so tagging a
+   red or still-running `master` only produces a failed release run:
+
+   ```sh
+   gh run watch --exit-status "$(gh run list --workflow ci.yml --branch master --commit "$(git rev-parse master)" --json databaseId --jq '.[0].databaseId')"
+   ```
+
+   Then create and push a signed annotated tag matching the package version.
+   Its signing key and email must be configured on your GitHub account so
+   GitHub reports the tag-object signature as verified:
 
    ```sh
    git tag -s v0.1.0 -m 'syq 0.1.0'
@@ -139,10 +149,7 @@ connection, so enable it only for a trusted release host rather than globally.
    first verifies that the annotated tag's signature is valid and that it
    directly targets the workflow commit, that this commit is reachable
    from protected `master`, and that the `rust`, `macos`, and `linux-arm64`
-   checks all succeeded on that exact commit. Pull requests are checked
-   against their own head rather than the merged result, so wait for the
-   post-merge `ci` run on `master` to finish before tagging; a red or
-   still-running `master` cannot be released. It then builds static GNU Linux x86-64/ARM64
+   checks all succeeded on that exact commit. It then builds static GNU Linux x86-64/ARM64
    binaries and native macOS Apple Silicon/Intel binaries, embeds an Ed25519
    signature over the manifest's RFC 8785 canonical JSON, verifies the exact
    asset inventory, creates provenance attestations, uploads a draft, checks
