@@ -4,8 +4,9 @@
 //! is a component walk rooted at an already-open directory; it never produces
 //! a canonical pathname that is reopened later. The selected object and its
 //! parent directory remain pinned while an endpoint-local worker pool removes
-//! descendants relative to directory descriptors. Symlinks encountered below
-//! a selected directory are payload entries and are unlinked, never followed.
+//! descendants relative to directory descriptors. Without `--follow`, a
+//! selected symlink and symlinks encountered below a selected directory are
+//! unlinked as entries; neither is followed.
 
 use crate::proto::{NativeRemoveKind, NativeRemoveOutcome, NativeRemoveSelection, PathBytes};
 use anyhow::{bail, Context, Result};
@@ -16,12 +17,15 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SYMLINK_LIMIT: usize = 40;
 const EVENT_BATCH: usize = 200;
+const EVENT_POLL: Duration = Duration::from_millis(100);
+const EVENT_FLUSH: Duration = Duration::from_millis(100);
+const ATTACHED_HEARTBEAT: Duration = Duration::from_secs(1);
 const RMDIR_RETRIES: usize = 3;
 
 #[cfg(target_os = "linux")]
@@ -76,7 +80,7 @@ impl PinnedParent {
 
 struct PinnedLeaf {
     name: PinnedName,
-    _object: File,
+    _object: Option<File>,
     label: PathBytes,
 }
 
@@ -191,13 +195,41 @@ impl Resolver {
                 }
             };
 
+            let final_component = components.is_empty();
             if identity.is_symlink() {
                 if !self.follow {
-                    bail!(
-                        "selector {:?} encounters symlink component {:?}; pass --follow to resolve symlinks",
-                        String::from_utf8_lossy(&selection.path),
-                        String::from_utf8_lossy(&component)
-                    );
+                    if !final_component {
+                        bail!(
+                            "selector {:?} encounters symlink component {:?}; pass --follow to resolve symlinks",
+                            String::from_utf8_lossy(&selection.path),
+                            String::from_utf8_lossy(&component)
+                        );
+                    }
+                    require_kind(selection.kind, identity, &label)?;
+                    traces.push(format!(
+                        "selector {:?} resolved to symlink {}:{}",
+                        String::from_utf8_lossy(&label),
+                        identity.dev,
+                        identity.ino
+                    ));
+                    return Ok(ResolvedSelection::Leaf(PinnedLeaf {
+                        name: PinnedName {
+                            parent: PinnedParent::File(
+                                current
+                                    .directory
+                                    .try_clone()
+                                    .context("pin selected symlink parent")?,
+                            ),
+                            name: component_cstring(&component)?,
+                            identity,
+                        },
+                        // Linux can hold an O_PATH descriptor for a symlink,
+                        // but macOS has no corresponding portable open mode.
+                        // The pinned parent/name plus identity check is the
+                        // same mechanism used for symlinks found in a tree.
+                        _object: None,
+                        label,
+                    }));
                 }
                 symlinks += 1;
                 if symlinks > SYMLINK_LIMIT {
@@ -231,7 +263,6 @@ impl Resolver {
                 continue;
             }
 
-            let terminal = components.is_empty();
             if identity.is_dir() {
                 let directory = open_directory_at(&current.directory, &component)
                     .with_context(|| format!("open directory component {:?}", bytes(&component)))?;
@@ -246,7 +277,7 @@ impl Resolver {
                     name: component_cstring(&component)?,
                     identity,
                 };
-                if terminal {
+                if final_component {
                     require_kind(selection.kind, identity, &label)?;
                     traces.push(format!(
                         "selector {:?} resolved to directory {}:{}",
@@ -268,7 +299,7 @@ impl Resolver {
                 continue;
             }
 
-            if !terminal {
+            if !final_component {
                 bail!(
                     "non-directory component {:?} in selector {:?}",
                     String::from_utf8_lossy(&component),
@@ -296,7 +327,7 @@ impl Resolver {
                     name: component_cstring(&component)?,
                     identity,
                 },
-                _object: object,
+                _object: Some(object),
                 label,
             }));
         }
@@ -495,6 +526,7 @@ struct Pool {
     pending: Mutex<usize>,
     events: mpsc::Sender<NativeRemoveOutcome>,
     dry_run: bool,
+    cancelled: AtomicBool,
 }
 
 impl Pool {
@@ -530,9 +562,32 @@ impl Pool {
         self.sender.lock().unwrap().take();
     }
 
-    fn outcome(&self, path: PathBytes, error: Option<String>) {
-        let _ = self.events.send(NativeRemoveOutcome { path, error });
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
     }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn outcome(&self, path: PathBytes, error: Option<String>) {
+        if !self.is_cancelled() {
+            let _ = self.events.send(NativeRemoveOutcome { path, error });
+        }
+    }
+}
+
+fn emit_attached(
+    pool: &Pool,
+    batch: &mut Vec<NativeRemoveOutcome>,
+    sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+) -> Result<()> {
+    let ready = std::mem::replace(batch, Vec::with_capacity(EVENT_BATCH));
+    if let Err(error) = sink(ready) {
+        pool.cancel();
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -577,28 +632,25 @@ pub(crate) fn remove(
         trace(traces)?;
     }
 
-    let (task_tx, task_rx) = mpsc::sync_channel(workers.max(1).saturating_mul(4));
+    // Queue every resolved root before starting workers. Once workers run,
+    // only they may take the bounded-queue inline fallback; the coordinator
+    // remains available to flush results and detect connection failure.
+    let queue_capacity = workers.max(1).saturating_mul(4).max(resolved.len()).max(1);
+    let (task_tx, task_rx) = mpsc::sync_channel(queue_capacity);
     let (event_tx, event_rx) = mpsc::channel();
     let pool = Arc::new(Pool {
         sender: Mutex::new(Some(task_tx)),
         pending: Mutex::new(0),
         events: event_tx,
         dry_run,
+        cancelled: AtomicBool::new(false),
     });
-    let task_rx = Arc::new(Mutex::new(task_rx));
-    let mut threads = Vec::new();
-    for _ in 0..workers.max(1) {
-        let pool = pool.clone();
-        let task_rx = task_rx.clone();
-        threads.push(std::thread::spawn(move || worker_loop(pool, task_rx)));
-    }
-
     for selected in resolved {
         match selected {
             ResolvedSelection::Missing => unreachable!(),
             ResolvedSelection::Leaf(leaf) => pool.submit(Task::Leaf {
                 name: leaf.name,
-                _object: Some(leaf._object),
+                _object: leaf._object,
                 label: leaf.label,
                 parent: None,
             }),
@@ -615,34 +667,53 @@ pub(crate) fn remove(
         }
     }
 
+    let task_rx = Arc::new(Mutex::new(task_rx));
+    let mut threads = Vec::new();
+    for _ in 0..workers.max(1) {
+        let pool = pool.clone();
+        let task_rx = task_rx.clone();
+        threads.push(std::thread::spawn(move || worker_loop(pool, task_rx)));
+    }
+
     let mut batch = Vec::with_capacity(EVENT_BATCH);
     let mut sink_error = None;
+    let mut last_emit = Instant::now();
     while !pool.is_done() {
-        match event_rx.recv_timeout(Duration::from_millis(100)) {
+        match event_rx.recv_timeout(EVENT_POLL) {
             Ok(event) => {
-                batch.push(event);
-                if batch.len() >= EVENT_BATCH {
-                    let ready = std::mem::replace(&mut batch, Vec::with_capacity(EVENT_BATCH));
-                    if sink_error.is_none() {
-                        sink_error = sink(ready).err();
-                    }
+                if sink_error.is_none() {
+                    batch.push(event);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        if sink_error.is_none()
+            && (batch.len() >= EVENT_BATCH
+                || (!batch.is_empty() && last_emit.elapsed() >= EVENT_FLUSH)
+                || last_emit.elapsed() >= ATTACHED_HEARTBEAT)
+        {
+            if let Err(error) = emit_attached(&pool, &mut batch, sink) {
+                sink_error = Some(error);
+            } else {
+                last_emit = Instant::now();
+            }
+        }
     }
     while let Ok(event) = event_rx.try_recv() {
-        batch.push(event);
-        if batch.len() >= EVENT_BATCH {
-            let ready = std::mem::replace(&mut batch, Vec::with_capacity(EVENT_BATCH));
-            if sink_error.is_none() {
-                sink_error = sink(ready).err();
+        if sink_error.is_none() {
+            batch.push(event);
+            if batch.len() >= EVENT_BATCH {
+                if let Err(error) = emit_attached(&pool, &mut batch, sink) {
+                    sink_error = Some(error);
+                }
             }
         }
     }
     if !batch.is_empty() && sink_error.is_none() {
-        sink_error = sink(batch).err();
+        if let Err(error) = emit_attached(&pool, &mut batch, sink) {
+            sink_error = Some(error);
+        }
     }
     pool.close();
     for thread in threads {
@@ -668,6 +739,17 @@ fn worker_loop(pool: Arc<Pool>, receiver: Arc<Mutex<mpsc::Receiver<Task>>>) {
 }
 
 fn process_task(pool: &Arc<Pool>, task: Task) {
+    if pool.is_cancelled() {
+        match task {
+            Task::Scan(job) | Task::Finish(job) => abandon_directory(pool, &job),
+            Task::Leaf { parent, .. } => {
+                if let Some(parent) = parent {
+                    directory_part_done(pool, parent);
+                }
+            }
+        }
+        return;
+    }
     match task {
         Task::Scan(job) => scan_directory(pool, job),
         Task::Leaf {
@@ -676,6 +758,12 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
             label,
             parent,
         } => {
+            if pool.is_cancelled() {
+                if let Some(parent) = parent {
+                    directory_part_done(pool, parent);
+                }
+                return;
+            }
             let error = if pool.dry_run {
                 None
             } else {
@@ -702,6 +790,9 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
         }
     };
     for component in names {
+        if pool.is_cancelled() {
+            break;
+        }
         let identity = match metadata_at(job.directory.as_raw_fd(), &component) {
             Ok(identity) => identity,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -769,6 +860,10 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
 }
 
 fn finish_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
+    if pool.is_cancelled() {
+        abandon_directory(pool, &job);
+        return;
+    }
     let Some(removal) = &job.removal else {
         if let Some(parent) = &job.parent {
             directory_part_done(pool, parent.clone());
@@ -1197,7 +1292,7 @@ mod tests {
             None,
             &[
                 selector(b"victim", NativeRemoveKind::Any),
-                selector(b"link", NativeRemoveKind::Any),
+                selector(b"link/file", NativeRemoveKind::Any),
             ],
             false,
             false,
@@ -1211,6 +1306,76 @@ mod tests {
         assert!(result.is_err());
         assert!(temp.path().join("victim").exists());
         assert!(temp.path().join("real/file").exists());
+    }
+
+    #[test]
+    fn no_follow_unlinks_selected_symlink_and_preserves_referent() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("real")).unwrap();
+        fs::write(temp.path().join("real/file"), b"data").unwrap();
+        symlink("real", temp.path().join("link")).unwrap();
+        let mut outcomes = Vec::new();
+        remove(
+            Some(temp.path().as_os_str().as_bytes()),
+            None,
+            &[selector(b"link", NativeRemoveKind::File)],
+            false,
+            false,
+            2,
+            &mut |_| Ok(()),
+            &mut |batch| {
+                outcomes.extend(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!temp.path().join("link").is_symlink());
+        assert_eq!(fs::read(temp.path().join("real/file")).unwrap(), b"data");
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].error.is_none());
+    }
+
+    #[test]
+    fn failed_attached_emit_cancels_pending_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("victim"), b"data").unwrap();
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(temp.path())
+            .unwrap();
+        let identity = metadata_at(directory.as_raw_fd(), b"victim").unwrap();
+        let (task_tx, _task_rx) = mpsc::sync_channel(1);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let pool = Arc::new(Pool {
+            sender: Mutex::new(Some(task_tx)),
+            pending: Mutex::new(0),
+            events: event_tx,
+            dry_run: false,
+            cancelled: AtomicBool::new(false),
+        });
+
+        let mut heartbeat = Vec::new();
+        let error = emit_attached(&pool, &mut heartbeat, &mut |_| bail!("client disconnected"))
+            .unwrap_err();
+        assert!(error.to_string().contains("client disconnected"));
+        assert!(pool.is_cancelled());
+
+        process_task(
+            &pool,
+            Task::Leaf {
+                name: PinnedName {
+                    parent: PinnedParent::File(directory),
+                    name: component_cstring(b"victim").unwrap(),
+                    identity,
+                },
+                _object: None,
+                label: b"victim".to_vec(),
+                parent: None,
+            },
+        );
+        assert_eq!(fs::read(temp.path().join("victim")).unwrap(), b"data");
     }
 
     #[test]

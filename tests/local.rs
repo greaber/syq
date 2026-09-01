@@ -402,7 +402,7 @@ fn native_rejects_transport_configuration() {
 }
 
 #[test]
-fn native_rm_refuses_a_symlink_before_mutating_any_selector() {
+fn native_rm_refuses_an_intermediate_symlink_before_mutating_any_selector() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
@@ -410,9 +410,72 @@ fn native_rm_refuses_a_symlink_before_mutating_any_selector() {
     write(&t.path("victim"), b"keep");
     symlink("real", t.path("link")).unwrap();
 
-    let output = native_syq(&["rm", "--cwd", &t.s(""), "--src", "victim", "--src", "link"]);
+    let output = native_syq(&[
+        "rm",
+        "--cwd",
+        &t.s(""),
+        "--src",
+        "victim",
+        "--src",
+        "link/file",
+    ]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("pass --follow"));
+    assert_eq!(read(&t.path("victim")), b"keep");
+    assert_eq!(read(&t.path("real/file")), b"keep");
+    assert!(t.path("link").is_symlink());
+}
+
+#[test]
+fn native_rm_without_follow_unlinks_selected_symlinks_and_preserves_referents() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real-dir/file"), b"keep");
+    write(&t.path("real-file"), b"keep");
+    symlink("real-dir", t.path("dir-link")).unwrap();
+    symlink("real-file", t.path("file-link")).unwrap();
+    symlink("missing", t.path("dangling-link")).unwrap();
+
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s(""),
+        "--src",
+        "dir-link",
+        "--src-file",
+        "file-link",
+        "--src",
+        "dangling-link",
+    ]);
+
+    assert!(!t.path("dir-link").is_symlink());
+    assert!(!t.path("file-link").is_symlink());
+    assert!(!t.path("dangling-link").is_symlink());
+    assert_eq!(read(&t.path("real-dir/file")), b"keep");
+    assert_eq!(read(&t.path("real-file")), b"keep");
+}
+
+#[test]
+fn native_rm_directory_selector_rejects_a_selected_symlink_before_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real/file"), b"keep");
+    write(&t.path("victim"), b"keep");
+    symlink("real", t.path("link")).unwrap();
+
+    let output = native_syq(&[
+        "rm",
+        "--cwd",
+        &t.s(""),
+        "--src",
+        "victim",
+        "--src-dir",
+        "link",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must resolve to a directory"));
     assert_eq!(read(&t.path("victim")), b"keep");
     assert_eq!(read(&t.path("real/file")), b"keep");
     assert!(t.path("link").is_symlink());
@@ -2592,7 +2655,7 @@ fn dry_run_reports_typed_preflight_summary() {
         "--delete",
         "--max-size",
         "5",
-        "-i",
+        "--ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -3768,11 +3831,11 @@ fn ignore_patterns_prune_dirs_and_files() {
     // `node_modules` at any depth, `*.o` anywhere, `/build` only at the root.
     run_ok(&[
         "-a",
-        "-i",
+        "--ignore",
         "node_modules",
-        "-i",
+        "--ignore",
         "*.o",
-        "-i",
+        "--ignore",
         "/build",
         &t.s("src/"),
         &t.s("dst"),
@@ -3803,11 +3866,11 @@ fn ignore_only_idiom_and_empty_dirs() {
     // The gitignore "only *.jpg" idiom: directories are still all created.
     run_ok(&[
         "-a",
-        "-i",
+        "--ignore",
         "*",
-        "-i",
+        "--ignore",
         "!*/",
-        "-i",
+        "--ignore",
         "!*.jpg",
         &t.s("src/"),
         &t.s("dst"),
@@ -3834,7 +3897,7 @@ fn ignore_from_file_and_later_negation_wins() {
         "-a",
         "--ignore-from",
         &t.s("pats"),
-        "-i",
+        "--ignore",
         "!x.o",
         &t.s("src/"),
         &t.s("dst"),
@@ -3842,14 +3905,14 @@ fn ignore_from_file_and_later_negation_wins() {
     let l = listing(&t.path("dst"));
     assert!(
         l.contains(&"x.o".to_string()),
-        "later -i '!x.o' must override file"
+        "later --ignore '!x.o' must override file"
     );
     assert!(!l.contains(&"a/y.o".to_string()));
     assert!(!l.iter().any(|p| p.contains("node_modules")));
     // And the other order: the file's `*.o` comes last, so x.o stays ignored.
     run_ok(&[
         "-a",
-        "-i",
+        "--ignore",
         "!x.o",
         "--ignore-from",
         &t.s("pats"),
@@ -3876,12 +3939,27 @@ fn ignore_applies_per_source_root_and_dry_run() {
     make_ignore_tree(&t.path("s2"));
     fs::create_dir(t.path("dst")).unwrap();
     // `/build` is anchored at each source's root, not the destination.
-    run_ok(&["-a", "-i", "/build", &t.s("s1"), &t.s("s2"), &t.s("dst")]);
+    run_ok(&[
+        "-a",
+        "--ignore",
+        "/build",
+        &t.s("s1"),
+        &t.s("s2"),
+        &t.s("dst"),
+    ]);
     assert!(!t.path("dst/s1/build").exists());
     assert!(!t.path("dst/s2/build").exists());
     assert!(t.path("dst/s1/a/build/out2").is_file());
     // Dry run with the root itself matching a pattern: the root is never ignored.
-    let out = run_ok(&["-an", "-i", "s1", "-i", "*.o", &t.s("s1"), &t.s("dst2")]);
+    let out = run_ok(&[
+        "-an",
+        "--ignore",
+        "s1",
+        "--ignore",
+        "*.o",
+        &t.s("s1"),
+        &t.s("dst2"),
+    ]);
     assert!(!t.path("dst2").exists());
     assert!(out.contains("in 9 files needing content work"), "{out}");
 }
@@ -3893,9 +3971,9 @@ fn ignore_reinclude_subdir_idiom() {
     // Everything directly under logs/ except the keep/ directory (git idiom).
     run_ok(&[
         "-a",
-        "-i",
+        "--ignore",
         "logs/*",
-        "-i",
+        "--ignore",
         "!logs/keep/",
         &t.s("src/"),
         &t.s("dst"),
@@ -3915,7 +3993,7 @@ fn ignore_from_strips_bom_and_hyphen_patterns_work() {
         "-a",
         "--ignore-from",
         &t.s("pats"),
-        "-i",
+        "--ignore",
         "-secret",
         &t.s("src/"),
         &t.s("dst"),
@@ -3932,8 +4010,8 @@ fn ignore_from_strips_bom_and_hyphen_patterns_work() {
 fn ignore_conflicts_with_rm() {
     let t = Tmp::new();
     make_ignore_tree(&t.path("tree"));
-    let out = syq(&["--rm", "-i", "keep", &t.s("tree")]);
-    assert!(!out.status.success(), "--rm with -i must be rejected");
+    let out = syq(&["--rm", "--ignore", "keep", &t.s("tree")]);
+    assert!(!out.status.success(), "--rm with --ignore must be rejected");
     assert!(
         t.path("tree/logs/keep/k").is_file(),
         "nothing may be removed"
@@ -3973,7 +4051,7 @@ fn delete_removes_extras_and_protects_ignored() {
         "-n",
         "-v",
         "--delete",
-        "-i",
+        "--ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -4007,7 +4085,7 @@ fn delete_removes_extras_and_protects_ignored() {
         "-a",
         "-v",
         "--delete",
-        "-i",
+        "--ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -4567,7 +4645,7 @@ fn delete_nested_roots_keep_their_own_anchored_ignores() {
         "-a",
         "-v",
         "--delete",
-        "-i",
+        "--ignore",
         "/foo",
         &t.s("src/"),
         &t.s("src2"),
@@ -4606,7 +4684,7 @@ fn delete_treats_partial_named_directory_as_ordinary_extra() {
         "-a",
         "-v",
         "--delete",
-        "-i",
+        "--ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -6516,7 +6594,7 @@ fn checkpoint_records_metadata_only_reconcile() {
 }
 
 // Unsupported rsync flags get a helpful, specific error (not clap's generic
-// "unexpected argument"), and the filter family points at -i.
+// "unexpected argument"), and the filter family points at --ignore.
 #[test]
 fn unsupported_rsync_flags_explain_themselves() {
     let t = Tmp::new();
@@ -6531,8 +6609,21 @@ fn unsupported_rsync_flags_explain_themselves() {
     ]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("-i/--ignore"), "should point to -i: {err}");
+    assert!(err.contains("--ignore"), "should point to --ignore: {err}");
     assert!(err.contains("gitignore"), "should mention gitignore: {err}");
+
+    let out = syq(&["-a", "-i", &t.s("src/"), &t.s("itemized-dst/")]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("itemize-changes"),
+        "should explain rsync -i: {err}"
+    );
+    assert!(
+        err.contains("long-only --ignore"),
+        "should name filtering: {err}"
+    );
+    assert!(!t.path("itemized-dst").exists());
 
     let out = syq(&["-a", "--delete-during", &t.s("src/"), &t.s("dst/")]);
     assert!(!out.status.success());
@@ -6583,9 +6674,9 @@ fn rsync_compat_noops_are_accepted() {
 fn flag_like_ignore_pattern_is_not_rejected() {
     let t = Tmp::new();
     write(&t.path("src/keep"), b"k");
-    // `-i --exclude` means "ignore a pattern literally named --exclude"; it must
+    // `--ignore --exclude` means "ignore a pattern literally named --exclude"; it must
     // not trip the --exclude rejection.
-    run_ok(&["-a", "-i", "--exclude", &t.s("src/"), &t.s("dst/")]);
+    run_ok(&["-a", "--ignore", "--exclude", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/keep")), b"k");
 }
 
@@ -6751,7 +6842,14 @@ fn delete_excluded_removes_ignored_destination_paths() {
     write(&t.path("dst/keep/k.log"), b"k");
     write(&t.path("dst/junk.log"), b"old");
     // Protected without the flag...
-    run_ok(&["-a", "--delete", "-i", "*.log", &t.s("src/"), &t.s("dst")]);
+    run_ok(&[
+        "-a",
+        "--delete",
+        "--ignore",
+        "*.log",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
     assert_eq!(
         listing(&t.path("dst")),
         ["a", "junk.log", "keep", "keep/k.log"]
@@ -6761,7 +6859,7 @@ fn delete_excluded_removes_ignored_destination_paths() {
         "-a",
         "--delete",
         "--delete-excluded",
-        "-i",
+        "--ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -6988,8 +7086,12 @@ fn files_from_rejections_and_stdin() {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     assert_eq!(listing(&t.path("dst")), ["b"]);
-    // Cannot combine with -i / --ignore-from / --delete (clap-level errors).
-    for extra in [["-i", "x"], ["--ignore-from", "list"], ["--delete", "-v"]] {
+    // Cannot combine with --ignore / --ignore-from / --delete (clap-level errors).
+    for extra in [
+        ["--ignore", "x"],
+        ["--ignore-from", "list"],
+        ["--delete", "-v"],
+    ] {
         let out = syq(&[
             "-a",
             "--files-from",

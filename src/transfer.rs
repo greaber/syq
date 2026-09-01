@@ -4257,7 +4257,7 @@ impl Planner<'_> {
             p.starts_with(r) && (r.ends_with(b"/") || p.get(r.len()) == Some(&b'/'))
         };
         for (root, sub) in roots.clone() {
-            // Every root is walked with its own -i anchoring. A root nested in
+            // Every root is walked with its own --ignore anchoring. A root nested in
             // this one (`syq rsync --delete a b/ dst`: dst/a inside dst) is left to
             // its own walk, so its patterns apply and nothing is deleted twice.
             let nested: Vec<PathBytes> = roots
