@@ -21,7 +21,12 @@ releases setting so published assets and tags cannot be changed afterward.
    `v*` tags to release maintainers. GitHub's ruleset signature rule applies to
    commits, not annotated tag-object signatures; the release workflow checks
    the latter explicitly through GitHub's tag verification API.
-4. The encrypted inventory initializer generates a dedicated SSH deploy key
+4. Publish the first `syq` version to crates.io manually, then add a GitHub
+   trusted publisher for repository `greaber/syq`, workflow `release.yml`, and
+   environment `release`. Do not put a long-lived crates.io token in GitHub
+   secrets. After the first automated publication succeeds, enable
+   trusted-publishing-only mode on crates.io and revoke the bootstrap token.
+5. The encrypted inventory initializer generates a dedicated SSH deploy key
    for `greaber/homebrew-tap`. The sync installs its public half on that
    repository with write access and places only its private half in the
    protected `release` environment. It has no access to the syq repository or
@@ -137,8 +142,9 @@ connection, so enable it only for a trusted release host rather than globally.
    binaries and native macOS Apple Silicon/Intel binaries, embeds an Ed25519
    signature over the manifest's RFC 8785 canonical JSON, verifies the exact
    asset inventory, creates provenance attestations, uploads a draft, checks
-   every uploaded byte, publishes it, and finally updates the tap.
-4. Verify one or more downloaded artifacts and exercise both install paths:
+   every uploaded byte, publishes it, publishes the matching source package to
+   crates.io with a short-lived OIDC credential, and finally updates the tap.
+4. Verify one or more downloaded artifacts and exercise all install paths:
 
    ```sh
    gh attestation verify syq-linux-x86_64 --repo greaber/syq
@@ -146,13 +152,16 @@ connection, so enable it only for a trusted release host rather than globally.
    less install.sh
    sh install.sh --bin-dir "$(mktemp -d)"
    brew install greaber/tap/syq
+   cargo install --locked syq --root "$(mktemp -d)"
    ```
 
 If a job stops after creating a draft, inspect that draft rather than
 overwriting it. The workflow refuses to reuse drafts. It may safely be rerun
 after a fully published release: it downloads every published asset and
 requires byte-for-byte equality with the rebuilt release before forwarding the
-formula to the tap job.
+formula to the tap job. The same rerun packages the source crate again and
+requires its SHA-256 to match the immutable crates.io version; a missing
+version is published, while a divergent version fails closed.
 
 The release workflow sets `SYQ_RELEASE_BUILD=1`, which makes each platform
 binary report the tag (for example `v0.2.0`) as its build identity. Ordinary
