@@ -479,6 +479,7 @@ pub enum Response {
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
     NativeRemoveTrace(Vec<String>),
+    /// An empty batch is an attached native-rm liveness frame.
     NativeRemoveBatch(Vec<NativeRemoveOutcome>),
     NativeRemoveDone,
     Stats(Vec<Option<Entry>>),
