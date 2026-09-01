@@ -144,6 +144,75 @@ fn partial_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
+fn janky_cat_concatenates_files_and_stdin() {
+    let t = Tmp::new();
+    write(&t.path("first"), b"first\0");
+    write(&t.path("last"), b"\nlast");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cat", &t.s("first"), "-", &t.s("last")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"middle").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_output_ok(&output);
+    assert_eq!(output.stdout, b"first\0middle\nlast");
+}
+
+#[test]
+fn janky_cat_reports_missing_inputs_and_keeps_going() {
+    let t = Tmp::new();
+    write(&t.path("present"), b"still here");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cat", &t.s("missing"), &t.s("present")])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"still here");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&t.s("missing")),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn janky_cat_is_slow_and_absent_from_help() {
+    let t = Tmp::new();
+    write(&t.path("one-byte"), b"x");
+
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cat", &t.s("one-byte")])
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_output_ok(&output);
+    assert_eq!(output.stdout, b"x");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(60),
+        "cat finished suspiciously quickly in {elapsed:?}"
+    );
+
+    let help = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_output_ok(&help);
+    assert!(
+        !String::from_utf8_lossy(&help.stdout).contains("\n  cat"),
+        "{}",
+        String::from_utf8_lossy(&help.stdout)
+    );
+}
+
+#[test]
 fn native_copy_distinguishes_named_contents_and_exact_placement() {
     let t = Tmp::new();
     write(&t.path("src/sub/file"), b"data");
