@@ -20,9 +20,37 @@ behavior, exit status, and safety checks.
 | JavaScript and TypeScript | `@syq/sdk` | [`js/`](js/) |
 | Go | `github.com/greaber/syq/sdk/go` | [`go/`](go/) |
 
-Package versions are independent of the syq executable version. A wrapper
-release may support multiple executable versions, while the future automation
-schema will have its own explicit major version.
+Every SDK release pins one exact, tested syq release. The default client does
+not search `PATH` or adopt a separately installed syq. On first use it downloads
+the pinned official binary for the current platform into an SDK-owned cache,
+verifies its archive and decompressed bytes against the release manifest
+embedded in the package, checks its version and release identity, and then
+always invokes that cached binary.
+
+The current mapping is:
+
+| Python SDK | syq executable |
+|---|---|
+| `0.0.1` | `0.1.5` |
+
+The two version numbers do not need to match, but the mapping is immutable for
+a published SDK release. Multiple SDK releases may pin the same syq release.
+Moving to another syq release requires a new SDK release and its compatibility
+tests. A syq release does not require an SDK release unless the SDK is being
+moved to it.
+
+Callers that need a local build, a newer syq, or an offline-provisioned binary
+may pass `executable=` explicitly. That opts out of the tested pairing; the
+caller owns compatibility and provenance for the override.
+
+This makes the supported SDK/runtime combination hermetic. SDK consumers can
+pin the Python package version in their own lockfile and choose when to adopt a
+new SDK-plus-syq pair. The SDK still versions changes to its Python API normally,
+but its supported subprocess behavior is never exposed to untested executable
+drift.
+
+The Python package implements this model. The JavaScript and Go preview
+packages must adopt it before their first registry releases.
 
 See [`RELEASING.md`](RELEASING.md) for the one-time registry setup and exact
 tag conventions.

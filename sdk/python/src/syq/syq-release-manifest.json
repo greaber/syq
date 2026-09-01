@@ -1,0 +1,69 @@
+{
+  "artifacts": {
+    "linux-aarch64": {
+      "archive": {
+        "name": "syq-linux-aarch64.gz",
+        "sha256": "949dc1d108ce9d659f9a35354e77afcc582170fc85d20fca20fd163c034e6c7e",
+        "size": 4232034
+      },
+      "binary": {
+        "name": "syq-linux-aarch64",
+        "sha256": "a8b6b0e7602d789668bdd433946144ffa67116f815ed1bf5bea8308f141d6b12",
+        "size": 8798640
+      }
+    },
+    "linux-x86_64": {
+      "archive": {
+        "name": "syq-linux-x86_64.gz",
+        "sha256": "a77c091e8a3d85f6c8d534f66e456ef2095efc7aba64acf1a8a747e3f7937e67",
+        "size": 4650527
+      },
+      "binary": {
+        "name": "syq-linux-x86_64",
+        "sha256": "eaf06c96e851ecd573313832607439a0c8033b6f5f6cca9c3c8b4b081556066d",
+        "size": 10683104
+      }
+    },
+    "macos-arm64": {
+      "archive": {
+        "name": "syq-macos-arm64.gz",
+        "sha256": "99379e50f8787391267b03cd84a0f30b541af8da7fc3bb3dd6b2585b877cd722",
+        "size": 3610717
+      },
+      "binary": {
+        "name": "syq-macos-arm64",
+        "sha256": "acd13c45729625d4ec994f4fbdf0c3b37d1e31ebca0d2e1639a9fa6f78b8aef7",
+        "size": 7858272
+      }
+    },
+    "macos-x86_64": {
+      "archive": {
+        "name": "syq-macos-x86_64.gz",
+        "sha256": "709d9fbb172dc01e4348da44e0af281fe7d03b2e7f2cf9c7fecb7bb95fcec3d4",
+        "size": 3951723
+      },
+      "binary": {
+        "name": "syq-macos-x86_64",
+        "sha256": "1b0c20ae5e213e726c13129c67a598393c2c63af7433b5fd44a2daae91401f2c",
+        "size": 8718620
+      }
+    }
+  },
+  "helper_id": "v0.1.5-p0",
+  "homebrew_formula": {
+    "name": "syq.rb",
+    "sha256": "13e3f5dc3640ada43f5d6c8d335b6ebfce4cedaea8a13e6dc77376b36f2f49a0",
+    "size": 1166
+  },
+  "installer": {
+    "name": "install.sh",
+    "sha256": "e5f083fe911d7b1c0fad1760f4bd0f0971796709e71bc45cce19b17debcf851f",
+    "size": 4931
+  },
+  "repository": "https://github.com/greaber/syq",
+  "schema": 1,
+  "signature": "rf6gNEhMqL93o7bUKQEBJ4U+YKhh19Opvy9yRLq75zJNqBfantuT0Web5WQK/ZLiMmCJUwTNj+O2Z+OEUMtqBA==",
+  "signature_scheme": "ed25519-jcs-v1",
+  "tag": "v0.1.5",
+  "version": "0.1.5"
+}

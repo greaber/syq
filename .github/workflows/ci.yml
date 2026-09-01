@@ -59,6 +59,7 @@ jobs:
         env:
           PYTHONPATH: sdk/python/src
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
+          XDG_CACHE_HOME: ${{ runner.temp }}/syq-sdk-cache
         run: |
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
           export SOURCE_DATE_EPOCH
@@ -73,6 +74,11 @@ jobs:
             name=${artifact##*/}
             cmp "$artifact" "target/sdk-python-dist-b/$name"
           done
+          set -- target/sdk-python-dist-a/syq-*-py3-none-any.whl
+          test "$#" -eq 1 && test -f "$1"
+          uv run --isolated --python 3.10 \
+            --with "$1" \
+            python -c 'import syq; assert syq.version() == syq.PINNED_SYQ_VERSION'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.x"

@@ -7,6 +7,8 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from .bootstrap import managed_executable
+
 
 @dataclass(frozen=True, slots=True)
 class Result:
@@ -40,7 +42,7 @@ def _text_arg(value: str | os.PathLike[str], *, label: str) -> str:
 def run(
     args: Sequence[str | os.PathLike[str]],
     *,
-    executable: str | os.PathLike[str] = "syq",
+    executable: str | os.PathLike[str] | None = None,
     check: bool = True,
     cwd: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
@@ -48,15 +50,20 @@ def run(
 ) -> Result:
     """Run syq without a shell and capture its complete byte output.
 
-    ``args`` contains only arguments after the executable name. A missing
-    executable, timeout, or other spawn failure is reported by ``subprocess``.
-    A completed nonzero process raises :class:`SyqProcessError` unless
-    ``check`` is false.
+    ``args`` contains only arguments after the executable name. By default the
+    SDK downloads and uses its pinned syq release. Passing ``executable`` opts
+    into an untested custom binary. A missing custom executable, timeout, or
+    other spawn failure is reported by ``subprocess``. A completed nonzero
+    process raises :class:`SyqProcessError` unless ``check`` is false.
     """
 
     if isinstance(args, (str, bytes, os.PathLike)):
         raise TypeError("args must be a sequence of individual arguments")
-    executable_text = _text_arg(executable, label="executable")
+    executable_text = (
+        os.fspath(managed_executable())
+        if executable is None
+        else _text_arg(executable, label="executable")
+    )
     argument_text = tuple(
         _text_arg(argument, label=f"args[{index}]")
         for index, argument in enumerate(args)
@@ -84,8 +91,8 @@ def run(
     return result
 
 
-def version(*, executable: str | os.PathLike[str] = "syq") -> str:
-    """Return the version reported by ``syq --version``."""
+def version(*, executable: str | os.PathLike[str] | None = None) -> str:
+    """Return the version of the pinned or explicitly overridden executable."""
 
     result = run(["--version"], executable=executable)
     try:

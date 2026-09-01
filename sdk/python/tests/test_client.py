@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import syq
 
@@ -39,7 +40,7 @@ class ClientTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def test_version(self) -> None:
+    def test_custom_executable_version_can_differ_from_package(self) -> None:
         self.assertRegex(syq.__version__, r"^\d+\.\d+\.\d+$")
         self.assertEqual(syq.version(executable=self.executable), "9.8.7")
 
@@ -49,6 +50,24 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(result.argv, (os.fspath(self.executable), "emit", argument))
         self.assertEqual(result.stdout, argument.encode())
         self.assertEqual(result.stderr, b"diagnostic")
+
+    def test_default_run_uses_the_managed_executable(self) -> None:
+        with mock.patch(
+            "syq.client.managed_executable", return_value=self.executable
+        ) as managed:
+            result = syq.run(["emit", "managed"])
+
+        managed.assert_called_once_with()
+        self.assertEqual(result.stdout, b"managed")
+
+    def test_explicit_executable_bypasses_the_managed_install(self) -> None:
+        with mock.patch(
+            "syq.client.managed_executable",
+            side_effect=AssertionError("managed install should not run"),
+        ):
+            result = syq.run(["emit", "custom"], executable=self.executable)
+
+        self.assertEqual(result.stdout, b"custom")
 
     def test_nonzero_result_is_retained(self) -> None:
         with self.assertRaises(syq.SyqProcessError) as caught:
