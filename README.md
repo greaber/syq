@@ -198,12 +198,12 @@ removed by another selector is successful. Symlinks encountered while walking
 inside a selected directory are removed as entries and are never followed.
 
 By default, native `rm` follows no symlinks while resolving `--cwd` or a
-selector, including the selector's final component. Encountering one aborts
-the entire command before mutation. `--follow` explicitly enables full
-resolution of those symlinks. The terminal non-symlink file or directory is
-then removed while the symlinks used to reach it remain in place, usually
-dangling. Native `rm` therefore has no direct-root-symlink deletion mode; use
-ordinary `rm` over SSH when the link itself is the intended object.
+selector. A symlink selected by name is removed as a symlink without touching
+its referent. A symlink in `--cwd`, or in a selector before the selected name,
+would have to be traversed; encountering one therefore aborts the entire
+command before mutation. `--follow` explicitly enables that traversal. The
+resolved non-symlink file or directory is then removed while the symlinks used
+to reach it remain in place, usually dangling.
 
 `--root DIR` is mutually exclusive with `--cwd`. The root path itself must
 contain no symlink, even with `--follow`. Selector resolution is confined to
@@ -219,6 +219,12 @@ directory and remove that object, recursively for a directory.
 resolved directory itself. All type checks and selector resolution finish
 before deletion begins. `-vv` prints the base identity, symlink hops, and final
 device/inode resolution used for the operation's audit trail.
+
+Remote native `rm` is attached to its control connection. While work remains,
+the endpoint sends a result or liveness frame at least once per second. A
+detected write failure cancels queued work and stops directory scans from
+scheduling more removals; operations already completed or inside a filesystem
+call are not rolled back. Native `rm` has no detached mode.
 
 The first native fidelity default is exactly `-rlt`: it recurses through
 directories, copies symlinks as symlinks, and retains mtimes. Owner, group,
@@ -294,10 +300,10 @@ explicitly say otherwise.
 | `--tcp-plain` | TCP data connections without encryption (trusted networks only) |
 | `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
 | `--tcp-congestion ALGO` | Linux: use `ALGO` on both ends of direct TCP data sockets; the host default is unchanged |
-| `-i PATTERN`, `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
-| `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `-i`) |
+| `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
+| `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `--ignore`) |
 | `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
-| `--delete-excluded` | With `--delete`, also remove destination paths the `-i` patterns exclude |
+| `--delete-excluded` | With `--delete`, also remove destination paths the `--ignore` patterns exclude |
 | `--max-delete N` | With `--delete`, delete nothing if more than N deletions are planned (exit 25) |
 | `-u`, `--update` | Skip files that are newer on the destination |
 | `--existing` | Only update files that already exist on the destination; create nothing |
@@ -889,7 +895,7 @@ strictly after the transfer (see below); hardlinks aren't implemented.
 `RSYNC-COMPAT.md` tracks rsync compatibility in full: what matches, what
 differs and why, what's missing, and the open issues. The short version:
 
-- rsync filter rules (`--exclude`/`--include`/`--filter`); use `-i` (gitignore
+- rsync filter rules (`--exclude`/`--include`/`--filter`); use `--ignore` (gitignore
   syntax) instead.
 - `--link-dest`, `--backup`.
 - `--delete-before`/`--delete-during` and `--force`. syq deletes only after
@@ -1080,20 +1086,20 @@ write still finishes with an atomic rename. When both ends are local, 32 workers
 are used. This costs one rename per file on NFS, but avoids exposing incomplete
 final-named files. `--inplace` is the explicit space/safety tradeoff.
 
-## Ignoring paths (`-i`, `--ignore-from`)
+## Ignoring paths (`--ignore`, `--ignore-from`)
 
 syq has one filter mechanism instead of rsync's include/exclude/filter rules:
-every `-i PATTERN` is a line of a virtual `.gitignore` anchored at each source
+every `--ignore PATTERN` is a line of a virtual `.gitignore` anchored at each source
 root, and `--ignore-from FILE` splices in the lines of a file. Patterns from
 both are applied in command-line order with gitignore semantics (last match
 wins, `!` re-includes), so anything you'd write in a `.gitignore` works here:
 
 ```sh
-syq rsync -a -i node_modules -i .git src/ host:dst/   # a name matches at any depth
-syq rsync -a -i '*.o' -i /build src/ host:dst/         # glob; leading / anchors to the root
-syq rsync -a -i 'logs/*' -i '!logs/keep/' src/ dst/    # everything in logs/ except keep/
-syq rsync -a --ignore-from .gitignore -i '!dist/' repo/ host:repo/
-syq rsync -a -i '*' -i '!*/' -i '!*.jpg' photos/ bak/  # copy only *.jpg
+syq rsync -a --ignore node_modules --ignore .git src/ host:dst/ # a name matches at any depth
+syq rsync -a --ignore '*.o' --ignore /build src/ host:dst/      # glob; leading / anchors to root
+syq rsync -a --ignore 'logs/*' --ignore '!logs/keep/' src/ dst/ # everything in logs/ except keep/
+syq rsync -a --ignore-from .gitignore --ignore '!dist/' repo/ host:repo/
+syq rsync -a --ignore '*' --ignore '!*/' --ignore '!*.jpg' photos/ bak/ # copy only *.jpg
 ```
 
 Rules of thumb (they're git's): `foo` matches a file or directory named `foo`
@@ -1104,7 +1110,7 @@ it is transferred or even scanned — which is why "only `*.jpg`" needs the
 (this is a filter on the walk, not git's notion of what's tracked). The source
 root itself is never ignored; with several sources each is filtered from its
 own root. `-n` previews the selected scope and intended changes. `--rm` does not
-take filters (it always removes the whole tree), so `-i` conflicts with it.
+take filters (it always removes the whole tree), so `--ignore` conflicts with it.
 
 As in git, a `!` rule cannot re-include something whose parent directory is
 ignored: `logs/**` prunes `logs/keep` itself, so `!logs/keep/**` after it has
@@ -1120,7 +1126,7 @@ have is removed. The rules are simpler than rsync's, deliberately:
 - **Scope.** Only inside directories the sources map onto: `syq rsync --delete a b
   dst/` cleans `dst/a` and `dst/b`, never `dst/c`. A single-file source deletes
   nothing.
-- **Ignored means out of scope, on both sides.** The `-i` patterns are applied
+- **Ignored means out of scope, on both sides.** The `--ignore` patterns are applied
   to the destination walk from the same roots, so an ignored entry is neither
   copied nor deleted, and a directory that holds one is kept (`not deleting
   keep/: it holds ignored paths`, on stderr, not an error). Patterns are
@@ -1212,7 +1218,7 @@ spell a literal comment-looking name as `./#name` or `./;name`. Leading `/` or
 the root itself are rejected. A listed path that doesn't exist is an error
 (exit 23) and the rest is still copied. The destination must be a directory (an
 existing file there is an error, never replaced). `--files-from` can't be
-combined with `-i`/`--ignore-from` or `--delete`; for a remote-to-remote copy
+combined with `--ignore`/`--ignore-from` or `--delete`; for a remote-to-remote copy
 it needs `--relay` (the list is read on this machine).
 
 ## Parallel removal (`--rm`)

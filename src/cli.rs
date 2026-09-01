@@ -276,13 +276,9 @@ pub struct Args {
     /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together
     /// with --ignore-from the patterns act like the lines of one .gitignore file, in
     /// command-line order, anchored at each source root. Skipping a directory skips its
-    /// whole subtree, so to copy only *.jpg use: -i '*' -i '!*/' -i '!*.jpg'
-    #[arg(
-        short = 'i',
-        long = "ignore",
-        value_name = "PATTERN",
-        allow_hyphen_values = true
-    )]
+    /// whole subtree, so to copy only *.jpg use: --ignore '*' --ignore '!*/'
+    /// --ignore '!*.jpg'
+    #[arg(long = "ignore", value_name = "PATTERN", allow_hyphen_values = true)]
     pub ignore: Vec<String>,
     /// Read ignore patterns from FILE (one per line, # comments); repeatable
     #[arg(long, value_name = "FILE")]
@@ -293,7 +289,7 @@ pub struct Args {
 
     /// Delete extraneous files from the destination directories (paths the source does not
     /// have). Deletion happens after the transfer and is skipped entirely if the source scan
-    /// reported any error. Ignored paths (-i) are protected on both sides. rsync's
+    /// reported any error. Ignored paths (--ignore) are protected on both sides. rsync's
     /// --delete-after and --delete-delay mean the same thing and are accepted. Cannot be combined
     /// with --verify-only or --files-from
     #[arg(
@@ -302,7 +298,7 @@ pub struct Args {
         conflicts_with_all = ["verify_only", "files_from"]
     )]
     pub delete: bool,
-    /// With --delete, also remove destination paths that the -i patterns exclude
+    /// With --delete, also remove destination paths that the --ignore patterns exclude
     #[arg(long, requires = "delete")]
     pub delete_excluded: bool,
     /// With --delete, refuse to delete anything if more than N deletions are planned (exit 25)
@@ -1124,7 +1120,7 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
             break; // end of options; the rest are paths
         }
         if value_long.contains(&tok.as_str())
-            || (!tok.starts_with("--") && matches!(tok.as_str(), "-e" | "-i" | "-j"))
+            || (!tok.starts_with("--") && matches!(tok.as_str(), "-e" | "-j"))
         {
             skip_next = true;
             continue;
@@ -1158,7 +1154,7 @@ fn unsupported_message(tok: &str) -> Option<String> {
         // Bundled short flags (e.g. `-auHz`): stop at the first value-taking
         // short, since everything after it is that option's value.
         for c in cluster.chars() {
-            if matches!(c, 'e' | 'i' | 'j') {
+            if matches!(c, 'e' | 'j') {
                 break;
             }
             if let Some(m) = message_for_short(c) {
@@ -1169,12 +1165,14 @@ fn unsupported_message(tok: &str) -> Option<String> {
     None
 }
 
-const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. Use -i/--ignore (or --ignore-from), which takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `-i node_modules`. See the README's \"Ignoring paths\" section.";
+const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. Use --ignore (or --ignore-from), which takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--ignore node_modules`. See the README's \"Ignoring paths\" section.";
+const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. Filtering uses the long-only --ignore option.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 
 fn message_for_long(base: &str) -> Option<&'static str> {
     Some(match base {
         "exclude" | "exclude-from" | "include" | "include-from" | "filter" => FILTER_MSG,
+        "itemize-changes" => ITEMIZE_MSG,
         "force" => DELETE_MSG,
         _ if base.starts_with("delete-")
             && !matches!(base, "delete-after" | "delete-delay" | "delete-excluded") =>
@@ -1204,6 +1202,7 @@ fn message_for_short(c: char) -> Option<&'static str> {
         'S' => "sparse",
         'x' => "one-file-system",
         'L' => "copy-links",
+        'i' => "itemize-changes",
         _ => return None,
     })
 }

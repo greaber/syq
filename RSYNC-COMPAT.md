@@ -158,8 +158,9 @@ item.
    re-includes, while rsync applies the first matching include/exclude/filter
    rule and has sender/receiver-side modifiers, `protect`/`risk` rules, and
    per-directory merge files. gitignore is what most users already know; the
-   trade is that rsync filter files can't be reused. (The short `-i` alias is a
-   separate CLI problem — open issue 1.)
+   trade is that rsync filter files can't be reused. Filtering uses the
+   long-only `--ignore`; rsync's `-i` remains `--itemize-changes` and is
+   rejected with a specific explanation because itemized output is absent.
 2. **Any error while listing the source disables deletion** — the same idea
    as rsync's file-list I/O check. A directory we couldn't read would
    otherwise look like one whose contents vanished. A read failure *during
@@ -205,8 +206,8 @@ command says what to change.
 - `--link-dest`/`--compare-dest`/`--copy-dest`.
 - `--relative` (`-R`), `--partial-dir`.
 - `-A`/`--acls`, `-X`/`--xattrs`, `-S`/`--sparse`, `-x`/`--one-file-system`.
-- `-i`/`--itemize-changes` — and the short flag is currently taken, open
-  issue 1.
+- `-i`/`--itemize-changes` — rejected with a specific explanation; use the
+  long-only `--ignore` for syq's gitignore-style filtering.
 - `--size-only`, `--ignore-times`/`-I`, `--modify-window`, `--chmod`,
   `--log-file`.
 - rsync filter rules (`--exclude`/`--include`/`--filter`); use `--ignore`.
@@ -215,21 +216,15 @@ command says what to change.
 
 ## Open issues
 
-1. **`-i` means `--ignore` in syq and `--itemize-changes` in rsync.** Worse
-   than cosmetic: rsync's `-i` takes no value, so a pasted multi-source
-   command can consume a source argument as an ignore pattern. Plan: make
-   `--ignore`/`--ignore-from` long-only; reject a bare `-i` with a specific
-   explanation until itemized output exists. Don't pick another rsync short
-   letter for ignore (`-I` is `--ignore-times`).
-2. **The remaining `--files-from` entry parsing doesn't match rsync's**
+1. **The remaining `--files-from` entry parsing doesn't match rsync's**
    (measured on 3.2.7 and 3.5.0). Finish the related path rules as one change:
    normalize `..` and clamp it at the source root instead of rejecting;
    preserve a trailing slash (`dir/` selects the directory's immediate
    children without `-r`, `dir` only the directory); accept `.`/`/` as the root
    entry (children without `-r`); add `-0` as an alias of `--from0`.
-3. **`-h` alone should print help**, as rsync does, while staying
+2. **`-h` alone should print help**, as rsync does, while staying
    `--human-readable` inside a cluster (`-avh`). Essentially free.
-4. **`-u` for symlinks/devices** — measure rsync, then align or record.
+3. **`-u` for symlinks/devices** — measure rsync, then align or record.
 
 ## Resolved
 
