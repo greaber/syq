@@ -88,6 +88,13 @@ Those tags run `.github/workflows/publish-sdks.yml`, which verifies the tag,
 version, tests, and package contents before entering the protected publishing
 environment.
 
+Python distributions use a pinned interpreter and the tagged commit timestamp
+as `SOURCE_DATE_EPOCH`, and the source archive is repacked with normalized
+metadata. CI compares two separate builds byte for byte. This makes a full
+workflow rerun safe even when the first run partly reached PyPI and its
+short-lived GitHub artifact has expired: rebuilding the same tag produces the
+same immutable files.
+
 Because the Go module lives below the repository root, its tag must include
 the module directory:
 

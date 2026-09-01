@@ -23,6 +23,12 @@ case "$1" in
     printf 'failed' >&2
     exit 23
     ;;
+  term)
+    kill -TERM "$$"
+    ;;
+  wait)
+    exec sleep 30
+    ;;
   *)
     exit 2
     ;;

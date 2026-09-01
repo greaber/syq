@@ -55,13 +55,24 @@ jobs:
           python-version: "3.10"
       - name: Install pinned Python tooling
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
-      - name: Test and package Python SDK
+      - name: Test and reproducibly package Python SDK
         env:
           PYTHONPATH: sdk/python/src
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
         run: |
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
-          uv run --project sdk/python --frozen python -m build sdk/python --outdir target/sdk-python-dist
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
+            uv run --project sdk/python --frozen python -m build sdk/python --outdir "$output"
+            python scripts/normalize-python-sdist.py \
+              --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
+            sleep 2
+          done
+          for artifact in target/sdk-python-dist-a/*; do
+            name=${artifact##*/}
+            cmp "$artifact" "target/sdk-python-dist-b/$name"
+          done
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.x"

@@ -35,6 +35,9 @@ func main() {
 `Run` returns a `*ProcessError` for a nonzero process status. The error retains
 the complete result, including stdout and stderr as byte slices. A caller that
 needs the status can use `errors.As` and inspect `ProcessError.Result`.
+Signal termination is represented by an exit code of `-1` and a non-nil
+`Signal`. If cancellation or a deadline terminated the process, `ContextError`
+is also set and `errors.Is` matches it through `ProcessError`.
 
 The `syq` executable must already be on `PATH`. Use `Client{Executable:
 "/path/to/syq"}` to select an explicit binary.

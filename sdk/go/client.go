@@ -4,7 +4,9 @@ package syq
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"unicode/utf8"
@@ -18,10 +20,17 @@ type Client struct {
 
 // Result is the complete result of one syq process.
 type Result struct {
-	Argv     []string
+	Argv []string
+	// ExitCode is -1 when the process was terminated by a signal instead of
+	// exiting normally. In that case, Signal identifies the signal when the
+	// platform exposes it.
 	ExitCode int
-	Stdout   []byte
-	Stderr   []byte
+	Signal   os.Signal
+	// ContextError records context cancellation or expiry when it terminated
+	// the process. It is nil for process failures unrelated to the context.
+	ContextError error
+	Stdout       []byte
+	Stderr       []byte
 }
 
 // ProcessError reports a syq process that completed unsuccessfully.
@@ -31,12 +40,31 @@ type ProcessError struct {
 }
 
 func (e *ProcessError) Error() string {
+	if e.Result.Signal != nil {
+		if e.Result.ContextError != nil {
+			return fmt.Sprintf(
+				"syq process received signal %v (%v)",
+				e.Result.Signal,
+				e.Result.ContextError,
+			)
+		}
+		return fmt.Sprintf("syq process received signal %v", e.Result.Signal)
+	}
+	if e.Result.ExitCode < 0 {
+		return "syq terminated without an exit status"
+	}
 	return fmt.Sprintf("syq exited with status %d", e.Result.ExitCode)
 }
 
 // Unwrap exposes the error returned by os/exec.
 func (e *ProcessError) Unwrap() error {
 	return e.Err
+}
+
+// Is lets callers match a context cancellation or deadline while Unwrap still
+// exposes the underlying os/exec error.
+func (e *ProcessError) Is(target error) bool {
+	return errors.Is(e.Result.ContextError, target)
 }
 
 // Run invokes syq from PATH without a shell and captures its complete output.
@@ -69,6 +97,10 @@ func (c Client) Run(ctx context.Context, args ...string) (Result, error) {
 	}
 	if command.ProcessState != nil {
 		result.ExitCode = command.ProcessState.ExitCode()
+		result.Signal = terminationSignal(command.ProcessState)
+		if result.Signal != nil {
+			result.ContextError = ctx.Err()
+		}
 	}
 	if err == nil {
 		return result, nil
