@@ -154,6 +154,7 @@ case "$1:$2" in
   api:*/git/ref/tags/*) printf '%s\n' "$SYQ_TEST_REF_JSON" ;;
   api:*/git/tags/*) printf '%s\n' "$SYQ_TEST_TAG_JSON" ;;
   api:*/compare/*) printf '%s\n' "$SYQ_TEST_COMPARE_JSON" ;;
+  api:*/check-runs*) printf '%s\n' "$SYQ_TEST_CHECKS_JSON" ;;
   release:download)
     shift 2
     destination=
@@ -177,30 +178,58 @@ tag_json=$(jq -cn --arg commit "$commit" '
    verification:{verified:true,reason:"valid"}}')
 compare_json=$(jq -cn --arg commit "$commit" \
   '{base_commit:{sha:$commit},merge_base_commit:{sha:$commit}}')
+checks_json=$(jq -cn '{check_runs:[
+  {name:"rust",status:"completed",conclusion:"success"},
+  {name:"macos",status:"completed",conclusion:"success"},
+  {name:"verify signed release tag",status:"in_progress",conclusion:null}]}')
 SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
-  SYQ_TEST_COMPARE_JSON="$compare_json" PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master >/dev/null
+  SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$checks_json" \
+  PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos >/dev/null
 
 lightweight=$(jq -cn --arg sha "$commit" '{object:{type:"commit",sha:$sha}}')
 expect_failure 'is lightweight' env \
   SYQ_TEST_REF_JSON="$lightweight" SYQ_TEST_TAG_JSON="$tag_json" PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
 unsigned=$(jq -cn --arg commit "$commit" '
   {tag:"v0.1.0",object:{type:"commit",sha:$commit},
    verification:{verified:false,reason:"unsigned"}}')
 expect_failure 'reason: unsigned' env \
   SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$unsigned" PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
 expect_failure 'not workflow commit' env \
   SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 \
-  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa master
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa master rust,macos
 unmerged_compare=$(jq -cn --arg commit "$commit" \
   '{base_commit:{sha:$commit},merge_base_commit:{sha:("b"*40)}}')
 expect_failure 'not reachable from protected branch master' env \
   SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
   SYQ_TEST_COMPARE_JSON="$unmerged_compare" PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
+# A red, pending, or absent required check on the tagged commit blocks the
+# release even when the tag itself is valid and merged.
+failed_checks=$(jq -cn '{check_runs:[
+  {name:"rust",status:"completed",conclusion:"failure"},
+  {name:"macos",status:"completed",conclusion:"success"}]}')
+expect_failure 'required check rust is failure' env \
+  SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
+  SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$failed_checks" \
+  PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
+pending_checks=$(jq -cn '{check_runs:[
+  {name:"rust",status:"in_progress",conclusion:null},
+  {name:"macos",status:"completed",conclusion:"success"}]}')
+expect_failure 'required check rust is pending' env \
+  SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
+  SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$pending_checks" \
+  PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
+expect_failure 'required check linux-arm64 is missing' env \
+  SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
+  SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$checks_json" \
+  PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos,linux-arm64
 
 # Published-release reruns compare content, not just asset names.
 local_assets="$work/local-assets"

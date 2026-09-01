@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # Require a GitHub-verified annotated tag that directly names the commit being
-# built by this release workflow and is reachable from the protected branch.
+# built by this release workflow, is reachable from the protected branch, and
+# has every named CI check concluded successfully. Pull requests are checked
+# against their own head, not against the branch they land on, so a merge can
+# leave the branch red; the tagged commit's own check runs are what prove it.
 set -euo pipefail
 
-if [ "$#" -ne 4 ]; then
-  echo "usage: $0 OWNER/REPOSITORY TAG EXPECTED_COMMIT PROTECTED_BRANCH" >&2
+if [ "$#" -ne 5 ]; then
+  echo "usage: $0 OWNER/REPOSITORY TAG EXPECTED_COMMIT PROTECTED_BRANCH REQUIRED_CHECKS" >&2
+  echo "REQUIRED_CHECKS is a comma-separated list of check run names" >&2
   exit 2
 fi
 repository=$1
 tag=$2
 expected_commit=$3
 protected_branch=$4
+required_checks=$5
 case "$repository" in
   */*) ;;
   *) echo "invalid GitHub repository: $repository" >&2; exit 2 ;;
@@ -23,6 +28,9 @@ case "$expected_commit" in
 esac
 case "$protected_branch" in
   ''|*[!A-Za-z0-9._/-]*) echo "unsafe protected branch: $protected_branch" >&2; exit 2 ;;
+esac
+case "$required_checks" in
+  ''|*[!A-Za-z0-9._,-]*) echo "unsafe required check list: $required_checks" >&2; exit 2 ;;
 esac
 command -v gh >/dev/null || { echo 'tag verification needs gh' >&2; exit 1; }
 command -v jq >/dev/null || { echo 'tag verification needs jq' >&2; exit 1; }
@@ -66,4 +74,16 @@ if [ "$base_commit" != "$target_commit" ] || [ "$merge_base" != "$target_commit"
   exit 1
 fi
 
-echo "verified signed annotated tag $tag at $target_commit on $protected_branch"
+check_runs=$(gh api "repos/$repository/commits/$target_commit/check-runs?filter=latest&per_page=100")
+IFS=, read -ra check_names <<<"$required_checks"
+for check_name in "${check_names[@]}"; do
+  conclusion=$(jq -r --arg name "$check_name" '
+    [.check_runs[] | select(.name == $name)] | if length == 0 then "missing"
+    elif length > 1 then "ambiguous" else .[0].conclusion // "pending" end' <<<"$check_runs")
+  test "$conclusion" = success || {
+    echo "required check $check_name is $conclusion on release commit $target_commit" >&2
+    exit 1
+  }
+done
+
+echo "verified signed annotated tag $tag at $target_commit on $protected_branch with checks $required_checks"
