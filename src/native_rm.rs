@@ -1037,6 +1037,9 @@ fn read_directory(directory: &File) -> Result<Vec<Vec<u8>>> {
         }
     }
     let stream = DirectoryStream(stream);
+    // dup() shares the directory offset with the pinned descriptor, so a retry
+    // must rewind before enumerating the directory again.
+    unsafe { libc::rewinddir(stream.0) };
     let mut names = Vec::new();
     loop {
         set_errno(0);
@@ -1138,6 +1141,26 @@ mod tests {
             assert!(validate_selector(path).is_err());
         }
         assert!(validate_selector(b"a//b/").is_ok());
+    }
+
+    #[test]
+    fn retry_scan_rewinds_directory_stream() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("one"), b"1").unwrap();
+        fs::write(temp.path().join("two"), b"2").unwrap();
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(temp.path())
+            .unwrap();
+
+        let mut first = read_directory(&directory).unwrap();
+        let mut second = read_directory(&directory).unwrap();
+        first.sort();
+        second.sort();
+
+        assert_eq!(first, vec![b"one".to_vec(), b"two".to_vec()]);
+        assert_eq!(second, first);
     }
 
     #[test]
