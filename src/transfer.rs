@@ -5,7 +5,8 @@ use crate::cli::{
     parse_rsh, parse_size, Args, Existence, Interface, Location, Placement, SourceSelection,
 };
 use crate::conn::{
-    ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, TcpCandidate, TcpPairStats,
+    ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
+    TcpPairStats,
 };
 use crate::fsops::{is_partial_name, join};
 use crate::progress::{commas, human, Progress, WorkerStatus};
@@ -26,17 +27,23 @@ pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 const FAST_BATCH_FILES: usize = 128;
 // Larger batches trade filesystem overlap for fewer request/ack turns. On the
 // measured 262 ms path, 4,096 one-byte files at eight workers improved from a
-// 9.68 s to an 8.72 s median at 512; keep the change confined to high RTT TCP.
+// 9.68 s to an 8.72 s median at 512. Direct TCP exposes its RTT; remote SSH
+// does not, but needs the same amortization and remains bounded by bytes below.
 const HIGH_RTT_FAST_BATCH_FILES: usize = 512;
 const HIGH_RTT_US: u64 = 100_000;
 const FAST_BATCH_BYTES: u64 = 16 << 20;
 const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 
-fn fast_batch_file_limit(src_rtt_us: Option<u64>, dst_rtt_us: Option<u64>) -> usize {
-    if src_rtt_us
-        .into_iter()
-        .chain(dst_rtt_us)
-        .any(|rtt| rtt >= HIGH_RTT_US)
+fn fast_batch_file_limit(
+    src_rtt_us: Option<u64>,
+    dst_rtt_us: Option<u64>,
+    remote_ssh_data: bool,
+) -> usize {
+    if remote_ssh_data
+        || src_rtt_us
+            .into_iter()
+            .chain(dst_rtt_us)
+            .any(|rtt| rtt >= HIGH_RTT_US)
     {
         HIGH_RTT_FAST_BATCH_FILES
     } else {
@@ -86,21 +93,31 @@ pub struct Opts {
 pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     Ok(match &loc.host {
         None => Endpoint::Local,
-        Some(h) => Endpoint::Remote(RemoteSpec {
-            local_process: false,
-            user: loc.user.clone(),
-            host: h.clone(),
-            rsh: parse_rsh(&args.rsh)?,
-            syq_path: args.syq_path.clone(),
-            auto_helper: args.restricted_grant.is_none()
-                && args.syq_path.is_none()
-                && !args.no_bootstrap,
-            restricted_grant: args.restricted_grant.clone(),
-            helper_install: Default::default(),
-            quiet: args.quiet,
-            tcp: Default::default(),
-            diagnostics: Default::default(),
-        }),
+        Some(h) => {
+            let rsh = parse_rsh(&args.rsh)?;
+            let ssh_multiplexer = args
+                .rsh
+                .is_none()
+                .then(SshMultiplexer::new)
+                .transpose()?
+                .map(Arc::new);
+            Endpoint::Remote(RemoteSpec {
+                local_process: false,
+                user: loc.user.clone(),
+                host: h.clone(),
+                rsh,
+                syq_path: args.syq_path.clone(),
+                auto_helper: args.restricted_grant.is_none()
+                    && args.syq_path.is_none()
+                    && !args.no_bootstrap,
+                restricted_grant: args.restricted_grant.clone(),
+                helper_install: Default::default(),
+                ssh_multiplexer,
+                quiet: args.quiet,
+                tcp: Default::default(),
+                diagnostics: Default::default(),
+            })
+        }
     })
 }
 
@@ -1003,8 +1020,12 @@ pub fn run(args: Args) -> Result<i32> {
                         }
                     }
                     gate.mark_ready(id);
+                    let remote_ssh_data = [&src_ep, &dst_ep]
+                        .into_iter()
+                        .filter_map(real_remote_spec)
+                        .any(|spec| spec.data_transport() == DataTransport::Ssh);
                     let fast_batch_files =
-                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us());
+                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us(), remote_ssh_data);
                     let mut worker = Worker {
                         id,
                         src,
@@ -1640,6 +1661,24 @@ pub fn run(args: Args) -> Result<i32> {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
             } else {
+                let multiplex_small_files = !opts.verify_only
+                    && !opts.inplace
+                    && bwlimit.is_none()
+                    && sched
+                        .jobs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|job| job.entry.size <= opts.block && job.dst_entry.is_none());
+                if multiplex_small_files {
+                    for spec in [&src_ep, &dst_ep]
+                        .into_iter()
+                        .filter_map(real_remote_spec)
+                        .filter(|spec| spec.data_transport() == DataTransport::Ssh)
+                    {
+                        spec.set_ssh_multiplexing(true);
+                    }
+                }
                 spawn_workers(args.connections);
             }
         }
@@ -5851,15 +5890,22 @@ mod tests {
     }
 
     #[test]
-    fn fast_batch_ceiling_only_grows_on_high_rtt_tcp() {
-        assert_eq!(fast_batch_file_limit(None, None), FAST_BATCH_FILES);
-        assert_eq!(fast_batch_file_limit(Some(99_999), None), FAST_BATCH_FILES);
+    fn fast_batch_ceiling_grows_on_high_rtt_tcp_or_remote_ssh() {
+        assert_eq!(fast_batch_file_limit(None, None, false), FAST_BATCH_FILES);
         assert_eq!(
-            fast_batch_file_limit(None, Some(HIGH_RTT_US)),
+            fast_batch_file_limit(Some(99_999), None, false),
+            FAST_BATCH_FILES
+        );
+        assert_eq!(
+            fast_batch_file_limit(None, Some(HIGH_RTT_US), false),
             HIGH_RTT_FAST_BATCH_FILES
         );
         assert_eq!(
-            fast_batch_file_limit(Some(262_000), Some(1_000)),
+            fast_batch_file_limit(Some(262_000), Some(1_000), false),
+            HIGH_RTT_FAST_BATCH_FILES
+        );
+        assert_eq!(
+            fast_batch_file_limit(None, None, true),
             HIGH_RTT_FAST_BATCH_FILES
         );
     }

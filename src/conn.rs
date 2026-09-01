@@ -11,7 +11,9 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub trait Conn: Send {
     fn send(&mut self, req: Request) -> Result<()>;
@@ -705,6 +707,43 @@ pub enum DataTransport {
     PlaintextTcp,
 }
 
+#[derive(Debug)]
+pub(crate) struct SshMultiplexer {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    reuse_for_workers: AtomicBool,
+}
+
+impl SshMultiplexer {
+    pub(crate) fn new() -> Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("syq-ssh-")
+            .tempdir()
+            .context("create private SSH control directory")?;
+        let path = directory.path().join("socket");
+        Ok(Self {
+            _directory: directory,
+            path,
+            reuse_for_workers: AtomicBool::new(false),
+        })
+    }
+
+    fn set_reuse_for_workers(&self, reuse: bool) {
+        self.reuse_for_workers.store(reuse, Ordering::Relaxed);
+    }
+
+    fn reuse_for_workers(&self) -> bool {
+        self.reuse_for_workers.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SshConnection {
+    Independent,
+    Control,
+    Worker,
+}
+
 #[derive(Clone, Debug)]
 pub struct RemoteSpec {
     /// Run the receiver helper as a local child. This gives local copies the
@@ -723,6 +762,10 @@ pub struct RemoteSpec {
     pub restricted_grant: Option<String>,
     /// Serializes a first-use install across control and worker clones.
     pub helper_install: std::sync::Arc<std::sync::Mutex<bool>>,
+    /// A private OpenSSH control socket. The control session is always capable
+    /// of multiplexing, but workers use it only after the completed plan shows
+    /// that every payload is a fresh small file.
+    pub(crate) ssh_multiplexer: Option<std::sync::Arc<SshMultiplexer>>,
     /// `-q`: suppress the "falling back to ssh" notice.
     pub quiet: bool,
     /// Shared across clones so workers see the TCP setup done on the control connection.
@@ -742,6 +785,7 @@ impl RemoteSpec {
             auto_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
+            ssh_multiplexer: None,
             quiet,
             tcp: Default::default(),
             diagnostics: Default::default(),
@@ -770,6 +814,12 @@ impl RemoteSpec {
         }
     }
 
+    pub fn set_ssh_multiplexing(&self, reuse: bool) {
+        if let Some(multiplexer) = &self.ssh_multiplexer {
+            multiplexer.set_reuse_for_workers(reuse);
+        }
+    }
+
     pub fn remote_shell_name(&self) -> String {
         std::path::Path::new(&self.rsh[0])
             .file_name()
@@ -784,22 +834,44 @@ impl RemoteSpec {
         }
     }
 
-    fn ssh_command(&self) -> Command {
+    fn ssh_command(&self, connection: SshConnection) -> Command {
         let mut cmd = Command::new(&self.rsh[0]);
         cmd.args(&self.rsh[1..]);
         if self.rsh[0].ends_with("ssh") {
-            // Data connections must not share one TCP stream / cipher process,
-            // and AES-GCM is much faster than OpenSSH's default chacha20 on
-            // CPUs with AES-NI. The list still includes the defaults so
-            // negotiation never fails.
-            cmd.args([
-                "-o",
-                "ControlMaster=no",
-                "-o",
-                "ControlPath=none",
-                "-o",
-                CIPHERS,
-            ]);
+            let multiplex = match (connection, &self.ssh_multiplexer) {
+                (SshConnection::Control, Some(multiplexer)) => Some((multiplexer, true)),
+                (SshConnection::Worker, Some(multiplexer)) if multiplexer.reuse_for_workers() => {
+                    Some((multiplexer, false))
+                }
+                _ => None,
+            };
+            if let Some((multiplexer, master)) = multiplex {
+                if master {
+                    // A failed control command can leave its socket briefly
+                    // behind while OpenSSH exits. This path is private to this
+                    // transfer, so clearing that stale inode before a retry is
+                    // safe and prevents the next master from refusing it.
+                    let _ = std::fs::remove_file(&multiplexer.path);
+                }
+                cmd.arg("-o")
+                    .arg(format!(
+                        "ControlMaster={}",
+                        if master { "yes" } else { "no" }
+                    ))
+                    .arg("-o")
+                    .arg(format!("ControlPath={}", multiplexer.path.display()))
+                    .arg("-o")
+                    .arg("ControlPersist=no");
+            } else {
+                // Large-file data connections need independent TCP streams and
+                // cipher processes. Custom remote-shell commands also keep
+                // their existing policy.
+                cmd.args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+            }
+            // AES-GCM is much faster than OpenSSH's default chacha20 on CPUs
+            // with AES-NI. The list still includes the defaults so negotiation
+            // never fails.
+            cmd.args(["-o", CIPHERS]);
             if let Some(u) = &self.user {
                 cmd.args(["-l", u]);
             }
@@ -859,7 +931,7 @@ impl RemoteSpec {
         let mut last = None;
         for attempt in 0..6 {
             let _slot = limited.then(connect_slot);
-            match self.connect_once(compress) {
+            match self.connect_once(compress, limited) {
                 Ok(c) => return Ok(c),
                 // Don't retry what won't change: a missing binary (127) or a
                 // build identity mismatch.
@@ -903,7 +975,7 @@ impl RemoteSpec {
         Err(last.unwrap())
     }
 
-    fn connect_once(&self, compress: bool) -> Result<RemoteConn> {
+    fn connect_once(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = &self.restricted_grant {
             server_args.push(format!("--restricted-grant={grant}"));
@@ -913,7 +985,11 @@ impl RemoteSpec {
             command.args(&server_args);
             command
         } else {
-            let mut command = self.ssh_command();
+            let mut command = self.ssh_command(if limited {
+                SshConnection::Worker
+            } else {
+                SshConnection::Control
+            });
             let remote_command = if self.restricted_grant.is_some() {
                 // This text is inspected by the forced receiver through
                 // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
@@ -1366,7 +1442,7 @@ impl RemoteSpec {
     }
 
     fn remote_bootstrap(&self) -> Result<RemoteBootstrap> {
-        let mut cmd = self.ssh_command();
+        let mut cmd = self.ssh_command(SshConnection::Independent);
         cmd.arg(remote_helper::probe_command())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1455,7 +1531,7 @@ impl RemoteSpec {
 
     fn try_direct_helper(&self, target: Target) -> Result<DirectHelper> {
         let script = remote_helper::download_script(target);
-        let mut cmd = self.ssh_command();
+        let mut cmd = self.ssh_command(SshConnection::Independent);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1577,7 +1653,7 @@ impl RemoteSpec {
 
     fn upload_helper(&self, target: Target, binary: &[u8]) -> Result<()> {
         let script = remote_helper::upload_script(target);
-        let mut cmd = self.ssh_command();
+        let mut cmd = self.ssh_command(SshConnection::Independent);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1900,6 +1976,7 @@ mod tests {
             auto_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
+            ssh_multiplexer: None,
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
@@ -2098,11 +2175,12 @@ mod tests {
             auto_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
+            ssh_multiplexer: None,
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
         };
-        let command = spec.ssh_command();
+        let command = spec.ssh_command(SshConnection::Independent);
         assert!(!command
             .get_args()
             .any(|arg| arg.to_string_lossy().starts_with("StrictHostKeyChecking=")));
@@ -2114,8 +2192,52 @@ mod tests {
             "StrictHostKeyChecking=yes".to_string(),
         ];
         assert!(configured
-            .ssh_command()
+            .ssh_command(SshConnection::Independent)
             .get_args()
             .any(|arg| arg == OsStr::new("StrictHostKeyChecking=yes")));
+    }
+
+    #[test]
+    fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
+        let multiplexer = std::sync::Arc::new(SshMultiplexer::new().unwrap());
+        let control_path = format!("ControlPath={}", multiplexer.path.display());
+        let spec = RemoteSpec {
+            local_process: false,
+            user: None,
+            host: "example".into(),
+            rsh: vec!["ssh".into()],
+            syq_path: None,
+            auto_helper: false,
+            restricted_grant: None,
+            helper_install: Default::default(),
+            ssh_multiplexer: Some(multiplexer),
+            quiet: false,
+            tcp: Default::default(),
+            diagnostics: Default::default(),
+        };
+        let args = |connection| {
+            spec.ssh_command(connection)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let control = args(SshConnection::Control);
+        assert!(control.iter().any(|arg| arg == "ControlMaster=yes"));
+        assert!(control.iter().any(|arg| arg == &control_path));
+        assert!(control.iter().any(|arg| arg == "ControlPersist=no"));
+
+        let worker = args(SshConnection::Worker);
+        assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
+        assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
+
+        spec.set_ssh_multiplexing(true);
+        let worker = args(SshConnection::Worker);
+        assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
+        assert!(worker.iter().any(|arg| arg == &control_path));
+        assert!(!worker.iter().any(|arg| arg == "ControlPath=none"));
+
+        let independent = args(SshConnection::Independent);
+        assert!(independent.iter().any(|arg| arg == "ControlPath=none"));
     }
 }

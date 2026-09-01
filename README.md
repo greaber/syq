@@ -718,14 +718,17 @@ source's mode with `-p`.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.
-Workers connect while the source is scanned but begin file data only after
-the mapped payload/sidecar namespace preflight completes.
+Workers connect after the mapped payload/sidecar namespace preflight completes.
 The data connections — by default separate TCP sockets carrying AES-256-GCM
-records (under `--no-tcp`, separate `ssh` processes instead), each its own flow
-and cipher — carry only "read range" / "write range" requests. Files go
-onto a largest-first queue; when a worker runs dry it steals the back half of
-the remaining range of whichever file has the most left, so the tail of a
-transfer stays parallel without pre-deciding chunk counts.
+records — carry only "read range" / "write range" requests. When data uses SSH
+(through `--no-tcp` or TCP fallback), a transfer consisting entirely of fresh
+small files opens worker sessions over the already-authenticated OpenSSH control
+connection; larger or mixed workloads retain separate `ssh` processes, TCP
+flows, and cipher processes. A custom `-e` command keeps its own SSH
+multiplexing policy. Files go onto a largest-first queue; when a worker runs dry
+it steals the back half of the remaining range of whichever file has the most
+left, so the tail of a transfer stays parallel without pre-deciding chunk
+counts.
 
 On the receiving side a file that needs content changes is written beside its
 destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
@@ -1013,6 +1016,12 @@ connections (where each stream is capped by OpenSSH's 2 MB window) it
 reaches line rate (~110 MB/s, where a fixed `-j 8` managed 44) about 30 s
 after the connections are up.
 
+On the same kind of long path (262 ms), a fresh 2,000-file / 8 MiB tree over
+`--no-tcp` took 11.29 s in two verified runs after fresh-small-file workers
+began reusing the authenticated control connection, versus 16.85 s with eight
+independently authenticated worker connections. Larger and mixed workloads
+still use independent SSH connections so they retain multi-flow throughput.
+
 `-j N` fixes the count and disables tuning. Use it when you know better (a
 spinning disk that must not be read in parallel: `-j 1`), or to be polite on
 a shared link.
@@ -1294,8 +1303,10 @@ fix for that.
   server sheds one — sshd's `MaxStartups` (default 10) randomly rejects
   sessions beyond 10 being set up at once — syq halves that number for the
   rest of the run and retries. Raising `MaxStartups` can reduce setup time for
-  ssh data connections, but increases the resources available to
-  unauthenticated clients; see [Server performance tuning](SERVER-TUNING.md).
+  independent ssh data connections; fresh-small-file workers using default ssh
+  reuse the authenticated control connection instead. A higher limit increases
+  the resources available to unauthenticated clients; see
+  [Server performance tuning](SERVER-TUNING.md).
   Auto-tuning starts at 16 for TCP data, or 8 for ssh data, and only opens more
   once they have been shown to pay.
 - Preferred direct remote→remote uses one enrollment-key authentication for the
