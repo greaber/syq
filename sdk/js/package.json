@@ -1,0 +1,41 @@
+{
+  "name": "@syq/sdk",
+  "version": "0.0.1",
+  "description": "JavaScript and TypeScript subprocess adapter for the syq parallel file copier",
+  "type": "module",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/greaber/syq",
+    "directory": "sdk/js"
+  },
+  "homepage": "https://github.com/greaber/syq/tree/master/sdk/js",
+  "bugs": "https://github.com/greaber/syq/issues",
+  "keywords": [
+    "copy",
+    "file-transfer",
+    "rsync",
+    "ssh"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "npm@11.13.0"
+}

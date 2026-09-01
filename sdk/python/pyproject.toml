@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "syq"
+version = "0.0.1"
+description = "Python subprocess adapter for the syq parallel file copier"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Grant Reaber" },
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Filesystems",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Homepage = "https://github.com/greaber/syq"
+Repository = "https://github.com/greaber/syq"
+Issues = "https://github.com/greaber/syq/issues"
+
+[dependency-groups]
+dev = [
+    "build==1.3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+syq = ["py.typed"]
+
+[tool.uv]
+required-version = "==0.11.6"
