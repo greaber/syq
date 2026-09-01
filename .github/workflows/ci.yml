@@ -38,10 +38,11 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets
+      - run: scripts/test-cargo-package.sh
       - run: scripts/test-installer.sh
       - run: scripts/test-release-tools.sh
       - run: scripts/test-secret-tools.sh
-      - run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-assets.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-homebrew-formula.sh scripts/test-secret-tools.sh
+      - run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-homebrew-formula.sh scripts/test-secret-tools.sh
 
   # The release workflow builds on this runner; libc field types differ from
   # x86-64 (st_nlink is u32 here), so check it before a tag can fail.

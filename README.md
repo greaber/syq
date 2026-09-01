@@ -44,18 +44,25 @@ Homebrew is also supported through the project-owned tap:
 brew install greaber/tap/syq
 ```
 
-Or build from source with the pinned Rust toolchain:
+Rust users can instead compile and install the published source package:
+
+```sh
+cargo install --locked syq
+```
+
+Or build a checkout with the pinned Rust toolchain:
 
 ```sh
 cargo build --release          # binary at target/release/syq
 cargo install --locked --path . # or: put it on your PATH
 ```
 
-Source builds carry a Git-derived build identity and deliberately do not claim
-to be an immutable release. Managed remote bootstrap is therefore available
-only in official release binaries. To use a source build remotely, install the
-same build there and pass `--syq-path /path/to/syq` (or put it on the remote
-`PATH` and use `--no-bootstrap`).
+Registry and checkout builds carry a source-revision identity and deliberately
+do not claim to be an immutable release. Managed remote bootstrap is therefore
+available only in official release binaries. To use a source build remotely,
+install the same locked source revision there and pass
+`--syq-path /path/to/syq` (or put it on the remote `PATH` and use
+`--no-bootstrap`).
 
 Standalone installs download and verify one signed release manifest at most
 once a day after a successful interactive command. When a newer release is

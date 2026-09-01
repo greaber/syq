@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,6 +26,7 @@ fn main() {
 }
 
 fn register_inputs() {
+    println!("cargo::rerun-if-changed=.cargo_vcs_info.json");
     if let Ok(output) = Command::new("git")
         .args([
             "ls-files",
@@ -59,13 +61,28 @@ fn register_inputs() {
 }
 
 fn development_identity(release_identity: &str) -> String {
-    let revision = git(&["rev-parse", "--short=12", "HEAD"])
+    let revision = packaged_revision()
+        .or_else(|| git(&["rev-parse", "--short=12", "HEAD"]))
         .filter(|value| value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .unwrap_or_else(|| format!("source.{}", build_nonce()));
     let dirty = working_tree_hash()
         .map(|hash| format!(".dirty.{hash}"))
         .unwrap_or_default();
     format!("{release_identity}+dev.{revision}{dirty}")
+}
+
+/// Cargo puts the source commit in every registry package. Prefer that value
+/// over a surrounding checkout so an extracted package has the same identity
+/// wherever it is compiled.
+fn packaged_revision() -> Option<String> {
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR")?);
+    let bytes = fs::read(manifest_dir.join(".cargo_vcs_info.json")).ok()?;
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let revision = metadata.get("git")?.get("sha1")?.as_str()?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(revision[..12].to_ascii_lowercase())
 }
 
 fn git(args: &[&str]) -> Option<String> {

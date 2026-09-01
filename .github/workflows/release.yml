@@ -1,5 +1,6 @@
 # Build all supported targets, assemble one complete signed release, attest its
-# contents, publish it draft-first, then update the project-owned Homebrew tap.
+# contents, publish it draft-first, publish the source crate, then update the
+# project-owned Homebrew tap.
 name: release
 
 on:
@@ -190,6 +191,44 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" dist/*
           scripts/verify-release-assets.sh "$GITHUB_REF_NAME" dist
           gh release edit "$GITHUB_REF_NAME" --draft=false
+      - name: Package the source crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version"
+          cargo package --locked
+          test -f "target/package/syq-$version.crate"
+      - name: Check whether crates.io already has this exact package
+        id: crates_io_state
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          if scripts/verify-crates-io-package.sh \
+            "$version" "target/package/syq-$version.crate"; then
+            echo 'published=true' >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            test "$status" -eq 3
+            echo 'published=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Authenticate to crates.io
+        if: steps.crates_io_state.outputs.published != 'true'
+        id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish the source crate
+        if: steps.crates_io_state.outputs.published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
+        run: cargo publish --locked
+      - name: Verify the published source crate
+        if: steps.crates_io_state.outputs.published != 'true'
+        shell: bash
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          scripts/verify-crates-io-package.sh \
+            "$version" "target/package/syq-$version.crate"
       - name: Carry the verified published formula to the tap job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
