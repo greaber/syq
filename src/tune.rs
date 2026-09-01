@@ -683,6 +683,17 @@ pub struct Gate {
     cv: Condvar,
 }
 
+/// Extend the slot table so `id`s below `n` exist. Slots are never dropped:
+/// `Vec::resize_with` would truncate a longer table, and a worker that marked
+/// itself ready after a higher-numbered one would then erase that worker's
+/// slot. The tuner would read the erased slots as absent and spawn duplicate
+/// workers for ids that are still running.
+fn grow_to(slots: &mut Vec<Slot>, n: usize) {
+    if slots.len() < n {
+        slots.resize_with(n, Slot::default);
+    }
+}
+
 impl Gate {
     pub fn new(active: usize) -> Arc<Self> {
         Arc::new(Gate {
@@ -717,7 +728,7 @@ impl Gate {
     /// Claim absent slots through `n` for connection setup.
     pub fn begin_warming(&self, n: usize) -> Vec<usize> {
         let mut slots = self.slots.lock().unwrap();
-        slots.resize_with(n, Slot::default);
+        grow_to(&mut slots, n);
         let mut ids = Vec::new();
         for (id, slot) in slots.iter_mut().take(n).enumerate() {
             if slot.phase == SlotPhase::Absent {
@@ -730,14 +741,14 @@ impl Gate {
 
     pub fn mark_ready(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
-        slots.resize_with(id + 1, Slot::default);
+        grow_to(&mut slots, id + 1);
         slots[id].phase = SlotPhase::Ready;
         self.cv.notify_all();
     }
 
     pub fn mark_warming(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
-        slots.resize_with(id + 1, Slot::default);
+        grow_to(&mut slots, id + 1);
         slots[id].phase = SlotPhase::Warming;
         self.cv.notify_all();
     }
@@ -745,7 +756,7 @@ impl Gate {
     /// Mark a cleanly retired worker reusable immediately.
     pub fn mark_absent(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
-        slots.resize_with(id + 1, Slot::default);
+        grow_to(&mut slots, id + 1);
         slots[id] = Slot::default();
         self.cv.notify_all();
     }
@@ -753,7 +764,7 @@ impl Gate {
     /// Mark setup or repeated connection loss after bounded retries.
     pub fn mark_failed(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
-        slots.resize_with(id + 1, Slot::default);
+        grow_to(&mut slots, id + 1);
         slots[id].phase = SlotPhase::Failed;
         self.cv.notify_all();
     }
@@ -1389,5 +1400,30 @@ mod tests {
         gate.clear_failed_from(2);
         assert_eq!(gate.begin_warming(3), vec![2]);
         assert!(gate.ready_through(2));
+    }
+
+    #[test]
+    fn out_of_order_readiness_keeps_every_warming_slot() {
+        // Workers connect in any order. A lower id reporting ready after a
+        // higher one must not erase the higher slots, or the tuner's healing
+        // poll would respawn duplicates of workers that are still running.
+        let gate = Gate::new(4);
+        assert_eq!(gate.begin_warming(4), vec![0, 1, 2, 3]);
+        gate.mark_ready(3);
+        gate.mark_ready(0);
+        gate.mark_warming(2);
+        gate.mark_ready(1);
+        gate.mark_ready(2);
+        assert!(gate.ready_through(4));
+        assert!(gate.begin_warming(4).is_empty());
+
+        // Shrinking the warming target must not forget higher candidates.
+        gate.set_retain(6);
+        assert_eq!(gate.begin_warming(6), vec![4, 5]);
+        gate.mark_ready(5);
+        assert!(gate.begin_warming(4).is_empty());
+        gate.mark_ready(4);
+        assert!(gate.ready_through(6));
+        assert!(gate.begin_warming(6).is_empty());
     }
 }
