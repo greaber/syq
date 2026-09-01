@@ -1,0 +1,163 @@
+name: publish SDKs
+
+on:
+  push:
+    tags:
+      - "sdk-python-v*"
+      - "sdk-js-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-tag:
+    name: verify signed SDK tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require a verified annotated tag for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/verify-release-tag.sh \
+            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master
+
+  build-python:
+    name: build Python SDK
+    if: startsWith(github.ref, 'refs/tags/sdk-python-v')
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+      - name: Install pinned Python tooling
+        run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
+      - name: Verify version and tests
+        env:
+          PYTHONPATH: sdk/python/src
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
+        run: |
+          version=$(python -c \
+            'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
+          test "$GITHUB_REF_NAME" = "sdk-python-v$version"
+          uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
+      - name: Build distributions with pinned tooling
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
+        run: |
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          uv run --project sdk/python --frozen python -m build sdk/python --outdir sdk-dist
+          python scripts/normalize-python-sdist.py \
+            --epoch "$SOURCE_DATE_EPOCH" sdk-dist/*.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-sdk-distributions
+          path: sdk-dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-python:
+    name: publish Python SDK
+    if: startsWith(github.ref, 'refs/tags/sdk-python-v')
+    needs: build-python
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+      - name: Install pinned publishing tooling
+        run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-sdk-distributions
+          path: sdk-dist
+      - name: Publish immutable distributions
+        run: >-
+          uv publish --trusted-publishing always
+          --check-url https://pypi.org/simple/
+          sdk-dist/*
+
+  build-js:
+    name: build JavaScript SDK
+    if: startsWith(github.ref, 'refs/tags/sdk-js-v')
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Verify version and tests
+        working-directory: sdk/js
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          test "$GITHUB_REF_NAME" = "sdk-js-v$version"
+          npm ci --ignore-scripts
+          npm test
+      - name: Pack the public package
+        working-directory: sdk/js
+        run: |
+          mkdir -p ../../sdk-dist
+          npm pack --pack-destination ../../sdk-dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: javascript-sdk-package
+          path: sdk-dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-js:
+    name: publish JavaScript SDK
+    if: startsWith(github.ref, 'refs/tags/sdk-js-v')
+    needs: build-js
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: javascript-sdk-package
+          path: sdk-dist
+      - name: Publish or verify the immutable package
+        shell: bash
+        run: |
+          package=$(find sdk-dist -mindepth 1 -maxdepth 1 -type f -name '*.tgz')
+          test -n "$package"
+          test "$(find sdk-dist -mindepth 1 -maxdepth 1 -type f -name '*.tgz' | wc -l)" -eq 1
+          version=${GITHUB_REF_NAME#sdk-js-v}
+          if published_sha=$(npm view "@syq/sdk@$version" dist.shasum); then
+            actual_sha=$(sha1sum "$package" | cut -d ' ' -f 1)
+            test "$actual_sha" = "$published_sha" || {
+              echo "npm already has different bytes for @syq/sdk@$version" >&2
+              exit 1
+            }
+            echo "npm already contains the exact @syq/sdk@$version package"
+            exit 0
+          fi
+          npm publish "$package" --access public

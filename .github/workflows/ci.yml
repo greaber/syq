@@ -44,6 +44,56 @@ jobs:
       - run: scripts/test-secret-tools.sh
       - run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-homebrew-formula.sh scripts/test-secret-tools.sh
 
+  sdks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+      - name: Install pinned Python tooling
+        run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
+      - name: Test and reproducibly package Python SDK
+        env:
+          PYTHONPATH: sdk/python/src
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
+        run: |
+          uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
+            uv run --project sdk/python --frozen python -m build sdk/python --outdir "$output"
+            python scripts/normalize-python-sdist.py \
+              --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
+            sleep 2
+          done
+          for artifact in target/sdk-python-dist-a/*; do
+            name=${artifact##*/}
+            cmp "$artifact" "target/sdk-python-dist-b/$name"
+          done
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.x"
+          package-manager-cache: false
+      - name: Test and package JavaScript SDK
+        working-directory: sdk/js
+        run: |
+          npm ci --ignore-scripts
+          npm test
+          npm pack --dry-run
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.x"
+          cache: false
+      - name: Format, vet, and test Go SDK
+        working-directory: sdk/go
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+
   # The release workflow builds on this runner; libc field types differ from
   # x86-64 (st_nlink is u32 here), so check it before a tag can fail.
   linux-arm64:

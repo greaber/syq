@@ -6,6 +6,9 @@ before a tag can publish anything. The workflow uses a draft until every file
 is uploaded and checked, then publishes it once. Enable GitHub's immutable
 releases setting so published assets and tags cannot be changed afterward.
 
+Python, JavaScript, and Go SDKs have independent versions and tag conventions.
+Their registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.md).
+
 ## One-time repository setup
 
 1. Rename the existing GitHub repository to `greaber/syq` and make it public;
