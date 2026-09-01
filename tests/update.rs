@@ -127,9 +127,9 @@ impl UpdateFixture {
         }
     }
 
-    fn command_at(&self, executable: &Path, argument: &str) -> Output {
+    fn command_at_args(&self, executable: &Path, arguments: &[&str]) -> Output {
         Command::new(executable)
-            .arg(argument)
+            .args(arguments)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &self.public_key)
             .env(
@@ -145,8 +145,16 @@ impl UpdateFixture {
             .unwrap()
     }
 
+    fn command_at(&self, executable: &Path, argument: &str) -> Output {
+        self.command_at_args(executable, &[argument])
+    }
+
     fn command(&self, argument: &str) -> Output {
         self.command_at(&self.installed, argument)
+    }
+
+    fn rsync_command(&self, argument: &str) -> Output {
+        self.command_at_args(&self.installed, &["rsync", argument])
     }
 
     fn register(&self) {
@@ -316,12 +324,12 @@ fn automatic_update_flags_are_no_longer_supported() {
     let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
 
     assert_failure_contains(
-        &fixture.command("--enable-auto-update"),
-        "expected a command",
+        &fixture.rsync_command("--enable-auto-update"),
+        "unexpected argument '--enable-auto-update'",
     );
     assert_failure_contains(
-        &fixture.command("--disable-auto-update"),
-        "expected a command",
+        &fixture.rsync_command("--disable-auto-update"),
+        "unexpected argument '--disable-auto-update'",
     );
 }
 

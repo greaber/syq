@@ -138,23 +138,27 @@ syq cp project --to server --into /backup       # named object → /backup/proje
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
 syq cp report --to server --as-new /reports/final
-syq cprm --src-src build --to server --into-existing /srv/app
+syq cp-prune --src-src build --to server --into-existing /srv/app
 syq rm cache old-output
-syq rm --at server --cwd /srv --path old-output
+syq rm --from server --cwd /srv --src old-output
+syq rm --root /srv --src-dir cache
+syq rm --cwd /srv --follow --src-dir current-release
 ```
 
 `--from [USER@]HOST` selects one source endpoint and `--to [USER@]HOST`
 selects one target endpoint; omission means local. A local path containing `:`
 stays local because native mode never guesses endpoints from path text.
 `--cwd DIR`/`-C DIR` changes where relative source selectors are resolved at
-the source endpoint. Absolute selectors ignore it.
+the source endpoint. Copy selectors may be absolute and then ignore `--cwd`.
+Removal selectors are always relative; native `rm` rejects a leading slash and
+any `.` or `..` component.
 
 Bare paths and repeatable `--src PATH` select named objects. A named directory
-keeps its basename at the target; a trailing slash is ordinary path spelling
-and has no semantic effect. `--src-src DIR` selects a directory's contents and
-merges them directly into the target container. `--src-no-follow PATH` selects
-a top-level symlink object itself; bare paths and `--src` follow a top-level
-symlink while retaining its written basename. Symlinks found while traversing
+keeps its basename at the target; a named symlink is copied as a symlink. A
+trailing slash is ordinary path spelling and has no semantic effect.
+`--src-src DIR` selects a directory's contents and merges them directly into
+the target container. `--srcs PATH...` and `--src-srcs DIR...` are bulk
+conveniences for those two canonical selectors. Symlinks found while traversing
 a directory are copied as symlinks and are never followed. Singular selector
 options consume their next argument even when it begins with `-`, so every Unix
 filename is expressible without losing raw path bytes.
@@ -170,36 +174,69 @@ Placement is always explicit in this initial native surface:
 | `--as-new PATH` | Map one named source exactly to `PATH` | Must not exist |
 | `--as-existing PATH` | Map one named source exactly to `PATH` | Must exist |
 
-The receiver enforces `new` and `existing` again when it mutates the target,
-not only during planning. New targets use no-replace creation or publication.
-Existing containers must remain the same directory object: every descendant
-mutation reopens that identity and uses descriptor-relative filesystem calls,
-so replacing the container path makes the operation fail without touching its
-replacement. An exact existing regular file is updated through the object that
-passed preflight, preserving its inode (and therefore updating any hard-link
-aliases). Existing symlinks and special files can be atomically replaced by
-the same type. An exact `--as-existing` operation that would change the
-target's type is refused; use `--as` when type replacement is intended.
+The `new` and `existing` forms are lightweight placement-root pathname checks
+during the ordinary initial destination inspection. A mismatch fails before
+transfer mutation begins. After a successful check, the current engine's
+ordinary pathname and publication behavior applies: these forms do not pin an
+inode or provide compare-and-swap behavior against a concurrent namespace
+writer. Changed regular files continue to use staged atomic publication.
+Mapping a non-directory source exactly onto an existing directory is rejected
+during the source's first scan batch, in both dry-run and execution.
 
 `cp` copies or updates mapped source objects and keeps unrelated target
-objects. `cprm` uses the same mapping and transfer engine, then applies the
+objects. `cp-prune` uses the same mapping and transfer engine, then applies the
 existing safe deletion planner to remove target-only descendants in mapped
 directory scopes. It never removes a source and requires explicit placement;
-`--max-delete N` keeps its all-or-nothing deletion budget. `rm` removes the
-explicitly selected object trees and never follows a selected symlink.
+`--max-delete N` keeps its all-or-nothing deletion budget.
 
-The first native fidelity default recurses through directories, copies in-tree
-symlinks as objects, and retains mtimes. Owner, group, modes, special files,
+Native `rm` resolves every explicit selector at the endpoint and pins the
+result before it makes its first change. Missing selectors are successful and
+duplicate or overlapping selectors may perform redundant work; they are not
+canonicalized or deduplicated. Removal then runs in an endpoint-local worker
+pool relative to the pinned directory handles. A namespace entry already
+removed by another selector is successful. Symlinks encountered while walking
+inside a selected directory are removed as entries and are never followed.
+
+By default, native `rm` follows no symlinks while resolving `--cwd` or a
+selector, including the selector's final component. Encountering one aborts
+the entire command before mutation. `--follow` explicitly enables full
+resolution of those symlinks. The terminal non-symlink file or directory is
+then removed while the symlinks used to reach it remain in place, usually
+dangling. Native `rm` therefore has no direct-root-symlink deletion mode; use
+ordinary `rm` over SSH when the link itself is the intended object.
+
+`--root DIR` is mutually exclusive with `--cwd`. The root path itself must
+contain no symlink, even with `--follow`. Selector resolution is confined to
+the pinned root and fails as soon as a relative or absolute symlink target
+would leave it, even if later components would re-enter. `--cwd` is not a
+containment boundary when `--follow` is used.
+
+For removal, `--src PATH` and bare paths accept either a terminal file or
+directory and remove that object, recursively for a directory.
+`--src-file PATH` requires a non-directory terminal object, while
+`--src-dir DIR` requires a directory and removes its entire tree.
+`--src-src DIR` requires a directory, removes its contents, and retains the
+resolved directory itself. All type checks and selector resolution finish
+before deletion begins. `-vv` prints the base identity, symlink hops, and final
+device/inode resolution used for the operation's audit trail.
+
+The first native fidelity default is exactly `-rlt`: it recurses through
+directories, copies symlinks as symlinks, and retains mtimes. Owner, group,
+modes, special files,
 hard links, ACLs, xattrs, filtering, comparison policy, and the automation API
 are intentionally not frozen by this first grammar. Use `syq rsync` when the
 current compatibility options for those capabilities are needed.
 
-The native commands currently share `-n/--dry-run`, `-v`, `-q`,
-`-j/--connections`, `--progress`, `--no-progress`, `--progress-json`, and the
-remote runtime options shown by `syq cp --help`. Remote-to-remote copies run on
-the source endpoint by default; `--relay` keeps orchestration local. Direct
-SSH command construction requires UTF-8 paths, while `--relay` carries raw path
-bytes in syq's protocol.
+The native commands accept only `-n`/`--dry-run`, `-v`/`--verbose`,
+`-q`/`--quiet`, and `-j`/`--connections` in addition to the endpoint,
+selector, cwd, and placement options above. `cp-prune` additionally accepts
+`--max-delete`; `rm` additionally accepts `--root` and `--follow` plus its
+typed selectors. Preservation policies, filters, comparison controls, progress
+interfaces, and SSH/transport configuration remain available only through
+`syq rsync`; sharing the transfer engine does not expose those options in
+native mode. Remote-to-remote copies still use the ordinary automatic
+transport. Native raw path bytes are relayed through syq's protocol when they
+cannot be represented in a direct remote shell command.
 
 ## Rsync compatibility
 

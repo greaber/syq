@@ -259,7 +259,13 @@ pub fn run(
             destination_policy.port(),
             &destination_policy.host_key_algorithms(),
         ));
-        let prepared = (!args.agent_broker_only)
+        // Native new/existing forms are deliberately only ordinary initial
+        // pathname checks. The command-restricted receiver cannot currently
+        // represent that lightweight policy, so retain the live constrained
+        // broker without preparing a receiver grant for those forms.
+        let receiver_grant_allowed =
+            args.interface == Interface::Rsync || args.target_existence == Existence::Any;
+        let prepared = (!args.agent_broker_only && receiver_grant_allowed)
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
@@ -326,7 +332,7 @@ pub fn run(
     let mut remote: Vec<String> = vec![match args.interface {
         Interface::Rsync => "rsync",
         Interface::NativeCp => "cp",
-        Interface::NativeCprm => "cprm",
+        Interface::NativeCpPrune => "cp-prune",
         Interface::NativeRm => bail!("native rm cannot be a remote-to-remote transfer"),
     }
     .into()];
@@ -359,7 +365,7 @@ pub fn run(
     if !short.is_empty() {
         remote.push(format!("-{short}"));
     }
-    if !args.compress {
+    if args.interface == Interface::Rsync && !args.compress {
         remote.push("--no-compress".into());
     }
     if let Some(j) = args.connections_opt {
@@ -409,61 +415,57 @@ pub fn run(
             remote.push(format!("--ignore={line}"));
         }
     }
-    if args.stats {
+    if args.interface == Interface::Rsync && args.stats {
         remote.push("--stats".into());
     }
     if let Some(n) = args.max_delete {
         remote.push(format!("--max-delete={n}"));
     }
-    if args.no_bootstrap {
-        remote.push("--no-bootstrap".into());
-    }
-    if args.no_tcp {
-        remote.push("--no-tcp".into());
-    }
-    if args.tcp_plain {
-        remote.push("--tcp-plain".into());
-    }
-    if let Some(grant) = &restricted_grant {
-        remote.push(format!("--restricted-grant={grant}"));
-    }
-    if let Some(algorithm) = &args.tcp_congestion {
-        remote.push(format!("--tcp-congestion={algorithm}"));
-    }
-    remote.push(format!("--tcp-ports={}", args.tcp_ports));
-    if args.progress_json && !args.quiet {
-        remote.push("--progress-json".into());
-    }
-    if args.dry_run {
-        remote.push(format!("--plan-source-host={src_target}"));
-    }
     if args.interface == Interface::Rsync {
+        if args.no_bootstrap {
+            remote.push("--no-bootstrap".into());
+        }
+        if args.no_tcp {
+            remote.push("--no-tcp".into());
+        }
+        if args.tcp_plain {
+            remote.push("--tcp-plain".into());
+        }
+        if let Some(grant) = &restricted_grant {
+            remote.push(format!("--restricted-grant={grant}"));
+        }
+        if let Some(algorithm) = &args.tcp_congestion {
+            remote.push(format!("--tcp-congestion={algorithm}"));
+        }
+        remote.push(format!("--tcp-ports={}", args.tcp_ports));
+        if args.progress_json && !args.quiet {
+            remote.push("--progress-json".into());
+        }
+        if args.dry_run {
+            remote.push(format!("--plan-source-host={src_target}"));
+        }
         remote.push(format!(
             "--direct-source-operand-count={source_operand_count}"
         ));
         remote.push("--direct-sources-prededuplicated".into());
-    }
-    if args.no_progress || args.quiet {
-        remote.push("--no-progress".into());
-    } else if std::io::stderr().is_terminal() {
-        remote.push("--progress".into());
-        remote.push(format!("--width={}", crate::progress::term_width()));
-    }
-    if let Some(p) = &args.syq_path {
-        remote.push(format!("--syq-path={p}"));
-    }
-    if let Some(e) = destination_rsh(
-        args.rsh.as_deref(),
-        same_host,
-        default_ssh_agent_policy.as_ref(),
-        constrained_rsh.as_deref(),
-    ) {
-        remote.push(if args.interface == Interface::Rsync {
-            "-e".into()
-        } else {
-            "--rsh".into()
-        });
-        remote.push(e);
+        if args.no_progress || args.quiet {
+            remote.push("--no-progress".into());
+        } else if std::io::stderr().is_terminal() {
+            remote.push("--progress".into());
+            remote.push(format!("--width={}", crate::progress::term_width()));
+        }
+        if let Some(p) = &args.syq_path {
+            remote.push(format!("--syq-path={p}"));
+        }
+        if let Some(e) = destination_rsh(
+            args.rsh.as_deref(),
+            same_host,
+            default_ssh_agent_policy.as_ref(),
+            constrained_rsh.as_deref(),
+        ) {
+            remote.push("-e".into());
+            remote.push(e);
+        }
     }
 
     if args.interface == Interface::Rsync {
@@ -505,8 +507,11 @@ pub fn run(
             remote.push(
                 match source.selection {
                     SourceSelection::Contents => "--src-src",
-                    SourceSelection::NamedNoFollow => "--src-no-follow",
-                    SourceSelection::Named | SourceSelection::Rsync => "--src",
+                    SourceSelection::File => "--src-file",
+                    SourceSelection::Directory => "--src-dir",
+                    SourceSelection::Named
+                    | SourceSelection::NamedNoFollow
+                    | SourceSelection::Rsync => "--src",
                 }
                 .into(),
             );
@@ -546,7 +551,39 @@ pub fn run(
     } else {
         ""
     };
-    let remote_cmd = format!("{dbg}{}", spec.program_command(&remote));
+    let mut internal_environment = Vec::new();
+    if args.interface != Interface::Rsync {
+        if let Some(grant) = &restricted_grant {
+            internal_environment.push(("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT", grant.clone()));
+        }
+        if args.dry_run {
+            internal_environment.push(("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST", src_target.clone()));
+        }
+        if let Some(rsh) = destination_rsh(
+            args.rsh.as_deref(),
+            same_host,
+            default_ssh_agent_policy.as_ref(),
+            constrained_rsh.as_deref(),
+        ) {
+            internal_environment.push(("SYQ_INTERNAL_NATIVE_RSH", rsh));
+        }
+        if !args.quiet && std::io::stderr().is_terminal() {
+            internal_environment.push((
+                "SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH",
+                crate::progress::term_width().to_string(),
+            ));
+        }
+    }
+    let environment = internal_environment
+        .into_iter()
+        .map(|(name, value)| format!("{name}={}", shell_words::quote(&value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let separator = if environment.is_empty() { "" } else { " " };
+    let remote_cmd = format!(
+        "{dbg}{environment}{separator}{}",
+        spec.program_command(&remote)
+    );
 
     let remote_cmd = if args.detach {
         // Survive the loss of this ssh session: new session, no controlling

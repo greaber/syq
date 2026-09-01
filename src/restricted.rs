@@ -1022,6 +1022,9 @@ impl RestrictedAuthority {
             | Request::AnchorDestination { .. } => {
                 bail!("destination-anchor management is not valid on a root-confined receiver")
             }
+            Request::NativeRemove { .. } => {
+                bail!("native removal is not valid on a command-restricted destination")
+            }
             Request::Hello { .. } => bail!("unexpected second receiver handshake"),
             Request::TransportStats | Request::Shutdown => {}
         }
@@ -1914,7 +1917,7 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     if !args.dry_run
         && !args.verify_only
-        && (args.delete || args.interface == Interface::NativeCprm)
+        && (args.delete || args.interface == Interface::NativeCpPrune)
         && args.max_size.is_some()
     {
         bail!(
@@ -1944,7 +1947,7 @@ fn grant_for(
     validate_restricted_args(args)?;
     let issued_at = now()?;
     let read_only = args.dry_run || args.verify_only;
-    let deletion = if !read_only && (args.delete || args.interface == Interface::NativeCprm) {
+    let deletion = if !read_only && (args.delete || args.interface == Interface::NativeCpPrune) {
         DeletionPolicyV1::DeleteDestinationOnly
     } else {
         DeletionPolicyV1::Forbid

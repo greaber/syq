@@ -436,6 +436,8 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
             crate::cli::SourceSelection::Named => "named-follow",
             crate::cli::SourceSelection::Contents => "contents-follow",
             crate::cli::SourceSelection::NamedNoFollow => "named-no-follow",
+            crate::cli::SourceSelection::File => "file",
+            crate::cli::SourceSelection::Directory => "directory",
         })
         .collect();
     let mut flags = serde_json::json!({
@@ -472,6 +474,25 @@ fn endpoint_identity(l: &Location) -> String {
     }
 }
 
+/// Keep existing checkpoint/partial identities unchanged for UTF-8 paths,
+/// while giving native raw-byte paths a lossless and unambiguous spelling.
+fn path_identity(path: &std::path::Path) -> String {
+    if let Some(path) = path.to_str() {
+        return path.to_string();
+    }
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = path.as_os_str().as_bytes();
+    let mut encoded = String::with_capacity(15 + bytes.len() * 2);
+    // NUL cannot occur in a Unix pathname, so no valid UTF-8 path can collide
+    // with this encoded namespace.
+    encoded.push_str("\0unix-path-hex:");
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 /// Load and, for a real copy, open the explicitly requested checkpoint.
 struct DestinationRoot<'a> {
     path: &'a [u8],
@@ -500,17 +521,13 @@ fn copy_identity(
     let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
     for source in srcs {
         let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
-        src_roots.push((
-            path.to_string_lossy().into_owned(),
-            source.copies_contents(),
-        ));
+        src_roots.push((path_identity(&path), source.copies_contents()));
     }
     let dst_root = match dst_canonical {
         Some(path) => path,
         None => canonical_path(dst_ctl, &dst.path, dst.is_remote())?,
-    }
-    .to_string_lossy()
-    .into_owned();
+    };
+    let dst_root = path_identity(&dst_root);
     Ok(crate::checkpoint::job_identity(
         &endpoint_identity(&srcs[0]),
         &src_roots,
@@ -645,7 +662,8 @@ pub fn run(args: Args) -> Result<i32> {
         .then_some(args.bwlimit_bytes)
         .map(BandwidthLimit::new)
         .map(Arc::new);
-    let locs: Vec<Location> = if args.locations.is_empty() {
+    let native_locations = !args.locations.is_empty();
+    let locs: Vec<Location> = if !native_locations {
         args.paths
             .iter()
             .map(|p| Location::parse(p))
@@ -688,7 +706,7 @@ pub fn run(args: Args) -> Result<i32> {
             "--unrestricted-agent-forwarding is only valid for a live direct transfer between two different remote hosts"
         );
     }
-    let source_operand_count = if args.locations.is_empty() {
+    let source_operand_count = if !native_locations {
         args.direct_source_operand_count
             .unwrap_or(raw_source_operands.len())
     } else {
@@ -706,8 +724,15 @@ pub fn run(args: Args) -> Result<i32> {
     // `file file new-dest` still creates a directory like other multi-source
     // commands.
     let multiple_source_operands = source_operand_count > 1;
-    let srcs: Vec<Location> = if !args.locations.is_empty() || args.direct_sources_prededuplicated {
+    let srcs: Vec<Location> = if args.direct_sources_prededuplicated {
         original_srcs.to_vec()
+    } else if native_locations {
+        let mut seen_sources = std::collections::HashSet::new();
+        original_srcs
+            .iter()
+            .filter(|source| seen_sources.insert((source.path.clone(), source.selection)))
+            .cloned()
+            .collect()
     } else {
         let mut seen_sources = std::collections::HashSet::new();
         raw_source_operands
@@ -784,11 +809,22 @@ pub fn run(args: Args) -> Result<i32> {
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
-            // Let the remote orchestrator observe the original source count so
-            // repeated file sources keep multi-source destination semantics.
-            return crate::direct::run(&args, srcs, dst, source_operand_count);
+            let direct_paths_are_utf8 = srcs
+                .iter()
+                .chain(std::iter::once(dst))
+                .all(|location| std::str::from_utf8(&location.path).is_ok());
+            if args.interface == Interface::Rsync || direct_paths_are_utf8 {
+                // Let the remote orchestrator observe the original source count so
+                // repeated file sources keep multi-source destination semantics.
+                return crate::direct::run(&args, srcs, dst, source_operand_count);
+            }
+            if !args.quiet {
+                eprintln!(
+                    "syq: remote-to-remote transfer: relaying raw path bytes through this machine"
+                );
+            }
         }
-        if !args.quiet {
+        if args.relay && !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
     }
@@ -1205,9 +1241,8 @@ pub fn run(args: Args) -> Result<i32> {
     }
     if args.interface != Interface::Rsync {
         // Native selectors are structural: validate every selected root before
-        // a missing --into target can be created. Named selectors follow their
-        // root unless --src-no-follow was used; contents selectors additionally
-        // require the resolved object to be a directory.
+        // a missing --into target can be created. Contents selectors follow
+        // their root and additionally require it to resolve to a directory.
         for source in srcs {
             match stat_one(&mut *src_ctl, &source.path, source.follows_root())? {
                 Some(entry) if source.requires_directory() && entry.kind != Kind::Dir => {
@@ -1285,52 +1320,14 @@ pub fn run(args: Args) -> Result<i32> {
             dst_entry_is_dir = true;
         }
     }
-    match args.target_existence {
-        Existence::Any => {}
-        Existence::New if dst_existed => bail!(
-            "target {} appeared while resolving it, but the selected placement requires a new path",
-            display(&dst_root)
-        ),
-        Existence::Existing if !dst_existed => bail!(
-            "target {} disappeared while resolving it, but the selected placement requires an existing path",
-            display(&dst_root)
-        ),
-        Existence::New | Existence::Existing => {}
-    }
-    let exact_condition = if args.placement == Placement::As {
-        match args.target_existence {
-            Existence::Any => TargetCondition::Any,
-            Existence::New => TargetCondition::Absent,
-            Existence::Existing => target_matches(
-                dst_root_entry
-                    .as_ref()
-                    .expect("existing target was validated above"),
-            ),
-        }
-    } else {
-        TargetCondition::Any
-    };
-    let mut mutation_root_condition = if args.target_existence == Existence::Existing
-        && dst_root_entry
-            .as_ref()
-            .is_some_and(|entry| entry.kind == Kind::Dir)
-    {
-        target_identity(
-            dst_root_entry
-                .as_ref()
-                .expect("existing target was validated above"),
-        )
-    } else {
-        TargetCondition::Any
-    };
-    // Native placement additionally binds each descendant mutation to the
-    // selected container identity. Ordinary rsync copies rely on the retained
-    // operator anchor; the signed receiver injects its enrolled-root guard.
-    let guard_containers = args.interface != Interface::Rsync;
-    let mut container_guard = dst_root_entry
-        .as_ref()
-        .filter(|entry| guard_containers && entry.kind == Kind::Dir)
-        .map(|entry| target_container(&dst_root, entry));
+    // Native new/existing forms are intentionally only the lightweight
+    // pathname checks above. Once they pass, use the ordinary engine's target
+    // conditions and publication behavior; this adapter does not add an
+    // identity precondition or a mutation-time existence recheck.
+    let exact_condition = TargetCondition::Any;
+    let mut mutation_root_condition = TargetCondition::Any;
+    let guard_containers = false;
+    let mut container_guard = None;
 
     // Reject copying a directory into itself: if the effective destination
     // resolves to (or inside) a source directory, the scanner would discover
@@ -1417,11 +1414,7 @@ pub fn run(args: Args) -> Result<i32> {
         && !args.existing;
     let dry_run_creates_root =
         args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
-    let root_create_condition = if args.target_existence == Existence::New {
-        TargetCondition::Absent
-    } else {
-        TargetCondition::Any
-    };
+    let root_create_condition = TargetCondition::Any;
     if use_operator_anchor {
         let create_operator_directory_now = directory_selection.is_none()
             && !args.dry_run
@@ -1913,15 +1906,6 @@ fn stat_many(
     }
 }
 
-fn target_matches(entry: &Entry) -> TargetCondition {
-    TargetCondition::MatchesFingerprint {
-        dev: entry.dev,
-        ino: entry.ino,
-        ctime: entry.ctime,
-        ctime_nsec: entry.ctime_nsec,
-    }
-}
-
 fn target_identity(entry: &Entry) -> TargetCondition {
     TargetCondition::Matches {
         dev: entry.dev,
@@ -1939,7 +1923,7 @@ fn target_container(root: &[u8], entry: &Entry) -> ContainerGuard {
 
 #[cfg(debug_assertions)]
 fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
-    if args.interface == Interface::Rsync || args.target_existence == Existence::Any {
+    if args.interface != Interface::Rsync || args.target_existence == Existence::Any {
         return Ok(());
     }
     if let Some(ready) = std::env::var_os("SYQ_TEST_TARGET_PRECONDITION_READY_FILE") {
@@ -2789,6 +2773,13 @@ impl Planner<'_> {
                 if let Some(root) = batch.first() {
                     if require_directory && root.kind != Kind::Dir {
                         bail!("contents selector {} is not a directory", display(src_root));
+                    }
+                    if destination.exact && destination.entry_is_dir && root.kind != Kind::Dir {
+                        bail!(
+                            "destination {} is an existing directory; cannot replace it with non-directory source {}",
+                            display(dst_root),
+                            display(src_root)
+                        );
                     }
                     if pl.opts.dry_run
                         && root.kind == Kind::Dir
@@ -5828,6 +5819,20 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_path_identity_is_lossless_without_changing_utf8_identity() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        assert_eq!(
+            path_identity(std::path::Path::new("/tmp/name")),
+            "/tmp/name"
+        );
+        let first = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/raw-\xff"));
+        let second = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/raw-\xfe"));
+        assert_ne!(path_identity(first), path_identity(second));
+        assert!(path_identity(first).starts_with('\0'));
+    }
 
     #[test]
     fn fast_batch_ceiling_only_grows_on_high_rtt_tcp() {

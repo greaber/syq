@@ -224,6 +224,40 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     Err(e) => w.write_msg(&Response::Err(format!("{e:#}")))?,
                 }
             }
+            Request::NativeRemove {
+                cwd,
+                root,
+                selections,
+                follow_symlinks,
+                dry_run,
+                workers,
+            } => {
+                let wref = std::cell::RefCell::new(&mut w);
+                let result = crate::native_rm::remove(
+                    cwd.as_deref(),
+                    root.as_deref(),
+                    &selections,
+                    follow_symlinks,
+                    dry_run,
+                    workers,
+                    &mut |messages| {
+                        Ok(wref
+                            .borrow_mut()
+                            .write_msg(&Response::NativeRemoveTrace(messages))?)
+                    },
+                    &mut |outcomes| {
+                        Ok(wref
+                            .borrow_mut()
+                            .write_msg(&Response::NativeRemoveBatch(outcomes))?)
+                    },
+                );
+                match result {
+                    Ok(()) => wref.borrow_mut().write_msg(&Response::NativeRemoveDone)?,
+                    Err(error) => wref
+                        .borrow_mut()
+                        .write_msg(&Response::Err(format!("{error:#}")))?,
+                }
+            }
             Request::Scan {
                 root,
                 follow_root,

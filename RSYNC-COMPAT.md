@@ -1,8 +1,8 @@
 # rsync compatibility
 
-syq has an rsync-shaped command line. This file is the tracked record of how
-far that goes: what behaves the same, what differs and why, what rsync has
-that syq doesn't, and the open issues. `README.md` is the user-facing
+`syq rsync` is syq's retained rsync-shaped command surface. This file is the
+tracked record of how far that goes: what behaves the same, what differs and
+why, what rsync has that syq doesn't, and the open issues. `README.md` is the user-facing
 contract; when the two disagree, fix one of them.
 
 Each entry says whether it was **measured** (run against upstream rsync —

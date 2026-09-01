@@ -164,7 +164,7 @@ not an syq requirement and is not automatically faster on a clean LAN. Changing
 application. If both endpoints already default to the wanted algorithm, syq's
 new direct TCP sockets inherit it and no application option is needed.
 
-For a scoped comparison on Linux, `syq --tcp-congestion ALGO` selects an
+For a scoped comparison on Linux, `syq rsync --tcp-congestion ALGO` selects an
 algorithm only for syq's direct TCP data sockets, on both the connecting and
 listening hosts. It does not change the host default. Both kernels must have
 the algorithm registered, and an unprivileged syq process may choose only an
