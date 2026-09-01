@@ -344,7 +344,7 @@ fn local_addrs() -> Vec<(String, u32)> {
         .unwrap_or_default();
     let mut addrs: Vec<(String, u32, u8)> = Vec::new(); // (ip, speed, priority-bucket)
     for line in text.lines() {
-        // "3: bond0    inet 10.2.201.45/24 brd ... scope global bond0"
+        // "3: bond0    inet 192.0.2.45/24 brd ... scope global bond0"
         let f: Vec<&str> = line.split_whitespace().collect();
         let (Some(iface), Some(ipcidr)) = (f.get(1), f.iter().skip_while(|w| **w != "inet").nth(1))
         else {
