@@ -39,8 +39,11 @@ Some setups mix the roles (see the seedbox pipeline below).
   ([codestudy guide](https://www.codestudy.net/blog/using-rsync-to-rename-files-during-copying-with-files-from/),
   [LinuxQuestions thread](https://www.linuxquestions.org/questions/linux-general-1/looping-rsync-to-rename-files-at-destination-help-4175723362/)).
   This is a hand-rolled mapping manifest without a tool to consume it:
-  N processes, N ssh handshakes, no shared scan, no parallelism, no
-  preflight conflict checking, no aggregate result.
+  N rsync processes with no shared scan, where parallelism, preflight
+  conflict checking, and aggregate results must all be added externally
+  (ssh setup can be amortized with connection multiplexing, and local
+  copies have none, so the invocation overhead itself is the smaller
+  cost).
 - **Rename propagation via a temporary hardlink working copy**
   ([Lincoln Loop](https://lincolnloop.com/blog/detecting-file-moves-renames-rsync/)):
   `cp -rlp` the tree, reorganize the copy, then sync *both* trees with
@@ -102,11 +105,13 @@ Some setups mix the roles (see the seedbox pipeline below).
   the destination only ever sees plain objects
   ([rclone local backend](https://rclone.org/local/)). The forum pain is
   mostly about preserving symlinks in backups, a different problem. What
-  object stores do add is that placement must be final at upload time
-  (no rename primitive; a "rename" is a paid server-side copy) — but the
-  farm satisfies that via local dereference too, so object stores are
-  not by themselves a farm-vs-mapping differentiator for ordinary
-  placement.
+  most flat-namespace object-store backends add is that placement must
+  be final at upload time (no rename primitive; a "rename" is a paid
+  server-side copy — not categorical: S3 Express directory buckets have
+  [RenameObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_RenameObject.html),
+  and hierarchical stores can rename atomically) — but the farm
+  satisfies that via local dereference too, so object stores are not by
+  themselves a farm-vs-mapping differentiator for ordinary placement.
 - **Global dereferencing is blunt.** Consuming a farm with `-L`
   dereferences *every* link, so a tree that itself contains symlinks
   that should arrive as symlinks cannot be expressed;
@@ -141,9 +146,11 @@ the incumbent solution is actually fine.
 - **Photo farm tools**: the farm is cheap (hardlinks), the workflow is
   two cron lines, and the farm doubles as a browsable local
   date-organized view — partially links-as-product, which mapping input
-  does not replace. The farm arguably dominates unless the source is
-  remote, the filesystem lacks hardlinks (FAT/exFAT cards, some network
-  mounts), or the permanent farm's drift and hygiene costs bite.
+  does not replace. The farm arguably dominates unless the source host
+  cannot hold or reach a staging location (remote, no shell) or the
+  permanent farm's drift and hygiene costs bite; a filesystem without
+  hardlinks (FAT/exFAT cards) only rules out the hardlink variant, since
+  a symlink farm on another filesystem consumed with `-L` still works.
 - **Seedbox pipelines**: most such users need the local media-layout
   view anyway (Plex reads local or mounted files), so the farm exists
   regardless and mapping input adds little. The exception is
@@ -183,10 +190,12 @@ narrowed profile, not the broad pattern.
 
 A forward-looking note on object stores: if syq ever grows
 S3-compatible endpoints (an open strategic question with its own
-constraints — no atomic rename, no native symlinks, different resume
+constraints — no atomic rename on most flat-namespace backends, no
+native symlinks, different resume
 and verification models; see `current-plans/rclone-pain-points.md`),
-mapping input remains the natural *interface* there — placement must be
-final at upload time since re-placement is a paid server-side copy —
+mapping input remains the natural *interface* there — placement must
+usually be final at upload time since re-placement is a paid
+server-side copy on most backends —
 but a local farm consumed with dereferencing serves ordinary placement
 at object stores too, so the argument for syq there rests on the same
 residual differentiators as elsewhere plus whatever the endpoint itself
