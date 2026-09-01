@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -35,6 +37,18 @@ case "$1" in
       sleep 0.01
     done
     sleep 30
+    ;;
+  interrupt)
+    printf '%s' "$$" > "$2.pid"
+    (
+      printf 'ready' > "$2.ready"
+      sleep 1
+      printf 'survived' > "$2"
+    ) &
+    while [ ! -f "$2.ready" ]; do
+      sleep 0.01
+    done
+    sleep 3
     ;;
   *)
     exit 2
@@ -107,6 +121,57 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(marker.with_suffix(".ready").exists())
         time.sleep(0.75)
         self.assertFalse(marker.exists())
+
+    def test_keyboard_interrupt_stops_spawned_descendants(self) -> None:
+        marker = Path(self.temporary_directory.name) / "interrupt-marker"
+        ready = marker.with_suffix(".ready")
+        pid_file = marker.with_suffix(".pid")
+        script = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "import syq\n"
+            "syq.run(['interrupt', Path(sys.argv[2])], "
+            "executable=Path(sys.argv[1]))\n"
+        )
+        wrapper = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                os.fspath(self.executable),
+                os.fspath(marker),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        try:
+            deadline = time.monotonic() + 3
+            while not ready.exists() and wrapper.poll() is None:
+                if time.monotonic() >= deadline:
+                    self.fail(
+                        "timed out waiting for the interrupt fixture; "
+                        f"wrapper status is {wrapper.returncode}"
+                    )
+                time.sleep(0.01)
+            self.assertIsNone(wrapper.poll())
+
+            wrapper.send_signal(signal.SIGINT)
+            wrapper.communicate(timeout=3)
+
+            self.assertNotEqual(wrapper.returncode, 0)
+            time.sleep(1.1)
+            self.assertFalse(marker.exists())
+        finally:
+            if wrapper.poll() is None:
+                wrapper.kill()
+                wrapper.communicate()
+            if pid_file.exists():
+                try:
+                    os.killpg(int(pid_file.read_text(encoding="utf-8")), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_one_string_is_not_treated_as_an_argument_sequence(self) -> None:
         with self.assertRaisesRegex(TypeError, "individual arguments"):

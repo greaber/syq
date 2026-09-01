@@ -82,7 +82,7 @@ def run(
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except BaseException:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
