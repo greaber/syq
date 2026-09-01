@@ -9,6 +9,7 @@ mod direct;
 pub mod enrollment;
 mod fsops;
 mod identity;
+mod janky_cat;
 mod native_rm;
 mod progress;
 mod proto;
@@ -129,6 +130,15 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("cat") {
+        match janky_cat::run(&argv[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("syq cat: {error:#}");
+                std::process::exit(1);
+            }
+        }
     }
     if let Some(result) = restricted::dispatch_management(&argv) {
         match result {
