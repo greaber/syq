@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1022,24 +1022,31 @@ fn read_link_at(parent: RawFd, component: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-fn read_directory(directory: &File) -> Result<Vec<Vec<u8>>> {
-    let duplicated = retry_fd(|| unsafe { libc::dup(directory.as_raw_fd()) })?;
-    let stream = unsafe { libc::fdopendir(duplicated) };
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::closedir(self.0) };
+    }
+}
+
+fn open_directory_stream(directory: &File) -> Result<DirectoryStream> {
+    // A duplicated directory descriptor shares its open-file-description
+    // offset. Reopen `.` relative to the pinned descriptor so concurrent
+    // scans and retries each have an independent offset.
+    let reopened =
+        open_directory_at(directory, b".").context("open independent removal directory stream")?;
+    let descriptor = reopened.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(descriptor) };
     if stream.is_null() {
         let error = io::Error::last_os_error();
-        let _ = unsafe { libc::close(duplicated) };
+        let _ = unsafe { libc::close(descriptor) };
         return Err(error).context("open removal directory stream");
     }
-    struct DirectoryStream(*mut libc::DIR);
-    impl Drop for DirectoryStream {
-        fn drop(&mut self) {
-            let _ = unsafe { libc::closedir(self.0) };
-        }
-    }
-    let stream = DirectoryStream(stream);
-    // dup() shares the directory offset with the pinned descriptor, so a retry
-    // must rewind before enumerating the directory again.
-    unsafe { libc::rewinddir(stream.0) };
+    Ok(DirectoryStream(stream))
+}
+
+fn read_directory_stream(stream: &mut DirectoryStream) -> Result<Vec<Vec<u8>>> {
     let mut names = Vec::new();
     loop {
         set_errno(0);
@@ -1059,23 +1066,15 @@ fn read_directory(directory: &File) -> Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
+fn read_directory(directory: &File) -> Result<Vec<Vec<u8>>> {
+    let mut stream = open_directory_stream(directory)?;
+    read_directory_stream(&mut stream)
+}
+
 fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
     loop {
         if operation() == 0 {
             return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-fn retry_fd(mut operation: impl FnMut() -> libc::c_int) -> io::Result<libc::c_int> {
-    loop {
-        let descriptor = operation();
-        if descriptor >= 0 {
-            return Ok(descriptor);
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -1144,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_scan_rewinds_directory_stream() {
+    fn repeated_directory_scans_start_at_the_beginning() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("one"), b"1").unwrap();
         fs::write(temp.path().join("two"), b"2").unwrap();
@@ -1161,6 +1160,28 @@ mod tests {
 
         assert_eq!(first, vec![b"one".to_vec(), b"two".to_vec()]);
         assert_eq!(second, first);
+    }
+
+    #[test]
+    fn simultaneous_directory_streams_have_independent_offsets() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("one"), b"1").unwrap();
+        fs::write(temp.path().join("two"), b"2").unwrap();
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(temp.path())
+            .unwrap();
+        let mut first = open_directory_stream(&directory).unwrap();
+        let mut second = open_directory_stream(&directory).unwrap();
+
+        let mut first_names = read_directory_stream(&mut first).unwrap();
+        let mut second_names = read_directory_stream(&mut second).unwrap();
+        first_names.sort();
+        second_names.sort();
+
+        assert_eq!(first_names, vec![b"one".to_vec(), b"two".to_vec()]);
+        assert_eq!(second_names, first_names);
     }
 
     #[test]
