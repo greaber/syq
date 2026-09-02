@@ -284,6 +284,14 @@ the terminal aggregates, and metadata-only updates are not yet
 reported per operation. A missing terminal record means the run did
 not finish.
 
+The results writer lives with the transfer coordinator. For a direct
+remote-to-remote copy, use `--results -` to stream its NDJSON back over the
+coordinator connection. A named results file is accepted only when the
+coordinator is local, including `--run-at local`; this avoids interpreting a
+local-looking pathname on a remote host. `--results` cannot be combined with
+`--detach`, because the caller would no longer be attached for the complete
+stream and its terminal record.
+
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:
 
