@@ -278,14 +278,14 @@ impl RestrictedAuthority {
             bail!("update-if-older existing-object policy is not enforceable by the receiver");
         }
         if copy.policy.publication == PublicationPolicyV1::InPlace
-            && (copy.policy.existing == ExistingDestinationPolicyV1::Skip
+            && (copy.policy.existing != ExistingDestinationPolicyV1::Replace
                 || (root_existence == RootExistenceV4::New
                     && copy.policy.placement == DestinationPlacementV1::ExactPath))
         {
-            // In-place preparation opens or creates the final pathname with
-            // no no-replace condition to attach, so it cannot be made to
-            // retain a pre-existing object.
-            bail!("in-place publication cannot honor a no-replace existing-object policy");
+            // In-place preparation opens, creates, or replaces the final
+            // pathname with no condition to attach, so it can neither retain
+            // a pre-existing object nor be pinned to one.
+            bail!("in-place publication cannot honor a signed existing-object policy");
         }
         let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
         let filter_roots = filters.destination_roots.clone();
@@ -667,22 +667,65 @@ impl RestrictedAuthority {
         &self,
         path: &[u8],
         is_dir: bool,
+        condition: Option<&mut proto::TargetCondition>,
         pending: &[(usize, Vec<u8>)],
     ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        let label = String::from_utf8_lossy(path);
         // A creation earlier in this same request (a symlink followed by its
         // metadata, say) counts: the batch executes in order, so the
         // metadata only ever lands on this request's own creation.
-        if self.copy.policy.existing != ExistingDestinationPolicyV1::Skip
-            || is_dir
-            || self.created_by_this_grant(path)
-            || pending.iter().any(|(_, created)| created == path)
-        {
-            return Ok(());
+        let own =
+            self.created_by_this_grant(path) || pending.iter().any(|(_, created)| created == path);
+        match self.copy.policy.existing {
+            ExistingDestinationPolicyV1::Skip if is_dir || own => Ok(()),
+            ExistingDestinationPolicyV1::Skip => {
+                bail!("signed grant retains existing objects: {label} may not be modified")
+            }
+            ExistingDestinationPolicyV1::MustExist => {
+                // Updates are pinned to the observed object, like
+                // publications: nothing hostA supplies names an inode on its
+                // own authority.
+                let Some(metadata) = self.rooted_metadata(path)? else {
+                    bail!("signed grant creates nothing: {label} does not exist")
+                };
+                let Some(condition) = condition else {
+                    return Ok(());
+                };
+                match *condition {
+                    Any => {
+                        *condition = Matches {
+                            dev: metadata.dev,
+                            ino: metadata.ino,
+                        }
+                    }
+                    Absent => bail!(
+                        "no-replace update of {label} contradicts the signed existing-object policy"
+                    ),
+                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
+                    MatchesFingerprint {
+                        dev,
+                        ino,
+                        ctime,
+                        ctime_nsec,
+                    } if (dev, ino, ctime, ctime_nsec)
+                        == (
+                            metadata.dev,
+                            metadata.ino,
+                            metadata.ctime,
+                            metadata.ctime_nsec,
+                        ) => {}
+                    Matches { .. } | MatchesFingerprint { .. } => bail!(
+                        "requested identity for {label} does not match the object the receiver observed"
+                    ),
+                }
+                Ok(())
+            }
+            ExistingDestinationPolicyV1::Replace => Ok(()),
+            ExistingDestinationPolicyV1::UpdateIfOlder => {
+                bail!("update-if-older existing-object policy is not enforceable by the receiver")
+            }
         }
-        bail!(
-            "signed grant retains existing objects: {} may not be modified",
-            String::from_utf8_lossy(path)
-        )
     }
 
     /// Refuse staging work whose eventual publication the existing-object
@@ -1142,7 +1185,7 @@ impl RestrictedAuthority {
                 flags,
                 condition,
             } => {
-                self.constrain_update(path, is_dir, pending)?;
+                self.constrain_update(path, is_dir, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -1157,7 +1200,7 @@ impl RestrictedAuthority {
                 flags,
                 condition,
             } => {
-                self.constrain_update(path, false, pending)?;
+                self.constrain_update(path, false, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -1327,7 +1370,7 @@ impl RestrictedAuthority {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
-                self.constrain_update(path, false, pending)?;
+                self.constrain_update(path, false, None, pending)?;
                 *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
@@ -1339,7 +1382,7 @@ impl RestrictedAuthority {
                 ..
             } => {
                 self.check_mutation_path(path, false)?;
-                self.constrain_update(path, false, pending)?;
+                self.constrain_update(path, false, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -2324,10 +2367,11 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     if args.inplace
         && (args.ignore_existing
+            || args.existing
             || (args.target_existence == Existence::New && args.placement == Placement::As))
     {
         bail!(
-            "--inplace cannot be combined with --ignore-existing or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver cannot make them no-replace"
+            "--inplace cannot be combined with --ignore-existing, --existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
     if !args.files_from_lines.is_empty()
@@ -3759,6 +3803,65 @@ mod tests {
     }
 
     #[test]
+    fn must_exist_pins_update_only_operations() {
+        use proto::TargetCondition::{Any, Matches};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let present = target.join("present");
+        let missing = target.join("missing");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&present, b"old").unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::MustExist,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap();
+        let identity = fs::symlink_metadata(&present).unwrap();
+        let expected = Matches {
+            dev: identity.dev(),
+            ino: identity.ino(),
+        };
+
+        let mut meta = apply(set_meta(&present));
+        authority.authorize(&mut meta, false).unwrap();
+        assert_eq!(op_condition(&meta), expected);
+        let mut same = apply(Op::SetFileMetaIfSame {
+            path: path_bytes(&present),
+            condition: Any,
+            meta: plain_meta(),
+            flags: 0,
+        });
+        authority.authorize(&mut same, false).unwrap();
+        assert_eq!(op_condition(&same), expected);
+        let mut finish = Request::FinishBasis {
+            path: path_bytes(&present),
+            partial_id: [1; 16],
+            meta: plain_meta(),
+            flags: 0,
+            condition: Any,
+            guard: None,
+        };
+        authority.authorize(&mut finish, false).unwrap();
+        let Request::FinishBasis { condition, .. } = &finish else {
+            unreachable!()
+        };
+        assert_eq!(*condition, expected);
+
+        let mut bogus = apply(Op::SetMeta {
+            path: path_bytes(&present),
+            meta: plain_meta(),
+            flags: 0,
+            condition: Matches { dev: 1, ino: 1 },
+        });
+        assert!(authority.authorize(&mut bogus, false).is_err());
+        let mut absent = apply(set_meta(&missing));
+        assert!(authority.authorize(&mut absent, false).is_err());
+    }
+
+    #[test]
     fn guarded_executor_honors_creation_conditions() {
         use proto::TargetCondition::{Absent, Any, Matches};
         let temporary = tempfile::tempdir().unwrap();
@@ -3875,18 +3978,19 @@ mod tests {
             RootExistenceV4::New,
         )
         .is_err());
-        // A new directory root is created by mkdir, so in-place files
-        // beneath it are fine, as are in-place updates of existing files.
+        // In-place preparation cannot be pinned to an observed object either,
+        // so MustExist is refused as well; only Replace remains, and a new
+        // directory root is fine because mkdir creates it.
+        assert!(inplace(
+            ExistingDestinationPolicyV1::MustExist,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .is_err());
         inplace(
             ExistingDestinationPolicyV1::Replace,
             DestinationPlacementV1::DirectoryContents,
             RootExistenceV4::New,
-        )
-        .unwrap();
-        inplace(
-            ExistingDestinationPolicyV1::MustExist,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
         )
         .unwrap();
 

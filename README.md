@@ -509,9 +509,10 @@ creation, and metadata or content changes to any non-directory that existed
 before the transfer are refused; existing directories are reused, as in the
 ordinary engine. Under `--existing` the receiver refuses to create any object
 and pins each update to the object it observed, so an existing object cannot
-change type. `--inplace` is refused together with `--ignore-existing` or
-`--as-new` on this path, because an in-place write opens the final pathname
-directly and cannot be made no-replace.
+change type. `--inplace` is refused together with `--ignore-existing`,
+`--existing`, or `--as-new` on this path, because an in-place write opens the
+final pathname directly and can neither be made no-replace nor be pinned to
+an observed object.
 Native `--into-new`/`--as-new` and `--into-existing`/`--as-existing` travel as
 a signed root precondition in a V4 grant, checked against the enrolled root
 when the grant is claimed; an older installed receiver rejects that grant
