@@ -280,18 +280,29 @@ impl ResultsWriter {
         if let Some(blocked) = result.deletions_blocked {
             object.insert("deletions_blocked".into(), blocked.into());
         }
-        self.write(record);
-        self.flush_now();
-        self.sealed.store(true, Relaxed);
+        self.write_and_seal(record, true);
     }
 
-    fn write(&self, mut record: serde_json::Value) {
-        if self.dead.load(Relaxed) || self.sealed.load(Relaxed) {
+    fn write(&self, record: serde_json::Value) {
+        self.write_and_seal(record, false);
+    }
+
+    fn write_and_seal(&self, mut record: serde_json::Value, seal: bool) {
+        if self.dead.load(Relaxed) {
             return;
         }
         // Take the output lock before allocating the sequence number, so
-        // records land in the stream in seq order.
+        // records land in the stream in seq order. The seal is checked and
+        // set under the same lock: a ticker that raced past an unsealed
+        // check would otherwise block on the mutex and append its progress
+        // record after the terminal one.
         let mut out = self.out.lock().unwrap();
+        if self.sealed.load(Relaxed) {
+            return;
+        }
+        if seal {
+            self.sealed.store(true, Relaxed);
+        }
         let seq = self.seq.fetch_add(1, Relaxed);
         let object = record.as_object_mut().expect("record is an object");
         object.insert("schema".into(), SCHEMA.into());
@@ -299,7 +310,10 @@ impl ResultsWriter {
         object.insert("seq".into(), seq.into());
         let written = serde_json::to_writer(&mut *out, &record)
             .map_err(std::io::Error::from)
-            .and_then(|()| out.write_all(b"\n"));
+            .and_then(|()| out.write_all(b"\n"))
+            // The terminal record leaves the process with the stream, so it
+            // flushes inside the same critical section that seals it.
+            .and_then(|()| if seal { out.flush() } else { Ok(()) });
         if let Err(error) = written {
             drop(out);
             self.mark_dead(&error);

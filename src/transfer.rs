@@ -4678,7 +4678,6 @@ impl Planner<'_> {
                         meta: e.meta(),
                         flags: opts.flags & !flags::MODE,
                     });
-                    self.progress.links_created.fetch_add(1, Relaxed);
                 }
                 Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
                     if self.skip_existing(&dst_entry) {
@@ -4762,7 +4761,6 @@ impl Planner<'_> {
                         meta,
                         flags,
                     });
-                    self.progress.specials_created.fetch_add(1, Relaxed);
                 }
                 Kind::Dir | Kind::Other => unreachable!("handled in the mapping loop"),
             }
@@ -4782,16 +4780,21 @@ impl Planner<'_> {
                 if let Some(e) = &error {
                     self.progress
                         .error_classified(&format!("syq: {e}"), Some("io"), None);
+                } else {
+                    // Counted only once the operation settles: a fatal
+                    // unwind between queueing and applying must not leave
+                    // phantom creations in the terminal aggregates.
                     match queued.action {
                         "create_symlink" => {
-                            self.progress.links_created.fetch_sub(1, Relaxed);
+                            self.progress.links_created.fetch_add(1, Relaxed);
                         }
                         _ => {
-                            self.progress.specials_created.fetch_sub(1, Relaxed);
+                            self.progress.specials_created.fetch_add(1, Relaxed);
                         }
                     }
-                } else if opts.verbose > 0 {
-                    self.progress.println(&queued.name);
+                    if opts.verbose > 0 {
+                        self.progress.println(&queued.name);
+                    }
                 }
                 if let Some(results) = self.progress.results_writer() {
                     results.emit_operation(&crate::results::OperationRecord {

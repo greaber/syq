@@ -32,9 +32,13 @@ The results writer lives with the transfer coordinator. For a direct
 remote-to-remote copy the stream rides the coordinator connection
 back to the invoking terminal, and the remote coordinator owns it end
 to end — run record, sequence numbers, and terminal record all come
-from one writer. If the transport collapses, the relayed stream can
-end without a terminal record; that is the standard unknown-outcome
-case below. `--results` cannot be combined with `--detach`, because
+from one writer. When a signed receiver receipt is expected, the
+relayed terminal record is withheld until the receipt verifies, so a
+terminal claiming success can never precede a failed verification; on
+verification failure the stream ends without a terminal record and
+syq exits nonzero. If the transport collapses, the relayed stream can
+likewise end without a terminal record; both are the standard
+unknown-outcome case below. `--results` cannot be combined with `--detach`, because
 the caller would not remain attached for the stream and its terminal
 record.
 
