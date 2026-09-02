@@ -122,10 +122,12 @@ struct AuthorityState {
     /// grant the shortcut above: a second creation of the same path races at
     /// the kernel instead of trusting an outcome that has not happened yet.
     provisional: HashSet<Vec<u8>>,
-    /// Bytes each prepared file may occupy on disk before any payload is
-    /// written: preallocation and basis seeding are charged against the
-    /// aggregate ceiling here, once per path at its largest declared size.
-    reserved: HashMap<Vec<u8>, u64>,
+    /// Bytes each staged or in-place file may occupy on disk, keyed by the
+    /// destination path and the partial this grant declared for it:
+    /// preallocation and basis seeding are charged against the aggregate
+    /// ceiling here, once per file at its largest declared size, and every
+    /// write or publication must name a declared partial.
+    reserved: HashMap<(Vec<u8>, proto::PartialId), u64>,
     reserved_bytes: u64,
     transferred_bytes: u64,
     deletions: u64,
@@ -477,9 +479,10 @@ impl RestrictedAuthority {
     /// the signed aggregate byte ceiling. A path is charged once, at the
     /// largest size declared for it, so retries and resumes do not double
     /// count while many distinct preparations cannot exceed the ceiling.
-    fn reserve_bytes(&self, path: &[u8], size: u64) -> Result<()> {
+    fn reserve_bytes(&self, path: &[u8], partial_id: proto::PartialId, size: u64) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        let previous = state.reserved.get(path).copied().unwrap_or(0);
+        let key = (path.to_vec(), partial_id);
+        let previous = state.reserved.get(&key).copied().unwrap_or(0);
         if size <= previous {
             return Ok(());
         }
@@ -491,7 +494,52 @@ impl RestrictedAuthority {
             bail!("signed grant total-byte limit exceeded by file preparation");
         }
         state.reserved_bytes = total;
-        state.reserved.insert(path.to_vec(), size);
+        state.reserved.insert(key, size);
+        Ok(())
+    }
+
+    /// The size this grant declared for a partial, which bounds what may be
+    /// written into it and what may be published from it. A partial left by
+    /// an earlier grant has no declaration here and cannot be used.
+    fn declared_size(&self, path: &[u8], partial_id: proto::PartialId) -> Result<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .reserved
+            .get(&(path.to_vec(), partial_id))
+            .copied()
+            .with_context(|| {
+                format!(
+                    "staged file {} was not declared under this grant",
+                    String::from_utf8_lossy(path)
+                )
+            })
+    }
+
+    /// Refuse to publish a staged or in-place file that is larger than the
+    /// size this grant declared for it.
+    fn check_published_length(
+        &self,
+        path: &[u8],
+        partial_id: proto::PartialId,
+        inplace: bool,
+    ) -> Result<()> {
+        let declared = self.declared_size(path, partial_id)?;
+        let staged = if inplace {
+            path.to_vec()
+        } else {
+            crate::fsops::partial_path(Path::new(OsStr::from_bytes(path)), &partial_id)?
+                .into_os_string()
+                .into_vec()
+        };
+        if let Some(metadata) = self.rooted_metadata(&staged)? {
+            if metadata.len > declared {
+                bail!(
+                    "staged file {} exceeds its declared size",
+                    String::from_utf8_lossy(path)
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1428,7 +1476,11 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::SeedBasis {
-                path, len, guard, ..
+                path,
+                partial_id,
+                len,
+                guard,
+                ..
             } => {
                 if self.copy.policy.publication != PublicationPolicyV1::AtomicStaged {
                     bail!("in-place signed receiver forbids staged basis creation");
@@ -1438,7 +1490,7 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, false, None, pending)?;
-                self.reserve_bytes(path, *len)?;
+                self.reserve_bytes(path, *partial_id, *len)?;
                 *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
@@ -1464,6 +1516,7 @@ impl RestrictedAuthority {
                 path,
                 size,
                 inplace,
+                partial_id,
                 guard,
                 ..
             } => {
@@ -1475,12 +1528,13 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_prepare(path)?;
-                self.reserve_bytes(path, *size)?;
+                self.reserve_bytes(path, *partial_id, *size)?;
                 *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
                 path,
                 inplace,
+                partial_id,
                 off,
                 data,
                 guard,
@@ -1489,12 +1543,20 @@ impl RestrictedAuthority {
                 if *inplace != (self.copy.policy.publication == PublicationPolicyV1::InPlace) {
                     bail!("file write does not match the signed publication policy");
                 }
+                let declared = self.declared_size(path, *partial_id)?;
+                if off
+                    .checked_add(data.len() as u64)
+                    .is_none_or(|end| end > declared)
+                {
+                    bail!("file write extends past the size declared for it");
+                }
                 self.charge_bytes(path, *off, data.len())?;
                 *guard = Some(self.guard.clone());
             }
             Request::Finalize {
                 path,
                 inplace,
+                partial_id,
                 meta,
                 flags,
                 condition,
@@ -1505,6 +1567,7 @@ impl RestrictedAuthority {
                     bail!("file finalization does not match the signed publication policy");
                 }
                 self.check_mutation_path(path, false)?;
+                self.check_published_length(path, *partial_id, *inplace)?;
                 self.constrain_creation(path, condition, false, 0, pending)?;
                 self.constrain_receiver_mode(
                     path,
@@ -3827,6 +3890,9 @@ mod tests {
 
         // A failed no-replace publication leaves nothing behind, so a foreign
         // object that appears afterwards is retained like any other.
+        authority
+            .authorize(&mut prepare_request(&fresh), false)
+            .unwrap();
         let mut publish = finalize_request(&fresh, Any);
         let settlement = authority.authorize(&mut publish, false).unwrap();
         authority.settle(settlement, &proto::Response::Err("raced".into()));
@@ -3838,6 +3904,9 @@ mod tests {
         let mut publish = small_put(&kept);
         let settlement = authority.authorize(&mut publish, false).unwrap();
         authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        authority
+            .authorize(&mut prepare_request(&kept), false)
+            .unwrap();
         let mut republish = finalize_request(&kept, Matches { dev: 1, ino: 1 });
         authority.authorize(&mut republish, false).unwrap();
 
@@ -3936,6 +4005,9 @@ mod tests {
             },
         );
         assert!(authority.authorize(&mut stale, false).is_err());
+        authority
+            .authorize(&mut prepare_request(&present), false)
+            .unwrap();
         let mut exact = finalize_request(
             &present,
             Matches {
@@ -4267,6 +4339,9 @@ mod tests {
         let mut revisit_root = apply(mkdir(&target));
         authority.authorize(&mut revisit_root, false).unwrap();
         assert_eq!(op_condition(&revisit_root), Any);
+        authority
+            .authorize(&mut prepare_request(&target.join("child")), false)
+            .unwrap();
         let mut child = finalize_request(&target.join("child"), Any);
         authority.authorize(&mut child, false).unwrap();
         assert_eq!(finalize_condition(&child), Any);
@@ -4723,6 +4798,18 @@ mod tests {
             guard: None,
         };
 
+        // Writes must land in a partial this grant declared.
+        assert!(authority.authorize(&mut request(0), false).is_err());
+        let mut prepare = Request::Prepare {
+            path: target.clone(),
+            size: 1024,
+            inplace: false,
+            partial_id: [0; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        authority.authorize(&mut prepare, false).unwrap();
+
         let started = Instant::now();
         authority.authorize(&mut request(0), false).unwrap();
         authority.authorize(&mut request(256), false).unwrap();
@@ -4731,7 +4818,7 @@ mod tests {
             "signed aggregate rate limit did not pace consecutive writes"
         );
 
-        let mut oversized = request(512);
+        let mut oversized = request(0);
         if let Request::WriteRange { data, .. } = &mut oversized {
             data.resize(513, 0);
         }

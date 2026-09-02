@@ -294,8 +294,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     }
                     Ok(w.write_msg(&Response::ScanBatch(batch))?)
                 };
-                let mut ignored =
-                    |paths| Ok(wref.borrow_mut().write_msg(&Response::ScanIgnored(paths))?);
+                let mut ignored = |paths: Vec<crate::proto::PathBytes>| {
+                    if let Some(authority) = &authority {
+                        authority
+                            .record_scanned(&requested_root, paths.iter().map(Vec::as_slice))?;
+                    }
+                    Ok(wref.borrow_mut().write_msg(&Response::ScanIgnored(paths))?)
+                };
                 let res = if let Some(guard) = guard {
                     crate::scan::scan_rooted(
                         &root,
