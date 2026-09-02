@@ -392,7 +392,9 @@ apply only to a direct copy between distinct remote endpoints. A detached
 launch requires coordinator-owned credentials (`--no-forward-agent`) or an
 explicit remote-shell policy; the launcher reports a follow target only after
 the detached coordinator has established the transfer route and completed
-destination preflight.
+destination preflight. If that readiness deadline expires, the launcher
+terminates and verifies the complete detached process group before reporting
+failure.
 
 The one-shot command-restricted write receiver currently requires encrypted
 TCP data connections. Consequently `--no-tcp`, TCP fallback, `--tcp-plain`,
@@ -520,10 +522,10 @@ credential caching, and notably a hardware-token approval is not required for
 reuse; do not enable it where that window is unacceptable. Data connections
 are unaffected: they remain separate TCP streams (or independent ssh
 processes under `--no-tcp`), so throughput does not change. Not available
-with an explicit `-e`/`--rsh`. Direct remote-to-remote transfers refuse it —
-the orchestrator runs on the source host, where no reusable local master
-exists — so add `--relay` to keep the orchestrator and its reusable
-connections on this machine; the command-restricted path additionally
+with an explicit `-e`/`--rsh`. Explicit endpoint ports are part of the reuse
+identity. Direct remote-to-remote transfers refuse it because a remote
+coordinator has no reusable local master, so use `--relay` with `syq rsync` or
+`--run-at local` with native syntax; the command-restricted path additionally
 refuses it because its host-bound authentication is verified on each fresh
 connection.
 

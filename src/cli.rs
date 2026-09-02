@@ -947,6 +947,9 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
                 parsed.size_selection,
             )
         };
+    if parsed.reuse_connection && remote.rsh.is_some() {
+        bail!("--reuse-connection cannot be used with --rsh");
+    }
     // `syq map` keeps `-C` out of selector paths so emitted `src` values stay
     // relative to it; the walk joins it back.
     let map_cwd = if interface == Interface::NativeMap {
@@ -1953,6 +1956,22 @@ mod tests {
         assert!(args.no_tcp);
         assert_eq!(args.tcp_ports, "49000-49010");
         assert!(args.detach);
+    }
+
+    #[test]
+    fn native_reuse_connection_rejects_an_explicit_remote_shell() {
+        let argv = [
+            "--reuse-connection",
+            "--rsh=ssh -J jump",
+            "source",
+            "--into",
+            "destination",
+        ]
+        .map(std::ffi::OsString::from);
+        let error = parse_native_copy(&argv, Interface::NativeCp).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--reuse-connection cannot be used with --rsh"));
     }
 
     #[test]

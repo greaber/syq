@@ -229,6 +229,18 @@ fn native_placement_arg(args: &Args) -> Result<&'static str> {
     })
 }
 
+fn detached_launcher_command(
+    remote_command: &str,
+    name: &str,
+    readiness_attempts: u32,
+    termination_attempts: u32,
+) -> String {
+    format!(
+        "mkdir -p \"$HOME/.syq\" && [ -x /bin/kill ] || {{ echo 'syq: detached launch requires /bin/kill for process-group cleanup' >&2; exit 1; }}; log=\"$HOME/.syq/{name}-$(date +%Y%m%d-%H%M%S)-$$.log\" && ready=\"$log.ready\" && rm -f -- \"$ready\" && {{ terminate_group() {{ /bin/kill -TERM -- \"-$pid\" 2>/dev/null || :; j=0; while /bin/kill -0 -- \"-$pid\" 2>/dev/null && [ \"$j\" -lt {termination_attempts} ]; do j=$((j + 1)); sleep 1; done; if /bin/kill -0 -- \"-$pid\" 2>/dev/null; then /bin/kill -KILL -- \"-$pid\" 2>/dev/null || :; fi; wait \"$pid\" 2>/dev/null || :; j=0; while /bin/kill -0 -- \"-$pid\" 2>/dev/null && [ \"$j\" -lt {termination_attempts} ]; do j=$((j + 1)); sleep 1; done; ! /bin/kill -0 -- \"-$pid\" 2>/dev/null; }}; SYQ_INTERNAL_DETACH_READY=\"$ready\" setsid nohup sh -c {} > \"$log\" 2>&1 < /dev/null & pid=$!; i=0; while [ \"$i\" -lt {readiness_attempts} ]; do if [ -f \"$ready\" ]; then rm -f -- \"$ready\"; echo \"$log\"; exit 0; fi; if ! kill -0 \"$pid\" 2>/dev/null; then wait \"$pid\"; status=$?; cat -- \"$log\" >&2; exit \"$status\"; fi; i=$((i + 1)); sleep 1; done; if ! terminate_group; then rm -f -- \"$ready\"; cat -- \"$log\" >&2; echo 'syq: could not terminate timed-out detached coordinator process group' >&2; exit 1; fi; rm -f -- \"$ready\"; cat -- \"$log\" >&2; echo 'syq: detached coordinator did not become ready within {readiness_attempts} seconds' >&2; exit 1; }}",
+        shell_words::quote(remote_command)
+    )
+}
+
 pub fn run(
     args: &Args,
     srcs: &[Location],
@@ -721,10 +733,7 @@ fn run_remote(
         } else {
             name
         };
-        format!(
-            "mkdir -p \"$HOME/.syq\" && log=\"$HOME/.syq/{name}-$(date +%Y%m%d-%H%M%S)-$$.log\" && ready=\"$log.ready\" && rm -f -- \"$ready\" && {{ SYQ_INTERNAL_DETACH_READY=\"$ready\" setsid nohup sh -c {} > \"$log\" 2>&1 < /dev/null & pid=$!; i=0; while [ \"$i\" -lt 30 ]; do if [ -f \"$ready\" ]; then rm -f -- \"$ready\"; echo \"$log\"; exit 0; fi; if ! kill -0 \"$pid\" 2>/dev/null; then wait \"$pid\"; status=$?; cat -- \"$log\" >&2; exit \"$status\"; fi; i=$((i + 1)); sleep 1; done; kill \"$pid\" 2>/dev/null; wait \"$pid\" 2>/dev/null; cat -- \"$log\" >&2; echo 'syq: detached coordinator did not become ready within 30 seconds' >&2; exit 1; }}",
-            shell_words::quote(&remote_cmd)
-        )
+        detached_launcher_command(&remote_cmd, &name, 30, 5)
     } else {
         remote_cmd
     };
@@ -966,6 +975,49 @@ mod tests {
         let location = parse_follow_location("[2001:db8::1]:2200:/tmp/run.log").unwrap();
         assert_eq!(location.host.as_deref(), Some("2001:db8::1"));
         assert_eq!(location.port, Some(2200));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_timeout_terminates_the_complete_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let pids = directory.path().join("pids");
+        let survived = directory.path().join("survived");
+        let remote_command = format!(
+            "trap '' TERM; (trap '' TERM; sleep 30; printf survived > {}) & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > {}; wait",
+            shell_words::quote(survived.to_str().unwrap()),
+            shell_words::quote(pids.to_str().unwrap()),
+        );
+        let launcher = detached_launcher_command(&remote_command, "timeout-test", 1, 1);
+        let output = Command::new("sh")
+            .args(["-c", &launcher])
+            .env("HOME", directory.path())
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("did not become ready within 1 seconds"),
+            "{stderr}"
+        );
+        let process_ids: Vec<i32> = std::fs::read_to_string(pids)
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        assert_eq!(process_ids.len(), 2);
+        let alive: Vec<i32> = process_ids
+            .into_iter()
+            .filter(|pid| unsafe { libc::kill(*pid, 0) == 0 })
+            .collect();
+        for pid in &alive {
+            unsafe {
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+        assert!(alive.is_empty(), "detached processes survived: {alive:?}");
+        assert!(!survived.exists());
     }
 
     #[test]

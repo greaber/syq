@@ -367,12 +367,10 @@ impl SshEndpoint {
         {
             bail!("invalid native enrollment endpoint");
         }
-        let host = if host.contains(':') {
-            format!("[{host}]")
-        } else {
-            host.to_owned()
-        };
         Ok(Self {
+            // OpenSSH takes a literal IPv6 address without URI-style
+            // brackets. Brackets belong only in syq's endpoint grammar and
+            // human-facing labels; -p carries the port separately.
             target: format!("{user}@{host}"),
             port,
         })
@@ -383,9 +381,13 @@ impl SshEndpoint {
     }
 
     pub(crate) fn label(&self) -> String {
+        let target = match self.target.rsplit_once('@') {
+            Some((user, host)) if host.contains(':') => format!("{user}@[{host}]"),
+            _ => self.target.clone(),
+        };
         match self.port {
-            Some(port) => format!("{}:{port}", self.target),
-            None => self.target.clone(),
+            Some(port) => format!("{target}:{port}"),
+            None => target,
         }
     }
 
@@ -735,7 +737,10 @@ mod tests {
                 && arg.contains("-p 2200")
                 && arg.contains("alice@jump.example")
         }));
-        assert!(args.iter().any(|arg| arg == "backup@[2001:db8::1]"));
+        assert_eq!(target.as_str(), "backup@2001:db8::1");
+        assert_eq!(target.label(), "backup@[2001:db8::1]:2222");
+        assert!(args.iter().any(|arg| arg == "backup@2001:db8::1"));
+        assert!(!args.iter().any(|arg| arg.contains("[2001:db8::1]")));
     }
 
     #[test]
