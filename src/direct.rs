@@ -6,42 +6,134 @@ use crate::delegation::RequestId;
 use crate::enrollment::EnrollmentId;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Read, Seek, Write};
 use std::process::{Command, Stdio};
 
 /// What the invoking machine expects hostB's receipt to say about itself.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ReceiptExpectation {
     public_key: String,
     enrollment_id: EnrollmentId,
     request_id: RequestId,
+    recipient_secret: Option<crate::receipt_v2::RecipientSecret>,
+    policy: Option<crate::receipt_v2::ReceiptPolicyV2>,
+    grant_digest: Option<[u8; 32]>,
 }
 
 /// The receipt envelope is bounded at 64 MiB; allow for base64 and slack.
 const MAX_RECEIPT_LINE_BYTES: usize = 96 * 1024 * 1024;
+const MAX_RECEIPT_V2_LINE_BYTES: usize = 192 * 1024;
+const MAX_RECEIPT_V2_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
+
+enum CapturedReceipt {
+    V1(Vec<u8>),
+    V2(CapturedReceiptV2),
+}
+
+struct CapturedReceiptV2 {
+    file: std::fs::File,
+    frames: u64,
+    bytes: u64,
+    ended: bool,
+}
+
+impl CapturedReceiptV2 {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            file: tempfile::tempfile().context("create encrypted receipt spool")?,
+            frames: 0,
+            bytes: 0,
+            ended: false,
+        })
+    }
+
+    fn push(&mut self, encoded: &[u8]) -> Result<()> {
+        if self.ended {
+            bail!("the relayed receipt contains a frame after its terminal frame");
+        }
+        let terminal = crate::receipt_v2::transport_frame_is_end(encoded)?;
+        let length = u32::try_from(encoded.len()).context("receipt frame length exceeds u32")?;
+        let added = 4u64 + u64::from(length);
+        self.bytes = self
+            .bytes
+            .checked_add(added)
+            .context("receipt capture byte count overflow")?;
+        if self.bytes > MAX_RECEIPT_V2_CAPTURE_BYTES {
+            bail!("the relayed receipt exceeds its local capture limit");
+        }
+        self.file.write_all(&length.to_be_bytes())?;
+        self.file.write_all(encoded)?;
+        self.frames += 1;
+        self.ended = terminal;
+        Ok(())
+    }
+
+    fn frames(&mut self) -> Result<CapturedFrames<'_>> {
+        self.file.flush()?;
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        Ok(CapturedFrames {
+            file: &mut self.file,
+            remaining: self.frames,
+        })
+    }
+}
+
+struct CapturedFrames<'a> {
+    file: &'a mut std::fs::File,
+    remaining: u64,
+}
+
+impl Iterator for CapturedFrames<'_> {
+    type Item = Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        Some((|| {
+            let mut length = [0u8; 4];
+            self.file.read_exact(&mut length)?;
+            let mut encoded = vec![0u8; u32::from_be_bytes(length) as usize];
+            self.file.read_exact(&mut encoded)?;
+            Ok(encoded)
+        })())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReceiptLineKind {
+    V1,
+    V2,
+}
 
 /// Pass the orchestrator's stdout through byte for byte, keeping only the
-/// receipt line to ourselves. Used only when a receipt is expected; other
-/// transfers inherit stdout untouched. Returns the last receipt payload.
-fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<Vec<u8>>> {
+/// receipt marker lines to ourselves. Used only when a receipt is expected;
+/// other transfers inherit stdout untouched. V2 frames are decoded one line
+/// at a time and spooled rather than accumulated in memory.
+fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
     relay_stdout_bounded(stdout, MAX_RECEIPT_LINE_BYTES)
 }
 
 /// Streams every ordinary line straight through without holding more than
 /// one buffer of it, so a hostile orchestrator cannot make this machine
 /// buffer an arbitrarily long line; only a receipt line is collected, up to
-/// `limit` bytes.
-fn relay_stdout_bounded(stdout: impl std::io::Read, limit: usize) -> Result<Option<Vec<u8>>> {
-    use std::io::Write;
-    let prefix = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes();
+/// its protocol-specific limit.
+fn relay_stdout_bounded(
+    stdout: impl std::io::Read,
+    legacy_limit: usize,
+) -> Result<Option<CapturedReceipt>> {
+    let v1_prefix = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes();
+    let v2_prefix = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes();
+    let decision_len = v1_prefix.len().max(v2_prefix.len());
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
     let mut out = std::io::stdout().lock();
     let mut receipt = None;
     // The first bytes of the current line, held only until the prefix
     // decision; then either the receipt payload being collected or nothing.
-    let mut head: Vec<u8> = Vec::with_capacity(prefix.len());
+    let mut head: Vec<u8> = Vec::with_capacity(decision_len);
     let mut decided = false;
-    let mut capturing: Option<Vec<u8>> = None;
+    let mut capturing: Option<(ReceiptLineKind, Vec<u8>)> = None;
     let finish_capture = |payload: &mut Vec<u8>| {
         while payload
             .last()
@@ -68,31 +160,36 @@ fn relay_stdout_bounded(stdout: impl std::io::Read, limit: usize) -> Result<Opti
             consumed += segment.len();
             if !decided {
                 head.extend_from_slice(segment);
-                if head.len() >= prefix.len() || ends_line {
+                if head.len() >= decision_len || ends_line {
                     decided = true;
-                    if head.starts_with(prefix) {
-                        capturing = Some(head[prefix.len()..].to_vec());
+                    if head.starts_with(v2_prefix) {
+                        capturing = Some((ReceiptLineKind::V2, head[v2_prefix.len()..].to_vec()));
+                    } else if head.starts_with(v1_prefix) {
+                        capturing = Some((ReceiptLineKind::V1, head[v1_prefix.len()..].to_vec()));
                     } else {
                         out.write_all(&head)
                             .context("relay remote orchestrator output")?;
                     }
                     head.clear();
                 }
-            } else if let Some(payload) = capturing.as_mut() {
+            } else if let Some((_, payload)) = capturing.as_mut() {
                 payload.extend_from_slice(segment);
             } else {
                 out.write_all(segment)
                     .context("relay remote orchestrator output")?;
             }
-            if let Some(payload) = capturing.as_mut() {
+            if let Some((kind, payload)) = capturing.as_mut() {
+                let limit = match kind {
+                    ReceiptLineKind::V1 => legacy_limit,
+                    ReceiptLineKind::V2 => MAX_RECEIPT_V2_LINE_BYTES,
+                };
                 if payload.len() > limit {
                     bail!("the relayed receipt line exceeds {limit} bytes");
                 }
             }
             if ends_line {
-                if let Some(payload) = capturing.as_mut() {
-                    receipt = Some(finish_capture(payload));
-                    capturing = None;
+                if let Some((kind, mut payload)) = capturing.take() {
+                    store_receipt_line(&mut receipt, kind, finish_capture(&mut payload))?;
                 } else {
                     out.flush().context("relay remote orchestrator output")?;
                 }
@@ -103,18 +200,48 @@ fn relay_stdout_bounded(stdout: impl std::io::Read, limit: usize) -> Result<Opti
     }
     // Output that ended without a newline.
     if !head.is_empty() {
-        if head.starts_with(prefix) {
-            capturing = Some(head[prefix.len()..].to_vec());
+        if head.starts_with(v2_prefix) {
+            capturing = Some((ReceiptLineKind::V2, head[v2_prefix.len()..].to_vec()));
+        } else if head.starts_with(v1_prefix) {
+            capturing = Some((ReceiptLineKind::V1, head[v1_prefix.len()..].to_vec()));
         } else {
             out.write_all(&head)
                 .context("relay remote orchestrator output")?;
         }
     }
-    if let Some(payload) = capturing.as_mut() {
-        receipt = Some(finish_capture(payload));
+    if let Some((kind, mut payload)) = capturing.take() {
+        store_receipt_line(&mut receipt, kind, finish_capture(&mut payload))?;
     }
     out.flush().context("relay remote orchestrator output")?;
     Ok(receipt)
+}
+
+fn store_receipt_line(
+    captured: &mut Option<CapturedReceipt>,
+    kind: ReceiptLineKind,
+    payload: Vec<u8>,
+) -> Result<()> {
+    match kind {
+        ReceiptLineKind::V1 => {
+            if captured.is_some() {
+                bail!("the remote orchestrator relayed more than one legacy receipt line");
+            }
+            *captured = Some(CapturedReceipt::V1(payload));
+        }
+        ReceiptLineKind::V2 => {
+            let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(payload.trim_ascii())
+                .context("decode a receipt v2 frame relayed from the source host")?;
+            if captured.is_none() {
+                *captured = Some(CapturedReceipt::V2(CapturedReceiptV2::new()?));
+            }
+            let Some(CapturedReceipt::V2(receipt)) = captured.as_mut() else {
+                bail!("the remote orchestrator mixed receipt protocol versions");
+            };
+            receipt.push(&encoded)?;
+        }
+    }
+    Ok(())
 }
 
 /// Verify hostB's receipt against the grant this machine signed. A missing,
@@ -122,16 +249,31 @@ fn relay_stdout_bounded(stdout: impl std::io::Read, limit: usize) -> Result<Opti
 /// what the source-side orchestrator reported.
 fn settle_receipt(
     expectation: &ReceiptExpectation,
-    payload: Option<&[u8]>,
+    captured: Option<&mut CapturedReceipt>,
     src_host: &str,
     dst_host: &str,
-    orchestrator_succeeded: bool,
+    orchestrator_exit_code: i32,
+    emit_results: bool,
     verbose: bool,
 ) -> Result<()> {
-    let Some(payload) = payload else {
+    let Some(captured) = captured else {
         bail!(
             "the command-restricted receiver on {dst_host} issued no receipt through {src_host}; what landed cannot be verified"
         );
+    };
+    if expectation.policy.is_some() {
+        return settle_receipt_v2(
+            expectation,
+            captured,
+            src_host,
+            dst_host,
+            orchestrator_exit_code,
+            emit_results,
+            verbose,
+        );
+    }
+    let CapturedReceipt::V1(payload) = captured else {
+        bail!("the receiver on {dst_host} returned a receipt protocol version that does not match the signed grant");
     };
     let envelope = base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(payload.trim_ascii())
@@ -161,7 +303,7 @@ fn settle_receipt(
             "{} in-place file(s) on {dst_host} were written but never completed",
             receipt.incomplete_count
         );
-        if orchestrator_succeeded {
+        if orchestrator_exit_code == 0 {
             bail!("{message}, yet {src_host} reported success");
         }
         eprintln!("syq: warning: {message}");
@@ -174,6 +316,147 @@ fn settle_receipt(
             receipt.deleted_count,
             receipt.observed_count,
             receipt.entries
+        );
+    }
+    Ok(())
+}
+
+fn settle_receipt_v2(
+    expectation: &ReceiptExpectation,
+    captured: &mut CapturedReceipt,
+    src_host: &str,
+    dst_host: &str,
+    orchestrator_exit_code: i32,
+    emit_results: bool,
+    verbose: bool,
+) -> Result<()> {
+    let CapturedReceipt::V2(captured) = captured else {
+        bail!("the receiver on {dst_host} returned a legacy receipt for a v2 grant");
+    };
+    if !captured.ended {
+        bail!("the receipt relayed through {src_host} has no terminal frame");
+    }
+    let secret = expectation
+        .recipient_secret
+        .as_ref()
+        .context("the local HPKE receipt key is unavailable")?;
+    let policy = expectation
+        .policy
+        .as_ref()
+        .context("the signed receipt policy is unavailable")?;
+    if !matches!(
+        policy.delivery,
+        crate::receipt_v2::ReceiptDeliveryV2::AttachedEncrypted { .. }
+    ) {
+        bail!("an attached transfer has a detached receipt policy");
+    }
+    let grant_digest = expectation
+        .grant_digest
+        .context("the signed grant digest is unavailable")?;
+    let frames = captured.frames()?;
+    let mut receipt = crate::receipt_v2::open_attached_frames(
+        frames,
+        secret,
+        &expectation.public_key,
+        expectation.enrollment_id,
+        expectation.request_id,
+        grant_digest,
+        policy,
+    )
+    .with_context(|| format!("decrypt and verify the receipt from {dst_host}"))?;
+
+    let mut first_problem = None;
+    receipt.for_each_record(|record| {
+        if first_problem.is_none() {
+            first_problem = match record {
+                crate::receipt_v2::RecordV2::Operation(record)
+                    if !matches!(
+                        record.disposition,
+                        crate::receipt_v2::OperationDispositionV2::Applied
+                            | crate::receipt_v2::OperationDispositionV2::Observed
+                    ) =>
+                {
+                    Some(format!(
+                        "{:?} {:?} for scope {} path {:?}{}",
+                        record.action,
+                        record.disposition,
+                        record.scope,
+                        String::from_utf8_lossy(&record.path),
+                        record
+                            .diagnostic
+                            .as_deref()
+                            .map(|message| format!(": {message}"))
+                            .unwrap_or_default()
+                    ))
+                }
+                crate::receipt_v2::RecordV2::Refusal(record) => Some(format!(
+                    "receiver refusal{}",
+                    record
+                        .diagnostic
+                        .as_deref()
+                        .map(|message| format!(": {message}"))
+                        .unwrap_or_default()
+                )),
+                crate::receipt_v2::RecordV2::FinalState(record)
+                    if matches!(
+                        record.object,
+                        crate::receipt_v2::FinalObjectV2::ObservationFailed { .. }
+                            | crate::receipt_v2::FinalObjectV2::Present {
+                                observation_error: Some(_),
+                                ..
+                            }
+                    ) =>
+                {
+                    Some(format!(
+                        "final-state observation failed for scope {} path {:?}",
+                        record.scope,
+                        String::from_utf8_lossy(&record.path)
+                    ))
+                }
+                _ => None,
+            };
+        }
+        Ok(())
+    })?;
+
+    let terminal = receipt.terminal.clone();
+    if emit_results {
+        crate::receipt_v2::write_automation_results(
+            &mut receipt,
+            &mut std::io::stdout().lock(),
+            orchestrator_exit_code,
+        )
+        .context("write receiver-attested --results stream")?;
+    }
+    if terminal.summary.refusals > 0 {
+        bail!(
+            "the receiver on {dst_host} refused {} request(s) from {src_host}; first: {}",
+            terminal.summary.refusals,
+            first_problem.as_deref().unwrap_or("(no detail recorded)")
+        );
+    }
+    if terminal.status != crate::receipt_v2::ReceiptStatusV2::Clean {
+        let message = format!(
+            "the receiver on {dst_host} issued a {:?} receipt{}",
+            terminal.status,
+            first_problem
+                .as_deref()
+                .map(|problem| format!("; first: {problem}"))
+                .unwrap_or_default()
+        );
+        if orchestrator_exit_code == 0 {
+            bail!("{message}, yet {src_host} reported success");
+        }
+        eprintln!("syq: warning: {message}");
+    }
+    if verbose {
+        eprintln!(
+            "syq: encrypted receipt from {dst_host} verified: {} operations, {} final states, {} files published ({}), {} deletions",
+            terminal.summary.operations,
+            terminal.summary.final_states,
+            terminal.summary.published_files,
+            crate::progress::human(terminal.summary.published_bytes),
+            terminal.summary.deletions
         );
     }
     Ok(())
@@ -515,6 +798,9 @@ fn run_remote(
                 public_key: prepared.receipt_public_key.clone(),
                 enrollment_id: prepared.enrollment_id,
                 request_id: prepared.request_id,
+                recipient_secret: prepared.receipt_recipient_secret,
+                policy: Some(prepared.receipt_policy),
+                grant_digest: Some(prepared.grant_digest),
             });
             if !args.quiet {
                 eprintln!(
@@ -632,7 +918,7 @@ fn run_remote(
     if let Some(n) = args.max_delete {
         remote.push(format!("--max-delete={n}"));
     }
-    if args.native_results.is_some() {
+    if args.native_results.is_some() && receipt_expectation.is_none() {
         // run_remote accepts only stdout above. The outer SSH process inherits
         // stdout, so the NDJSON stream and its terminal record reach the
         // original caller without assigning surprising remote path semantics.
@@ -810,6 +1096,11 @@ fn run_remote(
         );
     }
     if args.detach {
+        if receipt_expectation.is_some() {
+            eprintln!(
+                "syq: warning: detached restricted transfer reports only that the job started; its final signed receipt will be plaintext in hostA's log, visible to hostA, and will not be verified on this machine"
+            );
+        }
         let run = || {
             let mut cmd = make_command();
             cmd.stdin(Stdio::null())
@@ -890,10 +1181,11 @@ fn run_remote(
     if let Some(expectation) = &receipt_expectation {
         settle_receipt(
             expectation,
-            receipt_payload.as_deref(),
+            receipt_payload.as_mut(),
             &coordinator_host,
             peer.host.as_deref().unwrap_or("the peer endpoint"),
-            code == 0,
+            code,
+            args.native_results.is_some(),
             args.verbose > 0,
         )?;
     }
@@ -1081,6 +1373,9 @@ mod tests {
             public_key: key.public_key().to_openssh().unwrap(),
             enrollment_id,
             request_id,
+            recipient_secret: None,
+            policy: None,
+            grant_digest: None,
         };
         let mut ledger = crate::receipt::Ledger::default();
         ledger.published.insert(
@@ -1099,12 +1394,15 @@ mod tests {
                 .encode(crate::receipt::sign(&receipt, &key).unwrap())
         };
         let settle = |expectation: &ReceiptExpectation, payload: Option<&str>| {
+            let mut captured =
+                payload.map(|payload| CapturedReceipt::V1(payload.as_bytes().to_vec()));
             settle_receipt(
                 expectation,
-                payload.map(str::as_bytes),
+                captured.as_mut(),
                 "host-a",
                 "host-b",
-                true,
+                0,
+                false,
                 false,
             )
         };
@@ -1137,11 +1435,13 @@ mod tests {
         );
         let partial = encode(&partial, request_id);
         assert!(settle(&expectation, Some(&partial)).is_err());
+        let mut captured = CapturedReceipt::V1(partial.as_bytes().to_vec());
         settle_receipt(
             &expectation,
-            Some(partial.as_bytes()),
+            Some(&mut captured),
             "host-a",
             "host-b",
+            23,
             false,
             false,
         )
@@ -1155,7 +1455,11 @@ mod tests {
         .unwrap();
         let mismatched = ReceiptExpectation {
             public_key: stranger.public_key().to_openssh().unwrap(),
-            ..expectation.clone()
+            enrollment_id,
+            request_id,
+            recipient_secret: None,
+            policy: None,
+            grant_digest: None,
         };
         assert!(settle(&mismatched, Some(&good)).is_err());
 
@@ -1165,11 +1469,12 @@ mod tests {
         output.extend_from_slice(crate::receipt::RECEIPT_LINE_PREFIX.as_bytes());
         output.extend_from_slice(good.as_bytes());
         output.extend_from_slice(b"\r\n");
-        assert_eq!(
-            relay_stdout(output.as_slice()).unwrap().as_deref(),
-            Some(good.as_bytes())
-        );
-        assert_eq!(relay_stdout(b"plain\n".as_slice()).unwrap(), None);
+        let relayed = relay_stdout(output.as_slice()).unwrap().unwrap();
+        let CapturedReceipt::V1(relayed) = relayed else {
+            panic!("expected a legacy receipt");
+        };
+        assert_eq!(relayed, good.as_bytes());
+        assert!(relay_stdout(b"plain\n".as_slice()).unwrap().is_none());
 
         // Ordinary lines stream through however long they are, a receipt
         // line without a trailing newline still counts, and an oversized
@@ -1178,16 +1483,50 @@ mod tests {
         long.push(b'\n');
         long.extend_from_slice(crate::receipt::RECEIPT_LINE_PREFIX.as_bytes());
         long.extend_from_slice(good.as_bytes());
-        assert_eq!(
-            relay_stdout_bounded(long.as_slice(), 4096)
-                .unwrap()
-                .as_deref(),
-            Some(good.as_bytes())
-        );
+        let relayed = relay_stdout_bounded(long.as_slice(), 4096)
+            .unwrap()
+            .unwrap();
+        let CapturedReceipt::V1(relayed) = relayed else {
+            panic!("expected a legacy receipt");
+        };
+        assert_eq!(relayed, good.as_bytes());
         let mut oversized = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
         oversized.extend(std::iter::repeat_n(b'A', 5000));
         oversized.push(b'\n');
         assert!(relay_stdout_bounded(oversized.as_slice(), 4096).is_err());
+
+        // V2 marker lines are decoded and spooled as separate bounded frames,
+        // not accumulated into one receipt allocation.
+        let frames = [
+            crate::receipt_v2::TransportFrameV2::Start {
+                mode: crate::receipt_v2::TransportModeV2::DetachedSignedPlaintext,
+                encapsulated_key: Vec::new(),
+            },
+            crate::receipt_v2::TransportFrameV2::Chunk {
+                sequence: 0,
+                payload: b"stream".to_vec(),
+            },
+            crate::receipt_v2::TransportFrameV2::End {
+                sequence: 1,
+                payload: b"terminal".to_vec(),
+            },
+        ]
+        .map(|frame| crate::receipt_v2::encode_transport_frame(&frame).unwrap());
+        let mut output = Vec::new();
+        for frame in &frames {
+            output.extend_from_slice(crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes());
+            output.extend_from_slice(
+                base64::engine::general_purpose::STANDARD_NO_PAD
+                    .encode(frame)
+                    .as_bytes(),
+            );
+            output.push(b'\n');
+        }
+        let Some(CapturedReceipt::V2(mut captured)) = relay_stdout(&output[..]).unwrap() else {
+            panic!("expected captured receipt v2 frames");
+        };
+        let captured: Vec<Vec<u8>> = captured.frames().unwrap().map(Result::unwrap).collect();
+        assert_eq!(captured, frames);
     }
 
     #[test]

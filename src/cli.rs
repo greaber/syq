@@ -728,7 +728,7 @@ struct NativeCopyOperationalArgs {
     /// Command-restricted receiver ceiling: the signed grant expires DURATION after it is issued, e.g. 30m or 2h (direct remote-to-remote only; at most 23h)
     #[arg(long, value_name = "DURATION")]
     max_runtime: Option<String>,
-    /// Receipt detail from the command-restricted receiver: sizes of published files (default) or also a BLAKE3 digest of each (direct remote-to-remote only)
+    /// Receiver receipt detail: final sizes (default) or also final BLAKE3 file digests (direct remote-to-remote only)
     #[arg(long, value_name = "MODE", value_enum)]
     receipt: Option<ReceiptMode>,
 }
@@ -770,7 +770,7 @@ struct NativeRemoteArgs {
         conflicts_with = "no_tcp"
     )]
     tcp_congestion: Option<String>,
-    /// Run a remote-to-remote transfer detached at its coordinator
+    /// Run at the remote coordinator and return after launch; restricted receipts remain plaintext in its log and are not locally verified
     #[arg(long)]
     detach: bool,
     /// Give a remote coordinator no forwarded agent; it must own credentials for the peer

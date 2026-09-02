@@ -10,6 +10,11 @@
 //! record for every counted error; exactly one terminal `result`. Unchanged
 //! and excluded entries are aggregated in the terminal record only, and
 //! metadata-only updates are not yet reported per operation.
+//!
+//! Attached direct copies through a command-restricted receiver are the one
+//! exception: receipt_v2 emits their stream locally after verification, marks
+//! its provenance, omits source-side claims hostB cannot authenticate, and
+//! includes closure-time final-state records.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};

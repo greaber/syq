@@ -2073,20 +2073,55 @@ pub fn run(args: Args) -> Result<i32> {
     drop(st);
 
     // With a command-restricted receiver, ask for its signed receipt now that
-    // every mutation is settled, and hand it to the invoking machine as one
-    // marked line. That machine verifies it; this orchestrator's own report
-    // is not trusted for what landed.
+    // every mutation is settled, and hand its bounded frames to the invoking
+    // machine as marked lines. That machine verifies it; this orchestrator's
+    // own report is not trusted for what landed.
     if args.restricted_grant.is_some() {
         use base64::Engine as _;
-        match dst_ctl.call(Request::Receipt) {
-            Ok(Response::Receipt(envelope)) => println!(
-                "{}{}",
-                crate::receipt::RECEIPT_LINE_PREFIX,
-                base64::engine::general_purpose::STANDARD_NO_PAD.encode(envelope)
-            ),
-            Ok(Response::Err(error)) => progress.error(&format!("syq: receipt: {error}")),
-            Ok(other) => progress.error(&format!("syq: receipt: unexpected response {other:?}")),
-            Err(error) => progress.error(&format!("syq: receipt: {error:#}")),
+        if let Err(error) = dst_ctl.send(Request::Receipt) {
+            progress.error(&format!("syq: receipt: {error:#}"));
+        } else {
+            loop {
+                match dst_ctl.recv() {
+                    Ok(Response::Receipt(envelope)) => {
+                        println!(
+                            "{}{}",
+                            crate::receipt::RECEIPT_LINE_PREFIX,
+                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(envelope)
+                        );
+                        break;
+                    }
+                    Ok(Response::ReceiptV2(frame)) => {
+                        let terminal = match crate::receipt_v2::transport_frame_is_end(&frame) {
+                            Ok(terminal) => terminal,
+                            Err(error) => {
+                                progress.error(&format!("syq: receipt: {error:#}"));
+                                break;
+                            }
+                        };
+                        println!(
+                            "{}{}",
+                            crate::receipt_v2::RECEIPT_LINE_PREFIX,
+                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(frame)
+                        );
+                        if terminal {
+                            break;
+                        }
+                    }
+                    Ok(Response::Err(error)) => {
+                        progress.error(&format!("syq: receipt: {error}"));
+                        break;
+                    }
+                    Ok(other) => {
+                        progress.error(&format!("syq: receipt: unexpected response {other:?}"));
+                        break;
+                    }
+                    Err(error) => {
+                        progress.error(&format!("syq: receipt: {error:#}"));
+                        break;
+                    }
+                }
+            }
         }
     }
 

@@ -532,6 +532,9 @@ pub enum Response {
     TransportStats(Option<TcpSocketStats>),
     /// A signed receipt envelope (see receipt.rs).
     Receipt(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// One bounded frame of a receipt v2 stream. The final frame is marked
+    /// inside the canonical frame encoding.
+    ReceiptV2(#[serde(with = "serde_bytes")] Vec<u8>),
     Ok,
     Err(String),
 }
@@ -629,6 +632,7 @@ impl SizeHint for Response {
                     + 32
             }
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 32 + 24,
+            Response::Receipt(v) | Response::ReceiptV2(v) => v.len() + 16,
             _ => 256,
         }
     }
