@@ -121,12 +121,14 @@ After `.github/workflows/release.yml` completes successfully and the GitHub
 release is immutable, `.github/workflows/prepare-python-sdk.yml` downloads its
 exact signed manifest and prepares the next Python patch version. It opens an
 `automation/python-sdk-vX.Y.Z` pull request containing the version, manifest,
-cache-path documentation, lockfile, and mapping-table updates, then explicitly
-dispatches the normal CI and compatibility workflows. GitHub intentionally
-suppresses ordinary workflow events caused by its own token, which is why the
-dispatch is explicit. The repository keeps the default workflow token read
-only, permits trusted Actions workflows to create pull requests, and grants
-write scopes only inside this preparation workflow.
+cache-path documentation, lockfile, and mapping-table updates. GitHub places
+pull-request workflow runs caused by its own token into an approval-required
+state. The preparation workflow waits until GitHub has registered both native
+runs for the exact generated commit, then approves them through the Actions API
+so the required checks remain attached to the pull request. The repository
+keeps the default workflow token read only, permits trusted Actions workflows
+to create pull requests, and grants write scopes only inside this preparation
+workflow.
 
 Review and merge that pull request normally. The final publication remains a
 deliberate release-authority action: create the signed annotated
