@@ -4793,7 +4793,7 @@ impl Planner<'_> {
                 // --ignore-existing never touches what exists either: an
                 // existing non-directory where a directory maps stays, and the
                 // mapped directory with its whole subtree is skipped, visibly
-                // (rsync would unlink the file; see RSYNC-COMPAT.md).
+                // (rsync would unlink the file; see docs/rsync-compat.md).
                 let conflict = opts.ignore_existing && !is_dir && st.is_some();
                 if conflict
                     || (opts.existing && !is_dir)

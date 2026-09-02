@@ -1975,7 +1975,7 @@ fn unsupported_message(tok: &str) -> Option<String> {
     None
 }
 
-const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The SYQ extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See the README's \"Ignoring paths\" section.";
+const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The SYQ extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See \"Ignoring paths\" in docs/reference.md.";
 const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. --syq-verify-only can compare contents without mutation, but it does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 

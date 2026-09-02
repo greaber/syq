@@ -165,15 +165,18 @@ outlive its premise and steer later work in the wrong direction.
 
 ## Working on syq
 
-- `README.md` is the user-facing contract; the code is authoritative for
-  everything else.
+- `README.md` and the documents under `docs/` are the user-facing contract;
+  `README.md` is the overview and `docs/reference.md` carries the detailed
+  behavior. The code is authoritative for everything else.
 - Distinguish explicit requirements from assumptions and design choices. If a
   supposed requirement creates substantial complexity, question the premise
   and look for a simpler interpretation. Ask the user when the answer would
   materially change the product.
 - Prefer one clear implementation. Add fallbacks or compatibility paths only
   for a concrete scenario or consumer that needs them.
-- Keep CLI behavior, help text, `README.md`, and integration tests in sync.
+- Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
+  sync. A behavior change lands in `docs/reference.md` (or the topical
+  document that owns it), not in a new README section.
 - Copy failures must be visible. Do not make an incomplete or truncated result
   look successful.
 - Exercise copy, resume, verification, and removal behavior in disposable

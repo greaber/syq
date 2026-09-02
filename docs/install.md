@@ -1,0 +1,145 @@
+# Installing syq
+
+Syq runs on Linux and macOS. The local machine needs one of the installation
+paths below; remote hosts need nothing installed in advance, because syq
+installs a matching helper there on first use (see [Remote helper
+bootstrap](#remote-helper-bootstrap)). The [README](../README.md) has the
+short version.
+
+## Standalone installer
+
+The standalone installer needs no `sudo` and installs the matching Linux or
+macOS binary in `~/.local/bin`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
+```
+
+That initial shell installer necessarily needs `curl` or `wget` to obtain syq
+before syq exists. The installed application and its managed remote bootstrap
+do not depend on either command.
+
+To inspect it first, download the same URL without piping it to `sh`. Every
+release also has an immutable versioned installer, for example
+`https://github.com/greaber/syq/releases/download/v0.1.0/install.sh`. To choose
+another directory, download the script and run `sh install.sh --bin-dir DIR`
+(or pipe it to `sh -s -- --bin-dir DIR`). The script detects the target,
+verifies the archive's embedded SHA-256 and size, runs the temporary binary to
+check its version and release identity, and then replaces `syq` atomically.
+Even with `--bin-dir`, either `HOME` or `XDG_CONFIG_HOME` must be set so every
+successful standalone installation can record its managed-install receipt.
+
+## Homebrew
+
+Homebrew is also supported through the project-owned tap:
+
+```sh
+brew install greaber/tap/syq
+```
+
+## Cargo
+
+Rust users can instead compile and install the published source package:
+
+```sh
+cargo install --locked syq
+```
+
+Or build a checkout with the pinned Rust toolchain:
+
+```sh
+cargo build --release          # binary at target/release/syq
+cargo install --locked --path . # or: put it on your PATH
+```
+
+Checkout builds carry a source-revision identity. The crates.io 0.1.5 package
+predates stable identities for packaged source: two independent
+`cargo install --locked syq` builds receive different identities and cannot
+connect as remote peers. To use a 0.1.5 Cargo installation remotely, copy the
+exact installed executable to the remote and pass `--syq-path /path/to/syq`
+(or put it on the remote `PATH` and use `--no-bootstrap`).
+
+A later crate release containing packaged-source identity support will carry
+the package's source revision, allowing independent locked installations of
+that same version to connect. Source builds deliberately do not claim to be an
+immutable release, so managed remote bootstrap remains available only in
+official release binaries.
+
+## Update checks and self-update
+
+Standalone installs download and verify one signed release manifest at most
+once a day after a successful interactive command. When a newer release is
+available they print a reminder; updates are never installed as a side effect
+of a copy. Run `syq --self-update` to install the update, or set
+`SYQ_NO_UPDATE_CHECK=1` to disable automatic checks and reminders. Explicit
+`syq --self-update` checks still work when that variable is set. The install
+receipt lives at
+`$XDG_CONFIG_HOME/syq/install.json` (normally `~/.config/syq/install.json`) and
+must name the running executable, so a Homebrew or source build never replaces
+itself. Self-update is deliberately limited to standalone installs because a
+package manager must remain the owner of its files. Update Homebrew installs
+with `brew upgrade syq`.
+
+Release binaries are published for Linux x86-64/ARM64 and macOS Apple
+Silicon/Intel. Terminal downloads and Homebrew normally do not attach macOS's
+quarantine attribute, which is why command-line tools installed this way do not
+usually produce Gatekeeper prompts. A binary downloaded through a browser may;
+browser-oriented distribution would need Apple Developer ID signing and
+notarization in addition to this terminal-first path.
+
+## Remote helper bootstrap
+
+The remote side runs `syq --server`, but it does not need to be installed or
+configured first. An official syq uses its exact release helper under
+`~/.cache/syq/helpers/`. On first use of a version it detects the remote
+platform and checks for a downloader, SHA-256 implementation, and `gzip`. When
+that complete toolchain is available, the remote downloads the matching
+compressed binary and signed manifest from that version's GitHub release. It
+relays the manifest and computed digest over SSH, then waits while the local
+client verifies the manifest signature and compares its expected digest. Only
+an explicit approval from the client lets the remote install the helper
+atomically. This path therefore works even when the local machine cannot reach
+the release host. Later runs execute that exact path without an extra probe
+connection.
+
+If the remote toolchain is unavailable, a tool fails, or the download times
+out or otherwise fails, the local client downloads the target-specific archive
+with its built-in rustls HTTP client instead. It verifies both the archive and
+decompressed binary, caches the verified binary under
+`$XDG_CACHE_HOME/syq/helpers/` (normally `~/.cache/syq/helpers/`), and uploads it
+through the configured SSH command.
+This fallback does not require a remote downloader, hasher, or decompressor.
+Remote filesystem and installation errors fail immediately because uploading
+the same helper cannot fix them. A completed download with the wrong digest is
+discarded and produces an integrity warning even if the verified upload then
+succeeds.
+
+The managed cache accepts only a verified release binary. Helpers cached under
+an older identity or cache layout are never executed; they may be removed with
+the rest of the disposable helper cache. To opt out of managed bootstrap,
+install a compatible binary yourself and pass `--syq-path /path/to/syq`, or put
+it on the non-interactive remote `PATH` and use `--no-bootstrap`.
+
+The local client verifies the manifest's embedded Ed25519 signature over its
+RFC 8785 canonical JSON. Direct remote download uses `curl` or `wget`, `gzip`,
+and one of `sha256sum`, `shasum`, or `openssl`; those programs are optional
+because missing or unusable tools select verified SSH upload instead. Version
+directories coexist and either helper cache can be removed at any time; syq
+recreates the helper it needs on the next connection. After launch, both peers
+require the same build identity: the release tag for official binaries, or the
+Git-derived identity when an explicit source-built helper is used.
+
+## Platform notes
+
+- **macOS (Apple Silicon / Intel):** build natively on the Mac with
+  `cargo build --release` (needs the Xcode command-line tools, `xcode-select
+  --install`, for the bundled zstd C library). The tool is otherwise pure Rust
+  and uses only POSIX calls; Linux-only optimizations (`fallocate`,
+  glibc `mallopt`) are compiled out automatically. The receiver-side
+  same-machine copy fast path is Linux-only; on macOS those copies use the
+  normal path.
+- For a manually installed binary that is portable across distributions (for
+  example, a host with an older glibc), build a static binary:
+  `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
+  (the musl target also works if `musl-gcc` is installed, which `zstd-sys` needs).
+
