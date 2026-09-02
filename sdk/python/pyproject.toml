@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "syq"
 version = "0.0.1"
-description = "Python subprocess adapter for the syq parallel file copier"
+description = "Version-pinned Python adapter for the syq parallel file copier"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -38,7 +38,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-syq = ["py.typed"]
+syq = ["py.typed", "syq-release-manifest.json"]
 
 [tool.uv]
 required-version = "==0.11.6"

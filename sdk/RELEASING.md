@@ -68,6 +68,15 @@ Update exactly one package version, merge it through the normal protected
 branch workflow, and run all SDK checks. Create a signed annotated tag that
 directly targets the commit on `master`.
 
+For a Python release, first choose the exact immutable syq release the SDK will
+use. Replace `python/src/syq/syq-release-manifest.json` with that release's
+complete signed manifest; do not edit its artifact hashes by hand. Update the
+mapping table in `README.md`. The packaged manifest is the SDK's immutable
+executable-version mapping and runtime trust root for downloaded bytes. Tests
+and the release workflow must build the wheel in a clean cache, perform its
+managed first-use download, and require `syq.version()` to equal
+`syq.PINNED_SYQ_VERSION`.
+
 Python tags use the version in `python/pyproject.toml`:
 
 ```sh
@@ -85,8 +94,8 @@ git push origin sdk-js-v0.0.1
 ```
 
 Those tags run `.github/workflows/publish-sdks.yml`, which verifies the tag,
-version, tests, and package contents before entering the protected publishing
-environment.
+version, tests, package contents, pinned download, and executable identity
+before entering the protected publishing environment.
 
 Python distributions use a pinned interpreter and the tagged commit timestamp
 as `SOURCE_DATE_EPOCH`, and the source archive is repacked with normalized

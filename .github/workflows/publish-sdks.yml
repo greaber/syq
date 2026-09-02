@@ -55,12 +55,18 @@ jobs:
       - name: Build distributions with pinned tooling
         env:
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
+          XDG_CACHE_HOME: ${{ runner.temp }}/syq-sdk-cache
         run: |
           export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
           uv run --project sdk/python --frozen python -m build sdk/python --outdir sdk-dist
           python scripts/normalize-python-sdist.py \
             --epoch "$SOURCE_DATE_EPOCH" sdk-dist/*.tar.gz
+          set -- sdk-dist/syq-*-py3-none-any.whl
+          test "$#" -eq 1 && test -f "$1"
+          uv run --isolated --python 3.12.14 \
+            --with "$1" \
+            python -c 'import syq; assert syq.version() == syq.PINNED_SYQ_VERSION'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-sdk-distributions
