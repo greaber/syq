@@ -652,9 +652,11 @@ the installation response is lost, the next enrollment of the same endpoint
 and destination retries the same ID safely; `syq enrollments` labels that state
 `pending`, and `syq revoke` can remove either pending or active state. Running
 `syq enroll` again for an active destination also refreshes the installed
-receiver to the exact local syq binary and rotates its receipt key;
+receiver to the exact local syq binary; the receipt key is kept for the life
+of the enrollment, so a refresh, or a retry after a lost reply, never leaves
+the two sides holding different keys. To rotate it, revoke and enroll again.
 `syq enrollments` marks enrollments made before receipt keys existed as
-`no-receipt-key` until then. Revocation leaves that shared binary
+`no-receipt-key` until refreshed. Revocation leaves that shared binary
 because other enrollments may use it. It prevents new receiver sessions. A
 session that already claimed its signed request can finish an operation already
 in progress; later protocol requests are rejected once the signed execution
