@@ -235,6 +235,11 @@ pub struct Args {
         conflicts_with_all = ["no_tcp", "rm", "follow"]
     )]
     pub tcp_congestion: Option<String>,
+    /// Keep the implicit ssh control connection alive for 5 minutes after the
+    /// run and reuse it on later runs to the same endpoint (OpenSSH
+    /// ControlMaster); reused runs skip connection setup and re-authentication
+    #[arg(long, conflicts_with = "rsh")]
+    pub reuse_connection: bool,
     /// Remote-to-remote: start the transfer detached on the source host (survives losing this
     /// ssh session) and return; progress goes to a log you can watch with --follow
     #[arg(long)]
@@ -766,6 +771,11 @@ struct NativeCopyFields {
     /// unstable preview
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     results: Option<OsString>,
+    /// Keep the ssh control connection alive for 5 minutes after the run and
+    /// reuse it on later runs to the same endpoint (OpenSSH ControlMaster);
+    /// reused runs skip connection setup and re-authentication
+    #[arg(long)]
+    reuse_connection: bool,
     #[command(flatten)]
     operational: NativeCopyOperationalArgs,
 }
@@ -897,6 +907,9 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     let results = parsed.results.take();
     if results.is_some() && interface != Interface::NativeCp {
         bail!("--results is only available on syq cp");
+    }
+    if parsed.reuse_connection && interface == Interface::NativeMap {
+        bail!("--reuse-connection is only available on syq cp and cp-prune");
     }
     if results.is_some() && parsed.operational.common.dry_run {
         // Dry-run trace output is a deliberately deferred automation
@@ -1066,6 +1079,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.native_map_target = native_map_target;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
+    args.reuse_connection = parsed.reuse_connection;
     args.native_follow = parsed.selection.follow;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed

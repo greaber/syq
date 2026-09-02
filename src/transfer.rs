@@ -97,12 +97,16 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
         None => Endpoint::Local,
         Some(h) => {
             let rsh = parse_rsh(&args.rsh)?;
-            let ssh_multiplexer = args
-                .rsh
-                .is_none()
-                .then(SshMultiplexer::new)
-                .transpose()?
-                .map(Arc::new);
+            let ssh_multiplexer = if args.rsh.is_some() {
+                None
+            } else if args.reuse_connection && args.restricted_grant.is_none() {
+                Some(Arc::new(SshMultiplexer::persistent(
+                    loc.user.as_deref(),
+                    h,
+                )?))
+            } else {
+                Some(Arc::new(SshMultiplexer::new()?))
+            };
             Endpoint::Remote(RemoteSpec {
                 local_process: false,
                 user: loc.user.clone(),
@@ -798,6 +802,15 @@ pub fn run(args: Args) -> Result<i32> {
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
+            // The direct orchestrator runs on the source host and rebuilds
+            // the command; no direct leg holds a reusable local master, so
+            // refuse rather than silently ignore the flag. --relay keeps the
+            // orchestrator (and its persistent masters) on this machine.
+            if args.reuse_connection {
+                bail!(
+                    "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
+                );
+            }
             let direct_paths_are_utf8 = srcs
                 .iter()
                 .chain(std::iter::once(dst))

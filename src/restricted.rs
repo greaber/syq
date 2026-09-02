@@ -2574,6 +2574,11 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
             "--syq-path and --no-bootstrap cannot select the pre-enrolled command-restricted receiver"
         );
     }
+    if args.reuse_connection {
+        bail!(
+            "--reuse-connection is not available with the command-restricted receiver: its host-bound authentication is verified per fresh connection"
+        );
+    }
     if !args.dry_run
         && !args.verify_only
         && (args.delete || args.interface == Interface::NativeCpPrune)

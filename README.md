@@ -324,7 +324,8 @@ ACLs, and xattrs are not preserved.
 All native commands accept `--follow`, `-n`/`--dry-run`, `-v`/`--verbose`,
 `-q`/`--quiet`, `-j`/`--connections`, `--progress`/`--no-progress`, and
 `--progress-json` in addition to their endpoint and selector options. `cp` and `cp-prune` also
-accept `--hash`, `--no-compress`, `--bwlimit RATE`, `--stats`, repeatable
+accept `--hash`, `--no-compress`, `--bwlimit RATE`, `--stats`,
+`--reuse-connection`, repeatable
 `--ignore PATTERN`/`--ignore-from FILE`, `--preserve`, and `--inplace`. Filters
 use the gitignore semantics described below and apply at every source root;
 `cp-prune` protects excluded destination paths from pruning. `--hash`
@@ -431,6 +432,7 @@ explicitly say otherwise.
 | `--tcp-plain` | TCP data connections without encryption (trusted networks only) |
 | `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
 | `--tcp-congestion ALGO` | Linux: use `ALGO` on both ends of direct TCP data sockets; the host default is unchanged |
+| `--reuse-connection` | Keep the implicit ssh control connection alive 5 minutes after the run and reuse it on later runs to the same endpoint (see below) |
 | `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `--ignore`) |
 | `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
@@ -463,6 +465,24 @@ per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
 value by one byte, and `0` means unlimited. SYQ counts uncompressed file bytes;
 protocol overhead is not counted, and transport compression may make the actual
 network rate lower. Scanning, hashing, and metadata operations are not limited.
+
+`--reuse-connection` keeps the implicit ssh control connection alive in the
+background for five minutes after a run (OpenSSH ControlMaster with
+ControlPersist) and reuses it on later runs to the same `user@host`, cutting
+per-run connection setup to milliseconds — useful for scripted bursts of small
+copies. The socket lives in a private per-user runtime directory. During the
+window, anyone able to act as your local user can open sessions to that host
+through the socket without touching your key or agent — comparable to sudo's
+credential caching, and notably a hardware-token approval is not required for
+reuse; do not enable it where that window is unacceptable. Data connections
+are unaffected: they remain separate TCP streams (or independent ssh
+processes under `--no-tcp`), so throughput does not change. Not available
+with an explicit `-e`/`--rsh`. Direct remote-to-remote transfers refuse it —
+the orchestrator runs on the source host, where no reusable local master
+exists — so add `--relay` to keep the orchestrator and its reusable
+connections on this machine; the command-restricted path additionally
+refuses it because its host-bound authentication is verified on each fresh
+connection.
 
 Remote transfers use fast zstd level-1 compression by default. Each protocol
 frame is sent compressed only when that representation is smaller, so archives,

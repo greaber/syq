@@ -782,10 +782,21 @@ pub enum DataTransport {
 
 #[derive(Debug)]
 pub(crate) struct SshMultiplexer {
-    _directory: tempfile::TempDir,
+    /// Owns the per-run private socket directory; None in persistent mode,
+    /// where the socket lives in the shared per-user runtime directory and
+    /// deliberately outlives this process.
+    _directory: Option<tempfile::TempDir>,
     path: PathBuf,
+    /// --reuse-connection: ControlMaster=auto with a ControlPersist window,
+    /// so later syq runs to the same endpoint skip the SSH handshake.
+    persistent: bool,
     reuse_for_workers: AtomicBool,
 }
+
+/// How long a persistent control master lingers after its last client, in
+/// seconds. Long enough for scripted bursts of runs; short enough that the
+/// no-reauthentication window stays comparable to sudo's credential cache.
+const REUSE_PERSIST_SECONDS: &str = "300";
 
 impl SshMultiplexer {
     pub(crate) fn new() -> Result<Self> {
@@ -795,13 +806,105 @@ impl SshMultiplexer {
             .context("create private SSH control directory")?;
         let path = directory.path().join("socket");
         Ok(Self {
-            _directory: directory,
+            _directory: Some(directory),
             path,
+            persistent: false,
+            reuse_for_workers: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn persistent(user: Option<&str>, host: &str) -> Result<Self> {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let directory = base.join(format!("syq-cm-{}", unsafe { libc::geteuid() }));
+        Self::persistent_in(directory, user, host)
+    }
+
+    fn persistent_in(directory: PathBuf, user: Option<&str>, host: &str) -> Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        // Create and validate without ever following a symlink: in a shared
+        // parent such as /tmp, another user can pre-create this name as a
+        // symlink to a victim path, and a path-based chmod would follow it.
+        // mkdir + O_NOFOLLOW open + fstat + fchmod act only on the inode we
+        // verified, never on a path an attacker can redirect.
+        let c = std::ffi::CString::new(directory.as_os_str().as_bytes())
+            .context("SSH control directory path contains NUL")?;
+        if unsafe { libc::mkdir(c.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error).with_context(|| format!("create {}", directory.display()));
+            }
+        }
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "open SSH control directory {} (symlinks are refused)",
+                    directory.display()
+                )
+            });
+        }
+        let handle = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = handle
+            .metadata()
+            .with_context(|| format!("inspect {}", directory.display()))?;
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            anyhow::bail!(
+                "SSH control directory {} must be a directory owned by the current user",
+                directory.display()
+            );
+        }
+        if metadata.mode() & 0o077 != 0 {
+            // Verified as ours above; tighten through the descriptor so the
+            // permission change cannot be redirected either.
+            if unsafe { libc::fchmod(handle.as_raw_fd(), 0o700) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("restrict {}", directory.display()));
+            }
+        }
+        // A stable per-endpoint name: reuse must find the same socket across
+        // runs. Hashing keeps it short (Unix socket paths are length-limited)
+        // and avoids spelling the host in the filename.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(user.unwrap_or("").as_bytes());
+        hasher.update(b"@");
+        hasher.update(host.as_bytes());
+        let digest = hasher.finalize();
+        let mut name = String::from("cm-");
+        for byte in &digest[..8] {
+            name.push_str(&format!("{byte:02x}"));
+        }
+        let path = directory.join(name);
+        // A dead socket file blocks OpenSSH from creating a fresh master
+        // (auto then silently degrades to unmultiplexed connections). The
+        // directory is syq-private, so clearing an unconnectable leftover is
+        // safe; a live master answers the probe and is kept.
+        if path.exists() && std::os::unix::net::UnixStream::connect(&path).is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(Self {
+            _directory: None,
+            path,
+            persistent: true,
             reuse_for_workers: AtomicBool::new(false),
         })
     }
 
     fn set_reuse_for_workers(&self, reuse: bool) {
+        // A persistent master is shared across runs; worker data channels
+        // must never ride it (MaxSessions contention, shared cipher stream).
+        if self.persistent {
+            return;
+        }
         self.reuse_for_workers.store(reuse, Ordering::Relaxed);
     }
 
@@ -917,22 +1020,34 @@ impl RemoteSpec {
                 _ => None,
             };
             if let Some((multiplexer, master)) = multiplex {
-                if master {
-                    // A failed control command can leave its socket briefly
-                    // behind while OpenSSH exits. This path is private to this
-                    // transfer, so clearing that stale inode before a retry is
-                    // safe and prevents the next master from refusing it.
-                    let _ = std::fs::remove_file(&multiplexer.path);
+                if master && multiplexer.persistent {
+                    // Reuse across runs: become the master only if no live
+                    // one exists, and linger after this run so the next one
+                    // skips the handshake.
+                    cmd.arg("-o")
+                        .arg("ControlMaster=auto")
+                        .arg("-o")
+                        .arg(format!("ControlPath={}", multiplexer.path.display()))
+                        .arg("-o")
+                        .arg(format!("ControlPersist={REUSE_PERSIST_SECONDS}"));
+                } else {
+                    if master {
+                        // A failed control command can leave its socket briefly
+                        // behind while OpenSSH exits. This path is private to this
+                        // transfer, so clearing that stale inode before a retry is
+                        // safe and prevents the next master from refusing it.
+                        let _ = std::fs::remove_file(&multiplexer.path);
+                    }
+                    cmd.arg("-o")
+                        .arg(format!(
+                            "ControlMaster={}",
+                            if master { "yes" } else { "no" }
+                        ))
+                        .arg("-o")
+                        .arg(format!("ControlPath={}", multiplexer.path.display()))
+                        .arg("-o")
+                        .arg("ControlPersist=no");
                 }
-                cmd.arg("-o")
-                    .arg(format!(
-                        "ControlMaster={}",
-                        if master { "yes" } else { "no" }
-                    ))
-                    .arg("-o")
-                    .arg(format!("ControlPath={}", multiplexer.path.display()))
-                    .arg("-o")
-                    .arg("ControlPersist=no");
             } else {
                 // Large-file data connections need independent TCP streams and
                 // cipher processes. Custom remote-shell commands also keep
@@ -2509,5 +2624,74 @@ mod tests {
 
         let independent = args(SshConnection::Independent);
         assert!(independent.iter().any(|arg| arg == "ControlPath=none"));
+    }
+
+    #[test]
+    fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().to_path_buf();
+        // The socket name is stable per endpoint, and a dead leftover at the
+        // path is cleared so a fresh master can bind.
+        let probe = SshMultiplexer::persistent_in(base.clone(), Some("u"), "example").unwrap();
+        std::fs::write(&probe.path, b"stale").unwrap();
+        let multiplexer =
+            SshMultiplexer::persistent_in(base.clone(), Some("u"), "example").unwrap();
+        assert_eq!(probe.path, multiplexer.path);
+        assert!(!multiplexer.path.exists());
+        assert_eq!(
+            std::fs::metadata(&base).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let control_path = format!("ControlPath={}", multiplexer.path.display());
+        let spec = RemoteSpec {
+            local_process: false,
+            user: Some("u".into()),
+            host: "example".into(),
+            rsh: vec!["ssh".into()],
+            syq_path: None,
+            auto_helper: false,
+            restricted_grant: None,
+            helper_install: Default::default(),
+            ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
+            quiet: false,
+            tcp: Default::default(),
+            diagnostics: Default::default(),
+        };
+        let args = |connection| {
+            spec.ssh_command(connection)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let control = args(SshConnection::Control);
+        assert!(control.iter().any(|arg| arg == "ControlMaster=auto"));
+        assert!(control.iter().any(|arg| arg == &control_path));
+        assert!(control
+            .iter()
+            .any(|arg| arg == &format!("ControlPersist={REUSE_PERSIST_SECONDS}")));
+        // Worker data channels never ride a cross-run master, even when the
+        // small-file path asks for in-run multiplexing.
+        spec.set_ssh_multiplexing(true);
+        let worker = args(spec.ssh_connection(true));
+        assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
+        assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
+    }
+
+    #[test]
+    fn persistent_reuse_refuses_symlinked_directory_without_touching_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let outer = tempfile::tempdir().unwrap();
+        let victim = outer.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let attack = outer.path().join("syq-cm-attack");
+        std::os::unix::fs::symlink(&victim, &attack).unwrap();
+        assert!(SshMultiplexer::persistent_in(attack, Some("u"), "example").is_err());
+        // The victim's permissions were never modified through the symlink.
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 }
