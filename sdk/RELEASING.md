@@ -2,10 +2,17 @@
 
 SDK releases use independent versions and tags. Published versions are
 immutable: never move or delete their release tags or attempt to replace an
-uploaded package. A tag whose publication is abandoned before any permanent
-release or registry state exists remains provisional; audit all destinations,
-clean any recoverable draft, and delete that tag rather than burning an
-unpublished SDK version.
+uploaded package. A Python or JavaScript tag whose publication is abandoned
+before any permanent release or registry state exists remains provisional;
+audit all destinations, clean any recoverable draft, and delete that tag rather
+than burning an unpublished SDK version.
+
+A Go module tag such as `sdk/go/v*` is permanent as soon as it is pushed. The
+tag itself publishes the version: a client or arbitrary module proxy may fetch
+and cache it before the documented `proxy.golang.org` request. That publication
+cannot be fully audited, and deleting or recreating the tag can leave clients
+with conflicting authenticated content. Never delete, recreate, or move a Go
+module tag.
 
 ## One-time setup
 
