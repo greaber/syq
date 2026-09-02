@@ -97,9 +97,22 @@ use crate::enrollment::EnrollmentId;
 pub(crate) struct RequestId([u8; 32]);
 
 impl RequestId {
-    pub(crate) fn random() -> Result<Self> {
+    /// A fresh nonce whose first 8 bytes are the big-endian issue time, so
+    /// hex claim filenames sort chronologically for inspection. The
+    /// remaining 24 random bytes carry uniqueness; the timestamp is
+    /// organizational only — verifiers rely on the envelope signature and
+    /// the claim store, never on this prefix. IMPORTANT: claims created
+    /// before this layout carry fully random IDs that are indistinguishable
+    /// from timestamped ones by name, so any future expiry or pruning
+    /// decision MUST read `claimed_at` from inside the claim record (see
+    /// `validate_claim_record`), never interpret the filename; a
+    /// filename-based pruner could misread a legacy random prefix as an
+    /// ancient timestamp and delete a live claim, re-enabling its grant.
+    pub(crate) fn fresh(issued_at: i64) -> Result<Self> {
         let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).context("generate signed-request ID")?;
+        let seconds = u64::try_from(issued_at).context("request ID issue time before epoch")?;
+        bytes[..8].copy_from_slice(&seconds.to_be_bytes());
+        getrandom::fill(&mut bytes[8..]).context("generate signed-request ID")?;
         Ok(Self(bytes))
     }
 
@@ -3233,11 +3246,28 @@ mod tests {
 
     #[test]
     fn request_ids_are_fresh_and_distinct_from_stable_copy_ids() {
-        let first = RequestId::random().expect("random request ID");
-        let second = RequestId::random().expect("random request ID");
+        let first = RequestId::fresh(NOW).expect("fresh request ID");
+        let second = RequestId::fresh(NOW).expect("fresh request ID");
         assert_ne!(first, second);
         assert_eq!(std::mem::size_of::<RequestId>(), 32);
         assert_eq!(std::mem::size_of::<crate::proto::PartialId>(), 16);
+    }
+
+    #[test]
+    fn timestamped_request_ids_sort_chronologically_and_stay_unique() {
+        let earlier = RequestId::fresh(NOW).expect("fresh request ID");
+        let later = RequestId::fresh(NOW + 1).expect("fresh request ID");
+        assert_eq!(earlier.0[..8], u64::try_from(NOW).unwrap().to_be_bytes());
+        // Hex filenames of big-endian timestamps sort lexicographically in
+        // time order, so claim listings are naturally chronological.
+        assert!(earlier.file_component() < later.file_component());
+        // Same second, distinct nonces: the 24 random bytes carry uniqueness.
+        let sibling = RequestId::fresh(NOW).expect("fresh request ID");
+        assert_ne!(earlier, sibling);
+        assert_eq!(earlier.0[..8], sibling.0[..8]);
+        earlier.validate().expect("timestamped IDs validate");
+        // Pre-epoch issue times are refused rather than wrapped.
+        assert!(RequestId::fresh(-1).is_err());
     }
 
     #[test]
