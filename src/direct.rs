@@ -321,6 +321,7 @@ pub fn run(
         auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
         restricted_grant: None,
         helper_install: Default::default(),
+        ssh_multiplexer: None,
         quiet: args.quiet,
         tcp: Default::default(),
         diagnostics: Default::default(),

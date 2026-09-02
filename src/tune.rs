@@ -1060,6 +1060,7 @@ mod tests {
             auto_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
+            ssh_multiplexer: None,
             quiet: true,
             tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp.then(|| crate::conn::TcpInfo {
                 addrs: vec!["127.0.0.1".into()],
