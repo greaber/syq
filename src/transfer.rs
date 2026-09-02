@@ -901,6 +901,47 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
+    // A remote coordinator owns both SSH edges. Hand off before constructing
+    // local endpoints so the invoking machine neither reads its persistence
+    // policy nor creates records for connections it will never open.
+    if coordinator_is_remote {
+        if args.rsh.is_some() {
+            let rsh = parse_rsh(&args.rsh)?;
+            if !rsh[0].ends_with("ssh")
+                && srcs
+                    .iter()
+                    .chain(std::iter::once(dst))
+                    .any(|location| location.port.is_some())
+            {
+                bail!(
+                    "an explicit endpoint SSH port requires the default ssh or an --rsh command whose executable is ssh"
+                );
+            }
+        }
+        if args.connections_default {
+            args.connections = tune::START_SSH;
+        }
+        if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
+            return crate::direct::run_at_target(&args, srcs, dst, source_operand_count);
+        }
+        return crate::direct::run(&args, srcs, dst, source_operand_count);
+    }
+    if srcs[0].is_remote() && dst.is_remote() {
+        if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
+            args.relay = true;
+        }
+        if !args.quiet {
+            if args.relay {
+                eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
+            } else {
+                eprintln!(
+                    "syq: remote-to-remote transfer: relaying raw path bytes through this machine"
+                );
+            }
+        }
+    } else if args.interface != Interface::Rsync && args.run_at != RunAt::Auto {
+        bail!("--run-at currently applies only to copies between two remote endpoints");
+    }
     let src_ep = endpoint(&srcs[0], &args)?;
     let mut dst_ep = endpoint(dst, &args)?;
     if args.tcp_congestion.is_some() && !src_ep.is_remote() && !dst_ep.is_remote() {
@@ -924,34 +965,6 @@ pub fn run(args: Args) -> Result<i32> {
         } else {
             tune::START_LOCAL
         };
-    }
-    if src_ep.is_remote() && dst_ep.is_remote() {
-        if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
-            args.relay = true;
-        }
-        if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
-            return crate::direct::run_at_target(&args, srcs, dst, source_operand_count);
-        }
-        if !args.relay {
-            if args.interface == Interface::Rsync
-                || direct_paths_are_utf8
-                || args.run_at == RunAt::Source
-            {
-                // Let the remote orchestrator observe the original source count so
-                // repeated file sources keep multi-source destination semantics.
-                return crate::direct::run(&args, srcs, dst, source_operand_count);
-            }
-            if !args.quiet {
-                eprintln!(
-                    "syq: remote-to-remote transfer: relaying raw path bytes through this machine"
-                );
-            }
-        }
-        if args.relay && !args.quiet {
-            eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
-        }
-    } else if args.interface != Interface::Rsync && args.run_at != RunAt::Auto {
-        bail!("--run-at currently applies only to copies between two remote endpoints");
     }
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {

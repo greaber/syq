@@ -446,7 +446,9 @@ with `--pscope` lets separately launched or parallel commands share only that
 scope, independently of the global setting. `off --pscope` closes its live
 masters and removes it. If a script is killed before its cleanup trap runs,
 the masters still leave after their five-minute idle limit; the inert scope
-can be inspected or removed later with the printed path.
+can be inspected or removed later with the printed path. Scope paths beginning
+with a literal `~` or containing `${...}` are refused because OpenSSH expands
+those forms before opening a control socket.
 
 During either persistence window, anything able to act as the same local user
 can open sessions through the socket without touching the key or agent. This

@@ -196,6 +196,7 @@ pub(crate) fn scope_for_implicit_ssh(explicit_scope: Option<&Path>) -> Result<Op
 /// lossy UTF-8 conversion and makes whitespace one argv value rather than SSH
 /// configuration syntax.
 pub(crate) fn openssh_control_path(path: &Path) -> OsString {
+    debug_assert!(validate_openssh_control_path(path).is_ok());
     let bytes = path.as_os_str().as_bytes();
     let mut escaped =
         Vec::with_capacity(bytes.len() + bytes.iter().filter(|&&b| b == b'%').count());
@@ -206,6 +207,21 @@ pub(crate) fn openssh_control_path(path: &Path) -> OsString {
         escaped.push(byte);
     }
     OsString::from_vec(escaped)
+}
+
+/// OpenSSH expands a leading `~` and `${ENV}` in `ControlPath` even when the
+/// path is supplied as a separate `-S` argument. Those forms have no escaping
+/// contract comparable to `%%`, so refuse them before creating or accepting a
+/// control directory.
+pub(crate) fn validate_openssh_control_path(path: &Path) -> Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.first() == Some(&b'~') || bytes.windows(2).any(|pair| pair == b"${") {
+        bail!(
+            "SSH control path {} contains OpenSSH expansion syntax; it may not begin with `~` or contain `${{`",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Return the stable socket path for one endpoint and record enough metadata
@@ -372,6 +388,7 @@ fn is_global_scope(scope: &Path) -> Result<bool> {
 
 fn ensure_runtime_parent() -> Result<PathBuf> {
     let path = runtime_parent_path();
+    validate_openssh_control_path(&path)?;
     secure_directory(&path, true, true)?;
     Ok(path)
 }
@@ -426,6 +443,7 @@ fn create_marker(scope: &Path) -> Result<()> {
 }
 
 fn validate_scope(scope: &Path) -> Result<()> {
+    validate_openssh_control_path(scope)?;
     secure_directory(scope, false, false)?;
     let marker_path = scope.join(SCOPE_MARKER);
     let mut marker = OpenOptions::new()
@@ -778,5 +796,12 @@ mod tests {
             args[1].as_bytes(),
             b"/tmp/scope with space/%%h/non-utf8-\xff/socket"
         );
+    }
+
+    #[test]
+    fn openssh_environment_and_tilde_expansion_forms_are_refused() {
+        assert!(validate_openssh_control_path(Path::new("/tmp/scope with space/%h")).is_ok());
+        assert!(validate_openssh_control_path(Path::new("~/scope")).is_err());
+        assert!(validate_openssh_control_path(Path::new("/tmp/${HOME}/scope")).is_err());
     }
 }

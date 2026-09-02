@@ -9843,6 +9843,80 @@ fn absent_user_config_environment_keeps_ordinary_commands_nonpersistent() {
 }
 
 #[test]
+fn remote_coordinator_does_not_resolve_local_persistence() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("runtime")).unwrap();
+    write(&t.path("config/syq/persistence-v1.json"), b"not valid JSON");
+    let ssh = t.path("bin/ssh");
+    executable(
+        &ssh,
+        br#"#!/bin/sh
+: > "$FAKE_RSH_MARKER"
+exit 23
+"#,
+    );
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "rsync",
+                "-a",
+                "--no-forward-agent",
+                "hostA:src/",
+                "hostB:dst/",
+                "--no-progress",
+            ])
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("FAKE_RSH_MARKER", t.path("ssh-called"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+            )
+            .run()
+            .unwrap()
+    };
+
+    let output = run();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(t.path("ssh-called").exists());
+    assert!(!stderr_of(&output).contains("persistence configuration"));
+
+    let enabled = persistence_command(&t, &["on"]).run().unwrap();
+    assert_output_ok(&enabled);
+    let global_scope = String::from_utf8(enabled.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("scope: "))
+        .map(PathBuf::from)
+        .unwrap();
+    let output = run();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(
+        fs::read_dir(&global_scope)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".json")),
+        "remote-coordinator handoff recorded inactive local endpoints"
+    );
+    assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
+}
+
+#[test]
+fn ephemeral_persistence_refuses_openssh_expanding_runtime_paths() {
+    let t = Tmp::new();
+    let runtime = t.path("runtime-${HOME}");
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["persist", "on", "--ephemeral"])
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .run()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("OpenSSH expansion syntax"));
+    assert!(!runtime.exists(), "unsafe runtime path was created");
+}
+
+#[test]
 fn durable_and_ephemeral_policies_reach_implicit_ssh_connections() {
     let t = Tmp::new();
     fs::create_dir(t.path("runtime")).unwrap();

@@ -806,6 +806,7 @@ impl SshMultiplexer {
             .tempdir()
             .context("create private SSH control directory")?;
         let path = directory.path().join("socket");
+        crate::persistence::validate_openssh_control_path(&path)?;
         Ok(Self {
             _directory: Some(directory),
             path,
