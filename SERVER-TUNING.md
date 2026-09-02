@@ -162,14 +162,18 @@ current BBRv3 work is a separate, experimental implementation. BBRv1 can share
 a bottleneck unevenly with CUBIC or with BBR flows that have different
 round-trip times, depending on the path and its buffers. Because syq may use
 several flows, that fairness cost matters on a shared link even when the syq
-transfer itself is fast. BBR also relies on suitable packet pacing and fair
-queueing. These are good reasons for Linux to keep a conservative default for
-every application, but not reasons to avoid a scoped BBR test for a bulk copy.
+transfer itself is fast. BBR also relies on packet pacing. With the `fq` qdisc,
+Linux can pace it efficiently in the queueing layer; without `fq`, mainline BBR
+falls back to internal per-socket pacing, which may use more resources. `fq` is
+therefore useful on some hosts, but it is not a prerequisite for trying BBR.
+These are good reasons for Linux to keep a conservative default for every
+application, but not reasons to avoid a scoped BBR test for a bulk copy.
 
 See the [CUBIC standard][cubic-rfc], the [BBR project and version
 notes][bbr-project], the current [experimental BBR specification][bbr-draft],
-and an [experimental analysis of BBRv1 RTT fairness][bbr-fairness] for the
-details behind those trade-offs.
+the [mainline BBR implementation's pacing note][bbr-linux], and an
+[experimental analysis of BBRv1 RTT fairness][bbr-fairness] for the details
+behind those trade-offs.
 
 First inspect what each Linux endpoint supports and currently uses:
 
@@ -190,11 +194,17 @@ stops the transfer rather than silently changing the experiment. Without the
 option, each socket inherits its host's default.
 
 Compare algorithms with a fixed connection count so syq's worker tuning does
-not hide their effect:
+not hide their effect. Use only a disposable test destination, and restore it
+to the same absent or empty state before every invocation. Otherwise the first
+command copies the data and the second measures an up-to-date no-op. Reset the
+scratch path with the procedure appropriate to that host; never remove or
+empty a real destination for a benchmark.
 
 ```sh
-syq rsync -a -j 1 --tcp-congestion cubic --stats SOURCE HOST:DESTINATION
-syq rsync -a -j 1 --tcp-congestion bbr   --stats SOURCE HOST:DESTINATION
+# Reset HOST:DISPOSABLE-DESTINATION to absent or empty before this command.
+syq rsync -a -j 1 --tcp-congestion cubic --stats SOURCE HOST:DISPOSABLE-DESTINATION
+# Reset the same disposable destination again before this command.
+syq rsync -a -j 1 --tcp-congestion bbr --stats SOURCE HOST:DISPOSABLE-DESTINATION
 ```
 
 Repeat and alternate the two commands, then test the other transfer direction:
@@ -207,7 +217,8 @@ choice to a global sysctl change.
 
 The server setting governs bulk downloads, while the uploading client setting
 governs bulk uploads. The per-socket option does not attach or replace a
-queueing discipline. Changing
+queueing discipline, and changing the qdisc is not necessary for a BBR test.
+Changing
 `net.core.default_qdisc` alone may not replace qdiscs already attached to live
 interfaces, and virtual or multiqueue devices can have different behavior.
 Changing `net.ipv4.tcp_congestion_control` affects new connections from every
@@ -266,5 +277,6 @@ measured decision from an inherited assumption:
 [maxstartups]: https://man.openbsd.org/sshd_config#MaxStartups
 [bbr-draft]: https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/
 [bbr-fairness]: https://arxiv.org/abs/1706.09115
+[bbr-linux]: https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_bbr.c
 [bbr-project]: https://github.com/google/bbr
 [cubic-rfc]: https://www.rfc-editor.org/rfc/rfc9438.html
