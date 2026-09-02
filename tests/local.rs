@@ -8295,62 +8295,64 @@ fn native_remote_coordinator_streams_results_to_the_invoker() {
     let rsh = fake_rsh(&t);
     write(&t.path("src"), b"result stream");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["cp", "--rsh"])
-        .arg(&rsh)
-        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args([
-            "--no-tcp",
-            "-j",
-            "1",
-            "--from",
-            "hostA",
-            "--src",
-            &t.s("src"),
-            "--to",
-            "hostB",
-            "--run-at",
-            "target",
-            "--as",
-            &t.s("dst"),
-            "--results",
-            "-",
-            "-q",
-        ])
-        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_RSH_LOG", t.path("rsh.log"))
-        .run()
-        .expect("stream target-coordinator results");
+    for placement in ["auto", "source", "target"] {
+        let destination = t.s(&format!("dst-{placement}"));
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args([
+                "--no-tcp",
+                "-j",
+                "1",
+                "--from",
+                "hostA",
+                "--src",
+                &t.s("src"),
+                "--to",
+                "hostB",
+                "--run-at",
+                placement,
+                "--as",
+                &destination,
+                "--results",
+                "-",
+                "-q",
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .run()
+            .expect("stream remote-coordinator results");
 
-    assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), b"result stream");
-    let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("results line is JSON"))
-        .collect();
-    // The remote coordinator owns the stream end to end: exactly one run
-    // record, one terminal record, and a contiguous sequence — a second
-    // local writer would double the run record and restart seq.
-    assert_eq!(records.first().unwrap()["type"], "run");
-    for (index, record) in records.iter().enumerate() {
-        assert_eq!(record["seq"], index as u64, "line {}", index + 1);
+        assert_output_ok(&out);
+        assert_eq!(read(Path::new(&destination)), b"result stream");
+        let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("results line is JSON"))
+            .collect();
+        // The coordinator owns the stream end to end: exactly one run and
+        // terminal record, with no second writer restarting the sequence.
+        assert_eq!(records.first().unwrap()["type"], "run");
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["seq"], index as u64, "{placement}: {records:?}");
+        }
+        assert_eq!(
+            records.iter().filter(|r| r["type"] == "run").count(),
+            1,
+            "{placement}: {records:?}"
+        );
+        assert_eq!(
+            records.iter().filter(|r| r["type"] == "result").count(),
+            1,
+            "{placement}: {records:?}"
+        );
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["type"], "result");
+        assert_eq!(terminal["status"], "success");
+        assert_eq!(terminal["exit_code"], 0);
     }
-    assert_eq!(
-        records.iter().filter(|r| r["type"] == "run").count(),
-        1,
-        "exactly one run record"
-    );
-    assert_eq!(
-        records.iter().filter(|r| r["type"] == "result").count(),
-        1,
-        "exactly one terminal record"
-    );
-    let terminal = records.last().unwrap();
-    assert_eq!(terminal["type"], "result");
-    assert_eq!(terminal["status"], "success");
-    assert_eq!(terminal["exit_code"], 0);
 }
 
 #[test]

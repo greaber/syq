@@ -12,6 +12,18 @@ pub enum Interface {
     NativeMap,
 }
 
+const NATIVE_COMMANDS: &[(&str, Interface)] = &[
+    ("cp", Interface::NativeCp),
+    ("rm", Interface::NativeRm),
+    ("map", Interface::NativeMap),
+];
+
+fn native_interface(command: &str) -> Option<Interface> {
+    NATIVE_COMMANDS
+        .iter()
+        .find_map(|(name, interface)| (*name == command).then_some(*interface))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Placement {
     #[default]
@@ -402,9 +414,9 @@ impl Args {
         };
         match command {
             "rsync" => Self::parse_rsync(&argv[1..]),
-            "cp" => parse_native(&argv[1..], Interface::NativeCp),
-            "rm" => parse_native(&argv[1..], Interface::NativeRm),
-            "map" => parse_native(&argv[1..], Interface::NativeMap),
+            command if native_interface(command).is_some() => {
+                parse_native(&argv[1..], native_interface(command).unwrap())
+            }
             "--help" | "-h" => {
                 print_root_help();
                 std::process::exit(0);
@@ -1315,6 +1327,82 @@ fn apply_native_operational(args: &mut Args, operational: NativeOperationalArgs)
     args.progress = operational.progress;
     args.no_progress = operational.no_progress;
     args.progress_json = operational.progress_json;
+}
+
+#[cfg(test)]
+mod native_sdk_inventory_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(serde::Deserialize)]
+    struct Inventory {
+        schema: u64,
+        commands: BTreeMap<String, CommandInventory>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CommandInventory {
+        sdk: String,
+        python: Vec<String>,
+        internal: Vec<String>,
+        aliases: BTreeMap<String, String>,
+        raw_only: Vec<String>,
+        follow_up: Vec<String>,
+    }
+
+    fn long_options(command: clap::Command) -> BTreeSet<String> {
+        command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn every_native_option_has_an_sdk_disposition() {
+        let inventory: Inventory =
+            serde_json::from_str(include_str!("../sdk/python/native-api.json"))
+                .expect("Python native API inventory is valid JSON");
+        assert_eq!(inventory.schema, 1);
+        let commands = [
+            ("cp", NativeCopyCommand::command()),
+            ("rm", NativeRmCommand::command()),
+            ("map", NativeMapCommand::command()),
+        ];
+        assert_eq!(
+            inventory.commands.keys().cloned().collect::<BTreeSet<_>>(),
+            NATIVE_COMMANDS
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect(),
+            "classify every native command in sdk/python/native-api.json"
+        );
+        for (name, command) in commands {
+            let classified = inventory.commands.get(name).unwrap();
+            assert!(
+                matches!(classified.sdk.as_str(), "python" | "raw_only" | "follow_up"),
+                "{name} has an invalid SDK disposition"
+            );
+            let mut declared = BTreeSet::new();
+            for option in classified
+                .python
+                .iter()
+                .chain(&classified.internal)
+                .chain(classified.aliases.keys())
+                .chain(&classified.raw_only)
+                .chain(&classified.follow_up)
+            {
+                assert!(
+                    declared.insert(option.clone()),
+                    "{name} option --{option} has more than one SDK disposition"
+                );
+            }
+            assert_eq!(
+                declared,
+                long_options(command),
+                "update sdk/python/native-api.json whenever the native CLI changes"
+            );
+        }
+    }
 }
 
 fn apply_native_copy_operational(

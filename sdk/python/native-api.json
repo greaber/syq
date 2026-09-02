@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "commands": {
+    "cp": {
+      "sdk": "python",
+      "python": [
+        "from", "cwd", "follow", "src", "src-src", "src-file", "src-dir", "to",
+        "into", "into-new", "into-existing", "as", "as-new", "as-existing",
+        "mapping", "prune", "max-delete", "dry-run", "connections",
+        "reuse-connection", "run-at", "rsh", "syq-path", "no-bootstrap",
+        "tcp-plain", "no-tcp", "tcp-ports", "tcp-congestion",
+        "no-forward-agent", "unrestricted-agent-forwarding",
+        "agent-broker-only", "max-entries", "max-total-bytes", "max-runtime",
+        "hash", "no-compress", "bwlimit", "ignore", "ignore-from", "preserve",
+        "inplace", "max-size", "min-size"
+      ],
+      "internal": ["results"],
+      "aliases": {
+        "srcs": "src",
+        "src-srcs": "src-src",
+        "src-files": "src-file",
+        "src-dirs": "src-dir"
+      },
+      "raw_only": [
+        "verbose", "quiet", "progress", "no-progress", "progress-json",
+        "stats", "detach"
+      ],
+      "follow_up": []
+    },
+    "rm": {
+      "sdk": "raw_only",
+      "python": [],
+      "internal": [],
+      "aliases": {
+        "srcs": "src",
+        "src-srcs": "src-src",
+        "src-files": "src-file",
+        "src-dirs": "src-dir"
+      },
+      "raw_only": [
+        "from", "cwd", "root", "follow", "src", "src-src", "src-file", "src-dir",
+        "dry-run", "verbose", "quiet", "connections", "progress", "no-progress",
+        "progress-json"
+      ],
+      "follow_up": []
+    },
+    "map": {
+      "sdk": "python",
+      "python": ["cwd", "follow", "src", "src-src", "src-file", "src-dir", "to", "into", "as"],
+      "internal": ["quiet"],
+      "aliases": {
+        "srcs": "src",
+        "src-srcs": "src-src",
+        "src-files": "src-file",
+        "src-dirs": "src-dir"
+      },
+      "raw_only": [
+        "from", "into-new", "into-existing", "as-new", "as-existing", "mapping",
+        "results", "reuse-connection", "dry-run", "verbose", "connections",
+        "progress", "no-progress", "progress-json", "hash", "no-compress",
+        "bwlimit", "stats", "max-entries", "max-total-bytes", "max-runtime",
+        "ignore", "ignore-from", "preserve", "inplace"
+      ],
+      "follow_up": []
+    }
+  }
+}

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "syq"
 version = "0.0.3"
-description = "Version-pinned Python adapter for the syq parallel file copier"
+description = "Typed, version-pinned Python client for the syq parallel file copier"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
