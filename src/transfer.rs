@@ -900,6 +900,15 @@ pub fn run(args: Args) -> Result<i32> {
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
+            // The direct orchestrator runs on the source host and rebuilds
+            // the command; no direct leg holds a reusable local master, so
+            // refuse rather than silently ignore the flag. --relay keeps the
+            // orchestrator (and its persistent masters) on this machine.
+            if args.reuse_connection {
+                bail!(
+                    "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
+                );
+            }
             let direct_paths_are_utf8 = srcs
                 .iter()
                 .chain(std::iter::once(dst))

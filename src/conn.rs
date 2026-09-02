@@ -822,21 +822,53 @@ impl SshMultiplexer {
     }
 
     fn persistent_in(directory: PathBuf, user: Option<&str>, host: &str) -> Result<Self> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        std::fs::create_dir_all(&directory)
-            .with_context(|| format!("create {}", directory.display()))?;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restrict {}", directory.display()))?;
-        let metadata = std::fs::symlink_metadata(&directory)
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        // Create and validate without ever following a symlink: in a shared
+        // parent such as /tmp, another user can pre-create this name as a
+        // symlink to a victim path, and a path-based chmod would follow it.
+        // mkdir + O_NOFOLLOW open + fstat + fchmod act only on the inode we
+        // verified, never on a path an attacker can redirect.
+        let c = std::ffi::CString::new(directory.as_os_str().as_bytes())
+            .context("SSH control directory path contains NUL")?;
+        if unsafe { libc::mkdir(c.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error).with_context(|| format!("create {}", directory.display()));
+            }
+        }
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "open SSH control directory {} (symlinks are refused)",
+                    directory.display()
+                )
+            });
+        }
+        let handle = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = handle
+            .metadata()
             .with_context(|| format!("inspect {}", directory.display()))?;
-        if !metadata.file_type().is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
             anyhow::bail!(
-                "SSH control directory {} must be a private directory owned by the current user",
+                "SSH control directory {} must be a directory owned by the current user",
                 directory.display()
             );
+        }
+        if metadata.mode() & 0o077 != 0 {
+            // Verified as ours above; tighten through the descriptor so the
+            // permission change cannot be redirected either.
+            if unsafe { libc::fchmod(handle.as_raw_fd(), 0o700) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("restrict {}", directory.display()));
+            }
         }
         // A stable per-endpoint name: reuse must find the same socket across
         // runs. Hashing keeps it short (Unix socket paths are length-limited)
@@ -2644,5 +2676,22 @@ mod tests {
         let worker = args(spec.ssh_connection(true));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
+    }
+
+    #[test]
+    fn persistent_reuse_refuses_symlinked_directory_without_touching_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let outer = tempfile::tempdir().unwrap();
+        let victim = outer.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let attack = outer.path().join("syq-cm-attack");
+        std::os::unix::fs::symlink(&victim, &attack).unwrap();
+        assert!(SshMultiplexer::persistent_in(attack, Some("u"), "example").is_err());
+        // The victim's permissions were never modified through the symlink.
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 }

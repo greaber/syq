@@ -9444,3 +9444,14 @@ fn reuse_connection_flag_surface() {
     let out = syq(&["-a", "--reuse-connection", &t.s("src/"), &t.s("out2")]);
     assert!(out.status.success());
 }
+
+#[test]
+fn reuse_connection_refused_for_direct_remote_to_remote() {
+    let out = syq(&["-a", "--reuse-connection", "hostA:src/", "hostB:dst/"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("direct remote-to-remote"),
+        "stderr: {stderr}"
+    );
+}
