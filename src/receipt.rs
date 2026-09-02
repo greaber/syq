@@ -34,8 +34,12 @@ pub(crate) const MAX_REFUSAL_SAMPLES: usize = 8;
 pub(crate) struct PublishedV1 {
     pub path: Vec<u8>,
     pub size: u64,
-    /// BLAKE3 of the published contents, present only for hashed receipts.
+    /// BLAKE3 of the published contents, present only for hashed receipts
+    /// and only once the file is complete.
     pub digest: Option<[u8; 32]>,
+    /// False for an in-place file whose bytes changed but whose final step
+    /// never ran; staged files appear only once complete.
+    pub complete: bool,
 }
 
 /// One file the receiver hashed for the orchestrator (`--verify-only`,
@@ -54,6 +58,8 @@ pub(crate) struct ReceiptV1 {
     pub issued_at: i64,
     pub published_count: u64,
     pub published_bytes: u64,
+    /// Published entries that were left incomplete.
+    pub incomplete_count: u64,
     pub deleted_count: u64,
     pub observed_count: u64,
     /// Requests the grant refused, with the first few messages.
@@ -73,14 +79,25 @@ pub(crate) struct ReceiptV1 {
     pub observed: Vec<ObservedV1>,
 }
 
+/// One published path as the receiver tracks it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Published {
+    pub size: u64,
+    pub digest: Option<[u8; 32]>,
+    pub complete: bool,
+}
+
 /// What the receiver accumulates while a grant runs.
 #[derive(Debug, Default)]
 pub(crate) struct Ledger {
-    pub published: BTreeMap<Vec<u8>, (u64, Option<[u8; 32]>)>,
+    pub published: BTreeMap<Vec<u8>, Published>,
     pub deleted: BTreeSet<Vec<u8>>,
     pub observed: BTreeMap<Vec<u8>, (u64, [u8; 32])>,
     pub refused: u64,
     pub refusal_samples: Vec<String>,
+    /// Files a hashed receipt could not read back; any entry here means no
+    /// receipt can be issued.
+    pub hash_failures: Vec<String>,
 }
 
 impl Ledger {
@@ -104,12 +121,14 @@ impl Ledger {
         let published: Vec<PublishedV1> = self
             .published
             .iter()
-            .map(|(path, (size, digest))| PublishedV1 {
+            .map(|(path, state)| PublishedV1 {
                 path: path.clone(),
-                size: *size,
-                digest: *digest,
+                size: state.size,
+                digest: state.digest,
+                complete: state.complete,
             })
             .collect();
+        let incomplete_count = published.iter().filter(|item| !item.complete).count() as u64;
         let deleted: Vec<Vec<u8>> = self.deleted.iter().cloned().collect();
         let observed: Vec<ObservedV1> = self
             .observed
@@ -138,6 +157,7 @@ impl Ledger {
             issued_at,
             published_count: published.len() as u64,
             published_bytes,
+            incomplete_count,
             deleted_count: deleted.len() as u64,
             observed_count: observed.len() as u64,
             refused: self.refused,
@@ -282,10 +302,22 @@ mod tests {
 
     fn ledger() -> Ledger {
         let mut ledger = Ledger::default();
-        ledger
-            .published
-            .insert(b"/srv/dst/b".to_vec(), (4, Some([7; 32])));
-        ledger.published.insert(b"/srv/dst/a".to_vec(), (10, None));
+        ledger.published.insert(
+            b"/srv/dst/b".to_vec(),
+            Published {
+                size: 4,
+                digest: Some([7; 32]),
+                complete: true,
+            },
+        );
+        ledger.published.insert(
+            b"/srv/dst/a".to_vec(),
+            Published {
+                size: 10,
+                digest: None,
+                complete: false,
+            },
+        );
         ledger.deleted.insert(b"/srv/dst/gone".to_vec());
         ledger
             .observed
@@ -303,6 +335,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.published_count, 2);
         assert_eq!(receipt.published_bytes, 14);
+        assert_eq!(receipt.incomplete_count, 1);
         assert_eq!(receipt.deleted_count, 1);
         assert_eq!(receipt.observed_count, 1);
         assert_eq!(receipt.refused, 1);
@@ -332,7 +365,14 @@ mod tests {
         for index in 0..(MAX_LIST_BYTES / 4096 + 2) {
             let mut path = format!("/{index:08}/").into_bytes();
             path.extend_from_slice(&long);
-            ledger.published.insert(path, (1, None));
+            ledger.published.insert(
+                path,
+                Published {
+                    size: 1,
+                    digest: None,
+                    complete: true,
+                },
+            );
         }
         let receipt = ledger
             .receipt(
@@ -355,9 +395,14 @@ mod tests {
     fn oversized_lists_travel_as_their_digest() {
         let mut ledger = Ledger::default();
         for index in 0..=LIST_LIMIT {
-            ledger
-                .published
-                .insert(format!("/srv/dst/{index:08}").into_bytes(), (1, None));
+            ledger.published.insert(
+                format!("/srv/dst/{index:08}").into_bytes(),
+                Published {
+                    size: 1,
+                    digest: None,
+                    complete: true,
+                },
+            );
         }
         let receipt = ledger
             .receipt(

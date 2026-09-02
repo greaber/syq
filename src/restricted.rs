@@ -430,59 +430,40 @@ impl RestrictedAuthority {
             state = self.settled.wait_timeout(state, remaining).unwrap().0;
         }
         state.receipt_issued = true;
-        let published: Vec<Vec<u8>> = state.ledger.published.keys().cloned().collect();
-        let deleted_only: Vec<Vec<u8>> = state
+        if let Some(first) = state.ledger.hash_failures.first() {
+            bail!(
+                "{} published file(s) could not be hashed for the receipt; first: {first}",
+                state.ledger.hash_failures.len()
+            );
+        }
+        // A path both published and deleted under this grant is the one case
+        // where settlement order may differ from filesystem order (hostA
+        // raced the two). Now that the grant is closed and quiet, the tree
+        // decides those, and only those: everything else keeps the
+        // disposition its settlement recorded, so the receipt never needs
+        // to reopen files after final directory modes are restored.
+        let contested: Vec<Vec<u8>> = state
             .ledger
             .deleted
             .iter()
-            .filter(|path| !state.ledger.published.contains_key(*path))
+            .filter(|path| state.ledger.published.contains_key(*path))
             .cloned()
             .collect();
         drop(state);
-        // The grant is closed and nothing is in flight, so the tree is final.
-        // Settlement order need not match filesystem order when hostA raced
-        // a publication against a deletion of the same path, so the receipt
-        // states what is there now: a published path that is gone counts as
-        // deleted, a deleted path that is back is dropped, and sizes (and
-        // digests, for hashed receipts) come from the files themselves. A
-        // published file that cannot be read back is a receipt failure.
-        let mut final_published = Vec::with_capacity(published.len());
-        let mut final_deleted = Vec::new();
-        for path in published {
+        let mut present = Vec::new();
+        let mut absent = Vec::new();
+        for path in contested {
             match self.observe_final(&path)? {
-                Some(metadata) if metadata.is_file() => {
-                    let digest = if self.receipt_policy.hashed {
-                        Some(self.digest_published(&path).with_context(|| {
-                            format!(
-                                "hash published file {} for the receipt",
-                                String::from_utf8_lossy(&path)
-                            )
-                        })?)
-                    } else {
-                        None
-                    };
-                    final_published.push((path, metadata.len, digest));
-                }
-                Some(_) => bail!(
-                    "published file {} is no longer a regular file",
-                    String::from_utf8_lossy(&path)
-                ),
-                None => final_deleted.push(path),
-            }
-        }
-        for path in deleted_only {
-            if self.observe_final(&path)?.is_none() {
-                final_deleted.push(path);
+                Some(_) => present.push(path),
+                None => absent.push(path),
             }
         }
         let mut state = self.state.lock().unwrap();
-        state.ledger.published.clear();
-        state.ledger.deleted.clear();
-        for (path, size, digest) in final_published {
-            state.ledger.published.insert(path, (size, digest));
+        for path in present {
+            state.ledger.deleted.remove(&path);
         }
-        for path in final_deleted {
-            state.ledger.deleted.insert(path);
+        for path in absent {
+            state.ledger.published.remove(&path);
         }
         let receipt = state.ledger.receipt(
             self.enrollment_id,
@@ -821,6 +802,26 @@ impl RestrictedAuthority {
             proto::Response::Applied(results) => results.get(index).is_some_and(Option::is_some),
             _ => false,
         };
+        // Hash completed publications for a hashed receipt now, before the
+        // orchestrator's deferred directory modes can make them unreadable,
+        // and before taking the state lock.
+        let outcomes: Vec<(PendingOutcome, Option<Result<[u8; 32]>>)> = outcomes
+            .into_iter()
+            .map(|outcome| {
+                let digest = match &outcome {
+                    PendingOutcome::Publish {
+                        index,
+                        path,
+                        complete: true,
+                        ..
+                    } if self.receipt_policy.hashed && !failed(*index) => {
+                        Some(self.digest_published(path))
+                    }
+                    _ => None,
+                };
+                (outcome, digest)
+            })
+            .collect();
         let mut state = self.state.lock().unwrap();
         if tracked {
             state.in_flight = state.in_flight.saturating_sub(1);
@@ -832,12 +833,35 @@ impl RestrictedAuthority {
                 state.created.insert(creation.path);
             }
         }
-        for outcome in outcomes {
+        for (outcome, digest) in outcomes {
             match outcome {
                 // Both dispositions are kept; the receipt decides between
                 // them from the final tree once the grant is closed.
-                PendingOutcome::Publish { index, path, size } if !failed(index) => {
-                    state.ledger.published.insert(path, (size, None));
+                PendingOutcome::Publish {
+                    index,
+                    path,
+                    size,
+                    complete,
+                } if !failed(index) => {
+                    let digest = match digest {
+                        Some(Ok(digest)) => Some(digest),
+                        Some(Err(error)) => {
+                            state
+                                .ledger
+                                .hash_failures
+                                .push(format!("{}: {error:#}", String::from_utf8_lossy(&path)));
+                            None
+                        }
+                        None => None,
+                    };
+                    state.ledger.published.insert(
+                        path,
+                        crate::receipt::Published {
+                            size,
+                            digest,
+                            complete,
+                        },
+                    );
                 }
                 PendingOutcome::Delete { index, path } if !failed(index) => {
                     state.ledger.deleted.insert(path);
@@ -1791,6 +1815,16 @@ impl RestrictedAuthority {
                 self.check_mutation_path(path, false)?;
                 self.constrain_prepare(path)?;
                 self.reserve_bytes(path, *partial_id, *size)?;
+                if *inplace {
+                    // In-place preparation resizes the final file itself:
+                    // the receipt must know even if no final step follows.
+                    outcomes.push(PendingOutcome::Publish {
+                        index: 0,
+                        path: path.clone(),
+                        size: *size,
+                        complete: false,
+                    });
+                }
                 *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
@@ -1811,6 +1845,14 @@ impl RestrictedAuthority {
                     .is_none_or(|end| end > declared)
                 {
                     bail!("file write extends past the size declared for it");
+                }
+                if *inplace {
+                    outcomes.push(PendingOutcome::Publish {
+                        index: 0,
+                        path: path.clone(),
+                        size: declared,
+                        complete: false,
+                    });
                 }
                 self.charge_bytes(path, *off, data.len())?;
                 *guard = Some(self.guard.clone());
@@ -1835,6 +1877,7 @@ impl RestrictedAuthority {
                     index: 0,
                     path: path.clone(),
                     size: self.declared_size(path, *partial_id)?,
+                    complete: true,
                 });
                 self.constrain_receiver_mode(
                     path,
@@ -1866,6 +1909,7 @@ impl RestrictedAuthority {
                         index,
                         path: put.path.clone(),
                         size: put.data.len() as u64,
+                        complete: true,
                     });
                     self.constrain_receiver_mode(
                         &put.path,
@@ -1918,6 +1962,9 @@ enum PendingOutcome {
         index: usize,
         path: Vec<u8>,
         size: u64,
+        /// False for in-place preparation and writes, which change the
+        /// final file before its final step; true once that step ran.
+        complete: bool,
     },
     Delete {
         index: usize,
@@ -4844,6 +4891,104 @@ mod tests {
         assert_eq!(receipt.published.len(), 1);
         assert_eq!(receipt.published[0].path, path_bytes(&returned));
         assert_eq!(receipt.published[0].size, 4);
+    }
+
+    #[test]
+    fn in_place_files_appear_in_the_receipt_before_their_final_step() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let image = target.join("image");
+        fs::create_dir_all(&target).unwrap();
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let public = key.public_key().to_openssh().unwrap();
+        let authority = test_authority_with_receipt(
+            &root,
+            DeletionPolicyV1::Forbid,
+            1024,
+            0,
+            FilterPolicyV3::default(),
+            PublicationPolicyV1::InPlace,
+            ExistingDestinationPolicyV1::Replace,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+            Some((key, false)),
+        )
+        .unwrap();
+        let mut prepare = Request::Prepare {
+            path: path_bytes(&image),
+            size: 4,
+            inplace: true,
+            partial_id: [1; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut prepare, false).unwrap();
+        fs::write(&image, b"half").unwrap();
+        authority.settle(settlement, &proto::Response::Ok);
+        let mut write = Request::WriteRange {
+            path: path_bytes(&image),
+            inplace: true,
+            partial_id: [1; 16],
+            attempt: 0,
+            off: 0,
+            hash: crate::fsops::content_digest(b"ha"),
+            data: b"ha".to_vec(),
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut write, false).unwrap();
+        authority.settle(settlement, &proto::Response::Ok);
+
+        // Without a final step the receipt still lists the file, incomplete.
+        let envelope = authority.issue_receipt().unwrap();
+        let receipt = crate::receipt::verify(&envelope, &public).unwrap();
+        assert_eq!(receipt.published_count, 1);
+        assert_eq!(receipt.incomplete_count, 1);
+        assert_eq!(receipt.published[0].path, path_bytes(&image));
+        assert_eq!(receipt.published[0].size, 4);
+        assert!(!receipt.published[0].complete);
+
+        // With it, the same file is complete.
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let public = key.public_key().to_openssh().unwrap();
+        let finished = test_authority_with_receipt(
+            &root,
+            DeletionPolicyV1::Forbid,
+            1024,
+            0,
+            FilterPolicyV3::default(),
+            PublicationPolicyV1::InPlace,
+            ExistingDestinationPolicyV1::Replace,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+            Some((key, false)),
+        )
+        .unwrap();
+        let mut prepare = Request::Prepare {
+            path: path_bytes(&image),
+            size: 4,
+            inplace: true,
+            partial_id: [2; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        let settlement = finished.authorize(&mut prepare, false).unwrap();
+        finished.settle(settlement, &proto::Response::Ok);
+        let mut finalize = Request::Finalize {
+            path: path_bytes(&image),
+            inplace: true,
+            partial_id: [2; 16],
+            meta: plain_meta(),
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        let settlement = finished.authorize(&mut finalize, false).unwrap();
+        finished.settle(settlement, &proto::Response::Ok);
+        let receipt = crate::receipt::verify(&finished.issue_receipt().unwrap(), &public).unwrap();
+        assert_eq!(receipt.published_count, 1);
+        assert_eq!(receipt.incomplete_count, 0);
+        assert!(receipt.published[0].complete);
     }
 
     fn racing_public(authority: &RestrictedAuthority) -> String {
