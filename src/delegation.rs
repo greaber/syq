@@ -78,9 +78,9 @@ const MAX_SIGNER_BYTES: usize = 512;
 const MAX_GRANT_VALIDITY_SECS: i64 = 24 * 60 * 60;
 const MAX_CLOCK_SKEW_SECS: i64 = 5 * 60;
 const MAX_UNIX_TIMESTAMP: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
-const MAX_ENTRIES: u64 = 1_000_000_000_000;
+pub(crate) const MAX_ENTRIES: u64 = 1_000_000_000_000;
 // Keep later accounting representable in both signed and unsigned counters.
-const MAX_COPY_BYTES: u64 = i64::MAX as u64;
+pub(crate) const MAX_COPY_BYTES: u64 = i64::MAX as u64;
 const MAX_CONNECTIONS: u16 = 64;
 const MAX_FILTER_RULES: usize = 4096;
 const MAX_FILTER_RULE_BYTES: usize = 4096;

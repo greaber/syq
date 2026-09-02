@@ -537,7 +537,8 @@ tuning may use up to that signed ceiling.
 Deletion through the receiver (`cp-prune`, or `--delete` on the rsync-shaped
 command) requires an explicit `--max-delete`, so the deletion authority a
 compromised hostA could exercise inside the scope is always stated on the
-command line rather than defaulting to a hundred million. The other signed
+command line rather than defaulting to a hundred million; `--max-delete 0`
+signs a grant that forbids deletion outright. The other signed
 ceilings default to 100 million entries, 8 TiB of file data, and a 23-hour
 grant; native `--max-entries`, `--max-total-bytes`, and `--max-runtime` lower
 them for one transfer, which bounds what a claimed grant is worth to hostA.

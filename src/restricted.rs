@@ -468,11 +468,15 @@ impl RestrictedAuthority {
 
     fn record_path(&self, path: &[u8]) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        if state.paths.insert(path.to_vec())
-            && state.paths.len() as u64 > self.copy.limits.max_entries
-        {
+        if state.paths.contains(path) {
+            return Ok(());
+        }
+        // Check before inserting: a path rejected at the ceiling must not be
+        // remembered, or resubmitting it would pass as already counted.
+        if state.paths.len() as u64 >= self.copy.limits.max_entries {
             bail!("signed grant entry limit exceeded");
         }
+        state.paths.insert(path.to_vec());
         Ok(())
     }
 
@@ -2414,6 +2418,36 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
             "deletion through the command-restricted receiver needs an explicit --max-delete ceiling"
         );
     }
+    // Range-check every ceiling here, before automatic enrollment can touch
+    // hostB, rather than leaving it to grant validation after the fact.
+    if let Some(runtime) = args.max_runtime_secs {
+        if runtime > DEFAULT_RUNTIME_SECONDS {
+            bail!(
+                "--max-runtime exceeds the {}-hour signed grant ceiling",
+                DEFAULT_RUNTIME_SECONDS / 3600
+            );
+        }
+    }
+    if args
+        .max_entries
+        .is_some_and(|entries| entries == 0 || entries > delegation::MAX_ENTRIES)
+    {
+        bail!(
+            "--max-entries must be between 1 and {}",
+            delegation::MAX_ENTRIES
+        );
+    }
+    if args
+        .max_total_bytes
+        .is_some_and(|bytes| bytes == 0 || bytes > delegation::MAX_COPY_BYTES)
+    {
+        bail!("--max-total-bytes must be at least 1 byte");
+    }
+    if let Some(maximum) = args.max_size.as_deref() {
+        if crate::cli::parse_size(maximum)? == 0 {
+            bail!("--max-size must be at least 1 byte on the command-restricted path");
+        }
+    }
     if !args.files_from_lines.is_empty()
         || args.files_from.is_some()
         || args.native_mapping.is_some()
@@ -2460,7 +2494,12 @@ fn grant_for(
     validate_restricted_args(args)?;
     let issued_at = now()?;
     let read_only = args.dry_run || args.verify_only;
-    let deletion = if !read_only && (args.delete || args.interface == Interface::NativeCpPrune) {
+    // `--max-delete 0` means nothing may be deleted, which the grant states
+    // directly as a forbidding policy rather than a zero budget.
+    let deletion = if !read_only
+        && (args.delete || args.interface == Interface::NativeCpPrune)
+        && args.max_delete != Some(0)
+    {
         DeletionPolicyV1::DeleteDestinationOnly
     } else {
         DeletionPolicyV1::Forbid
@@ -2488,20 +2527,12 @@ fn grant_for(
                 .context("signed grant expiration overflow")?,
             DEFAULT_RUNTIME_SECONDS,
         ),
-        Some(runtime) => {
-            if runtime > DEFAULT_RUNTIME_SECONDS {
-                bail!(
-                    "--max-runtime exceeds the {}-hour signed grant ceiling",
-                    DEFAULT_RUNTIME_SECONDS / 3600
-                );
-            }
-            (
-                issued_at
-                    .checked_add(i64::from(runtime))
-                    .context("signed grant expiration overflow")?,
-                runtime,
-            )
-        }
+        Some(runtime) => (
+            issued_at
+                .checked_add(i64::from(runtime))
+                .context("signed grant expiration overflow")?,
+            runtime,
+        ),
     };
     let copies_contents = sources.iter().any(Location::copies_contents);
     let placement = match args.placement {
@@ -4814,6 +4845,85 @@ mod tests {
             guard: None,
         };
         authority.authorize(&mut observe_container, false).unwrap();
+    }
+
+    #[test]
+    fn entry_ceiling_survives_resubmission_of_a_rejected_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        // The helper grant allows eight entries.
+        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let stat = |name: String| Request::StatMany {
+            paths: vec![root
+                .join("target")
+                .join(name)
+                .as_os_str()
+                .as_bytes()
+                .to_vec()],
+            follow: false,
+            guard: None,
+        };
+        for index in 0..8 {
+            authority
+                .authorize(&mut stat(format!("entry-{index}")), false)
+                .unwrap();
+        }
+        assert!(authority
+            .authorize(&mut stat("entry-8".into()), false)
+            .is_err());
+        // Resubmitting the rejected path must not slip through as counted.
+        assert!(authority
+            .authorize(&mut stat("entry-8".into()), false)
+            .is_err());
+        // Paths already inside the ceiling remain usable.
+        authority
+            .authorize(&mut stat("entry-0".into()), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
+        let parse = |options: &[&str]| {
+            let mut argv = vec!["syq rsync", "-r"];
+            argv.extend_from_slice(options);
+            argv.extend_from_slice(&["host-a:source", "host-b:/backup"]);
+            let mut args = Args::try_parse_from(argv).unwrap();
+            args.normalize();
+            args
+        };
+        // validate_restricted_args runs first in prepare_transfer, before
+        // the enrollment lookup or installation.
+        let mut args = parse(&[]);
+        validate_restricted_args(&args).unwrap();
+        args.max_runtime_secs = Some(DEFAULT_RUNTIME_SECONDS + 1);
+        assert!(validate_restricted_args(&args).is_err());
+        let mut args = parse(&[]);
+        args.max_entries = Some(0);
+        assert!(validate_restricted_args(&args).is_err());
+        args.max_entries = Some(delegation::MAX_ENTRIES + 1);
+        assert!(validate_restricted_args(&args).is_err());
+        let mut args = parse(&[]);
+        args.max_total_bytes = Some(0);
+        assert!(validate_restricted_args(&args).is_err());
+        assert!(validate_restricted_args(&parse(&["--max-size", "0"])).is_err());
+        assert!(validate_restricted_args(&parse(&["--delete"])).is_err());
+        validate_restricted_args(&parse(&["--delete", "--max-delete", "0"])).unwrap();
+
+        // A zero deletion budget signs a grant that forbids deletion outright.
+        let id = EnrollmentId::random();
+        let source = Location::parse("host-a:source").unwrap();
+        let grant = grant_for(
+            &parse(&["--delete", "--max-delete", "0"]),
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup",
+        )
+        .unwrap();
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicyV1::Forbid);
+        assert_eq!(copy.limits.max_deletions, 0);
     }
 
     #[test]
