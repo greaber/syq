@@ -2,10 +2,9 @@
 
 use crate::cli::{Args, Existence, Location, Placement};
 use crate::delegation::{
-    self, CopyLimitsV1, CopyOperationV1, CopyOptionsV1, CopyPolicyV1, DeletionPolicyV1,
-    DestinationPlacementV1, ExistingDestinationPolicyV1, FilterPolicyV3, GrantExtensions,
-    GrantOperationV1, GrantV1, MutationScopeV1, PublicationPolicyV1, ReceiptPolicyV5, RequestId,
-    RootExistenceV4,
+    self, CopyLimits, CopyOperation, CopyOptions, CopyPolicy, DeletionPolicy, DestinationPlacement,
+    ExistingDestinationPolicy, FilterPolicy, Grant, GrantConstraints, GrantOperation,
+    MutationScope, PublicationPolicy, ReceiptPolicy, RequestId, RootExistence,
 };
 use crate::enrollment::{
     self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentRoute, SshEndpoint,
@@ -32,7 +31,10 @@ use std::sync::Mutex;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CONFIG_VERSION: u16 = 1;
+// Advance this generation whenever an installed receiver or its signed grant
+// protocol becomes incompatible. Local metadata from another generation is
+// ignored, so the next eligible copy installs a fresh receiver enrollment.
+const CONFIG_VERSION: u16 = 2;
 const MAX_STATE_FILE: usize = 256 * 1024;
 const MAX_AUTHORIZED_KEYS: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: u64 = 100_000_000;
@@ -99,10 +101,7 @@ struct LocalEnrollment {
     requested_parent: String,
     canonical_root: String,
     receiver_path: String,
-    /// Absent for enrollments installed before receivers had receipt keys;
-    /// rerunning `syq enrollment add` refreshes them.
-    #[serde(default)]
-    receipt_public_key: Option<String>,
+    receipt_public_key: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -279,15 +278,15 @@ fn read_process_umask() -> u32 {
 pub(crate) struct RestrictedAuthority {
     guard: ContainerGuard,
     destination: Vec<u8>,
-    copy: CopyOperationV1,
-    filters: FilterPolicyV3,
+    copy: CopyOperation,
+    filters: FilterPolicy,
     filter_matcher: Option<ignore::gitignore::Gitignore>,
     filter_roots: Vec<Vec<u8>>,
-    root_existence: RootExistenceV4,
+    root_existence: RootExistence,
     enrollment_id: EnrollmentId,
     request_id: RequestId,
-    receipt_policy: ReceiptPolicyV5,
-    receipt_key: Option<PrivateKey>,
+    receipt_policy: ReceiptPolicy,
+    receipt_key: PrivateKey,
     file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
     receiver_umask: u32,
     deadline: Instant,
@@ -300,34 +299,29 @@ pub(crate) struct RestrictedAuthority {
 impl RestrictedAuthority {
     fn new(
         config: &ReceiverEnrollment,
-        grant: GrantV1,
-        extensions: GrantExtensions,
-        receipt_key: Option<PrivateKey>,
+        grant: Grant,
+        extensions: GrantConstraints,
+        receipt_key: PrivateKey,
         deadline: Instant,
     ) -> Result<Self> {
-        let GrantExtensions {
+        let GrantConstraints {
             max_file_data_bytes_per_second,
             filters,
             root_existence,
             receipt: receipt_policy,
         } = extensions;
-        if receipt_policy.required && receipt_key.is_none() {
-            bail!(
-                "the grant requires a receipt but this receiver has no receipt key; rerun `syq enrollment add` to refresh the enrollment"
-            );
-        }
         let enrollment_id = grant.enrollment_id;
         let request_id = grant.request_id;
-        let GrantOperationV1::Copy(copy) = grant.operation;
-        if copy.policy.existing == ExistingDestinationPolicyV1::UpdateIfOlder {
+        let GrantOperation::Copy(copy) = grant.operation;
+        if copy.policy.existing == ExistingDestinationPolicy::UpdateIfOlder {
             // The comparison depends on a source mtime only the remote
             // coordinator reports, so the receiver cannot enforce it.
             bail!("update-if-older existing-object policy is not enforceable by the receiver");
         }
-        if copy.policy.publication == PublicationPolicyV1::InPlace
-            && (copy.policy.existing != ExistingDestinationPolicyV1::Replace
-                || (root_existence == RootExistenceV4::New
-                    && copy.policy.placement == DestinationPlacementV1::ExactPath))
+        if copy.policy.publication == PublicationPolicy::InPlace
+            && (copy.policy.existing != ExistingDestinationPolicy::Replace
+                || (root_existence == RootExistence::New
+                    && copy.policy.placement == DestinationPlacement::ExactPath))
         {
             // In-place preparation opens, creates, or replaces the final
             // pathname with no condition to attach, so it can neither retain
@@ -403,9 +397,7 @@ impl RestrictedAuthority {
 
     /// Sign hostB's account of this grant and close it to further mutation.
     pub(crate) fn issue_receipt(&self) -> Result<Vec<u8>> {
-        let key = self.receipt_key.as_ref().context(
-            "this receiver has no receipt key; rerun `syq enrollment add` to refresh the enrollment",
-        )?;
+        let key = &self.receipt_key;
         // Close the grant first, then wait for every request already
         // authorized on any connection to execute and settle, so the receipt
         // describes a final state rather than a snapshot with work in flight.
@@ -519,23 +511,23 @@ impl RestrictedAuthority {
         let observed = self.rooted_metadata(&self.destination)?;
         let destination = String::from_utf8_lossy(&self.destination);
         match (self.root_existence, observed) {
-            (RootExistenceV4::Any, _) => Ok(()),
-            (RootExistenceV4::New, Some(_)) => bail!(
+            (RootExistence::Any, _) => Ok(()),
+            (RootExistence::New, Some(_)) => bail!(
                 "signed destination {destination} already exists, but the grant requires a new path"
             ),
-            (RootExistenceV4::New, None) => Ok(()),
-            (RootExistenceV4::Existing, None) => bail!(
+            (RootExistence::New, None) => Ok(()),
+            (RootExistence::Existing, None) => bail!(
                 "signed destination {destination} does not exist, but the grant requires an existing path"
             ),
-            (RootExistenceV4::Existing, Some(metadata))
-                if self.copy.policy.placement != DestinationPlacementV1::ExactPath
+            (RootExistence::Existing, Some(metadata))
+                if self.copy.policy.placement != DestinationPlacement::ExactPath
                     && !metadata.is_dir() =>
             {
                 bail!(
                     "signed destination {destination} is not a directory, but the grant places names inside it"
                 )
             }
-            (RootExistenceV4::Existing, Some(_)) => Ok(()),
+            (RootExistence::Existing, Some(_)) => Ok(()),
         }
     }
 
@@ -594,7 +586,7 @@ impl RestrictedAuthority {
         Ok(())
     }
 
-    fn scope_allows(scope: &MutationScopeV1, path: &[u8]) -> bool {
+    fn scope_allows(scope: &MutationScope, path: &[u8]) -> bool {
         path == scope.path
             || (scope.descendants
                 && path.starts_with(&scope.path)
@@ -903,24 +895,24 @@ impl RestrictedAuthority {
         use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let policy = self.copy.policy.existing;
         let root_must_be_new =
-            self.root_existence == RootExistenceV4::New && path == self.destination;
+            self.root_existence == RootExistence::New && path == self.destination;
         let label = String::from_utf8_lossy(path);
         if root_must_be_new
             && !directory
-            && self.copy.policy.placement != DestinationPlacementV1::ExactPath
+            && self.copy.policy.placement != DestinationPlacement::ExactPath
         {
             bail!(
                 "signed placement puts names inside {label}, so it must be created as a directory"
             );
         }
         if self.created_by_this_grant(path)
-            || (policy == ExistingDestinationPolicyV1::Replace && !root_must_be_new)
+            || (policy == ExistingDestinationPolicy::Replace && !root_must_be_new)
         {
             return Ok(());
         }
         let observed = self.rooted_metadata(path)?;
         match policy {
-            ExistingDestinationPolicyV1::MustExist => {
+            ExistingDestinationPolicy::MustExist => {
                 let metadata = match observed {
                     Some(metadata) if !directory || metadata.is_dir() => metadata,
                     Some(_) => {
@@ -975,12 +967,12 @@ impl RestrictedAuthority {
                 }
                 Ok(())
             }
-            ExistingDestinationPolicyV1::Skip | ExistingDestinationPolicyV1::Replace => {
+            ExistingDestinationPolicy::Skip | ExistingDestinationPolicy::Replace => {
                 match observed {
                     Some(metadata)
                         if directory
                             && metadata.is_dir()
-                            && policy == ExistingDestinationPolicyV1::Skip =>
+                            && policy == ExistingDestinationPolicy::Skip =>
                     {
                         return Ok(());
                     }
@@ -1003,7 +995,7 @@ impl RestrictedAuthority {
                 });
                 Ok(())
             }
-            ExistingDestinationPolicyV1::UpdateIfOlder => {
+            ExistingDestinationPolicy::UpdateIfOlder => {
                 bail!("update-if-older existing-object policy is not enforceable by the receiver")
             }
         }
@@ -1029,12 +1021,12 @@ impl RestrictedAuthority {
         let own = self.created_by_this_grant(path)
             || pending.iter().any(|creation| creation.path == path);
         match self.copy.policy.existing {
-            ExistingDestinationPolicyV1::Skip if is_dir || own => Ok(()),
-            ExistingDestinationPolicyV1::Skip => {
+            ExistingDestinationPolicy::Skip if is_dir || own => Ok(()),
+            ExistingDestinationPolicy::Skip => {
                 bail!("signed grant retains existing objects: {label} may not be modified")
             }
-            ExistingDestinationPolicyV1::MustExist if own => Ok(()),
-            ExistingDestinationPolicyV1::MustExist => {
+            ExistingDestinationPolicy::MustExist if own => Ok(()),
+            ExistingDestinationPolicy::MustExist => {
                 // Updates are pinned to the observed object, like
                 // publications: nothing hostA supplies names an inode on its
                 // own authority.
@@ -1073,8 +1065,8 @@ impl RestrictedAuthority {
                 }
                 Ok(())
             }
-            ExistingDestinationPolicyV1::Replace => Ok(()),
-            ExistingDestinationPolicyV1::UpdateIfOlder => {
+            ExistingDestinationPolicy::Replace => Ok(()),
+            ExistingDestinationPolicy::UpdateIfOlder => {
                 bail!("update-if-older existing-object policy is not enforceable by the receiver")
             }
         }
@@ -1088,10 +1080,10 @@ impl RestrictedAuthority {
         }
         let label = String::from_utf8_lossy(path);
         match self.copy.policy.existing {
-            ExistingDestinationPolicyV1::Skip if self.rooted_metadata(path)?.is_some() => {
+            ExistingDestinationPolicy::Skip if self.rooted_metadata(path)?.is_some() => {
                 bail!("signed grant retains existing objects: {label} already exists")
             }
-            ExistingDestinationPolicyV1::MustExist if self.rooted_metadata(path)?.is_none() => {
+            ExistingDestinationPolicy::MustExist if self.rooted_metadata(path)?.is_none() => {
                 bail!("signed grant creates nothing: {label} does not exist")
             }
             _ => Ok(()),
@@ -1443,7 +1435,7 @@ impl RestrictedAuthority {
         } else {
             self.check_mutation_path(path, is_dir)?;
         }
-        if self.copy.policy.deletion == DeletionPolicyV1::Forbid {
+        if self.copy.policy.deletion == DeletionPolicy::Forbid {
             bail!("deletion is not authorized by the signed grant");
         }
         let mut state = self.state.lock().unwrap();
@@ -1766,7 +1758,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                if self.copy.policy.publication != PublicationPolicyV1::AtomicStaged {
+                if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
                     bail!("in-place signed receiver forbids staged basis creation");
                 }
                 if *len > self.copy.limits.max_file_bytes {
@@ -1804,7 +1796,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                if *inplace != (self.copy.policy.publication == PublicationPolicyV1::InPlace) {
+                if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file preparation does not match the signed publication policy");
                 }
                 if *size > self.copy.limits.max_file_bytes {
@@ -1834,7 +1826,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                if *inplace != (self.copy.policy.publication == PublicationPolicyV1::InPlace) {
+                if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file write does not match the signed publication policy");
                 }
                 let declared = self.declared_size(path, *partial_id)?;
@@ -1865,7 +1857,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                if *inplace != (self.copy.policy.publication == PublicationPolicyV1::InPlace) {
+                if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file finalization does not match the signed publication policy");
                 }
                 self.check_mutation_path(path, false)?;
@@ -1887,7 +1879,7 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::PutSmallBatch(puts) => {
-                if self.copy.policy.publication != PublicationPolicyV1::AtomicStaged {
+                if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
                     bail!("in-place signed receiver forbids staged small-file publication");
                 }
                 if let Some(limit) = &self.file_data_limit {
@@ -2237,7 +2229,7 @@ fn generate_transport_key(id: EnrollmentId) -> Result<PrivateKey> {
 }
 
 /// The receiver's own signing key for receipts. It lives only on hostB, in
-/// the enrollment's state directory, and is rotated by every install.
+/// the enrollment's state directory, and is generated once per enrollment.
 fn generate_receipt_key(id: EnrollmentId) -> Result<PrivateKey> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).context("generate receipt signing key")?;
@@ -2254,8 +2246,13 @@ const RECEIPT_KEY_FILE: &str = "receipt-key";
 /// a lost reply, always reports the key the local side already holds.
 /// Rotation is explicit: revoke, then enroll again.
 fn ensure_receipt_key(state: &Path, id: EnrollmentId) -> Result<PrivateKey> {
-    if let Some(existing) = load_receipt_key(state)? {
-        return Ok(existing);
+    let path = state.join(RECEIPT_KEY_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => return load_receipt_key(state),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", path.display()));
+        }
     }
     let key = generate_receipt_key(id)?;
     atomic_write(
@@ -2269,16 +2266,11 @@ fn ensure_receipt_key(state: &Path, id: EnrollmentId) -> Result<PrivateKey> {
     Ok(key)
 }
 
-/// The receipt signing key an install left in the state directory, if any.
-fn load_receipt_key(state: &Path) -> Result<Option<PrivateKey>> {
+/// The receipt signing key installed for this enrollment.
+fn load_receipt_key(state: &Path) -> Result<PrivateKey> {
     let path = state.join(RECEIPT_KEY_FILE);
-    if !path.exists() {
-        return Ok(None);
-    }
     let encoded = delegation::read_secure_regular(&path, "receipt signing key", 128 * 1024)?;
-    PrivateKey::from_openssh(&encoded)
-        .context("parse receipt signing key")
-        .map(Some)
+    PrivateKey::from_openssh(&encoded).context("parse receipt signing key")
 }
 
 fn signer_name(id: EnrollmentId) -> String {
@@ -2861,7 +2853,7 @@ fn enroll(
         requested_parent: response.requested_parent,
         canonical_root: response.canonical_root,
         receiver_path: response.receiver_path,
-        receipt_public_key: Some(response.receipt_public_key),
+        receipt_public_key: response.receipt_public_key,
     };
     complete_local_enrollment(&directory, &metadata)?;
     Ok((metadata, directory, response.canonical_destination))
@@ -2889,11 +2881,11 @@ fn now() -> Result<i64> {
         .context("current time exceeds signed grant range")
 }
 
-fn root_existence_for(existence: Existence) -> RootExistenceV4 {
+fn root_existence_for(existence: Existence) -> RootExistence {
     match existence {
-        Existence::Any => RootExistenceV4::Any,
-        Existence::New => RootExistenceV4::New,
-        Existence::Existing => RootExistenceV4::Existing,
+        Existence::Any => RootExistence::Any,
+        Existence::New => RootExistence::New,
+        Existence::Existing => RootExistence::Existing,
     }
 }
 
@@ -2999,16 +2991,16 @@ fn grant_for(
     id: EnrollmentId,
     login: &str,
     destination: &str,
-) -> Result<GrantV1> {
+) -> Result<Grant> {
     validate_restricted_args(args)?;
     let issued_at = now()?;
     let read_only = args.dry_run || args.verify_only;
     // `--max-delete 0` means nothing may be deleted, which the grant states
     // directly as a forbidding policy rather than a zero budget.
     let deletion = if !read_only && args.delete && args.max_delete != Some(0) {
-        DeletionPolicyV1::DeleteDestinationOnly
+        DeletionPolicy::DeleteDestinationOnly
     } else {
-        DeletionPolicyV1::Forbid
+        DeletionPolicy::Forbid
     };
     let max_entries = args.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
     let max_total_bytes = args.max_total_bytes.unwrap_or(DEFAULT_MAX_BYTES);
@@ -3020,8 +3012,8 @@ fn grant_for(
         .unwrap_or(DEFAULT_MAX_BYTES)
         .min(max_total_bytes);
     let max_deletions = match deletion {
-        DeletionPolicyV1::Forbid => 0,
-        DeletionPolicyV1::DeleteDestinationOnly => args
+        DeletionPolicy::Forbid => 0,
+        DeletionPolicy::DeleteDestinationOnly => args
             .max_delete
             .context("deletion through the command-restricted receiver needs --max-delete")?
             .min(max_entries),
@@ -3042,22 +3034,22 @@ fn grant_for(
     };
     let copies_contents = sources.iter().any(Location::copies_contents);
     let placement = match args.placement {
-        Placement::As => DestinationPlacementV1::ExactPath,
+        Placement::As => DestinationPlacement::ExactPath,
         Placement::Into | Placement::Rsync if copies_contents => {
-            DestinationPlacementV1::DirectoryContents
+            DestinationPlacement::DirectoryContents
         }
-        Placement::Into | Placement::Rsync => DestinationPlacementV1::DirectoryAsChild,
+        Placement::Into | Placement::Rsync => DestinationPlacement::DirectoryAsChild,
     };
     let destination_bytes = destination.as_bytes().to_vec();
     let mut mutation_scopes = match placement {
-        DestinationPlacementV1::ExactPath | DestinationPlacementV1::DirectoryContents => {
-            vec![MutationScopeV1 {
+        DestinationPlacement::ExactPath | DestinationPlacement::DirectoryContents => {
+            vec![MutationScope {
                 path: destination_bytes.clone(),
                 descendants: args.recursive,
             }]
         }
-        DestinationPlacementV1::DirectoryAsChild => {
-            let mut scopes = vec![MutationScopeV1 {
+        DestinationPlacement::DirectoryAsChild => {
+            let mut scopes = vec![MutationScope {
                 path: destination_bytes.clone(),
                 descendants: false,
             }];
@@ -3066,7 +3058,7 @@ fn grant_for(
                 if basename.is_empty() {
                     bail!("named source has no destination basename for signed scope");
                 }
-                scopes.push(MutationScopeV1 {
+                scopes.push(MutationScope {
                     path: crate::fsops::join(&destination_bytes, &basename),
                     descendants: args.recursive,
                 });
@@ -3081,16 +3073,16 @@ fn grant_for(
     // field; folding it in here would forbid creating files inside an
     // existing directory.
     let existing = if args.ignore_existing {
-        ExistingDestinationPolicyV1::Skip
+        ExistingDestinationPolicy::Skip
     } else if args.update {
-        ExistingDestinationPolicyV1::UpdateIfOlder
+        ExistingDestinationPolicy::UpdateIfOlder
     } else if args.existing {
-        ExistingDestinationPolicyV1::MustExist
+        ExistingDestinationPolicy::MustExist
     } else {
-        ExistingDestinationPolicyV1::Replace
+        ExistingDestinationPolicy::Replace
     };
     let (tcp_port_lo, tcp_port_hi) = crate::transfer::parse_ports(&args.tcp_ports)?;
-    let grant = GrantV1 {
+    let grant = Grant {
         enrollment_id: id,
         target_login: login.to_owned(),
         signer: signer_name(id),
@@ -3098,20 +3090,20 @@ fn grant_for(
         issued_at,
         not_before: issued_at.saturating_sub(CLOCK_SKEW_SECONDS),
         not_after,
-        operation: GrantOperationV1::Copy(CopyOperationV1 {
+        operation: GrantOperation::Copy(CopyOperation {
             destination: destination_bytes,
             mutation_scopes,
-            policy: CopyPolicyV1 {
+            policy: CopyPolicy {
                 placement,
                 existing,
                 deletion,
                 publication: if args.inplace {
-                    PublicationPolicyV1::InPlace
+                    PublicationPolicy::InPlace
                 } else {
-                    PublicationPolicyV1::AtomicStaged
+                    PublicationPolicy::AtomicStaged
                 },
             },
-            options: CopyOptionsV1 {
+            options: CopyOptions {
                 recursive: args.recursive,
                 preserve_symlinks: args.links,
                 preserve_permissions: args.perms,
@@ -3127,7 +3119,7 @@ fn grant_for(
                 tcp_port_lo,
                 tcp_port_hi,
             },
-            limits: CopyLimitsV1 {
+            limits: CopyLimits {
                 max_entries,
                 max_total_bytes,
                 max_file_bytes,
@@ -3220,12 +3212,7 @@ pub(crate) fn prepare_transfer(
         }
     };
     let private_key = load_private_key(&directory)?;
-    let receipt_public_key = metadata.receipt_public_key.clone().with_context(|| {
-        format!(
-            "enrollment {} predates receipts and cannot verify one; rerun `syq enrollment add {}:{}` to refresh it",
-            metadata.id, host, requested
-        )
-    })?;
+    let receipt_public_key = metadata.receipt_public_key.clone();
     let grant = grant_for(
         args,
         sources,
@@ -3236,9 +3223,9 @@ pub(crate) fn prepare_transfer(
     let request_id = grant.request_id;
     let grant = delegation::sign_grant(
         grant,
-        GrantExtensions {
+        GrantConstraints {
             max_file_data_bytes_per_second: args.bwlimit_bytes,
-            filters: FilterPolicyV3 {
+            filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
                 destination_roots: filter_destination_roots(
                     args,
@@ -3248,7 +3235,7 @@ pub(crate) fn prepare_transfer(
                 delete_excluded: args.delete_excluded,
             },
             root_existence: root_existence_for(args.target_existence),
-            receipt: ReceiptPolicyV5 {
+            receipt: ReceiptPolicy {
                 required: true,
                 hashed: args.receipt_hashed,
             },
@@ -3382,15 +3369,10 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             for (metadata, _) in active {
                 let target = endpoint(&metadata.target_login, &metadata.host, metadata.port)?;
                 println!(
-                    "{}\tactive\t{}\t{}\t{}",
+                    "{}\tactive\t{}\t{}",
                     metadata.id,
                     target.label(),
-                    metadata.canonical_root,
-                    if metadata.receipt_public_key.is_some() {
-                        "receipt-key"
-                    } else {
-                        "no-receipt-key"
-                    }
+                    metadata.canonical_root
                 );
             }
             for (pending, _) in load_pending_enrollments()? {
@@ -3425,12 +3407,8 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             let requested = std::str::from_utf8(&location.path)
                 .context("enrollment destination is not UTF-8")?;
             let via = management_via(&argv[4..])?;
-            let policy = crate::agent_broker::resolve_host_policy(
-                "ssh",
-                location.user.as_deref(),
-                host,
-                true,
-            )?;
+            let policy =
+                crate::agent_broker::resolve_host_policy("ssh", location.user.as_deref(), host)?;
             let (metadata, _, destination) = enroll(
                 host,
                 None,
@@ -3533,7 +3511,7 @@ mod tests {
 
     fn test_authority(
         root: &Path,
-        deletion: DeletionPolicyV1,
+        deletion: DeletionPolicy,
         maximum_bytes: u64,
     ) -> RestrictedAuthority {
         test_authority_with_rate(root, deletion, maximum_bytes, 0)
@@ -3541,7 +3519,7 @@ mod tests {
 
     fn test_authority_with_rate(
         root: &Path,
-        deletion: DeletionPolicyV1,
+        deletion: DeletionPolicy,
         maximum_bytes: u64,
         max_file_data_bytes_per_second: u64,
     ) -> RestrictedAuthority {
@@ -3550,18 +3528,18 @@ mod tests {
             deletion,
             maximum_bytes,
             max_file_data_bytes_per_second,
-            FilterPolicyV3::default(),
-            PublicationPolicyV1::AtomicStaged,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
         )
     }
 
     fn test_authority_with_policy(
         root: &Path,
-        deletion: DeletionPolicyV1,
+        deletion: DeletionPolicy,
         maximum_bytes: u64,
         max_file_data_bytes_per_second: u64,
-        filters: FilterPolicyV3,
-        publication: PublicationPolicyV1,
+        filters: FilterPolicy,
+        publication: PublicationPolicy,
     ) -> RestrictedAuthority {
         test_authority_with_existence(
             root,
@@ -3570,9 +3548,9 @@ mod tests {
             max_file_data_bytes_per_second,
             filters,
             publication,
-            ExistingDestinationPolicyV1::Replace,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .unwrap()
     }
@@ -3580,14 +3558,14 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn test_authority_with_existence(
         root: &Path,
-        deletion: DeletionPolicyV1,
+        deletion: DeletionPolicy,
         maximum_bytes: u64,
         max_file_data_bytes_per_second: u64,
-        filters: FilterPolicyV3,
-        publication: PublicationPolicyV1,
-        existing: ExistingDestinationPolicyV1,
-        placement: DestinationPlacementV1,
-        root_existence: RootExistenceV4,
+        filters: FilterPolicy,
+        publication: PublicationPolicy,
+        existing: ExistingDestinationPolicy,
+        placement: DestinationPlacement,
+        root_existence: RootExistence,
     ) -> Result<RestrictedAuthority> {
         test_authority_with_receipt(
             root,
@@ -3606,14 +3584,14 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn test_authority_with_receipt(
         root: &Path,
-        deletion: DeletionPolicyV1,
+        deletion: DeletionPolicy,
         maximum_bytes: u64,
         max_file_data_bytes_per_second: u64,
-        mut filters: FilterPolicyV3,
-        publication: PublicationPolicyV1,
-        existing: ExistingDestinationPolicyV1,
-        placement: DestinationPlacementV1,
-        root_existence: RootExistenceV4,
+        mut filters: FilterPolicy,
+        publication: PublicationPolicy,
+        existing: ExistingDestinationPolicy,
+        placement: DestinationPlacement,
+        root_existence: RootExistence,
         receipt: Option<(PrivateKey, bool)>,
     ) -> Result<RestrictedAuthority> {
         let opened = Root::open(root).unwrap();
@@ -3634,7 +3612,7 @@ mod tests {
         if !filters.ignore.is_empty() && filters.destination_roots.is_empty() {
             filters.destination_roots = vec![destination.as_os_str().as_bytes().to_vec()];
         }
-        let grant = GrantV1 {
+        let grant = Grant {
             enrollment_id: id,
             target_login: "receiver".into(),
             signer: signer_name(id),
@@ -3642,19 +3620,19 @@ mod tests {
             issued_at: 1,
             not_before: 1,
             not_after: 100,
-            operation: GrantOperationV1::Copy(CopyOperationV1 {
+            operation: GrantOperation::Copy(CopyOperation {
                 destination: destination.as_os_str().as_bytes().to_vec(),
-                mutation_scopes: vec![MutationScopeV1 {
+                mutation_scopes: vec![MutationScope {
                     path: destination.as_os_str().as_bytes().to_vec(),
                     descendants: true,
                 }],
-                policy: CopyPolicyV1 {
+                policy: CopyPolicy {
                     placement,
                     existing,
                     deletion,
                     publication,
                 },
-                options: CopyOptionsV1 {
+                options: CopyOptions {
                     recursive: true,
                     preserve_symlinks: true,
                     preserve_permissions: false,
@@ -3670,34 +3648,37 @@ mod tests {
                     tcp_port_lo: 47_600,
                     tcp_port_hi: 47_699,
                 },
-                limits: CopyLimitsV1 {
+                limits: CopyLimits {
                     max_entries: 8,
                     max_total_bytes: maximum_bytes,
                     max_file_bytes: maximum_bytes,
                     hash_block_bytes: 4 << 20,
                     max_connections: 2,
-                    max_deletions: u64::from(deletion != DeletionPolicyV1::Forbid) * 2,
+                    max_deletions: u64::from(deletion != DeletionPolicy::Forbid) * 2,
                     max_runtime_seconds: 60,
                 },
             }),
         };
-        let receipt_policy = receipt
-            .as_ref()
-            .map(|(_, hashed)| ReceiptPolicyV5 {
-                required: true,
-                hashed: *hashed,
-            })
-            .unwrap_or_default();
+        let (receipt_key, receipt_policy) = match receipt {
+            Some((key, hashed)) => (
+                key,
+                ReceiptPolicy {
+                    required: true,
+                    hashed,
+                },
+            ),
+            None => (generate_receipt_key(id)?, ReceiptPolicy::default()),
+        };
         RestrictedAuthority::new(
             &config,
             grant,
-            GrantExtensions {
+            GrantConstraints {
                 max_file_data_bytes_per_second,
                 filters,
                 root_existence,
                 receipt: receipt_policy,
             },
-            receipt.map(|(key, _)| key),
+            receipt_key,
             Instant::now() + std::time::Duration::from_secs(60),
         )
     }
@@ -3741,7 +3722,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_keys_are_distinct_per_enrollment_and_older_metadata_still_loads() {
+    fn receipt_keys_are_distinct_and_persist_for_an_enrollment() {
         let id = EnrollmentId::random();
         let key = generate_receipt_key(id).unwrap();
         let public = key.public_key().to_openssh().unwrap();
@@ -3765,25 +3746,6 @@ mod tests {
             second.public_key().to_openssh().unwrap()
         );
         assert!(state.join(RECEIPT_KEY_FILE).is_file());
-
-        // Metadata written before receipt keys existed has no key and is
-        // listed as needing a refresh rather than failing to load.
-        let current = LocalEnrollment {
-            version: CONFIG_VERSION,
-            id,
-            host: "vault".into(),
-            port: None,
-            target_login: "backup".into(),
-            remote_home: "/home/backup".into(),
-            requested_parent: "/archive".into(),
-            canonical_root: "/archive".into(),
-            receiver_path: "/home/backup/.local/libexec/syq-receiver".into(),
-            receipt_public_key: Some(public),
-        };
-        let mut older = serde_json::to_value(&current).unwrap();
-        older.as_object_mut().unwrap().remove("receipt_public_key");
-        let metadata: LocalEnrollment = serde_json::from_value(older).unwrap();
-        assert!(metadata.receipt_public_key.is_none());
     }
 
     #[test]
@@ -3828,7 +3790,11 @@ mod tests {
             requested_parent: "/archive".into(),
             canonical_root: "/archive".into(),
             receiver_path: "/home/backup/.local/libexec/syq-receiver".into(),
-            receipt_public_key: None,
+            receipt_public_key: generate_receipt_key(id)
+                .unwrap()
+                .public_key()
+                .to_openssh()
+                .unwrap(),
         };
         complete_local_enrollment(&directory, &metadata).unwrap();
         assert!(!directory.join("pending.json").exists());
@@ -3841,7 +3807,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
-        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 4);
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 4);
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let outside = temporary
             .path()
@@ -3952,7 +3918,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
-        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 4);
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 4);
         let destination = root.join("target").as_os_str().as_bytes().to_vec();
         let parent = root.as_os_str().as_bytes().to_vec();
 
@@ -3978,18 +3944,18 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
-        let policy = FilterPolicyV3 {
+        let policy = FilterPolicy {
             ignore: vec!["ignored/".into(), "!ignored/file".into()],
             destination_roots: Vec::new(),
             delete_excluded: false,
         };
         let authority = test_authority_with_policy(
             &root,
-            DeletionPolicyV1::DeleteDestinationOnly,
+            DeletionPolicy::DeleteDestinationOnly,
             16,
             0,
             policy.clone(),
-            PublicationPolicyV1::AtomicStaged,
+            PublicationPolicy::AtomicStaged,
         );
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let ignored = root
@@ -4033,15 +3999,15 @@ mod tests {
 
         let delete_excluded = test_authority_with_policy(
             &root,
-            DeletionPolicyV1::DeleteDestinationOnly,
+            DeletionPolicy::DeleteDestinationOnly,
             16,
             0,
-            FilterPolicyV3 {
+            FilterPolicy {
                 ignore: policy.ignore,
                 destination_roots: Vec::new(),
                 delete_excluded: true,
             },
-            PublicationPolicyV1::AtomicStaged,
+            PublicationPolicy::AtomicStaged,
         );
         let mut permitted_delete = Request::Apply {
             ops: vec![Op::Unlink { path: ignored }],
@@ -4078,15 +4044,15 @@ mod tests {
 
         let authority = test_authority_with_policy(
             &root,
-            DeletionPolicyV1::Forbid,
+            DeletionPolicy::Forbid,
             16,
             0,
-            FilterPolicyV3 {
+            FilterPolicy {
                 ignore: vec!["cache/".into()],
                 destination_roots,
                 delete_excluded: false,
             },
-            PublicationPolicyV1::AtomicStaged,
+            PublicationPolicy::AtomicStaged,
         );
         let prepare = |path| Request::Prepare {
             path,
@@ -4109,11 +4075,11 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let authority = test_authority_with_policy(
             &root,
-            DeletionPolicyV1::Forbid,
+            DeletionPolicy::Forbid,
             16,
             0,
-            FilterPolicyV3::default(),
-            PublicationPolicyV1::InPlace,
+            FilterPolicy::default(),
+            PublicationPolicy::InPlace,
         );
         let target = root.join("target/file").as_os_str().as_bytes().to_vec();
         let prepare = |inplace| Request::Prepare {
@@ -4132,17 +4098,17 @@ mod tests {
 
     fn existence_authority(
         root: &Path,
-        existing: ExistingDestinationPolicyV1,
-        placement: DestinationPlacementV1,
-        root_existence: RootExistenceV4,
+        existing: ExistingDestinationPolicy,
+        placement: DestinationPlacement,
+        root_existence: RootExistence,
     ) -> Result<RestrictedAuthority> {
         test_authority_with_existence(
             root,
-            DeletionPolicyV1::DeleteDestinationOnly,
+            DeletionPolicy::DeleteDestinationOnly,
             1024,
             0,
-            FilterPolicyV3::default(),
-            PublicationPolicyV1::AtomicStaged,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
             existing,
             placement,
             root_existence,
@@ -4275,9 +4241,9 @@ mod tests {
         fs::write(&kept, b"old").unwrap();
         let authority = existence_authority(
             &root,
-            ExistingDestinationPolicyV1::Skip,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .unwrap();
 
@@ -4379,9 +4345,9 @@ mod tests {
         std::os::unix::fs::symlink("present", &link).unwrap();
         let authority = existence_authority(
             &root,
-            ExistingDestinationPolicyV1::MustExist,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::MustExist,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .unwrap();
 
@@ -4449,9 +4415,9 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         let authority = existence_authority(
             &root,
-            ExistingDestinationPolicyV1::Skip,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .unwrap();
         let fresh = target.join("fresh");
@@ -4512,9 +4478,9 @@ mod tests {
         fs::write(&kept, b"old").unwrap();
         let authority = existence_authority(
             &root,
-            ExistingDestinationPolicyV1::Skip,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .unwrap();
 
@@ -4558,9 +4524,9 @@ mod tests {
         fs::write(&present, b"old").unwrap();
         let authority = existence_authority(
             &root,
-            ExistingDestinationPolicyV1::MustExist,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::MustExist,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .unwrap();
         let identity = fs::symlink_metadata(&present).unwrap();
@@ -4601,9 +4567,9 @@ mod tests {
         fs::write(&present, b"old").unwrap();
         let authority = existence_authority(
             &root,
-            ExistingDestinationPolicyV1::MustExist,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::MustExist,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .unwrap();
         let identity = fs::symlink_metadata(&present).unwrap();
@@ -4659,9 +4625,9 @@ mod tests {
         std::os::unix::fs::symlink("old-target", &link).unwrap();
         let authority = existence_authority(
             &root,
-            ExistingDestinationPolicyV1::MustExist,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::MustExist,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .unwrap();
         let before = fs::symlink_metadata(&link).unwrap();
@@ -4733,14 +4699,14 @@ mod tests {
         let key = generate_receipt_key(EnrollmentId::random()).unwrap();
         let mut authority = test_authority_with_receipt(
             root,
-            DeletionPolicyV1::DeleteDestinationOnly,
+            DeletionPolicy::DeleteDestinationOnly,
             1024,
             0,
-            FilterPolicyV3::default(),
-            PublicationPolicyV1::AtomicStaged,
-            ExistingDestinationPolicyV1::Replace,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
             Some((key, hashed)),
         )
         .unwrap();
@@ -4767,14 +4733,14 @@ mod tests {
         let public = key.public_key().to_openssh().unwrap();
         let authority = test_authority_with_receipt(
             &root,
-            DeletionPolicyV1::DeleteDestinationOnly,
+            DeletionPolicy::DeleteDestinationOnly,
             1024,
             0,
-            FilterPolicyV3::default(),
-            PublicationPolicyV1::AtomicStaged,
-            ExistingDestinationPolicyV1::Replace,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
             Some((key, true)),
         )
         .unwrap();
@@ -4942,14 +4908,14 @@ mod tests {
         let public = key.public_key().to_openssh().unwrap();
         let authority = test_authority_with_receipt(
             &root,
-            DeletionPolicyV1::Forbid,
+            DeletionPolicy::Forbid,
             1024,
             0,
-            FilterPolicyV3::default(),
-            PublicationPolicyV1::InPlace,
-            ExistingDestinationPolicyV1::Replace,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            FilterPolicy::default(),
+            PublicationPolicy::InPlace,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
             Some((key, false)),
         )
         .unwrap();
@@ -4991,14 +4957,14 @@ mod tests {
         let public = key.public_key().to_openssh().unwrap();
         let finished = test_authority_with_receipt(
             &root,
-            DeletionPolicyV1::Forbid,
+            DeletionPolicy::Forbid,
             1024,
             0,
-            FilterPolicyV3::default(),
-            PublicationPolicyV1::InPlace,
-            ExistingDestinationPolicyV1::Replace,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            FilterPolicy::default(),
+            PublicationPolicy::InPlace,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
             Some((key, false)),
         )
         .unwrap();
@@ -5030,13 +4996,7 @@ mod tests {
     }
 
     fn racing_public(authority: &RestrictedAuthority) -> String {
-        authority
-            .receipt_key
-            .as_ref()
-            .unwrap()
-            .public_key()
-            .to_openssh()
-            .unwrap()
+        authority.receipt_key.public_key().to_openssh().unwrap()
     }
 
     #[test]
@@ -5110,9 +5070,9 @@ mod tests {
         let target = root.join("target");
         let authority = existence_authority(
             &root,
-            ExistingDestinationPolicyV1::Replace,
-            DestinationPlacementV1::DirectoryAsChild,
-            RootExistenceV4::New,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryAsChild,
+            RootExistence::New,
         )
         .unwrap();
         let mut as_file = finalize_request(&target, Any);
@@ -5134,41 +5094,41 @@ mod tests {
         let inplace = |existing, placement, root_existence| {
             test_authority_with_existence(
                 &root,
-                DeletionPolicyV1::Forbid,
+                DeletionPolicy::Forbid,
                 1024,
                 0,
-                FilterPolicyV3::default(),
-                PublicationPolicyV1::InPlace,
+                FilterPolicy::default(),
+                PublicationPolicy::InPlace,
                 existing,
                 placement,
                 root_existence,
             )
         };
         assert!(inplace(
-            ExistingDestinationPolicyV1::Skip,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .is_err());
         assert!(inplace(
-            ExistingDestinationPolicyV1::Replace,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::New,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::New,
         )
         .is_err());
         // In-place preparation cannot be pinned to an observed object either,
         // so MustExist is refused as well; only Replace remains, and a new
         // directory root is fine because mkdir creates it.
         assert!(inplace(
-            ExistingDestinationPolicyV1::MustExist,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::MustExist,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .is_err());
         inplace(
-            ExistingDestinationPolicyV1::Replace,
-            DestinationPlacementV1::DirectoryContents,
-            RootExistenceV4::New,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::New,
         )
         .unwrap();
 
@@ -5199,7 +5159,7 @@ mod tests {
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let target = root.join("target");
-        let replace = ExistingDestinationPolicyV1::Replace;
+        let replace = ExistingDestinationPolicy::Replace;
 
         // A root that must be new is refused when present, and otherwise may
         // only be created without replacement; afterwards it is this grant's.
@@ -5207,16 +5167,16 @@ mod tests {
         assert!(existence_authority(
             &root,
             replace,
-            DestinationPlacementV1::DirectoryContents,
-            RootExistenceV4::New,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::New,
         )
         .is_err());
         fs::remove_dir(&target).unwrap();
         let authority = existence_authority(
             &root,
             replace,
-            DestinationPlacementV1::DirectoryContents,
-            RootExistenceV4::New,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::New,
         )
         .unwrap();
         let mut create_root = apply(mkdir(&target));
@@ -5240,23 +5200,23 @@ mod tests {
         assert!(existence_authority(
             &root,
             replace,
-            DestinationPlacementV1::DirectoryContents,
-            RootExistenceV4::Existing,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Existing,
         )
         .is_err());
         fs::write(&target, b"file").unwrap();
         assert!(existence_authority(
             &root,
             replace,
-            DestinationPlacementV1::DirectoryContents,
-            RootExistenceV4::Existing,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Existing,
         )
         .is_err());
         existence_authority(
             &root,
             replace,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Existing,
+            DestinationPlacement::ExactPath,
+            RootExistence::Existing,
         )
         .unwrap();
         fs::remove_file(&target).unwrap();
@@ -5264,8 +5224,8 @@ mod tests {
         existence_authority(
             &root,
             replace,
-            DestinationPlacementV1::DirectoryAsChild,
-            RootExistenceV4::Existing,
+            DestinationPlacement::DirectoryAsChild,
+            RootExistence::Existing,
         )
         .unwrap();
 
@@ -5273,9 +5233,9 @@ mod tests {
         // refused when the grant is claimed rather than trusted.
         assert!(existence_authority(
             &root,
-            ExistingDestinationPolicyV1::UpdateIfOlder,
-            DestinationPlacementV1::ExactPath,
-            RootExistenceV4::Any,
+            ExistingDestinationPolicy::UpdateIfOlder,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
         )
         .is_err());
     }
@@ -5302,7 +5262,7 @@ mod tests {
             guard: None,
         };
 
-        let receiver_modes = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let receiver_modes = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut receiver_mode = metadata(proto::flags::RECEIVER_MODE);
         receiver_modes.authorize(&mut receiver_mode, false).unwrap();
         let mut source_mode = metadata(proto::flags::MODE);
@@ -5310,7 +5270,7 @@ mod tests {
         let mut mixed = metadata(proto::flags::MODE_MASK);
         assert!(receiver_modes.authorize(&mut mixed, false).is_err());
 
-        let mut source_modes = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let mut source_modes = test_authority(&root, DeletionPolicy::Forbid, 1024);
         source_modes.copy.options.preserve_permissions = true;
         source_modes.copy.options.receiver_managed_modes = false;
         let mut source_mode = metadata(proto::flags::MODE);
@@ -5328,7 +5288,7 @@ mod tests {
         let new_directory = target.join("new-dir");
         fs::create_dir_all(&existing_directory).unwrap();
         fs::set_permissions(&existing_directory, fs::Permissions::from_mode(0o500)).unwrap();
-        let mut authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         authority.receiver_umask = 0o022;
         let path = |path: &Path| path.as_os_str().as_bytes().to_vec();
 
@@ -5564,7 +5524,7 @@ mod tests {
         let child = parent.join("child");
         fs::create_dir_all(&parent).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o2755)).unwrap();
-        let mut authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         authority.receiver_umask = 0o022;
 
         let mut mkdir = Request::Apply {
@@ -5635,7 +5595,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
-        let mut authority = test_authority(&root, DeletionPolicyV1::Forbid, DEFAULT_MAX_BYTES);
+        let mut authority = test_authority(&root, DeletionPolicy::Forbid, DEFAULT_MAX_BYTES);
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let request = |block, len| Request::HashBlocks {
             path: target.clone(),
@@ -5673,7 +5633,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
-        let authority = test_authority_with_rate(&root, DeletionPolicyV1::Forbid, 1024, 1024);
+        let authority = test_authority_with_rate(&root, DeletionPolicy::Forbid, 1024, 1024);
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let request = |off| Request::WriteRange {
             path: target.clone(),
@@ -5732,7 +5692,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
-        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut listener = Request::TcpListen {
             key: Some(vec![7; crate::crypto::KEY_LEN]),
             token: vec![8; 16],
@@ -5746,7 +5706,7 @@ mod tests {
         authority.close_control();
         assert!(!authority.control_is_open());
 
-        let wrong_range = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let wrong_range = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut listener = Request::TcpListen {
             key: Some(vec![7; crate::crypto::KEY_LEN]),
             token: vec![8; 16],
@@ -5756,7 +5716,7 @@ mod tests {
         };
         assert!(wrong_range.authorize(&mut listener, true).is_err());
 
-        let congestion_override = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let congestion_override = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut listener = Request::TcpListen {
             key: Some(vec![7; crate::crypto::KEY_LEN]),
             token: vec![8; 16],
@@ -5790,7 +5750,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
-        let mut authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         authority.copy.options.dry_run = true;
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let mut mutation = Request::Apply {
@@ -5834,15 +5794,15 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
-        let mut authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let allowed = root.join("target/source").as_os_str().as_bytes().to_vec();
         authority.copy.mutation_scopes = vec![
-            MutationScopeV1 {
+            MutationScope {
                 path: target.clone(),
                 descendants: false,
             },
-            MutationScopeV1 {
+            MutationScope {
                 path: allowed,
                 descendants: true,
             },
@@ -5875,7 +5835,7 @@ mod tests {
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         // The helper grant allows eight entries.
-        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let stat = |name: String| Request::StatMany {
             paths: vec![root
                 .join("target")
@@ -5911,15 +5871,15 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let authority = test_authority_with_policy(
             &root,
-            DeletionPolicyV1::Forbid,
+            DeletionPolicy::Forbid,
             16,
             0,
-            FilterPolicyV3 {
+            FilterPolicy {
                 ignore: vec!["ignored/".into()],
                 destination_roots: Vec::new(),
                 delete_excluded: true,
             },
-            PublicationPolicyV1::AtomicStaged,
+            PublicationPolicy::AtomicStaged,
         );
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let mut unfiltered_scan = Request::Scan {
@@ -5948,7 +5908,7 @@ mod tests {
         let root = temporary.path().join("root");
         fs::create_dir_all(root.join("target")).unwrap();
         // The helper grant allows 16 bytes in total and per file.
-        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 16);
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 16);
         let prepare = |name: &str, size| Request::Prepare {
             path: root
                 .join("target")
@@ -6024,7 +5984,7 @@ mod tests {
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         // The helper grant allows eight entries.
-        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let mut scan = Request::Scan {
             root: target.clone(),
@@ -6089,8 +6049,8 @@ mod tests {
             "/backup",
         )
         .unwrap();
-        let GrantOperationV1::Copy(copy) = &grant.operation;
-        assert_eq!(copy.policy.deletion, DeletionPolicyV1::Forbid);
+        let GrantOperation::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
         assert_eq!(copy.limits.max_deletions, 0);
     }
 
@@ -6117,7 +6077,7 @@ mod tests {
             "/backup",
         )
         .unwrap();
-        let GrantOperationV1::Copy(default_copy) = &default_grant.operation;
+        let GrantOperation::Copy(default_copy) = &default_grant.operation;
         assert_eq!(default_copy.limits.max_entries, DEFAULT_MAX_ENTRIES);
         assert_eq!(default_copy.limits.max_total_bytes, DEFAULT_MAX_BYTES);
         assert_eq!(default_copy.limits.max_file_bytes, DEFAULT_MAX_BYTES);
@@ -6144,7 +6104,7 @@ mod tests {
             "/backup",
         )
         .unwrap();
-        let GrantOperationV1::Copy(copy) = &grant.operation;
+        let GrantOperation::Copy(copy) = &grant.operation;
         assert_eq!(copy.limits.max_entries, 12);
         assert_eq!(copy.limits.max_total_bytes, 2 << 20);
         assert_eq!(copy.limits.max_file_bytes, 2 << 20);
@@ -6184,17 +6144,14 @@ mod tests {
             "/backup",
         )
         .unwrap();
-        let GrantOperationV1::Copy(copy) = &grant.operation;
-        assert_eq!(
-            copy.policy.deletion,
-            DeletionPolicyV1::DeleteDestinationOnly
-        );
+        let GrantOperation::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicy::DeleteDestinationOnly);
         assert_eq!(copy.limits.max_deletions, 30);
         // A read-only run plans no deletion, so it needs no budget.
         let preview = parse(&["--delete", "--dry-run"]);
         let grant = grant_for(&preview, &[source], id, "backup", "/backup").unwrap();
-        let GrantOperationV1::Copy(copy) = &grant.operation;
-        assert_eq!(copy.policy.deletion, DeletionPolicyV1::Forbid);
+        let GrantOperation::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
     }
 
     #[test]
@@ -6205,15 +6162,15 @@ mod tests {
         named_args.normalize();
         let named_source = Location::parse("host-a:source").unwrap();
         let named = grant_for(&named_args, &[named_source], id, "backup", "/backup").unwrap();
-        let GrantOperationV1::Copy(named) = named.operation;
+        let GrantOperation::Copy(named) = named.operation;
         assert_eq!(
             named.mutation_scopes,
             vec![
-                MutationScopeV1 {
+                MutationScope {
                     path: b"/backup".to_vec(),
                     descendants: false,
                 },
-                MutationScopeV1 {
+                MutationScope {
                     path: b"/backup/source".to_vec(),
                     descendants: true,
                 },
@@ -6226,10 +6183,10 @@ mod tests {
         let contents_source = Location::parse("host-a:source/").unwrap();
         let contents =
             grant_for(&contents_args, &[contents_source], id, "backup", "/backup").unwrap();
-        let GrantOperationV1::Copy(contents) = contents.operation;
+        let GrantOperation::Copy(contents) = contents.operation;
         assert_eq!(
             contents.mutation_scopes,
-            vec![MutationScopeV1 {
+            vec![MutationScope {
                 path: b"/backup".to_vec(),
                 descendants: true,
             }]
@@ -6240,7 +6197,7 @@ mod tests {
         nonrecursive_args.normalize();
         let file = Location::parse("host-a:file").unwrap();
         let nonrecursive = grant_for(&nonrecursive_args, &[file], id, "backup", "/backup").unwrap();
-        let GrantOperationV1::Copy(nonrecursive) = nonrecursive.operation;
+        let GrantOperation::Copy(nonrecursive) = nonrecursive.operation;
         assert!(nonrecursive
             .mutation_scopes
             .iter()
@@ -6263,7 +6220,7 @@ mod tests {
         fs::write(target.join("inside"), b"inside").unwrap();
         fs::write(outside.join("secret"), b"secret").unwrap();
         symlink(&outside, target.join("escape")).unwrap();
-        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
 
         let mut scan = Request::Scan {
             root: target.as_os_str().as_bytes().to_vec(),

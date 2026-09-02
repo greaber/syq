@@ -62,9 +62,8 @@ pub fn helper_identity() -> &'static str {
     crate::identity::build()
 }
 
-/// Keep cache layout separate from peer identity. Changing the generation
-/// prevents older cache formats from being executed without changing which
-/// builds are wire-compatible.
+/// Keep cache layout versioning separate from peer identity so cache changes
+/// do not affect wire compatibility.
 fn cache_key() -> String {
     format!("{}-{DOWNLOAD_CACHE_GENERATION}", helper_identity())
 }
@@ -363,7 +362,6 @@ mod tests {
         assert!(!script.contains(".sha256"));
         assert!(script.contains(helper_identity()));
         assert!(script.contains("--build-identity"));
-        assert!(!script.contains("--remote-helper-id"));
     }
 
     #[test]

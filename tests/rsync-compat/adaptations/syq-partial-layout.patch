@@ -46,7 +46,7 @@ index 1c8e953..d0c937c 100644
      since rsync moves it into place from its exit_cleanup handler."""
      proc = subprocess.Popen(
 -        rsync_argv('-a', '--no-whole-file', '--bwlimit=400', *extra_args,
-+        rsync_argv('-a', '-j', '1', '--bwlimit=400', *extra_args,
++        rsync_argv('-a', '--syq-connections', '1', '--bwlimit=400', *extra_args,
                     f'{src}/', f'{TODIR}/'),
          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
      tdir = TODIR / deepdir

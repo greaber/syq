@@ -16,14 +16,17 @@ our product position on each behavior instead of reducing them to a percentage.
 Categories:
 
 - **Compatible** — same observable behavior.
-- **Incompatible on purpose** — syq does something different because we
-  think rsync's behavior is wrong or unsafe. Each one carries its reasoning.
-- **Different, no claim of better** — a design choice that isn't rsync's;
-  reasonable either way.
-- **Not implemented** — rsync has it, syq doesn't yet.
+- **Compatible subset or approximation** — the ordinary result agrees, but a
+  documented edge, output detail, or implementation constraint differs. Exact
+  emulation may be disproportionate to the compatibility value, but the
+  approximation must not hide failure or introduce unexpected data loss.
+- **Intentional divergence** — syq knowingly chooses different semantics for
+  safety, product architecture, or another documented reason.
+- **SYQ extension** — functionality outside rsync's model. Every retained
+  long option uses a `--syq-` name so scripts can identify it as non-portable.
+- **Not implemented** — rsync has it, syq doesn't yet, or the behavior belongs
+  only on syq's native interface.
 - **Open issues** — known gaps we intend to close, or decisions still to make.
-- **Resolved** — a log of items that moved between categories, with the
-  commit or PR.
 
 ## Automated upstream test ledger
 
@@ -81,24 +84,27 @@ behavior; an entry without one is only believed, not held.
 | `--delete` scope: only inside the directories being synced; a single-file source deletes nothing | measured | `delete_only_inside_directories_the_sources_map_onto`, `delete_with_nested_roots_deletes_once` |
 | Ignored/excluded paths are protected from deletion by default; `--delete-excluded` lifts that | measured | `delete_removes_extras_and_protects_ignored`, `delete_nested_roots_keep_their_own_anchored_ignores`, `delete_excluded_removes_ignored_destination_paths` |
 | A directory that can't be emptied because of protected content is reported and left (rsync: `cannot delete non-empty directory`; syq: `not deleting keep/: it holds ignored paths`) | measured | `delete_removes_extras_and_protects_ignored` |
-| Deletion is skipped when listing the source hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; see "Different" 2 for the transfer-time case | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
+| Deletion is skipped when listing the source hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; see "Compatible subsets or approximations" 1 for the transfer-time case | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
 | Files the source has but a rule skips — `-u`, `--existing`, `--ignore-existing`, `--max-size`/`--min-size`, symlinks without `-l`, specials without `-D` — are not deleted, even when the destination entry is a non-empty directory | measured on 3.2.7 and 3.5.0 (an earlier README claim that rsync deletes a `--max-size` casualty was wrong) | `delete_never_removes_paths_the_source_has_but_skips`, `delete_leaves_directory_contents_under_a_skipped_source_path`, `size_limits_filter_files_and_protect_them_from_delete`, `delete_keeps_partials_of_filtered_files` |
-| `-u`/`--update`: a destination regular file with a newer mtime is left alone | measured for regular files; see "Different" for symlinks/devices | `update_skips_files_newer_on_the_destination` |
+| `-u`/`--update`: a destination regular file with a newer mtime is left alone | measured for regular files; see "Compatible subsets or approximations" for symlinks/devices | `update_skips_files_newer_on_the_destination` |
 | `--existing` / `--ignore-existing`, including `--existing` covering directories | measured | `ignore_existing_and_existing`, `existing_never_creates_the_destination_root`, `existing_leaves_a_file_where_a_source_directory_would_go`, `existing_dry_run_lists_no_missing_directories`, `existing_opens_up_readonly_dirs_even_after_a_symlinked_dir` |
 | `--max-size` / `--min-size` on regular files only; `K`/`M`/`G` suffixes | measured | `size_limits_filter_files_and_protect_them_from_delete`, `bad_size_limits_fail_before_anything_connects` |
-| `--files-from` baseline: paths relative to one source; implied parents created; a plain listed directory is copied without its contents unless `-r` is given explicitly (`-a` doesn't count); `--from0`; `-` reads stdin; blank entries and entries starting with `#` or `;` dropped in both separator modes (literal names remain reachable as `./#name` and `./;name`) | measured; entry *parsing* has gaps, open issue 2 | `files_from_copies_listed_paths_with_their_parents`, `files_from_treats_hash_and_semicolon_entries_as_comments`, `files_from_creates_listed_and_implied_dirs_without_r`, `files_from_repeats_and_late_listed_dirs_across_chunks`, `files_from_root_may_be_a_symlink_and_root_lines_are_rejected` |
+| `--files-from` baseline: paths relative to one source; implied parents created; a plain listed directory is copied without its contents unless `-r` is given explicitly (`-a` doesn't count); `--from0`; `-` reads stdin; blank entries and entries starting with `#` or `;` dropped in both separator modes (literal names remain reachable as `./#name` and `./;name`) | measured; entry *parsing* has gaps, open issue 1 | `files_from_copies_listed_paths_with_their_parents`, `files_from_treats_hash_and_semicolon_entries_as_comments`, `files_from_creates_listed_and_implied_dirs_without_r`, `files_from_repeats_and_late_listed_dirs_across_chunks`, `files_from_root_may_be_a_symlink_and_root_lines_are_rejected` |
 | `--delete-after` / `--delete-delay` accepted as synonyms of `--delete` (they describe what syq does) | by construction | `delete_after_and_delay_are_synonyms` |
-| `--max-delete N` exists and exits 25 when it trips | believed (exit code matches rsync); see "Different" for the cap semantics | `max_delete_refuses_everything_past_the_limit` |
-| An operator-named destination symlink is followed when owned by root or by the receiving process's effective uid; a foreign-owned component is refused unless `--insecure-links` is given | measured, including absolute and relative root/cross-uid cases | `symlink_destination_is_followed`, `destination_root_symlink_preserves_target_metadata_for_both_spellings`, `existing_updates_through_a_destination_root_symlink_to_a_dir`, `foreign_owned_destination_root_symlink_is_refused_unless_explicitly_allowed` |
+| `--max-delete N` exists and exits 25 when it trips | believed (exit code matches rsync); see "Intentional divergences" for positive-limit semantics | `max_delete_refuses_everything_past_the_limit` |
+| `--max-delete=0` reports destination-only entries without deleting them; `--max-delete=-1` is accepted as the historical synonym; without `--delete` the option has no effect | measured for syq; rsync behavior documented upstream | `max_delete_refuses_everything_past_the_limit` |
+| An operator-named destination symlink is followed when owned by root or by the receiving process's effective uid; a foreign-owned component is refused | measured, including absolute and relative root/cross-uid cases | `symlink_destination_is_followed`, `destination_root_symlink_preserves_target_metadata_for_both_spellings`, `existing_updates_through_a_destination_root_symlink_to_a_dir`, `foreign_owned_destination_root_symlink_is_refused` |
 | A symlink to a directory found *inside* the destination tree is replaced with a real directory; only the argument itself is followed (rsync without `-K`) | measured | `in_tree_destination_symlink_is_replaced_not_followed`, `existing_does_not_write_through_a_destination_symlink_dir` |
 | `-P`, `-h`, `--partial`, `--numeric-ids`, `-V` accepted as no-ops/aliases; common unsupported flags are rejected with an explanation | by construction | `rsync_compat_noops_are_accepted`, `unsupported_rsync_flags_explain_themselves` |
+| `-B` and `--block-size` select syq's transfer/hash block size | by construction | `checksum_repairs_silent_corruption` |
+| A remote source and remote destination are refused before connecting, as by rsync | by construction | `rsync_rejects_remote_to_remote` |
 | Source entries whose names look like SYQ sidecars (`.name.syq-part.<id>`) are copied as ordinary payload (with one warning); only the exact case where a payload path equals a sidecar this job would use for another file is refused, before anything is written | by construction (PR #7's namespace preflight) | `sidecar_named_source_directory_is_payload`, `delete_treats_sidecar_patterned_files_as_ordinary_extras`, `partial_named_symlink_is_a_symlink_not_a_leftover` |
 
-## Incompatible on purpose
+## Intentional divergences
 
-Each of these is a case where we think rsync's behavior is wrong or unsafe,
-and syq deliberately does otherwise. If the reasoning stops holding, move the
-item.
+Each item records the current reason syq does otherwise. Safety is one reason;
+architecture and disproportionate implementation cost can also justify a
+narrow divergence. If the reasoning stops holding, move the item.
 
 1. **`--delete` runs after the transfer, always; no `--delete-before` /
    `--delete-during`.** rsync defaults to delete-during. syq's rule means a run
@@ -110,10 +116,11 @@ item.
    deleted destination-only files" a worse outcome than "ran out of space."
    *Tests: `delete_with_inplace_replacing_many_symlinks`,
    `delete_removes_only_this_jobs_orphaned_sidecars`.*
-2. **`--max-delete N` deletes *nothing* past the limit.** rsync deletes the
-   first N and then stops. A safety cap that leaves the destination in a
-   partially-deleted state is not much of a safety cap; syq refuses outright,
-   says so, and exits 25 like rsync. *Test:
+2. **A positive `--max-delete N` deletes *nothing* past the limit.** rsync
+   deletes the first N and then stops. A safety cap that leaves the destination
+   in a partially-deleted state is not much of a safety cap; syq refuses
+   outright, says so, and exits 25 like rsync. Zero already means delete
+   nothing in both programs. *Test:
    `max_delete_refuses_everything_past_the_limit`.*
 3. **`--files-from` follows symlinked implied parents and creates them as real
    directories on the destination**, and refuses a listed symlink together with
@@ -150,46 +157,64 @@ item.
    the file and skips the mapped directory with its subtree, with a notice.
    *Test: `ignore_existing_keeps_a_file_where_a_source_directory_maps`.*
 
-## Different, no claim of better
+## SYQ extensions
 
-1. **Ignore rules use gitignore syntax (`--ignore`/`--ignore-from`), not
-   rsync's filter language.** Same model — `/` anchors, `dir/` matches only
-   directories, `**`, negation — but gitignore is last-match-wins with `!`
-   re-includes, while rsync applies the first matching include/exclude/filter
-   rule and has sender/receiver-side modifiers, `protect`/`risk` rules, and
-   per-directory merge files. gitignore is what most users already know; the
-   trade is that rsync filter files can't be reused. Filtering uses the
-   long-only `--ignore`; rsync's `-i` remains `--itemize-changes` and is
-   rejected with a specific explanation because itemized output is absent.
-2. **Any error while listing the source disables deletion** — the same idea
+These options intentionally do not pretend to be rsync options:
+
+| Option | Purpose |
+|---|---|
+| `--syq-connections N` | Fix syq's parallel connection/worker count |
+| `--syq-ignore`, `--syq-ignore-from` | Use syq's ordered gitignore-style filter language |
+| `--syq-progress-json` | Emit JSON progress events |
+| `--syq-verify-only` | Compare the selected source and destination scope without mutation |
+| `--syq-no-bootstrap` | Require a compatible syq in the remote `PATH` |
+| `--syq-no-tcp`, `--syq-tcp-plain`, `--syq-tcp-ports`, `--syq-tcp-congestion` | Tune syq's separate TCP data path |
+| `--syq-pscope PATH` | Use an isolated SSH persistence scope created by `syq persist on --ephemeral` |
+
+The gitignore rules have a broadly similar purpose to rsync filters but are not
+syntax-compatible: syq is last-match-wins with `!` re-inclusion, while rsync
+uses first-match include/exclude/filter rules with side modifiers and
+per-directory merge files. Rsync's `-i` remains `--itemize-changes` and is
+rejected because itemized output is not implemented.
+
+`--syq-verify-only` applies `-u`, size limits, `--existing`, and
+`--ignore-existing` to the scope it compares; it checks exactly what the
+corresponding copy would select. *Test: `verify_only_checks_the_filtered_scope`.*
+
+## Compatible subsets or approximations
+
+1. **Any error while listing the source disables deletion** — the same idea
    as rsync's file-list I/O check. A directory we couldn't read would
    otherwise look like one whose contents vanished. A read failure *during
    transfer* does not disable deletion: the failed file is still claimed, so
    it is never an extra, and the extras set is unaffected. *Tests:
    `unreadable_source_root_disables_delete`,
    `delete_is_skipped_when_the_source_scan_has_errors`.*
-3. **`-u` applies to regular files only.** rsync also compares mtimes for
+2. **`-u` applies to regular files only.** rsync also compares mtimes for
    symlinks and devices (believed, not measured). Low impact; could be
    aligned. Deliberately, a *type change* replaces regardless of mtimes —
    a source directory still replaces a newer destination file (as in
    rsync): `-u` is about not regressing newer file content, not about
    protecting whatever exists; that stronger promise is
-   `--ignore-existing`'s (see "Incompatible on purpose" 5).
-4. **`--files-from` cannot combine with `--ignore`/`--ignore-from` or
-   `--delete`, and direct remote→remote needs `--relay`** (the list is read
-   on the invoking machine). rsync allows all three. Restrictions rather than
-   differences: you get a clear usage error. Filters over a file list is a
-   plausible later addition; deletion scope under a file list is genuinely
-   ambiguous and rsync's semantics for it are murky. *Test:
+   `--ignore-existing`'s (see "Intentional divergences" 5).
+3. **`--files-from` cannot combine with `--syq-ignore`/
+   `--syq-ignore-from` or `--delete`.** Rsync allows filters and deletion with
+   a file list. These are explicit restrictions rather than silent semantic
+   choices. Filters over a file list are a plausible later addition; deletion
+   scope under a file list is genuinely ambiguous and rsync's semantics for it
+   are murky. *Test:
    `files_from_rejections_and_stdin`.*
-5. **`--verify-only` checks the run's scope.** `-u`, size limits,
-   `--existing`, `--ignore-existing` narrow what a run would transfer, and
-   `--verify-only` verifies exactly that set. rsync has no `--verify-only`.
-   *Test: `verify_only_checks_the_filtered_scope`.*
-6. **Deletions are executed over the control connection** in batches of 1000
-   (the receiving side unlinks a batch in parallel), not spread over the `-j`
+4. **Deletions are executed over the control connection** in batches of 1000
+   (the receiving side unlinks a batch in parallel), not spread over syq's
    data connections. rsync has one connection anyway; this is a note about
    syq's own model.
+5. **`--rsync-path PATH` must name syq, not rsync.** The standard spelling and
+   placement in the remote-shell command agree, but syq speaks its own protocol
+   and cannot launch an rsync peer. Unlike rsync's option, the current value is
+   an exact executable path rather than a shell fragment with extra arguments.
+6. **`-B`/`--block-size` controls syq's fixed transfer, hashing, and resume
+   granularity.** Rsync uses the option within its rolling-checksum algorithm,
+   which syq does not implement.
 
 ## Not implemented
 
@@ -197,8 +222,8 @@ rsync features syq doesn't have. The common ones are rejected with a one-line
 explanation (`src/cli.rs`, `reject_unsupported_rsync_flags`) so a pasted rsync
 command says what to change.
 
-- `--delete-before`, `--delete-during`, `--force` — see "Incompatible on
-  purpose" 1; these are refused rather than pending.
+- `--delete-before`, `--delete-during`, `--force` — see "Intentional
+  divergences" 1; these are refused rather than pending.
 - `-H`/`--hard-links` — needs cross-file ordering in a scheduler that has
   none today.
 - `-L`/`--copy-links`, `-k`/`--copy-dirlinks`, `-K`/`--keep-dirlinks`.
@@ -206,13 +231,16 @@ command says what to change.
 - `--link-dest`/`--compare-dest`/`--copy-dest`.
 - `--relative` (`-R`), `--partial-dir`.
 - `-A`/`--acls`, `-X`/`--xattrs`, `-S`/`--sparse`, `-x`/`--one-file-system`.
-- `-i`/`--itemize-changes` — rejected with a specific explanation; use the
-  long-only `--ignore` for syq's gitignore-style filtering.
+- `-i`/`--itemize-changes` — rejected with a specific explanation;
+  `--syq-verify-only` compares contents but does not provide itemized output.
 - `--size-only`, `--ignore-times`/`-I`, `--modify-window`, `--chmod`,
   `--log-file`.
-- rsync filter rules (`--exclude`/`--include`/`--filter`); use `--ignore`.
+- rsync filter rules (`--exclude`/`--include`/`--filter`); use
+  `--syq-ignore` if gitignore semantics are suitable.
 - rsync daemon mode / `rsync://`; syq speaks its own protocol.
 - Rolling-checksum delta transfer; syq resumes at block granularity.
+- Remote-to-remote transfer is deliberately absent from `syq rsync`, matching
+  rsync itself; use native `syq cp` or `syq cp --prune`.
 
 ## Open issues
 
@@ -225,33 +253,3 @@ command says what to change.
 2. **`-h` alone should print help**, as rsync does, while staying
    `--human-readable` inside a cluster (`-avh`). Essentially free.
 3. **`-u` for symlinks/devices** — measure rsync, then align or record.
-
-## Resolved
-
-- Exactly repeated raw source operands are deduplicated before scanning while
-  preserving the original operand count for destination placement. Distinct
-  spellings remain distinct even when parsing gives them the same endpoint.
-- Operator-named destination paths use rsync's ownership walk on the receiving
-  endpoint: symlinks at any component are followed only when owned by root or
-  by that endpoint's effective uid. `--insecure-links` is the explicit legacy
-  opt-out. The control connection retains that selected directory; every worker
-  securely reopens or inherits it, verifies its device/inode, and performs
-  destination requests relative to it. Replacing the external spelling after
-  selection therefore cannot redirect the copy.
-- Source entries named like sidecars were excluded from copies; PR #7's
-  namespace preflight made them ordinary payload (rsync-compatible), and
-  this branch follows it. Former open issue 4. Destination `--delete` now
-  protects only this command's live resume sidecars; other sidecar-patterned
-  entries are ordinary extras.
-
-- `--delete-excluded`, `--max-delete`, `--delete-after`/`--delete-delay` —
-  added (sync-options `118c8ee`).
-- Nested destination symlinks were briefly followed at any depth (`rsync -K`
-  behavior); PR #7 restored rsync's replace-in-tree, follow-argument-only
-  rule, and `--existing` follows it.
-- README claimed rsync deletes a `--max-size` casualty under `--delete`;
-  measured false, README corrected (this file's commit).
-- The experimental automatic journal/marker and its later explicit checkpoint
-  replacement were removed. Ordinary partial-file resume remains automatic.
-- PR #7 replaced the shared `.name.syq-partial` path with deterministic
-  job-scoped sidecars.

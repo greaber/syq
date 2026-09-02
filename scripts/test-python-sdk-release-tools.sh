@@ -24,7 +24,17 @@ next_syq_version="$syq_major.$syq_minor.$((syq_patch + 1))"
 next_python_version="$python_major.$python_minor.$((python_patch + 1))"
 candidate="$work/candidate.json"
 jq --arg version "$next_syq_version" \
-  '.version = $version | .tag = ("v" + $version) | .helper_id = ("v" + $version + "-p0")' \
+  '{
+    schema,
+    repository,
+    version:$version,
+    tag:("v" + $version),
+    artifacts,
+    installer,
+    homebrew_formula,
+    signature_scheme,
+    signature
+  }' \
   "$current_manifest" > "$candidate"
 python3 "$script_dir/prepare-python-sdk-release.py" \
   --root "$work" --manifest "$candidate"
@@ -53,6 +63,15 @@ if python3 "$script_dir/prepare-python-sdk-release.py" \
   exit 1
 fi
 grep -F 'release manifest has no valid base64 signature' "$work/invalid.out" >/dev/null
+
+jq '.unexpected = true' "$candidate" > "$invalid"
+if python3 "$script_dir/prepare-python-sdk-release.py" \
+  --root "$work" --manifest "$invalid" > "$work/invalid.out" 2>&1; then
+  echo 'manifest with an unexpected field succeeded' >&2
+  exit 1
+fi
+grep -F 'release manifest fields do not match the current schema' \
+  "$work/invalid.out" >/dev/null
 
 trusted_pr='https://github.com/greaber/syq/pull/123'
 cat > "$work/pull-requests.json" <<EOF

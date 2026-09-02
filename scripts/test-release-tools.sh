@@ -53,7 +53,7 @@ formula_sha=$(sha256sum "$first/syq.rb" | awk '{print $1}')
 jq -e \
   --arg installer_sha "$installer_sha" --arg formula_sha "$formula_sha" '
     .schema == 1
-    and .helper_id == (.tag + "-p0")
+    and (keys == ["artifacts", "homebrew_formula", "installer", "repository", "schema", "signature_scheme", "tag", "version"])
     and (.artifacts | length == 4)
     and .installer.name == "install.sh"
     and .installer.sha256 == $installer_sha

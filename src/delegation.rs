@@ -50,23 +50,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub(crate) const SSHSIG_NAMESPACE: &str = "syq-grant-v1@greaber.github";
+pub(crate) const SSHSIG_NAMESPACE: &str = "syq-grant@greaber.github";
 const WIRE_MAGIC: &[u8; 8] = b"SYQGRNT\0";
-// V1's typed GrantV1 body is frozen. V2 wraps that body with a signed
-// receiver-side file-data rate ceiling. V3 additionally binds source-selection
-// filters and their deletion policy so a remote source coordinator cannot
-// mutate a path the invoking machine excluded. V4 adds the placement root's
-// signed existence precondition (`--into-new`, `--as-existing`, and friends).
-// Receivers retain V1/V2/V3 decoding. The SSHSIG namespace remains stable
-// because the signed wire version already separates the payloads and existing
-// enrollment policies authorize this protocol family by that namespace.
-const WIRE_VERSION_V1: u16 = 1;
-const WIRE_VERSION_V2: u16 = 2;
-// V5 adds the receipt policy: whether the receiver must issue a signed
-// receipt and whether it hashes what it publishes.
-const WIRE_VERSION_V3: u16 = 3;
-const WIRE_VERSION_V4: u16 = 4;
-const WIRE_VERSION: u16 = 5;
+const WIRE_VERSION: u16 = 1;
 const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 2 + 4 + 4;
 const MAX_GRANT_BYTES: usize = 32 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
@@ -104,13 +90,10 @@ impl RequestId {
     /// hex claim filenames sort chronologically for inspection. The
     /// remaining 24 random bytes carry uniqueness; the timestamp is
     /// organizational only — verifiers rely on the envelope signature and
-    /// the claim store, never on this prefix. IMPORTANT: claims created
-    /// before this layout carry fully random IDs that are indistinguishable
-    /// from timestamped ones by name, so any future expiry or pruning
-    /// decision MUST read `claimed_at` from inside the claim record (see
-    /// `validate_claim_record`), never interpret the filename; a
-    /// filename-based pruner could misread a legacy random prefix as an
-    /// ancient timestamp and delete a live claim, re-enabling its grant.
+    /// the claim store, never on this prefix. IMPORTANT: Any future expiry
+    /// or pruning decision MUST read `claimed_at` from the
+    /// claim record (see `validate_claim_record`), never infer it from the
+    /// filename.
     pub(crate) fn fresh(issued_at: i64) -> Result<Self> {
         let mut bytes = [0u8; 32];
         let seconds = u64::try_from(issued_at).context("request ID issue time before epoch")?;
@@ -132,46 +115,46 @@ impl RequestId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum GrantOperationV1 {
-    Copy(CopyOperationV1),
+pub(crate) enum GrantOperation {
+    Copy(CopyOperation),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CopyOperationV1 {
+pub(crate) struct CopyOperation {
     /// Canonically spelled absolute target path. This is only a signed name;
     /// receiver authorization resolves it beneath the enrolled root handle.
     pub destination: Vec<u8>,
     /// Exact receiver-side mutation roots derived locally from the source
     /// spellings. A scope may authorize the named object alone or its subtree.
-    pub mutation_scopes: Vec<MutationScopeV1>,
-    pub policy: CopyPolicyV1,
-    pub options: CopyOptionsV1,
-    pub limits: CopyLimitsV1,
+    pub mutation_scopes: Vec<MutationScope>,
+    pub policy: CopyPolicy,
+    pub options: CopyOptions,
+    pub limits: CopyLimits,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct MutationScopeV1 {
+pub(crate) struct MutationScope {
     pub path: Vec<u8>,
     pub descendants: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CopyPolicyV1 {
-    pub placement: DestinationPlacementV1,
-    pub existing: ExistingDestinationPolicyV1,
-    pub deletion: DeletionPolicyV1,
-    pub publication: PublicationPolicyV1,
+pub(crate) struct CopyPolicy {
+    pub placement: DestinationPlacement,
+    pub existing: ExistingDestinationPolicy,
+    pub deletion: DeletionPolicy,
+    pub publication: PublicationPolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum DestinationPlacementV1 {
+pub(crate) enum DestinationPlacement {
     ExactPath,
     DirectoryContents,
     DirectoryAsChild,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ExistingDestinationPolicyV1 {
+pub(crate) enum ExistingDestinationPolicy {
     Replace,
     Skip,
     UpdateIfOlder,
@@ -179,19 +162,19 @@ pub(crate) enum ExistingDestinationPolicyV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum DeletionPolicyV1 {
+pub(crate) enum DeletionPolicy {
     Forbid,
     DeleteDestinationOnly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum PublicationPolicyV1 {
+pub(crate) enum PublicationPolicy {
     AtomicStaged,
     InPlace,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CopyOptionsV1 {
+pub(crate) struct CopyOptions {
     pub recursive: bool,
     pub preserve_symlinks: bool,
     pub preserve_permissions: bool,
@@ -209,7 +192,7 @@ pub(crate) struct CopyOptionsV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CopyLimitsV1 {
+pub(crate) struct CopyLimits {
     pub max_entries: u64,
     pub max_total_bytes: u64,
     pub max_file_bytes: u64,
@@ -220,7 +203,7 @@ pub(crate) struct CopyLimitsV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct GrantV1 {
+pub(crate) struct Grant {
     pub enrollment_id: EnrollmentId,
     pub target_login: String,
     pub signer: String,
@@ -228,10 +211,10 @@ pub(crate) struct GrantV1 {
     pub issued_at: i64,
     pub not_before: i64,
     pub not_after: i64,
-    pub operation: GrantOperationV1,
+    pub operation: GrantOperation,
 }
 
-impl GrantV1 {
+impl Grant {
     fn validate_static(&self) -> Result<()> {
         self.enrollment_id.validate()?;
         self.request_id.validate()?;
@@ -259,12 +242,12 @@ impl GrantV1 {
         }
 
         match &self.operation {
-            GrantOperationV1::Copy(copy) => copy.validate(validity),
+            GrantOperation::Copy(copy) => copy.validate(validity),
         }
     }
 }
 
-impl CopyOperationV1 {
+impl CopyOperation {
     fn validate(&self, validity: i64) -> Result<()> {
         validate_absolute_path(&self.destination)?;
         if self.mutation_scopes.is_empty() || self.mutation_scopes.len() > 1024 {
@@ -313,10 +296,10 @@ impl CopyOperationV1 {
             bail!("copy TCP port range is reversed");
         }
         match self.policy.deletion {
-            DeletionPolicyV1::Forbid if limits.max_deletions != 0 => {
+            DeletionPolicy::Forbid if limits.max_deletions != 0 => {
                 bail!("copy forbids deletion but has a nonzero deletion limit")
             }
-            DeletionPolicyV1::DeleteDestinationOnly
+            DeletionPolicy::DeleteDestinationOnly
                 if limits.max_deletions == 0 || limits.max_deletions > limits.max_entries =>
             {
                 bail!("copy deletion limit is outside the supported range")
@@ -327,15 +310,8 @@ impl CopyOperationV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantBodyV2 {
-    grant: GrantV1,
-    /// Aggregate receiver-side file-data ceiling. Zero means unlimited.
-    max_file_data_bytes_per_second: u64,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct FilterPolicyV3 {
+pub(crate) struct FilterPolicy {
     /// Ordered gitignore-style rules, anchored independently at every source
     /// root mapped into the signed destination scopes.
     pub ignore: Vec<String>,
@@ -345,12 +321,8 @@ pub(crate) struct FilterPolicyV3 {
     pub delete_excluded: bool,
 }
 
-impl FilterPolicyV3 {
-    fn is_active(&self) -> bool {
-        !self.ignore.is_empty() || !self.destination_roots.is_empty() || self.delete_excluded
-    }
-
-    fn validate(&self, grant: &GrantV1) -> Result<()> {
+impl FilterPolicy {
+    fn validate(&self, grant: &Grant) -> Result<()> {
         if self.ignore.len() > MAX_FILTER_RULES {
             bail!("signed filter-rule count exceeds the supported range");
         }
@@ -369,7 +341,7 @@ impl FilterPolicyV3 {
             {
                 bail!("signed filter-root count is outside the supported range");
             }
-            let GrantOperationV1::Copy(copy) = &grant.operation;
+            let GrantOperation::Copy(copy) = &grant.operation;
             for root in &self.destination_roots {
                 validate_absolute_path(root)?;
                 if !copy.mutation_scopes.iter().any(|scope| {
@@ -399,19 +371,12 @@ impl FilterPolicyV3 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantBodyV3 {
-    grant: GrantV1,
-    max_file_data_bytes_per_second: u64,
-    filters: FilterPolicyV3,
-}
-
 /// Signed precondition on the placement root itself. The receiver checks it
 /// once against the enrolled root when the grant is claimed, and `New`
 /// additionally forces no-replace creation of that root, so a remote source
 /// coordinator cannot turn `--into-new` into an update of an existing tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum RootExistenceV4 {
+pub(crate) enum RootExistence {
     #[default]
     Any,
     /// The signed destination must not exist when the grant is claimed.
@@ -422,28 +387,25 @@ pub(crate) enum RootExistenceV4 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantBodyV4 {
-    grant: GrantV1,
+struct GrantBody {
+    grant: Grant,
     max_file_data_bytes_per_second: u64,
-    filters: FilterPolicyV3,
-    root_existence: RootExistenceV4,
+    filters: FilterPolicy,
+    root_existence: RootExistence,
+    receipt: ReceiptPolicy,
 }
 
 /// Whether the receiver must issue a signed receipt for this grant, and how
 /// much it records. A required receipt is what lets the invoking machine
 /// check hostA's report against hostB's own account.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ReceiptPolicyV5 {
+pub(crate) struct ReceiptPolicy {
     pub required: bool,
     /// Also record a BLAKE3 digest of every published file.
     pub hashed: bool,
 }
 
-impl ReceiptPolicyV5 {
-    pub(crate) fn is_active(self) -> bool {
-        self.required || self.hashed
-    }
-
+impl ReceiptPolicy {
     fn validate(self) -> Result<()> {
         if self.hashed && !self.required {
             bail!("hashed receipts require a receipt");
@@ -452,38 +414,27 @@ impl ReceiptPolicyV5 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantBodyV5 {
-    grant: GrantV1,
-    max_file_data_bytes_per_second: u64,
-    filters: FilterPolicyV3,
-    root_existence: RootExistenceV4,
-    receipt: ReceiptPolicyV5,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SignedGrantEnvelope {
-    pub grant: GrantV1,
+    pub grant: Grant,
     pub max_file_data_bytes_per_second: u64,
-    pub filters: FilterPolicyV3,
-    pub root_existence: RootExistenceV4,
-    pub receipt: ReceiptPolicyV5,
+    pub filters: FilterPolicy,
+    pub root_existence: RootExistence,
+    pub receipt: ReceiptPolicy,
     /// Canonical OpenSSH armored SSHSIG bytes.
     pub signature: Vec<u8>,
-    wire_version: u16,
 }
 
 impl SignedGrantEnvelope {
     #[cfg(test)]
-    fn new(grant: GrantV1, max_file_data_bytes_per_second: u64, signature: Vec<u8>) -> Self {
+    fn new(grant: Grant, max_file_data_bytes_per_second: u64, signature: Vec<u8>) -> Self {
         Self {
             grant,
             max_file_data_bytes_per_second,
-            filters: FilterPolicyV3::default(),
-            root_existence: RootExistenceV4::Any,
-            receipt: ReceiptPolicyV5::default(),
+            filters: FilterPolicy::default(),
+            root_existence: RootExistence::Any,
+            receipt: ReceiptPolicy::default(),
             signature,
-            wire_version: WIRE_VERSION,
         }
     }
 
@@ -491,7 +442,6 @@ impl SignedGrantEnvelope {
         self.grant.validate_static()?;
         validate_canonical_sshsig(&self.signature)?;
         let body = canonical_body_bytes(
-            self.wire_version,
             &self.grant,
             self.max_file_data_bytes_per_second,
             &self.filters,
@@ -506,7 +456,7 @@ impl SignedGrantEnvelope {
         }
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body.len() + self.signature.len());
         out.extend_from_slice(WIRE_MAGIC);
-        out.extend_from_slice(&self.wire_version.to_be_bytes());
+        out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
         out.extend_from_slice(&(body.len() as u32).to_be_bytes());
         out.extend_from_slice(&(self.signature.len() as u32).to_be_bytes());
         out.extend_from_slice(&body);
@@ -522,10 +472,7 @@ impl SignedGrantEnvelope {
             bail!("not a SYQ signed grant envelope");
         }
         let version = u16::from_be_bytes(bytes[8..10].try_into().expect("fixed header"));
-        if !matches!(
-            version,
-            WIRE_VERSION_V1 | WIRE_VERSION_V2 | WIRE_VERSION_V3 | WIRE_VERSION_V4 | WIRE_VERSION
-        ) {
+        if version != WIRE_VERSION {
             bail!("unsupported signed grant envelope version {version}");
         }
         let grant_len =
@@ -546,95 +493,33 @@ impl SignedGrantEnvelope {
             bail!("signed grant envelope length is noncanonical");
         }
         let body_bytes = &bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + grant_len];
-        let no_receipt = ReceiptPolicyV5::default();
-        let (grant, max_file_data_bytes_per_second, filters, root_existence, receipt) =
-            match version {
-                WIRE_VERSION_V1 => {
-                    let grant: GrantV1 =
-                        postcard::from_bytes(body_bytes).context("decode signed grant")?;
-                    (
-                        grant,
-                        0,
-                        FilterPolicyV3::default(),
-                        RootExistenceV4::Any,
-                        no_receipt,
-                    )
-                }
-                WIRE_VERSION_V2 => {
-                    let body: GrantBodyV2 =
-                        postcard::from_bytes(body_bytes).context("decode signed grant")?;
-                    (
-                        body.grant,
-                        body.max_file_data_bytes_per_second,
-                        FilterPolicyV3::default(),
-                        RootExistenceV4::Any,
-                        no_receipt,
-                    )
-                }
-                WIRE_VERSION_V3 => {
-                    let body: GrantBodyV3 =
-                        postcard::from_bytes(body_bytes).context("decode signed grant")?;
-                    (
-                        body.grant,
-                        body.max_file_data_bytes_per_second,
-                        body.filters,
-                        RootExistenceV4::Any,
-                        no_receipt,
-                    )
-                }
-                WIRE_VERSION_V4 => {
-                    let body: GrantBodyV4 =
-                        postcard::from_bytes(body_bytes).context("decode signed grant")?;
-                    (
-                        body.grant,
-                        body.max_file_data_bytes_per_second,
-                        body.filters,
-                        body.root_existence,
-                        no_receipt,
-                    )
-                }
-                WIRE_VERSION => {
-                    let body: GrantBodyV5 =
-                        postcard::from_bytes(body_bytes).context("decode signed grant")?;
-                    (
-                        body.grant,
-                        body.max_file_data_bytes_per_second,
-                        body.filters,
-                        body.root_existence,
-                        body.receipt,
-                    )
-                }
-                _ => unreachable!(),
-            };
+        let body: GrantBody = postcard::from_bytes(body_bytes).context("decode signed grant")?;
         if canonical_body_bytes(
-            version,
-            &grant,
-            max_file_data_bytes_per_second,
-            &filters,
-            root_existence,
-            receipt,
+            &body.grant,
+            body.max_file_data_bytes_per_second,
+            &body.filters,
+            body.root_existence,
+            body.receipt,
         )? != body_bytes
         {
             bail!("signed grant uses a noncanonical encoding");
         }
-        grant.validate_static()?;
-        filters.validate(&grant)?;
+        body.grant.validate_static()?;
+        body.filters.validate(&body.grant)?;
         let signature = bytes[WIRE_HEADER_LEN + grant_len..].to_vec();
         validate_canonical_sshsig(&signature)?;
         Ok(Self {
-            grant,
-            max_file_data_bytes_per_second,
-            filters,
-            root_existence,
-            receipt,
+            grant: body.grant,
+            max_file_data_bytes_per_second: body.max_file_data_bytes_per_second,
+            filters: body.filters,
+            root_existence: body.root_existence,
+            receipt: body.receipt,
             signature,
-            wire_version: version,
         })
     }
 
     fn signing_payload(&self) -> Result<Vec<u8>> {
-        signing_payload_for_version(
-            self.wire_version,
+        signing_payload(
             &self.grant,
             self.max_file_data_bytes_per_second,
             &self.filters,
@@ -645,21 +530,20 @@ impl SignedGrantEnvelope {
 }
 
 pub(crate) fn sign_grant(
-    grant: GrantV1,
-    extensions: GrantExtensions,
+    grant: Grant,
+    constraints: GrantConstraints,
     private_key: &PrivateKey,
 ) -> Result<Vec<u8>> {
-    let GrantExtensions {
+    let GrantConstraints {
         max_file_data_bytes_per_second,
         mut filters,
         root_existence,
         receipt,
-    } = extensions;
+    } = constraints;
     if private_key.is_encrypted() {
         bail!("cannot sign a grant with an encrypted transport key");
     }
-    // With no filters, --delete-excluded has no observable effect. Erase that
-    // no-op so such commands retain the oldest compatible grant encoding.
+    // With no filters, --delete-excluded has no observable effect.
     if filters.ignore.is_empty() {
         filters.delete_excluded = false;
         filters.destination_roots.clear();
@@ -668,21 +552,7 @@ pub(crate) fn sign_grant(
         filters.destination_roots.dedup();
     }
     filters.validate(&grant)?;
-    // Keep emitting the oldest form capable of representing the request so
-    // ordinary transfers remain usable with existing receiver enrollments.
-    let wire_version = if receipt.is_active() {
-        WIRE_VERSION
-    } else if root_existence != RootExistenceV4::Any {
-        WIRE_VERSION_V4
-    } else if filters.is_active() {
-        WIRE_VERSION_V3
-    } else if max_file_data_bytes_per_second == 0 {
-        WIRE_VERSION_V1
-    } else {
-        WIRE_VERSION_V2
-    };
-    let payload = signing_payload_for_version(
-        wire_version,
+    let payload = signing_payload(
         &grant,
         max_file_data_bytes_per_second,
         &filters,
@@ -702,35 +572,31 @@ pub(crate) fn sign_grant(
         root_existence,
         receipt,
         signature,
-        wire_version,
     }
     .encode()
 }
 
 #[cfg(test)]
-fn signing_payload(grant: &GrantV1, max_file_data_bytes_per_second: u64) -> Result<Vec<u8>> {
-    signing_payload_for_version(
-        WIRE_VERSION,
+fn signing_payload_default(grant: &Grant, max_file_data_bytes_per_second: u64) -> Result<Vec<u8>> {
+    signing_payload(
         grant,
         max_file_data_bytes_per_second,
-        &FilterPolicyV3::default(),
-        RootExistenceV4::Any,
-        ReceiptPolicyV5::default(),
+        &FilterPolicy::default(),
+        RootExistence::Any,
+        ReceiptPolicy::default(),
     )
 }
 
-fn signing_payload_for_version(
-    wire_version: u16,
-    grant: &GrantV1,
+fn signing_payload(
+    grant: &Grant,
     max_file_data_bytes_per_second: u64,
-    filters: &FilterPolicyV3,
-    root_existence: RootExistenceV4,
-    receipt: ReceiptPolicyV5,
+    filters: &FilterPolicy,
+    root_existence: RootExistence,
+    receipt: ReceiptPolicy,
 ) -> Result<Vec<u8>> {
     grant.validate_static()?;
     filters.validate(grant)?;
     let body = canonical_body_bytes(
-        wire_version,
         grant,
         max_file_data_bytes_per_second,
         filters,
@@ -742,81 +608,28 @@ fn signing_payload_for_version(
     }
     let mut out = Vec::with_capacity(WIRE_MAGIC.len() + 2 + 4 + body.len());
     out.extend_from_slice(WIRE_MAGIC);
-    out.extend_from_slice(&wire_version.to_be_bytes());
+    out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
     out.extend_from_slice(&body);
     Ok(out)
 }
 
 fn canonical_body_bytes(
-    wire_version: u16,
-    grant: &GrantV1,
+    grant: &Grant,
     max_file_data_bytes_per_second: u64,
-    filters: &FilterPolicyV3,
-    root_existence: RootExistenceV4,
-    receipt: ReceiptPolicyV5,
+    filters: &FilterPolicy,
+    root_existence: RootExistence,
+    receipt: ReceiptPolicy,
 ) -> Result<Vec<u8>> {
     receipt.validate()?;
-    let root_constrained = root_existence != RootExistenceV4::Any;
-    let receipt_requested = receipt.is_active();
-    match wire_version {
-        WIRE_VERSION_V1 => {
-            if max_file_data_bytes_per_second != 0
-                || filters.is_active()
-                || root_constrained
-                || receipt_requested
-            {
-                bail!("version-one grants cannot carry signed extensions");
-            }
-            canonical_grant_bytes(grant)
-        }
-        WIRE_VERSION_V2 => {
-            if filters.is_active() || root_constrained || receipt_requested {
-                bail!("version-two grants cannot carry filter, root-existence, or receipt policy");
-            }
-            postcard::to_stdvec(&GrantBodyV2 {
-                grant: grant.clone(),
-                max_file_data_bytes_per_second,
-            })
-            .context("encode canonical signed grant")
-        }
-        WIRE_VERSION_V3 => {
-            if root_constrained || receipt_requested {
-                bail!("version-three grants cannot carry root-existence or receipt policy");
-            }
-            postcard::to_stdvec(&GrantBodyV3 {
-                grant: grant.clone(),
-                max_file_data_bytes_per_second,
-                filters: filters.clone(),
-            })
-            .context("encode canonical signed grant")
-        }
-        WIRE_VERSION_V4 => {
-            if receipt_requested {
-                bail!("version-four grants cannot carry receipt policy");
-            }
-            postcard::to_stdvec(&GrantBodyV4 {
-                grant: grant.clone(),
-                max_file_data_bytes_per_second,
-                filters: filters.clone(),
-                root_existence,
-            })
-            .context("encode canonical signed grant")
-        }
-        WIRE_VERSION => postcard::to_stdvec(&GrantBodyV5 {
-            grant: grant.clone(),
-            max_file_data_bytes_per_second,
-            filters: filters.clone(),
-            root_existence,
-            receipt,
-        })
-        .context("encode canonical signed grant"),
-        _ => bail!("unsupported signed grant envelope version {wire_version}"),
-    }
-}
-
-fn canonical_grant_bytes(grant: &GrantV1) -> Result<Vec<u8>> {
-    postcard::to_stdvec(grant).context("encode canonical signed grant")
+    postcard::to_stdvec(&GrantBody {
+        grant: grant.clone(),
+        max_file_data_bytes_per_second,
+        filters: filters.clone(),
+        root_existence,
+        receipt,
+    })
+    .context("encode canonical signed grant")
 }
 
 fn validate_identity(name: &str, value: &str, maximum: usize, slash_allowed: bool) -> Result<()> {
@@ -950,7 +763,7 @@ impl ReceiverContext<'_> {
         Ok(self.wall_time_bounds_at(observed_at)?.1)
     }
 
-    fn validate_at(&self, grant: &GrantV1, observed_at: Instant) -> Result<i64> {
+    fn validate_at(&self, grant: &Grant, observed_at: Instant) -> Result<i64> {
         let (earliest_now, latest_now) = self.wall_time_bounds_at(observed_at)?;
         self.enrollment_id.validate()?;
         validate_identity(
@@ -1224,21 +1037,21 @@ fn read_verifier_output(mut output: impl Read) -> io::Result<Vec<u8>> {
 #[derive(Debug)]
 pub(crate) struct VerifiedGrant {
     #[allow(dead_code)]
-    grant: GrantV1,
+    grant: Grant,
     max_file_data_bytes_per_second: u64,
-    filters: FilterPolicyV3,
-    root_existence: RootExistenceV4,
-    receipt: ReceiptPolicyV5,
+    filters: FilterPolicy,
+    root_existence: RootExistence,
+    receipt: ReceiptPolicy,
     execution_deadline: Instant,
 }
 
-/// The signed extensions a grant carries beyond its frozen V1 body.
+/// Signed receiver policy carried alongside the copy grant.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct GrantExtensions {
+pub(crate) struct GrantConstraints {
     pub max_file_data_bytes_per_second: u64,
-    pub filters: FilterPolicyV3,
-    pub root_existence: RootExistenceV4,
-    pub receipt: ReceiptPolicyV5,
+    pub filters: FilterPolicy,
+    pub root_existence: RootExistence,
+    pub receipt: ReceiptPolicy,
 }
 
 impl VerifiedGrant {
@@ -1247,10 +1060,10 @@ impl VerifiedGrant {
         self.execution_deadline
     }
 
-    pub(crate) fn into_parts(self) -> (GrantV1, GrantExtensions, Instant) {
+    pub(crate) fn into_parts(self) -> (Grant, GrantConstraints, Instant) {
         (
             self.grant,
-            GrantExtensions {
+            GrantConstraints {
                 max_file_data_bytes_per_second: self.max_file_data_bytes_per_second,
                 filters: self.filters,
                 root_existence: self.root_existence,
@@ -1300,7 +1113,7 @@ pub(crate) fn verify_and_claim(
 }
 
 fn execution_deadline(
-    grant: &GrantV1,
+    grant: &Grant,
     clock_skew_seconds: i64,
     current_wall_time: i64,
     verified_at: Instant,
@@ -1316,7 +1129,7 @@ fn execution_deadline(
         bail!("grant expired while it was being verified and claimed");
     }
     let max_runtime = match &grant.operation {
-        GrantOperationV1::Copy(copy) => u64::from(copy.limits.max_runtime_seconds),
+        GrantOperation::Copy(copy) => u64::from(copy.limits.max_runtime_seconds),
     };
     let budget = max_runtime.min(remaining as u64);
     verified_at
@@ -2097,7 +1910,7 @@ mod tests {
             }
         }
 
-        fn signed(&self, grant: GrantV1) -> Vec<u8> {
+        fn signed(&self, grant: Grant) -> Vec<u8> {
             signed_envelope(grant, &self.key, SSHSIG_NAMESPACE, None)
         }
     }
@@ -2245,8 +2058,8 @@ mod tests {
         output.stdout
     }
 
-    fn fixture_grant(request_byte: u8) -> GrantV1 {
-        GrantV1 {
+    fn fixture_grant(request_byte: u8) -> Grant {
+        Grant {
             enrollment_id: EnrollmentId::test_v4(7),
             target_login: TARGET.to_owned(),
             signer: SIGNER.to_owned(),
@@ -2254,19 +2067,19 @@ mod tests {
             issued_at: NOW,
             not_before: NOW - 30,
             not_after: NOW + 600,
-            operation: GrantOperationV1::Copy(CopyOperationV1 {
+            operation: GrantOperation::Copy(CopyOperation {
                 destination: b"/srv/archive/project".to_vec(),
-                mutation_scopes: vec![MutationScopeV1 {
+                mutation_scopes: vec![MutationScope {
                     path: b"/srv/archive/project".to_vec(),
                     descendants: true,
                 }],
-                policy: CopyPolicyV1 {
-                    placement: DestinationPlacementV1::ExactPath,
-                    existing: ExistingDestinationPolicyV1::Replace,
-                    deletion: DeletionPolicyV1::Forbid,
-                    publication: PublicationPolicyV1::AtomicStaged,
+                policy: CopyPolicy {
+                    placement: DestinationPlacement::ExactPath,
+                    existing: ExistingDestinationPolicy::Replace,
+                    deletion: DeletionPolicy::Forbid,
+                    publication: PublicationPolicy::AtomicStaged,
                 },
-                options: CopyOptionsV1 {
+                options: CopyOptions {
                     recursive: true,
                     preserve_symlinks: true,
                     preserve_permissions: true,
@@ -2282,7 +2095,7 @@ mod tests {
                     tcp_port_lo: 47_600,
                     tcp_port_hi: 47_699,
                 },
-                limits: CopyLimitsV1 {
+                limits: CopyLimits {
                     max_entries: 10_000,
                     max_total_bytes: 1 << 30,
                     max_file_bytes: 1 << 29,
@@ -2319,7 +2132,7 @@ mod tests {
     }
 
     fn signed_envelope(
-        grant: GrantV1,
+        grant: Grant,
         key: &Path,
         namespace: &str,
         agent: Option<&AgentGuard>,
@@ -2328,36 +2141,35 @@ mod tests {
     }
 
     fn signed_envelope_with_rate(
-        grant: GrantV1,
+        grant: Grant,
         max_file_data_bytes_per_second: u64,
         key: &Path,
         namespace: &str,
         agent: Option<&AgentGuard>,
     ) -> Vec<u8> {
-        let payload =
-            signing_payload(&grant, max_file_data_bytes_per_second).expect("make signing payload");
+        let payload = signing_payload_default(&grant, max_file_data_bytes_per_second)
+            .expect("make signing payload");
         let signature = sign(&payload, key, namespace, agent);
         SignedGrantEnvelope::new(grant, max_file_data_bytes_per_second, signature)
             .encode()
             .expect("encode signed grant")
     }
 
-    fn raw_envelope(grant: &GrantV1, signature: &[u8]) -> Vec<u8> {
+    fn raw_envelope(grant: &Grant, signature: &[u8]) -> Vec<u8> {
         raw_envelope_with_rate(grant, 0, signature)
     }
 
     fn raw_envelope_with_rate(
-        grant: &GrantV1,
+        grant: &Grant,
         max_file_data_bytes_per_second: u64,
         signature: &[u8],
     ) -> Vec<u8> {
         let grant = canonical_body_bytes(
-            WIRE_VERSION,
             grant,
             max_file_data_bytes_per_second,
-            &FilterPolicyV3::default(),
-            RootExistenceV4::Any,
-            ReceiptPolicyV5::default(),
+            &FilterPolicy::default(),
+            RootExistence::Any,
+            ReceiptPolicy::default(),
         )
         .expect("encode test grant");
         let mut out = Vec::new();
@@ -2377,64 +2189,32 @@ mod tests {
         let decoded = SignedGrantEnvelope::decode(&encoded).expect("decode canonical grant");
         assert_eq!(decoded.grant, fixture_grant(1));
         assert_eq!(decoded.max_file_data_bytes_per_second, 0);
-
-        let legacy_grant = fixture_grant(28);
-        let legacy_payload = signing_payload_for_version(
-            WIRE_VERSION_V1,
-            &legacy_grant,
-            0,
-            &FilterPolicyV3::default(),
-            RootExistenceV4::Any,
-            ReceiptPolicyV5::default(),
-        )
-        .expect("make legacy signing payload");
-        let legacy_signature = sign(&legacy_payload, &fixture.key, SSHSIG_NAMESPACE, None);
-        let legacy_encoded = SignedGrantEnvelope {
-            grant: legacy_grant.clone(),
-            max_file_data_bytes_per_second: 0,
-            filters: FilterPolicyV3::default(),
-            root_existence: RootExistenceV4::Any,
-            receipt: ReceiptPolicyV5::default(),
-            signature: legacy_signature,
-            wire_version: WIRE_VERSION_V1,
-        }
-        .encode()
-        .expect("encode version-one grant");
-        let legacy =
-            SignedGrantEnvelope::decode(&legacy_encoded).expect("decode version-one grant");
-        assert_eq!(legacy.grant, legacy_grant);
-        assert_eq!(legacy.max_file_data_bytes_per_second, 0);
-        let verified = verify_and_claim(
-            &legacy_encoded,
-            &context(SIGNER, TARGET, NOW, 0),
-            &fixture.policy(),
-            &fixture.replay("version-one-compatibility-replay"),
-        )
-        .expect("verify version-one grant");
-        assert_eq!(verified.into_parts().1.max_file_data_bytes_per_second, 0);
+        let mut unsupported = encoded.clone();
+        unsupported[8..10].copy_from_slice(&(WIRE_VERSION + 1).to_be_bytes());
+        assert!(SignedGrantEnvelope::decode(&unsupported).is_err());
 
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert!(SignedGrantEnvelope::decode(&trailing).is_err());
 
         let mut relative = fixture_grant(2);
-        let GrantOperationV1::Copy(copy) = &mut relative.operation;
+        let GrantOperation::Copy(copy) = &mut relative.operation;
         copy.destination = b"relative/path".to_vec();
-        assert!(signing_payload(&relative, 0).is_err());
+        assert!(signing_payload_default(&relative, 0).is_err());
 
         let mut unbounded = fixture_grant(3);
         unbounded.not_after = unbounded.not_before + MAX_GRANT_VALIDITY_SECS + 1;
-        assert!(signing_payload(&unbounded, 0).is_err());
+        assert!(signing_payload_default(&unbounded, 0).is_err());
 
         let mut excessive = fixture_grant(4);
-        let GrantOperationV1::Copy(copy) = &mut excessive.operation;
+        let GrantOperation::Copy(copy) = &mut excessive.operation;
         copy.limits.max_connections = MAX_CONNECTIONS + 1;
-        assert!(signing_payload(&excessive, 0).is_err());
+        assert!(signing_payload_default(&excessive, 0).is_err());
 
         let mut excessive = fixture_grant(4);
-        let GrantOperationV1::Copy(copy) = &mut excessive.operation;
+        let GrantOperation::Copy(copy) = &mut excessive.operation;
         copy.limits.max_total_bytes = u64::MAX;
-        assert!(signing_payload(&excessive, 0).is_err());
+        assert!(signing_payload_default(&excessive, 0).is_err());
     }
 
     #[test]
@@ -2445,11 +2225,8 @@ mod tests {
         let public = private.public_key().to_openssh().unwrap();
         fs::write(&fixture.allowed_signers, format!("{SIGNER} {public}\n")).unwrap();
         let replay = fixture.replay("in-process-signature-replay");
-        let encoded = sign_grant(fixture_grant(44), GrantExtensions::default(), &private).unwrap();
-        assert_eq!(
-            SignedGrantEnvelope::decode(&encoded).unwrap().wire_version,
-            WIRE_VERSION_V1
-        );
+        let encoded = sign_grant(fixture_grant(44), GrantConstraints::default(), &private).unwrap();
+        SignedGrantEnvelope::decode(&encoded).unwrap();
         verify_and_claim(
             &encoded,
             &context(SIGNER, TARGET, NOW, 0),
@@ -2460,15 +2237,14 @@ mod tests {
 
         let rate_limited = sign_grant(
             fixture_grant(45),
-            GrantExtensions {
+            GrantConstraints {
                 max_file_data_bytes_per_second: 4096,
-                ..GrantExtensions::default()
+                ..GrantConstraints::default()
             },
             &private,
         )
         .unwrap();
         let decoded = SignedGrantEnvelope::decode(&rate_limited).unwrap();
-        assert_eq!(decoded.wire_version, WIRE_VERSION_V2);
         assert_eq!(decoded.max_file_data_bytes_per_second, 4096);
         verify_and_claim(
             &rate_limited,
@@ -2478,24 +2254,23 @@ mod tests {
         )
         .expect("OpenSSH must accept the signed rate extension");
 
-        let filters = FilterPolicyV3 {
+        let filters = FilterPolicy {
             ignore: vec!["*.tmp".into(), "!keep.tmp".into()],
             destination_roots: vec![b"/srv/archive/project".to_vec()],
             delete_excluded: false,
         };
         let filtered = sign_grant(
             fixture_grant(46),
-            GrantExtensions {
+            GrantConstraints {
                 filters: filters.clone(),
-                ..GrantExtensions::default()
+                ..GrantConstraints::default()
             },
             &private,
         )
         .unwrap();
         let decoded = SignedGrantEnvelope::decode(&filtered).unwrap();
-        assert_eq!(decoded.wire_version, WIRE_VERSION_V3);
         assert_eq!(decoded.filters, filters);
-        assert_eq!(decoded.root_existence, RootExistenceV4::Any);
+        assert_eq!(decoded.root_existence, RootExistence::Any);
         let verified = verify_and_claim(
             &filtered,
             &context(SIGNER, TARGET, NOW, 0),
@@ -2505,35 +2280,33 @@ mod tests {
         .expect("OpenSSH must accept the signed filter extension");
         assert_eq!(verified.into_parts().1.filters, filters);
 
-        let outside = FilterPolicyV3 {
+        let outside = FilterPolicy {
             ignore: vec!["*.tmp".into()],
             destination_roots: vec![b"/srv/outside".to_vec()],
             delete_excluded: false,
         };
         assert!(sign_grant(
             fixture_grant(47),
-            GrantExtensions {
+            GrantConstraints {
                 filters: outside,
-                ..GrantExtensions::default()
+                ..GrantConstraints::default()
             },
             &private
         )
         .is_err());
 
-        // A root-existence precondition needs the V4 body, even without the
-        // other extensions, and survives verification unchanged.
+        // A root-existence precondition survives verification unchanged.
         let rooted = sign_grant(
             fixture_grant(48),
-            GrantExtensions {
-                root_existence: RootExistenceV4::New,
-                ..GrantExtensions::default()
+            GrantConstraints {
+                root_existence: RootExistence::New,
+                ..GrantConstraints::default()
             },
             &private,
         )
         .unwrap();
         let decoded = SignedGrantEnvelope::decode(&rooted).unwrap();
-        assert_eq!(decoded.wire_version, WIRE_VERSION_V4);
-        assert_eq!(decoded.root_existence, RootExistenceV4::New);
+        assert_eq!(decoded.root_existence, RootExistence::New);
         let verified = verify_and_claim(
             &rooted,
             &context(SIGNER, TARGET, NOW, 0),
@@ -2541,33 +2314,23 @@ mod tests {
             &fixture.replay("in-process-root-existence-signature-replay"),
         )
         .expect("OpenSSH must accept the signed root-existence extension");
-        assert_eq!(verified.into_parts().1.root_existence, RootExistenceV4::New);
-        assert!(canonical_body_bytes(
-            WIRE_VERSION_V3,
-            &fixture_grant(49),
-            0,
-            &FilterPolicyV3::default(),
-            RootExistenceV4::Existing,
-            ReceiptPolicyV5::default(),
-        )
-        .is_err());
+        assert_eq!(verified.into_parts().1.root_existence, RootExistence::New);
 
-        // A receipt policy needs the V5 body and survives verification.
-        let policy = ReceiptPolicyV5 {
+        // A receipt policy survives verification in the current grant body.
+        let policy = ReceiptPolicy {
             required: true,
             hashed: true,
         };
         let receipted = sign_grant(
             fixture_grant(50),
-            GrantExtensions {
+            GrantConstraints {
                 receipt: policy,
-                ..GrantExtensions::default()
+                ..GrantConstraints::default()
             },
             &private,
         )
         .unwrap();
         let decoded = SignedGrantEnvelope::decode(&receipted).unwrap();
-        assert_eq!(decoded.wire_version, WIRE_VERSION);
         assert_eq!(decoded.receipt, policy);
         let verified = verify_and_claim(
             &receipted,
@@ -2577,23 +2340,14 @@ mod tests {
         )
         .expect("OpenSSH must accept the signed receipt extension");
         assert_eq!(verified.into_parts().1.receipt, policy);
-        assert!(canonical_body_bytes(
-            WIRE_VERSION_V4,
-            &fixture_grant(51),
-            0,
-            &FilterPolicyV3::default(),
-            RootExistenceV4::Any,
-            policy,
-        )
-        .is_err());
         assert!(sign_grant(
             fixture_grant(52),
-            GrantExtensions {
-                receipt: ReceiptPolicyV5 {
+            GrantConstraints {
+                receipt: ReceiptPolicy {
                     required: false,
                     hashed: true,
                 },
-                ..GrantExtensions::default()
+                ..GrantConstraints::default()
             },
             &private,
         )
@@ -2603,9 +2357,9 @@ mod tests {
     #[test]
     fn delete_excluded_filters_remain_valid_when_deletion_is_forbidden() {
         let grant = fixture_grant(50);
-        let GrantOperationV1::Copy(copy) = &grant.operation;
-        assert_eq!(copy.policy.deletion, DeletionPolicyV1::Forbid);
-        let filters = FilterPolicyV3 {
+        let GrantOperation::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
+        let filters = FilterPolicy {
             ignore: vec!["*.tmp".into()],
             destination_roots: vec![b"/srv/archive/project".to_vec()],
             delete_excluded: true,
@@ -2616,252 +2370,10 @@ mod tests {
     }
 
     #[test]
-    fn version_one_grant_encoding_is_frozen() {
-        fn placement_tag(value: DestinationPlacementV1) -> u8 {
-            match value {
-                DestinationPlacementV1::ExactPath => 0,
-                DestinationPlacementV1::DirectoryContents => 1,
-                DestinationPlacementV1::DirectoryAsChild => 2,
-            }
-        }
-        fn existing_tag(value: ExistingDestinationPolicyV1) -> u8 {
-            match value {
-                ExistingDestinationPolicyV1::Replace => 0,
-                ExistingDestinationPolicyV1::Skip => 1,
-                ExistingDestinationPolicyV1::UpdateIfOlder => 2,
-                ExistingDestinationPolicyV1::MustExist => 3,
-            }
-        }
-        fn deletion_tag(value: DeletionPolicyV1) -> u8 {
-            match value {
-                DeletionPolicyV1::Forbid => 0,
-                DeletionPolicyV1::DeleteDestinationOnly => 1,
-            }
-        }
-        fn publication_tag(value: PublicationPolicyV1) -> u8 {
-            match value {
-                PublicationPolicyV1::AtomicStaged => 0,
-                PublicationPolicyV1::InPlace => 1,
-            }
-        }
-        fn append(transcript: &mut Vec<u8>, label: &str, grant: &GrantV1) {
-            // Keep operation matching exhaustive so adding a V1 operation must
-            // deliberately update this schema fingerprint.
-            let operation_tag = match &grant.operation {
-                GrantOperationV1::Copy(_) => 0,
-            };
-            transcript.extend_from_slice(&(label.len() as u32).to_be_bytes());
-            transcript.extend_from_slice(label.as_bytes());
-            transcript.push(operation_tag);
-            let payload = signing_payload_for_version(
-                WIRE_VERSION_V1,
-                grant,
-                0,
-                &FilterPolicyV3::default(),
-                RootExistenceV4::Any,
-                ReceiptPolicyV5::default(),
-            )
-            .expect("encode version-one signing payload");
-            transcript.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            transcript.extend_from_slice(&payload);
-        }
-
-        fn append_mutation(
-            transcript: &mut Vec<u8>,
-            baseline: &GrantV1,
-            label: &str,
-            mutate: impl FnOnce(&mut GrantV1),
-        ) {
-            let mut grant = baseline.clone();
-            mutate(&mut grant);
-            append(transcript, label, &grant);
-        }
-
-        let mut transcript = Vec::new();
-        transcript.extend_from_slice(b"syq-v1-schema-fingerprint-v3");
-        transcript.extend_from_slice(&(SSHSIG_NAMESPACE.len() as u32).to_be_bytes());
-        transcript.extend_from_slice(SSHSIG_NAMESPACE.as_bytes());
-
-        let mut baseline = fixture_grant(31);
-        baseline.target_login = "backup-one".to_owned();
-        baseline.signer = "alice-one@example.test".to_owned();
-        let GrantOperationV1::Copy(copy) = &mut baseline.operation;
-        copy.destination = b"/srv/fingerprint-one".to_vec();
-        copy.mutation_scopes = vec![MutationScopeV1 {
-            path: copy.destination.clone(),
-            descendants: true,
-        }];
-        copy.policy.deletion = DeletionPolicyV1::DeleteDestinationOnly;
-        copy.limits.max_deletions = 7;
-        append(&mut transcript, "baseline", &baseline);
-
-        append_mutation(&mut transcript, &baseline, "enrollment-id", |grant| {
-            grant.enrollment_id = EnrollmentId::test_v4(8);
-        });
-        append_mutation(&mut transcript, &baseline, "target-login", |grant| {
-            grant.target_login = "backup-two".to_owned();
-        });
-        append_mutation(&mut transcript, &baseline, "signer", |grant| {
-            grant.signer = "alice-two@example.test".to_owned();
-        });
-        append_mutation(&mut transcript, &baseline, "request-id", |grant| {
-            grant.request_id = RequestId([32; 32]);
-        });
-        append_mutation(&mut transcript, &baseline, "issued-at", |grant| {
-            grant.issued_at += 1;
-        });
-        append_mutation(&mut transcript, &baseline, "not-before", |grant| {
-            grant.not_before += 1;
-        });
-        append_mutation(&mut transcript, &baseline, "not-after", |grant| {
-            grant.not_after += 1;
-        });
-        append_mutation(&mut transcript, &baseline, "destination", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.destination = b"/srv/fingerprint-two".to_vec();
-            copy.mutation_scopes[0].path = copy.destination.clone();
-        });
-        append_mutation(&mut transcript, &baseline, "mutation-scope-path", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.mutation_scopes[0].path = b"/srv/fingerprint-one/child".to_vec();
-        });
-        append_mutation(
-            &mut transcript,
-            &baseline,
-            "mutation-scope-descendants",
-            |grant| {
-                let GrantOperationV1::Copy(copy) = &mut grant.operation;
-                copy.mutation_scopes[0].descendants = false;
-            },
-        );
-
-        for placement in [
-            DestinationPlacementV1::ExactPath,
-            DestinationPlacementV1::DirectoryContents,
-            DestinationPlacementV1::DirectoryAsChild,
-        ] {
-            transcript.push(placement_tag(placement));
-            append_mutation(&mut transcript, &baseline, "placement", |grant| {
-                let GrantOperationV1::Copy(copy) = &mut grant.operation;
-                copy.policy.placement = placement;
-            });
-        }
-        for existing in [
-            ExistingDestinationPolicyV1::Replace,
-            ExistingDestinationPolicyV1::Skip,
-            ExistingDestinationPolicyV1::UpdateIfOlder,
-            ExistingDestinationPolicyV1::MustExist,
-        ] {
-            transcript.push(existing_tag(existing));
-            append_mutation(&mut transcript, &baseline, "existing", |grant| {
-                let GrantOperationV1::Copy(copy) = &mut grant.operation;
-                copy.policy.existing = existing;
-            });
-        }
-        for deletion in [
-            DeletionPolicyV1::Forbid,
-            DeletionPolicyV1::DeleteDestinationOnly,
-        ] {
-            transcript.push(deletion_tag(deletion));
-            append_mutation(&mut transcript, &baseline, "deletion", |grant| {
-                let GrantOperationV1::Copy(copy) = &mut grant.operation;
-                copy.policy.deletion = deletion;
-                copy.limits.max_deletions = match deletion {
-                    DeletionPolicyV1::Forbid => 0,
-                    DeletionPolicyV1::DeleteDestinationOnly => 7,
-                };
-            });
-        }
-        for publication in [
-            PublicationPolicyV1::AtomicStaged,
-            PublicationPolicyV1::InPlace,
-        ] {
-            transcript.push(publication_tag(publication));
-            append_mutation(&mut transcript, &baseline, "publication", |grant| {
-                let GrantOperationV1::Copy(copy) = &mut grant.operation;
-                copy.policy.publication = publication;
-            });
-        }
-
-        macro_rules! toggle_option {
-            ($field:ident) => {
-                append_mutation(&mut transcript, &baseline, stringify!($field), |grant| {
-                    let GrantOperationV1::Copy(copy) = &mut grant.operation;
-                    copy.options.$field = !copy.options.$field;
-                });
-            };
-        }
-        append_mutation(&mut transcript, &baseline, "recursive", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.options.recursive = false;
-            for scope in &mut copy.mutation_scopes {
-                scope.descendants = false;
-            }
-        });
-        toggle_option!(preserve_symlinks);
-        append_mutation(&mut transcript, &baseline, "mode-policy", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.options.preserve_permissions = !copy.options.preserve_permissions;
-            copy.options.receiver_managed_modes = !copy.options.receiver_managed_modes;
-        });
-        toggle_option!(preserve_times);
-        toggle_option!(preserve_owner);
-        toggle_option!(preserve_group);
-        toggle_option!(preserve_devices);
-        toggle_option!(compare_existing_by_content);
-        toggle_option!(dry_run);
-        toggle_option!(verify_only);
-        toggle_option!(compressed_transport);
-        append_mutation(&mut transcript, &baseline, "tcp-port-lo", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.options.tcp_port_lo += 1;
-        });
-        append_mutation(&mut transcript, &baseline, "tcp-port-hi", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.options.tcp_port_hi += 1;
-        });
-
-        append_mutation(&mut transcript, &baseline, "max-entries", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.limits.max_entries += 11;
-        });
-        append_mutation(&mut transcript, &baseline, "max-total-bytes", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.limits.max_total_bytes += 13;
-        });
-        append_mutation(&mut transcript, &baseline, "max-file-bytes", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.limits.max_file_bytes += 17;
-        });
-        append_mutation(&mut transcript, &baseline, "hash-block-bytes", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.limits.hash_block_bytes += 19;
-        });
-        append_mutation(&mut transcript, &baseline, "max-connections", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.limits.max_connections += 1;
-        });
-        append_mutation(&mut transcript, &baseline, "max-deletions", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.limits.max_deletions += 1;
-        });
-        append_mutation(&mut transcript, &baseline, "max-runtime-seconds", |grant| {
-            let GrantOperationV1::Copy(copy) = &mut grant.operation;
-            copy.limits.max_runtime_seconds += 1;
-        });
-
-        assert_eq!(
-            hex(&Sha256::digest(&transcript)),
-            "a9cc942c273619558102e526873bc0ae0e3bc6a65917fdc1e9d9e7e62688000a",
-            "changing the namespace, signing bytes, or variant surface requires a new wire version"
-        );
-    }
-
-    #[test]
     fn malformed_and_noncanonical_sshsig_are_rejected() {
         let fixture = Fixture::ordinary();
         let grant = fixture_grant(5);
-        let payload = signing_payload(&grant, 0).expect("payload");
+        let payload = signing_payload_default(&grant, 0).expect("payload");
         let signature = sign(&payload, &fixture.key, SSHSIG_NAMESPACE, None);
 
         let mut malformed = signature.clone();
@@ -2908,7 +2420,7 @@ mod tests {
         let original = SignedGrantEnvelope::decode(&fixture.signed(fixture_grant(7)))
             .expect("decode signed request");
         let mut altered = original.grant;
-        let GrantOperationV1::Copy(copy) = &mut altered.operation;
+        let GrantOperation::Copy(copy) = &mut altered.operation;
         copy.options.verify_only = false;
         let tampered = raw_envelope(&altered, &original.signature);
         assert!(verify_and_claim(
@@ -3073,7 +2585,7 @@ mod tests {
 
         let mut expired = fixture_grant(20);
         expired.not_after = NOW + 1;
-        let GrantOperationV1::Copy(copy) = &mut expired.operation;
+        let GrantOperation::Copy(copy) = &mut expired.operation;
         copy.limits.max_runtime_seconds = 1;
         assert!(
             execution_deadline(&expired, 0, NOW + 2, started + Duration::from_secs(2),).is_err()
@@ -3110,7 +2622,7 @@ mod tests {
 
         let mut expired = fixture_grant(23);
         expired.not_after = NOW + 2;
-        let GrantOperationV1::Copy(copy) = &mut expired.operation;
+        let GrantOperation::Copy(copy) = &mut expired.operation;
         copy.limits.max_runtime_seconds = 1;
         let encoded = fixture.signed(expired);
         let expired_replay = fixture.replay("queued-expired-replay");

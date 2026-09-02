@@ -68,12 +68,6 @@ fn main() {
         println!("{}", identity::build());
         return;
     }
-    // Compatibility with the 0.1.0 standalone updater. New code uses the
-    // release/build identity above and never interprets this as a protocol.
-    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--remote-helper-id") {
-        println!("{}", identity::legacy_helper_id());
-        return;
-    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--release-manifest-signing-payload") {
         if argv.len() != 3 {
             eprintln!("syq: --release-manifest-signing-payload requires one manifest path");
@@ -122,9 +116,8 @@ fn main() {
         }
         return;
     }
-    // Keep accepting the historical root spelling for managed helpers. A
-    // compatibility wrapper whose public prefix is `syq rsync` naturally
-    // turns its remote `--server` launch into `syq rsync --server`.
+    // Remote launches may invoke either `syq --server` or
+    // `syq rsync --server`; both enter the same internal server.
     let server_mode = argv.get(1).and_then(|arg| arg.to_str()) == Some("--server")
         || (argv.get(1).and_then(|arg| arg.to_str()) == Some("rsync")
             && argv.get(2).and_then(|arg| arg.to_str()) == Some("--server"));
@@ -186,9 +179,7 @@ fn main() {
     }
     persistence::mark_explicit_scope(&mut args);
     let quiet = args.quiet;
-    let result = if args.follow {
-        direct::follow(&args)
-    } else if args.interface == cli::Interface::NativeMap {
+    let result = if args.interface == cli::Interface::NativeMap {
         native_map::run(&args)
     } else if args.rm {
         rm::run(args)
