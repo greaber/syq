@@ -16,6 +16,7 @@ mod progress;
 mod proto;
 mod remote_helper;
 mod restricted;
+mod results;
 mod rm;
 #[allow(dead_code)]
 mod rooted;

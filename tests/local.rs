@@ -8203,3 +8203,163 @@ fn native_cp_mapping_end_to_end_map_pipeline() {
     assert_eq!(read(&t.path("pub/berlin/img.jpg")), b"img");
     assert_eq!(read(&t.path("pub/notes.txt")), b"hello");
 }
+
+// ---- syq cp --results ----
+
+#[test]
+fn native_cp_results_stream_success_and_partial() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"abc");
+    std::os::unix::fs::symlink("a.txt", t.path("src/l")).unwrap();
+    let manifest = format!(
+        "{}{}{}",
+        entry_line("a.txt", "x/a.txt", Some("file")),
+        entry_line("l", "l", Some("symlink")),
+        entry_line("gone.txt", "g.txt", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(out.status.code(), Some(23));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("results line is JSON"))
+        .collect();
+    // Envelope: schema v0, strictly increasing seq, run first, result last.
+    for (i, v) in lines.iter().enumerate() {
+        assert_eq!(v["schema"], "syq.automation");
+        assert_eq!(v["schema_version"], 0);
+        assert_eq!(v["seq"], i as u64);
+    }
+    assert_eq!(lines[0]["type"], "run");
+    assert_eq!(lines[0]["mapping"], true);
+    let last = lines.last().unwrap();
+    assert_eq!(last["type"], "result");
+    assert_eq!(last["status"], "partial");
+    assert_eq!(last["exit_code"], 23);
+    assert_eq!(last["files_transferred"], 1);
+    assert_eq!(last["symlinks_created"], 1);
+    assert!(last["directories_created"].as_u64().unwrap() >= 1);
+    assert_eq!(last["errors"], 1);
+    let ops: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|v| v["type"] == "operation_result")
+        .collect();
+    let find = |dst: &str| {
+        *ops.iter()
+            .find(|v| v["dst"]["value"] == dst)
+            .unwrap_or_else(|| panic!("no operation_result for {dst}"))
+    };
+    let file = find("x/a.txt");
+    assert_eq!(file["action"], "transfer_file");
+    assert_eq!(file["disposition"], "succeeded");
+    assert_eq!(file["kind"], "file");
+    assert_eq!(file["bytes"], 3);
+    assert_eq!(file["src"]["value"], "a.txt");
+    let dir = find("x");
+    assert_eq!(dir["action"], "create_directory");
+    assert_eq!(dir["disposition"], "succeeded");
+    let link = find("l");
+    assert_eq!(link["action"], "create_symlink");
+    assert_eq!(link["disposition"], "succeeded");
+    let failed = find("g.txt");
+    assert_eq!(failed["disposition"], "failed");
+    assert_eq!(failed["retryable"], "unknown");
+    assert_eq!(failed["src"]["value"], "gone.txt");
+    // A failed record round-trips as a retry mapping entry.
+    let retry = format!(
+        "{{\"src\":{},\"dst\":{},\"kind\":{}}}\n",
+        failed["src"], failed["dst"], failed["kind"]
+    );
+    write(&t.path("src/gone.txt"), b"late");
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r2.ndjson",
+            "-q",
+        ],
+        Some(retry.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "retry failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("dst/g.txt")), b"late");
+    let last: serde_json::Value = String::from_utf8(read(&t.path("r2.ndjson")))
+        .unwrap()
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .unwrap();
+    assert_eq!(last["status"], "success");
+    assert_eq!(last["exit_code"], 0);
+    // An error record accompanied the failure in the first run.
+    assert!(
+        lines
+            .iter()
+            .any(|v| v["type"] == "error"
+                && v["message"].as_str().unwrap().contains("does not exist"))
+    );
+}
+
+#[test]
+fn native_cp_results_without_mapping_and_refusals() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "out",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["mapping"], false);
+    let op = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["dst"]["value"] == "f.txt")
+        .expect("transfer record");
+    assert_eq!(op["disposition"], "succeeded");
+    assert!(op.get("src").is_none(), "non-mapping records carry no src");
+    assert_eq!(lines.last().unwrap()["status"], "success");
+    // map and cp-prune refuse --results.
+    let out = syq_map_in(&t.path(""), &["--src-src", "src", "--results", "r.ndjson"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only available on syq cp"));
+}

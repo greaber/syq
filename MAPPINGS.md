@@ -231,3 +231,29 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
 - `syq map` streams as it scans, and `syq cp --mapping -` starts work
   before the stream ends; conflict checks are incremental. Exit codes
   and output are the ordinary `syq cp` ones.
+
+## Machine-readable results (preview)
+
+`syq cp --results FILE` (also `-` for stdout; combine that with `-q`)
+writes an NDJSON outcome stream beside the ordinary human output:
+a `run` record, one `operation_result` per settled mutation and per
+failed mapping entry, an `error` record per counted error, and exactly
+one terminal `result` with the exit code and aggregate counts. The
+records carry `schema_version: 0` — an unstable preview of the planned
+automation interface; unchanged and excluded entries appear only in
+the terminal aggregates, and metadata-only updates are not yet
+reported per operation. A missing terminal record means the run did
+not finish.
+
+Failed operation records carry `src`, `dst`, and `kind`, so a retry
+manifest is one filter away:
+
+```sh
+syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
+jq -c 'select(.type == "operation_result" and .disposition == "failed"
+              and .retryable != "no") | {src, dst, kind}' r.ndjson \
+  | syq cp --mapping - -C src --to nas --into /data
+```
+
+The second line is what an exit code cannot express: which entries
+failed, and whether a retry could help.

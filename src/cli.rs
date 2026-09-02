@@ -83,6 +83,9 @@ pub struct Args {
     /// (`-` reads stdin, streamed).
     #[arg(skip)]
     pub native_mapping: Option<Vec<u8>>,
+    /// `--results` NDJSON outcome stream for native cp (`-` writes stdout).
+    #[arg(skip)]
+    pub native_results: Option<Vec<u8>>,
 
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
@@ -662,6 +665,11 @@ struct NativeCopyFields {
     /// dst paths are relative to the --into container
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     mapping: Option<OsString>,
+    /// Write machine-readable NDJSON operation results to FILE (`-` writes
+    /// to stdout; combine with -q). Automation schema version 0, an
+    /// unstable preview
+    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
+    results: Option<OsString>,
     #[command(flatten)]
     operational: NativeOperationalArgs,
 }
@@ -764,6 +772,10 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     let mapping = parsed.mapping.take();
     if mapping.is_some() && interface != Interface::NativeCp {
         bail!("--mapping is only available on syq cp");
+    }
+    let results = parsed.results.take();
+    if results.is_some() && interface != Interface::NativeCp {
+        bail!("--results is only available on syq cp");
     }
     let mut locations = if mapping.is_some() {
         let has_selectors = !(parsed.selection.src.is_empty()
@@ -911,6 +923,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.native_map_cwd = map_cwd;
     args.native_map_target = native_map_target;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
+    args.native_results = results.map(OsStringExt::into_vec);
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
         // through the source connection; a direct remote-to-remote copy has

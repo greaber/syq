@@ -872,6 +872,20 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
+    if let Some(results) = args.native_results.as_deref() {
+        let out: Box<dyn std::io::Write + Send> = if results == b"-" {
+            Box::new(std::io::stdout())
+        } else {
+            let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
+            Box::new(std::io::BufWriter::new(
+                std::fs::File::create(&path)
+                    .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?,
+            ))
+        };
+        let writer = Arc::new(crate::results::ResultsWriter::new(out));
+        writer.emit_run(args.native_mapping.is_some());
+        progress.set_results(writer);
+    }
     let sched = Arc::new(Sched::new(block, min_split));
 
     // Workers connect on their own threads once the control connections are
@@ -1520,6 +1534,7 @@ pub fn run(args: Args) -> Result<i32> {
         },
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
+        mapping_mode: false,
         create_root: if create_root && multiple_distinct_sources {
             Some((dst_root.clone(), root_create_condition))
         } else {
@@ -1733,6 +1748,7 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let max_delete_hit = st.max_delete_hit;
     let dry_run_changes = std::mem::take(&mut st.dry_run_changes);
+    let created_counts = (st.dirs_created, st.links_created, st.specials_created);
     drop(st);
 
     progress.stop();
@@ -1891,7 +1907,7 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
-    Ok(if aborted {
+    let exit_code = if aborted {
         1
     } else if errors > 0 {
         23
@@ -1899,7 +1915,32 @@ pub fn run(args: Args) -> Result<i32> {
         25
     } else {
         0
-    })
+    };
+    if let Some(results) = progress.results_writer() {
+        results.emit_result(&crate::results::ResultRecord {
+            status: if aborted {
+                "aborted"
+            } else if max_delete_hit {
+                "refused"
+            } else if errors > 0 {
+                "partial"
+            } else {
+                "success"
+            },
+            exit_code,
+            files_transferred: progress.files_done.load(Relaxed),
+            files_unchanged: progress.files_skipped.load(Relaxed),
+            files_excluded: progress.files_excluded.load(Relaxed),
+            directories_created: created_counts.0,
+            symlinks_created: created_counts.1,
+            specials_created: created_counts.2,
+            errors,
+            bytes_transferred: progress.bytes_done.load(Relaxed),
+            bytes_unchanged: progress.bytes_skipped.load(Relaxed),
+            elapsed_ms: progress.start.elapsed().as_millis() as u64,
+        });
+    }
+    Ok(exit_code)
 }
 
 fn st_dirs(p: &Progress) -> u64 {
@@ -2650,6 +2691,8 @@ struct Planner<'a> {
     /// --mapping: full destination paths of implicit ancestor directories no
     /// entry names, created with default metadata (no deferred stamping).
     implicit_dirs: std::collections::HashSet<PathBytes>,
+    /// This run consumes a --mapping manifest (identity entries included).
+    mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
     root_path: PathBytes,
     exact_condition: TargetCondition,
@@ -3056,6 +3099,7 @@ impl Planner<'_> {
         reader: &mut dyn std::io::BufRead,
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
+        self.mapping_mode = true;
         match stat_one(src, src_root, true)? {
             Some(e) if e.kind == Kind::Dir => {}
             Some(_) => bail!(
@@ -3114,20 +3158,24 @@ impl Planner<'_> {
             let mut batch: Vec<Entry> = Vec::new();
             for ((line_number, m), st) in chunk.into_iter().zip(stats) {
                 let Some(e) = st else {
-                    self.progress.error(&format!(
-                        "syq: --mapping line {line_number}: source {} does not exist",
+                    let message = format!(
+                        "--mapping line {line_number}: source {} does not exist",
                         display(&m.src)
-                    ));
+                    );
+                    self.progress.error(&format!("syq: {message}"));
+                    self.emit_mapping_entry_failed(&m, "unknown", &message);
                     continue;
                 };
                 if let Some(declared) = m.kind {
                     if !declared.matches(e.kind) {
-                        self.progress.error(&format!(
-                            "syq: --mapping line {line_number}: source {} is {}, not the declared {}",
+                        let message = format!(
+                            "--mapping line {line_number}: source {} is {}, not the declared {}",
                             display(&m.src),
                             kind_label(e.kind),
                             declared.label(),
-                        ));
+                        );
+                        self.progress.error(&format!("syq: {message}"));
+                        self.emit_mapping_entry_failed(&m, "no", &message);
                         continue;
                     }
                 }
@@ -3656,6 +3704,7 @@ impl Planner<'_> {
                     let errs = self.apply(new_dirs)?;
                     let mut failed = 0;
                     for ((name, condition), err) in op_info.iter().zip(errs) {
+                        let created = err.is_none();
                         if let Some(err) = err {
                             failed += 1;
                             self.progress.error(&format!("syq: {err}"));
@@ -3664,6 +3713,22 @@ impl Planner<'_> {
                             }
                         } else if opts.verbose > 0 {
                             self.progress.println(&format!("{}/", display(name)));
+                        }
+                        if let (Some(results), Some(dst_rel)) = (
+                            self.progress.results_writer(),
+                            strip_dst_root(name, dst_root),
+                        ) {
+                            results.emit_operation(&crate::results::OperationRecord {
+                                action: "create_directory",
+                                dst: dst_rel,
+                                src: self.mapping_source_rel(dst_rel).as_deref(),
+                                kind: "dir",
+                                disposition: if created { "succeeded" } else { "failed" },
+                                bytes: None,
+                                attempts: None,
+                                retryable: (!created).then_some("unknown"),
+                                message: None,
+                            });
                         }
                     }
                     self.dirs_created += (n - failed) as u64;
@@ -3755,7 +3820,7 @@ impl Planner<'_> {
             )?
         };
         let mut ops: Vec<Op> = Vec::new();
-        let mut op_names: Vec<String> = Vec::new();
+        let mut op_names: Vec<QueuedLeafOp> = Vec::new();
         // Metadata repairs for quick-check-identical files, each with the
         // checkpoint record once the repair has actually succeeded.
         let mut meta_fixes: Vec<(Op, Option<QuickCheckRecord>)> = Vec::new();
@@ -4021,7 +4086,12 @@ impl Planner<'_> {
                     if !self.invalidate_completion(&dst_rel) {
                         continue;
                     }
-                    op_names.push(format!("{rel} -> {}", display(&target)));
+                    op_names.push(QueuedLeafOp {
+                        dst_rel: dst_rel.clone(),
+                        action: "create_symlink",
+                        kind: "symlink",
+                        name: format!("{rel} -> {}", display(&target)),
+                    });
                     ops.push(Op::Symlink {
                         path: dst_path.clone(),
                         target,
@@ -4088,7 +4158,12 @@ impl Planner<'_> {
                     if !self.invalidate_completion(&dst_rel) {
                         continue;
                     }
-                    op_names.push(rel);
+                    op_names.push(QueuedLeafOp {
+                        dst_rel: dst_rel.clone(),
+                        action: "create_special",
+                        kind: "special",
+                        name: rel,
+                    });
                     ops.push(Op::Mknod {
                         path: dst_path.clone(),
                         mode: e.mode,
@@ -4129,13 +4204,35 @@ impl Planner<'_> {
         if !ops.is_empty() {
             let errs = self.apply(ops)?;
             // Two ops per item: creation then metadata.
-            for (i, name) in op_names.iter().enumerate() {
+            for (i, queued) in op_names.iter().enumerate() {
                 let e1 = errs.get(2 * i).cloned().flatten();
                 let e2 = errs.get(2 * i + 1).cloned().flatten();
-                if let Some(e) = e1.or(e2) {
+                let error = e1.or(e2);
+                if let Some(e) = &error {
                     self.progress.error(&format!("syq: {e}"));
+                    match queued.action {
+                        "create_symlink" => self.links_created -= 1,
+                        _ => self.specials_created -= 1,
+                    }
                 } else if opts.verbose > 0 {
-                    self.progress.println(name);
+                    self.progress.println(&queued.name);
+                }
+                if let Some(results) = self.progress.results_writer() {
+                    results.emit_operation(&crate::results::OperationRecord {
+                        action: queued.action,
+                        dst: &queued.dst_rel,
+                        src: self.mapping_source_rel(&queued.dst_rel).as_deref(),
+                        kind: queued.kind,
+                        disposition: if error.is_none() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                        bytes: None,
+                        attempts: None,
+                        retryable: error.is_some().then_some("unknown"),
+                        message: error.as_deref(),
+                    });
                 }
             }
         }
@@ -4314,6 +4411,51 @@ impl Planner<'_> {
 
     /// Display name for a source entry: its destination-relative path, or the
     /// source's basename when a single file is copied to an exact destination.
+    /// --mapping: the manifest source path (base-relative) for a destination,
+    /// so `--results` records round-trip as retry mapping entries. None
+    /// outside mapping mode, where no base-relative source spelling exists.
+    fn mapping_source_rel(&self, dst_rel: &[u8]) -> Option<PathBytes> {
+        if !self.mapping_mode {
+            return None;
+        }
+        Some(
+            self.src_overrides
+                .get(dst_rel)
+                .cloned()
+                .unwrap_or_else(|| dst_rel.to_vec()),
+        )
+    }
+
+    /// A mapping entry that failed before any job existed (missing source,
+    /// declared-kind mismatch): the error was already counted; this emits the
+    /// per-entry result record retry tooling filters on.
+    fn emit_mapping_entry_failed(
+        &self,
+        entry: &ManifestEntry,
+        retryable: &'static str,
+        message: &str,
+    ) {
+        if let Some(results) = self.progress.results_writer() {
+            let (action, kind) = match entry.kind {
+                Some(DeclaredKind::Dir) => ("create_directory", "dir"),
+                Some(DeclaredKind::Symlink) => ("create_symlink", "symlink"),
+                Some(DeclaredKind::Special) => ("create_special", "special"),
+                _ => ("transfer_file", "file"),
+            };
+            results.emit_operation(&crate::results::OperationRecord {
+                action,
+                dst: &entry.dst,
+                src: Some(&entry.src),
+                kind,
+                disposition: "failed",
+                bytes: None,
+                attempts: None,
+                retryable: Some(retryable),
+                message: Some(message),
+            });
+        }
+    }
+
     fn rel_name(&self, src_root: &[u8], sub_b: &[u8], path: &[u8]) -> String {
         let r = join(sub_b, path);
         if r.is_empty() {
@@ -4388,6 +4530,7 @@ impl Planner<'_> {
         dst_entry: Option<Entry>,
     ) {
         let target_condition = self.exact_condition_for(&dst);
+        let src_rel = self.mapping_source_rel(&rel_bytes);
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
@@ -4402,6 +4545,7 @@ impl Planner<'_> {
             attempts: 0,
             done: Arc::new(AtomicU64::new(0)),
             inplace: false,
+            src_rel,
         });
     }
 
@@ -5188,7 +5332,9 @@ impl Worker {
             .zip(results.into_iter().zip(now.into_iter()))
         {
             if let Err(e) = res {
-                self.progress.error(&format!("syq: {}: {e:#}", j.rel));
+                let message = format!("{e:#}");
+                self.progress.error(&format!("syq: {}: {message}", j.rel));
+                self.emit_file_result_failed(j, "unknown", &message);
                 self.sched.fail_file(*idx);
                 continue;
             }
@@ -5230,6 +5376,11 @@ impl Worker {
                         "syq: {}: source changed during transfer (or vanished)",
                         j.rel
                     ));
+                    self.emit_file_result_failed(
+                        j,
+                        "yes",
+                        "source changed during transfer (or vanished)",
+                    );
                     self.sched.fail_file(*idx);
                 }
                 continue;
@@ -5237,6 +5388,19 @@ impl Worker {
             self.progress.add_bytes(j.entry.size);
             j.done.store(j.entry.size, Relaxed);
             self.progress.files_done.fetch_add(1, Relaxed);
+            if let Some(results) = self.progress.results_writer() {
+                results.emit_operation(&crate::results::OperationRecord {
+                    action: "transfer_file",
+                    dst: &j.rel_bytes,
+                    src: j.src_rel.as_deref(),
+                    kind: "file",
+                    disposition: "succeeded",
+                    bytes: Some(j.entry.size),
+                    attempts: Some(u64::from(j.attempts) + 1),
+                    retryable: None,
+                    message: None,
+                });
+            }
             self.record_done(&j.rel_bytes, &j.entry);
             if self.opts.verbose > 0 {
                 self.progress.println(&j.rel);
@@ -5251,11 +5415,31 @@ impl Worker {
             return Err(e);
         }
         if !self.sched.is_failed(idx) {
-            let rel = self.sched.jobs.lock().unwrap()[idx].rel.clone();
-            self.progress.error(&format!("syq: {rel}: {e:#}"));
+            let job = self.job(idx);
+            let message = format!("{e:#}");
+            self.progress.error(&format!("syq: {}: {message}", job.rel));
+            self.emit_file_result_failed(&job, "unknown", &message);
             self.sched.fail_file(idx);
         }
         Ok(())
+    }
+
+    /// One failed-transfer result record; the error itself was already
+    /// counted and printed by the caller.
+    fn emit_file_result_failed(&self, job: &FileJob, retryable: &'static str, message: &str) {
+        if let Some(results) = self.progress.results_writer() {
+            results.emit_operation(&crate::results::OperationRecord {
+                action: "transfer_file",
+                dst: &job.rel_bytes,
+                src: job.src_rel.as_deref(),
+                kind: "file",
+                disposition: "failed",
+                bytes: None,
+                attempts: Some(u64::from(job.attempts) + 1),
+                retryable: Some(retryable),
+                message: Some(message),
+            });
+        }
     }
 
     fn job(&self, idx: usize) -> FileJob {
@@ -5943,6 +6127,19 @@ impl Worker {
             self.progress.files_skipped.fetch_add(1, Relaxed);
         } else {
             self.progress.files_done.fetch_add(1, Relaxed);
+            if let Some(results) = self.progress.results_writer() {
+                results.emit_operation(&crate::results::OperationRecord {
+                    action: "transfer_file",
+                    dst: &job.rel_bytes,
+                    src: job.src_rel.as_deref(),
+                    kind: "file",
+                    disposition: "succeeded",
+                    bytes: Some(job.entry.size),
+                    attempts: Some(u64::from(job.attempts) + 1),
+                    retryable: None,
+                    message: None,
+                });
+            }
         }
         self.record_done(&job.rel_bytes, &job.entry);
         if !matched && self.opts.verbose > 0 {
@@ -6296,4 +6493,23 @@ fn implicit_dir_entry(path: PathBytes) -> Entry {
         ctime_nsec: 0,
         link: None,
     }
+}
+
+/// A queued symlink/special creation: the display string for -v plus the
+/// machine-readable identity `--results` records need.
+struct QueuedLeafOp {
+    dst_rel: PathBytes,
+    action: &'static str,
+    kind: &'static str,
+    name: String,
+}
+
+/// The container-relative spelling of a full destination path; None for the
+/// container itself.
+fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
+    if path == dst_root {
+        return None;
+    }
+    let rest = path.strip_prefix(dst_root)?;
+    Some(rest.strip_prefix(b"/").unwrap_or(rest))
 }

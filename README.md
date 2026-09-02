@@ -248,7 +248,9 @@ current compatibility options for those capabilities are needed.
 
 The native commands accept only `-n`/`--dry-run`, `-v`/`--verbose`,
 `-q`/`--quiet`, and `-j`/`--connections` in addition to the endpoint,
-selector, cwd, and placement options above. `cp-prune` additionally accepts
+selector, cwd, and placement options above. `cp` additionally accepts
+`--mapping` and `--results` (see [MAPPINGS.md](MAPPINGS.md)); `cp-prune`
+additionally accepts
 `--max-delete`; `rm` additionally accepts `--root` and `--follow` plus its
 typed selectors. Preservation policies, filters, comparison controls, progress
 interfaces, and SSH/transport configuration remain available only through
