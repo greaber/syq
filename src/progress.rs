@@ -58,6 +58,7 @@ pub struct Progress {
     /// `--results`: machine-readable NDJSON outcome stream, set once after
     /// construction so workers and the planner reach it with no plumbing.
     results: std::sync::OnceLock<Arc<crate::results::ResultsWriter>>,
+    result_destination: std::sync::OnceLock<usize>,
 }
 
 struct TermState {
@@ -109,6 +110,7 @@ impl Progress {
             }),
             stop: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
+            result_destination: std::sync::OnceLock::new(),
         })
     }
 
@@ -118,6 +120,14 @@ impl Progress {
 
     pub fn results_writer(&self) -> Option<&Arc<crate::results::ResultsWriter>> {
         self.results.get()
+    }
+
+    pub fn set_result_destination(&self, index: usize) {
+        let _ = self.result_destination.set(index);
+    }
+
+    pub fn result_destination(&self) -> Option<usize> {
+        self.result_destination.get().copied()
     }
 
     pub fn set_worker(&self, id: usize, s: Option<WorkerStatus>) {
@@ -162,7 +172,7 @@ impl Progress {
         self.errors.fetch_add(1, Relaxed);
         self.eprintln(line);
         if let Some(results) = self.results.get() {
-            results.emit_error_classified(line, class, os_kind);
+            results.emit_error_classified_for(line, class, os_kind, self.result_destination());
         }
     }
 

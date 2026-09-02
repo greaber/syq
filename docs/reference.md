@@ -16,6 +16,7 @@ target placement in separate arguments:
 
 ```sh
 syq cp project --to server --into /backup       # named object → /backup/project
+syq cp project --tos server-a server-b --into /backup # one copy → both targets
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
 syq cp --from server:2222 data --to backup:2200 --into /archive
@@ -61,6 +62,55 @@ equally to local and remote copies.
 the source endpoint. Copy selectors may be absolute and then ignore `--cwd`.
 Removal selectors are always relative; native `rm` rejects a leading slash and
 any `.` or `..` component.
+
+`cp` can coordinate several remote targets from one local source. Each `--to`
+or `--tos` starts a target group, followed by that group's placement:
+
+```sh
+syq cp --src-src build --tos edge-a edge-b edge-c --into /srv/app
+syq cp --src-src build \
+  --to edge-a --into-new /srv/app-a \
+  --tos edge-b edge-c --into-existing /opt/app
+```
+
+The placement is exactly one of `--into`, `--into-new`, `--into-existing`,
+`--as`, `--as-new`, or `--as-existing`. It must follow its `--to` or `--tos`
+group and come before the next group. `--tos` takes one or more endpoints and
+stops at the next option; every endpoint in the group shares its eventual
+placement. Target groups may use different paths and placement preconditions.
+Targets keep their command-line order, and naming the same parsed user, host,
+and port twice is an error. A local copy has no target group and keeps its
+single placement form.
+
+The target connections are opened concurrently. Each target registers the
+local source through the ordinary descriptor-pinned source path, while one of
+them walks it and shares that scan with the others. SYQ waits until every
+target has connected, checked its placement, planned the complete copy, and
+passed its fresh-target capacity check before any target replays a destination
+mutation. A failure before that barrier leaves every target unchanged. This is
+not a distributed transaction: a connection or filesystem failure after the
+barrier can leave some targets complete and others partial, and `--prune`
+planning and removal run after each target's file transfers. Rerunning the same
+command safely converges the targets.
+
+Multi-target copies support the ordinary local-source `cp` options, including
+`--root`, directional link following, `--mapping` (stdin is acquired once),
+`--inplace`, `--prune`, dry runs, filtering and preservation, progress, stats,
+and automation results. `--connections` is one budget divided among targets;
+an explicit value smaller than the number of targets is refused. `--bwlimit`
+is likewise one aggregate file-data limit. Human and JSON progress are
+aggregated across targets. `--results` and `--results-fd` produce one stream;
+its run record lists all destinations and each target-specific trace,
+operation, or error carries a zero-based `destination_index` into that ordered
+destination list.
+
+A remote source is the remaining unsupported multi-target topology. Direct
+remote-to-remote coordination and its command-restricted receiver grants bind
+one destination, so treating several independent remote coordinators as one
+barrier would make a safety promise they cannot enforce. The receiver-only
+ceilings, receipts, detached mode, and agent-forwarding controls consequently
+retain their existing direct remote-to-remote scope rather than acquiring a
+different meaning in multi-target mode.
 
 Bare paths and repeatable `--src PATH` select named objects. A named directory
 keeps its basename at the target; by default a named symlink is copied as a

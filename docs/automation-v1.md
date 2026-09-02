@@ -104,9 +104,10 @@ Identifies the run: `run_id` (opaque string, unique per invocation),
 (`source`|`destination`), `kind` (`local`|`ssh`), and for ssh
 endpoints `host` and, when given, `user`. Never credentials, ports,
 or raw shell arguments. A copy run also has `prune` and `mapping` booleans and
-source and destination endpoints. A removal run omits those copy-only fields
-and has exactly one source endpoint, regardless of how many selectors it
-contains.
+source and destination endpoints. A coordinated multi-target copy lists its
+source once and then every destination in command-line order. A removal run
+omits those copy-only fields and has exactly one source endpoint, regardless of
+how many selectors it contains.
 
 ### `progress` — sampled telemetry
 
@@ -117,6 +118,8 @@ lossy by design — drive spinners and dashboards from it, never final
 accounting; the terminal record is the only authority on totals.
 Removal has no byte accounting, so its byte and unchanged/excluded fields are
 zero; its file counts reflect endpoint outcomes delivered so far.
+For a multi-target copy these counters and the terminal counters are sums over
+all destinations.
 
 ### `trace` — dry-run only, one per intended mutation
 
@@ -126,6 +129,10 @@ explanation the same decision would print under `-v`:
 
 `destination_missing` | `type_differs` | `content_differs` |
 `metadata_differs` | `destination_only` (`--prune` deletions).
+
+On a multi-target run, `destination_index` is the zero-based index among the
+run record's destination endpoints. It is absent on an ordinary one-target
+run.
 
 There is no identity linking a trace to an operation in a later real
 run: the filesystem can change between the two, and the stream does
@@ -142,6 +149,9 @@ manifest entry), `kind` (`file`|`dir`|`symlink`|`special`; present
 when known — a receiver-attested `set_metadata` omits it), and
 `disposition`: `succeeded` | `failed` | `blocked` (a `--max-delete`
 refusal) | `incomplete` | `observed` (receiver-attested streams).
+On a multi-target run, `destination_index` identifies which ordered
+destination the operation belongs to; it is absent on an ordinary one-target
+run.
 Optional: `bytes`, `attempts`, on failures `retryable`
 (`yes`|`no`|`unknown`), `class`, `os_kind`, `message`, and on
 receiver-attested records `provenance`, `scope` (the index of the
@@ -193,7 +203,8 @@ aggregate error ledger.
 ### `error` — one per counted error
 
 `message` is display text, never a parsing contract. Optional `class`
-and `os_kind` where the emission site knows them; a receiver refusal
+and `os_kind` where the emission site knows them. A multi-target error also
+has `destination_index` when it belongs to one destination; a receiver refusal
 arrives as an `error` with `class: "safety_limit"`, `provenance`, and
 the receiver's `code`.
 

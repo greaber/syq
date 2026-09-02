@@ -151,6 +151,7 @@ if os.environ.get("SYQ_FAKE_SHAPE") != "empty":
         records.append({
             "schema": "syq.automation", "schema_version": 1, "seq": 2,
             "type": "trace", "action": "transfer_file",
+            "destination_index": 0,
             "dst": {"encoding": "utf-8", "value": "a.txt"},
             "kind": "file", "reason": "destination_missing", "bytes": 3,
         })
@@ -158,6 +159,7 @@ if os.environ.get("SYQ_FAKE_SHAPE") != "empty":
         records.append({
             "schema": "syq.automation", "schema_version": 1, "seq": 2,
             "type": "operation_result", "action": "transfer_file",
+            "destination_index": 0,
             "dst": {"encoding": "utf-8", "value": "a.txt"},
             "kind": "file", "disposition": "succeeded", "bytes": 3,
             "attempts": 1,
@@ -313,6 +315,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertTrue(any(isinstance(event, syq.ProgressEvent) for event in events))
         trace = next(event for event in events if isinstance(event, syq.TraceEvent))
         self.assertEqual(trace.action, syq.OperationAction.TRANSFER_FILE)
+        self.assertEqual(trace.destination_index, 0)
         self.assertEqual(trace.reason, syq.TraceReason.DESTINATION_MISSING)
         argv = self.argv()
         for expected in (
@@ -518,6 +521,26 @@ class NativeClientTests(unittest.TestCase):
         )
         self.assertEqual(operation.disposition, syq.Disposition.SUCCEEDED)
         self.assertEqual(operation.kind, syq.EntryKind.FILE)
+        self.assertEqual(operation.destination_index, 0)
+
+    def test_cp_combines_to_and_tos_endpoints(self) -> None:
+        self.client.cp(
+            "source",
+            to="alpha",
+            tos=["beta", "gamma:2222"],
+            into="target",
+        )
+        argv = self.argv()
+        start = argv.index("--tos")
+        self.assertEqual(
+            argv[start : start + 4],
+            ["--tos", "alpha", "beta", "gamma:2222"],
+        )
+        self.assertNotIn("--to", argv)
+
+    def test_cp_rejects_a_scalar_tos_value(self) -> None:
+        with self.assertRaisesRegex(TypeError, "iterable of endpoint strings"):
+            self.client.cp("source", tos="alpha", into="target")
 
     def test_cp_forwards_native_remote_controls(self) -> None:
         self.client.cp(

@@ -54,6 +54,7 @@ learn a second set of names for concepts that syq already names.
 | `--no-compress` | `no_compress=` |
 | `--max-delete` | `max_delete=` |
 | `--from` | `from_=` |
+| `--tos` | `tos=` |
 | `--as` | `as_=` |
 | `class` event field | `class_` attribute |
 
@@ -143,6 +144,20 @@ syq.cp(
 )
 ```
 
+Pass `tos=` an iterable for a coordinated local-source copy to several
+destinations. When both are present, the client combines `to=` and `tos=` into
+one native `--tos` group sharing the requested placement. Operation, trace,
+and error events expose their optional `destination_index`:
+
+```python
+syq.cp(
+    "project",
+    to="edge-a",
+    tos=["edge-b", "edge-c"],
+    into="/backup",
+)
+```
+
 `cp` returns only after it has received and validated the terminal result and
 reaped the process. By default, a non-successful terminal result raises
 `SyqOperationError`; the exception retains the same typed result. Pass
@@ -204,6 +219,7 @@ syq.cp(
     follow_src=False,
     follow_dest=False,
     to=None,
+    tos=None,
     into=None,
     into_new=None,
     into_existing=None,

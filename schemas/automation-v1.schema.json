@@ -360,6 +360,9 @@
         "type": {
           "const": "trace"
         },
+        "destination_index": {
+          "$ref": "#/$defs/u64"
+        },
         "action": {
           "$ref": "#/$defs/action"
         },
@@ -428,6 +431,9 @@
         "seq": true,
         "type": {
           "const": "operation_result"
+        },
+        "destination_index": {
+          "$ref": "#/$defs/u64"
         },
         "action": {
           "$ref": "#/$defs/action"
@@ -714,6 +720,9 @@
         "seq": true,
         "type": {
           "const": "error"
+        },
+        "destination_index": {
+          "$ref": "#/$defs/u64"
         },
         "message": {
           "type": "string"

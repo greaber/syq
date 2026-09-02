@@ -204,6 +204,20 @@ def _endpoints(record: dict[str, Any]) -> tuple[Endpoint, ...]:
     return tuple(endpoints)
 
 
+def _destination_index(record: dict[str, Any], run: RunEvent) -> int | None:
+    index = _optional_integer(record, "destination_index")
+    if index is None:
+        return None
+    destinations = sum(
+        endpoint.role is EndpointRole.DESTINATION for endpoint in run.endpoints
+    )
+    if index < 0 or index >= destinations:
+        raise SyqProtocolError(
+            "automation destination_index does not name a run destination"
+        )
+    return index
+
+
 class AutomationDecoder:
     """Validate one complete automation-v1 typed-operation stream incrementally."""
 
@@ -343,6 +357,7 @@ class AutomationDecoder:
                 raise SyqProtocolError("a live automation stream contains a trace")
             return TraceEvent(
                 **common,
+                destination_index=_destination_index(record, self.run),
                 action=_enum(record, "action", OperationAction),
                 dst=_tagged(record.get("dst"), label="dst"),
                 src=_tagged(record["src"], label="src") if "src" in record else None,
@@ -373,6 +388,7 @@ class AutomationDecoder:
                 )
             return OperationResult(
                 **common,
+                destination_index=_destination_index(record, self.run),
                 action=_enum(record, "action", OperationAction),
                 dst=_tagged(record.get("dst"), label="dst"),
                 src=_tagged(record["src"], label="src") if "src" in record else None,
@@ -502,6 +518,7 @@ class AutomationDecoder:
                 )
             event = ErrorEvent(
                 **common,
+                destination_index=_destination_index(record, self.run),
                 message=_string(record, "message"),
                 class_=_optional_enum(record, "class", ErrorClass),
                 os_kind=_optional_enum(record, "os_kind", OsKind),

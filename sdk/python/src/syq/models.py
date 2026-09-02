@@ -295,6 +295,7 @@ class TraceEvent:
     kind: EntryKind
     bytes: int | None
     reason: TraceReason
+    destination_index: int | None = None
     type: str = "trace"
 
 
@@ -314,6 +315,7 @@ class OperationResult:
     class_: ErrorClass | None
     os_kind: OsKind | None
     message: str | None
+    destination_index: int | None = None
     provenance: str | None = None
     scope: int | None = None
     code: ReceiptCode | None = None
@@ -388,6 +390,7 @@ class ErrorEvent:
     message: str
     class_: ErrorClass | None
     os_kind: OsKind | None
+    destination_index: int | None = None
     provenance: str | None = None
     code: ReceiptCode | None = None
     type: str = "error"

@@ -642,6 +642,461 @@ fn source_scan_uses_registered_root_after_operator_path_replacement() {
     );
 }
 
+#[test]
+fn native_copy_fans_out_to_one_tos_group() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("src/sub/file"), b"replicated");
+    for host in ["alpha", "beta", "gamma"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            &t.s("src"),
+            "--tos",
+            "alpha",
+            "beta",
+            "gamma",
+            "--into-existing",
+            "dst",
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    for host in ["alpha", "beta", "gamma"] {
+        assert_eq!(
+            read(&t.path(&format!("remotes/{host}/dst/sub/file"))),
+            b"replicated"
+        );
+    }
+}
+
+#[test]
+fn fanout_target_groups_apply_distinct_paths_and_placement_modes() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("source"), b"placed independently");
+    for host in ["alpha", "beta", "gamma", "delta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(&home).unwrap();
+        if matches!(host, "beta" | "gamma") {
+            fs::create_dir(home.join("existing")).unwrap();
+        }
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--to",
+            "alpha",
+            "--into-new",
+            "created",
+            "--tos",
+            "beta",
+            "gamma",
+            "--into-existing",
+            "existing",
+            "--to",
+            "delta",
+            "--as-new",
+            "renamed",
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    assert_eq!(
+        read(&t.path("remotes/alpha/created/source")),
+        b"placed independently"
+    );
+    for host in ["beta", "gamma"] {
+        assert_eq!(
+            read(&t.path(&format!("remotes/{host}/existing/source"))),
+            b"placed independently"
+        );
+    }
+    assert_eq!(
+        read(&t.path("remotes/delta/renamed")),
+        b"placed independently"
+    );
+}
+
+#[test]
+fn fanout_cached_scans_follow_deduplicated_source_order() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("large"), &vec![b'l'; 3 * 1024]);
+    write(&t.path("small"), b"copy me");
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("large"),
+            &t.s("large"),
+            &t.s("small"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--max-size",
+            "2K",
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    for host in ["alpha", "beta"] {
+        let destination = t.path(&format!("remotes/{host}/dst"));
+        assert_eq!(read(&destination.join("small")), b"copy me");
+        assert!(!destination.join("large").exists());
+    }
+}
+
+#[test]
+fn fanout_target_preflight_failure_leaves_ready_target_unchanged() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("src/file"), b"new");
+    let alpha = t.path("remotes/alpha");
+    let beta = t.path("remotes/beta");
+    fs::create_dir_all(alpha.join("dst")).unwrap();
+    fs::create_dir_all(&beta).unwrap();
+    write(&alpha.join("dst/file"), b"old");
+    install_cached_remote_helper(&alpha);
+    install_cached_remote_helper(&beta);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            &t.s("src"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--results",
+            &t.s("failed-results.ndjson"),
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(read(&alpha.join("dst/file")), b"old");
+    assert!(!beta.join("dst").exists());
+    let content = String::from_utf8(read(&t.path("failed-results.ndjson"))).unwrap();
+    assert_automation_v1_stream(
+        &automation_v1_validator(),
+        &content,
+        "failed fan-out result stream",
+    );
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["type"] == "result")
+            .count(),
+        1
+    );
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["exit_code"], 1);
+    let errors: Vec<_> = records
+        .iter()
+        .filter(|record| record["type"] == "error")
+        .collect();
+    assert!(!errors.is_empty());
+    assert!(errors
+        .iter()
+        .all(|record| record["destination_index"].is_u64()));
+    assert_eq!(terminal["errors"].as_u64().unwrap(), errors.len() as u64);
+}
+
+#[test]
+fn fanout_copy_plan_failure_prevents_every_target_mutation() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("source"), b"new");
+    let alpha = t.path("remotes/alpha");
+    let beta = t.path("remotes/beta");
+    fs::create_dir_all(alpha.join("ready")).unwrap();
+    fs::create_dir_all(beta.join("dst")).unwrap();
+    install_cached_remote_helper(&alpha);
+    install_cached_remote_helper(&beta);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--to",
+            "alpha",
+            "--into-existing",
+            "ready",
+            "--to",
+            "beta",
+            "--as-existing",
+            "dst",
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fs::read_dir(alpha.join("ready")).unwrap().count(), 0);
+    assert!(beta.join("dst").is_dir());
+    assert_eq!(fs::read_dir(beta.join("dst")).unwrap().count(), 0);
+}
+
+#[test]
+fn fanout_preserves_inplace_and_prune_behavior() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("src/file"), b"new contents");
+    let mut inodes = Vec::new();
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        write(&home.join("dst/file"), b"old");
+        write(&home.join("dst/extra"), b"remove");
+        inodes.push(fs::metadata(home.join("dst/file")).unwrap().ino());
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            &t.s("src"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--inplace",
+            "--prune",
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    for (host, inode) in ["alpha", "beta"].into_iter().zip(inodes) {
+        let destination = t.path(&format!("remotes/{host}/dst"));
+        assert_eq!(read(&destination.join("file")), b"new contents");
+        assert_eq!(fs::metadata(destination.join("file")).unwrap().ino(), inode);
+        assert!(!destination.join("extra").exists());
+    }
+}
+
+#[test]
+fn fanout_preserves_root_links_filters_and_metadata_behavior() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("base/real/keep"), b"kept");
+    write(&t.path("base/real/skip.tmp"), b"excluded");
+    fs::set_permissions(t.path("base/real/keep"), fs::Permissions::from_mode(0o640)).unwrap();
+    symlink("real", t.path("base/link")).unwrap();
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("actual")).unwrap();
+        symlink("actual", home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--root",
+            &t.s("base"),
+            "--follow-src",
+            "--src-src",
+            "link",
+            "--tos",
+            "alpha",
+            "beta",
+            "--follow-dest",
+            "--ignore=*.tmp",
+            "--preserve=permissions",
+            "--into-existing",
+            "dst",
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    for host in ["alpha", "beta"] {
+        let destination = t.path(&format!("remotes/{host}/actual"));
+        assert_eq!(read(&destination.join("keep")), b"kept");
+        assert_eq!(
+            fs::metadata(destination.join("keep")).unwrap().mode() & 0o777,
+            0o640
+        );
+        assert!(!destination.join("skip.tmp").exists());
+    }
+}
+
+#[test]
+fn fanout_acquires_a_mapping_once_and_applies_it_to_every_target() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("src/original"), b"mapped");
+    let mapping = br#"{"src":{"encoding":"utf-8","value":"original"},"dst":{"encoding":"utf-8","value":"renamed"},"kind":"file"}
+"#;
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--cwd",
+            &t.s("src"),
+            "--mapping",
+            "-",
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(mapping).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_output_ok(&output);
+    for host in ["alpha", "beta"] {
+        assert_eq!(
+            read(&t.path(&format!("remotes/{host}/dst/renamed"))),
+            b"mapped"
+        );
+    }
+}
+
+#[test]
+fn fanout_results_are_one_stream_with_target_indexed_operations() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("src/file"), b"result");
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            &t.s("src"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--results",
+            &t.s("results.ndjson"),
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    let content = String::from_utf8(read(&t.path("results.ndjson"))).unwrap();
+    assert_automation_v1_stream(
+        &automation_v1_validator(),
+        &content,
+        "fan-out result stream",
+    );
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.first().unwrap()["type"], "run");
+    assert_eq!(
+        records.first().unwrap()["endpoints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let mut destinations: Vec<u64> = records
+        .iter()
+        .filter(|record| record["type"] == "operation_result")
+        .map(|record| record["destination_index"].as_u64().unwrap())
+        .collect();
+    destinations.sort_unstable();
+    destinations.dedup();
+    assert_eq!(destinations, [0, 1]);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["type"] == "result")
+            .count(),
+        1
+    );
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["files_transferred"], 2);
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn self_copy_guard_does_not_reject_a_destination_outside_the_moved_source() {
@@ -3637,6 +4092,39 @@ exec /bin/sh -c "$1"
 "#,
     );
     path
+}
+
+/// A fake remote shell whose endpoint name selects an isolated HOME.
+fn fanout_fake_rsh(t: &Tmp) -> PathBuf {
+    let path = t.path("fanout-fake-rsh");
+    executable(
+        &path,
+        br#"#!/bin/sh
+host=$1
+shift
+HOME="$FAKE_REMOTE_ROOT/$host"
+PATH=/usr/bin:/bin
+export HOME PATH
+cd "$HOME" || exit 97
+printf '%s %s\n' "$host" "$1" >> "$FAKE_RSH_LOG"
+exec /bin/sh -c "$1"
+"#,
+    );
+    path
+}
+
+fn install_cached_remote_helper(home: &Path) {
+    let identity = binary_identity("--build-identity");
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "linux-x86_64",
+        "aarch64" => "linux-aarch64",
+        arch => panic!("unsupported test architecture {arch}"),
+    };
+    let helper = home.join(format!(
+        ".cache/syq/helpers/{identity}-release-v1/{target}/syq"
+    ));
+    fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), helper).unwrap();
 }
 
 /// An ssh-shaped fixture that records the connection arguments, including

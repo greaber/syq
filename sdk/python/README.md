@@ -26,6 +26,8 @@ print(syq.managed_executable())  # downloads once, then returns the cached path
 
 plan = syq.cp("project", to="server", into="/backup", dry_run=True)
 print(plan.files_transferred, plan.bytes_transferred)
+
+replicated = syq.cp("project", tos=["server-a", "server-b"], into="/backup")
 ```
 
 The typed API validates syq's complete automation-v1 stream and its agreement
