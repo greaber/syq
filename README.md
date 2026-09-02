@@ -58,6 +58,7 @@ syq rsync -a --verify-only src/ host:dst/          # compare content; write noth
 syq cp project --to server --into /backup          # → /backup/project
 syq cp --src-src project --to server --into /app   # contents of project → /app
 syq rm --root /srv --src-dir cache                 # remove /srv/cache; never leave /srv
+set -o pipefail                                    # so a failed producer fails the pipeline
 syq map --src-src photos | jq '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C photos --to nas --into /pub   # placement as data
 ```

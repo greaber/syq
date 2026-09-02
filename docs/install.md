@@ -52,18 +52,17 @@ cargo build --release          # binary at target/release/syq
 cargo install --locked --path . # or: put it on your PATH
 ```
 
-Checkout builds carry a source-revision identity. The crates.io 0.1.5 package
-predates stable identities for packaged source: two independent
-`cargo install --locked syq` builds receive different identities and cannot
-connect as remote peers. To use a 0.1.5 Cargo installation remotely, copy the
-exact installed executable to the remote and pass `--syq-path /path/to/syq`
-(or put it on the remote `PATH` and use `--no-bootstrap`).
+Checkout builds carry a source-revision identity. Crates.io packages from
+0.1.7 on carry the package's source revision too, so two independent
+`cargo install --locked syq` builds of one version receive the same identity
+and can connect as remote peers. The 0.1.5 package predates that: its two
+independent builds receive different identities, so to use a 0.1.5 Cargo
+installation remotely, copy the exact installed executable to the remote and
+pass `--syq-path /path/to/syq` (or put it on the remote `PATH` and use
+`--no-bootstrap`).
 
-A later crate release containing packaged-source identity support will carry
-the package's source revision, allowing independent locked installations of
-that same version to connect. Source builds deliberately do not claim to be an
-immutable release, so managed remote bootstrap remains available only in
-official release binaries.
+Source builds deliberately do not claim to be an immutable release, so managed
+remote bootstrap remains available only in official release binaries.
 
 ## Update checks and self-update
 

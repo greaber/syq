@@ -91,6 +91,7 @@ pipeline converges. For stage-by-stage completion, materialize the
 manifest instead:
 
 ```bash
+set -o pipefail
 syq map --src-src src | jq '.dst.value |= ascii_downcase' > m.ndjson \
   && syq cp --mapping m.ndjson -C src --to nas --into /pub
 ```
@@ -226,11 +227,11 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
   an exact single-path placement cannot host a manifest — each entry's
   `dst` already is its own `--as`. It is part of the native surface
   only; `syq rsync` is unchanged.
-- `syq map` accepts the `syq cp` grammar, including `--as PATH`, which
-  emits the single selected root under the target's basename; see
-  "Emitting a mapping" for this version's restrictions. The typed `rm`
-  selectors (`--src-dir`, `--src-file`) are not part of the copy
-  grammar.
+- `syq map` accepts the `syq cp` grammar, including `--as PATH` (which
+  emits the single selected root under the target's basename) and the
+  typed selectors `--src-file`/`--src-dir`, validated exactly as native
+  cp validates them; see "Emitting a mapping" for this version's
+  restrictions.
 - Fidelity is the native default (`-rlt`). There is no per-entry
   policy: preservation and comparison behavior stay global.
 - An entry claims exactly one object. A `dir` entry claims the
@@ -254,7 +255,7 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
   declared-kind ancestor conflicts refuse the run before any entry is
   applied (the `--into` container itself is created eagerly, as with
   `--files-from`). The price is memory proportional to the manifest, as
-  in a multi-source copy. Execution then overlaps source stats and transfers.
+  in a multi-source copy. Sources are then statted and planned in chunks, and transfers begin once planning completes.
   Conflicts only observable at execution — an undeclared ancestor that
   turns out not to be a directory, existing destination state — still
   fail entries individually. `syq map` streams its output. Exit codes
@@ -276,12 +277,25 @@ not finish.
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:
 
-```sh
+```bash
+set -o pipefail
 syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
-jq -c 'select(.type == "operation_result" and .disposition == "failed"
-              and .retryable != "no") | {src, dst, kind}' r.ndjson \
+jq -cs 'if (.[-1].type? // "") != "result"
+        then "incomplete results stream (no terminal record)" | halt_error
+        elif (.[-1].status != "success" and .[-1].status != "partial")
+        then "run stopped early (status \(.[-1].status)); rerun it instead of retrying" | halt_error
+        else .[] | select(.type == "operation_result"
+                          and .disposition == "failed"
+                          and .retryable != "no")
+             | {src, dst, kind} end' r.ndjson \
   | syq cp --mapping - -C src --to nas --into /data
 ```
 
-The second line is what an exit code cannot express: which entries
-failed, and whether a retry could help.
+The jq program first checks the stream's terminal record: a results
+file without one is from a run that did not finish (a crash, a kill),
+and a terminal status other than `success` or `partial` (an aborted
+run, say) means queued entries were never settled — in both cases
+entries may have no records at all, so a retry manifest built from
+what is there would look complete while it is not. With the
+terminal record present, the filter is what an exit code cannot
+express: which entries failed, and whether a retry could help.
