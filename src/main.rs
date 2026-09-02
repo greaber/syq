@@ -4,6 +4,8 @@ mod cli;
 mod conn;
 mod crypto;
 mod delegation;
+#[allow(dead_code)]
+mod descriptor_broker;
 mod direct;
 pub mod enrollment;
 mod fsops;
@@ -12,6 +14,7 @@ mod janky_cat;
 mod native_map;
 mod native_rm;
 mod persistence;
+mod private_broker;
 mod progress;
 mod proto;
 mod receipt;

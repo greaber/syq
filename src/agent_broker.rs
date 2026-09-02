@@ -7,23 +7,28 @@
 //! userauth request binds each signature to the destination host key and login
 //! user.
 
+use crate::private_broker::{
+    ConnectionRegistry, PrivateBroker, PrivateBrokerConfig, TrackedStream,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use signature::{Signer, Verifier};
 use ssh_agent_lib::proto::extension::{MessageExtension, SessionBind};
 use ssh_agent_lib::proto::{Extension, Identity, PublicCredential, Request, Response, SignRequest};
 use ssh_agent_lib::ssh_encoding::{Decode, Encode};
 use ssh_agent_lib::ssh_key::{public::KeyData, Algorithm, PrivateKey, PublicKey};
-use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::FileTypeExt;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+#[cfg(test)]
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -37,44 +42,6 @@ const MAX_SSH_CONFIG_BYTES: usize = 1024 * 1024;
 const SSH_AGENT_FAILURE: &[u8] = &[5];
 const SSH_AGENT_SUCCESS: &[u8] = &[6];
 const SSH_AGENT_EXTENSION_FAILURE: &[u8] = &[28];
-
-static SIGNAL_CLEANUP_PATHS: OnceLock<Arc<Mutex<HashSet<PathBuf>>>> = OnceLock::new();
-static SIGNAL_CLEANUP_THREAD: OnceLock<()> = OnceLock::new();
-
-fn register_signal_cleanup(path: &Path) -> Result<()> {
-    let paths = SIGNAL_CLEANUP_PATHS
-        .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
-        .clone();
-    if SIGNAL_CLEANUP_THREAD.get().is_none() {
-        let mut signals = signal_hook::iterator::Signals::new([
-            signal_hook::consts::SIGINT,
-            signal_hook::consts::SIGTERM,
-        ])
-        .context("register constrained-agent signal cleanup")?;
-        let cleanup_paths = paths.clone();
-        thread::Builder::new()
-            .name("syq-agent-signal-cleanup".into())
-            .spawn(move || {
-                if let Some(signal) = signals.forever().next() {
-                    let paths: Vec<_> = cleanup_paths.lock().unwrap().iter().cloned().collect();
-                    for path in paths {
-                        let _ = std::fs::remove_dir_all(path);
-                    }
-                    let _ = signal_hook::low_level::emulate_default_handler(signal);
-                }
-            })
-            .context("start constrained-agent signal cleanup")?;
-        let _ = SIGNAL_CLEANUP_THREAD.set(());
-    }
-    paths.lock().unwrap().insert(path.to_path_buf());
-    Ok(())
-}
-
-fn unregister_signal_cleanup(path: &Path) {
-    if let Some(paths) = SIGNAL_CLEANUP_PATHS.get() {
-        paths.lock().unwrap().remove(path);
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct HostPolicy {
@@ -778,18 +745,14 @@ fn parse_known_host_output(
 /// listener and workers, and removes the private socket directory.
 pub struct ConstrainedAgentBroker {
     ambient_socket: PathBuf,
-    socket_path: PathBuf,
-    shutdown: Arc<AtomicBool>,
-    connections: Arc<ConnectionRegistry>,
-    listener_thread: Option<JoinHandle<()>>,
-    _socket_dir: tempfile::TempDir,
+    broker: PrivateBroker,
 }
 
 impl std::fmt::Debug for ConstrainedAgentBroker {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ConstrainedAgentBroker")
-            .field("socket_path", &self.socket_path)
+            .field("socket_path", &self.broker.socket_path())
             .finish_non_exhaustive()
     }
 }
@@ -889,56 +852,31 @@ impl ConstrainedAgentBroker {
                 ambient_socket.display()
             );
         }
-        let socket_dir = tempfile::Builder::new()
-            .prefix("syq-agent-")
-            .tempdir()
-            .context("create private constrained-agent directory")?;
-        let socket_path = socket_dir.path().join("agent.sock");
-        validate_openssh_option_path(&socket_path, "temporary constrained-agent path")?;
-        let listener = UnixListener::bind(&socket_path)
-            .with_context(|| format!("bind constrained agent at {}", socket_path.display()))?;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        register_signal_cleanup(socket_dir.path())?;
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let connections = Arc::new(ConnectionRegistry::default());
-        let thread_shutdown = Arc::clone(&shutdown);
-        let thread_connections = Arc::clone(&connections);
         let backend = Arc::new(backend);
         let policy = Arc::new(policy);
-        let listener_thread = thread::Builder::new()
-            .name("syq-agent-listener".into())
-            .spawn(move || {
-                accept_connections(
-                    listener,
-                    backend,
-                    policy,
-                    max_connections,
-                    thread_shutdown,
-                    thread_connections,
-                )
-            });
-        let listener_thread = match listener_thread {
-            Ok(thread) => thread,
-            Err(error) => {
-                unregister_signal_cleanup(socket_dir.path());
-                return Err(error).context("start constrained-agent listener");
-            }
-        };
+        let broker = PrivateBroker::start(
+            PrivateBrokerConfig {
+                directory_prefix: "syq-agent-",
+                socket_name: "agent.sock",
+                listener_thread: "syq-agent-listener",
+                client_thread: "syq-agent-client",
+                max_connections,
+                io_timeout: BROKER_IO_TIMEOUT,
+            },
+            move |stream, connections| {
+                let _ = serve_client(stream, &backend, &policy, connections);
+            },
+        )?;
+        validate_openssh_option_path(broker.socket_path(), "temporary constrained-agent path")?;
 
         Ok(Self {
             ambient_socket,
-            socket_path,
-            shutdown,
-            connections,
-            listener_thread: Some(listener_thread),
-            _socket_dir: socket_dir,
+            broker,
         })
     }
 
     pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+        self.broker.socket_path()
     }
 
     pub fn ambient_socket(&self) -> &Path {
@@ -960,146 +898,6 @@ fn validate_openssh_option_path(path: &Path, label: &str) -> Result<()> {
         bail!("{label} contains characters that are unsafe in an OpenSSH command-line option");
     }
     Ok(())
-}
-
-impl Drop for ConstrainedAgentBroker {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-        self.connections.shutdown_all();
-        // Wake accept immediately instead of waiting for the nonblocking poll.
-        let _ = UnixStream::connect(&self.socket_path);
-        if let Some(listener) = self.listener_thread.take() {
-            let _ = listener.join();
-        }
-        unregister_signal_cleanup(self._socket_dir.path());
-    }
-}
-
-fn accept_connections(
-    listener: UnixListener,
-    backend: Arc<SigningBackend>,
-    policy: Arc<BrokerPolicy>,
-    max_connections: usize,
-    shutdown: Arc<AtomicBool>,
-    connections: Arc<ConnectionRegistry>,
-) {
-    let mut workers: Vec<JoinHandle<()>> = Vec::new();
-    while !shutdown.load(Ordering::Acquire) {
-        reap_workers(&mut workers);
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if workers.len() >= max_connections {
-                    let _ = stream.shutdown(Shutdown::Both);
-                    continue;
-                }
-                let Ok(stream) = connections.track(stream) else {
-                    continue;
-                };
-                let worker_backend = Arc::clone(&backend);
-                let worker_policy = Arc::clone(&policy);
-                let worker_connections = Arc::clone(&connections);
-                match thread::Builder::new()
-                    .name("syq-agent-client".into())
-                    .spawn(move || {
-                        let _ = serve_client(
-                            stream,
-                            &worker_backend,
-                            &worker_policy,
-                            worker_connections,
-                        );
-                    }) {
-                    Ok(worker) => workers.push(worker),
-                    Err(_) => continue,
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => break,
-        }
-    }
-    connections.shutdown_all();
-    for worker in workers {
-        let _ = worker.join();
-    }
-}
-
-fn reap_workers(workers: &mut Vec<JoinHandle<()>>) {
-    let mut index = 0;
-    while index < workers.len() {
-        if workers[index].is_finished() {
-            let worker = workers.swap_remove(index);
-            let _ = worker.join();
-        } else {
-            index += 1;
-        }
-    }
-}
-
-#[derive(Default)]
-struct ConnectionRegistry {
-    next_id: AtomicU64,
-    streams: Mutex<HashMap<u64, UnixStream>>,
-}
-
-impl ConnectionRegistry {
-    fn track(self: &Arc<Self>, stream: UnixStream) -> io::Result<TrackedStream> {
-        stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
-        let registered = stream.try_clone()?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id, registered);
-        Ok(TrackedStream {
-            stream,
-            id,
-            registry: Arc::clone(self),
-        })
-    }
-
-    fn shutdown_all(&self) {
-        let streams = self
-            .streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for stream in streams.values() {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-    }
-}
-
-struct TrackedStream {
-    stream: UnixStream,
-    id: u64,
-    registry: Arc<ConnectionRegistry>,
-}
-
-impl Drop for TrackedStream {
-    fn drop(&mut self) {
-        self.registry
-            .streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.id);
-    }
-}
-
-impl Read for TrackedStream {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buffer)
-    }
-}
-
-impl Write for TrackedStream {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
-    }
 }
 
 #[derive(Default)]
@@ -2628,26 +2426,12 @@ mod tests {
             clients.push(client);
         }
         let deadline = Instant::now() + Duration::from_secs(2);
-        while broker
-            .connections
-            .streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
-            < TEST_BROKER_CONNECTIONS
+        while broker.broker.active_connections() < TEST_BROKER_CONNECTIONS
             && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(
-            broker
-                .connections
-                .streams
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len(),
-            TEST_BROKER_CONNECTIONS
-        );
+        assert_eq!(broker.broker.active_connections(), TEST_BROKER_CONNECTIONS);
         let mut excess = UnixStream::connect(&path).unwrap();
         excess
             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -2668,16 +2452,10 @@ mod tests {
     #[test]
     fn tracked_broker_connections_have_bounded_io() {
         let (stream, _peer) = UnixStream::pair().unwrap();
-        let registry = Arc::new(ConnectionRegistry::default());
+        let registry = Arc::new(ConnectionRegistry::new(BROKER_IO_TIMEOUT));
         let tracked = registry.track(stream).unwrap();
-        assert_eq!(
-            tracked.stream.read_timeout().unwrap(),
-            Some(BROKER_IO_TIMEOUT)
-        );
-        assert_eq!(
-            tracked.stream.write_timeout().unwrap(),
-            Some(BROKER_IO_TIMEOUT)
-        );
+        assert_eq!(tracked.read_timeout().unwrap(), Some(BROKER_IO_TIMEOUT));
+        assert_eq!(tracked.write_timeout().unwrap(), Some(BROKER_IO_TIMEOUT));
     }
 
     #[test]
