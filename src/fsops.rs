@@ -1675,45 +1675,54 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
             target: link,
             condition,
             ..
-        } => {
-            if let Some(metadata) = observe_rooted_condition(target, *condition)? {
-                if *condition != TargetCondition::Any && !metadata.is_symlink() {
+        } => match observe_rooted_condition(target, *condition)? {
+            // A matched replacement swaps the new leaf in atomically, so a
+            // concurrent replacement of the observed object is refused
+            // rather than deleted.
+            Some(metadata) if *condition != TargetCondition::Any => {
+                if !metadata.is_symlink() {
                     bail!(
                         "target {} cannot change type under a matched condition",
                         target.label.display()
                     );
                 }
+                root.replace_symlink_if_same(path, link, metadata.dev, metadata.ino)
+            }
+            Some(metadata) => {
                 if metadata.is_dir() {
                     root.remove_directory(path)?;
                 } else {
                     root.unlink(path)?;
                 }
+                root.create_symlink(path, link)
             }
-            root.create_symlink(path, link)
-        }
+            None => root.create_symlink(path, link),
+        },
         Op::Mknod {
             mode,
             rdev,
             condition,
             ..
-        } => {
-            if let Some(metadata) = observe_rooted_condition(target, *condition)? {
-                if *condition != TargetCondition::Any
-                    && file_type_bits(metadata.mode) != file_type_bits(*mode)
-                {
+        } => match observe_rooted_condition(target, *condition)? {
+            Some(metadata) if *condition != TargetCondition::Any => {
+                if file_type_bits(metadata.mode) != file_type_bits(*mode) {
                     bail!(
                         "target {} cannot change type under a matched condition",
                         target.label.display()
                     );
                 }
+                root.replace_node_if_same(path, *mode, *rdev, metadata.dev, metadata.ino)
+            }
+            Some(metadata) => {
                 if metadata.is_dir() {
                     root.remove_directory(path)?;
                 } else {
                     root.unlink(path)?;
                 }
+                root.create_node(path, *mode, *rdev)
             }
-            root.create_node(path, *mode, *rdev)
-        }
+            None => root.create_node(path, *mode, *rdev),
+        },
         Op::SetMeta {
             meta,
             flags,
