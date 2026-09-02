@@ -9628,3 +9628,156 @@ fn native_cp_results_dry_and_live_directory_totals_agree() {
         assert_eq!(last["directories_created"], 1, "{mode}");
     }
 }
+
+#[test]
+fn native_cp_results_file_inside_endpoints_is_refused() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    write(&t.path("dst/keep.txt"), b"k");
+    // A results file inside the destination would be pruned as
+    // destination-only (or clobbered by a transfer).
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--prune",
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "dst/r.ndjson",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("refusing to write inside"), "{stderr}");
+    assert!(stderr.contains("destination"), "{stderr}");
+    assert!(!t.path("dst/r.ndjson").exists());
+    assert!(t.path("dst/keep.txt").exists());
+    // A results file inside a walked source would be truncated by its own
+    // creation and then copied mid-write.
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "src/f.txt",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("refusing to write inside"), "{stderr}");
+    assert!(stderr.contains("source"), "{stderr}");
+    assert_eq!(read(&t.path("src/f.txt")), b"data");
+}
+
+#[test]
+fn native_cp_results_non_tty_run_emits_progress_records() {
+    let t = Tmp::new();
+    write(&t.path("src/big.bin"), &vec![7u8; 64 * 1024]);
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--bwlimit",
+            "32",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let progress_records = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|v| v["type"] == "progress")
+        .count();
+    // ~2s at the rate limit: the ticker samples once immediately and then
+    // at least once more at the one-second throttle, TTY or not.
+    assert!(progress_records >= 2, "saw {progress_records}");
+}
+
+#[test]
+fn native_cp_mapping_cross_chunk_directory_upgrade_emits_one_trace() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    std::fs::create_dir(t.path("src/d")).unwrap();
+    std::fs::create_dir(t.path("src/xdir")).unwrap();
+    // Entry 1 synthesizes ancestor `x`; filler pushes the explicit `x`
+    // entry past the 4096-entry scan batch so the upgrade crosses chunks.
+    let mut manifest = entry_line("a.txt", "x/a.txt", Some("file"));
+    for i in 0..4095 {
+        manifest.push_str(&entry_line("d", &format!("d{i:04}"), Some("dir")));
+    }
+    manifest.push_str(&entry_line("xdir", "x", Some("dir")));
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "-C",
+            "src",
+            "--mapping",
+            "-",
+            "--into",
+            "dst",
+            "-n",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let x_traces = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|v| {
+            v["type"] == "trace" && v["action"] == "create_directory" && v["dst"]["value"] == "x"
+        })
+        .count();
+    assert_eq!(x_traces, 1);
+}
+
+#[test]
+fn native_cp_prune_fatal_failure_reports_deletion_aggregates() {
+    let t = Tmp::new();
+    write(&t.path("dst/keep.txt"), b"k");
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--prune",
+            "--src-src",
+            "missing",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    let terminal: serde_json::Value = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .unwrap();
+    assert_eq!(terminal["status"], "failed");
+    // The run record says prune: true, so the terminal record carries the
+    // deletion aggregates even on a fatal failure: zeros, because the run
+    // died before the deletion pass.
+    assert_eq!(terminal["deletions_planned"], 0);
+    assert_eq!(terminal["deletions_completed"], 0);
+    assert_eq!(terminal["deletions_blocked"], 0);
+}

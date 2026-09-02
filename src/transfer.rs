@@ -699,6 +699,32 @@ pub fn run(args: Args) -> Result<i32> {
                     .map_err(|error| anyhow::anyhow!("--results: {error}"))?;
             }
             let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
+            // Refuse a results file inside the transfer's own endpoints:
+            // creating it truncates whatever is there, a source walk would
+            // copy it mid-write, and --prune deletes it as destination-only.
+            // Mapping runs read only manifest-listed source paths, so only
+            // their destination containment is checked (the source base
+            // defaults to `.`, which would refuse every relative path).
+            let results_abs = lexical_absolute(std::path::Path::new(OsStr::from_bytes(results)))?;
+            for (index, location) in args.locations.iter().enumerate() {
+                if location.host.is_some() {
+                    continue;
+                }
+                let is_destination = args.locations.len() >= 2 && index + 1 == args.locations.len();
+                if !is_destination && args.native_mapping.is_some() {
+                    continue;
+                }
+                let root =
+                    lexical_absolute(std::path::Path::new(OsStr::from_bytes(&location.path)))?;
+                if results_abs.starts_with(&root) {
+                    bail!(
+                        "--results {}: refusing to write inside the transfer's {} {}; the run would copy, overwrite, or delete its own results file",
+                        path.display(),
+                        if is_destination { "destination" } else { "source" },
+                        std::path::Path::new(OsStr::from_bytes(&location.path)).display()
+                    );
+                }
+            }
             Box::new(std::io::BufWriter::new(
                 std::fs::File::create(&path)
                     .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?,
@@ -731,6 +757,7 @@ pub fn run(args: Args) -> Result<i32> {
         progress.set_results(writer);
     }
     let dry_run = args.dry_run;
+    let prune = args.delete;
     let outcome = run_transfer(args, Arc::clone(&progress));
     if outcome.is_err() {
         // The error text reaches stderr via main; the stream still gets its
@@ -751,9 +778,12 @@ pub fn run(args: Args) -> Result<i32> {
                 bytes_transferred: progress.bytes_done.load(Relaxed),
                 bytes_unchanged: progress.bytes_skipped.load(Relaxed),
                 elapsed_ms: progress.start.elapsed().as_millis() as u64,
-                deletions_planned: None,
-                deletions_completed: None,
-                deletions_blocked: None,
+                // What the deletion pass did before the run died; zeros
+                // mean it never got that far, and status "failed" already
+                // marks every aggregate here as pre-failure state.
+                deletions_planned: prune.then(|| progress.deletions_planned.load(Relaxed)),
+                deletions_completed: prune.then(|| progress.deletions_completed.load(Relaxed)),
+                deletions_blocked: prune.then(|| progress.deletions_blocked.load(Relaxed)),
             });
         }
     }
@@ -3896,22 +3926,28 @@ impl Planner<'_> {
                 for (p, _, e, destination) in &planned {
                     match destination {
                         None => {
-                            self.dry_run_changes.directories.insert(p.clone());
-                            if let Some(dst_rel) = strip_dst_root(p, dst_root) {
-                                self.emit_trace_with_src(
-                                    "create_directory",
-                                    dst_rel,
-                                    "dir",
-                                    None,
-                                    "destination_missing",
-                                    !self.implicit_dirs.contains(p),
-                                );
-                            }
-                            if opts.verbose > 0 {
-                                self.progress.println(&format!(
-                                    "create directory {} (destination missing)",
-                                    display_directory(p)
-                                ));
+                            // The insert doubles as a dedupe: an explicit
+                            // directory entry that upgrades a synthesized
+                            // ancestor from an earlier chunk plans the same
+                            // path again, and a live run's stat would filter
+                            // it while a dry run has nothing to stat.
+                            if self.dry_run_changes.directories.insert(p.clone()) {
+                                if let Some(dst_rel) = strip_dst_root(p, dst_root) {
+                                    self.emit_trace_with_src(
+                                        "create_directory",
+                                        dst_rel,
+                                        "dir",
+                                        None,
+                                        "destination_missing",
+                                        !self.implicit_dirs.contains(p),
+                                    );
+                                }
+                                if opts.verbose > 0 {
+                                    self.progress.println(&format!(
+                                        "create directory {} (destination missing)",
+                                        display_directory(p)
+                                    ));
+                                }
                             }
                         }
                         Some(d) if d.kind != Kind::Dir => {
@@ -5113,6 +5149,7 @@ impl Planner<'_> {
         let leaves = std::mem::take(&mut self.deletes.leaves);
         let dirs = std::mem::take(&mut self.deletes.dirs);
         let planned = leaves.len() as u64 + dirs.values().map(|v| v.len() as u64).sum::<u64>();
+        self.progress.deletions_planned.store(planned, Relaxed);
         if let Some(max) = opts.max_delete {
             if planned > max {
                 self.progress.eprintln(&format!(
@@ -5143,6 +5180,7 @@ impl Planner<'_> {
                     }
                 }
                 self.max_delete_hit = true;
+                self.progress.deletions_blocked.store(planned, Relaxed);
                 return Ok(0);
             }
         }
@@ -5155,6 +5193,7 @@ impl Planner<'_> {
                 if opts.dry_run {
                     for (p, rel, kind) in chunk {
                         n += 1;
+                        me.progress.deletions_completed.fetch_add(1, Relaxed);
                         if let Some(dst_rel) = strip_dst_root(p, &me.root_path) {
                             me.emit_trace("delete", dst_rel, kind, None, "destination_only");
                         }
@@ -5183,6 +5222,7 @@ impl Planner<'_> {
                     match err {
                         None => {
                             n += 1;
+                            me.progress.deletions_completed.fetch_add(1, Relaxed);
                             if opts.verbose > 0 {
                                 me.progress.println(&format!("deleting {rel}"));
                             }
@@ -6916,6 +6956,31 @@ struct QueuedLeafOp {
 
 /// The container-relative spelling of a full destination path; None for the
 /// container itself.
+/// Absolute lexical form: joined to the cwd with `.`/`..` folded, without
+/// touching the filesystem, so containment can be checked before anything
+/// is created.
+fn lexical_absolute(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    use std::path::Component;
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory")?
+            .join(path)
+    };
+    let mut out = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
 fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
     if path == dst_root {
         return None;

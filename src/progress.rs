@@ -39,6 +39,11 @@ pub struct Progress {
     pub scanned: AtomicU64,
     pub scan_done: AtomicBool,
     pub errors: AtomicU64,
+    /// --prune bookkeeping mirrored here so the fatal-error terminal record
+    /// can report what the deletion pass did before the run died.
+    pub deletions_planned: AtomicU64,
+    pub deletions_completed: AtomicU64,
+    pub deletions_blocked: AtomicU64,
     /// Workers currently allowed to take work (0 = fixed -j, not shown).
     pub active_workers: AtomicU64,
     pub start: Instant,
@@ -85,6 +90,9 @@ impl Progress {
             scanned: AtomicU64::new(0),
             scan_done: AtomicBool::new(false),
             errors: AtomicU64::new(0),
+            deletions_planned: AtomicU64::new(0),
+            deletions_completed: AtomicU64::new(0),
+            deletions_blocked: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             start: Instant::now(),
             workers: Mutex::new(vec![None; n_workers]),
@@ -334,7 +342,9 @@ impl Progress {
     }
 
     pub fn spawn_ticker(self: &Arc<Self>) -> Option<std::thread::JoinHandle<()>> {
-        if !self.enabled && !self.json {
+        // A results stream needs the ticker too: sampled progress records
+        // are emitted from render() even when stderr is not a terminal.
+        if !self.enabled && !self.json && self.results.get().is_none() {
             return None;
         }
         let p = self.clone();

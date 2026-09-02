@@ -1,15 +1,19 @@
 //! `--results`: an NDJSON stream of machine-readable operation outcomes for
-//! native cp. Automation schema version 0 — an explicitly unstable preview
-//! of the planned automation interface (`--output=ndjson` stays reserved for
-//! the stable contract). Human output is unchanged; records go to the named
-//! file, or to stdout with `-` (combine that with `-q`).
+//! native cp. Automation schema version 1: every record carries `schema`
+//! (`syq.automation`), `schema_version`, and a monotonic `seq`. Records go
+//! to the named file, or to stdout with `-`, which suppresses syq's own
+//! human stdout output so the stream stays parseable.
 //!
-//! Version-0 coverage: one `run` record first; one `operation_result` per
-//! settled mutation (file transfers, directory/symlink/special creation
-//! inside the target container) and per failed mapping entry; an `error`
-//! record for every counted error; exactly one terminal `result`. Unchanged
-//! and excluded entries are aggregated in the terminal record only, and
-//! metadata-only updates are not yet reported per operation.
+//! Version-1 coverage: one `run` record first (run id, mode, prune/mapping/
+//! dry-run flags, sanitized endpoints); sampled `progress` records; one
+//! `operation_result` per settled mutation (file transfers, directory/
+//! symlink/special creation inside the target container, `--prune`
+//! deletions) and per failed mapping entry, with `retryable` and
+//! `class`/`os_kind` where known; an `error` record for every counted
+//! error; `trace` records instead of operation results on dry runs; exactly
+//! one terminal `result` whose numbers also feed the human summary, so the
+//! two cannot disagree. Unchanged and excluded entries are aggregated in
+//! the terminal record only.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
