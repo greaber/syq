@@ -353,12 +353,18 @@ receiver, `cp` also accepts the receiver ceilings
 (`s`, `m`, or `h`; at most 23h). They are signed into the grant and enforced
 by hostB, and are refused anywhere else because nothing would enforce them.
 `cp` additionally accepts `--mapping` and `--results`
-(see [MAPPINGS.md](MAPPINGS.md)), but neither can be combined with `--prune`:
-mapping manifests define no deletion region, and the preview results schema
-does not yet represent deletions. `--max-delete` requires `--prune`; `rm`
-additionally accepts `--root` plus its endpoint-side removal semantics.
+(see [MAPPINGS.md](MAPPINGS.md)). For a direct remote-to-remote copy,
+`--results -` streams the remote coordinator's NDJSON back to the invoking
+terminal. A named results file requires `--run-at local`; direct remote
+coordinators reject it rather than creating a surprising remote file.
+`--results` is also rejected with `--detach`, because its stream would no
+longer remain attached. Neither `--mapping` nor `--results` can be combined
+with `--prune`: mapping manifests define no deletion region, and the preview
+results schema does not yet represent deletions. `--max-delete` requires
+`--prune`; `rm` additionally accepts `--root` plus its endpoint-side removal
+semantics.
 
-Native `cp` and `cp-prune` expose the remote runtime and transport controls
+Native `cp` exposes the remote runtime and transport controls
 directly: `--rsh COMMAND`, `--syq-path PATH`, `--no-bootstrap`, `--no-tcp`,
 `--tcp-plain`, `--tcp-ports LO-HI`, and Linux `--tcp-congestion ALGO`. An
 explicit `--rsh` is the complete SSH and agent policy and bypasses automatic

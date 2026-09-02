@@ -8264,6 +8264,167 @@ fn native_auto_raw_path_relay_rejects_direct_only_controls() {
 }
 
 #[test]
+fn native_remote_coordinator_streams_results_to_the_invoker() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"result stream");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--run-at",
+            "target",
+            "--as",
+            &t.s("dst"),
+            "--results",
+            "-",
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("stream target-coordinator results");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"result stream");
+    let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("results line is JSON"))
+        .collect();
+    assert_eq!(records.first().unwrap()["type"], "run");
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "success");
+    assert_eq!(terminal["exit_code"], 0);
+}
+
+#[test]
+fn native_named_results_require_a_local_coordinator() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"local results");
+
+    for placement in ["source", "target"] {
+        let destination = t.s(&format!("dst-{placement}"));
+        let results = t.s(&format!("results-{placement}.ndjson"));
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args([
+                "--from",
+                "hostA",
+                "--src",
+                &t.s("src"),
+                "--to",
+                "hostB",
+                "--run-at",
+                placement,
+                "--as",
+                &destination,
+                "--results",
+                &results,
+                "-q",
+            ])
+            .run()
+            .expect("reject a remote named results file");
+
+        assert!(!out.status.success(), "{placement} unexpectedly succeeded");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains("transfer coordinator"), "{stderr}");
+        assert!(stderr.contains("--results -"), "{stderr}");
+        assert!(stderr.contains("--run-at local"), "{stderr}");
+        assert!(!Path::new(&destination).exists());
+        assert!(!Path::new(&results).exists());
+    }
+
+    let results = t.s("results-local.ndjson");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--run-at",
+            "local",
+            "--as",
+            &t.s("dst-local"),
+            "--results",
+            &results,
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("write local-coordinator results");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst-local")), b"local results");
+    let terminal: serde_json::Value = fs::read_to_string(results)
+        .unwrap()
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "success");
+}
+
+#[test]
+fn native_detach_rejects_an_unattached_results_stream() {
+    let t = Tmp::new();
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--rsh",
+            "ssh",
+            "--detach",
+            "--from",
+            "hostA",
+            "--src",
+            "/source",
+            "--to",
+            "hostB",
+            "--as",
+            &t.s("dst"),
+            "--results",
+            "-",
+            "-q",
+        ])
+        .run()
+        .expect("reject detached streamed results");
+
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("result stream would not remain attached"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
 fn native_run_at_local_relays_between_remote_endpoints() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);

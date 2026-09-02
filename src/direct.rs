@@ -267,6 +267,15 @@ fn run_remote(
     source_operand_count: usize,
     coordinator_at_target: bool,
 ) -> Result<i32> {
+    match args.native_results.as_deref() {
+        Some(b"-") if args.detach => bail!(
+            "--results cannot be used with --detach because the remote result stream would not remain attached"
+        ),
+        Some(b"-") | None => {}
+        Some(_) => bail!(
+            "a remote transfer coordinator accepts only --results -; use --run-at local to create a named results file"
+        ),
+    }
     let rsh = parse_rsh(&args.rsh)?;
     let coordinator = if coordinator_at_target { dst } else { &srcs[0] };
     let peer = if coordinator_at_target { &srcs[0] } else { dst };
@@ -495,6 +504,13 @@ fn run_remote(
     }
     if let Some(n) = args.max_delete {
         remote.push(format!("--max-delete={n}"));
+    }
+    if args.native_results.is_some() {
+        // run_remote accepts only stdout above. The outer SSH process inherits
+        // stdout, so the NDJSON stream and its terminal record reach the
+        // original caller without assigning surprising remote path semantics.
+        remote.push("--results".into());
+        remote.push("-".into());
     }
     if args.no_bootstrap {
         remote.push("--no-bootstrap".into());

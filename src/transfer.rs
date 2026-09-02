@@ -736,6 +736,13 @@ pub fn run(args: Args) -> Result<i32> {
         .iter()
         .chain(std::iter::once(dst))
         .all(|location| std::str::from_utf8(&location.path).is_ok());
+    let coordinator_is_remote = original_srcs[0].is_remote()
+        && dst.is_remote()
+        && !args.relay
+        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
+        && (args.interface == Interface::Rsync
+            || args.run_at != RunAt::Auto
+            || direct_paths_are_utf8);
     let direct_remote_to_remote = original_srcs[0].is_remote()
         && dst.is_remote()
         && !original_srcs[0].same_host(dst)
@@ -751,6 +758,21 @@ pub fn run(args: Args) -> Result<i32> {
     {
         bail!(
             "--detach, --no-forward-agent, and --agent-broker-only apply only to a direct copy between two different remote endpoints"
+        );
+    }
+    if args.detach && args.native_results.is_some() {
+        bail!(
+            "--results cannot be used with --detach because the remote result stream would not remain attached"
+        );
+    }
+    if args
+        .native_results
+        .as_deref()
+        .is_some_and(|results| results != b"-")
+        && coordinator_is_remote
+    {
+        bail!(
+            "--results FILE is written by the transfer coordinator, which is remote for this copy; use --results - to stream NDJSON here or --run-at local to create a local file"
         );
     }
     if args.restricted_grant.is_some()
