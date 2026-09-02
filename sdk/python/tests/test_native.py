@@ -15,7 +15,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 
 args = sys.argv[1:]
 marker = os.environ.get("SYQ_FAKE_DESCENDANT")
@@ -40,46 +39,57 @@ if command == "map":
     }))
     raise SystemExit(int(os.environ.get("SYQ_FAKE_EXIT", "0")))
 
-mode = command
 dry_run = "--dry-run" in args
-run_id = "fake-run"
+prune = "--prune" in args
 records = [{
-    "schema": "syq.automation", "schema_version": 1,
-    "run_id": run_id, "seq": 0, "elapsed_ms": 0,
-    "type": "run", "syq_version": "9.8.7", "mode": mode,
+    "schema": "syq.automation", "schema_version": 1, "seq": 0,
+    "type": "run", "run_id": "fake-run", "started_at": 123,
+    "syq_version": "9.8.7", "mode": "cp", "prune": prune,
     "dry_run": dry_run, "mapping": "--mapping" in args,
+    "endpoints": [
+        {"role": "source", "kind": "local"},
+        {"role": "destination", "kind": "ssh", "host": "target", "user": "u"},
+    ],
+}, {
+    "schema": "syq.automation", "schema_version": 1, "seq": 1,
+    "type": "progress", "bytes_done": 0, "bytes_total": 3,
+    "bytes_unchanged": 0, "files_done": 0, "files_total": 1,
+    "files_unchanged": 0, "files_excluded": 0, "scanned": 1,
+    "scan_done": True, "elapsed_ms": 1,
 }]
 if os.environ.get("SYQ_FAKE_SHAPE") != "empty":
-    records.append({
-        "schema": "syq.automation", "schema_version": 1,
-        "run_id": run_id, "seq": 1, "elapsed_ms": 1,
-        "type": "operation_result",
-        "action": "remove" if command == "rm" else "transfer_file",
-        "dst": {"encoding": "utf-8", "value": "a.txt", "display": "a.txt"},
-        "kind": "unknown" if command == "rm" else "file",
-        "disposition": "planned" if dry_run else "succeeded",
-        "bytes": 3 if command != "rm" else 0,
-    })
+    if dry_run:
+        records.append({
+            "schema": "syq.automation", "schema_version": 1, "seq": 2,
+            "type": "trace", "action": "transfer_file",
+            "dst": {"encoding": "utf-8", "value": "a.txt"},
+            "kind": "file", "reason": "destination_missing", "bytes": 3,
+        })
+    else:
+        records.append({
+            "schema": "syq.automation", "schema_version": 1, "seq": 2,
+            "type": "operation_result", "action": "transfer_file",
+            "dst": {"encoding": "utf-8", "value": "a.txt"},
+            "kind": "file", "disposition": "succeeded", "bytes": 3,
+            "attempts": 1,
+        })
 status = os.environ.get("SYQ_FAKE_STATUS", "success")
 exit_code = 0 if status == "success" else 23
-seq = len(records)
 records.append({
-    "schema": "syq.automation", "schema_version": 1,
-    "run_id": run_id, "seq": seq, "elapsed_ms": 2,
+    "schema": "syq.automation", "schema_version": 1, "seq": len(records),
     "type": "result", "status": status, "exit_code": exit_code,
-    "files_planned": 0 if command == "rm" else 1,
-    "files_completed": 0 if dry_run or command == "rm" else 1,
-    "files_unchanged": 0, "files_excluded": 0,
-    "directories_planned": 0, "directories_completed": 0,
-    "symlinks_planned": 0, "symlinks_completed": 0,
-    "specials_planned": 0, "specials_completed": 0,
-    "deletions_planned": 1 if command == "rm" else 0,
-    "deletions_completed": 1 if command == "rm" and not dry_run else 0,
-    "deletions_blocked": False, "errors": 0 if status == "success" else 1,
-    "bytes_planned": 0 if command == "rm" else 3,
-    "bytes_completed": 0 if dry_run or command == "rm" else 3,
-    "bytes_unchanged": 0,
+    "dry_run": dry_run, "files_transferred": 1, "files_unchanged": 0,
+    "files_excluded": 0, "directories_created": 0, "symlinks_created": 0,
+    "specials_created": 0, "errors": 0 if status == "success" else 1,
+    "bytes_transferred": 0 if dry_run else 3, "bytes_unchanged": 0,
+    "elapsed_ms": 2,
 })
+if prune:
+    records[-1].update({
+        "deletions_planned": 1,
+        "deletions_completed": 0 if dry_run else 1,
+        "deletions_blocked": 0,
+    })
 shape = os.environ.get("SYQ_FAKE_SHAPE")
 if shape == "bad-schema":
     records[0]["schema_version"] = 99
@@ -87,6 +97,25 @@ elif shape == "gap":
     records[-1]["seq"] += 1
 elif shape == "truncated":
     records.pop()
+elif shape == "partial-deletions":
+    records[-1].pop("deletions_completed")
+elif shape == "oversized-integer":
+    records[-1]["files_transferred"] = 1 << 64
+elif shape == "failed-operation":
+    records[-2].update({
+        "disposition": "failed", "retryable": "yes", "class": "io",
+        "os_kind": "permission_denied", "message": "denied",
+    })
+elif shape == "unknown-event":
+    records.insert(-1, {
+        "schema": "syq.automation", "schema_version": 1,
+        "seq": records[-1]["seq"], "type": "future_addition", "value": 1,
+    })
+    records[-1]["seq"] += 1
+elif shape == "oversized-line":
+    sys.stdout.buffer.write(b"x" * (16 * 1024 * 1024 + 1))
+    sys.stdout.buffer.flush()
+    raise SystemExit(0)
 for record in records:
     print(json.dumps(record), flush=True)
 raise SystemExit(exit_code)
@@ -110,7 +139,7 @@ class NativeClientTests(unittest.TestCase):
     def argv(self) -> list[str]:
         return json.loads(self.argv_log.read_text(encoding="utf-8"))
 
-    def test_cp_uses_native_names_and_streams_typed_events(self) -> None:
+    def test_cp_uses_native_names_and_streams_v1_trace_events(self) -> None:
         events: list[syq.AutomationEvent] = []
         result = self.client.cp(
             src=["a", "b"],
@@ -119,6 +148,8 @@ class NativeClientTests(unittest.TestCase):
             follow=True,
             to="target",
             into_existing="out",
+            prune=True,
+            max_delete=10,
             dry_run=True,
             hash=True,
             no_compress=True,
@@ -139,40 +170,39 @@ class NativeClientTests(unittest.TestCase):
 
         self.assertIsInstance(result, syq.CpResult)
         self.assertTrue(result.dry_run)
-        self.assertEqual(result.files_planned, 1)
-        self.assertEqual(result.files_completed, 0)
+        self.assertEqual(result.files_transferred, 1)
+        self.assertEqual(result.deletions_planned, 1)
+        self.assertEqual(result.deletions_completed, 0)
         self.assertIs(events[-1], result)
-        operation = next(
-            event for event in events if isinstance(event, syq.OperationResult)
-        )
-        self.assertEqual(operation.disposition, syq.Disposition.PLANNED)
+        run = next(event for event in events if isinstance(event, syq.RunEvent))
+        self.assertTrue(run.prune)
+        self.assertEqual(run.endpoints[1].kind, syq.EndpointKind.SSH)
+        self.assertTrue(any(isinstance(event, syq.ProgressEvent) for event in events))
+        trace = next(event for event in events if isinstance(event, syq.TraceEvent))
+        self.assertEqual(trace.action, syq.OperationAction.TRANSFER_FILE)
+        self.assertEqual(trace.reason, syq.TraceReason.DESTINATION_MISSING)
         argv = self.argv()
         for expected in (
             "cp", "--src", "--src-dir", "--from", "--follow", "--to",
-            "--into-existing", "--dry-run", "--hash", "--no-compress",
-            "--bwlimit", "--connections", "--reuse-connection", "--max-entries",
-            "--max-total-bytes", "--max-runtime", "--ignore", "--ignore-from",
-            "--preserve", "--inplace", "--max-size", "--min-size",
-            "--results=-", "--quiet",
+            "--into-existing", "--prune", "--max-delete", "--dry-run",
+            "--hash", "--no-compress", "--bwlimit", "--connections",
+            "--reuse-connection", "--max-entries", "--max-total-bytes",
+            "--max-runtime", "--ignore", "--ignore-from", "--preserve",
+            "--inplace", "--max-size", "--min-size", "--results=-",
         ):
             self.assertIn(expected, argv)
+        self.assertNotIn("--quiet", argv)
         self.assertEqual(argv.count("--src"), 2)
 
-    def test_cp_prune_and_rm_have_command_specific_results(self) -> None:
-        prune = self.client.cp_prune(
-            src_src="source", into="target", max_delete=10
+    def test_live_cp_returns_operation_results(self) -> None:
+        events: list[syq.AutomationEvent] = []
+        result = self.client.cp("source", into="target", on_event=events.append)
+        self.assertEqual(result.files_transferred, 1)
+        operation = next(
+            event for event in events if isinstance(event, syq.OperationResult)
         )
-        self.assertIsInstance(prune, syq.CpPruneResult)
-        self.assertEqual(self.argv()[0], "cp-prune")
-        self.assertIn("--max-delete", self.argv())
-
-        removal = self.client.rm(
-            src_dir=["a", "b"], root="safe", follow=True, dry_run=True
-        )
-        self.assertIsInstance(removal, syq.RmResult)
-        self.assertEqual(removal.deletions_planned, 1)
-        self.assertIn("--root", self.argv())
-        self.assertIn("--follow", self.argv())
+        self.assertEqual(operation.disposition, syq.Disposition.SUCCEEDED)
+        self.assertEqual(operation.kind, syq.EntryKind.FILE)
 
     def test_non_success_result_raises_or_can_be_returned(self) -> None:
         env = {**self.env, "SYQ_FAKE_STATUS": "partial"}
@@ -183,6 +213,23 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.stderr, b"")
         result = client.cp("source", into="target", check=False)
         self.assertEqual(result.exit_code, 23)
+
+    def test_failure_metadata_uses_mechanical_python_field_names(self) -> None:
+        events: list[syq.AutomationEvent] = []
+        client = syq.Client(
+            executable=self.executable,
+            env={
+                **self.env,
+                "SYQ_FAKE_STATUS": "partial",
+                "SYQ_FAKE_SHAPE": "failed-operation",
+            },
+        )
+        client.cp("source", into="target", check=False, on_event=events.append)
+        operation = next(
+            event for event in events if isinstance(event, syq.OperationResult)
+        )
+        self.assertIs(operation.class_, syq.ErrorClass.IO)
+        self.assertIs(operation.os_kind, syq.OsKind.PERMISSION_DENIED)
 
     def test_protocol_rejects_unsupported_incomplete_and_gapped_streams(self) -> None:
         for shape, message in (
@@ -197,6 +244,28 @@ class NativeClientTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(syq.SyqProtocolError, message):
                     client.cp("source", into="target")
+
+    def test_protocol_ignores_additive_record_types(self) -> None:
+        client = syq.Client(
+            executable=self.executable,
+            env={**self.env, "SYQ_FAKE_SHAPE": "unknown-event"},
+        )
+        self.assertEqual(client.cp("source", into="target").exit_code, 0)
+
+    def test_protocol_enforces_prune_totals_and_machine_value_bounds(self) -> None:
+        cases = (
+            ("partial-deletions", True, "every deletion total"),
+            ("oversized-integer", False, "unsigned 64-bit range"),
+            ("oversized-line", False, "larger than 16 MiB"),
+        )
+        for shape, prune, message in cases:
+            with self.subTest(shape=shape):
+                client = syq.Client(
+                    executable=self.executable,
+                    env={**self.env, "SYQ_FAKE_SHAPE": shape},
+                )
+                with self.assertRaisesRegex(syq.SyqProtocolError, message):
+                    client.cp("source", into="target", prune=prune)
 
     def test_mapping_is_complete_before_the_copy_starts(self) -> None:
         self.argv_log.unlink(missing_ok=True)
@@ -229,8 +298,10 @@ class NativeClientTests(unittest.TestCase):
     def test_structural_validation_happens_before_launch(self) -> None:
         with self.assertRaisesRegex(syq.SyqInvocationError, "exactly one"):
             self.client.cp("source")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "requires --prune"):
+            self.client.cp("source", into="target", max_delete=1)
         with self.assertRaisesRegex(syq.SyqInvocationError, "conflicts"):
-            self.client.rm("source", cwd="a", root="b")
+            self.client.cp(mapping="manifest", into="target", prune=True)
         with self.assertRaisesRegex(syq.SyqInvocationError, "ordinary source"):
             self.client.cp("a", "b", as_="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "ordinary source"):

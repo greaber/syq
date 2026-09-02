@@ -8,10 +8,11 @@ The JavaScript and Go previews currently expose two operations:
 - run the `syq` executable with an argument array, never through a shell;
 - query and validate `syq --version`.
 
-The Python package also implements typed `cp`, `cp_prune`, `rm`, and `map`
-against syq's versioned NDJSON automation interface. The executable remains
-authoritative for argument semantics, filesystem behavior, exit status, and
-safety checks.
+The Python package also implements typed `cp` (including `prune=True`) and
+`map` against syq's versioned machine interfaces. Commands without an
+automation result stream, currently including `rm`, remain available through
+raw `run`. The executable remains authoritative for argument semantics,
+filesystem behavior, exit status, and safety checks.
 
 The Python-native surface is documented in
 [`python/NATIVE_API.md`](python/NATIVE_API.md).

@@ -1,131 +1,138 @@
-# Automation interface v1
+# Automation schema v1
 
-The native mutating commands expose one machine-readable results contract:
+`syq cp [--prune] ... --results FILE|-` emits a versioned NDJSON event
+stream. This is the stable machine-readable output consumed by the Python SDK
+and other automation. `syq map` uses a separate, bare mapping-manifest format;
+`syq rm` does not yet expose automation-v1 results.
 
-```sh
-syq cp ... --results=- --quiet
-syq cp-prune ... --results=run.ndjson
-syq rm ... --results=run.ndjson
-```
-
-`--results` is newline-delimited JSON (NDJSON). It is independent of human
-stdout/stderr and of `--progress-json`. Use `--quiet` when writing results to
-stdout so stdout contains only records. `syq map` already owns stdout as its
-mapping stream and does not accept `--results`.
-
-Version 1 deliberately uses the same record types for live and dry runs. A
-consumer can switch `--dry-run` without changing its decoder: operation
-records have `disposition: "planned"` in a dry run and `"succeeded"` or
-`"failed"` in a live run, while terminal aggregates separate planned and
-completed work.
-
-## Stream invariants
+With a named file, normal human output remains available. With `--results -`,
+the event stream owns stdout and syq suppresses human stdout automatically.
+Stderr remains diagnostic text and is not part of the protocol.
 
 Every record contains:
 
-- `schema: "syq.automation"` and `schema_version: 1`;
-- one nonempty `run_id`, unchanged throughout the stream;
-- `seq`, beginning at zero and increasing by exactly one; and
-- nonnegative `elapsed_ms`, measured from creation of the results writer.
-
-A normally completed stream begins with exactly one `run` record and ends
-with exactly one `result` record. Nothing follows `result`. Consumers must
-also reap syq and require the `result.exit_code` to equal the process status.
-EOF without a terminal result is incomplete even when the process exited zero;
-this detects crashes, kills, output failures, and incompatible executables.
-
-CLI or connection failures that happen before the results writer can start do
-not produce a stream. The process status and stderr remain authoritative for
-that case.
-
-For a direct remote-to-remote copy, use `--results=-`; named results files are
-refused because the copy orchestrator runs on the source host. The stdout
-stream is forwarded to the invoking host and is what the Python client uses.
-
-Within schema version 1, producers may add fields to existing records.
-Consumers must ignore fields they do not use. New record types, required
-fields, enum values, or changed meanings require another schema version.
-
-## Paths
-
-Paths are lossless tagged objects:
-
 ```json
-{"encoding":"utf-8","value":"dir/file","display":"dir/file"}
-{"encoding":"base64","value":"cmF3Lf8=","display":"raw-�"}
+{"schema":"syq.automation","schema_version":1,"seq":0,"type":"run"}
 ```
 
-`value` is either Unicode text or standard padded base64 of the raw Unix path
-bytes. `display` is diagnostic only and must never be used to reconstruct a
-path. Copy operation paths are relative to the destination placement root.
-Removal paths use the endpoint-resolved spelling reported by `syq rm`.
+`seq` starts at zero and increases by one in stream order. A complete stream
+starts with exactly one `run` record and ends with exactly one `result` record.
+EOF without a terminal result means the outcome is unknown, even when the
+process exits successfully or every preceding operation appeared successful.
 
 ## Records
 
 ### `run`
 
-The first record adds:
+The first record identifies the invocation:
 
-- `syq_version`;
-- `mode`: `cp`, `cp-prune`, or `rm`;
-- `dry_run`: whether mutations were suppressed; and
-- `mapping`: whether `cp` consumed a mapping manifest.
+- `run_id`: opaque run identifier;
+- `started_at`: Unix time in seconds;
+- `syq_version` and `mode` (`cp`);
+- `prune`, `mapping`, and `dry_run` booleans; and
+- `endpoints`: sanitized source and destination identities with `role`, `kind`
+  (`local` or `ssh`), and optional `host` and `user`.
+
+Credentials and raw remote-shell arguments never appear in endpoint records.
+The run id and wall-clock start time appear only here, not on every event.
+
+### `progress`
+
+Sampled, lossy telemetry contains `bytes_done`, `bytes_total`,
+`bytes_unchanged`, `files_done`, `files_total`, `files_unchanged`,
+`files_excluded`, `scanned`, `scan_done`, and `elapsed_ms`. Final results are
+not computed from progress samples.
+
+### `trace`
+
+Dry runs emit one trace for each intended mutation. A trace contains `action`,
+`dst`, optional `src`, `kind`, optional `bytes`, and `reason`. Reasons are:
+
+- `destination_missing`
+- `type_differs`
+- `content_differs`
+- `metadata_differs`
+- `destination_only` for a planned `--prune` deletion
+
+Dry runs do not emit `operation_result` records. A trace describes the state
+observed during that run; it is not a transaction or precondition for a later
+copy.
 
 ### `operation_result`
 
-An operation record contains `action`, `dst`, `kind`, and `disposition`.
-Depending on the operation it may also contain `src`, `bytes`, `attempts`,
-`retryable` (`yes`, `no`, or `unknown`), and `message`.
+Live runs emit settled mutations and failed mapping entries. Fields are
+`action`, `dst`, optional `src`, `kind`, and `disposition`. Optional fields are
+`bytes`, `attempts`, and, on failures, `retryable`, `class`, `os_kind`, and
+`message`.
 
-Version 1 reports file transfers, directory/symlink/special creation, and
-removals. Unchanged objects, policy exclusions, and metadata-only updates are
-aggregate-only. Failed mapping operations carry `src`, `dst`, and `kind` when
-that identity is sufficient to construct a retry mapping entry. The stream is
-observation, not automatic retry authorization.
+Actions are `transfer_file`, `create_directory`, `create_symlink`,
+`create_special`, and `delete`. Dispositions are `succeeded`, `failed`, and
+`blocked`. Retryability is `yes`, `no`, or `unknown`.
 
-### `warning` and `error`
+### `error`
 
-A warning contains a stable `code`, aggregate `count`, and `message`. An error
-contains `class`, `retryable`, and `message`. Human stderr may contain more
-diagnostic context; consumers must not parse it as a substitute for these
-fields.
+Each counted error has a human-readable `message` and may have a structured
+`class` and `os_kind`. Error classes are `io`, `transport`, `conflict`,
+`integrity`, `safety_limit`, `usage`, and `internal`. Local OS kinds are
+`not_found`, `permission_denied`, `already_exists`, `invalid_input`,
+`no_space`, `read_only`, and `other`.
+
+Messages are diagnostic presentation, never parsing contracts.
 
 ### `result`
 
-The terminal record contains `status` (`success`, `partial`, `refused`, or
-`failed`), `exit_code`, and these aggregates:
+The terminal record is authoritative and flushed immediately. It contains:
 
-```text
-files_planned                 files_completed
-files_unchanged               files_excluded
-directories_planned           directories_completed
-symlinks_planned              symlinks_completed
-specials_planned              specials_completed
-deletions_planned             deletions_completed
-deletions_blocked             errors
-bytes_planned                 bytes_completed
-bytes_unchanged
+- `status`: `success`, `partial`, `refused`, `aborted`, or `failed`;
+- `exit_code` and `dry_run`;
+- `files_transferred`, `files_unchanged`, and `files_excluded`;
+- `directories_created`, `symlinks_created`, and `specials_created`;
+- `errors`, `bytes_transferred`, `bytes_unchanged`, and `elapsed_ms`; and
+- on `--prune` runs, `deletions_planned`, `deletions_completed`, and
+  `deletions_blocked`.
+
+Dry and live calls use the same terminal result shape. During a dry run, the
+mutation counts describe the work syq would perform; no mutation is committed.
+The human summary is rendered from the same result structure.
+
+Exit status and terminal status agree as follows:
+
+| Exit | Status | Meaning |
+|---:|---|---|
+| 0 | `success` | Everything requested settled successfully |
+| 1 | `failed` or `aborted` | Fatal setup, transport, or scheduler failure |
+| 2 | no stream | Argument or usage error |
+| 23 | `partial` | Some entries failed and the rest settled |
+| 25 | `refused` | A safety guard refused the operation |
+
+## Paths and integers
+
+Paths are lossless tagged objects:
+
+```json
+{"encoding":"utf-8","value":"dir/file"}
+{"encoding":"base64","value":"cmF3Lf8="}
 ```
 
-Completed counts never exceed their corresponding planned counts. All
-completed mutation counts are zero in a dry run. `success` has exit code zero;
-other statuses have a nonzero exit code. `partial` means some work failed but
-the command settled its queue, `refused` means a policy such as `--max-delete`
-prevented a planned phase, and `failed` means the run aborted.
+There is no protocol `display` field. Consumers may decode a path lossily for
+display without changing its byte identity. Counts and byte values are
+non-negative integers in the unsigned 64-bit range.
 
-## SDK conformance
+## Consumer requirements
 
-The Python client validates the full envelope, path encoding, known record and
-enum values, dry/live dispositions, aggregate relationships, terminal
-presence, and process-status agreement. It delivers records incrementally to
-`on_event` without retaining an unbounded operation ledger.
+A v1 consumer must validate the schema major, sequence, first and terminal
+records, required fields, path encodings, stable enum values, and agreement
+between terminal and process status. It must ignore unknown record types and
+unknown optional fields so additions remain compatible. It must fail closed on
+an unknown schema major, terminal status, or path encoding.
 
-The native option inventory in `sdk/python/native-api.json` is checked against
-the Rust command definitions. A native change must classify each new option as
-implemented by Python, SDK-internal, a CLI-only alias/presentation control, or
-`follow_up`. Ordinary feature work may use `follow_up`; the release workflow
-refuses to publish syq while any such entry remains. After the change reaches
-`master`, the Python API synchronization workflow creates or updates a tracking
-issue and closes it once the inventory is synchronized. Candidate tests then
-run the typed Python `cp`, `cp-prune`, `rm`, and `map` paths against the exact
-syq binary that CI built.
+Operation records need not be retained in memory. Consumers can stream them to
+a ledger or callback and retain only the terminal result. A retry manifest is
+safe to derive only after receiving a terminal result that says all queued
+operations settled; an incomplete stream may omit operations the caller never
+saw.
+
+Within schema version 1, required fields do not change type or meaning and
+existing record types, actions, dispositions, statuses, classes, reasons, and
+path encodings are not renamed or reused. New record types and optional fields
+may be added.

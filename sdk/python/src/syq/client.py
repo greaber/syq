@@ -24,12 +24,10 @@ from .errors import (
 )
 from .models import (
     AutomationEvent,
-    CpPruneResult,
     CpResult,
     MappingEntry,
     OperationStatus,
     OperationSummary,
-    RmResult,
     _mapping_json,
 )
 from .protocol import AutomationDecoder, parse_mapping_line
@@ -38,6 +36,7 @@ from .protocol import AutomationDecoder, parse_mapping_line
 PathArgument = str | bytes | os.PathLike[str] | os.PathLike[bytes]
 Argument = str | bytes
 Selector = PathArgument | Iterable[PathArgument]
+_MAX_STREAM_LINE_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,11 +185,19 @@ class _LineProcess:
         while True:
             newline = self._buffer.find(b"\n")
             if newline >= 0:
+                if newline > _MAX_STREAM_LINE_BYTES:
+                    raise SyqProtocolError(
+                        "syq emitted a machine-output line larger than 16 MiB"
+                    )
                 line = bytes(self._buffer[:newline])
                 del self._buffer[: newline + 1]
                 return line
             if self._eof:
                 if self._buffer:
+                    if len(self._buffer) > _MAX_STREAM_LINE_BYTES:
+                        raise SyqProtocolError(
+                            "syq emitted a machine-output line larger than 16 MiB"
+                        )
                     line = bytes(self._buffer)
                     self._buffer.clear()
                     return line
@@ -201,6 +208,13 @@ class _LineProcess:
             chunk = os.read(self._stdout.fileno(), 64 * 1024)
             if chunk:
                 self._buffer.extend(chunk)
+                if (
+                    len(self._buffer) > _MAX_STREAM_LINE_BYTES
+                    and b"\n" not in self._buffer
+                ):
+                    raise SyqProtocolError(
+                        "syq emitted a machine-output line larger than 16 MiB"
+                    )
             else:
                 self._eof = True
 
@@ -303,6 +317,7 @@ def _copy_arguments(
     as_: PathArgument | None,
     as_new: PathArgument | None,
     as_existing: PathArgument | None,
+    prune: bool,
     dry_run: bool,
     hash: bool,
     no_compress: bool,
@@ -372,6 +387,8 @@ def _copy_arguments(
                 "--as, --as-new, and --as-existing require exactly one "
                 "ordinary source object"
             )
+    if prune:
+        argv.append("--prune")
     if dry_run:
         argv.append("--dry-run")
     if hash:
@@ -410,6 +427,8 @@ def _copy_arguments(
     _append_text(argv, "--min-size", min_size)
     max_delete = _nonnegative_integer(max_delete, option="--max-delete")
     if max_delete is not None:
+        if not prune:
+            raise SyqInvocationError("--max-delete requires --prune")
         argv.extend(("--max-delete", str(max_delete)))
     return argv, source_count
 
@@ -520,12 +539,14 @@ class Client:
         self,
         argv: list[Argument],
         *,
-        mode: str,
+        prune: bool,
+        mapping: bool,
+        dry_run: bool,
         on_event: Callable[[AutomationEvent], object] | None,
         timeout: float | None,
         check: bool,
     ) -> OperationSummary:
-        argv.extend(("--results=-", "--quiet"))
+        argv.append("--results=-")
         command = (self._executable_value(), *argv)
         process = _LineProcess(
             command,
@@ -533,14 +554,18 @@ class Client:
             env=self.env,
             timeout=self.timeout if timeout is None else timeout,
         )
-        decoder = AutomationDecoder(mode)
+        decoder = AutomationDecoder(
+            prune=prune,
+            mapping=mapping,
+            dry_run=dry_run,
+        )
         try:
             while True:
                 line = process.next_line()
                 if line is None:
                     break
                 event = decoder.feed(line)
-                if on_event is not None:
+                if event is not None and on_event is not None:
                     on_event(event)
             returncode = process.finish()
             result = decoder.finish(returncode)
@@ -572,6 +597,7 @@ class Client:
         as_new: PathArgument | None = None,
         as_existing: PathArgument | None = None,
         mapping: PathArgument | Iterable[MappingEntry] | None = None,
+        prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
         no_compress: bool = False,
@@ -587,6 +613,7 @@ class Client:
         inplace: bool = False,
         max_size: str | int | None = None,
         min_size: str | int | None = None,
+        max_delete: int | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
         timeout: float | None = None,
         check: bool = True,
@@ -608,6 +635,7 @@ class Client:
             as_=as_,
             as_new=as_new,
             as_existing=as_existing,
+            prune=prune,
             dry_run=dry_run,
             hash=hash,
             no_compress=no_compress,
@@ -623,13 +651,21 @@ class Client:
             inplace=inplace,
             max_size=max_size,
             min_size=min_size,
-            max_delete=None,
+            max_delete=max_delete,
         )
+        if mapping is not None and prune:
+            raise SyqInvocationError("--mapping conflicts with --prune")
         if mapping is None:
             if source_count == 0:
                 raise SyqInvocationError("syq cp needs a source selector or mapping")
             return self._typed(
-                argv, mode="cp", on_event=on_event, timeout=timeout, check=check
+                argv,
+                prune=prune,
+                mapping=False,
+                dry_run=dry_run,
+                on_event=on_event,
+                timeout=timeout,
+                check=check,
             )
         if source_count:
             raise SyqInvocationError("--mapping replaces source selectors")
@@ -638,7 +674,13 @@ class Client:
         if isinstance(mapping, (str, bytes, os.PathLike)):
             argv.extend(("--mapping", _argument(mapping, label="mapping")))
             return self._typed(
-                argv, mode="cp", on_event=on_event, timeout=timeout, check=check
+                argv,
+                prune=False,
+                mapping=True,
+                dry_run=dry_run,
+                on_event=on_event,
+                timeout=timeout,
+                check=check,
             )
         with tempfile.NamedTemporaryFile(
             mode="wb", prefix="syq-python-mapping-", suffix=".ndjson"
@@ -657,135 +699,14 @@ class Client:
             manifest.flush()
             argv.extend(("--mapping", manifest.name))
             return self._typed(
-                argv, mode="cp", on_event=on_event, timeout=timeout, check=check
+                argv,
+                prune=False,
+                mapping=True,
+                dry_run=dry_run,
+                on_event=on_event,
+                timeout=timeout,
+                check=check,
             )
-
-    def cp_prune(
-        self,
-        *sources: PathArgument,
-        src: Selector | None = None,
-        src_src: Selector | None = None,
-        src_file: Selector | None = None,
-        src_dir: Selector | None = None,
-        from_: str | None = None,
-        cwd: PathArgument | None = None,
-        follow: bool = False,
-        to: str | None = None,
-        into: PathArgument | None = None,
-        into_new: PathArgument | None = None,
-        into_existing: PathArgument | None = None,
-        as_: PathArgument | None = None,
-        as_new: PathArgument | None = None,
-        as_existing: PathArgument | None = None,
-        dry_run: bool = False,
-        hash: bool = False,
-        no_compress: bool = False,
-        bwlimit: str | int | None = None,
-        connections: int | None = None,
-        reuse_connection: bool = False,
-        max_entries: int | None = None,
-        max_total_bytes: str | int | None = None,
-        max_runtime: str | int | None = None,
-        ignore: str | Iterable[str] | None = None,
-        ignore_from: Selector | None = None,
-        preserve: str | Iterable[str] | None = None,
-        inplace: bool = False,
-        max_size: str | int | None = None,
-        min_size: str | int | None = None,
-        max_delete: int | None = None,
-        on_event: Callable[[AutomationEvent], object] | None = None,
-        timeout: float | None = None,
-        check: bool = True,
-    ) -> CpPruneResult:
-        argv, source_count = _copy_arguments(
-            "cp-prune",
-            sources,
-            src=src,
-            src_src=src_src,
-            src_file=src_file,
-            src_dir=src_dir,
-            from_=from_,
-            cwd=cwd,
-            follow=follow,
-            to=to,
-            into=into,
-            into_new=into_new,
-            into_existing=into_existing,
-            as_=as_,
-            as_new=as_new,
-            as_existing=as_existing,
-            dry_run=dry_run,
-            hash=hash,
-            no_compress=no_compress,
-            bwlimit=bwlimit,
-            connections=connections,
-            reuse_connection=reuse_connection,
-            max_entries=max_entries,
-            max_total_bytes=max_total_bytes,
-            max_runtime=max_runtime,
-            ignore=ignore,
-            ignore_from=ignore_from,
-            preserve=preserve,
-            inplace=inplace,
-            max_size=max_size,
-            min_size=min_size,
-            max_delete=max_delete,
-        )
-        if source_count == 0:
-            raise SyqInvocationError("syq cp-prune needs a source selector")
-        return self._typed(
-            argv, mode="cp-prune", on_event=on_event, timeout=timeout, check=check
-        )
-
-    def rm(
-        self,
-        *sources: PathArgument,
-        src: Selector | None = None,
-        src_src: Selector | None = None,
-        src_file: Selector | None = None,
-        src_dir: Selector | None = None,
-        from_: str | None = None,
-        cwd: PathArgument | None = None,
-        root: PathArgument | None = None,
-        follow: bool = False,
-        dry_run: bool = False,
-        connections: int | None = None,
-        on_event: Callable[[AutomationEvent], object] | None = None,
-        timeout: float | None = None,
-        check: bool = True,
-    ) -> RmResult:
-        if cwd is not None and root is not None:
-            raise SyqInvocationError("--cwd conflicts with --root")
-        argv: list[Argument] = ["rm"]
-        count = 0
-        for index, source in enumerate(sources):
-            argv.append(_argument(source, label=f"sources[{index}]"))
-            count += 1
-        for option, value in (
-            ("--src", src),
-            ("--src-src", src_src),
-            ("--src-file", src_file),
-            ("--src-dir", src_dir),
-        ):
-            count += _append_paths(argv, option, value)
-        if not count:
-            raise SyqInvocationError("syq rm needs a source selector")
-        if from_ is not None:
-            argv.extend(("--from", _text_arg(from_, label="from_")))
-        if cwd is not None:
-            argv.extend(("--cwd", _argument(cwd, label="cwd")))
-        if root is not None:
-            argv.extend(("--root", _argument(root, label="root")))
-        if follow:
-            argv.append("--follow")
-        if dry_run:
-            argv.append("--dry-run")
-        connections = _positive_integer(connections, option="--connections")
-        if connections is not None:
-            argv.extend(("--connections", str(connections)))
-        return self._typed(
-            argv, mode="rm", on_event=on_event, timeout=timeout, check=check
-        )
 
     def map(
         self,
@@ -824,6 +745,7 @@ class Client:
             as_=as_,
             as_new=None,
             as_existing=None,
+            prune=False,
             dry_run=False,
             hash=False,
             no_compress=False,

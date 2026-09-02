@@ -21,10 +21,23 @@ class EntryKind(_StringEnum):
     SPECIAL = "special"
 
 
+class EndpointKind(_StringEnum):
+    LOCAL = "local"
+    SSH = "ssh"
+
+
+class OperationAction(_StringEnum):
+    TRANSFER_FILE = "transfer_file"
+    CREATE_DIRECTORY = "create_directory"
+    CREATE_SYMLINK = "create_symlink"
+    CREATE_SPECIAL = "create_special"
+    DELETE = "delete"
+
+
 class Disposition(_StringEnum):
-    PLANNED = "planned"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    BLOCKED = "blocked"
 
 
 class Retryability(_StringEnum):
@@ -33,10 +46,39 @@ class Retryability(_StringEnum):
     UNKNOWN = "unknown"
 
 
+class ErrorClass(_StringEnum):
+    IO = "io"
+    TRANSPORT = "transport"
+    CONFLICT = "conflict"
+    INTEGRITY = "integrity"
+    SAFETY_LIMIT = "safety_limit"
+    USAGE = "usage"
+    INTERNAL = "internal"
+
+
+class OsKind(_StringEnum):
+    NOT_FOUND = "not_found"
+    PERMISSION_DENIED = "permission_denied"
+    ALREADY_EXISTS = "already_exists"
+    INVALID_INPUT = "invalid_input"
+    NO_SPACE = "no_space"
+    READ_ONLY = "read_only"
+    OTHER = "other"
+
+
+class TraceReason(_StringEnum):
+    DESTINATION_MISSING = "destination_missing"
+    TYPE_DIFFERS = "type_differs"
+    CONTENT_DIFFERS = "content_differs"
+    METADATA_DIFFERS = "metadata_differs"
+    DESTINATION_ONLY = "destination_only"
+
+
 class OperationStatus(_StringEnum):
     SUCCESS = "success"
     PARTIAL = "partial"
     REFUSED = "refused"
+    ABORTED = "aborted"
     FAILED = "failed"
 
 
@@ -54,13 +96,18 @@ class PathValue:
     """A lossless path from an automation event."""
 
     raw: bytes
-    display: str
 
     @property
     def text(self) -> str:
         """Decode the path as UTF-8, raising when it is a byte-only path."""
 
         return self.raw.decode("utf-8")
+
+    @property
+    def display(self) -> str:
+        """Return a lossy display spelling without making it protocol data."""
+
+        return os.fsdecode(self.raw)
 
     def __bytes__(self) -> bytes:
         return self.raw
@@ -91,8 +138,6 @@ class RelativePath:
 
     @property
     def text(self) -> str:
-        """Decode the path as UTF-8, raising when it is a byte-only path."""
-
         return self.raw.decode("utf-8")
 
     def __bytes__(self) -> bytes:
@@ -136,34 +181,76 @@ class MappingEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class Endpoint:
+    role: str
+    kind: EndpointKind
+    host: str | None = None
+    user: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RunEvent:
     schema: str
     schema_version: int
-    run_id: str
     seq: int
-    elapsed_ms: int
+    run_id: str
+    started_at: int
     syq_version: str
     mode: str
-    dry_run: bool
+    prune: bool
     mapping: bool
+    dry_run: bool
+    endpoints: tuple[Endpoint, ...]
     type: str = "run"
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressEvent:
+    schema: str
+    schema_version: int
+    seq: int
+    bytes_done: int
+    bytes_total: int
+    bytes_unchanged: int
+    files_done: int
+    files_total: int
+    files_unchanged: int
+    files_excluded: int
+    scanned: int
+    scan_done: bool
+    elapsed_ms: int
+    type: str = "progress"
+
+
+@dataclass(frozen=True, slots=True)
+class TraceEvent:
+    schema: str
+    schema_version: int
+    seq: int
+    action: OperationAction
+    dst: PathValue
+    src: PathValue | None
+    kind: EntryKind
+    bytes: int | None
+    reason: TraceReason
+    type: str = "trace"
 
 
 @dataclass(frozen=True, slots=True)
 class OperationResult:
     schema: str
     schema_version: int
-    run_id: str
     seq: int
-    elapsed_ms: int
-    action: str
+    action: OperationAction
     dst: PathValue
     src: PathValue | None
-    kind: str
+    kind: EntryKind
     disposition: Disposition
     bytes: int | None
     attempts: int | None
     retryable: Retryability | None
+    class_: ErrorClass | None
+    os_kind: OsKind | None
     message: str | None
     type: str = "operation_result"
 
@@ -178,39 +265,23 @@ class OperationResult:
         if not self.is_retryable or self.src is None:
             return None
         try:
-            kind = EntryKind(self.kind)
             return MappingEntry(
                 RelativePath(self.src.raw),
                 RelativePath(self.dst.raw),
-                kind,
+                self.kind,
             )
         except ValueError:
             return None
 
 
 @dataclass(frozen=True, slots=True)
-class WarningEvent:
-    schema: str
-    schema_version: int
-    run_id: str
-    seq: int
-    elapsed_ms: int
-    code: str
-    count: int
-    message: str
-    type: str = "warning"
-
-
-@dataclass(frozen=True, slots=True)
 class ErrorEvent:
     schema: str
     schema_version: int
-    run_id: str
     seq: int
-    elapsed_ms: int
-    error_class: str
-    retryable: Retryability
     message: str
+    class_: ErrorClass | None
+    os_kind: OsKind | None
     type: str = "error"
 
 
@@ -218,29 +289,23 @@ class ErrorEvent:
 class OperationSummary:
     schema: str
     schema_version: int
-    run_id: str
     seq: int
-    elapsed_ms: int
     status: OperationStatus
     exit_code: int
     dry_run: bool
-    files_planned: int
-    files_completed: int
+    files_transferred: int
     files_unchanged: int
     files_excluded: int
-    directories_planned: int
-    directories_completed: int
-    symlinks_planned: int
-    symlinks_completed: int
-    specials_planned: int
-    specials_completed: int
-    deletions_planned: int
-    deletions_completed: int
-    deletions_blocked: bool
+    directories_created: int
+    symlinks_created: int
+    specials_created: int
     errors: int
-    bytes_planned: int
-    bytes_completed: int
+    bytes_transferred: int
     bytes_unchanged: int
+    elapsed_ms: int
+    deletions_planned: int | None
+    deletions_completed: int | None
+    deletions_blocked: int | None
     type: str = "result"
 
 
@@ -249,24 +314,13 @@ class CpResult(OperationSummary):
     pass
 
 
-@dataclass(frozen=True, slots=True)
-class CpPruneResult(OperationSummary):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class RmResult(OperationSummary):
-    pass
-
-
 AutomationEvent = (
     RunEvent
+    | ProgressEvent
+    | TraceEvent
     | OperationResult
-    | WarningEvent
     | ErrorEvent
     | CpResult
-    | CpPruneResult
-    | RmResult
 )
 
 

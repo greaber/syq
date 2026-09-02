@@ -43,8 +43,8 @@ learn a second set of names for concepts that syq already names.
 | Native spelling | Python spelling |
 |---|---|
 | `syq cp` | `syq.cp()` or `Client.cp()` |
-| `syq cp-prune` | `syq.cp_prune()` or `Client.cp_prune()` |
-| `syq rm` | `syq.rm()` or `Client.rm()` |
+| `syq cp --prune` | `syq.cp(prune=True)` or `Client.cp(prune=True)` |
+| `syq rm` | `syq.run(["rm", ...])` or `Client.run(["rm", ...])` |
 | `syq map` | `syq.map()` or `Client.map()` |
 | `--src-src` | `src_src=` |
 | `--into-existing` | `into_existing=` |
@@ -52,6 +52,7 @@ learn a second set of names for concepts that syq already names.
 | `--max-delete` | `max_delete=` |
 | `--from` | `from_=` |
 | `--as` | `as_=` |
+| `class` event field | `class_` attribute |
 
 The only spelling transformations are mechanical:
 
@@ -85,11 +86,12 @@ iterables.
 
 ## Scope
 
-The typed interface covers the native filesystem operations `cp`, `cp_prune`,
-`rm`, and `map`. It does not wrap `syq rsync`. The rsync-shaped surface remains
-available through `Client.run` and the module-level `syq.run` function.
-Enrollment and other administrative commands also remain raw operations until
-they have a stable machine contract that benefits from Python types.
+The typed interface covers native `cp`, including its `--prune` mode, and
+`map`. It does not wrap `syq rm` yet because automation v1 does not define an
+`rm` result stream, and it does not wrap `syq rsync`. Both remain available
+through `Client.run` and the module-level `syq.run` function. Enrollment and
+other administrative commands also remain raw operations until they have a
+stable machine contract that benefits from Python types.
 
 Module functions and client methods have the same operation names and
 signatures. A module function uses a default `Client`; applications that need
@@ -106,7 +108,7 @@ result = syq.cp(
     into="/backup",
 )
 
-print(result.files_completed, result.bytes_completed)
+print(result.files_transferred, result.bytes_transferred)
 ```
 
 The corresponding native command is:
@@ -200,6 +202,7 @@ syq.cp(
     as_new=None,
     as_existing=None,
     mapping=None,
+    prune=False,
     dry_run=False,
     hash=False,
     no_compress=False,
@@ -215,6 +218,7 @@ syq.cp(
     inplace=False,
     max_size=None,
     min_size=None,
+    max_delete=None,
     on_event=None,
     timeout=None,
     check=True,
@@ -239,15 +243,14 @@ compare-and-swap operations.
 
 Python performs structural validation that requires no filesystem or network
 access, such as conflicting placement parameters, `as_` with multiple
-sources, selectors combined with `mapping`, and `cwd` combined with `root`.
-The executable remains authoritative for path resolution, type checks,
-endpoint behavior, and filesystem state. Errors should use native option names
-so they remain searchable in `syq --help` and the README.
+sources, and selectors or `prune=True` combined with `mapping`. The executable
+remains authoritative for path resolution, type checks, endpoint behavior,
+and filesystem state. Errors use native option names so they remain searchable
+in `syq --help` and the README.
 
-Copy selectors may be absolute, with the same behavior as native `cp`. `rm`
-rejects absolute selectors and explicit `.` or `..` components. Input paths
-accept text and byte path-like objects on supported Unix systems; byte paths
-are not decoded merely to build argv.
+Copy selectors may be absolute, with the same behavior as native `cp`. Input
+paths accept text and byte path-like objects on supported Unix systems; byte
+paths are not decoded merely to build argv.
 
 `follow`, `hash`, `no_compress`, `bwlimit`, `connections`, `reuse_connection`, `ignore`,
 `ignore_from`, `preserve`, `inplace`, `max_size`, `min_size`, and `dry_run`
@@ -367,58 +370,33 @@ The typed API does not initially expose a `stream=True` switch.
 ## Copy and prune
 
 ```python
-result = syq.cp_prune(
+result = syq.cp(
     src_src="build",
     to="server",
     into_existing="/srv/app",
+    prune=True,
     max_delete=100,
 )
 ```
 
-`cp_prune` accepts the same valid native selector, placement, copy, and
-process-level parameters as `cp`, plus `max_delete`. It does not accept
+There is no `cp_prune` Python method because there is no `cp-prune` native
+command. `prune=True` serializes as `--prune` on `cp`; `max_delete` serializes
+as `--max-delete` and is valid only with `prune=True`. Prune does not accept
 `mapping`, because native mappings do not define deletion scopes. The library
 does not infer a deletion scope or retry a refused prune.
 
 ## Removal
 
-```python
-result = syq.rm(
-    src_dir="old-output",
-    from_="server",
-    root="/srv",
-)
-```
-
-The conceptual signature follows `syq rm`:
+Automation v1 currently covers only `cp [--prune]`. Until `rm` has a stable
+result stream, callers use the raw escape hatch and interpret only the process
+status unless they deliberately own some other output format:
 
 ```python
-syq.rm(
-    *sources,
-    src=None,
-    src_src=None,
-    src_file=None,
-    src_dir=None,
-    from_=None,
-    cwd=None,
-    root=None,
-    follow=False,
-    dry_run=False,
-    connections=None,
-    on_event=None,
-    timeout=None,
-    check=True,
-)
+client.run(["rm", "--src-dir", "old-output", "--from", "server", "--root", "/srv"])
 ```
 
-`root` conflicts with `cwd`, matching native `--root` and `--cwd`. `follow`
-controls selector-resolution symlinks exactly as native `--follow` does; it
-does not cause the directory walk to follow descendant symlinks.
-
-The method never supplies confirmation automatically and never retries a
-removal automatically. An application that needs approval first calls the
-same operation with `dry_run=True` and must still treat that result as a view
-of filesystem state, not a transaction or lock.
+The Python SDK will add `rm` when the native command exposes a structured
+completion contract. It does not parse `rm`'s human output in the meantime.
 
 ## Dry runs
 
@@ -426,19 +404,19 @@ of filesystem state, not a transaction or lock.
 
 ```python
 preview = syq.cp(src_src="build", into="staging", dry_run=True)
-preview = syq.cp_prune(
+preview = syq.cp(
     src_src="build",
     into_existing="staging",
+    prune=True,
     max_delete=100,
     dry_run=True,
 )
-preview = syq.rm("cache", dry_run=True)
 ```
 
-There are no `preview_copy`, `preview_copy_prune`, or `preview_remove`
-commands. Those would rename the native operation and make one flag change the
-Python verb. The command-specific result carries `dry_run=True`; its operation
-events describe planned work instead of completed work.
+There are no `preview_copy` or `preview_copy_prune` commands. Those would
+rename the native operation and make flags change the Python verb. `CpResult`
+carries `dry_run=True`; `TraceEvent` records describe planned mutations, while
+a live run emits `OperationResult` records for settled mutations.
 
 A dry run describes what syq observed and would have done. It is not an
 executable transaction, authorization token, or promise that the filesystem
@@ -448,9 +426,10 @@ shared execution trace and terminal result.
 ## Events and terminal results
 
 Typed operations consume the stable automation stream. `on_event` receives
-frozen dataclasses corresponding to the schema's records, including run-start
-information, operation results, warnings, structured errors, and the terminal
-result.
+frozen dataclasses corresponding to its known records: `RunEvent`, sampled
+`ProgressEvent`, dry-run `TraceEvent` or live `OperationResult`, `ErrorEvent`,
+and the terminal `CpResult`. Additive unknown record types are validated for a
+well-formed envelope and sequence position, then ignored.
 
 The schema in [AUTOMATION.md](../../AUTOMATION.md), not this document, owns
 their exact fields and enum members. The Python types expose every stable
@@ -460,9 +439,11 @@ The client validates at least these stream invariants:
 
 - the schema identifier and supported major version;
 - the required first record;
-- one run identity and strictly increasing sequence numbers;
-- path tags and integer ranges;
+- strictly increasing sequence numbers starting at zero;
+- path tags and unsigned 64-bit integer ranges;
 - required fields and documented enum values;
+- agreement between the invocation and the run's `prune`, `mapping`, and
+  `dry_run` flags;
 - exactly one terminal result, with nothing after it; and
 - agreement between the terminal exit code and the reaped process status.
 
@@ -471,8 +452,9 @@ operation succeeded or the process status is zero.
 
 Successful operation events are not retained by default. A copy may contain
 millions of entries; callers that need a ledger consume `on_event` and write
-one. Terminal aggregates are retained in the returned command-specific result,
-such as `CpResult`, `CpPruneResult`, or `RmResult`.
+one. Terminal aggregates are retained in the returned `CpResult`. Prune-only
+deletion totals are optional fields on that same type and are required exactly
+when the run has `prune=True`.
 
 ## Failure model
 
@@ -590,6 +572,7 @@ The initial typed API does not provide:
 - a Python implementation of the transfer engine;
 - FFI or an in-process Rust runtime;
 - a typed mirror of `syq rsync`;
+- typed `rm` before the command has an automation result stream;
 - semantic aliases for native commands or options;
 - a generic `extra_args` hole in typed methods—use `run` instead;
 - automatic retries or rollback;
@@ -606,8 +589,9 @@ The initial typed API does not provide:
 | Raw stdin and safe streaming | Process behavior only | Implemented |
 | `RelativePath` and mapping codecs | Exact binary pairing | Implemented |
 | `map` and safe `cp(mapping=...)` input | Native mapping commands | Implemented |
-| Typed `cp`, `cp_prune`, and `rm` | Automation v1 | Implemented |
-| Typed `dry_run=True` | Automation-v1 planned operations | Implemented |
+| Typed `cp`, including `prune=True` | Automation v1 | Implemented |
+| Typed `rm` | Native `rm` result stream | Awaiting product support |
+| Typed `dry_run=True` | Automation-v1 trace records | Implemented |
 
 The source inventory `native-api.json` records the disposition of every native
 option. Rust tests require new options to appear there. A feature PR may put an

@@ -38,20 +38,20 @@ class CandidateCompatibilityTests(unittest.TestCase):
                 on_event=events.append,
             )
             self.assertTrue(preview.dry_run)
-            self.assertEqual(preview.files_planned, 1)
-            self.assertEqual(preview.files_completed, 0)
+            self.assertEqual(preview.files_transferred, 1)
+            self.assertEqual(preview.bytes_transferred, 0)
             self.assertFalse(destination.exists())
             self.assertTrue(
                 any(
-                    isinstance(event, syq.OperationResult)
-                    and event.disposition is syq.Disposition.PLANNED
+                    isinstance(event, syq.TraceEvent)
+                    and event.reason is syq.TraceReason.DESTINATION_MISSING
                     for event in events
                 )
             )
 
             result = client.cp(source.name, as_new=destination.name)
             self.assertEqual(result.exit_code, 0)
-            self.assertEqual(result.files_completed, 1)
+            self.assertEqual(result.files_transferred, 1)
             self.assertEqual(destination.read_bytes(), source.read_bytes())
 
             mapping_source = root / "mapping-source"
@@ -68,7 +68,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
                 follow=True,
                 into="mapped",
             )
-            self.assertEqual(mapped.files_completed, 1)
+            self.assertEqual(mapped.files_transferred, 1)
             self.assertEqual((root / "mapped" / "mapped.txt").read_bytes(), b"mapped")
 
             prune_source = root / "prune-source"
@@ -77,20 +77,14 @@ class CandidateCompatibilityTests(unittest.TestCase):
             prune_target.mkdir()
             (prune_source / "keep").write_bytes(b"keep")
             (prune_target / "extra").write_bytes(b"extra")
-            pruned = client.cp_prune(
+            pruned = client.cp(
                 src_src=prune_source.name,
                 into_existing=prune_target.name,
+                prune=True,
                 max_delete=1,
             )
             self.assertEqual(pruned.deletions_completed, 1)
             self.assertFalse((prune_target / "extra").exists())
-
-            removal_preview = client.rm(destination.name, dry_run=True)
-            self.assertEqual(removal_preview.deletions_planned, 1)
-            self.assertTrue(destination.exists())
-            removed = client.rm(destination.name)
-            self.assertEqual(removed.deletions_completed, 1)
-            self.assertFalse(destination.exists())
 
             raw_name = b"raw-\xff"
             raw_source = os.fsencode(root) + b"/" + raw_name
@@ -105,7 +99,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
                 into=b"raw-target",
                 on_event=raw_events.append,
             )
-            self.assertEqual(raw_result.files_completed, 1)
+            self.assertEqual(raw_result.files_transferred, 1)
             raw_operation = next(
                 event
                 for event in raw_events

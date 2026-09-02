@@ -3,7 +3,8 @@
 `syq` is the official Python client for the
 [syq parallel file copier](https://github.com/greaber/syq). It invokes syq with
 an argument array and never constructs a shell command. The typed API mirrors
-the native commands: `cp`, `cp_prune`, `rm`, and `map`.
+native `cp`, including `cp --prune`, and `map`. Commands without an automation
+result stream, including `rm`, remain available through `run`.
 
 ```sh
 python -m pip install syq
@@ -21,20 +22,21 @@ print(syq.PINNED_SYQ_VERSION)    # tested executable version
 print(syq.managed_executable())  # downloads once, then returns the cached path
 
 plan = syq.cp("project", to="server", into="/backup", dry_run=True)
-print(plan.files_planned, plan.bytes_planned)
+print(plan.files_transferred, plan.bytes_transferred)
 ```
 
 The typed API validates syq's complete automation-v1 stream and its agreement
-with the process status. Dry and live calls return the same result types;
-completed mutation counts are zero for a dry run:
+with the process status. Dry and live calls return the same `CpResult` type;
+dry runs report planned mutation totals and emit `TraceEvent` records:
 
 ```python
 client = syq.Client(process_cwd="/srv/jobs")
 
-preview = client.cp_prune(
+preview = client.cp(
     src_src="build",
     to="server",
     into_existing="/srv/app",
+    prune=True,
     max_delete=100,
     dry_run=True,
 )
@@ -45,8 +47,8 @@ potentially enormous operation ledger in memory:
 
 ```python
 def observe(event: syq.AutomationEvent) -> None:
-    if isinstance(event, syq.OperationResult):
-        print(event.action, event.dst, event.disposition)
+    if isinstance(event, (syq.TraceEvent, syq.OperationResult)):
+        print(event.action, event.dst)
 
 result = syq.cp("data", into="backup", on_event=observe)
 ```

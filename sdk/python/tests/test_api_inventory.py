@@ -22,8 +22,6 @@ class NativeApiInventoryTests(unittest.TestCase):
     def test_every_python_option_is_in_the_matching_signature(self) -> None:
         sdk_parameters = {
             "cp": {"self", "sources", "on_event", "timeout", "check"},
-            "cp-prune": {"self", "sources", "on_event", "timeout", "check"},
-            "rm": {"self", "sources", "on_event", "timeout", "check"},
             "map": {"self", "sources", "timeout"},
         }
         for command, classified in self.inventory["commands"].items():
@@ -44,6 +42,7 @@ class NativeApiInventoryTests(unittest.TestCase):
                 self.assertEqual(
                     inspect.signature(module_function), method_without_self
                 )
+
 
 if __name__ == "__main__":
     unittest.main()
