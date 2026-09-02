@@ -8,7 +8,8 @@ a mapping syq itself emits — and syq does what it always does:
 parallel transfer, delta, resume, verification, and conflict checking
 before a single byte moves.
 
-```sh
+```bash
+set -o pipefail
 syq map --src-src photos \
   | jq '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C photos --to nas --into /pub
@@ -82,11 +83,24 @@ things that otherwise need dedicated flags or custom copy scripts.
 Re-running any of these converges like an ordinary syq copy: what
 already landed is skipped.
 
+As in any shell pipeline, `syq cp` sees only the bytes that reach it:
+the examples set `set -o pipefail` (Bash) so a failed producer fails
+the pipeline. Nothing wrong is copied either way — a truncated
+manifest copies only a valid prefix, and re-running the corrected
+pipeline converges. For stage-by-stage completion, materialize the
+manifest instead:
+
+```bash
+syq map --src-src src | jq '.dst.value |= ascii_downcase' > m.ndjson \
+  && syq cp --mapping m.ndjson -C src --to nas --into /pub
+```
+
 ### Lowercase every destination name
 
 A migration to a case-insensitive filesystem:
 
-```sh
+```bash
+set -o pipefail
 syq map --src-src src \
   | jq '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C src --to nas --into /pub
@@ -133,7 +147,8 @@ up around every run.
 
 ### Repartition into `YEAR/MM/` folders by modification time
 
-```sh
+```bash
+set -o pipefail
 syq map --src-src photos \
   | jq 'select(.kind == "file")
         | .dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value' \
@@ -159,7 +174,8 @@ lifecycle (rebuild after changes, clean up after runs).
 
 ### Only files of at least 1 MiB
 
-```sh
+```bash
+set -o pipefail
 syq map --src-src data \
   | jq 'select(.kind != "file" or .size >= 1048576)' \
   | syq cp --mapping - -C data --to nas --into /big
@@ -200,7 +216,7 @@ line:
 
 For the patterns people build today with hardlink or symlink staging
 farms so that plain rsync can mirror a restructured tree — and where
-those farms fall short — see [use-cases/link-farms.md](../use-cases/link-farms.md).
+those farms fall short — see [use-cases/link-farms.md](https://github.com/greaber/syq/blob/master/use-cases/link-farms.md).
 
 ## Semantics and limits
 
@@ -223,13 +239,25 @@ those farms fall short — see [use-cases/link-farms.md](../use-cases/link-farms
   symlink, and a destination path that would traverse a symlink inside
   the target container fails that entry. Resolve links yourself before
   emitting if you want targets instead.
+- `kind: "special"` asserts the source's type; it does not override the
+  fixed `-rlt` fidelity, which copies no special files. Such an entry is
+  a policy exclusion like `--min-size`: the run still succeeds and the
+  entry appears only in the excluded aggregate. Filter with
+  `jq 'select(.kind != "special")'` to drop such entries up front.
 - Mappings define no deletion region, so `--mapping` is not available
   on `cp-prune`.
 - Duplicate lines are errors, even identical ones: a duplicate almost
   always means a generator bug. Deduplicate in your generator if you
   union overlapping fragments.
-- `syq map` streams as it scans, and `syq cp --mapping -` starts work
-  before the stream ends; conflict checks are incremental. Exit codes
+- `syq cp --mapping` reads and validates the whole manifest before
+  copying anything: parse errors, duplicate destinations, and
+  declared-kind ancestor conflicts refuse the run before any entry is
+  applied (the `--into` container itself is created eagerly, as with
+  `--files-from`). The price is memory proportional to the manifest, as
+  in a multi-source copy. Execution then overlaps source stats and transfers.
+  Conflicts only observable at execution — an undeclared ancestor that
+  turns out not to be a directory, existing destination state — still
+  fail entries individually. `syq map` streams its output. Exit codes
   and output are the ordinary `syq cp` ones.
 
 ## Machine-readable results (preview)

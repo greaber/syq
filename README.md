@@ -226,7 +226,7 @@ remote helper, SDK-managed binary, and self-update is verified against that
 manifest before it runs.
 
 [Security](docs/security.md) explains all three, what each protects, and what
-it does not. Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
+it does not. Report vulnerabilities as described in [SECURITY.md](https://github.com/greaber/syq/blob/master/SECURITY.md).
 
 ## Interfaces
 
@@ -239,10 +239,10 @@ it does not. Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
    verb first, make endpoints, selection, and placement explicit, and add what
    rsync lacks: a parallel `rm`, exact placement, mappings. Native mode is
    experimental, and its grammar may change between releases.
-3. **Programmatic.** `--progress-json`, `--results`, and preview SDKs for
-   Python, JavaScript, and Go in [`sdk/`](sdk/) that run a pinned, verified
-   syq. A versioned NDJSON automation interface with first-class plans is in
-   design; the SDKs' typed surface will follow it.
+3. **Programmatic.** `--progress-json`, `--results`, and a preview
+   [Python SDK](https://github.com/greaber/syq/tree/master/sdk/python) that
+   runs a pinned, verified syq. A versioned NDJSON automation interface with
+   first-class plans is in design; the SDK's typed surface will follow it.
 
 ## Status and limitations
 
@@ -266,7 +266,7 @@ reasons.
 - [Composability](docs/composability.md) and [Mappings](docs/mappings.md)
 - [Security](docs/security.md) and [Threat inventory](docs/threat-inventory.md)
 - [Rsync compatibility record](docs/rsync-compat.md)
-- [Security policy](SECURITY.md) and [Releasing](RELEASING.md)
+- [Security policy](https://github.com/greaber/syq/blob/master/SECURITY.md) and [Releasing](https://github.com/greaber/syq/blob/master/RELEASING.md)
 
 ## License
 

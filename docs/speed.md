@@ -220,12 +220,6 @@ began reusing the authenticated control connection, versus 16.85 s with eight
 independently authenticated worker connections. Larger and mixed workloads
 still use independent SSH connections so they retain multi-flow throughput.
 
-On the same kind of long path (262 ms), a fresh 2,000-file / 8 MiB tree over
-`--no-tcp` took 11.29 s in two verified runs after fresh-small-file workers
-began reusing the authenticated control connection, versus 16.85 s with eight
-independently authenticated worker connections. Larger and mixed workloads
-still use independent SSH connections so they retain multi-flow throughput.
-
 `-j N` fixes the count and disables tuning. Use it when you know better (a
 spinning disk that must not be read in parallel: `-j 1`), or to be polite on
 a shared link.

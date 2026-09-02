@@ -14,7 +14,7 @@ state of each:
    the binary that runs on a remote host, or replaces your local one, is
    verified.
 
-To report a vulnerability, follow [SECURITY.md](../SECURITY.md).
+To report a vulnerability, follow [SECURITY.md](https://github.com/greaber/syq/blob/master/SECURITY.md).
 
 ## Hardening against a hostile filesystem
 
@@ -272,7 +272,7 @@ verified:
   RFC 8785 canonical JSON, publishes provenance attestations, checks every
   uploaded byte, and publishes once. The signing key lives in an encrypted
   inventory on maintainer machines; CI receives only the two individual
-  secrets it needs. [RELEASING.md](../RELEASING.md) has the procedure.
+  secrets it needs. [RELEASING.md](https://github.com/greaber/syq/blob/master/RELEASING.md) has the procedure.
 - **The public key is compiled into every official syq.** A remote helper is
   installed only after the *local* client has verified the manifest signature
   and compared the binary's digest, whether the remote downloaded the release
@@ -283,7 +283,7 @@ verified:
   manifest at most once a day and print a reminder; nothing is installed as a
   side effect of a copy. `syq --self-update` installs after the same
   verification, and only for installs it owns (never over Homebrew or Cargo).
-- **SDKs pin a release.** Each SDK release pins one syq release and verifies the
+- **The Python SDK pins a release.** Each SDK release pins one syq release and verifies the
   downloaded binary against the manifest embedded in the package before every
   use.
 - **Source builds are honest about identity.** A checkout build carries its Git

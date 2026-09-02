@@ -20,8 +20,6 @@ local copy on hostA and disables agent forwarding.
 
 ## The default path: enrolled receiver plus constrained broker
 
-## The default path: enrolled receiver plus constrained broker
-
 With implicit OpenSSH, the default combines a pre-enrolled forced receiver on
 hostB with a temporary local agent broker. The first transfer to a destination
 parent generates an Ed25519 enrollment key locally, uploads the exact running
@@ -46,8 +44,6 @@ one setup session is the bootstrap trust boundary; later transfers use only the
 forced key. Syq generates the special key automatically, and its
 `syq-enrollment:ID` marker makes the managed `authorized_keys` line
 recognizable to users, administrators, and monitoring tools.
-
-## Signed per-transfer requests
 
 ## Signed per-transfer requests
 
@@ -97,15 +93,11 @@ access to it.
 
 ## What the restriction does and does not protect
 
-## What the restriction does and does not protect
-
 The restriction protects hostB; it does not make hostA a trustworthy source.
 A compromised hostA can omit source files, alter their contents, lie about
 source metadata, or stop the transfer. It still cannot escape the signed
 destination scopes or independently authenticate to hostB with the enrollment
 key.
-
-## Options that fail closed under the restricted path
 
 ## Options that fail closed under the restricted path
 
@@ -138,8 +130,6 @@ first when that distinction matters.
 
 ## Enrollment lifecycle
 
-## Enrollment lifecycle
-
 Use `syq enroll [USER@]HOST:DEST [--via [USER@]HOST]` to pre-enroll,
 `syq enrollments` to list local enrollments, and `syq revoke ID [--via ...]` to
 remove the forced key and both sides' per-enrollment state. Before changing
@@ -153,8 +143,6 @@ because other enrollments may use it. It prevents new receiver sessions. A
 session that already claimed its signed request can finish an operation already
 in progress; later protocol requests are rejected once the signed execution
 deadline expires rather than forcibly interrupting a filesystem syscall.
-
-## Broker-only mode
 
 ## Broker-only mode
 
@@ -199,8 +187,6 @@ authority of that destination account for the transfer's lifetime. Command or
 filesystem restrictions require destination-side policy such as a forced syq
 receiver. This is not a signed grant: it adds no timestamp, expiry, or replay
 cache beyond the live SSH sessions and the broker socket's lifetime.
-
-## Requirements and host identity
 
 ## Requirements and host identity
 
@@ -251,8 +237,6 @@ reuse host private keys between them.
 
 ## Escape hatches and explicit remote shells
 
-## Escape hatches and explicit remote shells
-
 Pass `--no-forward-agent` to give hostA no agent at all; hostA must then have
 its own credentials for hostB, and its own `IdentityAgent` configuration is
 left intact. `--unrestricted-agent-forwarding` is a
@@ -274,8 +258,6 @@ above. If first-contact trust is appropriate, establish it with ordinary SSH
 (directly or through the configured jump path) before starting the transfer.
 An explicit `-e 'ssh -o StrictHostKeyChecking=accept-new'` bypasses the broker
 and leaves that policy to the supplied command.
-
-## Detached transfers
 
 ## Detached transfers
 

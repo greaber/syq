@@ -133,22 +133,23 @@ different commands into one tree produce the union of their files. The
 the one deliberate exception, `--checkpoint`, which trusts recorded
 completions to skip destination lookups on very large repeated jobs.
 
-## Programs and SDKs
+## Programs and the Python SDK
 
-Preview SDKs for Python, JavaScript/TypeScript, and Go live in
-[`sdk/`](../sdk/). Each runs the `syq` executable with an argument array (never
-a shell), pins one exact, tested syq release, and downloads and verifies that
-release's official binary on first use, so the pairing an application tested
-is the pairing it ships. They deliberately expose only raw execution and
-version discovery today and do not parse human output.
+A preview Python SDK lives in
+[sdk/python](https://github.com/greaber/syq/tree/master/sdk/python). It runs
+the `syq` executable with an argument array (never a shell), pins one exact,
+tested syq release, and downloads and verifies that release's official binary
+on first use, so the pairing an application tested is the pairing it ships. It
+deliberately exposes only raw execution and version discovery today and does
+not parse human output.
 
-Their typed surface will follow syq's versioned NDJSON automation interface,
+Its typed surface will follow syq's versioned NDJSON automation interface,
 which is in design. Its shape: a mapping is the input half (selection and
 placement as a manifest, shipped as `--mapping`); an enveloped event stream is
 the output half (the `--results` preview is its first slice); and a dry-run
 *trace* of intended operations, in the same vocabulary as results, is the plan
 you can inspect, filter, and hand back. The contract will be versioned, with
-fixtures, before any SDK claims a stable copy API. Until then, `--dry-run`,
+fixtures, before the SDK claims a stable copy API. Until then, `--dry-run`,
 exit codes, `--progress-json`, `--results`, and mappings are the composition
 points, and the executable remains authoritative for semantics, exit status,
 and safety checks.
