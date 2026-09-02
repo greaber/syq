@@ -72,6 +72,9 @@ struct InstallResponse {
     canonical_root: String,
     canonical_destination: String,
     receiver_path: String,
+    /// OpenSSH public key of the receipt signing key hostB generated for
+    /// this enrollment; the local side verifies receipts against it.
+    receipt_public_key: String,
     change: String,
 }
 
@@ -88,11 +91,17 @@ struct LocalEnrollment {
     version: u16,
     id: EnrollmentId,
     host: String,
+    #[serde(default)]
+    port: Option<u16>,
     target_login: String,
     remote_home: String,
     requested_parent: String,
     canonical_root: String,
     receiver_path: String,
+    /// Absent for enrollments installed before receivers had receipt keys;
+    /// rerunning `syq enroll` refreshes them.
+    #[serde(default)]
+    receipt_public_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,6 +109,8 @@ struct PendingEnrollment {
     version: u16,
     id: EnrollmentId,
     host: String,
+    #[serde(default)]
+    port: Option<u16>,
     target_login: String,
     requested_destination: String,
 }
@@ -1893,6 +1904,51 @@ fn generate_transport_key(id: EnrollmentId) -> Result<PrivateKey> {
         .context("construct restricted transport key")
 }
 
+/// The receiver's own signing key for receipts. It lives only on hostB, in
+/// the enrollment's state directory, and is rotated by every install.
+fn generate_receipt_key(id: EnrollmentId) -> Result<PrivateKey> {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).context("generate receipt signing key")?;
+    let keypair = Ed25519Keypair::from_seed(&seed);
+    seed.fill(0);
+    PrivateKey::new(keypair.into(), format!("syq-receipt:{id}"))
+        .context("construct receipt signing key")
+}
+
+const RECEIPT_KEY_FILE: &str = "receipt-key";
+
+/// The enrollment's receipt key: generated on first install and kept by
+/// every later install, so a refresh after a syq upgrade, or a retry after
+/// a lost reply, always reports the key the local side already holds.
+/// Rotation is explicit: revoke, then enroll again.
+fn ensure_receipt_key(state: &Path, id: EnrollmentId) -> Result<PrivateKey> {
+    if let Some(existing) = load_receipt_key(state)? {
+        return Ok(existing);
+    }
+    let key = generate_receipt_key(id)?;
+    atomic_write(
+        state,
+        RECEIPT_KEY_FILE,
+        key.to_openssh(LineEnding::LF)
+            .context("encode receipt signing key")?
+            .as_bytes(),
+        0o600,
+    )?;
+    Ok(key)
+}
+
+/// The receipt signing key an install left in the state directory, if any.
+fn load_receipt_key(state: &Path) -> Result<Option<PrivateKey>> {
+    let path = state.join(RECEIPT_KEY_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let encoded = delegation::read_secure_regular(&path, "receipt signing key", 128 * 1024)?;
+    PrivateKey::from_openssh(&encoded)
+        .context("parse receipt signing key")
+        .map(Some)
+}
+
 fn signer_name(id: EnrollmentId) -> String {
     format!("syq-enrollment-{id}")
 }
@@ -2042,6 +2098,11 @@ pub(crate) fn remote_install() -> Result<()> {
             .context("restricted receiver path is not UTF-8")?
             .to_owned(),
     };
+    let receipt_key = ensure_receipt_key(&state, request.id)?;
+    let receipt_public_key = receipt_key
+        .public_key()
+        .to_openssh()
+        .context("encode receipt public key")?;
     atomic_write(&state, "config.json", &serde_json::to_vec(&config)?, 0o600)?;
     atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
 
@@ -2066,6 +2127,7 @@ pub(crate) fn remote_install() -> Result<()> {
             .to_str()
             .context("restricted receiver path is not UTF-8")?
             .to_owned(),
+        receipt_public_key,
         change: match change {
             AuthorizedKeysChange::Installed => "installed",
             AuthorizedKeysChange::Unchanged => "unchanged",
@@ -2351,12 +2413,13 @@ fn install_over_route(
     Ok(response)
 }
 
-fn endpoint(login: &str, host: &str) -> Result<SshEndpoint> {
-    SshEndpoint::parse(&format!("{login}@{host}"))
+fn endpoint(login: &str, host: &str, port: Option<u16>) -> Result<SshEndpoint> {
+    SshEndpoint::from_parts(login, host, port)
 }
 
 fn enroll(
     host: &str,
+    port: Option<u16>,
     login: &str,
     requested_destination: &str,
     jump: Option<&SshEndpoint>,
@@ -2368,7 +2431,7 @@ fn enroll(
 
     let mut active = None;
     for (metadata, directory) in load_local_enrollments()? {
-        if metadata.host == host && metadata.target_login == login {
+        if metadata.host == host && metadata.port == port && metadata.target_login == login {
             if let Some(canonical_destination) = destination_for(&metadata, requested_destination)?
             {
                 active = Some((metadata, directory, canonical_destination));
@@ -2392,6 +2455,7 @@ fn enroll(
             .into_iter()
             .find(|(pending, _)| {
                 pending.host == host
+                    && pending.port == port
                     && pending.target_login == login
                     && pending.requested_destination == requested_destination
             })
@@ -2405,6 +2469,7 @@ fn enroll(
                 version: CONFIG_VERSION,
                 id: metadata.id,
                 host: metadata.host,
+                port: metadata.port,
                 target_login: metadata.target_login,
                 requested_destination: requested_destination.to_owned(),
             };
@@ -2421,6 +2486,7 @@ fn enroll(
                 version: CONFIG_VERSION,
                 id,
                 host: host.to_owned(),
+                port,
                 target_login: login.to_owned(),
                 requested_destination: requested_destination.to_owned(),
             };
@@ -2436,7 +2502,7 @@ fn enroll(
         requested_destination: requested_destination.to_owned(),
         public_key,
     };
-    let target = endpoint(login, host)?;
+    let target = endpoint(login, host, port)?;
     let direct = install_over_route(&target, EnrollmentRoute::Direct, &request);
     let response = match (direct, jump) {
         (Ok(response), _) => response,
@@ -2457,11 +2523,13 @@ fn enroll(
         version: CONFIG_VERSION,
         id: pending.id,
         host: host.to_owned(),
+        port,
         target_login: login.to_owned(),
         remote_home: response.remote_home,
         requested_parent: response.requested_parent,
         canonical_root: response.canonical_root,
         receiver_path: response.receiver_path,
+        receipt_public_key: Some(response.receipt_public_key),
     };
     complete_local_enrollment(&directory, &metadata)?;
     Ok((metadata, directory, response.canonical_destination))
@@ -2786,7 +2854,10 @@ pub(crate) fn prepare_transfer(
         .context("restricted destination path is not UTF-8")?;
     let mut selected = None;
     for (metadata, directory) in load_local_enrollments()? {
-        if metadata.host == host && metadata.target_login == destination_login {
+        if metadata.host == host
+            && metadata.port == destination.port
+            && metadata.target_login == destination_login
+        {
             if let Some(canonical_destination) = destination_for(&metadata, requested)? {
                 selected = Some((metadata, directory, canonical_destination));
                 break;
@@ -2804,8 +2875,16 @@ pub(crate) fn prepare_transfer(
             let jump = endpoint(
                 source_login,
                 sources[0].host.as_deref().context("source host missing")?,
+                sources[0].port,
             )?;
-            enroll(host, destination_login, requested, Some(&jump), false)?
+            enroll(
+                host,
+                destination.port,
+                destination_login,
+                requested,
+                Some(&jump),
+                false,
+            )?
         }
     };
     let private_key = load_private_key(&directory)?;
@@ -2935,18 +3014,26 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                     .map(|(metadata, _)| metadata.id)
                     .collect::<HashSet<_>>();
                 for (metadata, _) in active {
+                    let target = endpoint(&metadata.target_login, &metadata.host, metadata.port)?;
                     println!(
-                        "{}\tactive\t{}@{}\t{}",
-                        metadata.id, metadata.target_login, metadata.host, metadata.canonical_root
+                        "{}\tactive\t{}\t{}\t{}",
+                        metadata.id,
+                        target.label(),
+                        metadata.canonical_root,
+                        if metadata.receipt_public_key.is_some() {
+                            "receipt-key"
+                        } else {
+                            "no-receipt-key"
+                        }
                     );
                 }
                 for (pending, _) in load_pending_enrollments()? {
                     if !active_ids.contains(&pending.id) {
+                        let target = endpoint(&pending.target_login, &pending.host, pending.port)?;
                         println!(
-                            "{}\tpending\t{}@{}\t{}",
+                            "{}\tpending\t{}\t{}",
                             pending.id,
-                            pending.target_login,
-                            pending.host,
+                            target.label(),
                             pending.requested_destination
                         );
                     }
@@ -2979,11 +3066,19 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                 host,
                 true,
             )?;
-            let (metadata, _, destination) =
-                enroll(host, &policy.login_user, requested, via.as_ref(), true)?;
+            let (metadata, _, destination) = enroll(
+                host,
+                None,
+                &policy.login_user,
+                requested,
+                via.as_ref(),
+                true,
+            )?;
             println!(
-                "enrolled {} for {}@{}:{}",
-                metadata.id, metadata.target_login, metadata.host, destination
+                "enrolled {} for {}:{}",
+                metadata.id,
+                endpoint(&metadata.target_login, &metadata.host, metadata.port)?.label(),
+                destination
             );
             Ok(0)
         })()),
@@ -3002,7 +3097,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             let active = load_local_enrollments()?
                 .into_iter()
                 .find(|(metadata, _)| metadata.id == id);
-            let (target_login, host, remote_command, directory) = match active {
+            let (target_login, host, port, remote_command, directory) = match active {
                 Some((metadata, directory)) => {
                     let command = enrollment::EnrollmentRemoteCommand::new(
                         Path::new(&metadata.receiver_path),
@@ -3011,6 +3106,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                     (
                         metadata.target_login,
                         metadata.host,
+                        metadata.port,
                         command.as_str().to_owned(),
                         directory,
                     )
@@ -3023,6 +3119,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                     (
                         pending.target_login,
                         pending.host,
+                        pending.port,
                         "exec \"$HOME/.local/libexec/syq-receiver\" --restricted-revoke".to_owned(),
                         directory,
                     )
@@ -3035,7 +3132,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                 target_login: target_login.clone(),
                 public_key: private_key.public_key().to_openssh()?,
             };
-            let target = endpoint(&target_login, &host)?;
+            let target = endpoint(&target_login, &host, port)?;
             let encoded = serde_json::to_vec(&request)?;
             let direct = run_ssh(&target, EnrollmentRoute::Direct, &remote_command, &encoded);
             match (direct, via.as_ref()) {
@@ -3054,7 +3151,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             delegation::validate_private_directory_path(&directory)?;
             fs::remove_dir_all(&directory)
                 .with_context(|| format!("remove local enrollment {}", directory.display()))?;
-            println!("revoked {id} from {target_login}@{host}");
+            println!("revoked {id} from {}", target.label());
             Ok(0)
         })()),
         _ => None,
@@ -3241,6 +3338,52 @@ mod tests {
     }
 
     #[test]
+    fn receipt_keys_are_distinct_per_enrollment_and_older_metadata_still_loads() {
+        let id = EnrollmentId::random();
+        let key = generate_receipt_key(id).unwrap();
+        let public = key.public_key().to_openssh().unwrap();
+        assert!(public.starts_with("ssh-ed25519 "));
+        assert!(public.ends_with(&format!("syq-receipt:{id}")));
+        let again = generate_receipt_key(id).unwrap();
+        assert_ne!(again.public_key().to_openssh().unwrap(), public);
+        ssh_key::PublicKey::from_openssh(&public).unwrap();
+
+        // An install keeps the key it finds, so a refresh or a retried
+        // install reports the same public key the local side already has.
+        let (_, home) = current_account().unwrap();
+        let temporary = tempfile::tempdir_in(home).unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let state = temporary.path().join("state");
+        ensure_directory(&state, 0o700).unwrap();
+        let first = ensure_receipt_key(&state, id).unwrap();
+        let second = ensure_receipt_key(&state, id).unwrap();
+        assert_eq!(
+            first.public_key().to_openssh().unwrap(),
+            second.public_key().to_openssh().unwrap()
+        );
+        assert!(state.join(RECEIPT_KEY_FILE).is_file());
+
+        // Metadata written before receipt keys existed has no key and is
+        // listed as needing a refresh rather than failing to load.
+        let current = LocalEnrollment {
+            version: CONFIG_VERSION,
+            id,
+            host: "vault".into(),
+            port: None,
+            target_login: "backup".into(),
+            remote_home: "/home/backup".into(),
+            requested_parent: "/archive".into(),
+            canonical_root: "/archive".into(),
+            receiver_path: "/home/backup/.local/libexec/syq-receiver".into(),
+            receipt_public_key: Some(public),
+        };
+        let mut older = serde_json::to_value(&current).unwrap();
+        older.as_object_mut().unwrap().remove("receipt_public_key");
+        let metadata: LocalEnrollment = serde_json::from_value(older).unwrap();
+        assert!(metadata.receipt_public_key.is_none());
+    }
+
+    #[test]
     fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
         let (_, home) = current_account().unwrap();
         let temporary = tempfile::tempdir_in(home).unwrap();
@@ -3252,6 +3395,7 @@ mod tests {
             version: CONFIG_VERSION,
             id,
             host: "host-b".into(),
+            port: None,
             target_login: "backup".into(),
             requested_destination: "/archive/item".into(),
         };
@@ -3275,11 +3419,13 @@ mod tests {
             version: CONFIG_VERSION,
             id,
             host: pending.host,
+            port: pending.port,
             target_login: pending.target_login,
             remote_home: "/home/backup".into(),
             requested_parent: "/archive".into(),
             canonical_root: "/archive".into(),
             receiver_path: "/home/backup/.local/libexec/syq-receiver".into(),
+            receipt_public_key: None,
         };
         complete_local_enrollment(&directory, &metadata).unwrap();
         assert!(!directory.join("pending.json").exists());
@@ -3396,6 +3542,32 @@ mod tests {
             guard: None,
         };
         assert!(authority.authorize(&mut write, false).is_err());
+    }
+
+    #[test]
+    fn exact_destination_observation_scope_excludes_its_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 4);
+        let destination = root.join("target").as_os_str().as_bytes().to_vec();
+        let parent = root.as_os_str().as_bytes().to_vec();
+
+        let mut exact = Request::StatMany {
+            paths: vec![destination],
+            follow: false,
+            guard: None,
+        };
+        authority.authorize(&mut exact, false).unwrap();
+
+        let mut parent = Request::Canonicalize {
+            path: parent,
+            guard: None,
+        };
+        let error = authority.authorize(&mut parent, false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("observation is outside the signed destination scopes"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ fn direct_command(
     rsh: &[String],
     user: Option<&str>,
     host: &str,
+    port: Option<u16>,
     remote_cmd: &str,
     default_ssh_forward_agent: Option<&AgentForwarding>,
 ) -> Command {
@@ -59,6 +60,9 @@ fn direct_command(
         if let Some(user) = user {
             cmd.args(["-l", user]);
         }
+        if let Some(port) = port {
+            cmd.args(["-p", &port.to_string()]);
+        }
         cmd.arg("--");
     } else if let Some(user) = user {
         cmd.args(["-l", user]);
@@ -97,11 +101,11 @@ fn destination_rsh(
         // agent, but does not require host-bound authentication from OpenSSH
         // versions that predate the constrained broker's 8.9 floor.
         Some(AgentForwarding::Unrestricted) => {
-            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no".into())
+            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no".to_owned())
         }
         // With no forwarded agent, preserve hostA's own IdentityAgent and
         // authentication configuration while preventing another forwarding hop.
-        Some(AgentForwarding::Disabled) | None => Some("ssh -a".into()),
+        Some(AgentForwarding::Disabled) | None => Some("ssh -a".to_owned()),
     }
 }
 
@@ -199,10 +203,18 @@ fn endpoint_arg(
     } else {
         host.to_string()
     };
-    match login_user.or(location.user.as_deref()) {
+    let endpoint = match login_user.or(location.user.as_deref()) {
         Some(user) => format!("{user}@{host}"),
         None => host,
+    };
+    match location.port {
+        Some(port) => format!("{endpoint}:{port}"),
+        None => endpoint,
     }
+}
+
+fn endpoint_display(location: &Location) -> String {
+    endpoint_arg(location, None, None)
 }
 
 fn native_placement_arg(args: &Args) -> Result<&'static str> {
@@ -217,24 +229,79 @@ fn native_placement_arg(args: &Args) -> Result<&'static str> {
     })
 }
 
+fn detached_launcher_command(
+    remote_command: &str,
+    name: &str,
+    readiness_attempts: u32,
+    termination_attempts: u32,
+) -> String {
+    format!(
+        "mkdir -p \"$HOME/.syq\" && [ -x /bin/kill ] || {{ echo 'syq: detached launch requires /bin/kill for process-group cleanup' >&2; exit 1; }}; log=\"$HOME/.syq/{name}-$(date +%Y%m%d-%H%M%S)-$$.log\" && ready=\"$log.ready\" && rm -f -- \"$ready\" && {{ terminate_group() {{ /bin/kill -TERM -- \"-$pid\" 2>/dev/null || :; j=0; while /bin/kill -0 -- \"-$pid\" 2>/dev/null && [ \"$j\" -lt {termination_attempts} ]; do j=$((j + 1)); sleep 1; done; if /bin/kill -0 -- \"-$pid\" 2>/dev/null; then /bin/kill -KILL -- \"-$pid\" 2>/dev/null || :; fi; wait \"$pid\" 2>/dev/null || :; j=0; while /bin/kill -0 -- \"-$pid\" 2>/dev/null && [ \"$j\" -lt {termination_attempts} ]; do j=$((j + 1)); sleep 1; done; ! /bin/kill -0 -- \"-$pid\" 2>/dev/null; }}; SYQ_INTERNAL_DETACH_READY=\"$ready\" setsid nohup sh -c {} > \"$log\" 2>&1 < /dev/null & pid=$!; i=0; while [ \"$i\" -lt {readiness_attempts} ]; do if [ -f \"$ready\" ]; then rm -f -- \"$ready\"; echo \"$log\"; exit 0; fi; if ! kill -0 \"$pid\" 2>/dev/null; then wait \"$pid\"; status=$?; cat -- \"$log\" >&2; exit \"$status\"; fi; i=$((i + 1)); sleep 1; done; if ! terminate_group; then rm -f -- \"$ready\"; cat -- \"$log\" >&2; echo 'syq: could not terminate timed-out detached coordinator process group' >&2; exit 1; fi; rm -f -- \"$ready\"; cat -- \"$log\" >&2; echo 'syq: detached coordinator did not become ready within {readiness_attempts} seconds' >&2; exit 1; }}",
+        shell_words::quote(remote_command)
+    )
+}
+
 pub fn run(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
     source_operand_count: usize,
 ) -> Result<i32> {
+    run_remote(args, srcs, dst, source_operand_count, false)
+}
+
+pub fn run_at_target(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    source_operand_count: usize,
+) -> Result<i32> {
+    if args.interface == Interface::Rsync {
+        bail!("--run-at target is available only through native copy syntax");
+    }
+    if !srcs[0].same_host(dst)
+        && args.rsh.is_none()
+        && !args.no_forward_agent
+        && !args.unrestricted_agent_forwarding
+        && !args.agent_broker_only
+    {
+        bail!(
+            "--run-at target requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with target-host credentials, or an explicit --rsh policy"
+        );
+    }
+    run_remote(args, srcs, dst, source_operand_count, true)
+}
+
+fn run_remote(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    source_operand_count: usize,
+    coordinator_at_target: bool,
+) -> Result<i32> {
+    match args.native_results.as_deref() {
+        Some(b"-") if args.detach => bail!(
+            "--results cannot be used with --detach because the remote result stream would not remain attached"
+        ),
+        Some(b"-") | None => {}
+        Some(_) => bail!(
+            "a remote transfer coordinator accepts only --results -; use --run-at local to create a named results file"
+        ),
+    }
     let rsh = parse_rsh(&args.rsh)?;
-    let src_host = srcs[0].host.clone().unwrap();
+    let coordinator = if coordinator_at_target { dst } else { &srcs[0] };
+    let peer = if coordinator_at_target { &srcs[0] } else { dst };
+    let coordinator_host = coordinator.host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
     if args.detach && args.rsh.is_none() && !same_host && !args.no_forward_agent {
         bail!(
-            "a constrained agent exists only while syq is attached; --detach requires --no-forward-agent and credentials on {src_host}, or an explicit --rsh policy"
+            "a constrained agent exists only while syq is attached; --detach requires --no-forward-agent and credentials on {coordinator_host}, or an explicit --rsh policy"
         );
     }
 
     let mut broker_guard = None;
-    let mut destination_login_user = None;
-    let mut destination_connection_host = None;
+    let mut peer_login_user = None;
+    let mut peer_connection_host = None;
     let mut constrained_rsh = None;
     let mut restricted_destination_path = None;
     let mut restricted_grant = None;
@@ -245,35 +312,37 @@ pub fn run(
     } else if args.unrestricted_agent_forwarding {
         Some(AgentForwarding::Unrestricted)
     } else {
-        let source_policy = crate::agent_broker::resolve_host_policy(
+        let coordinator_policy = crate::agent_broker::resolve_host_policy_at(
             &rsh[0],
-            srcs[0].user.as_deref(),
-            &src_host,
+            coordinator.user.as_deref(),
+            &coordinator_host,
+            coordinator.port,
             false,
         )?;
-        let destination_policy = crate::agent_broker::resolve_host_policy(
+        let peer_policy = crate::agent_broker::resolve_host_policy_at(
             &rsh[0],
-            dst.user.as_deref(),
-            dst.host.as_deref().unwrap(),
+            peer.user.as_deref(),
+            peer.host.as_deref().unwrap(),
+            peer.port,
             args.agent_broker_only,
         )?;
-        destination_login_user = Some(destination_policy.login_user.clone());
-        destination_connection_host = Some(destination_policy.connection_host().to_owned());
+        peer_login_user = Some(peer_policy.login_user.clone());
+        peer_connection_host = Some(peer_policy.connection_host().to_owned());
         constrained_rsh = Some(constrained_destination_rsh(
-            destination_policy.port(),
-            &destination_policy.host_key_algorithms(),
+            peer_policy.port(),
+            &peer_policy.host_key_algorithms(),
         ));
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
         // form instead of silently keeping only the constrained broker.
-        let prepared = (!args.agent_broker_only)
+        let prepared = (!coordinator_at_target && !args.agent_broker_only)
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
                     srcs,
                     dst,
-                    &source_policy.login_user,
-                    &destination_policy.login_user,
+                    &coordinator_policy.login_user,
+                    &peer_policy.login_user,
                     automatic_enrollment_allowed(args.dry_run, args.verify_only),
                 )
             })
@@ -281,7 +350,7 @@ pub fn run(
             .context(
                 "prepare command-restricted destination enrollment; use --agent-broker-only to explicitly request authentication-only confinement",
             )?;
-        let policy = crate::agent_broker::BrokerPolicy::new(source_policy, destination_policy);
+        let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
         let limit = broker_connection_limit(args.connections_opt, args.connections)?;
         let broker = if let Some(prepared) = prepared {
             restricted_destination_path = Some(prepared.canonical_destination);
@@ -318,14 +387,13 @@ pub fn run(
         );
     }
     // The follow target must reconnect the way we did: keep an explicit user.
-    let src_target = match &srcs[0].user {
-        Some(user) => format!("{user}@{src_host}"),
-        None => src_host.clone(),
-    };
+    let coordinator_target = endpoint_display(coordinator);
+    let source_target = endpoint_display(&srcs[0]);
     let spec = crate::conn::RemoteSpec {
         local_process: false,
-        user: srcs[0].user.clone(),
-        host: src_host.clone(),
+        user: coordinator.user.clone(),
+        host: coordinator_host.clone(),
+        port: coordinator.port,
         rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
         syq_path: args.syq_path.clone(),
         auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
@@ -449,42 +517,53 @@ pub fn run(
     if let Some(n) = args.max_delete {
         remote.push(format!("--max-delete={n}"));
     }
+    if args.native_results.is_some() {
+        // run_remote accepts only stdout above. The outer SSH process inherits
+        // stdout, so the NDJSON stream and its terminal record reach the
+        // original caller without assigning surprising remote path semantics.
+        remote.push("--results".into());
+        remote.push("-".into());
+    }
+    if args.no_bootstrap {
+        remote.push("--no-bootstrap".into());
+    }
+    if args.no_tcp {
+        remote.push("--no-tcp".into());
+    }
+    if args.tcp_plain {
+        remote.push("--tcp-plain".into());
+    }
+    if let Some(algorithm) = &args.tcp_congestion {
+        remote.push(format!("--tcp-congestion={algorithm}"));
+    }
+    remote.push(format!("--tcp-ports={}", args.tcp_ports));
+    if let Some(path) = &args.syq_path {
+        remote.push(format!("--syq-path={path}"));
+    }
+    if let Some(remote_shell) = destination_rsh(
+        args.rsh.as_deref(),
+        same_host,
+        default_ssh_agent_policy.as_ref(),
+        constrained_rsh.as_deref(),
+    ) {
+        remote.push(if args.interface == Interface::Rsync {
+            "-e".into()
+        } else {
+            "--rsh".into()
+        });
+        remote.push(remote_shell);
+    }
     if args.interface == Interface::Rsync {
-        if args.no_bootstrap {
-            remote.push("--no-bootstrap".into());
-        }
-        if args.no_tcp {
-            remote.push("--no-tcp".into());
-        }
-        if args.tcp_plain {
-            remote.push("--tcp-plain".into());
-        }
         if let Some(grant) = &restricted_grant {
             remote.push(format!("--restricted-grant={grant}"));
         }
-        if let Some(algorithm) = &args.tcp_congestion {
-            remote.push(format!("--tcp-congestion={algorithm}"));
-        }
-        remote.push(format!("--tcp-ports={}", args.tcp_ports));
         if args.dry_run {
-            remote.push(format!("--plan-source-host={src_target}"));
+            remote.push(format!("--plan-source-host={source_target}"));
         }
         remote.push(format!(
             "--direct-source-operand-count={source_operand_count}"
         ));
         remote.push("--direct-sources-prededuplicated".into());
-        if let Some(p) = &args.syq_path {
-            remote.push(format!("--syq-path={p}"));
-        }
-        if let Some(e) = destination_rsh(
-            args.rsh.as_deref(),
-            same_host,
-            default_ssh_agent_policy.as_ref(),
-            constrained_rsh.as_deref(),
-        ) {
-            remote.push("-e".into());
-            remote.push(e);
-        }
     }
     if args.progress_json && !args.quiet {
         remote.push("--progress-json".into());
@@ -520,7 +599,7 @@ pub fn run(
                 format!("./{dst_path}")
             }
         } else {
-            let host = destination_connection_host
+            let host = peer_connection_host
                 .as_deref()
                 .unwrap_or_else(|| dst.host.as_deref().unwrap());
             let host = if host.contains(':') {
@@ -528,13 +607,21 @@ pub fn run(
             } else {
                 host.to_owned()
             };
-            match destination_login_user.as_deref().or(dst.user.as_deref()) {
+            match peer_login_user.as_deref().or(dst.user.as_deref()) {
                 Some(user) => format!("{user}@{host}:{dst_path}"),
                 None => format!("{host}:{dst_path}"),
             }
         };
         remote.push(dst_arg);
     } else {
+        if coordinator_at_target && !same_host {
+            remote.push("--from".into());
+            remote.push(endpoint_arg(
+                &srcs[0],
+                peer_login_user.as_deref(),
+                peer_connection_host.as_deref(),
+            ));
+        }
         for source in srcs {
             remote.push(
                 match source.selection {
@@ -549,12 +636,12 @@ pub fn run(
             );
             remote.push(utf8_path(&source.path, "source path", args.interface)?);
         }
-        if !srcs[0].same_host(dst) {
+        if !coordinator_at_target && !srcs[0].same_host(dst) {
             remote.push("--to".into());
             remote.push(endpoint_arg(
                 dst,
-                destination_login_user.as_deref(),
-                destination_connection_host.as_deref(),
+                peer_login_user.as_deref(),
+                peer_connection_host.as_deref(),
             ));
         }
         remote.push(native_placement_arg(args)?.into());
@@ -567,7 +654,12 @@ pub fn run(
 
     if args.detach {
         // Detached: log JSON progress instead of a live display.
-        remote.retain(|a| a != "--progress" && !a.starts_with("--width="));
+        remote.retain(|a| {
+            a != "--progress"
+                && a != "--no-progress"
+                && a != "--progress-json"
+                && !a.starts_with("--width=")
+        });
         remote.insert(1, "--no-progress".into());
         remote.insert(1, "--progress-json".into());
         remote.insert(1, "-v".into());
@@ -589,15 +681,10 @@ pub fn run(
             internal_environment.push(("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT", grant.clone()));
         }
         if args.dry_run {
-            internal_environment.push(("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST", src_target.clone()));
-        }
-        if let Some(rsh) = destination_rsh(
-            args.rsh.as_deref(),
-            same_host,
-            default_ssh_agent_policy.as_ref(),
-            constrained_rsh.as_deref(),
-        ) {
-            internal_environment.push(("SYQ_INTERNAL_NATIVE_RSH", rsh));
+            internal_environment.push((
+                "SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST",
+                coordinator_target.clone(),
+            ));
         }
         if !args.no_progress && !args.quiet && std::io::stderr().is_terminal() {
             internal_environment.push((
@@ -646,10 +733,7 @@ pub fn run(
         } else {
             name
         };
-        format!(
-            "mkdir -p \"$HOME/.syq\" && log=\"$HOME/.syq/{name}-$(date +%Y%m%d-%H%M%S).log\" && (setsid nohup sh -c {} > \"$log\" 2>&1 < /dev/null &) && echo \"$log\"",
-            shell_words::quote(&remote_cmd)
-        )
+        detached_launcher_command(&remote_cmd, &name, 30, 5)
     } else {
         remote_cmd
     };
@@ -657,15 +741,16 @@ pub fn run(
     let make_command = || {
         direct_command(
             &rsh,
-            srcs[0].user.as_deref(),
-            &src_host,
+            coordinator.user.as_deref(),
+            &coordinator_host,
+            coordinator.port,
             &remote_cmd,
             default_ssh_agent_policy.as_ref(),
         )
     };
     if args.unrestricted_agent_forwarding {
         eprintln!(
-            "syq: warning: --unrestricted-agent-forwarding exposes every capability in your SSH agent to {src_host} for this transfer"
+            "syq: warning: --unrestricted-agent-forwarding exposes every capability in your SSH agent to {coordinator_host} for this transfer"
         );
     }
     if args.detach {
@@ -683,23 +768,30 @@ pub fn run(
         }
         let log = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !out.status.success() || log.is_empty() {
-            bail!("could not start detached transfer on {src_host}");
+            bail!("could not start detached transfer on {coordinator_host}");
         }
         // The handoff is the command's result, not chatter: -q trims it to
         // the bare follow target rather than suppressing it.
         if args.quiet {
-            println!("{src_target}:{log}");
+            println!("{coordinator_target}:{log}");
         } else {
-            println!("syq: started on {src_target}, log {log}");
-            println!("syq: follow with:  syq rsync --follow {src_target}:{log}");
+            println!("syq: started on {coordinator_target}, log {log}");
+            let remote_shell = args
+                .rsh
+                .as_deref()
+                .map(|rsh| format!(" -e {}", shell_words::quote(rsh)))
+                .unwrap_or_default();
+            println!(
+                "syq: follow with:  syq rsync{remote_shell} --follow {coordinator_target}:{log}"
+            );
         }
         return Ok(0);
     }
     if !args.quiet {
         if args.interface == Interface::Rsync {
-            eprintln!("syq: remote-to-remote: running on {src_host} (use --relay to route data through this machine)");
+            eprintln!("syq: remote-to-remote: running on {coordinator_host} (use --relay to route data through this machine)");
         } else {
-            eprintln!("syq: remote-to-remote: running on {src_host}");
+            eprintln!("syq: remote-to-remote: running on {coordinator_host}");
         }
     }
     let run = || {
@@ -736,16 +828,16 @@ pub fn run(
                 && !same_host
             {
                 if args.interface == Interface::Rsync {
-                    bail!("remote-to-remote transfer on {src_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Retry with --relay, use --no-forward-agent with source-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", destination_login_user.as_deref().unwrap_or("the destination user"), dst.host.as_deref().unwrap_or("the destination"))
+                    bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Retry with --relay, use --no-forward-agent with coordinator-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
                 }
-                bail!("remote-to-remote transfer on {src_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --no-forward-agent with source-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", destination_login_user.as_deref().unwrap_or("the destination user"), dst.host.as_deref().unwrap_or("the destination"))
+                bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --no-forward-agent with coordinator-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
             }
             if args.interface == Interface::Rsync {
-                bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
+                bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); if {coordinator_host} cannot reach the destination, retry with --relay")
             }
-            bail!("remote-to-remote transfer on {src_host} failed (exit {c}); {src_host} may not be able to reach the destination")
+            bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); {coordinator_host} may not be able to reach the peer endpoint")
         }
-        None => bail!("remote syq on {src_host} killed by signal"),
+        None => bail!("remote syq on {coordinator_host} killed by signal"),
     }
 }
 
@@ -765,7 +857,7 @@ pub fn follow(args: &Args) -> Result<i32> {
         .paths
         .first()
         .ok_or_else(|| anyhow::anyhow!("usage: syq rsync --follow HOST:LOGFILE"))?;
-    let loc = Location::parse(target)?;
+    let loc = parse_follow_location(target)?;
     let (Some(host), log) = (&loc.host, &loc.path) else {
         bail!("usage: syq rsync --follow HOST:LOGFILE")
     };
@@ -775,6 +867,12 @@ pub fn follow(args: &Args) -> Result<i32> {
     cmd.args(&rsh[1..]);
     if let Some(u) = &loc.user {
         cmd.args(["-l", u]);
+    }
+    if let Some(port) = loc.port {
+        if !rsh[0].ends_with("ssh") {
+            bail!("a follow target with an explicit port requires an ssh remote-shell command");
+        }
+        cmd.args(["-p", &port.to_string()]);
     }
     cmd.arg(host)
         .arg(format!("tail -n +1 -f {}", shell_words::quote(&log)));
@@ -841,6 +939,22 @@ pub fn follow(args: &Args) -> Result<i32> {
     Ok(0)
 }
 
+fn parse_follow_location(target: &str) -> Result<Location> {
+    if let Some(separator) = target.find(":/") {
+        let endpoint = &target[..separator];
+        if let Some(endpoint) = crate::cli::parse_native_endpoint(Some(endpoint))? {
+            return Ok(Location {
+                user: endpoint.user,
+                host: Some(endpoint.host),
+                port: endpoint.port,
+                path: target.as_bytes()[separator + 1..].to_vec(),
+                selection: crate::cli::SourceSelection::Rsync,
+            });
+        }
+    }
+    Location::parse(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,12 +965,69 @@ mod tests {
     }
 
     #[test]
+    fn follow_target_accepts_native_ports_and_ipv6() {
+        let location = parse_follow_location("alice@host:2222:/home/alice/run.log").unwrap();
+        assert_eq!(location.user.as_deref(), Some("alice"));
+        assert_eq!(location.host.as_deref(), Some("host"));
+        assert_eq!(location.port, Some(2222));
+        assert_eq!(location.path, b"/home/alice/run.log");
+
+        let location = parse_follow_location("[2001:db8::1]:2200:/tmp/run.log").unwrap();
+        assert_eq!(location.host.as_deref(), Some("2001:db8::1"));
+        assert_eq!(location.port, Some(2200));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_timeout_terminates_the_complete_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let pids = directory.path().join("pids");
+        let survived = directory.path().join("survived");
+        let remote_command = format!(
+            "trap '' TERM; (trap '' TERM; sleep 30; printf survived > {}) & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > {}; wait",
+            shell_words::quote(survived.to_str().unwrap()),
+            shell_words::quote(pids.to_str().unwrap()),
+        );
+        let launcher = detached_launcher_command(&remote_command, "timeout-test", 1, 1);
+        let output = Command::new("sh")
+            .args(["-c", &launcher])
+            .env("HOME", directory.path())
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("did not become ready within 1 seconds"),
+            "{stderr}"
+        );
+        let process_ids: Vec<i32> = std::fs::read_to_string(pids)
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        assert_eq!(process_ids.len(), 2);
+        let alive: Vec<i32> = process_ids
+            .into_iter()
+            .filter(|pid| unsafe { libc::kill(*pid, 0) == 0 })
+            .collect();
+        for pid in &alive {
+            unsafe {
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+        assert!(alive.is_empty(), "detached processes survived: {alive:?}");
+        assert!(!survived.exists());
+    }
+
+    #[test]
     fn default_ssh_controls_agent_forwarding_explicitly() {
         let rsh = vec!["ssh".to_string(), "-p".to_string(), "2222".to_string()];
         let forwarded = direct_command(
             &rsh,
             Some("alice"),
             "source",
+            None,
             "syq ...",
             Some(&AgentForwarding::Unrestricted),
         );
@@ -868,6 +1039,7 @@ mod tests {
             &rsh,
             Some("alice"),
             "source",
+            None,
             "syq ...",
             Some(&AgentForwarding::Disabled),
         );
@@ -883,7 +1055,7 @@ mod tests {
             ambient: "/tmp/ambient-agent".into(),
             broker: "/tmp/syq-agent".into(),
         };
-        let command = direct_command(&rsh, None, "source", "syq ...", Some(&policy));
+        let command = direct_command(&rsh, None, "source", None, "syq ...", Some(&policy));
         let args = args(&command);
         assert!(args.contains(&OsStr::new("IdentityAgent=/tmp/ambient-agent")));
         assert!(args.contains(&OsStr::new("ForwardAgent=/tmp/syq-agent")));
@@ -942,6 +1114,10 @@ mod tests {
             Some("custom-rsh".into())
         );
         assert_eq!(
+            destination_rsh(Some("ssh -J jump"), false, None, None),
+            Some("ssh -J jump".into())
+        );
+        assert_eq!(
             destination_rsh(None, true, Some(&constrained), Some(&hardened)),
             None
         );
@@ -973,12 +1149,20 @@ mod tests {
             endpoint_arg(&destination, Some("backup"), Some("2001:db8::1")),
             "backup@[2001:db8::1]"
         );
+        let destination = Location {
+            port: Some(2200),
+            ..destination
+        };
+        assert_eq!(
+            endpoint_arg(&destination, Some("backup"), Some("vault.internal")),
+            "backup@vault.internal:2200"
+        );
     }
 
     #[test]
     fn explicit_ssh_does_not_get_agent_flags() {
         let rsh = vec!["ssh".to_string(), "-a".to_string()];
-        let command = direct_command(&rsh, None, "source", "syq ...", None);
+        let command = direct_command(&rsh, None, "source", None, "syq ...", None);
         let args = args(&command);
         assert!(!args.contains(&OsStr::new("-A")));
         assert_eq!(
@@ -990,7 +1174,7 @@ mod tests {
     #[test]
     fn custom_remote_shell_does_not_get_ssh_agent_flags() {
         let rsh = vec!["custom-rsh".to_string()];
-        let command = direct_command(&rsh, None, "source", "syq ...", None);
+        let command = direct_command(&rsh, None, "source", None, "syq ...", None);
         let args = args(&command);
         assert!(!args.contains(&OsStr::new("-a")));
         assert!(!args.contains(&OsStr::new("-A")));

@@ -39,6 +39,21 @@ pub enum SourceSelection {
     Directory,
 }
 
+/// Endpoint that owns the transfer coordinator for a native copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum RunAt {
+    /// Preserve the existing behavior: run locally unless both endpoints are
+    /// remote, then run at the source when possible.
+    #[default]
+    Auto,
+    /// Run the coordinator at the source endpoint.
+    Source,
+    /// Run the coordinator at the target endpoint.
+    Target,
+    /// Keep the coordinator on the invoking machine.
+    Local,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "syq rsync",
@@ -67,7 +82,7 @@ pub struct Args {
     /// Endpoint-side containment boundary for native removal.
     #[arg(skip)]
     pub native_rm_root: Option<Vec<u8>>,
-    /// Permit symlinks while resolving directly supplied native endpoint paths.
+    /// Permit symlinks that must be traversed in directly supplied native paths.
     #[arg(skip)]
     pub native_follow: bool,
     /// Source-side base for `syq map` selectors, joined at walk time so the
@@ -85,6 +100,9 @@ pub struct Args {
     /// `--results` NDJSON outcome stream for native cp (`-` writes stdout).
     #[arg(skip)]
     pub native_results: Option<Vec<u8>>,
+    /// Native coordinator placement. Rsync-shaped commands retain `--relay`.
+    #[arg(skip)]
+    pub run_at: RunAt,
 
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
@@ -546,13 +564,13 @@ fn print_root_help() {
 
 #[derive(clap::Args, Debug)]
 struct NativeSelectionArgs {
-    /// Source endpoint ([USER@]HOST); omitted means local
+    /// Source endpoint ([USER@]HOST[:PORT]); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     from: Option<String>,
     /// Resolve relative source selectors from DIR at the source endpoint
     #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
     cwd: Option<OsString>,
-    /// Follow symlinks while resolving directly supplied endpoint paths
+    /// Follow symlinks that must be traversed in directly supplied endpoint paths
     #[arg(long)]
     follow: bool,
     /// Select a named source object (repeatable)
@@ -586,7 +604,7 @@ struct NativeSelectionArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeRmSelectionArgs {
-    /// Source endpoint ([USER@]HOST); omitted means local
+    /// Source endpoint ([USER@]HOST[:PORT]); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     from: Option<String>,
     /// Resolve relative selectors from DIR at the source endpoint
@@ -601,7 +619,7 @@ struct NativeRmSelectionArgs {
     /// Confine resolution and removal beneath DIR
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     root: Option<OsString>,
-    /// Follow symlinks while resolving directly supplied endpoint paths
+    /// Follow symlinks that must be traversed in directly supplied endpoint paths
     #[arg(long)]
     follow: bool,
     /// Select an object without constraining the selected object's type (repeatable)
@@ -697,6 +715,57 @@ struct NativeCopyOperationalArgs {
     max_runtime: Option<String>,
 }
 
+#[derive(clap::Args, Debug, Default)]
+struct NativeRemoteArgs {
+    /// Choose the endpoint that runs the coordinator
+    #[arg(long, value_enum, default_value_t = RunAt::Auto)]
+    run_at: RunAt,
+    /// Remote shell command (default: ssh); the command owns SSH and agent policy when set
+    #[arg(long = "rsh", value_name = "COMMAND")]
+    rsh: Option<String>,
+    /// Use this exact syq executable on remote endpoints instead of the managed helper
+    #[arg(long, value_name = "PATH")]
+    syq_path: Option<String>,
+    /// Require syq on each remote PATH instead of installing a versioned helper
+    #[arg(long)]
+    no_bootstrap: bool,
+    /// Use TCP data connections without encryption (trusted networks only)
+    #[arg(long)]
+    tcp_plain: bool,
+    /// Send file data through SSH rather than separate TCP data connections
+    #[arg(long)]
+    no_tcp: bool,
+    /// Port range remote listeners use for TCP data connections
+    #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
+    tcp_ports: String,
+    /// Use this congestion-control algorithm for direct TCP data sockets (Linux only)
+    #[arg(
+        long,
+        value_name = "ALGO",
+        value_parser = parse_tcp_congestion,
+        conflicts_with = "no_tcp"
+    )]
+    tcp_congestion: Option<String>,
+    /// Run a remote-to-remote transfer detached at its coordinator
+    #[arg(long)]
+    detach: bool,
+    /// Give a remote coordinator no forwarded agent; it must own credentials for the peer
+    #[arg(long, conflicts_with = "rsh")]
+    no_forward_agent: bool,
+    /// Expose the complete local SSH agent to a live remote coordinator
+    #[arg(
+        long,
+        conflicts_with_all = ["rsh", "no_forward_agent", "detach"]
+    )]
+    unrestricted_agent_forwarding: bool,
+    /// Use destination-bound authentication without a command-restricted enrollment
+    #[arg(
+        long,
+        conflicts_with_all = ["rsh", "no_forward_agent", "unrestricted_agent_forwarding", "detach"]
+    )]
+    agent_broker_only: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum NativePreserve {
     Permissions,
@@ -708,7 +777,7 @@ enum NativePreserve {
 struct NativeCopyFields {
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Target endpoint ([USER@]HOST); omitted means local
+    /// Target endpoint ([USER@]HOST[:PORT]); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
     /// Put selected names inside DIR, creating it if necessary
@@ -735,7 +804,7 @@ struct NativeCopyFields {
         allow_hyphen_values = true
     )]
     into_existing: Option<OsString>,
-    /// Map one named source exactly to PATH
+    /// Map one named source exactly to PATH; never follow its final entry
     #[arg(
         long,
         value_name = "PATH",
@@ -743,7 +812,7 @@ struct NativeCopyFields {
         allow_hyphen_values = true
     )]
     r#as: Option<OsString>,
-    /// Map one named source exactly to PATH, which must not exist
+    /// Map one named source exactly to PATH; its final entry must not exist and is never followed
     #[arg(
         long,
         value_name = "PATH",
@@ -751,7 +820,7 @@ struct NativeCopyFields {
         allow_hyphen_values = true
     )]
     as_new: Option<OsString>,
-    /// Map one named source exactly to PATH, which must exist
+    /// Map one named source exactly to PATH; its final entry must exist and is never followed
     #[arg(
         long,
         value_name = "PATH",
@@ -765,8 +834,8 @@ struct NativeCopyFields {
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     mapping: Option<OsString>,
     /// Write the machine-readable NDJSON result stream to FILE; `-` writes
-    /// it to stdout and suppresses human stdout output. Automation schema
-    /// version 1
+    /// it to stdout and suppresses human stdout output. A named file
+    /// requires a local coordinator. Automation schema version 1
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     results: Option<OsString>,
     /// Keep the ssh control connection alive for 5 minutes after the run and
@@ -801,6 +870,8 @@ struct NativeCopyCommand {
     copy: NativeCopyFields,
     #[command(flatten)]
     size_selection: NativeSizeSelectionArgs,
+    #[command(flatten)]
+    remote: NativeRemoteArgs,
     /// After copying, remove target-only objects in mapped directory scopes;
     /// ignored and size-excluded source paths remain protected
     #[arg(long, conflicts_with = "mapping")]
@@ -848,7 +919,7 @@ fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
 fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     let mut full_argv = vec![OsString::from(command_label(interface))];
     full_argv.extend_from_slice(argv);
-    let (mut parsed, matches, prune, max_delete, size_selection) =
+    let (mut parsed, remote, matches, prune, max_delete, size_selection) =
         if interface == Interface::NativeMap {
             let matches = NativeMapCommand::command()
                 .try_get_matches_from(full_argv)
@@ -856,6 +927,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             let parsed = NativeMapCommand::from_arg_matches(&matches)?;
             (
                 parsed.copy,
+                NativeRemoteArgs::default(),
                 matches,
                 false,
                 None,
@@ -868,12 +940,16 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
             (
                 parsed.copy,
+                parsed.remote,
                 matches,
                 parsed.prune,
                 parsed.max_delete,
                 parsed.size_selection,
             )
         };
+    if parsed.reuse_connection && remote.rsh.is_some() {
+        bail!("--reuse-connection cannot be used with --rsh");
+    }
     // `syq map` keeps `-C` out of selector paths so emitted `src` values stay
     // relative to it; the walk joins it back.
     let map_cwd = if interface == Interface::NativeMap {
@@ -1067,6 +1143,9 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         }
     }
     apply_native_copy_operational(&mut args, parsed.operational, &matches)?;
+    if interface != Interface::NativeMap {
+        apply_native_remote(&mut args, remote)?;
+    }
     if args.max_entries.is_some()
         || args.max_total_bytes.is_some()
         || args.max_runtime_secs.is_some()
@@ -1288,6 +1367,23 @@ fn apply_native_copy_operational(
     Ok(())
 }
 
+fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> {
+    args.run_at = remote.run_at;
+    args.rsh = remote.rsh;
+    args.syq_path = remote.syq_path;
+    args.no_bootstrap = remote.no_bootstrap;
+    args.tcp_plain = remote.tcp_plain;
+    args.no_tcp = remote.no_tcp;
+    crate::transfer::parse_ports(&remote.tcp_ports)?;
+    args.tcp_ports = remote.tcp_ports;
+    args.tcp_congestion = remote.tcp_congestion;
+    args.detach = remote.detach;
+    args.no_forward_agent = remote.no_forward_agent;
+    args.unrestricted_agent_forwarding = remote.unrestricted_agent_forwarding;
+    args.agent_broker_only = remote.agent_broker_only;
+    Ok(())
+}
+
 /// Direct remote-to-remote execution needs a few automatically derived engine
 /// controls on the source host. Keep them out of the native command grammar:
 /// they are carried by the internal launcher environment, so public native
@@ -1304,7 +1400,9 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
     };
     args.restricted_grant = utf8("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT")?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
-    args.rsh = utf8("SYQ_INTERNAL_NATIVE_RSH")?;
+    if let Some(rsh) = utf8("SYQ_INTERNAL_NATIVE_RSH")? {
+        args.rsh = Some(rsh);
+    }
     if let Some(width) = utf8("SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH")? {
         args.width = Some(
             width
@@ -1372,36 +1470,77 @@ pub(crate) fn native_basename(path: &[u8]) -> Option<&[u8]> {
     (!name.is_empty() && name != b"." && name != b"..").then_some(name)
 }
 
-fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<(Option<String>, String)>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeEndpoint {
+    pub(crate) user: Option<String>,
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
+}
+
+pub(crate) fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<NativeEndpoint>> {
     let Some(spec) = spec else {
         return Ok(None);
     };
-    let (user, host) = match spec.rsplit_once('@') {
-        Some((user, host)) if !user.is_empty() => (Some(user.to_string()), host),
+    let (user, authority) = match spec.rsplit_once('@') {
+        Some((user, authority)) if !user.is_empty() => (Some(user.to_string()), authority),
         Some(_) => bail!("empty user in endpoint {spec:?}"),
         None => (None, spec),
     };
-    let bracketed = host.starts_with('[') && host.ends_with(']');
-    if host.starts_with('[') != host.ends_with(']') {
-        bail!("mismatched brackets in endpoint {spec:?}");
+    if user.as_deref().is_some_and(|user| {
+        user.bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_whitespace() || matches!(byte, b'/' | b'@'))
+    }) {
+        bail!("invalid user in endpoint {spec:?}");
     }
-    if host.contains(':') && !bracketed {
-        bail!(
-            "endpoint {spec:?} contains `:`; pass paths separately and write IPv6 hosts in brackets"
-        );
-    }
-    let host = if bracketed {
-        &host[1..host.len() - 1]
+    let parse_port = |value: &str| -> Result<u16> {
+        let port = value
+            .parse::<u16>()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid SSH port in endpoint {spec:?}; pass paths separately with --cwd and source/placement arguments"
+                )
+            })?;
+        if port == 0 {
+            bail!("SSH port in endpoint {spec:?} must be between 1 and 65535");
+        }
+        Ok(port)
+    };
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("mismatched brackets in endpoint {spec:?}"))?;
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else if let Some(value) = suffix.strip_prefix(':') {
+            Some(parse_port(value)?)
+        } else {
+            bail!("unexpected text after bracketed host in endpoint {spec:?}");
+        };
+        (host, port)
+    } else if let Some((host, value)) = authority.rsplit_once(':') {
+        if host.contains(':') {
+            bail!("IPv6 host in endpoint {spec:?} must be enclosed in brackets");
+        }
+        (host, Some(parse_port(value)?))
     } else {
-        host
+        (authority, None)
     };
     if host.is_empty() {
         bail!("empty host in endpoint {spec:?}");
     }
-    if host.contains('/') {
-        bail!("endpoint {spec:?} contains a path; pass paths separately with --cwd and source/placement arguments");
+    if host
+        .bytes()
+        .any(|byte| byte == 0 || byte.is_ascii_whitespace() || matches!(byte, b'/' | b'[' | b']'))
+    {
+        bail!("invalid host in endpoint {spec:?}; pass paths separately with --cwd and source/placement arguments");
     }
-    Ok(Some((user, host.to_string())))
+    Ok(Some(NativeEndpoint {
+        user,
+        host: host.to_string(),
+        port,
+    }))
 }
 
 /// Read a --files-from list: one path per line (or NUL-separated with --from0),
@@ -1789,16 +1928,85 @@ mod tests {
     }
 
     #[test]
+    fn native_remote_controls_lower_to_the_shared_engine() {
+        let argv = [
+            "--run-at=target",
+            "--rsh=ssh -J jump",
+            "--syq-path=/opt/syq",
+            "--no-bootstrap",
+            "--no-tcp",
+            "--tcp-ports=49000-49010",
+            "--detach",
+            "source",
+            "--into",
+            "destination",
+        ]
+        .map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        assert_eq!(args.run_at, super::RunAt::Target);
+        assert_eq!(args.rsh.as_deref(), Some("ssh -J jump"));
+        assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
+        assert!(args.no_bootstrap);
+        assert!(args.no_tcp);
+        assert_eq!(args.tcp_ports, "49000-49010");
+        assert!(args.detach);
+    }
+
+    #[test]
+    fn native_reuse_connection_rejects_an_explicit_remote_shell() {
+        let argv = [
+            "--reuse-connection",
+            "--rsh=ssh -J jump",
+            "source",
+            "--into",
+            "destination",
+        ]
+        .map(std::ffi::OsString::from);
+        let error = parse_native_copy(&argv, Interface::NativeCp).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--reuse-connection cannot be used with --rsh"));
+    }
+
+    #[test]
     fn native_endpoints_are_separate_from_paths() {
         assert_eq!(
             parse_native_endpoint(Some("alice@example.test")).unwrap(),
-            Some((Some("alice".into()), "example.test".into()))
+            Some(super::NativeEndpoint {
+                user: Some("alice".into()),
+                host: "example.test".into(),
+                port: None,
+            })
         );
         assert_eq!(
             parse_native_endpoint(Some("[2001:db8::1]")).unwrap(),
-            Some((None, "2001:db8::1".into()))
+            Some(super::NativeEndpoint {
+                user: None,
+                host: "2001:db8::1".into(),
+                port: None,
+            })
+        );
+        assert_eq!(
+            parse_native_endpoint(Some("alice@example.test:2222")).unwrap(),
+            Some(super::NativeEndpoint {
+                user: Some("alice".into()),
+                host: "example.test".into(),
+                port: Some(2222),
+            })
+        );
+        assert_eq!(
+            parse_native_endpoint(Some("alice@[2001:db8::1]:2200")).unwrap(),
+            Some(super::NativeEndpoint {
+                user: Some("alice".into()),
+                host: "2001:db8::1".into(),
+                port: Some(2200),
+            })
         );
         assert!(parse_native_endpoint(Some("host:path")).is_err());
+        assert!(parse_native_endpoint(Some("2001:db8::1")).is_err());
+        assert!(parse_native_endpoint(Some("host:0")).is_err());
+        assert!(parse_native_endpoint(Some("host]:2222")).is_err());
+        assert!(parse_native_endpoint(Some("bad user@host")).is_err());
         assert!(parse_native_endpoint(Some("host/path")).is_err());
     }
 
@@ -1831,6 +2039,9 @@ mod tests {
 pub struct Location {
     pub user: Option<String>,
     pub host: Option<String>,
+    /// Explicit native endpoint SSH port. Rsync-shaped operands leave this to
+    /// ssh_config and therefore store no override here.
+    pub port: Option<u16>,
     /// Path as given (may be relative to the remote home).
     pub path: Vec<u8>,
     pub selection: SourceSelection,
@@ -1855,6 +2066,7 @@ impl Location {
             return Ok(Location {
                 user: None,
                 host: None,
+                port: None,
                 path: s.as_bytes().to_vec(),
                 selection: SourceSelection::Rsync,
             });
@@ -1882,25 +2094,27 @@ impl Location {
         Ok(Location {
             user,
             host: Some(host),
+            port: None,
             path,
             selection: SourceSelection::Rsync,
         })
     }
 
     fn native(
-        endpoint: Option<(Option<String>, String)>,
+        endpoint: Option<NativeEndpoint>,
         mut path: Vec<u8>,
         selection: SourceSelection,
     ) -> Location {
         while path.len() > 1 && path.ends_with(b"/") {
             path.pop();
         }
-        let (user, host) = endpoint
-            .map(|(user, host)| (user, Some(host)))
-            .unwrap_or((None, None));
+        let (user, host, port) = endpoint
+            .map(|endpoint| (endpoint.user, Some(endpoint.host), endpoint.port))
+            .unwrap_or((None, None, None));
         Location {
             user,
             host,
+            port,
             path,
             selection,
         }
@@ -1952,7 +2166,7 @@ impl Location {
     }
 
     pub fn same_host(&self, other: &Location) -> bool {
-        self.user == other.user && self.host == other.host
+        self.user == other.user && self.host == other.host && self.port == other.port
     }
 }
 

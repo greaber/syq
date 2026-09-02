@@ -788,7 +788,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
 }
 
 #[test]
-fn native_copy_placement_links_use_the_same_follow_policy() {
+fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
@@ -811,19 +811,33 @@ fn native_copy_placement_links_use_the_same_follow_policy() {
         "--as-existing",
         &t.s("exact-link"),
     ]);
-    assert_eq!(read(&t.path("referent")), b"new");
-    assert!(t.path("exact-link").is_symlink());
+    assert_eq!(read(&t.path("exact-link")), b"new");
+    assert_eq!(read(&t.path("referent")), b"old-again");
+    assert!(!t.path("exact-link").is_symlink());
 
-    symlink("created-referent", t.path("dangling-link")).unwrap();
+    symlink("never-created", t.path("dangling-existing-link")).unwrap();
     run_native_ok(&[
         "cp",
         "--follow",
         &t.s("source"),
-        "--as-new",
-        &t.s("dangling-link"),
+        "--as-existing",
+        &t.s("dangling-existing-link"),
     ]);
-    assert_eq!(read(&t.path("created-referent")), b"new");
-    assert!(t.path("dangling-link").is_symlink());
+    assert_eq!(read(&t.path("dangling-existing-link")), b"new");
+    assert!(!t.path("never-created").exists());
+
+    symlink("also-never-created", t.path("dangling-new-link")).unwrap();
+    let refused = native_syq(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-new",
+        &t.s("dangling-new-link"),
+    ]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("already exists"));
+    assert!(t.path("dangling-new-link").is_symlink());
+    assert!(!t.path("also-never-created").exists());
 
     fs::create_dir_all(t.path("links")).unwrap();
     write(&t.path("elsewhere/relative-referent"), b"old-relative");
@@ -839,8 +853,12 @@ fn native_copy_placement_links_use_the_same_follow_policy() {
         "--as-existing",
         &t.s("links/relative-link"),
     ]);
-    assert_eq!(read(&t.path("elsewhere/relative-referent")), b"new");
-    assert!(t.path("links/relative-link").is_symlink());
+    assert_eq!(read(&t.path("links/relative-link")), b"new");
+    assert_eq!(
+        read(&t.path("elsewhere/relative-referent")),
+        b"old-relative"
+    );
+    assert!(!t.path("links/relative-link").is_symlink());
 
     let absolute_referent = t.path("elsewhere/absolute-referent");
     write(&absolute_referent, b"old-absolute");
@@ -852,23 +870,54 @@ fn native_copy_placement_links_use_the_same_follow_policy() {
         "--as-existing",
         &t.s("links/absolute-link"),
     ]);
-    assert_eq!(read(&absolute_referent), b"new");
-    assert!(t.path("links/absolute-link").is_symlink());
+    assert_eq!(read(&t.path("links/absolute-link")), b"new");
+    assert_eq!(read(&absolute_referent), b"old-absolute");
+    assert!(!t.path("links/absolute-link").is_symlink());
 
     symlink(
-        "../elsewhere/created-external-referent",
+        "../elsewhere/never-created-external-referent",
         t.path("links/dangling-external-link"),
     )
     .unwrap();
-    run_native_ok(&[
+    let refused = native_syq(&[
         "cp",
         "--follow",
         &t.s("source"),
         "--as-new",
         &t.s("links/dangling-external-link"),
     ]);
-    assert_eq!(read(&t.path("elsewhere/created-external-referent")), b"new");
+    assert!(!refused.status.success());
     assert!(t.path("links/dangling-external-link").is_symlink());
+    assert!(!t.path("elsewhere/never-created-external-referent").exists());
+
+    fs::create_dir(t.path("real-parent")).unwrap();
+    symlink("real-parent", t.path("parent-link")).unwrap();
+    let refused = native_syq(&["cp", &t.s("source"), "--as", &t.s("parent-link/exact-name")]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(!t.path("real-parent/exact-name").exists());
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as",
+        &t.s("parent-link/exact-name"),
+    ]);
+    assert_eq!(read(&t.path("real-parent/exact-name")), b"new");
+
+    write(&t.path("source-tree/file"), b"tree");
+    symlink("source-tree", t.path("source-tree-link")).unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--src-dir",
+        &t.s("source-tree"),
+        "--as-existing",
+        &t.s("source-tree-link"),
+    ]);
+    assert!(!t.path("source-tree-link").is_symlink());
+    assert_eq!(read(&t.path("source-tree-link/file")), b"tree");
+    assert_eq!(read(&t.path("source-tree/file")), b"tree");
 
     fs::create_dir(t.path("real-container")).unwrap();
     symlink("real-container", t.path("container-link")).unwrap();
@@ -1082,19 +1131,17 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
 }
 
 #[test]
-fn native_rejects_transport_configuration() {
-    for option in ["--rsh", "--syq-path", "--no-tcp", "--relay"] {
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args(["cp", option, "value", "source", "--into", "target"])
-            .run()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(2), "{option}");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
-            "{option}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+fn native_keeps_rsync_only_relay_out_of_its_transport_surface() {
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--relay", "source", "--into", "target"])
+        .run()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -1575,6 +1622,34 @@ else
 fi
 export HOME PATH
 printf '%s\n' "$1" >> "$FAKE_RSH_LOG"
+exec /bin/sh -c "$1"
+"#,
+    );
+    path
+}
+
+/// An ssh-shaped fixture that records the connection arguments, including
+/// native endpoint ports and control-master policy, then runs the remote
+/// command locally.
+fn fake_ssh(t: &Tmp) -> PathBuf {
+    let path = t.path("bin/ssh");
+    executable(
+        &path,
+        br#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_RSH_LOG"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|-l|-p) shift 2 ;;
+        -a|-A|-x|-k|-T) shift ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+HOME="$FAKE_REMOTE_HOME"
+PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
+export HOME PATH
 exec /bin/sh -c "$1"
 "#,
     );
@@ -8053,8 +8128,9 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     let original_inode = fs::metadata(t.path("dst/keep")).unwrap().ino();
 
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
         .args([
-            "cp",
             "--from",
             "fake",
             "--follow",
@@ -8071,7 +8147,6 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             &t.s("dst"),
             "-q",
         ])
-        .env("SYQ_INTERNAL_NATIVE_RSH", rsh)
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -8103,6 +8178,493 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "source command omitted {option}: {log}"
         );
     }
+}
+
+#[test]
+fn native_run_at_target_reverses_the_remote_ssh_edge() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src/file"), b"pulled");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "--tcp-ports=49000-49002",
+            "-j",
+            "1",
+            "--from",
+            "hostA",
+            "--src-src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--run-at",
+            "target",
+            "--into",
+            &t.s("dst"),
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("run native pull through fake remote shell");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/file")), b"pulled");
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    let mut invocations = log.lines();
+    let target_command = invocations.next().expect("target coordinator launch");
+    assert!(target_command.contains("--from hostA"), "{target_command}");
+    assert!(target_command.contains("--no-tcp"), "{target_command}");
+    assert!(
+        target_command.contains("--tcp-ports=49000-49002"),
+        "{target_command}"
+    );
+    assert!(
+        invocations.next().is_some(),
+        "the target coordinator never opened the reversed edge to hostA: {log}"
+    );
+}
+
+#[test]
+fn native_target_dry_run_labels_the_real_endpoints_and_ports() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    write(&t.path("src/file"), b"planned");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&ssh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "--dry-run",
+            "--from",
+            "hostA:2200",
+            "--src-src",
+            &t.s("src"),
+            "--to",
+            "hostB:2222",
+            "--run-at",
+            "target",
+            "--into",
+            &t.s("dst"),
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("run target-side native dry-run");
+
+    assert_output_ok(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "mapping: hostA:2200:{} -> hostB:2222:{}",
+            t.s("src"),
+            t.s("dst")
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("-> hostA:2200:"), "{stdout}");
+    let ssh_log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        ssh_log.lines().any(|line| line.contains("-p 2222")),
+        "{ssh_log}"
+    );
+    assert!(
+        ssh_log.lines().any(|line| line.contains("-p 2200")),
+        "{ssh_log}"
+    );
+}
+
+#[test]
+fn native_auto_raw_path_relay_rejects_direct_only_controls() {
+    let mut raw_source = b"/source-".to_vec();
+    raw_source.push(0xff);
+    let raw_source = std::ffi::OsString::from_vec(raw_source);
+
+    for option in [
+        "--detach",
+        "--no-forward-agent",
+        "--agent-broker-only",
+        "--unrestricted-agent-forwarding",
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("cp")
+            .arg(option)
+            .args(["--from", "hostA", "--src"])
+            .arg(&raw_source)
+            .args(["--to", "hostB", "--as", "/target"])
+            .run()
+            .expect("reject a direct-only option before automatic relay");
+
+        assert!(!out.status.success(), "{option} unexpectedly succeeded");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains("direct"), "{option}: {stderr}");
+        assert!(
+            !stderr.contains("relaying raw path bytes"),
+            "{option} entered relay execution: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn native_remote_coordinator_streams_results_to_the_invoker() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"result stream");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--run-at",
+            "target",
+            "--as",
+            &t.s("dst"),
+            "--results",
+            "-",
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("stream target-coordinator results");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"result stream");
+    let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("results line is JSON"))
+        .collect();
+    assert_eq!(records.first().unwrap()["type"], "run");
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "success");
+    assert_eq!(terminal["exit_code"], 0);
+}
+
+#[test]
+fn native_named_results_require_a_local_coordinator() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"local results");
+
+    for placement in ["source", "target"] {
+        let destination = t.s(&format!("dst-{placement}"));
+        let results = t.s(&format!("results-{placement}.ndjson"));
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args([
+                "--from",
+                "hostA",
+                "--src",
+                &t.s("src"),
+                "--to",
+                "hostB",
+                "--run-at",
+                placement,
+                "--as",
+                &destination,
+                "--results",
+                &results,
+                "-q",
+            ])
+            .run()
+            .expect("reject a remote named results file");
+
+        assert!(!out.status.success(), "{placement} unexpectedly succeeded");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains("transfer coordinator"), "{stderr}");
+        assert!(stderr.contains("--results -"), "{stderr}");
+        assert!(stderr.contains("--run-at local"), "{stderr}");
+        assert!(!Path::new(&destination).exists());
+        assert!(!Path::new(&results).exists());
+    }
+
+    let results = t.s("results-local.ndjson");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--run-at",
+            "local",
+            "--as",
+            &t.s("dst-local"),
+            "--results",
+            &results,
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("write local-coordinator results");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst-local")), b"local results");
+    let terminal: serde_json::Value = fs::read_to_string(results)
+        .unwrap()
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "success");
+}
+
+#[test]
+fn native_detach_rejects_an_unattached_results_stream() {
+    let t = Tmp::new();
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--rsh",
+            "ssh",
+            "--detach",
+            "--from",
+            "hostA",
+            "--src",
+            "/source",
+            "--to",
+            "hostB",
+            "--as",
+            &t.s("dst"),
+            "--results",
+            "-",
+            "-q",
+        ])
+        .run()
+        .expect("reject detached streamed results");
+
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("result stream would not remain attached"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn native_run_at_local_relays_between_remote_endpoints() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src/file"), b"relayed");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--from",
+            "hostA",
+            "--src-src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--run-at",
+            "local",
+            "--into",
+            &t.s("dst"),
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("run native relay through fake remote shell");
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/file")), b"relayed");
+    assert!(
+        fs::read_to_string(t.path("rsh.log"))
+            .unwrap()
+            .lines()
+            .count()
+            >= 2,
+        "relay did not connect to both endpoints"
+    );
+}
+
+#[test]
+fn native_run_at_target_fails_closed_without_read_enrollment_support() {
+    let t = Tmp::new();
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--run-at",
+            "target",
+            "--into",
+            &t.s("dst"),
+        ])
+        .run()
+        .expect("reject unavailable default pull mode");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("read-restricted source enrollment"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn native_endpoint_port_reaches_ssh() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    write(&t.path("src"), b"first");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .arg("cp")
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            &t.s("src"),
+            "--to",
+            "backup.example:2222",
+            "--as",
+            &t.s("dst"),
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+        );
+    assert_output_ok(&command.run().unwrap());
+    assert_eq!(read(&t.path("dst")), b"first");
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(log.lines().all(|line| line.contains("-p 2222")), "{log}");
+
+    assert!(log.contains("ControlMaster=yes"), "{log}");
+    assert!(log.contains("ControlPersist=no"), "{log}");
+}
+
+#[test]
+fn native_detach_waits_for_coordinator_readiness() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"detached");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--detach",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--as",
+            &t.s("dst"),
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("launch detached native transfer");
+    assert_output_ok(&out);
+    let follow_target = String::from_utf8(out.stdout).unwrap();
+    assert!(follow_target.starts_with("hostA:"), "{follow_target}");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !t.path("dst").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(read(&t.path("dst")), b"detached");
+    let ready_files = fs::read_dir(t.path("remote-home/.syq"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".ready"))
+        .count();
+    assert_eq!(ready_files, 0, "launcher left its readiness marker behind");
+}
+
+#[test]
+fn native_detach_does_not_report_an_immediate_setup_failure_as_started() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let started = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "--detach",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("missing"),
+            "--to",
+            "hostB",
+            "--as",
+            &t.s("dst"),
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("reject failed detached launch");
+    assert!(!out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "failed launch returned a follow target"
+    );
+    assert!(stderr_of(&out).contains("source"), "{}", stderr_of(&out));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "immediate setup failure waited for the full readiness timeout"
+    );
+    assert!(!t.path("dst").exists());
 }
 
 // ----------------------------------------------------------- review round 13
@@ -9531,6 +10093,25 @@ fn reuse_connection_refused_for_direct_remote_to_remote() {
         stderr.contains("direct remote-to-remote"),
         "stderr: {stderr}"
     );
+
+    let out = native_syq(&[
+        "cp",
+        "--reuse-connection",
+        "--from",
+        "hostA",
+        "--src-src",
+        "src",
+        "--to",
+        "hostB",
+        "--run-at",
+        "target",
+        "--into",
+        "dst",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("remote transfer coordinator"), "{stderr}");
+    assert!(stderr.contains("--run-at local"), "{stderr}");
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{
-    parse_rsh, parse_size, Args, Existence, Interface, Location, Placement, SourceSelection,
+    parse_rsh, parse_size, Args, Existence, Interface, Location, Placement, RunAt, SourceSelection,
 };
 use crate::conn::{
     ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
@@ -16,6 +16,7 @@ use crate::tune::{self, Gate};
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -97,12 +98,18 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
         None => Endpoint::Local,
         Some(h) => {
             let rsh = parse_rsh(&args.rsh)?;
+            if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
+                bail!(
+                    "an explicit endpoint SSH port requires the default ssh or an --rsh command whose executable is ssh"
+                );
+            }
             let ssh_multiplexer = if args.rsh.is_some() {
                 None
             } else if args.reuse_connection && args.restricted_grant.is_none() {
                 Some(Arc::new(SshMultiplexer::persistent(
                     loc.user.as_deref(),
                     h,
+                    loc.port,
                 )?))
             } else {
                 Some(Arc::new(SshMultiplexer::new()?))
@@ -111,6 +118,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 local_process: false,
                 user: loc.user.clone(),
                 host: h.clone(),
+                port: loc.port,
                 rsh,
                 syq_path: args.syq_path.clone(),
                 auto_helper: args.restricted_grant.is_none()
@@ -466,6 +474,43 @@ fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum DestinationIdentityPlan {
+    /// The command-restricted enrollment already supplied the canonical
+    /// parent plus literal placement leaf. No receiver observation is needed.
+    Enrolled(std::path::PathBuf),
+    /// Canonicalize the complete destination spelling.
+    Canonicalize(PathBytes),
+    /// Canonicalize only the parent, then restore the literal placement leaf.
+    CanonicalizeParent {
+        parent: PathBytes,
+        exact_path: PathBytes,
+    },
+}
+
+fn destination_identity_plan(
+    exact_native_destination: bool,
+    restricted_receiver: bool,
+    operator_dst_root: &[u8],
+    destination_path: &[u8],
+) -> DestinationIdentityPlan {
+    if exact_native_destination && restricted_receiver {
+        // Direct setup replaces the public operand with the enrolled
+        // destination: a canonical parent plus its literal leaf. The signed
+        // grant binds these same absolute bytes. Asking the receiver to
+        // canonicalize the parent would both be unnecessary and exceed the
+        // exact destination's observation scope.
+        DestinationIdentityPlan::Enrolled(crate::fsops::resolve(destination_path))
+    } else if exact_native_destination {
+        DestinationIdentityPlan::CanonicalizeParent {
+            parent: parent_path(operator_dst_root),
+            exact_path: operator_dst_root.to_vec(),
+        }
+    } else {
+        DestinationIdentityPlan::Canonicalize(destination_path.to_vec())
+    }
+}
+
 /// Encode the content/metadata-affecting options into the job identity.
 fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
     let source_modes: Vec<&str> = srcs
@@ -503,13 +548,25 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
     flags.to_string()
 }
 
-/// The endpoint half of a job identity: `user@host` (the user matters — two
-/// accounts on one host see different destinations), or `local`.
+/// The endpoint half of a job identity: `user@host[:port]` (the user and an
+/// explicit port matter — they may select different filesystems), or `local`.
 fn endpoint_identity(l: &Location) -> String {
     match (&l.user, &l.host) {
         (_, None) => "local".into(),
-        (Some(u), Some(h)) => format!("{u}@{h}"),
-        (None, Some(h)) => h.clone(),
+        (user, Some(host)) => {
+            // Preserve the established portless identity byte-for-byte. A
+            // port-qualified native endpoint gets a distinct, unambiguous
+            // spelling; IPv6 needs brackets before the port separator.
+            let host = match l.port {
+                Some(port) if host.contains(':') => format!("[{host}]:{port}"),
+                Some(port) => format!("{host}:{port}"),
+                None => host.clone(),
+            };
+            match user {
+                Some(user) => format!("{user}@{host}"),
+                None => host,
+            }
+        }
     }
 }
 
@@ -667,6 +724,22 @@ fn handle_tcp_setup_error(
     Ok(())
 }
 
+fn announce_detached_ready() -> Result<()> {
+    let Some(path) = std::env::var_os("SYQ_INTERNAL_DETACH_READY") else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("create detached-readiness marker {}", path.display()))?;
+    use std::io::Write as _;
+    file.write_all(b"ready\n")?;
+    Ok(())
+}
+
 pub fn run(args: Args) -> Result<i32> {
     // The results stream and progress exist before anything else can fail,
     // so every run that got past argument parsing settles with a terminal
@@ -689,6 +762,33 @@ pub fn run(args: Args) -> Result<i32> {
             .map_err(|error| anyhow::anyhow!("--mapping: {error}"))?;
     }
     if let Some(results) = args.native_results.as_deref() {
+        // Topology refusals come before the stream exists: a refused run
+        // must not have created or truncated a results file. These mirror
+        // run_transfer's coordinator placement (native only — rsync never
+        // sets native_results).
+        if args.detach {
+            bail!(
+                "--results cannot be used with --detach because the remote result stream would not remain attached"
+            );
+        }
+        if results != b"-" && args.locations.len() >= 2 {
+            let source = &args.locations[0];
+            let dst = args.locations.last().expect("locations checked above");
+            let direct_paths_are_utf8 = args
+                .locations
+                .iter()
+                .all(|location| std::str::from_utf8(&location.path).is_ok());
+            let coordinator_is_remote = source.is_remote()
+                && dst.is_remote()
+                && !args.relay
+                && args.run_at != RunAt::Local
+                && (args.run_at != RunAt::Auto || direct_paths_are_utf8);
+            if coordinator_is_remote {
+                bail!(
+                    "--results FILE is written by the transfer coordinator, which is remote for this copy; use --results - to stream NDJSON here or --run-at local to create a local file"
+                );
+            }
+        }
         let out: Box<dyn std::io::Write + Send> = if results == b"-" {
             // The machine owns stdout: suppress every human stdout line.
             progress.suppress_stdout();
@@ -893,6 +993,59 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .map(|(_, sources)| sources)
         .unwrap_or(&[]);
     let (dst, original_srcs) = locs.split_last().unwrap();
+    let direct_paths_are_utf8 = original_srcs
+        .iter()
+        .chain(std::iter::once(dst))
+        .all(|location| std::str::from_utf8(&location.path).is_ok());
+    let coordinator_is_remote = original_srcs[0].is_remote()
+        && dst.is_remote()
+        && !args.relay
+        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
+        && (args.interface == Interface::Rsync
+            || args.run_at != RunAt::Auto
+            || direct_paths_are_utf8);
+    let direct_remote_to_remote = original_srcs[0].is_remote()
+        && dst.is_remote()
+        && !original_srcs[0].same_host(dst)
+        && !args.relay
+        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
+        // Native auto placement relays raw path bytes because they cannot be
+        // represented in the remote coordinator's argv. Validate direct-only
+        // controls against the topology that will actually run.
+        && (args.interface == Interface::Rsync
+            || args.run_at != RunAt::Auto
+            || direct_paths_are_utf8);
+    if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
+    {
+        bail!(
+            "--detach, --no-forward-agent, and --agent-broker-only apply only to a direct copy between two different remote endpoints"
+        );
+    }
+    if args.reuse_connection && coordinator_is_remote {
+        if args.interface == Interface::Rsync {
+            bail!(
+                "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
+            );
+        }
+        bail!(
+            "--reuse-connection is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
+        );
+    }
+    if args.detach && args.native_results.is_some() {
+        bail!(
+            "--results cannot be used with --detach because the remote result stream would not remain attached"
+        );
+    }
+    if args
+        .native_results
+        .as_deref()
+        .is_some_and(|results| results != b"-")
+        && coordinator_is_remote
+    {
+        bail!(
+            "--results FILE is written by the transfer coordinator, which is remote for this copy; use --results - to stream NDJSON here or --run-at local to create a local file"
+        );
+    }
     if args.restricted_grant.is_some()
         && (args.no_tcp
             || args.tcp_plain
@@ -909,12 +1062,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             bail!("all sources must be on the same host");
         }
     }
-    if args.unrestricted_agent_forwarding
-        && (!original_srcs[0].is_remote()
-            || !dst.is_remote()
-            || original_srcs[0].same_host(dst)
-            || args.relay)
-    {
+    if args.unrestricted_agent_forwarding && !direct_remote_to_remote {
         bail!(
             "--unrestricted-agent-forwarding is only valid for a live direct transfer between two different remote hosts"
         );
@@ -998,26 +1146,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         };
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
+        if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
+            args.relay = true;
+        }
+        if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
+            return crate::direct::run_at_target(&args, srcs, dst, source_operand_count);
+        }
         if !args.relay {
-            // The direct orchestrator runs on the source host and rebuilds
-            // the command; no direct leg holds a reusable local master, so
-            // refuse rather than silently ignore the flag. --relay keeps the
-            // orchestrator (and its persistent masters) on this machine.
-            if args.reuse_connection {
-                bail!(
-                    "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
-                );
-            }
-            let direct_paths_are_utf8 = srcs
-                .iter()
-                .chain(std::iter::once(dst))
-                .all(|location| std::str::from_utf8(&location.path).is_ok());
-            if args.interface == Interface::Rsync || direct_paths_are_utf8 {
-                if args.native_results.is_some() {
-                    bail!(
-                        "--results is not yet supported for direct remote-to-remote transfers: the orchestrator runs on the source host and cannot feed a local stream"
-                    );
-                }
+            if args.interface == Interface::Rsync
+                || direct_paths_are_utf8
+                || args.run_at == RunAt::Source
+            {
                 // Let the remote orchestrator observe the original source count so
                 // repeated file sources keep multi-source destination semantics.
                 return crate::direct::run(&args, srcs, dst, source_operand_count);
@@ -1031,6 +1170,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if args.relay && !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
+    } else if args.interface != Interface::Rsync && args.run_at != RunAt::Auto {
+        bail!("--run-at currently applies only to copies between two remote endpoints");
     }
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {
@@ -1326,18 +1467,42 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
     let operator_dst_root = clean_root(&dst.path);
-    let (dst_root_entry, dst_canonical) = stat_and_canonicalize(
-        &mut *dst_ctl,
+    // Exact native placement names a directory entry, so its identity is the
+    // canonical parent plus the operator-supplied leaf. Ordinary endpoints
+    // compute that form here; restricted setup already supplied and signed
+    // it. Canonicalizing the whole path would dereference an existing leaf
+    // symlink and give the self-copy guard and resumable-job identity the
+    // wrong destination.
+    let exact_native_destination =
+        args.interface != Interface::Rsync && args.placement == Placement::As;
+    let identity_plan = destination_identity_plan(
+        exact_native_destination,
+        args.restricted_grant.is_some(),
         &operator_dst_root,
         &dst.path,
-        dst.is_remote(),
-    )?;
+    );
+    let (dst_root_entry, dst_canonical) = match identity_plan {
+        DestinationIdentityPlan::Enrolled(canonical) => (
+            stat_one(&mut *dst_ctl, &operator_dst_root, false)?,
+            canonical,
+        ),
+        DestinationIdentityPlan::Canonicalize(path) => {
+            stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root, &path, dst.is_remote())?
+        }
+        DestinationIdentityPlan::CanonicalizeParent { parent, exact_path } => {
+            let (entry, mut canonical) =
+                stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root, &parent, dst.is_remote())?;
+            append_final_component(&mut canonical, &exact_path);
+            (entry, canonical)
+        }
+    };
     // Rsync retains its destination-directory compatibility rule. Native
-    // paths instead use one explicit policy: keep the named symlink as the
-    // object by default, or resolve the complete chain under --follow.
+    // container placement keeps the named symlink by default or resolves its
+    // complete chain under --follow. Exact native placement always selects
+    // the final directory entry; --follow applies only to its parent path.
     let (dst_root, mut dst_root_entry) = match args.interface {
         Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?,
-        _ if args.native_follow => follow_operator_symlink(
+        _ if args.native_follow && args.placement == Placement::Into => follow_container_symlink(
             &mut *dst_ctl,
             &operator_dst_root,
             dst_root_entry,
@@ -1459,10 +1624,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let operator_directory = if dst_is_dir {
         operator_dst_root.clone()
     } else {
-        // Exact --follow placement selects the referent itself. Its retained
-        // authority is therefore the referent's parent, which may differ from
-        // the parent of the operator's symlink spelling.
-        parent_path(&dst_root)
+        // Exact placement always retains the parent of the command-line leaf.
+        // Under --follow that walk may traverse parent symlinks, but it never
+        // changes which final directory entry the command addresses.
+        parent_path(&operator_dst_root)
     };
     let request_prefix = if dst_is_dir {
         dst_root.clone()
@@ -1551,7 +1716,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             let sn = canonical_path(&mut *src_ctl, &s.path, remote)?;
             // Effective destination(s): the destination itself, plus
             // destination/basename when placement uses it as a container.
-            let mut effs = vec![canonical_path(&mut *src_ctl, &dst.path, remote)?];
+            let mut effs = vec![if exact_native_destination {
+                dst_canonical.clone()
+            } else {
+                canonical_path(&mut *src_ctl, &dst.path, remote)?
+            }];
             if dst_is_dir && !s.copies_contents() && args.files_from.is_none() {
                 let base = s.basename();
                 if !base.is_empty() {
@@ -1714,6 +1883,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
+    announce_detached_ready()?;
     let all_remote_endpoints_use_tcp = use_tcp
         && [&src_ep, &dst_ep]
             .into_iter()
@@ -2516,6 +2686,19 @@ fn parent_path(path: &[u8]) -> PathBytes {
     }
 }
 
+/// Append the final raw component of `path` to an already-canonicalized
+/// parent. Native exact placement deliberately treats this component as a
+/// directory entry rather than resolving through it.
+fn append_final_component(parent: &mut std::path::PathBuf, path: &[u8]) {
+    let component = path
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .filter(|component| !component.is_empty());
+    if let Some(component) = component {
+        parent.push(OsStr::from_bytes(component));
+    }
+}
+
 /// Fetch the destination root's entry and canonical spelling in one network
 /// turn. They are independent read-only queries; sending both before waiting
 /// avoids an otherwise unnecessary RTT on every remote copy.
@@ -2639,11 +2822,11 @@ fn follow_dir_symlink(
     Ok((path.to_vec(), entry))
 }
 
-/// Resolve a symlink in the last component of a directly supplied native
-/// pathname. Unlike rsync's directory-only compatibility behavior, explicit
-/// `--follow` selects the referent regardless of its type. Placement forms
-/// that allow a missing target may create the referent of a dangling chain.
-fn follow_operator_symlink(
+/// Resolve a symlink used as a directly supplied native container. Explicit
+/// `--follow` selects the referent regardless of its type; the caller then
+/// requires the result to be a directory. Placement forms that allow a
+/// missing target may create the referent of a dangling chain.
+fn follow_container_symlink(
     conn: &mut dyn Conn,
     path: &[u8],
     entry: Option<Entry>,
@@ -2731,9 +2914,13 @@ fn display_location(loc: &Location, path: &[u8]) -> String {
     } else {
         host.clone()
     };
-    match &loc.user {
-        Some(user) => format!("{user}@{host}:{path}"),
-        None => format!("{host}:{path}"),
+    let endpoint = match &loc.user {
+        Some(user) => format!("{user}@{host}"),
+        None => host,
+    };
+    match loc.port {
+        Some(port) => format!("{endpoint}:{port}:{path}"),
+        None => format!("{endpoint}:{path}"),
     }
 }
 
@@ -6764,6 +6951,51 @@ mod tests {
     }
 
     #[test]
+    fn explicit_ssh_port_is_part_of_endpoint_identity() {
+        let location = |host: &str, port| Location {
+            user: Some("alice".into()),
+            host: Some(host.into()),
+            port,
+            path: b"/data".to_vec(),
+            selection: SourceSelection::Named,
+        };
+
+        assert_eq!(endpoint_identity(&location("backup", None)), "alice@backup");
+        assert_eq!(
+            endpoint_identity(&location("backup", Some(2200))),
+            "alice@backup:2200"
+        );
+        assert_eq!(
+            endpoint_identity(&location("backup", Some(2222))),
+            "alice@backup:2222"
+        );
+        assert_eq!(
+            endpoint_identity(&location("2001:db8::1", Some(2200))),
+            "alice@[2001:db8::1]:2200"
+        );
+    }
+
+    #[test]
+    fn dry_run_location_labels_include_explicit_ssh_port() {
+        let location = |host: &str, port| Location {
+            user: Some("alice".into()),
+            host: Some(host.into()),
+            port: Some(port),
+            path: b"/data".to_vec(),
+            selection: SourceSelection::Named,
+        };
+
+        assert_eq!(
+            display_location(&location("backup", 2200), b"/data"),
+            "alice@backup:2200:/data"
+        );
+        assert_eq!(
+            display_location(&location("2001:db8::1", 2222), b"/data"),
+            "alice@[2001:db8::1]:2222:/data"
+        );
+    }
+
+    #[test]
     fn fast_batch_ceiling_grows_on_high_rtt_tcp_or_remote_ssh() {
         assert_eq!(fast_batch_file_limit(None, None, false), FAST_BATCH_FILES);
         assert_eq!(
@@ -6807,6 +7039,25 @@ mod tests {
                 "clean_root({given:?})"
             );
         }
+    }
+
+    #[test]
+    fn restricted_exact_identity_uses_the_enrolled_leaf_without_observing_its_parent() {
+        assert_eq!(
+            destination_identity_plan(true, true, b"/enrolled/root/link", b"/enrolled/root/link",),
+            DestinationIdentityPlan::Enrolled(std::path::PathBuf::from("/enrolled/root/link"))
+        );
+        assert_eq!(
+            destination_identity_plan(false, true, b"/enrolled/root", b"/enrolled/root"),
+            DestinationIdentityPlan::Canonicalize(b"/enrolled/root".to_vec())
+        );
+        assert_eq!(
+            destination_identity_plan(true, false, b"links/exact", b"links/exact"),
+            DestinationIdentityPlan::CanonicalizeParent {
+                parent: b"links".to_vec(),
+                exact_path: b"links/exact".to_vec(),
+            }
+        );
     }
 
     #[test]

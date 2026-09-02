@@ -25,6 +25,15 @@ and is not part of the contract. `--results` is not available on
 `syq map` (its stdout is the manifest format) or, yet, on other
 commands. `--dry-run` composes; see below.
 
+The results writer lives with the transfer coordinator. For a direct
+remote-to-remote copy, use `--results -`: the stream rides the
+coordinator connection back to the invoking terminal. A named results
+file is accepted only when the coordinator is local (including
+`--run-at local`) — a local-looking pathname is never interpreted on
+a remote host. `--results` cannot be combined with `--detach`,
+because the caller would not remain attached for the stream and its
+terminal record.
+
 A `FILE` inside the transfer's own endpoints is refused before
 anything is created — the run would copy, overwrite, or prune its own
 results file. The check uses the transfer's own `~` expansion and
