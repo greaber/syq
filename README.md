@@ -206,7 +206,10 @@ ordinary pathname and publication behavior applies: these forms do not pin an
 inode or provide compare-and-swap behavior against a concurrent namespace
 writer. Changed regular files continue to use staged atomic publication.
 Mapping a non-directory source exactly onto an existing directory is rejected
-during the source's first scan batch, in both dry-run and execution.
+during the source's first scan batch, in both dry-run and execution. On the
+command-restricted remote-to-remote path the precondition is also signed: the
+receiver checks it against the enrolled root when it claims the grant, and a
+`new` root can only be created without replacing anything.
 
 `cp` copies or updates mapped source objects and keeps unrelated target
 objects. `cp-prune` uses the same mapping and transfer engine, then applies the
@@ -485,8 +488,8 @@ A compromised hostA can invent the source tree wholesale: names, object types,
 metadata, and file bytes need not correspond to anything on hostA's filesystem.
 It can also omit entries or stop the transfer. HostB can enforce only signed
 command properties visible in receiver requests, such as destination scopes,
-publication and preservation policy, resource limits, and whether a requested
-mutation could have survived the signed filter traversal. HostA still cannot
+publication, preservation, and existing-object policy, resource limits, and
+whether a requested mutation could have survived the signed filter traversal. HostA still cannot
 escape those checks or independently authenticate to hostB with the enrollment
 key.
 
@@ -500,10 +503,19 @@ root even when it overlaps an ignored path from another contents source.
 The signed publication policy distinguishes atomic staged writes from
 `--inplace`; in-place requests use descriptor-relative opens and writes beneath
 the enrolled root and cannot silently switch back to staged publication.
-`--no-tcp`, `--tcp-plain`, `--tcp-congestion`, `--update`, `--existing`,
-`--ignore-existing`, native `--*-new`/`--*-existing`, `--files-from`, `--mapping`,
-`--min-size`, `--syq-path`, and `--no-bootstrap` currently fail closed because
-the receiver cannot enforce those semantics independently of hostA.
+The existing-object policy is signed and enforced by the receiver. Under
+`--ignore-existing` every creation and publication is forced to no-replace
+creation, and metadata or content changes to any non-directory that existed
+before the transfer are refused; existing directories are reused, as in the
+ordinary engine. Under `--existing` the receiver refuses to create any object.
+Native `--into-new`/`--as-new` and `--into-existing`/`--as-existing` travel as
+a signed root precondition in a V4 grant, checked against the enrolled root
+when the grant is claimed; an older installed receiver rejects that grant
+safely until `syq enroll` refreshes it. `--update` still fails closed because
+it compares against source modification times that only hostA reports.
+`--no-tcp`, `--tcp-plain`, `--tcp-congestion`, `--files-from`, `--mapping`,
+`--min-size`, `--syq-path`, and `--no-bootstrap` also fail closed because the
+receiver cannot enforce those semantics independently of hostA.
 `--max-size` is enforced as a signed per-file limit, but is refused together
 with deletion because filtered source files could otherwise make hostA's
 deletion plan ambiguous. Explicit `-j` values above 64 are also refused; auto
