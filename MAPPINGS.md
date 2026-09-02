@@ -107,11 +107,15 @@ That is a reasonable choice for a one-time transfer. Its limits:
   wins and one file's content is lost without warning.
 - Every run resends every byte: no delta, no resume, and an
   interrupted pipe leaves truncated files in place.
-- The data flows over one unverified connection.
+- The data moves over one connection, at single-stream ssh speed.
 - The transform sees only the name, so the mtime- and size-based
   examples below cannot be expressed.
 - Symlink targets are rewritten too by default, which breaks links
-  pointing outside the tree.
+  pointing outside the tree. (syq takes the opposite trade: target
+  text is copied verbatim, so out-of-tree links survive, but an
+  in-tree link does not follow the rename — harmless here because the
+  case-insensitive destination resolves `Notes.TXT` anyway, dangling
+  on a case-sensitive one.)
 
 rsync itself has no rename option. Keeping rsync's delta and resume
 means a symlink staging farm: `ln -sf` each file into a lowercased
