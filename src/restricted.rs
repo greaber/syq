@@ -429,7 +429,13 @@ impl RestrictedAuthority {
         }
         state.receipt_issued = true;
         let published: Vec<Vec<u8>> = state.ledger.published.keys().cloned().collect();
-        let deleted: Vec<Vec<u8>> = state.ledger.deleted.iter().cloned().collect();
+        let deleted_only: Vec<Vec<u8>> = state
+            .ledger
+            .deleted
+            .iter()
+            .filter(|path| !state.ledger.published.contains_key(*path))
+            .cloned()
+            .collect();
         drop(state);
         // The grant is closed and nothing is in flight, so the tree is final.
         // Settlement order need not match filesystem order when hostA raced
@@ -462,7 +468,7 @@ impl RestrictedAuthority {
                 None => final_deleted.push(path),
             }
         }
-        for path in deleted {
+        for path in deleted_only {
             if self.observe_final(&path)?.is_none() {
                 final_deleted.push(path);
             }
@@ -826,14 +832,12 @@ impl RestrictedAuthority {
         }
         for outcome in outcomes {
             match outcome {
+                // Both dispositions are kept; the receipt decides between
+                // them from the final tree once the grant is closed.
                 PendingOutcome::Publish { index, path, size } if !failed(index) => {
-                    state.ledger.deleted.remove(&path);
-                    // Digests for hashed receipts are computed when the
-                    // receipt is issued, once the file is final.
                     state.ledger.published.insert(path, (size, None));
                 }
                 PendingOutcome::Delete { index, path } if !failed(index) => {
-                    state.ledger.published.remove(&path);
                     state.ledger.deleted.insert(path);
                 }
                 PendingOutcome::Observe { path } => {
