@@ -524,6 +524,12 @@ struct NativeSelectionArgs {
     /// Select a named source directory (repeatable)
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     src_dir: Vec<OsString>,
+    /// Select several named non-directory source objects
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    src_files: Vec<OsString>,
+    /// Select several named source directories
+    #[arg(long, value_name = "DIR", num_args = 1..)]
+    src_dirs: Vec<OsString>,
     /// Select several named source objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
@@ -567,6 +573,12 @@ struct NativeRmSelectionArgs {
     /// Select a directory tree (repeatable)
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     src_dir: Vec<OsString>,
+    /// Select several non-directory terminal objects
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    src_files: Vec<OsString>,
+    /// Select several directory trees
+    #[arg(long, value_name = "DIR", num_args = 1..)]
+    src_dirs: Vec<OsString>,
     /// Select several objects without constraining their terminal type
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
@@ -592,6 +604,27 @@ struct NativeOperationalArgs {
     /// Use a fixed number of parallel connections/workers
     #[arg(short = 'j', long = "connections", value_name = "N")]
     connections: Option<usize>,
+    /// Show progress even when stderr is not a terminal
+    #[arg(long, overrides_with = "no_progress")]
+    progress: bool,
+    /// Never show the human progress display
+    #[arg(long)]
+    no_progress: bool,
+    /// Emit machine-readable progress lines (JSON) on stderr
+    #[arg(long)]
+    progress_json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct NativeCopyOperationalArgs {
+    #[command(flatten)]
+    common: NativeOperationalArgs,
+    /// Limit aggregate file-data throughput (default unit: KiB/s; 0 disables)
+    #[arg(long, value_name = "RATE")]
+    bwlimit: Option<String>,
+    /// Print transfer statistics at the end
+    #[arg(long)]
+    stats: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -650,7 +683,7 @@ struct NativeCopyFields {
     )]
     as_existing: Option<OsString>,
     #[command(flatten)]
-    operational: NativeOperationalArgs,
+    operational: NativeCopyOperationalArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -770,7 +803,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.locations = locations;
     args.delete = interface == Interface::NativeCpPrune;
     args.max_delete = max_delete;
-    apply_native_operational(&mut args, parsed.operational);
+    apply_native_copy_operational(&mut args, parsed.operational)?;
     apply_internal_native_direct(&mut args)?;
     Ok(args)
 }
@@ -814,6 +847,16 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
             "src_dir",
             SourceSelection::Directory,
             &parsed.selection.src_dir,
+        ),
+        (
+            "src_files",
+            SourceSelection::File,
+            &parsed.selection.src_files,
+        ),
+        (
+            "src_dirs",
+            SourceSelection::Directory,
+            &parsed.selection.src_dirs,
         ),
     ] {
         if let Some(indices) = matches.indices_of(id) {
@@ -861,6 +904,8 @@ fn lower_native_selection(
         ("src_srcs", SourceSelection::Contents, &parsed.src_srcs),
         ("src_file", SourceSelection::File, &parsed.src_file),
         ("src_dir", SourceSelection::Directory, &parsed.src_dir),
+        ("src_files", SourceSelection::File, &parsed.src_files),
+        ("src_dirs", SourceSelection::Directory, &parsed.src_dirs),
     ] {
         if let Some(indices) = matches.indices_of(id) {
             ordered.extend(
@@ -905,6 +950,29 @@ fn apply_native_operational(args: &mut Args, operational: NativeOperationalArgs)
     args.verbose = operational.verbose;
     args.quiet = operational.quiet;
     args.connections_opt = operational.connections;
+    args.progress = operational.progress;
+    args.no_progress = operational.no_progress;
+    args.progress_json = operational.progress_json;
+}
+
+fn apply_native_copy_operational(
+    args: &mut Args,
+    operational: NativeCopyOperationalArgs,
+) -> Result<()> {
+    let NativeCopyOperationalArgs {
+        common,
+        bwlimit,
+        stats,
+    } = operational;
+    args.bwlimit_bytes = bwlimit
+        .as_deref()
+        .map(crate::bwlimit::parse_rate)
+        .transpose()?
+        .unwrap_or(0);
+    args.bwlimit = bwlimit;
+    args.stats = stats;
+    apply_native_operational(args, common);
+    Ok(())
 }
 
 /// Direct remote-to-remote execution needs a few automatically derived engine

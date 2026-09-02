@@ -460,6 +460,46 @@ fn native_cp_prune_checks_all_typed_sources_before_mutation() {
 }
 
 #[test]
+fn native_copy_accepts_copy_only_operational_controls() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-file",
+            &t.s("src/file"),
+            "--as-new",
+            &t.s("copied"),
+            "--bwlimit",
+            "1G",
+            "--stats",
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("copied")), b"payload");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("scanned entries:"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let invalid = native_syq(&[
+        "cp",
+        &t.s("src/file"),
+        "--as-new",
+        &t.s("invalid"),
+        "--bwlimit",
+        "fast",
+    ]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(stderr_of(&invalid).contains("bad --bwlimit"));
+    assert!(!t.path("invalid").exists());
+}
+
+#[test]
 fn native_copy_named_selector_preserves_a_root_symlink() {
     use std::os::unix::fs::symlink;
 
@@ -852,6 +892,30 @@ fn native_rm_typed_selectors_check_every_type_before_mutation() {
     ]);
     assert!(!t.path("file").exists());
     assert!(!t.path("directory").exists());
+}
+
+#[test]
+fn native_rm_accepts_bulk_typed_selectors() {
+    let t = Tmp::new();
+    write(&t.path("base/file-a"), b"a");
+    write(&t.path("base/file-b"), b"b");
+    write(&t.path("base/dir-a/child"), b"a");
+    write(&t.path("base/dir-b/child"), b"b");
+
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s("base"),
+        "--src-files",
+        "file-a",
+        "file-b",
+        "--src-dirs",
+        "dir-a",
+        "dir-b",
+        "--progress-json",
+        "--no-progress",
+    ]);
+    assert!(listing(&t.path("base")).is_empty());
 }
 
 #[test]
@@ -3907,6 +3971,10 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
     write(&t.path("sources/a"), b"a");
     write(&t.path("sources/tree/f"), b"tree");
     write(&t.path("sources/contents/b"), b"b");
+    write(&t.path("sources/file-a"), b"file-a");
+    write(&t.path("sources/file-b"), b"file-b");
+    write(&t.path("sources/dir-a/c"), b"dir-a");
+    write(&t.path("sources/dir-b/d"), b"dir-b");
     write(&t.path("sources/z"), b"z");
 
     run_native_ok(&[
@@ -3916,6 +3984,12 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         "tree",
         "--src-srcs",
         "contents",
+        "--src-files",
+        "file-a",
+        "file-b",
+        "--src-dirs",
+        "dir-a",
+        "dir-b",
         "--src",
         "z",
         "--cwd",
@@ -3926,7 +4000,13 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         &t.s("dest"),
     ]);
 
-    assert_eq!(listing(&t.path("dest")), ["a", "b", "tree", "tree/f", "z"]);
+    assert_eq!(
+        listing(&t.path("dest")),
+        [
+            "a", "b", "dir-a", "dir-a/c", "dir-b", "dir-b/d", "file-a", "file-b", "tree", "tree/f",
+            "z",
+        ]
+    );
 }
 
 #[test]
@@ -3950,6 +4030,8 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
         ["cp", "-a", "source", "--into", "dest"].as_slice(),
         ["cp", "--delete", "source", "--into", "dest"].as_slice(),
         ["rm", "--no-tcp", "source", "", ""].as_slice(),
+        ["rm", "--bwlimit", "1M", "source", ""].as_slice(),
+        ["rm", "--stats", "source", "", ""].as_slice(),
     ] {
         let args: Vec<_> = args.iter().copied().filter(|arg| !arg.is_empty()).collect();
         let out = native_syq(&args);

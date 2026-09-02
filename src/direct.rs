@@ -375,9 +375,6 @@ pub fn run(
     if args.interface == Interface::Rsync {
         remote.push(format!("--block-size={}", args.block_size));
         remote.push(format!("--min-split={}", args.min_split));
-        if let Some(rate) = &args.bwlimit {
-            remote.push(format!("--bwlimit={rate}"));
-        }
         if args.verify_only {
             remote.push("--verify-only".into());
         }
@@ -415,7 +412,10 @@ pub fn run(
             remote.push(format!("--ignore={line}"));
         }
     }
-    if args.interface == Interface::Rsync && args.stats {
+    if let Some(rate) = &args.bwlimit {
+        remote.push(format!("--bwlimit={rate}"));
+    }
+    if args.stats {
         remote.push("--stats".into());
     }
     if let Some(n) = args.max_delete {
@@ -438,9 +438,6 @@ pub fn run(
             remote.push(format!("--tcp-congestion={algorithm}"));
         }
         remote.push(format!("--tcp-ports={}", args.tcp_ports));
-        if args.progress_json && !args.quiet {
-            remote.push("--progress-json".into());
-        }
         if args.dry_run {
             remote.push(format!("--plan-source-host={src_target}"));
         }
@@ -448,12 +445,6 @@ pub fn run(
             "--direct-source-operand-count={source_operand_count}"
         ));
         remote.push("--direct-sources-prededuplicated".into());
-        if args.no_progress || args.quiet {
-            remote.push("--no-progress".into());
-        } else if std::io::stderr().is_terminal() {
-            remote.push("--progress".into());
-            remote.push(format!("--width={}", crate::progress::term_width()));
-        }
         if let Some(p) = &args.syq_path {
             remote.push(format!("--syq-path={p}"));
         }
@@ -466,6 +457,17 @@ pub fn run(
             remote.push("-e".into());
             remote.push(e);
         }
+    }
+    if args.progress_json && !args.quiet {
+        remote.push("--progress-json".into());
+    }
+    if args.no_progress || args.quiet {
+        remote.push("--no-progress".into());
+    } else if args.progress {
+        remote.push("--progress".into());
+    } else if args.interface == Interface::Rsync && std::io::stderr().is_terminal() {
+        remote.push("--progress".into());
+        remote.push(format!("--width={}", crate::progress::term_width()));
     }
 
     if args.interface == Interface::Rsync {
@@ -567,7 +569,7 @@ pub fn run(
         ) {
             internal_environment.push(("SYQ_INTERNAL_NATIVE_RSH", rsh));
         }
-        if !args.quiet && std::io::stderr().is_terminal() {
+        if !args.no_progress && !args.quiet && std::io::stderr().is_terminal() {
             internal_environment.push((
                 "SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH",
                 crate::progress::term_width().to_string(),
