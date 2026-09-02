@@ -282,7 +282,8 @@ executes such a manifest — a generalized `--as` covering many entries, each
 with its own destination. Between the two, any tool that edits JSON can
 reshape a transfer:
 
-```sh
+```bash
+set -o pipefail
 syq map --src-src photos \
   | jq '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C photos --to nas --into /pub

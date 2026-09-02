@@ -531,7 +531,11 @@ struct SourceMapping<'a> {
     sub: &'a [u8],
 }
 
-fn validate_native_source_type(path: &[u8], selection: SourceSelection, kind: Kind) -> Result<()> {
+pub(crate) fn validate_native_source_type(
+    path: &[u8],
+    selection: SourceSelection,
+    kind: Kind,
+) -> Result<()> {
     match selection {
         SourceSelection::Contents if kind != Kind::Dir => {
             bail!("contents selector {} is not a directory", display(path))
@@ -3318,8 +3322,8 @@ impl Planner<'_> {
         // destination state) still fail entries individually below.
         let entries = read_mapping_manifest(reader)?;
 
-        // Phase 2: stat sources and plan in chunks, overlapping with
-        // transfer work exactly like any other single-source scan. `emitted`
+        // Phase 2: stat sources and plan in chunks; as with any native
+        // copy, transfers begin once planning completes. `emitted`
         // is what the planner was given for each destination path;
         // `synthesized` are implicit ancestors an explicit entry may still
         // upgrade.

@@ -8886,3 +8886,41 @@ fn native_cp_mapping_whole_manifest_preflight_writes_nothing() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not dir"));
     assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
 }
+
+#[test]
+fn native_mapping_and_map_respect_typed_selectors() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"f");
+    fs::create_dir_all(t.path("src/d")).unwrap();
+    // --mapping rejects typed selectors instead of silently discarding them.
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "--src-dir",
+            "absent",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+        ],
+        Some(b""),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("replaces source selectors"));
+    // syq map enforces typed-selector preconditions like native cp.
+    let out = syq_map_in(&t.path("src"), &["--src-file", "d"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is a directory"));
+    let out = syq_map_in(&t.path("src"), &["--src-dir", "f.txt"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not a directory"));
+    // Happy paths still emit.
+    let lines = map_lines(&syq_map_in(
+        &t.path("src"),
+        &["--src-dir", "d", "--src-file", "f.txt"],
+    ));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["d", "f.txt"]);
+}

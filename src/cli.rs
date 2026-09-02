@@ -751,7 +751,7 @@ struct NativeCopyPruneCommand {
     version,
     about = "Print the resolved selection and placement of a copy as an NDJSON mapping",
     long_about = "Print the resolved selection and placement of a copy as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to the target container), the object kind, and size/mtime for regular files. Emission is local and read-only; it never contacts a destination. Names must be valid UTF-8.",
-    override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | PATH]... [PLACEMENT]"
+    override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... [PLACEMENT]"
 )]
 struct NativeMapCommand {
     #[command(flatten)]
@@ -830,6 +830,10 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             && parsed.selection.src_src.is_empty()
             && parsed.selection.srcs.is_empty()
             && parsed.selection.src_srcs.is_empty()
+            && parsed.selection.src_file.is_empty()
+            && parsed.selection.src_dir.is_empty()
+            && parsed.selection.src_files.is_empty()
+            && parsed.selection.src_dirs.is_empty()
             && parsed.selection.sources.is_empty());
         if has_selectors {
             bail!("--mapping replaces source selectors; do not combine them");

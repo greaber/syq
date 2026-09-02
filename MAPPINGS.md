@@ -91,6 +91,7 @@ pipeline converges. For stage-by-stage completion, materialize the
 manifest instead:
 
 ```bash
+set -o pipefail
 syq map --src-src src | jq '.dst.value |= ascii_downcase' > m.ndjson \
   && syq cp --mapping m.ndjson -C src --to nas --into /pub
 ```
@@ -226,11 +227,11 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   an exact single-path placement cannot host a manifest — each entry's
   `dst` already is its own `--as`. It is part of the native surface
   only; `syq rsync` is unchanged.
-- `syq map` accepts the `syq cp` grammar, including `--as PATH`, which
-  emits the single selected root under the target's basename; see
-  "Emitting a mapping" for this version's restrictions. The typed `rm`
-  selectors (`--src-dir`, `--src-file`) are not part of the copy
-  grammar.
+- `syq map` accepts the `syq cp` grammar, including `--as PATH` (which
+  emits the single selected root under the target's basename) and the
+  typed selectors `--src-file`/`--src-dir`, validated exactly as native
+  cp validates them; see "Emitting a mapping" for this version's
+  restrictions.
 - Fidelity is the native default (`-rlt`). There is no per-entry
   policy: preservation and comparison behavior stay global.
 - An entry claims exactly one object. A `dir` entry claims the
@@ -254,7 +255,7 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   declared-kind ancestor conflicts refuse the run before any entry is
   applied (the `--into` container itself is created eagerly, as with
   `--files-from`). The price is memory proportional to the manifest, as
-  in a multi-source copy. Execution then overlaps source stats and transfers.
+  in a multi-source copy. Sources are then statted and planned in chunks, and transfers begin once planning completes.
   Conflicts only observable at execution — an undeclared ancestor that
   turns out not to be a directory, existing destination state — still
   fail entries individually. `syq map` streams its output. Exit codes

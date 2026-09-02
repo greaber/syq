@@ -55,6 +55,11 @@ pub fn run(args: &Args) -> Result<i32> {
             // Named selectors never follow the selected symlink itself.
             let md = std::fs::symlink_metadata(&full)
                 .with_context(|| format!("source {}", full.display()))?;
+            crate::transfer::validate_native_source_type(
+                &location.path,
+                location.selection,
+                metadata_kind(&md),
+            )?;
             let dst_name = match (args.placement, &args.native_map_target) {
                 (Placement::As, Some(target)) => native_basename(target)
                     .ok_or_else(|| anyhow!("--as target has no basename"))?
@@ -164,6 +169,29 @@ fn join_rel(prefix: &[u8], name: &[u8]) -> Vec<u8> {
     joined.push(b'/');
     joined.extend_from_slice(name);
     joined
+}
+
+fn metadata_kind(md: &Metadata) -> crate::proto::Kind {
+    use crate::proto::Kind;
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = md.file_type();
+    if file_type.is_dir() {
+        Kind::Dir
+    } else if file_type.is_file() {
+        Kind::File
+    } else if file_type.is_symlink() {
+        Kind::Symlink
+    } else if file_type.is_fifo() {
+        Kind::Fifo
+    } else if file_type.is_socket() {
+        Kind::Socket
+    } else if file_type.is_char_device() {
+        Kind::CharDev
+    } else if file_type.is_block_device() {
+        Kind::BlockDev
+    } else {
+        Kind::Other
+    }
 }
 
 fn full_path(args: &Args, selector: &[u8]) -> PathBuf {
