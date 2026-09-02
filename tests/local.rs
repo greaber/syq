@@ -9687,4 +9687,23 @@ fn reuse_connection_refused_for_direct_remote_to_remote() {
         stderr.contains("direct remote-to-remote"),
         "stderr: {stderr}"
     );
+
+    let out = native_syq(&[
+        "cp",
+        "--reuse-connection",
+        "--from",
+        "hostA",
+        "--src-src",
+        "src",
+        "--to",
+        "hostB",
+        "--run-at",
+        "target",
+        "--into",
+        "dst",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("remote transfer coordinator"), "{stderr}");
+    assert!(stderr.contains("--run-at local"), "{stderr}");
 }

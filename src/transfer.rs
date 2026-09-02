@@ -760,6 +760,16 @@ pub fn run(args: Args) -> Result<i32> {
             "--detach, --no-forward-agent, and --agent-broker-only apply only to a direct copy between two different remote endpoints"
         );
     }
+    if args.reuse_connection && coordinator_is_remote {
+        if args.interface == Interface::Rsync {
+            bail!(
+                "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
+            );
+        }
+        bail!(
+            "--reuse-connection is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
+        );
+    }
     if args.detach && args.native_results.is_some() {
         bail!(
             "--results cannot be used with --detach because the remote result stream would not remain attached"
@@ -882,15 +892,6 @@ pub fn run(args: Args) -> Result<i32> {
             return crate::direct::run_at_target(&args, srcs, dst, source_operand_count);
         }
         if !args.relay {
-            // The direct orchestrator runs on the source host and rebuilds
-            // the command; no direct leg holds a reusable local master, so
-            // refuse rather than silently ignore the flag. --relay keeps the
-            // orchestrator (and its persistent masters) on this machine.
-            if args.reuse_connection {
-                bail!(
-                    "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
-                );
-            }
             if args.interface == Interface::Rsync
                 || direct_paths_are_utf8
                 || args.run_at == RunAt::Source

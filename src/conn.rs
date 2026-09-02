@@ -2672,8 +2672,7 @@ mod tests {
             SshMultiplexer::persistent_in(base.clone(), Some("u"), "example", None).unwrap();
         assert_eq!(probe.path, multiplexer.path);
         let alternate_port =
-            SshMultiplexer::persistent_in(base.clone(), Some("u"), "example", Some(2222))
-                .unwrap();
+            SshMultiplexer::persistent_in(base.clone(), Some("u"), "example", Some(2222)).unwrap();
         assert_ne!(multiplexer.path, alternate_port.path);
         assert!(!multiplexer.path.exists());
         assert_eq!(
