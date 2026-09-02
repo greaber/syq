@@ -1,6 +1,5 @@
 mod agent_broker;
 mod bwlimit;
-mod checkpoint;
 mod cli;
 mod conn;
 mod crypto;
@@ -17,6 +16,7 @@ mod proto;
 mod remote_helper;
 mod restricted;
 mod results;
+mod resume;
 mod rm;
 #[allow(dead_code)]
 mod rooted;

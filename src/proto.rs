@@ -48,6 +48,17 @@ pub enum Kind {
     Other,
 }
 
+/// How a directly supplied endpoint pathname treats symlink components.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OperatorSymlinkPolicy {
+    /// Native default: refuse every symlink that resolution would traverse.
+    Refuse,
+    /// Rsync compatibility: follow links owned by root or the endpoint euid.
+    TrustedOwner,
+    /// Explicit convenience mode: follow links regardless of ownership.
+    FollowAll,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Entry {
     /// Relative to the scan root; empty means the root itself.
@@ -299,13 +310,12 @@ pub enum Request {
         follow: bool,
         guard: Option<ContainerGuard>,
     },
-    /// Resolve an operator-supplied destination directory component by
-    /// component, following only symlinks owned by root or this endpoint's
-    /// effective uid. A missing suffix is accepted only when requested.
+    /// Resolve an operator-supplied directory component by component. A
+    /// missing suffix is accepted only when requested.
     CheckOperatorDirectory {
         path: PathBytes,
         allow_missing: bool,
-        insecure_links: bool,
+        symlink_policy: OperatorSymlinkPolicy,
     },
     /// Create the missing suffix retained by CheckOperatorDirectory, then
     /// return the selected directory's stable identity.
@@ -323,7 +333,7 @@ pub enum Request {
         expected_dev: u64,
         expected_ino: u64,
         request_prefix: PathBytes,
-        insecure_links: bool,
+        symlink_policy: OperatorSymlinkPolicy,
     },
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {

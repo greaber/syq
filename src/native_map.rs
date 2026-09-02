@@ -43,23 +43,33 @@ pub fn run(args: &Args) -> Result<i32> {
     let mut top_level_dst: HashSet<Vec<u8>> = HashSet::new();
     for location in &args.locations {
         let full = full_path(args, &location.path);
+        if !args.native_follow {
+            crate::fsops::check_operator_path_no_symlinks(
+                full.as_os_str().as_bytes(),
+                location.selection != SourceSelection::Contents,
+                false,
+            )?;
+        }
         if location.selection == SourceSelection::Contents {
-            // Contents selectors follow a root symlink, matching native cp.
-            let md = std::fs::metadata(&full)
+            let md = metadata(&full, args.native_follow)
                 .with_context(|| format!("--src-src {}", full.display()))?;
             if !md.is_dir() {
                 bail!("--src-src {} is not a directory", full.display());
             }
             walk_children(&full, &location.path, b"", b"", &mut out)?;
         } else {
-            // Named selectors never follow the selected symlink itself.
-            let md = std::fs::symlink_metadata(&full)
+            let md = metadata(&full, args.native_follow)
                 .with_context(|| format!("source {}", full.display()))?;
             crate::transfer::validate_native_source_type(
                 &location.path,
                 location.selection,
                 metadata_kind(&md),
             )?;
+            let src_name = if args.native_follow {
+                resolved_named_source(args, &full)?
+            } else {
+                location.path.clone()
+            };
             let dst_name = match (args.placement, &args.native_map_target) {
                 (Placement::As, Some(target)) => native_basename(target)
                     .ok_or_else(|| anyhow!("--as target has no basename"))?
@@ -74,9 +84,9 @@ pub fn run(args: &Args) -> Result<i32> {
                     String::from_utf8_lossy(&dst_name)
                 );
             }
-            emit(&mut out, &location.path, &dst_name, &md)?;
+            emit(&mut out, &src_name, &dst_name, &md)?;
             if md.is_dir() {
-                walk_children(&full, &location.path, &location.path, &dst_name, &mut out)?;
+                walk_children(&full, &location.path, &src_name, &dst_name, &mut out)?;
             }
         }
     }
@@ -192,6 +202,44 @@ fn metadata_kind(md: &Metadata) -> crate::proto::Kind {
     } else {
         Kind::Other
     }
+}
+
+fn metadata(path: &Path, follow: bool) -> std::io::Result<Metadata> {
+    if follow {
+        std::fs::metadata(path)
+    } else {
+        std::fs::symlink_metadata(path)
+    }
+}
+
+/// Mapping entries are data and are never affected by the consumer's
+/// `--follow`. Materialize a followed named selector as the referent's path
+/// relative to the mapping base so the emitted manifest still selects the
+/// same object when it is consumed.
+fn resolved_named_source(args: &Args, full: &Path) -> Result<Vec<u8>> {
+    let base = match &args.native_map_cwd {
+        Some(cwd) => PathBuf::from(OsStr::from_bytes(cwd)),
+        None => std::env::current_dir().context("resolve syq map working directory")?,
+    };
+    let base = std::fs::canonicalize(&base)
+        .with_context(|| format!("resolve syq map source base {}", base.display()))?;
+    let resolved = std::fs::canonicalize(full)
+        .with_context(|| format!("resolve followed source {}", full.display()))?;
+    let relative = resolved.strip_prefix(&base).map_err(|_| {
+        anyhow!(
+            "followed source {} resolves outside source base {}; pass its real path with a matching -C base",
+            full.display(),
+            base.display()
+        )
+    })?;
+    let bytes = relative.as_os_str().as_bytes();
+    if bytes.is_empty() {
+        bail!(
+            "followed source {} resolves to the source base itself; select its contents instead",
+            full.display()
+        );
+    }
+    Ok(bytes.to_vec())
 }
 
 fn full_path(args: &Args, selector: &[u8]) -> PathBuf {

@@ -13,14 +13,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
+  scope:
     runs-on: ubuntu-latest
+    outputs:
+      native: ${{ steps.changes.outputs.native }}
+      sdks: ${{ steps.changes.outputs.sdks }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - run: rustup component add rustfmt clippy
+      - name: Classify changed paths
+        id: changes
+        run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
+
+  rust:
+    needs: scope
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful path classification
+        if: needs.scope.result != 'success'
+        run: echo 'Path classification failed.' >&2; exit 1
+      - name: Complete the required check for documentation and SDK-only changes
+        if: needs.scope.outputs.native != 'true'
+        run: echo 'Full Rust validation is not needed for this change set.'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.scope.outputs.native == 'true'
+        with:
+          persist-credentials: false
+      - if: needs.scope.outputs.native == 'true'
+        run: rustup component add rustfmt clippy
       - name: Check dependency policy
+        if: needs.scope.outputs.native == 'true'
         env:
           CARGO_DENY_VERSION: 0.20.2
           CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
@@ -36,27 +61,51 @@ jobs:
           test "$("$RUNNER_TEMP/$directory/cargo-deny" --version)" = \
             "cargo-deny $CARGO_DENY_VERSION"
           "$RUNNER_TEMP/$directory/cargo-deny" --locked check
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --all-targets
-      - run: scripts/test-cargo-package.sh
-      - run: scripts/test-installer.sh
-      - run: scripts/test-release-tools.sh
-      - run: scripts/test-secret-tools.sh
-      - run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-homebrew-formula.sh scripts/test-python-sdk-release-tools.sh scripts/test-secret-tools.sh
+      - if: needs.scope.outputs.native == 'true'
+        run: cargo fmt --all -- --check
+      - if: needs.scope.outputs.native == 'true'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - if: needs.scope.outputs.native == 'true'
+        run: cargo test --locked --all-targets
+      - if: needs.scope.outputs.native == 'true'
+        run: scripts/test-cargo-package.sh
+      - if: needs.scope.outputs.native == 'true'
+        run: scripts/test-installer.sh
+      - if: needs.scope.outputs.native == 'true'
+        run: scripts/test-release-tools.sh
+      - if: needs.scope.outputs.native == 'true'
+        run: scripts/test-release-orchestration.sh
+      - if: needs.scope.outputs.native == 'true'
+        run: scripts/check-workflows.sh
+      - if: needs.scope.outputs.native == 'true'
+        run: scripts/test-secret-tools.sh
+      - if: needs.scope.outputs.native == 'true'
+        run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/ci-scope.sh scripts/approve-generated-pr-runs.sh scripts/release-preflight.sh scripts/release-status.sh scripts/check-workflows.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-release-orchestration.sh scripts/test-homebrew-formula.sh scripts/test-python-sdk-release-tools.sh scripts/test-secret-tools.sh
 
   sdks:
+    needs: scope
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Require successful path classification
+        if: needs.scope.result != 'success'
+        run: echo 'Path classification failed.' >&2; exit 1
+      - name: Complete the required check for documentation-only changes
+        if: needs.scope.outputs.sdks != 'true'
+        run: echo 'Full SDK validation is not needed for this change set.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.scope.outputs.sdks == 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: needs.scope.outputs.sdks == 'true'
         with:
           python-version: "3.10"
       - name: Install pinned Python tooling
+        if: needs.scope.outputs.sdks == 'true'
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
       - name: Require the SDK mapping for the latest syq release
+        if: needs.scope.outputs.sdks == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -67,8 +116,10 @@ jobs:
             exit 1
           }
       - name: Build the candidate syq executable
+        if: needs.scope.outputs.sdks == 'true'
         run: cargo build --locked --bin syq
       - name: Test and reproducibly package Python SDK
+        if: needs.scope.outputs.sdks == 'true'
         env:
           PYTHONPATH: sdk/python/src
           SYQ_CANDIDATE_EXECUTABLE: ${{ github.workspace }}/target/debug/syq
@@ -97,20 +148,24 @@ jobs:
             --with "$1" \
             python -c 'import syq; assert syq.version() == syq.PINNED_SYQ_VERSION'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: needs.scope.outputs.sdks == 'true'
         with:
           node-version: "22.x"
           package-manager-cache: false
       - name: Test and package JavaScript SDK
+        if: needs.scope.outputs.sdks == 'true'
         working-directory: sdk/js
         run: |
           npm ci --ignore-scripts
           npm test
           npm pack --dry-run
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: needs.scope.outputs.sdks == 'true'
         with:
           go-version: "1.26.x"
           cache: false
       - name: Format, vet, and test Go SDK
+        if: needs.scope.outputs.sdks == 'true'
         working-directory: sdk/go
         run: |
           test -z "$(gofmt -l .)"
@@ -120,19 +175,41 @@ jobs:
   # The release workflow builds on this runner; libc field types differ from
   # x86-64 (st_nlink is u32 here), so check it before a tag can fail.
   linux-arm64:
+    needs: scope
+    if: always()
     runs-on: ubuntu-24.04-arm
     steps:
+      - name: Require successful path classification
+        if: needs.scope.result != 'success'
+        run: echo 'Path classification failed.' >&2; exit 1
+      - name: Complete the required check for documentation and SDK-only changes
+        if: needs.scope.outputs.native != 'true'
+        run: echo 'The ARM build is not affected by this change set.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.scope.outputs.native == 'true'
         with:
           persist-credentials: false
-      - run: cargo check --locked --all-targets
+      - if: needs.scope.outputs.native == 'true'
+        run: cargo check --locked --all-targets
 
   macos:
+    needs: scope
+    if: always()
     runs-on: macos-14
     steps:
+      - name: Require successful path classification
+        if: needs.scope.result != 'success'
+        run: echo 'Path classification failed.' >&2; exit 1
+      - name: Complete the required check for documentation and SDK-only changes
+        if: needs.scope.outputs.native != 'true'
+        run: echo 'The macOS build and installer are not affected by this change set.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.scope.outputs.native == 'true'
         with:
           persist-credentials: false
-      - run: cargo check --locked --all-targets
-      - run: scripts/test-installer.sh
-      - run: scripts/test-homebrew-formula.sh
+      - if: needs.scope.outputs.native == 'true'
+        run: cargo check --locked --all-targets
+      - if: needs.scope.outputs.native == 'true'
+        run: scripts/test-installer.sh
+      - if: needs.scope.outputs.native == 'true'
+        run: scripts/test-homebrew-formula.sh

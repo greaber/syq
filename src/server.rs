@@ -163,12 +163,16 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Err(_) => break,
         };
         t[0] += t0.elapsed().as_secs_f64();
-        if let Some(authority) = &authority {
-            if let Err(error) = authority.authorize(&mut req, over_ssh) {
-                w.write_msg(&Response::Err(format!("{error:#}")))?;
-                continue;
-            }
-        }
+        let settlement = match &authority {
+            Some(authority) => match authority.authorize(&mut req, over_ssh) {
+                Ok(settlement) => Some(settlement),
+                Err(error) => {
+                    w.write_msg(&Response::Err(format!("{error:#}")))?;
+                    continue;
+                }
+            },
+            None => None,
+        };
         match &req {
             Request::WriteRange { data, .. } => {
                 blocks += 1;
@@ -265,6 +269,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 report_ignored,
                 guard,
             } => {
+                let requested_root = root.clone();
                 let root = match ops.scan_root(&root) {
                     Ok(root) => root,
                     Err(error) => {
@@ -276,15 +281,26 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 // writer borrow suffices.
                 let warns = std::cell::RefCell::new(Vec::new());
                 let wref = std::cell::RefCell::new(&mut w);
-                let mut sink = |batch| {
+                let mut sink = |batch: Vec<crate::proto::Entry>| {
+                    if let Some(authority) = &authority {
+                        authority.record_scanned(
+                            &requested_root,
+                            batch.iter().map(|entry| entry.path.as_slice()),
+                        )?;
+                    }
                     let mut w = wref.borrow_mut();
                     for m in warns.borrow_mut().drain(..) {
                         w.write_msg(&Response::ScanWarn(m))?;
                     }
                     Ok(w.write_msg(&Response::ScanBatch(batch))?)
                 };
-                let mut ignored =
-                    |paths| Ok(wref.borrow_mut().write_msg(&Response::ScanIgnored(paths))?);
+                let mut ignored = |paths: Vec<crate::proto::PathBytes>| {
+                    if let Some(authority) = &authority {
+                        authority
+                            .record_scanned(&requested_root, paths.iter().map(Vec::as_slice))?;
+                    }
+                    Ok(wref.borrow_mut().write_msg(&Response::ScanIgnored(paths))?)
+                };
                 let res = if let Some(guard) = guard {
                     crate::scan::scan_rooted(
                         &root,
@@ -321,6 +337,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
             other => {
                 let t0 = std::time::Instant::now();
                 let resp = ops.handle(&other);
+                if let (Some(authority), Some(settlement)) = (&authority, settlement) {
+                    authority.settle(settlement, &resp);
+                }
                 t[1] += t0.elapsed().as_secs_f64();
                 if drop_after_handling_for_test(&other) {
                     return Ok(());

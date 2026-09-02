@@ -65,12 +65,12 @@ pub struct Args {
     /// not joined into selector strings by the orchestrator.
     #[arg(skip)]
     pub native_rm_cwd: Option<Vec<u8>>,
-    /// Symlink-free containment boundary for native removal.
+    /// Endpoint-side containment boundary for native removal.
     #[arg(skip)]
     pub native_rm_root: Option<Vec<u8>>,
-    /// Permit symlinks while resolving the native removal base/selectors.
+    /// Permit symlinks while resolving directly supplied native endpoint paths.
     #[arg(skip)]
-    pub native_rm_follow: bool,
+    pub native_follow: bool,
     /// Source-side base for `syq map` selectors, joined at walk time so the
     /// emitted `src` values stay relative to it.
     #[arg(skip)]
@@ -209,15 +209,6 @@ pub struct Args {
     /// in-place write leaves a newer-looking final file those filters would then skip forever
     #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
-    /// Avoid completed-file destination lookups on later runs. Normal reruns and partial-file
-    /// resume do not need this. The file persists and must be outside local source/destination trees.
-    #[arg(
-        long,
-        value_name = "FILE",
-        conflicts_with_all = ["checksum", "verify_only", "rm"]
-    )]
-    pub checkpoint: Option<String>,
-
     /// Remote shell command (default: ssh); controls agent forwarding when set
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
@@ -325,6 +316,13 @@ pub struct Args {
     /// With --delete, refuse to delete anything if more than N deletions are planned (exit 25)
     #[arg(long, value_name = "N", requires = "delete")]
     pub max_delete: Option<u64>,
+    /// Native-only command-restricted receiver ceilings, signed into the grant.
+    #[arg(skip)]
+    pub max_entries: Option<u64>,
+    #[arg(skip)]
+    pub max_total_bytes: Option<u64>,
+    #[arg(skip)]
+    pub max_runtime_secs: Option<u32>,
     /// Skip regular files that are newer on the destination (directories,
     /// symlinks and specials are unaffected)
     #[arg(short = 'u', long)]
@@ -475,7 +473,7 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
         .map(crate::bwlimit::parse_rate)
         .transpose()?
         .unwrap_or(0);
-    args.ignore_lines = ordered_ignore_lines(&args.ignore, &args.ignore_from, matches)?;
+    args.ignore_lines = ordered_ignore_lines(&args.ignore, &args.ignore_from, matches, true)?;
     if let Some(f) = &args.files_from {
         // Check this before reading the list (it may be stdin) and before
         // anything connects: the list lives on this machine, but a direct
@@ -502,6 +500,7 @@ fn ordered_ignore_lines(
     ignore: &[String],
     ignore_from: &[String],
     matches: &clap::ArgMatches,
+    follow_paths: bool,
 ) -> Result<Vec<String>> {
     let mut items: Vec<(usize, bool, String)> = Vec::new();
     if let Some(indices) = matches.indices_of("ignore") {
@@ -523,6 +522,10 @@ fn ordered_ignore_lines(
     let mut lines = Vec::new();
     for (_, from_file, value) in items {
         if from_file {
+            if !follow_paths {
+                crate::fsops::check_operator_path_no_symlinks(value.as_bytes(), false, false)
+                    .map_err(|error| anyhow::anyhow!("--ignore-from {value}: {error}"))?;
+            }
             let text = std::fs::read_to_string(&value)
                 .map_err(|error| anyhow::anyhow!("--ignore-from {value}: {error}"))?;
             let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
@@ -551,6 +554,9 @@ struct NativeSelectionArgs {
     /// Resolve relative source selectors from DIR at the source endpoint
     #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
     cwd: Option<OsString>,
+    /// Follow symlinks while resolving directly supplied endpoint paths
+    #[arg(long)]
+    follow: bool,
     /// Select a named source object (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src: Vec<OsString>,
@@ -594,31 +600,31 @@ struct NativeRmSelectionArgs {
         conflicts_with = "root"
     )]
     cwd: Option<OsString>,
-    /// Confine resolution and removal beneath symlink-free DIR
+    /// Confine resolution and removal beneath DIR
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     root: Option<OsString>,
-    /// Follow symlinks while resolving --cwd and source selectors
+    /// Follow symlinks while resolving directly supplied endpoint paths
     #[arg(long)]
     follow: bool,
-    /// Select an object without constraining its terminal type (repeatable)
+    /// Select an object without constraining the selected object's type (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src: Vec<OsString>,
     /// Select a directory's contents, retaining the directory (repeatable)
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     src_src: Vec<OsString>,
-    /// Select a non-directory terminal object (repeatable)
+    /// Select a non-directory object (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src_file: Vec<OsString>,
     /// Select a directory tree (repeatable)
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     src_dir: Vec<OsString>,
-    /// Select several non-directory terminal objects
+    /// Select several non-directory objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
     src_files: Vec<OsString>,
     /// Select several directory trees
     #[arg(long, value_name = "DIR", num_args = 1..)]
     src_dirs: Vec<OsString>,
-    /// Select several objects without constraining their terminal type
+    /// Select several objects without constraining their selected types
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
     /// Select the contents of several directories
@@ -682,6 +688,15 @@ struct NativeCopyOperationalArgs {
     /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
     #[arg(long)]
     inplace: bool,
+    /// Command-restricted receiver ceiling: refuse to touch more than N destination entries (direct remote-to-remote only)
+    #[arg(long, value_name = "N")]
+    max_entries: Option<u64>,
+    /// Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total (direct remote-to-remote only)
+    #[arg(long, value_name = "SIZE")]
+    max_total_bytes: Option<String>,
+    /// Command-restricted receiver ceiling: the signed grant expires DURATION after it is issued, e.g. 30m or 2h (direct remote-to-remote only; at most 23h)
+    #[arg(long, value_name = "DURATION")]
+    max_runtime: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1065,6 +1080,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
     args.reuse_connection = parsed.reuse_connection;
+    args.native_follow = parsed.selection.follow;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
         // through the source connection; a direct remote-to-remote copy has
@@ -1076,6 +1092,21 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         }
     }
     apply_native_copy_operational(&mut args, parsed.operational, &matches)?;
+    if args.max_entries.is_some()
+        || args.max_total_bytes.is_some()
+        || args.max_runtime_secs.is_some()
+    {
+        // These are assertions for hostB's enrolled receiver to enforce; with
+        // no such receiver in the topology, nothing would enforce them, so
+        // refuse rather than let them read as local limits.
+        let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
+        let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
+        if !(src_remote && dst_remote) {
+            bail!(
+                "--max-entries, --max-total-bytes, and --max-runtime are command-restricted receiver ceilings; they apply only to direct remote-to-remote copies"
+            );
+        }
+    }
     apply_internal_native_direct(&mut args)?;
     Ok(args)
 }
@@ -1157,7 +1188,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     args.locations = locations;
     args.native_rm_cwd = parsed.selection.cwd.map(OsStringExt::into_vec);
     args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
-    args.native_rm_follow = parsed.selection.follow;
+    args.native_follow = parsed.selection.follow;
     args.rm = true;
     apply_native_operational(&mut args, parsed.operational);
     Ok(args)
@@ -1242,7 +1273,16 @@ fn apply_native_copy_operational(
         ignore_from,
         preserve,
         inplace,
+        max_entries,
+        max_total_bytes,
+        max_runtime,
     } = operational;
+    args.max_entries = max_entries;
+    args.max_total_bytes = max_total_bytes.as_deref().map(parse_size).transpose()?;
+    args.max_runtime_secs = max_runtime
+        .as_deref()
+        .map(parse_duration_secs)
+        .transpose()?;
     args.checksum = hash;
     args.no_compress = no_compress;
     if no_compress {
@@ -1255,7 +1295,7 @@ fn apply_native_copy_operational(
         .unwrap_or(0);
     args.bwlimit = bwlimit;
     args.stats = stats;
-    args.ignore_lines = ordered_ignore_lines(&ignore, &ignore_from, matches)?;
+    args.ignore_lines = ordered_ignore_lines(&ignore, &ignore_from, matches, args.native_follow)?;
     args.ignore = ignore;
     args.ignore_from = ignore_from;
     args.inplace = inplace;
@@ -1468,7 +1508,6 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         "--min-size",
         "--files-from",
         "--max-delete",
-        "--checkpoint",
         "--tcp-ports",
         "--tcp-congestion",
         "--syq-path",
@@ -1571,6 +1610,34 @@ fn message_for_short(c: char) -> Option<&'static str> {
     })
 }
 
+/// Parse a whole-number duration with an optional `s`, `m`, or `h` suffix
+/// (seconds when unsuffixed) into seconds. Zero is rejected.
+pub fn parse_duration_secs(s: &str) -> Result<u32> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => {
+            let m: u32 = match c.to_ascii_lowercase() {
+                's' => 1,
+                'm' => 60,
+                'h' => 60 * 60,
+                _ => bail!("bad duration suffix in {s:?}; use s, m, or h"),
+            };
+            (&s[..s.len() - 1], m)
+        }
+        _ => (s, 1),
+    };
+    let n: u32 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad duration {s:?}"))?;
+    let seconds = n
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("bad duration {s:?}: value is too large"))?;
+    if seconds == 0 {
+        bail!("duration {s:?} must be at least one second");
+    }
+    Ok(seconds)
+}
+
 pub fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {
@@ -1611,10 +1678,21 @@ pub fn parse_size(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_size, Args,
-        Interface, Placement, SourceSelection,
+        native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
+        parse_size, Args, Interface, Placement, SourceSelection,
     };
     use clap::Parser;
+
+    #[test]
+    fn durations_take_seconds_minutes_or_hours_and_reject_zero() {
+        assert_eq!(parse_duration_secs("45").unwrap(), 45);
+        assert_eq!(parse_duration_secs("90s").unwrap(), 90);
+        assert_eq!(parse_duration_secs("30m").unwrap(), 1800);
+        assert_eq!(parse_duration_secs("2H").unwrap(), 7200);
+        for bad in ["0", "0m", "", "5d", "1.5h", "-3", "4294967295h"] {
+            assert!(parse_duration_secs(bad).is_err(), "{bad:?}");
+        }
+    }
 
     fn args(options: &[&str]) -> Args {
         let mut argv = vec!["syq"];
@@ -1695,6 +1773,7 @@ mod tests {
     #[test]
     fn native_copy_policies_lower_to_the_shared_engine() {
         let argv = [
+            "--follow",
             "--ignore",
             "*.tmp",
             "--ignore",
@@ -1709,6 +1788,7 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        assert!(args.native_follow);
         assert_eq!(args.ignore_lines, ["*.tmp", "!keep.tmp"]);
         assert!(args.perms);
         assert!(args.owner);
@@ -1860,13 +1940,13 @@ impl Location {
         }
     }
 
-    pub fn follows_root(&self) -> bool {
+    pub fn follows_root(&self, native_follow: bool) -> bool {
         match self.selection {
-            SourceSelection::Named => true,
-            SourceSelection::Contents => true,
-            SourceSelection::NamedNoFollow | SourceSelection::File | SourceSelection::Directory => {
-                false
-            }
+            SourceSelection::Named
+            | SourceSelection::Contents
+            | SourceSelection::NamedNoFollow
+            | SourceSelection::File
+            | SourceSelection::Directory => native_follow,
             SourceSelection::Rsync => self.copies_contents(),
         }
     }

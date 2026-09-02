@@ -10,16 +10,39 @@ permissions:
   contents: read
 
 jobs:
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      conformance: ${{ steps.changes.outputs.conformance }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changed paths
+        id: changes
+        run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
+
   conformance:
+    needs: scope
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: target/cargo
     steps:
+      - name: Require successful path classification
+        if: needs.scope.result != 'success'
+        run: echo 'Path classification failed.' >&2; exit 1
+      - name: Complete the required check for documentation and SDK-only changes
+        if: needs.scope.outputs.conformance != 'true'
+        run: echo 'Rsync conformance is not affected by this change set.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.scope.outputs.conformance == 'true'
         with:
           persist-credentials: false
       - name: Cache pinned rsync source and helpers
+        if: needs.scope.outputs.conformance == 'true'
         id: rsync-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -28,11 +51,12 @@ jobs:
             target/rsync-compat/suites
           key: rsync-compat-${{ runner.os }}-${{ hashFiles('scripts/rsync-compat.py', 'tests/rsync-compat/manifest.toml', 'tests/rsync-compat/inventory.tsv', 'tests/rsync-compat/adaptations/*.patch') }}
       - name: Install rsync test-build prerequisites
-        if: steps.rsync-cache.outputs.cache-hit != 'true'
+        if: needs.scope.outputs.conformance == 'true' && steps.rsync-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y autoconf automake build-essential
       - name: Cache Cargo dependencies and build output
+        if: needs.scope.outputs.conformance == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -43,10 +67,13 @@ jobs:
           restore-keys: |
             cargo-rsync-compat-${{ runner.os }}-
       - name: Test compatibility harness
+        if: needs.scope.outputs.conformance == 'true'
         run: python3 tests/rsync-compat/harness_test.py
       - name: Run classified upstream tests
+        if: needs.scope.outputs.conformance == 'true'
         run: python3 scripts/rsync-compat.py --require-tests --test-timeout 120 -j 4
       - name: Run suite as root, including root-only circumstances
+        if: needs.scope.outputs.conformance == 'true'
         run: |
           sudo env \
             PATH="$PATH" \
@@ -56,10 +83,10 @@ jobs:
               --no-build-syq --syq-bin "$PWD/target/cargo/debug/syq" \
               --test-timeout 120 -j 4
       - name: Restore compatibility-cache ownership
-        if: always()
+        if: always() && needs.scope.outputs.conformance == 'true'
         run: sudo chown -R "$(id -u):$(id -g)" target/rsync-compat
       - name: Upload compatibility report
-        if: always()
+        if: always() && needs.scope.outputs.conformance == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rsync-compatibility
