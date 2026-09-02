@@ -23,7 +23,9 @@
 //! descriptor-based traversal, an already-open descendant remains the selected
 //! object if another process subsequently renames it.
 
+use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Context, Result};
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -63,7 +65,7 @@ pub(crate) struct RootIdentity {
     pub(crate) ino: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RootMetadata {
     pub(crate) dev: u64,
     pub(crate) ino: u64,
@@ -77,6 +79,350 @@ pub(crate) struct RootMetadata {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) rdev: u64,
+}
+
+/// Whether resolution needs to traverse the last component as a directory or
+/// select it as a named entry. Selecting an entry may independently request
+/// that a last-component symlink be followed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperatorFinalComponent {
+    Directory,
+    Entry { follow_symlink: bool },
+}
+
+/// One symlink hop taken while resolving an operator path. Callers use this
+/// only for diagnostics; authority is carried by the returned descriptors.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OperatorSymlinkHop {
+    pub(crate) component: Vec<u8>,
+    pub(crate) target: Vec<u8>,
+}
+
+/// An existing named entry selected relative to its retained parent. `object`
+/// pins a non-directory object where the platform can open it without
+/// following; a selected symlink may have only its parent, name, and observed
+/// identity. Directories are pinned separately by `PinnedDirectory`.
+pub(crate) struct PinnedLeaf {
+    parent: File,
+    name: CString,
+    metadata: RootMetadata,
+    object: Option<File>,
+}
+
+impl PinnedLeaf {
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            parent: self.parent.try_clone().context("duplicate pinned parent")?,
+            name: self.name.clone(),
+            metadata: self.metadata,
+            object: self
+                .object
+                .as_ref()
+                .map(|object| object.try_clone())
+                .transpose()
+                .context("duplicate pinned object")?,
+        })
+    }
+
+    pub(crate) fn metadata(&self) -> RootMetadata {
+        self.metadata
+    }
+
+    pub(crate) fn into_parts(self) -> (File, CString, RootMetadata, Option<File>) {
+        (self.parent, self.name, self.metadata, self.object)
+    }
+}
+
+/// An existing selected directory. `entry` retains the parent/name used to
+/// select it when the directory itself may later need to be renamed or
+/// removed; it is absent when resolution ends at the resolver's base.
+pub(crate) struct PinnedDirectory {
+    directory: File,
+    entry: Option<PinnedLeaf>,
+    metadata: RootMetadata,
+}
+
+impl PinnedDirectory {
+    pub(crate) fn metadata(&self) -> RootMetadata {
+        self.metadata
+    }
+
+    pub(crate) fn into_parts(self) -> (File, Option<PinnedLeaf>) {
+        (self.directory, self.entry)
+    }
+}
+
+/// The nearest retained existing directory and the unresolved suffix beneath
+/// it. Creation remains a caller policy; this type supplies only authority.
+pub(crate) struct PinnedMissing {
+    directory: File,
+    components: VecDeque<Vec<u8>>,
+}
+
+impl PinnedMissing {
+    pub(crate) fn into_parts(self) -> (File, VecDeque<Vec<u8>>) {
+        (self.directory, self.components)
+    }
+}
+
+pub(crate) enum PinnedPath {
+    Missing(PinnedMissing),
+    Leaf(PinnedLeaf),
+    Directory(PinnedDirectory),
+}
+
+struct OperatorCursor {
+    directory: File,
+    entry: Option<PinnedLeaf>,
+}
+
+/// Descriptor-retaining component resolver for paths supplied directly by an
+/// operator. Descendant transfer paths use `RelativePath` and `Root` instead.
+pub(crate) struct OperatorResolver {
+    base: File,
+    confined: bool,
+    relative_input: bool,
+    symlink_policy: OperatorSymlinkPolicy,
+}
+
+impl OperatorResolver {
+    /// Begin at the process root or cwd. Absolute symlink targets may restart
+    /// at `/` because this form is not confined beneath a caller-provided base.
+    pub(crate) fn resolve_process(
+        path: &[u8],
+        symlink_policy: OperatorSymlinkPolicy,
+        final_component: OperatorFinalComponent,
+        allow_missing: bool,
+        hops: &mut Vec<OperatorSymlinkHop>,
+    ) -> Result<PinnedPath> {
+        Self {
+            base: open_operator_start(path.starts_with(b"/"))?,
+            confined: false,
+            relative_input: false,
+            symlink_policy,
+        }
+        .resolve(path, final_component, allow_missing, hops)
+    }
+
+    /// Begin at an already-open directory. The supplied path must be relative;
+    /// a confined resolver also refuses `..` and symlink targets that would
+    /// escape that directory.
+    pub(crate) fn beneath(
+        base: &File,
+        confined: bool,
+        symlink_policy: OperatorSymlinkPolicy,
+    ) -> Result<Self> {
+        Ok(Self {
+            base: base.try_clone().context("duplicate operator path base")?,
+            confined,
+            relative_input: true,
+            symlink_policy,
+        })
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        path: &[u8],
+        final_component: OperatorFinalComponent,
+        allow_missing: bool,
+        hops: &mut Vec<OperatorSymlinkHop>,
+    ) -> Result<PinnedPath> {
+        if path.contains(&0) {
+            bail!("operator path contains NUL");
+        }
+        if self.relative_input && path.starts_with(b"/") {
+            bail!("path beneath an opened operator base must be relative");
+        }
+        let mut components = operator_components(path);
+        let mut stack = vec![OperatorCursor {
+            directory: self
+                .base
+                .try_clone()
+                .context("duplicate operator path base")?,
+            entry: None,
+        }];
+        let mut symlink_count = 0usize;
+
+        loop {
+            let Some(component) = components.pop_front() else {
+                let current = stack.last().expect("operator resolver stack is nonempty");
+                let metadata = root_metadata_from_std(&current.directory.metadata()?)?;
+                return Ok(PinnedPath::Directory(PinnedDirectory {
+                    directory: current
+                        .directory
+                        .try_clone()
+                        .context("pin selected directory")?,
+                    entry: current
+                        .entry
+                        .as_ref()
+                        .map(PinnedLeaf::try_clone)
+                        .transpose()?,
+                    metadata,
+                }));
+            };
+
+            if component == b"." {
+                continue;
+            }
+            if component == b".." {
+                if stack.len() > 1 {
+                    stack.pop();
+                } else if self.confined {
+                    bail!("operator path resolves outside its confined root");
+                } else {
+                    stack[0] = OperatorCursor {
+                        directory: open_operator_directory_at(&stack[0].directory, b"..")
+                            .context("resolve operator path parent")?,
+                        entry: None,
+                    };
+                }
+                continue;
+            }
+
+            let current = stack.last().expect("operator resolver stack is nonempty");
+            let name = operator_component_cstring(&component)?;
+            let metadata = match metadata_at(current.directory.as_raw_fd(), &name) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound && allow_missing => {
+                    components.push_front(component);
+                    return Ok(PinnedPath::Missing(PinnedMissing {
+                        directory: current
+                            .directory
+                            .try_clone()
+                            .context("pin nearest existing directory")?,
+                        components,
+                    }));
+                }
+                Err(error) => return Err(error).context("inspect operator path component"),
+            };
+            let final_name = components.is_empty();
+            let follow_symlink = !final_name
+                || matches!(final_component, OperatorFinalComponent::Directory)
+                || matches!(
+                    final_component,
+                    OperatorFinalComponent::Entry {
+                        follow_symlink: true
+                    }
+                );
+
+            if metadata.is_symlink() {
+                if !follow_symlink {
+                    let object = open_operator_symlink_at(current.directory.as_raw_fd(), &name)?;
+                    if let Some(object) = &object {
+                        require_operator_identity(
+                            metadata,
+                            root_metadata_from_std(&object.metadata()?)?,
+                            "operator symlink",
+                        )?;
+                    }
+                    return Ok(PinnedPath::Leaf(PinnedLeaf {
+                        parent: current
+                            .directory
+                            .try_clone()
+                            .context("pin selected symlink parent")?,
+                        name,
+                        metadata,
+                        object,
+                    }));
+                }
+                self.authorize_symlink(metadata, &component)?;
+                symlink_count += 1;
+                if symlink_count > 40 {
+                    bail!("too many symlink levels in operator path");
+                }
+                let target = operator_read_link_at(current.directory.as_raw_fd(), &name)?;
+                hops.push(OperatorSymlinkHop {
+                    component,
+                    target: target.clone(),
+                });
+                if target.starts_with(b"/") {
+                    if self.confined {
+                        bail!("operator path has an absolute symlink target outside its root");
+                    }
+                    stack = vec![OperatorCursor {
+                        directory: open_operator_start(true)?,
+                        entry: None,
+                    }];
+                }
+                let mut target_components = operator_components(&target);
+                target_components.append(&mut components);
+                components = target_components;
+                continue;
+            }
+
+            if metadata.is_dir() {
+                let directory = open_operator_directory_at(&current.directory, &component)
+                    .context("open operator directory component")?;
+                require_operator_identity(
+                    metadata,
+                    root_metadata_from_std(&directory.metadata()?)?,
+                    "operator directory",
+                )?;
+                let entry = PinnedLeaf {
+                    parent: current
+                        .directory
+                        .try_clone()
+                        .context("pin selected directory parent")?,
+                    name,
+                    metadata,
+                    object: None,
+                };
+                if final_name {
+                    return Ok(PinnedPath::Directory(PinnedDirectory {
+                        directory,
+                        entry: Some(entry),
+                        metadata,
+                    }));
+                }
+                stack.push(OperatorCursor {
+                    directory,
+                    entry: Some(entry),
+                });
+                continue;
+            }
+
+            if !final_name || matches!(final_component, OperatorFinalComponent::Directory) {
+                return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
+            }
+            let object = open_operator_metadata_at(current.directory.as_raw_fd(), &name)
+                .context("pin operator path leaf")?;
+            require_operator_identity(
+                metadata,
+                root_metadata_from_std(&object.metadata()?)?,
+                "operator leaf",
+            )?;
+            return Ok(PinnedPath::Leaf(PinnedLeaf {
+                parent: current
+                    .directory
+                    .try_clone()
+                    .context("pin selected object parent")?,
+                name,
+                metadata,
+                object: Some(object),
+            }));
+        }
+    }
+
+    fn authorize_symlink(&self, metadata: RootMetadata, component: &[u8]) -> Result<()> {
+        let euid = unsafe { libc::geteuid() };
+        match self.symlink_policy {
+            OperatorSymlinkPolicy::Refuse => bail!(
+                "refusing symlink component {:?} in operator path; pass --follow to resolve symlinks",
+                String::from_utf8_lossy(component)
+            ),
+            OperatorSymlinkPolicy::TrustedOwner
+                if !operator_symlink_owner_is_trusted(metadata.uid, euid) =>
+            {
+                bail!(
+                    "refusing symlink component {:?} owned by uid {}; expected uid 0 or receiver uid {}",
+                    String::from_utf8_lossy(component),
+                    metadata.uid,
+                    euid
+                )
+            }
+            OperatorSymlinkPolicy::TrustedOwner | OperatorSymlinkPolicy::FollowAll => Ok(()),
+        }
+    }
 }
 
 impl RootMetadata {
@@ -428,19 +774,6 @@ impl Root {
         .with_context(|| format!("create confined node {}", path.label()))
     }
 
-    pub(crate) fn chmod(&self, path: &RelativePath, mode: u32) -> Result<()> {
-        let parent = self.resolve_parent(path)?;
-        retry_zero(|| unsafe {
-            libc::fchmodat(
-                parent.directory.as_raw_fd(),
-                parent.leaf.as_ptr(),
-                (mode & 0o7777) as libc::mode_t,
-                0,
-            )
-        })
-        .with_context(|| format!("chmod confined path {}", path.label()))
-    }
-
     pub(crate) fn chown(
         &self,
         path: &RelativePath,
@@ -734,6 +1067,133 @@ struct ResolvedParent {
 
 fn component_cstring(component: &[u8]) -> CString {
     CString::new(component).expect("RelativePath already rejected NUL")
+}
+
+fn operator_components(path: &[u8]) -> VecDeque<Vec<u8>> {
+    path.split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+fn operator_component_cstring(component: &[u8]) -> Result<CString> {
+    CString::new(component).context("operator path component contains NUL")
+}
+
+fn operator_directory_flags() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    {
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+}
+
+fn open_operator_start(absolute: bool) -> Result<File> {
+    let name = CString::new(if absolute { "/" } else { "." })
+        .expect("fixed operator start contains no NUL");
+    open_operator_directory_fd(libc::AT_FDCWD, &name)
+}
+
+fn open_operator_directory_at(parent: &File, component: &[u8]) -> Result<File> {
+    let component = operator_component_cstring(component)?;
+    open_operator_directory_fd(parent.as_raw_fd(), &component)
+}
+
+fn open_operator_directory_fd(parent: RawFd, component: &CString) -> Result<File> {
+    let directory = open_at(parent, component, operator_directory_flags(), 0)?;
+    if !directory.metadata()?.is_dir() {
+        bail!("operator path component is not a directory");
+    }
+    Ok(directory)
+}
+
+fn open_operator_metadata_at(parent: RawFd, name: &CString) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    let flags =
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags =
+        libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let flags =
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+    open_at(parent, name, flags, 0)
+}
+
+fn open_operator_symlink_at(parent: RawFd, name: &CString) -> Result<Option<File>> {
+    #[cfg(target_os = "linux")]
+    {
+        open_at(
+            parent,
+            name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC,
+            0,
+        )
+        .map(Some)
+        .context("pin operator symlink")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        open_at(
+            parent,
+            name,
+            libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+            0,
+        )
+        .map(Some)
+        .context("pin operator symlink")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (parent, name);
+        Ok(None)
+    }
+}
+
+fn operator_read_link_at(parent: RawFd, name: &CString) -> Result<Vec<u8>> {
+    let mut capacity = 256usize;
+    loop {
+        let mut target = Vec::<u8>::with_capacity(capacity);
+        let length = unsafe {
+            libc::readlinkat(parent, name.as_ptr(), target.as_mut_ptr().cast(), capacity)
+        };
+        if length < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("read operator symlink");
+        }
+        let length = length as usize;
+        if length < capacity {
+            unsafe { target.set_len(length) };
+            return Ok(target);
+        }
+        capacity = capacity
+            .checked_mul(2)
+            .filter(|next| *next <= libc::PATH_MAX as usize * 2)
+            .context("operator symlink target is too long")?;
+    }
+}
+
+fn require_operator_identity(
+    expected: RootMetadata,
+    actual: RootMetadata,
+    label: &str,
+) -> Result<()> {
+    if (actual.dev, actual.ino, actual.file_type())
+        != (expected.dev, expected.ino, expected.file_type())
+    {
+        bail!("{label} changed identity during resolution");
+    }
+    Ok(())
+}
+
+fn operator_symlink_owner_is_trusted(owner: u32, euid: u32) -> bool {
+    owner == 0 || owner == euid
 }
 
 fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
@@ -1047,6 +1507,211 @@ mod tests {
 
     fn relative(path: &[u8]) -> RelativePath {
         RelativePath::new(path).unwrap()
+    }
+
+    fn operator_path(path: &Path) -> Vec<u8> {
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[test]
+    fn operator_resolver_selects_a_last_component_symlink_without_following_it() {
+        let tree = TestDir::new("operator-leaf-link");
+        let outside = tree.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let selected = tree.path().join("selected");
+        symlink(&outside, &selected).unwrap();
+        let original = fs::symlink_metadata(&selected).unwrap();
+
+        let mut hops = Vec::new();
+        let result = OperatorResolver::resolve_process(
+            &operator_path(&selected),
+            OperatorSymlinkPolicy::Refuse,
+            OperatorFinalComponent::Entry {
+                follow_symlink: false,
+            },
+            false,
+            &mut hops,
+        )
+        .unwrap();
+        let PinnedPath::Leaf(leaf) = result else {
+            panic!("last-component symlink was not selected as a leaf");
+        };
+        assert!(leaf.metadata().is_symlink());
+        let (_, name, _, object) = leaf.into_parts();
+        assert_eq!(name.as_bytes(), b"selected");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let object = object.expect("supported platform should pin the symlink object");
+            fs::rename(&selected, tree.path().join("moved")).unwrap();
+            symlink("replacement", &selected).unwrap();
+            let pinned = object.metadata().unwrap();
+            let replacement = fs::symlink_metadata(&selected).unwrap();
+            assert_eq!(
+                (pinned.dev(), pinned.ino()),
+                (original.dev(), original.ino())
+            );
+            assert_ne!(
+                (pinned.dev(), pinned.ino()),
+                (replacement.dev(), replacement.ino())
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert!(object.is_none());
+        assert!(hops.is_empty());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn operator_resolver_follows_only_components_requested_by_the_caller() {
+        let tree = TestDir::new("operator-follow");
+        let real = tree.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let outside = tree.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        symlink("real", tree.path().join("container")).unwrap();
+        symlink(&outside, real.join("leaf")).unwrap();
+        let selected = tree.path().join("container/leaf");
+
+        let mut hops = Vec::new();
+        assert!(OperatorResolver::resolve_process(
+            &operator_path(&selected),
+            OperatorSymlinkPolicy::Refuse,
+            OperatorFinalComponent::Entry {
+                follow_symlink: false,
+            },
+            false,
+            &mut hops,
+        )
+        .is_err());
+
+        let result = OperatorResolver::resolve_process(
+            &operator_path(&selected),
+            OperatorSymlinkPolicy::FollowAll,
+            OperatorFinalComponent::Entry {
+                follow_symlink: false,
+            },
+            false,
+            &mut hops,
+        )
+        .unwrap();
+        let PinnedPath::Leaf(leaf) = result else {
+            panic!("last-component symlink was unexpectedly followed");
+        };
+        assert!(leaf.metadata().is_symlink());
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].component, b"container");
+        assert_eq!(hops[0].target, b"real");
+    }
+
+    #[test]
+    fn operator_resolver_reports_the_missing_suffix_from_a_retained_parent() {
+        let tree = TestDir::new("operator-missing");
+        let base = File::open(tree.path()).unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+        let mut hops = Vec::new();
+        let result = resolver
+            .resolve(
+                b"new/nested",
+                OperatorFinalComponent::Directory,
+                true,
+                &mut hops,
+            )
+            .unwrap();
+        let PinnedPath::Missing(missing) = result else {
+            panic!("missing suffix was not returned");
+        };
+        let (directory, components) = missing.into_parts();
+        let metadata = directory.metadata().unwrap();
+        let expected = fs::metadata(tree.path()).unwrap();
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (expected.dev(), expected.ino())
+        );
+        assert_eq!(
+            components,
+            VecDeque::from([b"new".to_vec(), b"nested".to_vec()])
+        );
+        assert!(hops.is_empty());
+    }
+
+    #[test]
+    fn operator_symlink_trust_is_root_or_receiver_ownership() {
+        assert!(operator_symlink_owner_is_trusted(0, 1000));
+        assert!(operator_symlink_owner_is_trusted(1000, 1000));
+        assert!(!operator_symlink_owner_is_trusted(1001, 1000));
+        assert!(!operator_symlink_owner_is_trusted(1000, 0));
+    }
+
+    #[test]
+    fn confined_operator_resolver_rejects_relative_and_absolute_link_escapes() {
+        let tree = TestDir::new("operator-confined");
+        let base_path = tree.path().join("base");
+        let outside = tree.path().join("outside");
+        fs::create_dir(&base_path).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink("../outside", base_path.join("relative")).unwrap();
+        symlink(&outside, base_path.join("absolute")).unwrap();
+        let base = File::open(&base_path).unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::FollowAll).unwrap();
+
+        let mut hops = Vec::new();
+        assert!(resolver
+            .resolve(
+                b"/absolute-input",
+                OperatorFinalComponent::Directory,
+                false,
+                &mut hops,
+            )
+            .is_err());
+
+        for selected in [&b"relative"[..], &b"absolute"[..]] {
+            let mut hops = Vec::new();
+            assert!(resolver
+                .resolve(
+                    selected,
+                    OperatorFinalComponent::Directory,
+                    false,
+                    &mut hops,
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn selected_operator_directory_remains_pinned_after_rename() {
+        let tree = TestDir::new("operator-directory-pin");
+        let selected = tree.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        let original = fs::metadata(&selected).unwrap();
+        let mut hops = Vec::new();
+        let result = OperatorResolver::resolve_process(
+            &operator_path(&selected),
+            OperatorSymlinkPolicy::Refuse,
+            OperatorFinalComponent::Directory,
+            false,
+            &mut hops,
+        )
+        .unwrap();
+        let PinnedPath::Directory(directory) = result else {
+            panic!("directory was not selected");
+        };
+
+        fs::rename(&selected, tree.path().join("moved")).unwrap();
+        fs::create_dir(&selected).unwrap();
+        let replacement = fs::metadata(&selected).unwrap();
+        let (directory, entry) = directory.into_parts();
+        let pinned = directory.metadata().unwrap();
+        assert_eq!(
+            (pinned.dev(), pinned.ino()),
+            (original.dev(), original.ino())
+        );
+        assert_ne!(
+            (pinned.dev(), pinned.ino()),
+            (replacement.dev(), replacement.ino())
+        );
+        assert!(entry.is_some());
     }
 
     #[test]
