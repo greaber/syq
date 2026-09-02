@@ -7881,3 +7881,116 @@ fn files_from_unwritable_destination_root_fails_and_is_left_alone() {
     assert_eq!(mode, 0o500, "the unlisted root keeps its mode");
     assert!(!t.path("dst/a").exists());
 }
+
+// ---- syq map ----
+
+fn syq_map_in(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("map")
+        .args(args)
+        .current_dir(dir)
+        .run()
+        .expect("run syq map")
+}
+
+fn map_lines(out: &Output) -> Vec<serde_json::Value> {
+    assert!(
+        out.status.success(),
+        "syq map failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout.clone())
+        .expect("map output is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("map line is JSON"))
+        .collect()
+}
+
+fn map_path(value: &serde_json::Value, key: &str) -> String {
+    assert_eq!(value[key]["encoding"], "utf-8");
+    value[key]["value"]
+        .as_str()
+        .expect("tagged path value")
+        .to_string()
+}
+
+#[test]
+fn native_map_contents_emits_identity_parent_first() {
+    let t = Tmp::new();
+    write(&t.path("src/Berlin/IMG.JPG"), b"img");
+    write(&t.path("src/Notes.TXT"), b"hello");
+    std::os::unix::fs::symlink("Notes.TXT", t.path("src/Link.TXT")).unwrap();
+    let lines = map_lines(&syq_map_in(&t.path(""), &["--src-src", "src"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["Berlin", "Berlin/IMG.JPG", "Link.TXT", "Notes.TXT"]);
+    for v in &lines {
+        assert_eq!(map_path(v, "src"), map_path(v, "dst"));
+    }
+    assert_eq!(lines[0]["kind"], "dir");
+    assert!(lines[0].get("size").is_none());
+    assert_eq!(lines[1]["kind"], "file");
+    assert_eq!(lines[1]["size"], 3);
+    assert!(lines[1]["mtime"].is_i64());
+    assert_eq!(lines[2]["kind"], "symlink");
+    assert!(lines[2].get("size").is_none());
+    assert_eq!(lines[3]["kind"], "file");
+}
+
+#[test]
+fn native_map_named_cwd_and_as_rename() {
+    let t = Tmp::new();
+    write(&t.path("photos/x/a.jpg"), b"a");
+    // Named selector: dst gains the basename prefix.
+    let lines = map_lines(&syq_map_in(&t.path(""), &["photos"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["photos", "photos/x", "photos/x/a.jpg"]);
+    for v in &lines {
+        assert_eq!(map_path(v, "src"), map_path(v, "dst"));
+    }
+    // -C: emitted src stays relative to the base.
+    let lines = map_lines(&syq_map_in(&t.path(""), &["-C", "photos", "--src", "x"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["x", "x/a.jpg"]);
+    assert_eq!(map_path(&lines[0], "src"), "x");
+    // --as renames the single selected root; src spelling is unchanged.
+    let lines = map_lines(&syq_map_in(&t.path(""), &["photos", "--as", "album"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["album", "album/x", "album/x/a.jpg"]);
+    let srcs: Vec<String> = lines.iter().map(|v| map_path(v, "src")).collect();
+    assert_eq!(srcs, ["photos", "photos/x", "photos/x/a.jpg"]);
+}
+
+#[test]
+fn native_map_refusals() {
+    let t = Tmp::new();
+    write(&t.path("d1/n"), b"1");
+    write(&t.path("d2/n"), b"2");
+    let refuse = |args: &[&str], needle: &str| {
+        let out = syq_map_in(&t.path(""), args);
+        assert!(!out.status.success(), "expected failure for {args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(stderr.contains(needle), "stderr for {args:?}: {stderr}");
+    };
+    refuse(&["/etc"], "root-relative");
+    refuse(&["--src-src", "d1", "--src-src", "d2"], "only selector");
+    refuse(&["--src-src", "d1", "d2"], "only selector");
+    refuse(&["d1/n", "d2/n"], "same destination name");
+    refuse(&["d1", "--into-new", "z"], "never contacts a destination");
+    refuse(&["d1", "--from", "remotehost"], "not yet supported");
+}
+
+#[test]
+fn native_map_refuses_non_utf8_names() {
+    let t = Tmp::new();
+    write(&t.path("src/ok.txt"), b"ok");
+    let bad = t
+        .path("src")
+        .join(std::ffi::OsString::from_vec(b"bad\xff.dat".to_vec()));
+    write(&bad, b"x");
+    let out = syq_map_in(&t.path(""), &["--src-src", "src"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("UTF-8"), "stderr: {stderr}");
+}

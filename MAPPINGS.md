@@ -66,6 +66,14 @@ Emission refuses names that are not valid UTF-8 (so published
 one-line transforms are safe by construction); mappings you author
 yourself may use the base64 form for such names.
 
+In this first version `syq map` reads a local source (`--from` is
+refused), and takes either `--src-src DIR` as the only selector or any
+number of relative named selectors. It never contacts a destination,
+so `--to` and `--into` do not change what is emitted and the
+`--into-new`/`--into-existing`/`--as-new`/`--as-existing` existence
+preconditions are refused; only `--as` changes the output, by renaming
+the single selected root.
+
 ## Transform in the middle
 
 Because a mapping is plain data, the pipeline
@@ -202,10 +210,11 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   an exact single-path placement cannot host a manifest — each entry's
   `dst` already is its own `--as`. It is part of the native surface
   only; `syq rsync` is unchanged.
-- `syq map` accepts any `syq cp` invocation, including
-  `report --as /reports/final`, which emits that single resolved entry.
-  The typed `rm` selectors (`--src-dir`, `--src-file`) are not part of
-  the copy grammar.
+- `syq map` accepts the `syq cp` grammar, including `--as PATH`, which
+  emits the single selected root under the target's basename; see
+  "Emitting a mapping" for this version's restrictions. The typed `rm`
+  selectors (`--src-dir`, `--src-file`) are not part of the copy
+  grammar.
 - Fidelity is the native default (`-rlt`). There is no per-entry
   policy: preservation and comparison behavior stay global.
 - An entry claims exactly one object. A `dir` entry claims the
