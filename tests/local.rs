@@ -8795,3 +8795,55 @@ fn native_cp_results_implicit_dir_failure_is_not_a_retry_entry() {
         assert!(v.get("src").is_some(), "retry candidates carry src: {v}");
     }
 }
+
+#[test]
+fn native_cp_mapping_specials_are_visible_skips_not_failures() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"abc");
+    fs::create_dir_all(t.path("src")).unwrap();
+    let fifo = t.path("src/pipe");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let manifest = format!(
+        "{}{}",
+        entry_line("a.txt", "a.txt", None),
+        entry_line("pipe", "pipe", Some("special")),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.path("dst/pipe").exists());
+    assert_eq!(read(&t.path("dst/a.txt")), b"abc");
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let skipped = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["dst"]["value"] == "pipe")
+        .expect("skipped record");
+    assert_eq!(skipped["disposition"], "skipped");
+    assert_eq!(skipped["kind"], "special");
+    assert!(skipped.get("retryable").is_none());
+    let last = lines.last().unwrap();
+    assert_eq!(last["status"], "success");
+    assert_eq!(last["files_excluded"], 1);
+}

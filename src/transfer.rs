@@ -3588,6 +3588,7 @@ impl Planner<'_> {
                 Claim::Weak if e.kind == Kind::Other => {
                     // Unknown type: never transferred.
                     self.progress.files_excluded.fetch_add(1, Relaxed);
+                    self.emit_mapping_entry_skipped(&e, &dst_rel);
                 }
                 Claim::Weak => {
                     // Symlink without -l, special without -D.
@@ -3596,6 +3597,7 @@ impl Planner<'_> {
                             .eprintln(&format!("skipping non-regular file \"{rel}\""));
                     }
                     self.progress.files_excluded.fetch_add(1, Relaxed);
+                    self.emit_mapping_entry_skipped(&e, &dst_rel);
                 }
                 Claim::File { .. } | Claim::Leaf => others.push(Planned {
                     src,
@@ -4663,6 +4665,37 @@ impl Planner<'_> {
                 attempts: None,
                 retryable: Some(retryable),
                 message: Some(message),
+            });
+        }
+    }
+
+    /// A mapping entry excluded by policy (a special file or unknown type
+    /// under the fixed -rlt fidelity): visible in the results stream as a
+    /// skipped operation, not a failure — the same class as a --min-size
+    /// exclusion, and never selected by the retry filter.
+    fn emit_mapping_entry_skipped(&self, e: &Entry, dst_rel: &[u8]) {
+        if !self.mapping_mode {
+            return;
+        }
+        if let Some(results) = self.progress.results_writer() {
+            let (action, kind) = match e.kind {
+                Kind::Symlink => ("create_symlink", "symlink"),
+                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
+                    ("create_special", "special")
+                }
+                _ => ("transfer_file", "file"),
+            };
+            let src = self.mapping_source_rel(dst_rel);
+            results.emit_operation(&crate::results::OperationRecord {
+                action,
+                dst: dst_rel,
+                src: src.as_deref(),
+                kind,
+                disposition: "skipped",
+                bytes: None,
+                attempts: None,
+                retryable: None,
+                message: Some("not copied by native cp's fixed -rlt policy"),
             });
         }
     }

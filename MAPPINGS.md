@@ -82,6 +82,12 @@ things that otherwise need dedicated flags or custom copy scripts.
 Re-running any of these converges like an ordinary syq copy: what
 already landed is skipped.
 
+As in any shell pipeline, `syq cp` sees only the bytes that reach it:
+if a producer fails partway, use `set -o pipefail` so the pipeline's
+exit status reflects it. Nothing wrong is copied either way — a
+truncated manifest copies a valid prefix, and re-running after the fix
+completes the rest.
+
 ### Lowercase every destination name
 
 A migration to a case-insensitive filesystem:
@@ -223,6 +229,11 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   symlink, and a destination path that would traverse a symlink inside
   the target container fails that entry. Resolve links yourself before
   emitting if you want targets instead.
+- An entry whose object the fixed `-rlt` fidelity does not copy (a FIFO
+  or device) is skipped, not failed: the run still succeeds, the entry
+  counts as excluded, and with `--results` it appears with disposition
+  `skipped` — the same class as a `--min-size` exclusion. Filter with
+  `jq 'select(.kind != "special")'` to drop such entries up front.
 - Mappings define no deletion region, so `--mapping` is not available
   on `cp-prune`.
 - Duplicate lines are errors, even identical ones: a duplicate almost
@@ -236,8 +247,10 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
 
 `syq cp --results FILE` (also `-` for stdout; combine that with `-q`)
 writes an NDJSON outcome stream beside the ordinary human output:
-a `run` record, one `operation_result` per settled mutation and per
-failed mapping entry, an `error` record per counted error, and exactly
+a `run` record, one `operation_result` per settled mutation, per
+failed mapping entry, and per policy-skipped mapping entry
+(disposition `succeeded`, `failed`, or `skipped`), an `error` record
+per counted error, and exactly
 one terminal `result` with the exit code and aggregate counts. The
 records carry `schema_version: 0` — an unstable preview of the planned
 automation interface; unchanged and excluded entries appear only in
