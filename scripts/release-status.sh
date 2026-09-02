@@ -32,12 +32,23 @@ if [ "$reference" != null ]; then
   object_sha=$(jq -er .object.sha <<<"$reference")
   if [ "$object_type" = tag ]; then
     tag_object=$(gh api "repos/$repository/git/tags/$object_sha")
-    tag_commit=$(jq -er .object.sha <<<"$tag_object")
+    actual_tag=$(jq -er .tag <<<"$tag_object")
+    target_type=$(jq -er .object.type <<<"$tag_object")
+    target_sha=$(jq -er .object.sha <<<"$tag_object")
     verified=$(jq -r '.verification.verified == true and .verification.reason == "valid"' <<<"$tag_object")
-    [ "$verified" = true ] && tag_state=verified || tag_state=unverified
-  else
+    if [ "$actual_tag" != "$tag" ]; then
+      tag_state=name-mismatch
+    elif [ "$target_type" != commit ]; then
+      tag_state=invalid-target
+    else
+      tag_commit=$target_sha
+      [ "$verified" = true ] && tag_state=verified || tag_state=unverified
+    fi
+  elif [ "$object_type" = commit ]; then
     tag_commit=$object_sha
     tag_state=lightweight
+  else
+    tag_state=invalid-target
   fi
 fi
 

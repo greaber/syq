@@ -113,7 +113,7 @@ jobs:
             "- bumps the Python SDK to $PYTHON_VERSION" \
             "- embeds the exact signed v$SYQ_VERSION release manifest" \
             "- updates the documented SDK-to-syq mapping" \
-            "The native pull-request checks are approved explicitly because GitHub puts workflow runs caused by GITHUB_TOKEN into an approval-required state. Auto-merge is requested after those required checks are registered; publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
+            "The native pull-request checks are approved explicitly because GitHub puts workflow runs caused by GITHUB_TOKEN into an approval-required state. Auto-merge is requested only after the substantive sdks check succeeds on this exact commit; publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
           pr_url=$(gh pr create \
             --base master \
             --head "$branch" \

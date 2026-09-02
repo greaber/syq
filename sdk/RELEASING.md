@@ -138,9 +138,11 @@ state. The preparation workflow waits until GitHub has registered both native
 runs for the exact generated commit, verifies that the pull request and native
 events belong to the trusted repository, then approves them through the
 Actions API so the required checks remain attached to the pull request. The
-fixture-tested helper has a bounded deadline and reports its last observed
-state on failure. Once the runs exist, the workflow requests auto-merge; GitHub
-still waits for every required check and branch-protection rule. The repository
+fixture-tested helper has bounded deadlines and reports its last observed state
+on failure. Because `sdks` is not currently a required branch-protection check,
+the helper also waits for that check to succeed on the exact generated commit
+before the workflow requests auto-merge. GitHub then still waits for every
+required check and branch-protection rule. The repository
 keeps the default workflow token read only, permits trusted Actions workflows
 to create pull requests, and grants write scopes only inside this preparation
 workflow.

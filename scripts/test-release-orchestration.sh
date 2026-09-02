@@ -86,6 +86,16 @@ elif [ "$1:$2" = 'run:list' ]; then
     {conclusion:"action_required",databaseId:102,event:$event,headSha:$sha,status:"completed",url:"https://example.test/102",workflowName:"rsync compatibility"}]'
 elif [ "$1" = api ] && [[ " $* " == *'/approve '* ]]; then
   printf '%s\n' "$*" >>"$SYQ_TEST_APPROVAL_LOG"
+elif [ "$1" = api ] && [[ "$2" == *'/check-runs?'* ]]; then
+  status=${SYQ_TEST_SDK_STATUS:-completed}
+  conclusion=${SYQ_TEST_SDK_CONCLUSION:-success}
+  if [ "$conclusion" = null ]; then
+    jq -cn --arg status "$status" \
+      '{check_runs:[{name:"sdks",status:$status,conclusion:null}]}'
+  else
+    jq -cn --arg status "$status" --arg conclusion "$conclusion" \
+      '{check_runs:[{name:"sdks",status:$status,conclusion:$conclusion}]}'
+  fi
 else
   echo "unexpected fake gh invocation: $*" >&2
   exit 2
@@ -106,6 +116,17 @@ expect_failure 'timed out waiting for native pull-request workflow runs' env \
   SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_RUN_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   SYQ_TEST_APPROVAL_LOG="$approval_log" SYQ_APPROVAL_TIMEOUT_SECONDS=0 \
   PATH="$approval_bin:$PATH" \
+  "$script_dir/approve-generated-pr-runs.sh" \
+  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
+expect_failure 'required generated-PR check sdks is completed/failure' env \
+  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_SDK_CONCLUSION=failure \
+  SYQ_TEST_APPROVAL_LOG="$approval_log" PATH="$approval_bin:$PATH" \
+  "$script_dir/approve-generated-pr-runs.sh" \
+  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
+expect_failure 'timed out waiting for required generated-PR check sdks' env \
+  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_SDK_STATUS=in_progress \
+  SYQ_TEST_SDK_CONCLUSION=null SYQ_REQUIRED_CHECK_TIMEOUT_SECONDS=0 \
+  SYQ_TEST_APPROVAL_LOG="$approval_log" PATH="$approval_bin:$PATH" \
   "$script_dir/approve-generated-pr-runs.sh" \
   greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
 expect_failure 'timed out waiting for native pull-request workflow runs' env \
@@ -231,7 +252,10 @@ case "$1:$2" in
   api:*)
     case " $* " in
       *'/git/matching-refs/tags/v0.1.8 '*) jq -cn --arg sha "$SYQ_TEST_STATUS_TAG_OBJECT" '[{ref:"refs/tags/v0.1.8",object:{type:"tag",sha:$sha}}]' ;;
-      *'/git/tags/'*) jq -cn --arg sha "$SYQ_TEST_STATUS_COMMIT" '{object:{sha:$sha},verification:{verified:true,reason:"valid"}}' ;;
+      *'/git/tags/'*) jq -cn --arg sha "$SYQ_TEST_STATUS_COMMIT" \
+        --arg tag "${SYQ_TEST_STATUS_OBJECT_TAG:-v0.1.8}" \
+        --arg type "${SYQ_TEST_STATUS_TARGET_TYPE:-commit}" \
+        '{tag:$tag,object:{type:$type,sha:$sha},verification:{verified:true,reason:"valid"}}' ;;
       *'/releases?per_page=100 '*) printf '[[{"tag_name":"v0.1.8","draft":false,"immutable":true,"html_url":"https://example.test/v0.1.8"}]]\n' ;;
       *'/actions/runs/303/pending_deployments '*) printf '[{"environment":{"name":"release"}}]\n' ;;
       *'homebrew-tap/contents/Formula/syq.rb '*) jq -cn --arg content "$SYQ_TEST_STATUS_FORMULA_B64" '{content:$content}' ;;
@@ -268,5 +292,23 @@ jq -e --arg commit "$status_commit" '
   jq . "$work/status.json" >&2
   exit 1
 }
+
+PATH="$status_bin:$PATH" \
+SYQ_TEST_STATUS_COMMIT="$status_commit" \
+SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
+SYQ_TEST_STATUS_OBJECT_TAG=v0.1.7 \
+SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
+  "$script_dir/release-status.sh" --json v0.1.8 >"$work/status-name-mismatch.json"
+jq -e '.tag_state == "name-mismatch" and .tag_commit == null' \
+  "$work/status-name-mismatch.json" >/dev/null
+
+PATH="$status_bin:$PATH" \
+SYQ_TEST_STATUS_COMMIT="$status_commit" \
+SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
+SYQ_TEST_STATUS_TARGET_TYPE=tag \
+SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
+  "$script_dir/release-status.sh" --json v0.1.8 >"$work/status-nested-tag.json"
+jq -e '.tag_state == "invalid-target" and .tag_commit == null' \
+  "$work/status-nested-tag.json" >/dev/null
 
 echo 'release orchestration tests passed'

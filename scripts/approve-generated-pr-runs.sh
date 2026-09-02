@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Approve only the native PR runs belonging to one exact trusted generated PR.
+# Approve only the native PR runs belonging to one exact trusted generated PR,
+# then require the substantive SDK check to pass on that same head.
 set -euo pipefail
 
 if [ "$#" -ne 3 ]; then
@@ -12,6 +13,7 @@ head_sha=$3
 trusted_repository=${SYQ_TRUSTED_REPOSITORY:-greaber/syq}
 timeout_seconds=${SYQ_APPROVAL_TIMEOUT_SECONDS:-60}
 interval_seconds=${SYQ_APPROVAL_INTERVAL_SECONDS:-5}
+check_timeout_seconds=${SYQ_REQUIRED_CHECK_TIMEOUT_SECONDS:-900}
 
 [ "$repository" = "$trusted_repository" ] || {
   echo "refusing generated-PR approval for $repository; expected $trusted_repository" >&2
@@ -27,6 +29,10 @@ interval_seconds=${SYQ_APPROVAL_INTERVAL_SECONDS:-5}
 }
 [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || {
   echo "invalid approval timeout: $timeout_seconds" >&2
+  exit 2
+}
+[[ "$check_timeout_seconds" =~ ^[0-9]+$ ]] || {
+  echo "invalid required-check timeout: $check_timeout_seconds" >&2
   exit 2
 }
 if ! [[ "$interval_seconds" =~ ^[0-9]+$ ]] || [ "$interval_seconds" -le 0 ]; then
@@ -107,4 +113,38 @@ for workflow_name in ci 'rsync compatibility'; do
       exit 1
       ;;
   esac
+done
+
+check_deadline=$((SECONDS + check_timeout_seconds))
+check_state='{"count":0,"status":"missing","conclusion":null}'
+while :; do
+  check_runs=$(gh api \
+    "repos/$repository/commits/$head_sha/check-runs?filter=latest&per_page=100")
+  check_state=$(jq -c '
+    [.check_runs[] | select(.name == "sdks")] |
+    if length == 0 then {count:0,status:"missing",conclusion:null}
+    elif length > 1 then {count:length,status:"ambiguous",conclusion:null}
+    else {count:1,status:.[0].status,conclusion:(.[0].conclusion // null)} end
+  ' <<<"$check_runs")
+  check_status=$(jq -er .status <<<"$check_state")
+  check_conclusion=$(jq -r '.conclusion // empty' <<<"$check_state")
+  if [ "$check_status" = completed ] && [ "$check_conclusion" = success ]; then
+    echo "Required generated-PR check sdks passed for $head_sha"
+    break
+  fi
+  if [ "$check_status" = completed ] && [ "$check_conclusion" != action_required ]; then
+    echo "required generated-PR check sdks is $check_status/${check_conclusion:-missing} for $head_sha" >&2
+    exit 1
+  fi
+  if [ "$check_status" = ambiguous ]; then
+    echo "required generated-PR check sdks is ambiguous for $head_sha" >&2
+    exit 1
+  fi
+  if [ "$SECONDS" -ge "$check_deadline" ]; then
+    echo "timed out waiting for required generated-PR check sdks on $head_sha; last observed state:" >&2
+    jq -c . <<<"$check_state" >&2
+    exit 1
+  fi
+  echo "Waiting for required generated-PR check sdks on $head_sha; observed $check_status${check_conclusion:+/$check_conclusion}"
+  sleep "$interval_seconds"
 done
