@@ -60,7 +60,7 @@ jobs:
           set -euo pipefail
           python3 scripts/prepare-python-sdk-release.py \
             --manifest "$RELEASE_MANIFEST"
-          uv lock --project sdk/python --offline
+          uv lock --project sdk/python
           if git diff --quiet; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
             exit 0
