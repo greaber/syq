@@ -102,6 +102,36 @@ pub(crate) fn tcp_congestion_fallback_note(requested: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// A worker reached the receiver, but its destination anchor was rejected.
+/// Retrying or changing transports cannot repair a failed identity check.
+#[derive(Debug)]
+struct WorkerInitializationError(String);
+
+impl std::fmt::Display for WorkerInitializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkerInitializationError {}
+
+pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<WorkerInitializationError>())
+}
+
+fn worker_initialization_response(response: Response) -> Result<()> {
+    match response {
+        Response::Ok => Ok(()),
+        Response::Err(error) => Err(WorkerInitializationError(error).into()),
+        other => Err(WorkerInitializationError(format!(
+            "unexpected worker initialization response {other:?}"
+        ))
+        .into()),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn tcp_congestion_control<S: AsRawFd>(socket: &S) -> std::io::Result<String> {
     // Linux currently caps names at TCP_CA_NAME_MAX (16 including NUL). Leave
@@ -693,6 +723,21 @@ pub struct TcpProbe {
     pub candidates: Vec<TcpCandidate>,
 }
 
+/// TCP listener state whose route probes are running in the background.
+///
+/// The listener must be requested over the authenticated control connection,
+/// but probing its advertised addresses does not use that connection. Keeping
+/// the probe join handle here lets destination preflight cover the bounded
+/// reachability window without weakening route selection.
+pub(crate) struct PendingTcpSetup {
+    port: u16,
+    key: Option<Vec<u8>>,
+    token: Vec<u8>,
+    congestion_control: Option<String>,
+    remote_congestion_control: Option<String>,
+    probe: std::thread::JoinHandle<Vec<TcpCandidate>>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RemoteDiagnostics {
     pub peer: Option<PeerInfo>,
@@ -900,7 +945,7 @@ impl RemoteSpec {
     /// connections at random when many are being set up at once, so we also
     /// limit how many connects are in flight.
     pub fn connect(&self, compress: bool) -> Result<RemoteConn> {
-        self.connect_with(compress, true)
+        self.connect_with_request(compress, true, None)
     }
 
     /// `limited`: take a connect slot (data connections). The control
@@ -908,7 +953,16 @@ impl RemoteSpec {
     /// queue behind workers. In managed mode the release helper is installed
     /// on first use if the remote lacks it.
     pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
-        let first = self.connect_retried(compress, limited);
+        self.connect_with_request(compress, limited, None)
+    }
+
+    fn connect_with_request(
+        &self,
+        compress: bool,
+        limited: bool,
+        initial_request: Option<Request>,
+    ) -> Result<RemoteConn> {
+        let first = self.connect_retried(compress, limited, initial_request.clone());
         let Err(first_error) = first else {
             return first;
         };
@@ -917,27 +971,34 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress, limited).with_context(|| {
-            format!(
-                "could not start the {} helper installed on {}",
-                remote_helper::helper_identity(),
-                self.label()
-            )
-        })
+        self.connect_retried(compress, limited, initial_request)
+            .with_context(|| {
+                format!(
+                    "could not start the {} helper installed on {}",
+                    remote_helper::helper_identity(),
+                    self.label()
+                )
+            })
     }
 
-    fn connect_retried(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
+    fn connect_retried(
+        &self,
+        compress: bool,
+        limited: bool,
+        initial_request: Option<Request>,
+    ) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
         for attempt in 0..6 {
             let _slot = limited.then(connect_slot);
-            match self.connect_once(compress, limited) {
+            match self.connect_once(compress, limited, initial_request.clone()) {
                 Ok(c) => return Ok(c),
                 // Don't retry what won't change: a missing binary (127) or a
                 // build identity mismatch.
                 Err(e)
                     if attempt == 5
                         || e.to_string().contains("build identity mismatch")
+                        || is_worker_initialization_error(&e)
                         || e.to_string().contains("exit status: 127")
                         || e.to_string().contains(&format!(
                             "exit status: {}",
@@ -975,7 +1036,12 @@ impl RemoteSpec {
         Err(last.unwrap())
     }
 
-    fn connect_once(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
+    fn connect_once(
+        &self,
+        compress: bool,
+        limited: bool,
+        initial_request: Option<Request>,
+    ) -> Result<RemoteConn> {
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = &self.restricted_grant {
             server_args.push(format!("--restricted-grant={grant}"));
@@ -1023,40 +1089,50 @@ impl RemoteSpec {
             peer: None,
             tcp_socket: None,
         };
-        let conn = hello(conn, compress, Vec::new())?;
+        let conn = hello(conn, compress, Vec::new(), initial_request)?;
         self.record_peer(&conn);
         Ok(conn)
     }
 
     /// Ask the remote (over the control connection) to accept TCP data
-    /// connections; records how to reach it for later `connect` calls.
-    pub fn setup_tcp(
+    /// connections, then begin probing the advertised routes in the
+    /// background. The caller must finish the setup before opening workers.
+    pub(crate) fn begin_tcp_setup(
         &self,
         ctl: &mut dyn Conn,
         plain: bool,
         ports: (u16, u16),
         congestion_control: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<PendingTcpSetup> {
         *self.tcp.lock().unwrap() = None;
         {
             let mut diagnostics = self.diagnostics.lock().unwrap();
             diagnostics.tcp_probe = None;
             diagnostics.tcp_setup_error = None;
         }
-        let result = self.setup_tcp_inner(ctl, plain, ports, congestion_control);
+        let result = self.begin_tcp_setup_inner(ctl, plain, ports, congestion_control);
         if let Err(error) = &result {
             self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
         }
         result
     }
 
-    fn setup_tcp_inner(
+    /// Join background route probes and record the selected TCP data paths.
+    pub(crate) fn finish_tcp_setup(&self, pending: PendingTcpSetup) -> Result<()> {
+        let result = self.finish_tcp_setup_inner(pending);
+        if let Err(error) = &result {
+            self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
+        }
+        result
+    }
+
+    fn begin_tcp_setup_inner(
         &self,
         ctl: &mut dyn Conn,
         plain: bool,
         ports: (u16, u16),
         congestion_control: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<PendingTcpSetup> {
         let key = if plain {
             None
         } else {
@@ -1115,8 +1191,35 @@ impl RemoteSpec {
                 );
             }
         }
-        // Probe which advertised addresses this client can actually reach.
-        probe_reachable(&mut candidates, port);
+        // Probing is independent of the authenticated control stream. Let the
+        // orchestrator do destination preflight and plan payloads while every
+        // candidate receives its complete bounded probe window.
+        let probe = std::thread::spawn(move || {
+            probe_reachable(&mut candidates, port);
+            candidates
+        });
+        Ok(PendingTcpSetup {
+            port,
+            key,
+            token,
+            congestion_control: congestion_control.map(str::to_owned),
+            remote_congestion_control,
+            probe,
+        })
+    }
+
+    fn finish_tcp_setup_inner(&self, pending: PendingTcpSetup) -> Result<()> {
+        let PendingTcpSetup {
+            port,
+            key,
+            token,
+            congestion_control,
+            remote_congestion_control,
+            probe,
+        } = pending;
+        let mut candidates = probe
+            .join()
+            .map_err(|_| anyhow!("TCP route probe thread panicked"))?;
         // Multipath only across comparable-speed NICs: keep those within 2x of
         // the fastest reachable one. Mixing a fast and a slow path (a rail and
         // Tailscale, say) would drag the transfer down, so we don't.
@@ -1165,7 +1268,7 @@ impl RemoteSpec {
             port,
             key,
             token,
-            congestion_control: congestion_control.map(str::to_owned),
+            congestion_control,
             failed: false,
             failure: None,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1195,7 +1298,12 @@ impl RemoteSpec {
     /// reachable data addresses (multipath). Addresses were already probed and
     /// speed-filtered in setup_tcp, so we just round-robin and fall through on
     /// the rare transient failure.
-    fn connect_tcp(&self, info: &TcpInfo, compress: bool) -> Result<RemoteConn> {
+    fn connect_tcp(
+        &self,
+        info: &TcpInfo,
+        compress: bool,
+        initial_request: Option<Request>,
+    ) -> Result<RemoteConn> {
         let n = info.addrs.len();
         let start = info.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
         let mut last = anyhow!("no data address");
@@ -1267,7 +1375,7 @@ impl RemoteSpec {
                 peer: None,
                 tcp_socket: Some(tcp_socket),
             };
-            let conn = hello(conn, compress, info.token.clone())?;
+            let conn = hello(conn, compress, info.token.clone(), initial_request.clone())?;
             self.record_peer(&conn);
             return Ok(conn);
         }
@@ -1380,33 +1488,43 @@ impl std::fmt::Debug for TcpInfo {
     }
 }
 
-fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteConn> {
-    {
-        conn.send(Request::Hello {
-            identity: crate::identity::build().to_string(),
-            compress,
-            debug: crate::transfer::debug(),
-            token,
-        })?;
-        match conn.recv() {
-            Ok(Response::HelloOk { identity, platform })
-                if identity == crate::identity::build() =>
-            {
-                conn.peer = Some(PeerInfo { identity, platform });
-                Ok(conn)
-            }
-            Ok(Response::HelloOk { identity, .. }) => {
-                bail!(
-                    "{}: build identity mismatch (remote {identity}, local {})",
-                    conn.label,
-                    crate::identity::build()
-                )
-            }
-            Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
-            Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
-            Err(e) => bail!("{e}\ncould not start the remote syq on {}", conn.label),
-        }
+fn hello(
+    mut conn: RemoteConn,
+    compress: bool,
+    token: Vec<u8>,
+    initial_request: Option<Request>,
+) -> Result<RemoteConn> {
+    conn.send(Request::Hello {
+        identity: crate::identity::build().to_string(),
+        compress,
+        debug: crate::transfer::debug(),
+        token,
+    })?;
+    // Worker destination anchoring is independent of the Hello response. Put
+    // it on the wire immediately so the receiver can authenticate, anchor,
+    // and acknowledge within one WAN turn while preserving response order.
+    if let Some(request) = initial_request.as_ref() {
+        conn.send(request.clone())?;
     }
+    match conn.recv() {
+        Ok(Response::HelloOk { identity, platform }) if identity == crate::identity::build() => {
+            conn.peer = Some(PeerInfo { identity, platform });
+        }
+        Ok(Response::HelloOk { identity, .. }) => {
+            bail!(
+                "{}: build identity mismatch (remote {identity}, local {})",
+                conn.label,
+                crate::identity::build()
+            )
+        }
+        Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
+        Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
+        Err(e) => bail!("{e}\ncould not start the remote syq on {}", conn.label),
+    }
+    if initial_request.is_some() {
+        worker_initialization_response(conn.recv()?)?;
+    }
+    Ok(conn)
 }
 
 impl RemoteSpec {
@@ -1834,14 +1952,33 @@ impl Endpoint {
     }
 
     pub fn connect(&self, compress: bool) -> Result<Box<dyn Conn>> {
+        self.connect_with_request(compress, None)
+    }
+
+    pub(crate) fn connect_with_request(
+        &self,
+        compress: bool,
+        initial_request: Option<Request>,
+    ) -> Result<Box<dyn Conn>> {
         match self {
-            Endpoint::Local => Ok(Box::new(LocalConn::new())),
+            Endpoint::Local => {
+                let mut conn = LocalConn::new();
+                if let Some(request) = initial_request {
+                    worker_initialization_response(conn.call(request)?)?;
+                }
+                Ok(Box::new(conn))
+            }
             Endpoint::Remote(spec) => {
                 let info = spec.tcp.lock().unwrap().clone();
                 if let Some(info) = info.filter(|i| !i.failed) {
-                    match spec.connect_tcp(&info, compress) {
+                    match spec.connect_tcp(&info, compress, initial_request.clone()) {
                         Ok(c) => return Ok(Box::new(c)),
-                        Err(e) if is_tcp_congestion_error(&e) => return Err(e),
+                        Err(e)
+                            if is_tcp_congestion_error(&e)
+                                || is_worker_initialization_error(&e) =>
+                        {
+                            return Err(e)
+                        }
                         Err(e) => {
                             if spec.restricted_grant.is_some() {
                                 return Err(e).with_context(|| {
@@ -1873,7 +2010,11 @@ impl Endpoint {
                         spec.label()
                     );
                 }
-                Ok(Box::new(spec.connect(compress)?))
+                Ok(Box::new(spec.connect_with_request(
+                    compress,
+                    true,
+                    initial_request,
+                )?))
             }
         }
     }
@@ -1993,7 +2134,7 @@ mod tests {
         };
 
         let error = spec
-            .connect_tcp(&info, false)
+            .connect_tcp(&info, false, None)
             .err()
             .expect("unregistered congestion control should fail locally");
         let message = format!("{error:#}");
@@ -2010,6 +2151,14 @@ mod tests {
             tcp_congestion_fallback_note(Some("reno")),
             "; requested congestion control reno is not used by the SSH fallback"
         );
+    }
+
+    #[test]
+    fn rejected_worker_initialization_is_not_a_retryable_transport_error() {
+        let error = worker_initialization_response(Response::Err("destination changed".into()))
+            .unwrap_err();
+        assert!(is_worker_initialization_error(&error));
+        assert!(!is_tcp_congestion_error(&error));
     }
 
     #[test]

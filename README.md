@@ -718,7 +718,11 @@ source's mode with `-p`.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.
-Workers connect after the mapped payload/sidecar namespace preflight completes.
+Workers receive no file work until the mapped payload/sidecar namespace
+preflight completes. For a fresh remote destination with a selected TCP route,
+they begin connecting as soon as a source batch proves that file work exists,
+overlapping authentication with sidecar resolution and directory creation;
+an empty tree opens no worker connection.
 The data connections — by default separate TCP sockets carrying AES-256-GCM
 records — carry only "read range" / "write range" requests. When data uses SSH
 (through `--no-tcp` or TCP fallback), a transfer consisting entirely of fresh
@@ -1077,7 +1081,11 @@ ssh (silenced by `-q`). When several NICs of
 comparable speed are reachable (e.g. an 8-rail RoCE fabric), syq spreads its
 data connections across all of them (multipath) — it keeps only paths within
 2x of the fastest, so it never drags a fast transfer down by mixing in a slow
-link. Single-homed hosts and laptops use the one best path, unchanged. With ufw:
+link. Every candidate still gets its complete bounded probe window, but those
+independent probes run while the control connection prepares the destination.
+Worker Hello and destination anchoring are likewise sent in one
+pipelined setup turn. Single-homed hosts and laptops use the one best path,
+unchanged. With ufw:
 
 ```sh
 sudo ufw allow from 192.0.2.0/24  to any port 47600:47699 proto tcp   # example LAN
