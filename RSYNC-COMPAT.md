@@ -251,8 +251,7 @@ command says what to change.
   rule, and `--existing` follows it.
 - README claimed rsync deletes a `--max-size` casualty under `--delete`;
   measured false, README corrected (this file's commit).
-- The automatic journal/marker (whose completion records `--delete` had to
-  invalidate) was replaced by the explicit `--checkpoint`; `--delete` records
-  deletions in an active checkpoint.
+- The experimental automatic journal/marker and its later explicit checkpoint
+  replacement were removed. Ordinary partial-file resume remains automatic.
 - PR #7 replaced the shared `.name.syq-partial` path with deterministic
   job-scoped sidecars.

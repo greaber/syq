@@ -422,9 +422,6 @@ pub fn run(
         if args.existing {
             remote.push("--existing".into());
         }
-        if let Some(path) = &args.checkpoint {
-            remote.push(format!("--checkpoint={path}"));
-        }
     }
     if let Some(maximum) = &args.max_size {
         remote.push(format!("--max-size={maximum}"));
