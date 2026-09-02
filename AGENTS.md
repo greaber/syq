@@ -166,8 +166,11 @@ outlive its premise and steer later work in the wrong direction.
 ## Working on syq
 
 - `README.md` and the documents under `docs/` are the user-facing contract;
-  `README.md` is the overview and `docs/reference.md` carries the detailed
-  behavior. The code is authoritative for everything else.
+  `README.md` is a brief front door and `docs/` is the source of the
+  documentation site published with GitHub Pages (mdBook, configured by
+  `book.toml`; every page must be listed in `docs/SUMMARY.md`;
+  `scripts/check-doc-links.py` checks links). `docs/reference.md` carries the
+  detailed behavior. The code is authoritative for everything else.
 - Distinguish explicit requirements from assumptions and design choices. If a
   supposed requirement creates substantial complexity, question the premise
   and look for a simpler interpretation. Ask the user when the answer would

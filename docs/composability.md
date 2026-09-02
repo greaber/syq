@@ -42,10 +42,11 @@ Several guarantees make the plan more than a printout:
   look like, and a mismatch fails before transfer begins. Rsync's rule that
   the meaning of `dest` depends on whether it already exists is confined to
   `syq rsync`.
-- **Deletion is guarded.** `--delete` runs only after the copy, only after a
-  complete and error-free scan of both sides, and `--max-delete N` deletes
-  nothing at all when more than N deletions are planned.
-- **`--dry-run` and `--verify-only` are read-only by construction.** Under the
+- **Deletion is guarded.** Pruning (`cp --prune`, or `--delete` under
+  `syq rsync`) runs only after the copy, only after a complete and error-free
+  scan of both sides, and `--max-delete N` deletes nothing at all when more
+  than N deletions are planned.
+- **`--dry-run` and `--syq-verify-only` are read-only by construction.** Under the
   command-restricted remote-to-remote path, the signed grant marks them
   read-only and the receiver rejects every mutation even if the sending host
   attempts one.
@@ -63,12 +64,13 @@ that moment, not a frozen ledger that can later be executed unchanged.
 Everything a command line can express about *what* to move and *where*, a file
 or a stream can express too:
 
-- `--ignore PATTERN` and `--ignore-from FILE` take gitignore syntax, so the
+- `--ignore PATTERN` and `--ignore-from FILE` (`--syq-ignore` and
+  `--syq-ignore-from` under `syq rsync`) take gitignore syntax, so the
   `.gitignore` you already maintain filters a copy
-  ([Ignoring paths](reference.md#ignoring-paths---ignore---ignore-from)).
-- `--files-from FILE` (and `--from0`) copies exactly the listed paths without
-  walking the source, which is the point on a slow filesystem when the list is
-  already known ([Copying a list](reference.md#copying-a-list---files-from)).
+  ([Ignoring paths](reference.md#ignoring-paths)).
+- `syq rsync --files-from FILE` (and `--from0`) copies exactly the listed paths
+  without walking the source, which is the point on a slow filesystem when the
+  list is already known ([Copying a list](reference.md#copying-a-list---files-from)).
 - Native selectors separate the endpoint (`--from host`), the working
   directory (`-C DIR`), the selection (`--src`, `--src-src`, `--src-file`,
   `--src-dir`, and their plural forms), and the placement (`--into`, `--as`),
@@ -98,7 +100,8 @@ or a stream can express too:
 - **Exit codes** distinguish complete success (0), a finished run with
   per-file failures (23), a deletion phase refused by `--max-delete` (25), and
   a fatal error (1). See [Exit codes](reference.md#exit-codes).
-- `--progress-json` writes one JSON line per second on stderr for progress
+- `--progress-json` (`--syq-progress-json` under `syq rsync`) writes one JSON
+  line per second on stderr for progress
   displays and monitoring; `--stats` prints the summary counts, where the
   auto-tuner settled, and the kernel's TCP counters.
 - `--results FILE` (or `-` for stdout, together with `-q`) on native `cp`

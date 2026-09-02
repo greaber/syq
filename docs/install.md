@@ -3,8 +3,7 @@
 Syq runs on Linux and macOS. The local machine needs one of the installation
 paths below; remote hosts need nothing installed in advance, because syq
 installs a matching helper there on first use (see [Remote helper
-bootstrap](#remote-helper-bootstrap)). The [README](../README.md) has the
-short version.
+bootstrap](#remote-helper-bootstrap)).
 
 ## Standalone installer
 
@@ -52,14 +51,12 @@ cargo build --release          # binary at target/release/syq
 cargo install --locked --path . # or: put it on your PATH
 ```
 
-Checkout builds carry a source-revision identity, and crates.io packages carry
-the package's source revision, so two independent `cargo install --locked syq`
-builds of one version receive the same identity and can connect as remote
-peers. Source builds deliberately do not claim to be an immutable release, so
-managed remote bootstrap remains available only in official release binaries.
-To use a source build remotely, copy the exact installed executable to the
-remote and pass `--syq-path /path/to/syq` (or put it on the remote `PATH` and
-use `--no-bootstrap`).
+Managed remote bootstrap is available only from official release builds.
+For Cargo and checkout builds, install a compatible `syq` on the remote and
+select it explicitly. Native `syq cp` uses `--syq-path PATH`, or
+`--no-bootstrap` when the binary is on the remote `PATH`; `syq rsync` uses the
+rsync-compatible `--rsync-path PATH`, or `--syq-no-bootstrap` for the same
+`PATH` lookup.
 
 ## Update checks and self-update
 
@@ -110,11 +107,11 @@ the same helper cannot fix them. A completed download with the wrong digest is
 discarded and produces an integrity warning even if the verified upload then
 succeeds.
 
-The managed cache accepts only a verified release binary. Helpers cached under
-an older identity or cache layout are never executed; they may be removed with
-the rest of the disposable helper cache. To opt out of managed bootstrap,
-install a compatible binary yourself and pass `--syq-path /path/to/syq`, or put
-it on the non-interactive remote `PATH` and use `--no-bootstrap`.
+The managed cache accepts only a verified release binary. To opt out of
+managed bootstrap, install a compatible binary yourself. Native `syq cp` uses
+`--syq-path /path/to/syq`, or `--no-bootstrap` when the binary is on the
+non-interactive remote `PATH`; `syq rsync` uses `--rsync-path /path/to/syq` or
+`--syq-no-bootstrap`.
 
 The local client verifies the manifest's embedded Ed25519 signature over its
 RFC 8785 canonical JSON. Direct remote download uses `curl` or `wget`, `gzip`,

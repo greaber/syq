@@ -9,7 +9,10 @@ the sidecar, queue, and publication model these mechanisms sit on; [Server
 tuning](server-tuning.md) covers optional host changes. Measure before tuning:
 `--stats` reports where the auto-tuner settled and the kernel's TCP counters,
 `-vv` reports the planned route, and `SYQ_DEBUG=1` reports where every worker
-spent its time.
+spent its time. Option names in this document are the native spellings; under
+`syq rsync`, syq-specific options carry a `--syq-` prefix (`--syq-connections`,
+`--syq-no-tcp`, `--syq-tcp-plain`, and so on; see the [compatibility options
+table](reference.md#compatibility-options)).
 
 ## What makes syq fast
 
@@ -21,7 +24,7 @@ spent its time.
    the copy runs, settling on the smallest count within 5 % of the best
    measured rate (one worker is a valid answer for a spinning disk), and
    remembers that count per path and transport as the next run's starting
-   point. See [How many connections](#how-many-connections--j).
+   point. See [How many connections](#how-many-connections).
 2. **A TCP data path beside ssh.** OpenSSH caps each channel at a 2 MB window,
    which is roughly 2 MB per round trip (about 7 MB/s at 265 ms), and caps each
    process at a few hundred MB/s of cipher work. Syq keeps ssh for
@@ -56,7 +59,10 @@ spent its time.
    ChaCha20; it disables connection multiplexing on purpose, since multiplexed
    channels share one cipher process; it brings up control connections first
    and up to 32 handshakes at a time; and it halves its concurrency when sshd's
-   `MaxStartups` sheds a connection.
+   `MaxStartups` sheds a connection. `syq persist on` keeps one authenticated
+   control connection per host alive for five minutes between commands, so a
+   series of small copies pays for authentication (and a hardware-token touch)
+   once.
 8. **Metadata latency hidden, not multiplied.** Parallel stat and I/O hide the
    per-operation latency of NFS, FUSE, and object-backed filesystems. Syq does
    not do fewer metadata operations per file than rsync: staged publication
@@ -89,7 +95,7 @@ your own workloads against rsync and cp.
 | One 4 GiB file, local disk → asynchronous NFS mount | 9.93 s median | `cp` 10.94 s median |
 | One 4 GiB file, NFS → local disk | 1.13 GiB/s | |
 | Remove 20,000 files on NFS, `-j32` | 2.5 s | `rm -rf` 9.7 s |
-| 1 Gbit, Germany → Japan (265 ms), ssh data connections | ~110 MB/s auto-tuned | fixed `-j 8` 44 MB/s |
+| 1 Gbit, Germany → Japan (265 ms), ssh data connections | ~110 MB/s auto-tuned | a fixed 8 connections: 44 MB/s |
 | Same path, TCP data connections | line rate, settling at 8–13 connections | |
 | 262 ms path, fresh 2,000-file / 8 MiB tree over `--no-tcp` | 11.29 s | 16.85 s with independent worker handshakes |
 | 20 Gbit LAN, two 160-core hosts, `-j8` into tmpfs | 1.2–1.3 GiB/s | one ssh stream 450–550 MB/s |
@@ -97,7 +103,7 @@ your own workloads against rsync and cp.
 ## When rsync or cp is faster
 
 - **A single spinning disk.** Parallel reads of one file there mean seeks. Use
-  `-j 1` or a large `--min-split`; the auto-tuner can also settle at one
+  `--connections 1`; the auto-tuner can also settle at one
   worker, but a short job may finish before it measures the slowdown.
 - **Delta transfer against a shifted old copy.** When the receiver holds an
   old version of a file, rsync's rolling checksum matches blocks at any byte
@@ -126,8 +132,8 @@ These options buy speed by giving something up; the default is the safe side.
   renaming, saving the space and time of a second copy, at the cost of atomic
   publication and safe interruption.
 - `--no-compress` saves the compression attempt on a very fast LAN.
-- `-j N` fixes the connection count and disables tuning; `--bwlimit` caps
-  throughput to be polite on a shared link.
+- `--connections N` fixes the connection count and disables tuning;
+  `--bwlimit` caps throughput to be polite on a shared link.
 
 The rest of this document describes each mechanism in detail.
 
@@ -143,13 +149,13 @@ The rest of this document describes each mechanism in detail.
   are latency-bound; parallel stat and I/O hide it. The scan is parallel too.
 - **NVMe / RAID** on either side.
 - **Not** a single spinning disk: parallel reads of one file there mean seeks.
-  Use `-j 1` or a large `--min-split`.
+  Fix the worker count at one (`syq cp --connections 1`, or
+  `syq rsync --syq-connections 1`).
 
-## How many connections (`-j`)
+## How many connections
 
-Without `-j`, syq tunes the number of workers while a copy runs instead of
-guessing (`--rm` keeps a fixed 8, or 32 locally: removal is metadata-bound
-and short). On a data path it has measured before, it starts at that path's last
+Without an explicit connection count, syq tunes the number of workers while a
+copy runs instead of guessing. On a data path it has measured before, it starts at that path's last
 settled count; otherwise it starts with 16 when every remote endpoint has a
 reachable TCP data path, 8 over ssh, or 32 when both ends are local (threads
 are free, connections are not). Remembered results are keyed only by the
@@ -158,7 +164,7 @@ RTT, workload, filesystem or other volatile telemetry. A stale hint only costs
 the tuner a probe or two. The cache is
 `$XDG_CACHE_HOME/syq/tuning-v1.json` (normally
 `~/.cache/syq/tuning-v1.json`; set `SYQ_TUNING_CACHE` to override it or to an
-empty value to disable it). Explicit `-j`, dry runs, verification, short runs
+empty value to disable it). An explicit connection count, dry runs, verification, short runs
 that compare no counts, failed/aborted copies, and runs whose TCP path falls
 back to ssh after workers start do not update it; the last case may contain
 mixed-transport measurements that are not representative of either pure path.
@@ -206,33 +212,34 @@ starting count. The progress line shows the current count
 Measured from a 1 Gbit box in Germany to a host in Japan (265 ms): over TCP
 data connections it settles around 8–13 at line rate; over ssh data
 connections (where each stream is capped by OpenSSH's 2 MB window) it
-reaches line rate (~110 MB/s, where a fixed `-j 8` managed 44) about 30 s
+reaches line rate (~110 MB/s, where a fixed eight workers managed 44) about 30 s
 after the connections are up.
 
 On the same kind of long path (262 ms), a fresh 2,000-file / 8 MiB tree over
-`--no-tcp` took 11.29 s in two verified runs after fresh-small-file workers
+`--syq-no-tcp` took 11.29 s in two verified runs after fresh-small-file workers
 began reusing the authenticated control connection, versus 16.85 s with eight
 independently authenticated worker connections. Larger and mixed workloads
 still use independent SSH connections so they retain multi-flow throughput.
 
-`-j N` fixes the count and disables tuning. Use it when you know better (a
-spinning disk that must not be read in parallel: `-j 1`), or to be polite on
-a shared link.
+Native `-j N`/`--connections N`, or compatibility
+`--syq-connections N`, fixes the count and disables tuning. Use it when you
+know better—for example, one worker for a spinning disk that must not be read
+in parallel—or to be polite on a shared link.
 
 ## TCP data connections
 
 ssh caps every stream at a few hundred MB/s of cipher CPU, and its 2 MB
 per-channel flow-control window caps a stream at roughly `2 MB / RTT` on long
-links (≈7 MB/s at 265 ms). So by default (unless `--no-tcp`) syq keeps ssh for
+links (≈7 MB/s at 265 ms). So by default (unless `--syq-no-tcp`) syq keeps ssh for
 authentication and control only and moves the data over separate TCP
-connections: the remote opens a listener on a port from `--tcp-ports` (default
+connections: the remote opens a listener on a port from `--syq-tcp-ports` (default
 47600-47699), and the data connections are plain TCP sockets carrying
 AES-256-GCM records keyed by a secret exchanged over the ssh session
-(`--tcp-plain` skips the encryption on trusted networks; `--no-tcp` sends data over the ssh connection instead). If the port can't be
+(`--syq-tcp-plain` skips the encryption on trusted networks; `--syq-no-tcp` sends data over the ssh connection instead). If the port can't be
 reached — a firewall, typically — syq says so once and falls back to ssh data
 connections, so the default is always safe.
 
-On Linux, `--tcp-congestion ALGO` requests a congestion-control algorithm for
+On Linux, `--syq-tcp-congestion ALGO` requests a congestion-control algorithm for
 both ends of every direct TCP data connection. The connecting socket is
 configured before `connect`, and the remote listener is configured before its
 port is advertised, so accepted sockets inherit the same algorithm. This is a
@@ -297,12 +304,10 @@ or start transfer workers, and verbosity does not change dry-run's success or
 failure. The reported route is therefore a plan for a real transfer, not a
 claim that a worker data connection was completed.
 
-Remote→remote (`syq rsync hostA:src hostB:dst`) works the same way: the orchestrator
-on hostA connects to hostB's listener. Diagnostics are relative to that active
-orchestrator: the existing status message identifies hostA, and the detailed
-remote block describes hostB. If both paths are on hostA, `-vv` reports a local
-filesystem route there. With `--relay`, this machine is the orchestrator and
-both remote endpoints receive detailed blocks.
+Native remote-to-remote copies work the same way: the orchestrator on hostA
+connects to hostB's listener. Diagnostics are relative to that active
+orchestrator. If both endpoints name hostA, `-vv` reports a local filesystem
+route there.
 
 No special server setup is required. For a measurement-first checklist of
 optional firewall, sshd, TCP, and host-network changes, including their
@@ -337,9 +342,10 @@ use the pipelined whole-file request described in the
 
 ## NFS
 
-Local↔NFS copies are a local→local syq run (`syq rsync -a -j16 /raid/x /mnt/nfs/x`)
+Local↔NFS copies are a local-to-local syq run
+(`syq cp --connections 16 /raid/x --into /mnt/nfs`)
 and benefit from parallelism across files and on reads: measured on a 20 Gbit
-NFSv4.2 mount, reads of one 4 GB file reached 858 MiB/s with `-j8` vs ~400 MB/s
+NFSv4.2 mount, reads of one 4 GB file reached 858 MiB/s with eight workers vs ~400 MB/s
 for `cp`, and 20,000 small files were written in 28 s vs 72 s for `cp -r`.
 Writes from a recognized local disk filesystem into one asynchronous NFS inode
 are instead serialized automatically by the receiver when the kernel cannot
@@ -373,11 +379,9 @@ add headroom for those concurrent files and other NFS traffic.
   once they have been shown to pay.
 - Preferred direct remote→remote uses one enrollment-key authentication for the
   hostB control connection, then encrypted token-authenticated TCP workers.
-  `--agent-broker-only` instead authenticates every hostB SSH connection
-  through your ambient agent; over a slow link or with a confirming hardware
-  key, those round trips can dominate setup time.
 - Measured on two 160-core hosts on a 20 Gbit LAN: a single ssh stream tops out
-  around 450–550 MB/s; `syq rsync -j8` into tmpfs reached ~1.2–1.3 GiB/s (the raw
+  around 450–550 MB/s; `syq rsync --syq-connections 8` into tmpfs reached
+  ~1.2–1.3 GiB/s (the raw
   multi-stream ssh ceiling), while writes to the destination's ext4 NVMe capped
   everything, rsync included, at ~600 MB/s. Check the disk before blaming the
   network.

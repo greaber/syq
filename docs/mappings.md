@@ -278,8 +278,7 @@ writes an NDJSON outcome stream beside the ordinary human output:
 a `run` record, one `operation_result` per settled mutation and per
 failed mapping entry, an `error` record per counted error, and exactly
 one terminal `result` with the exit code and aggregate counts. The
-records carry `schema_version: 0` — an unstable preview of the planned
-automation interface; unchanged and excluded entries appear only in
+records carry `schema_version: 0` — an unstable preview format; unchanged and excluded entries appear only in
 the terminal aggregates, and metadata-only updates are not
 reported per operation. A missing terminal record means the run did
 not finish.
