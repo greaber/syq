@@ -36,8 +36,9 @@ The current mapping is:
 The two version numbers do not need to match, but the mapping is immutable for
 a published SDK release. Multiple SDK releases may pin the same syq release.
 Moving to another syq release requires a new SDK release and its compatibility
-tests. A syq release does not require an SDK release unless the SDK is being
-moved to it.
+tests. Every successful official syq release automatically prepares a Python
+SDK patch-release pull request that pins its exact signed manifest. Maintainers
+review and merge that mapping before creating the signed Python SDK tag.
 
 Callers that need a local build, a newer syq, or an offline-provisioned binary
 may pass `executable=` explicitly. That opts out of the tested pairing; the

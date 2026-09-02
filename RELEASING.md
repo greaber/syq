@@ -131,8 +131,10 @@ connection, so enable it only for a trusted release host rather than globally.
 2. Wait for the post-merge `ci` run on `master` to succeed for the release
    commit. Pull requests are checked against their own head rather than the
    merged result, and the release workflow refuses a commit whose `rust`,
-   `macos`, and `linux-arm64` checks have not all succeeded, so tagging a
-   red or still-running `master` only produces a failed release run:
+   `sdks`, `macos`, and `linux-arm64` checks have not all succeeded. The `sdks`
+   check builds the candidate syq and exercises it through the Python adapter,
+   so tagging a red or still-running `master` only produces a failed release
+   run:
 
    ```sh
    gh run watch --exit-status "$(gh run list --workflow ci.yml --branch master --commit "$(git rev-parse master)" --json databaseId --jq '.[0].databaseId')"
@@ -151,13 +153,18 @@ connection, so enable it only for a trusted release host rather than globally.
    approve it again when the separate Homebrew tap job is ready. The workflow
    first verifies that the annotated tag's signature is valid and that it
    directly targets the workflow commit, that this commit is reachable
-   from protected `master`, and that the `rust`, `macos`, and `linux-arm64`
-   checks all succeeded on that exact commit. It then builds static GNU Linux x86-64/ARM64
+   from protected `master`, and that the `rust`, `sdks`, `macos`, and
+   `linux-arm64` checks all succeeded on that exact commit. It then builds
+   static GNU Linux x86-64/ARM64
    binaries and native macOS Apple Silicon/Intel binaries, embeds an Ed25519
    signature over the manifest's RFC 8785 canonical JSON, verifies the exact
    asset inventory, creates provenance attestations, uploads a draft, checks
    every uploaded byte, publishes it, publishes the matching source package to
    crates.io with a short-lived OIDC credential, and finally updates the tap.
+   Once the entire release workflow succeeds, the Python SDK preparation
+   workflow opens a pull request for the next SDK patch release using this
+   immutable syq manifest. PyPI publication remains a separate signed-tag and
+   protected-environment action, so a registry outage cannot block syq.
 4. Verify one or more downloaded artifacts and exercise all install paths:
 
    ```sh
