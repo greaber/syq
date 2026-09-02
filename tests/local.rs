@@ -9136,3 +9136,17 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("run stopped early (status aborted)"));
 }
+
+const DOC_JQ_DROP_SPECIALS: &str = r#"select(.kind != "special")"#;
+
+#[test]
+fn mappings_md_drop_specials_example_works_verbatim() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"ok");
+    let fifo = t.path("src/pipe");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    run_doc_pipeline(&t, DOC_JQ_DROP_SPECIALS, &["-c"], "src", "dst");
+    assert_eq!(read(&t.path("dst/a.txt")), b"ok");
+    assert!(!t.path("dst/pipe").exists());
+}

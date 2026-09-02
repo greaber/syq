@@ -244,7 +244,7 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   fixed `-rlt` fidelity, which copies no special files. Such an entry is
   a policy exclusion like `--min-size`: the run still succeeds and the
   entry appears only in the excluded aggregate. Filter with
-  `jq 'select(.kind != "special")'` to drop such entries up front.
+  `jq -c 'select(.kind != "special")'` to drop such entries up front.
 - Mappings define no deletion region, so `--mapping` is not available
   on `cp-prune`.
 - Duplicate lines are errors, even identical ones: a duplicate almost
