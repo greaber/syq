@@ -46,6 +46,9 @@ Remote-copy controls use the same names with underscores, including `run_at`,
 `rsh`, `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
 `tcp_congestion`, and the native agent-forwarding policy flags. `detach` stays
 on raw `run()` because a detached command cannot return typed attached results.
+Ignore rules retain native ordering when interleaved by using
+`ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`; `ignore_from=` remains the
+simple form when every file follows the inline patterns.
 
 `on_event` receives typed records as syq produces them without keeping a
 potentially enormous operation ledger in memory:

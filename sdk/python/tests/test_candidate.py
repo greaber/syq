@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import syq
 
@@ -64,14 +65,60 @@ class CandidateCompatibilityTests(unittest.TestCase):
             with client.map(src_src=mapping_alias.name, follow=True) as mapping:
                 entries = list(mapping)
             self.assertEqual(entries[0].src, syq.RelativePath("mapped.txt"))
-            mapped = client.cp(
-                mapping=entries,
-                cwd=mapping.cwd,
-                follow=True,
-                into="mapped",
-            )
+            physical_temp = root / "physical-temp"
+            physical_temp.mkdir()
+            temporary_alias = root / "temporary-alias"
+            temporary_alias.symlink_to(physical_temp, target_is_directory=True)
+            named_temporary_file = tempfile.NamedTemporaryFile
+
+            def create_through_alias(**kwargs):
+                return named_temporary_file(dir=temporary_alias, **kwargs)
+
+            with mock.patch(
+                "syq.client.tempfile.NamedTemporaryFile",
+                side_effect=create_through_alias,
+            ):
+                mapped = client.cp(
+                    mapping=entries,
+                    cwd=mapping.cwd,
+                    follow=True,
+                    into="mapped",
+                )
             self.assertEqual(mapped.files_transferred, 1)
             self.assertEqual((root / "mapped" / "mapped.txt").read_bytes(), b"mapped")
+
+            generated_source = root / "generated-source"
+            generated_source.mkdir()
+            (generated_source / "generated.txt").write_bytes(b"generated")
+            with mock.patch(
+                "syq.client.tempfile.NamedTemporaryFile",
+                side_effect=create_through_alias,
+            ):
+                generated = client.cp(
+                    mapping=[syq.MappingEntry("generated.txt", "generated.txt")],
+                    cwd=generated_source.name,
+                    into="generated-target",
+                )
+            self.assertEqual(generated.files_transferred, 1)
+            self.assertEqual(
+                (root / "generated-target" / "generated.txt").read_bytes(),
+                b"generated",
+            )
+
+            ignore_source = root / "ignore-source"
+            ignore_source.mkdir()
+            (ignore_source / "keep.tmp").write_bytes(b"keep")
+            ignore_rules = root / "ignore.rules"
+            ignore_rules.write_text("*.tmp\n", encoding="utf-8")
+            ordered = client.cp(
+                src_src=ignore_source.name,
+                into="ignore-target",
+                ignore=[syq.IgnoreFrom(ignore_rules.name), "!keep.tmp"],
+            )
+            self.assertEqual(ordered.files_transferred, 1)
+            self.assertEqual(
+                (root / "ignore-target" / "keep.tmp").read_bytes(), b"keep"
+            )
 
             prune_source = root / "prune-source"
             prune_target = root / "prune-target"

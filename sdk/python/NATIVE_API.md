@@ -274,6 +274,25 @@ Python API does not replace them with differently defined unit types.
 same native constraints and five-minute reuse window; the library does not
 maintain a separate connection pool.
 
+Native ignore rules form one ordered stream: `--ignore` and `--ignore-from`
+take effect in command-line order, and the last matching rule wins. A simple
+`ignore_from=` value follows every pattern supplied through `ignore=`. When
+the two option kinds must be interleaved, put `syq.IgnoreFrom(path)` values in
+the ordered `ignore=` sequence:
+
+```python
+syq.cp(
+    "source",
+    into="destination",
+    ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"],
+)
+```
+
+This serializes as `--ignore-from rules --ignore '!keep.tmp'`. Python cannot
+recover the order in which separately named keyword arguments appeared in a
+call, so `IgnoreFrom` is the native `--ignore-from` occurrence used inside the
+single ordered stream rather than a new filtering concept.
+
 Native remote controls keep their command names mechanically: `run_at`, `rsh`,
 `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
 `tcp_congestion`, `no_forward_agent`, `unrestricted_agent_forwarding`, and
@@ -376,8 +395,11 @@ rather than retaining another complete Python object graph.
 
 After successful materialization, syq performs its own authoritative manifest
 validation and conflict checks. The temporary file remains available until the
-child exits and is then removed. Passing a manifest path to `mapping` skips
-Python materialization and passes that file to syq.
+child exits and is then removed. Its SDK-generated path is canonicalized before
+launch so a symlink in the system temporary-directory path does not require
+`follow=True`; this does not alter the treatment of caller-supplied paths.
+Passing a manifest path to `mapping` skips Python materialization and passes
+that file to syq unchanged.
 
 Callers that intentionally want raw stdin behavior can use:
 
@@ -494,9 +516,10 @@ The exception families have distinct meanings:
 `SyqOperationError.result` contains the typed terminal result and its `stderr`
 attribute retains up to the final 8 KiB of diagnostic output.
 `SyqProtocolError` retains the raw process status and bounded diagnostic
-context needed to investigate without storing an unbounded stream in the
-exception. Process spawn failures and timeouts retain the existing standard
-Python exception behavior of the raw adapter.
+context needed to investigate. Typed streaming calls drain stderr concurrently
+into that bounded in-memory tail rather than spooling the complete stream to
+temporary storage. Process spawn failures and timeouts retain the existing
+standard Python exception behavior of the raw adapter.
 
 `check=False` affects only `SyqOperationError`. It cannot turn install,
 invocation, process, or protocol failures into successful return values.

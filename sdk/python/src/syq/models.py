@@ -26,6 +26,11 @@ class EndpointKind(_StringEnum):
     SSH = "ssh"
 
 
+class EndpointRole(_StringEnum):
+    SOURCE = "source"
+    DESTINATION = "destination"
+
+
 class OperationAction(_StringEnum):
     TRANSFER_FILE = "transfer_file"
     CREATE_DIRECTORY = "create_directory"
@@ -181,8 +186,15 @@ class MappingEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class IgnoreFrom:
+    """An ordered ``--ignore-from`` occurrence in an ``ignore`` stream."""
+
+    path: str | bytes | os.PathLike[str] | os.PathLike[bytes]
+
+
+@dataclass(frozen=True, slots=True)
 class Endpoint:
-    role: str
+    role: EndpointRole
     kind: EndpointKind
     host: str | None = None
     user: str | None = None

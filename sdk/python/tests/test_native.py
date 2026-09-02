@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import syq
 
@@ -29,6 +30,10 @@ log = os.environ.get("SYQ_FAKE_ARGV")
 if log:
     with open(log, "w", encoding="utf-8") as output:
         json.dump(args, output)
+stderr_bytes = int(os.environ.get("SYQ_FAKE_STDERR_BYTES", "0"))
+if stderr_bytes:
+    sys.stderr.buffer.write(b"x" * stderr_bytes)
+    sys.stderr.buffer.flush()
 
 command = args[0]
 if command == "map":
@@ -93,6 +98,8 @@ if prune:
 shape = os.environ.get("SYQ_FAKE_SHAPE")
 if shape == "bad-schema":
     records[0]["schema_version"] = 99
+elif shape == "bad-endpoint-role":
+    records[0]["endpoints"][0]["role"] = "observer"
 elif shape == "gap":
     records[-1]["seq"] += 1
 elif shape == "truncated":
@@ -177,6 +184,8 @@ class NativeClientTests(unittest.TestCase):
         run = next(event for event in events if isinstance(event, syq.RunEvent))
         self.assertTrue(run.prune)
         self.assertEqual(run.endpoints[1].kind, syq.EndpointKind.SSH)
+        self.assertEqual(run.endpoints[0].role, syq.EndpointRole.SOURCE)
+        self.assertEqual(run.endpoints[1].role, syq.EndpointRole.DESTINATION)
         self.assertTrue(any(isinstance(event, syq.ProgressEvent) for event in events))
         trace = next(event for event in events if isinstance(event, syq.TraceEvent))
         self.assertEqual(trace.action, syq.OperationAction.TRANSFER_FILE)
@@ -279,6 +288,7 @@ class NativeClientTests(unittest.TestCase):
     def test_protocol_rejects_unsupported_incomplete_and_gapped_streams(self) -> None:
         for shape, message in (
             ("bad-schema", "schema version"),
+            ("bad-endpoint-role", "field 'role' is unsupported"),
             ("gap", "sequence"),
             ("truncated", "terminal result"),
         ):
@@ -289,6 +299,23 @@ class NativeClientTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(syq.SyqProtocolError, message):
                     client.cp("source", into="target")
+
+    def test_streaming_stderr_is_bounded_without_a_temporary_spool(self) -> None:
+        client = syq.Client(
+            executable=self.executable,
+            env={
+                **self.env,
+                "SYQ_FAKE_SHAPE": "truncated",
+                "SYQ_FAKE_STDERR_BYTES": str(2 * 1024 * 1024),
+            },
+        )
+        with mock.patch(
+            "syq.client.tempfile.TemporaryFile",
+            side_effect=AssertionError("stderr must not be spooled"),
+        ):
+            with self.assertRaises(syq.SyqProtocolError) as caught:
+                client.cp("source", into="target")
+        self.assertEqual(caught.exception.stderr, b"x" * 8192)
 
     def test_protocol_ignores_additive_record_types(self) -> None:
         client = syq.Client(
@@ -330,6 +357,42 @@ class NativeClientTests(unittest.TestCase):
         argv = self.argv()
         manifest = Path(argv[argv.index("--mapping") + 1])
         self.assertFalse(manifest.exists(), "temporary manifest survived the call")
+
+    def test_generated_mapping_path_resolves_temporary_directory_symlinks(self) -> None:
+        physical = self.root / "physical-tmp"
+        physical.mkdir()
+        alias = self.root / "tmp-alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        named_temporary_file = tempfile.NamedTemporaryFile
+
+        def create_through_alias(**kwargs):
+            return named_temporary_file(dir=alias, **kwargs)
+
+        with mock.patch(
+            "syq.client.tempfile.NamedTemporaryFile",
+            side_effect=create_through_alias,
+        ):
+            self.client.cp(
+                mapping=[syq.MappingEntry("a", "a")],
+                cwd="source",
+                into="target",
+            )
+        argv = self.argv()
+        manifest = Path(argv[argv.index("--mapping") + 1])
+        self.assertEqual(manifest.parent, physical.resolve())
+
+    def test_ignore_stream_preserves_native_cross_option_order(self) -> None:
+        self.client.cp(
+            "source",
+            into="target",
+            ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"],
+        )
+        argv = self.argv()
+        start = argv.index("--ignore-from")
+        self.assertEqual(
+            argv[start : start + 4],
+            ["--ignore-from", "rules", "--ignore", "!keep.tmp"],
+        )
 
     def test_map_is_streaming_typed_and_context_managed(self) -> None:
         with self.client.map(src_src="source", follow=True) as stream:

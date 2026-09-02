@@ -14,6 +14,7 @@ from .models import (
     Disposition,
     Endpoint,
     EndpointKind,
+    EndpointRole,
     EntryKind,
     ErrorClass,
     ErrorEvent,
@@ -165,7 +166,12 @@ def _endpoints(record: dict[str, Any]) -> tuple[Endpoint, ...]:
         if kind is EndpointKind.SSH and not host:
             raise SyqProtocolError("an SSH endpoint must contain a host")
         endpoints.append(
-            Endpoint(role=_string(value, "role"), kind=kind, host=host, user=user)
+            Endpoint(
+                role=_enum(value, "role", EndpointRole),
+                kind=kind,
+                host=host,
+                user=user,
+            )
         )
     return tuple(endpoints)
 

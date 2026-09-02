@@ -8,11 +8,11 @@ import selectors
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
 
 from .bootstrap import managed_executable
 from .errors import (
@@ -25,6 +25,7 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
+    IgnoreFrom,
     MappingEntry,
     OperationStatus,
     OperationSummary,
@@ -36,7 +37,9 @@ from .protocol import AutomationDecoder, parse_mapping_line
 PathArgument = str | bytes | os.PathLike[str] | os.PathLike[bytes]
 Argument = str | bytes
 Selector = PathArgument | Iterable[PathArgument]
+IgnoreSelector = str | IgnoreFrom | Iterable[str | IgnoreFrom]
 _MAX_STREAM_LINE_BYTES = 16 * 1024 * 1024
+_MAX_STDERR_BYTES = 8 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,19 +163,27 @@ class _LineProcess:
         self.argv = argv
         self.timeout = timeout
         self._deadline = None if timeout is None else time.monotonic() + timeout
-        self._stderr_file: BinaryIO = tempfile.TemporaryFile()
         self._process = subprocess.Popen(
             argv,
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=self._stderr_file,
+            stderr=subprocess.PIPE,
             shell=False,
             start_new_session=True,
         )
         assert self._process.stdout is not None
+        assert self._process.stderr is not None
         self._stdout = self._process.stdout
+        self._stderr = self._process.stderr
+        self._stderr_tail = bytearray()
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            name="syq-stderr-drain",
+            daemon=True,
+        )
+        self._stderr_thread.start()
         self._selector = selectors.DefaultSelector()
         self._selector.register(self._stdout, selectors.EVENT_READ)
         self._buffer = bytearray()
@@ -240,10 +251,21 @@ class _LineProcess:
         self._close_files()
 
     def _capture_stderr(self) -> None:
-        self._stderr_file.flush()
-        end = self._stderr_file.seek(0, os.SEEK_END)
-        self._stderr_file.seek(max(0, end - 8192))
-        self.stderr = self._stderr_file.read()
+        self._stderr_thread.join()
+        self.stderr = bytes(self._stderr_tail)
+
+    def _drain_stderr(self) -> None:
+        while True:
+            chunk = self._stderr.read(64 * 1024)
+            if not chunk:
+                return
+            if len(chunk) >= _MAX_STDERR_BYTES:
+                self._stderr_tail[:] = chunk[-_MAX_STDERR_BYTES:]
+                continue
+            excess = len(self._stderr_tail) + len(chunk) - _MAX_STDERR_BYTES
+            if excess > 0:
+                del self._stderr_tail[:excess]
+            self._stderr_tail.extend(chunk)
 
     def _close_files(self) -> None:
         if self._closed:
@@ -251,7 +273,7 @@ class _LineProcess:
         self._closed = True
         self._selector.close()
         self._stdout.close()
-        self._stderr_file.close()
+        self._stderr.close()
 
 
 def _values(value: Selector | None, *, label: str) -> tuple[Argument, ...]:
@@ -377,7 +399,7 @@ def _copy_arguments(
     max_entries: int | None,
     max_total_bytes: str | int | None,
     max_runtime: str | int | None,
-    ignore: str | Iterable[str] | None,
+    ignore: IgnoreSelector | None,
     ignore_from: Selector | None,
     preserve: str | Iterable[str] | None,
     inplace: bool,
@@ -457,11 +479,18 @@ def _copy_arguments(
     _append_text(argv, "--max-total-bytes", max_total_bytes)
     _append_text(argv, "--max-runtime", max_runtime)
     if ignore is not None:
-        patterns = (ignore,) if isinstance(ignore, str) else tuple(ignore)
-        for pattern in patterns:
-            if not isinstance(pattern, str):
-                raise SyqInvocationError("--ignore patterns must be text")
-            argv.extend(("--ignore", pattern))
+        rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
+        for rule in rules:
+            if isinstance(rule, IgnoreFrom):
+                argv.extend(
+                    ("--ignore-from", _argument(rule.path, label="--ignore-from"))
+                )
+            elif isinstance(rule, str):
+                argv.extend(("--ignore", rule))
+            else:
+                raise SyqInvocationError(
+                    "--ignore entries must be text or syq.IgnoreFrom"
+                )
     _append_paths(argv, "--ignore-from", ignore_from)
     if preserve is not None:
         attributes = (preserve,) if isinstance(preserve, str) else tuple(preserve)
@@ -668,7 +697,7 @@ class Client:
         max_entries: int | None = None,
         max_total_bytes: str | int | None = None,
         max_runtime: str | int | None = None,
-        ignore: str | Iterable[str] | None = None,
+        ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
         inplace: bool = False,
@@ -772,7 +801,7 @@ class Client:
                     + b"\n"
                 )
             manifest.flush()
-            argv.extend(("--mapping", manifest.name))
+            argv.extend(("--mapping", os.path.realpath(manifest.name)))
             return self._typed(
                 argv,
                 prune=False,
