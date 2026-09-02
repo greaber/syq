@@ -277,12 +277,21 @@ not finish.
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:
 
-```sh
+```bash
+set -o pipefail
 syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
-jq -c 'select(.type == "operation_result" and .disposition == "failed"
-              and .retryable != "no") | {src, dst, kind}' r.ndjson \
+jq -cs 'if (.[-1].type? // "") != "result"
+        then "incomplete results stream (no terminal record)" | halt_error
+        else .[] | select(.type == "operation_result"
+                          and .disposition == "failed"
+                          and .retryable != "no")
+             | {src, dst, kind} end' r.ndjson \
   | syq cp --mapping - -C src --to nas --into /data
 ```
 
-The second line is what an exit code cannot express: which entries
-failed, and whether a retry could help.
+The jq program first checks the stream's terminal record: a results
+file without one is from a run that did not finish (a crash, a kill),
+so entries the run never reached have no records at all and a retry
+built from the prefix would look complete while it is not. With the
+terminal record present, the filter is what an exit code cannot
+express: which entries failed, and whether a retry could help.
