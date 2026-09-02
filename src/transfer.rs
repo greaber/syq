@@ -85,8 +85,8 @@ pub struct Opts {
     pub ignore_existing: bool,
     /// --existing: never create a destination path that doesn't exist.
     pub existing: bool,
-    /// Follow foreign-owned symlinks in the operator-selected destination.
-    pub insecure_links: bool,
+    /// Symlink policy for the operator-selected destination path.
+    pub operator_symlink_policy: OperatorSymlinkPolicy,
     /// --max-size / --min-size: regular files outside the range are not transferred.
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
@@ -97,12 +97,16 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
         None => Endpoint::Local,
         Some(h) => {
             let rsh = parse_rsh(&args.rsh)?;
-            let ssh_multiplexer = args
-                .rsh
-                .is_none()
-                .then(SshMultiplexer::new)
-                .transpose()?
-                .map(Arc::new);
+            let ssh_multiplexer = if args.rsh.is_some() {
+                None
+            } else if args.reuse_connection && args.restricted_grant.is_none() {
+                Some(Arc::new(SshMultiplexer::persistent(
+                    loc.user.as_deref(),
+                    h,
+                )?))
+            } else {
+                Some(Arc::new(SshMultiplexer::new()?))
+            };
             Endpoint::Remote(RemoteSpec {
                 local_process: false,
                 user: loc.user.clone(),
@@ -121,6 +125,20 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             })
         }
     })
+}
+
+fn operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+    if args.interface == Interface::Rsync {
+        if args.insecure_links {
+            OperatorSymlinkPolicy::FollowAll
+        } else {
+            OperatorSymlinkPolicy::TrustedOwner
+        }
+    } else if args.native_follow {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    }
 }
 
 /// Open a control connection. It bypasses the data-connection connect
@@ -475,7 +493,7 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
         "ignore": opts.ignore,
     });
     // Keep the established compatibility identity byte-for-byte stable so an
-    // upgrade does not orphan resumable sidecars or checkpoints.
+    // upgrade does not orphan resumable sidecars.
     if srcs
         .iter()
         .any(|source| source.selection != crate::cli::SourceSelection::Rsync)
@@ -495,8 +513,8 @@ fn endpoint_identity(l: &Location) -> String {
     }
 }
 
-/// Keep existing checkpoint/partial identities unchanged for UTF-8 paths,
-/// while giving native raw-byte paths a lossless and unambiguous spelling.
+/// Keep existing partial identities unchanged for UTF-8 paths, while giving
+/// native raw-byte paths a lossless and unambiguous spelling.
 fn path_identity(path: &std::path::Path) -> String {
     if let Some(path) = path.to_str() {
         return path.to_string();
@@ -514,7 +532,6 @@ fn path_identity(path: &std::path::Path) -> String {
     encoded
 }
 
-/// Load and, for a real copy, open the explicitly requested checkpoint.
 struct DestinationRoot<'a> {
     path: &'a [u8],
     existed: bool,
@@ -536,6 +553,10 @@ pub(crate) fn validate_native_source_type(
     kind: Kind,
 ) -> Result<()> {
     match selection {
+        SourceSelection::Contents | SourceSelection::Directory if kind == Kind::Symlink => bail!(
+            "selector {} is a symlink; pass --follow to resolve symlinks",
+            display(path)
+        ),
         SourceSelection::Contents if kind != Kind::Dir => {
             bail!("contents selector {} is not a directory", display(path))
         }
@@ -573,7 +594,7 @@ fn copy_identity(
         None => canonical_path(dst_ctl, &dst.path, dst.is_remote())?,
     };
     let dst_root = path_identity(&dst_root);
-    Ok(crate::checkpoint::job_identity(
+    Ok(crate::resume::job_identity(
         &endpoint_identity(&srcs[0]),
         &src_roots,
         &endpoint_identity(dst),
@@ -582,105 +603,13 @@ fn copy_identity(
     ))
 }
 
-fn checkpoint_setup(
-    args: &Args,
-    srcs: &[Location],
-    dst: DestinationRoot<'_>,
-    dst_ctl: &mut dyn Conn,
-    identity: &str,
-) -> Result<Option<CheckpointState>> {
-    use crate::checkpoint::Checkpoint;
-    let Some(path) = args.checkpoint.as_deref().map(std::path::Path::new) else {
-        return Ok(None);
-    };
-    let (checkpoint, loaded) = if args.dry_run {
-        let loaded = Checkpoint::load(path)?;
-        if let Some(ex) = &loaded.existing_identity {
-            if ex != identity {
-                bail!(
-                    "checkpoint {} describes a different copy; choose another path or remove it",
-                    path.display()
-                );
-            }
-        }
-        (None, loaded)
-    } else {
-        let (checkpoint, loaded) = Checkpoint::open(path, identity)?;
-        (Some(checkpoint), loaded)
-    };
-    if !loaded.completed.is_empty() {
-        if !dst.existed {
-            bail!(
-                "checkpoint {} records completed files, but destination {} is missing; remove the checkpoint to restart",
-                path.display(),
-                display(dst.path)
-            );
-        }
-        if dst.entry_is_dir {
-            for source in srcs.iter().filter(|source| !source.copies_contents()) {
-                let basename = source.basename();
-                if basename.is_empty() {
-                    continue;
-                }
-                let prefix = basename.as_slice();
-                let has_completed_path = loaded.completed.keys().any(|completed| {
-                    completed == prefix
-                        || completed
-                            .strip_prefix(prefix)
-                            .is_some_and(|suffix| suffix.starts_with(b"/"))
-                });
-                if has_completed_path {
-                    let target = join(dst.path, prefix);
-                    if stat_one(dst_ctl, &target, false)?.is_none() {
-                        bail!(
-                            "checkpoint {} records completed files, but destination target {} is missing; remove the checkpoint to restart",
-                            path.display(),
-                            display(&target)
-                        );
-                    }
-                }
-            }
-        }
-    }
-    let checkpoint = checkpoint.map(|checkpoint| {
-        let checkpoint = std::sync::Arc::new(checkpoint);
-        checkpoint.spawn_flusher();
-        checkpoint
-    });
-    Ok(Some(CheckpointState {
-        checkpoint,
-        completed: std::sync::Arc::new(loaded.completed),
-    }))
-}
-
-/// Explicit checkpoint state for one transfer.
-struct CheckpointState {
-    checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
-    completed: std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>,
-}
-
-impl Drop for CheckpointState {
-    fn drop(&mut self) {
-        if let Some(checkpoint) = &self.checkpoint {
-            let _ = checkpoint.close();
-        }
-    }
-}
-
-/// Shared with workers after checkpoint setup and before planning enqueues work.
-#[derive(Default)]
-struct CheckpointShared {
-    checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
-}
-type CheckpointSlot = std::sync::Arc<std::sync::OnceLock<CheckpointShared>>;
-
 #[derive(Clone, Debug)]
 struct DestinationAnchor {
     operator_path: PathBytes,
     request_prefix: PathBytes,
     dev: u64,
     ino: u64,
-    insecure_links: bool,
+    symlink_policy: OperatorSymlinkPolicy,
 }
 type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
 
@@ -750,12 +679,25 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
+    if let Some(mapping) = args
+        .native_mapping
+        .as_deref()
+        .filter(|mapping| *mapping != b"-")
+        .filter(|_| !args.native_follow)
+    {
+        crate::fsops::check_operator_path_no_symlinks(mapping, false, false)
+            .map_err(|error| anyhow::anyhow!("--mapping: {error}"))?;
+    }
     if let Some(results) = args.native_results.as_deref() {
         let out: Box<dyn std::io::Write + Send> = if results == b"-" {
             // The machine owns stdout: suppress every human stdout line.
             progress.suppress_stdout();
             Box::new(std::io::stdout())
         } else {
+            if !args.native_follow {
+                crate::fsops::check_operator_path_no_symlinks(results, false, true)
+                    .map_err(|error| anyhow::anyhow!("--results: {error}"))?;
+            }
             let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
             Box::new(std::io::BufWriter::new(
                 std::fs::File::create(&path)
@@ -952,29 +894,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     let srcs = srcs.as_slice();
     let multiple_distinct_sources = srcs.len() > 1;
-    if let Some(checkpoint) = args.checkpoint.as_deref() {
-        let checkpoint = crate::fsops::normalize(std::path::Path::new(checkpoint));
-        for source in srcs.iter().filter(|source| !source.is_remote()) {
-            let root = crate::fsops::normalize(&crate::fsops::resolve(&source.path));
-            if checkpoint.starts_with(&root) {
-                bail!(
-                    "checkpoint {} must not be inside local source {}",
-                    checkpoint.display(),
-                    root.display()
-                );
-            }
-        }
-        if !dst.is_remote() {
-            let root = crate::fsops::normalize(&crate::fsops::resolve(&dst.path));
-            if checkpoint.starts_with(&root) {
-                bail!(
-                    "checkpoint {} must not be inside local destination {}",
-                    checkpoint.display(),
-                    root.display()
-                );
-            }
-        }
-    }
     // Reject up front when two sources would land on the same destination name
     // (e.g. a/same and b/same into dest/) — before any bytes are written.
     {
@@ -1017,6 +936,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
         if !args.relay {
+            // The direct orchestrator runs on the source host and rebuilds
+            // the command; no direct leg holds a reusable local master, so
+            // refuse rather than silently ignore the flag. --relay keeps the
+            // orchestrator (and its persistent masters) on this machine.
+            if args.reuse_connection {
+                bail!(
+                    "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
+                );
+            }
             let direct_paths_are_utf8 = srcs
                 .iter()
                 .chain(std::iter::once(dst))
@@ -1074,10 +1002,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         update: args.update,
         ignore_existing: args.ignore_existing,
         existing: args.existing,
-        insecure_links: args.insecure_links,
+        operator_symlink_policy: operator_symlink_policy(&args),
         max_size,
         min_size,
     });
+
     let sched = Arc::new(Sched::new(block, min_split));
 
     // Workers connect on their own threads once the control connections are
@@ -1085,7 +1014,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // handshakes (at sshd's MaxStartups or a serialized ssh agent). The tuner
     // may spawn more workers later, so the handles live behind a mutex.
     let gate = Gate::new(args.connections);
-    let checkpoint_slot: CheckpointSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let destination_anchor: DestinationAnchorSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let destination_anchor_required = args.restricted_grant.is_none();
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
@@ -1101,7 +1029,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             opts,
             gate,
             workers,
-            checkpoint_slot,
             destination_anchor,
             bwlimit,
             transport_stats,
@@ -1114,7 +1041,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             opts.clone(),
             gate.clone(),
             workers.clone(),
-            checkpoint_slot.clone(),
             destination_anchor.clone(),
             bwlimit.clone(),
             transport_stats.clone(),
@@ -1130,7 +1056,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 progress,
                 opts,
                 gate,
-                checkpoint,
                 destination_anchor,
                 bwlimit,
                 transport_stats,
@@ -1142,7 +1067,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 progress.clone(),
                 opts.clone(),
                 gate.clone(),
-                checkpoint_slot.clone(),
                 destination_anchor.clone(),
                 bwlimit.clone(),
                 transport_stats.clone(),
@@ -1216,7 +1140,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         sched: sched.clone(),
                         progress: progress.clone(),
                         opts: opts.clone(),
-                        checkpoint: checkpoint.clone(),
                         bwlimit: bwlimit.clone(),
                         gate: gate.clone(),
                         t: [0.0; 4],
@@ -1346,11 +1269,19 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         &dst.path,
         dst.is_remote(),
     )?;
-    // A destination that is a symlink to a directory is that directory (as
-    // for rsync). Use the resolved target path for all planning and metadata,
-    // so ordinary in-tree symlinks can still be replaced instead of followed.
-    let (dst_root, mut dst_root_entry) =
-        follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?;
+    // Rsync retains its destination-directory compatibility rule. Native
+    // paths instead use one explicit policy: keep the named symlink as the
+    // object by default, or resolve the complete chain under --follow.
+    let (dst_root, mut dst_root_entry) = match args.interface {
+        Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?,
+        _ if args.native_follow => follow_operator_symlink(
+            &mut *dst_ctl,
+            &operator_dst_root,
+            dst_root_entry,
+            args.target_existence != Existence::Existing,
+        )?,
+        _ => (operator_dst_root.clone(), dst_root_entry),
+    };
     if debug() {
         eprintln!(
             "syq: destination stat complete at {:.2}s",
@@ -1376,6 +1307,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let dst_is_dir = match args.placement {
         Placement::Into => {
+            if args.interface != Interface::Rsync
+                && !args.native_follow
+                && dst_root_entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.kind == Kind::Symlink)
+            {
+                bail!(
+                    "--into target {} is a symlink; pass --follow to resolve symlinks",
+                    display(&dst_root)
+                );
+            }
             if dst_existed && !dst_entry_is_dir {
                 bail!(
                     "--into target {} exists but is not a directory",
@@ -1413,11 +1355,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     if args.interface != Interface::Rsync {
-        // Native selectors are structural: validate every selected root before
-        // a missing --into target can be created. Contents selectors follow
-        // their root and additionally require it to resolve to a directory.
+        // This semantic preflight rejects a static symlink in every parent
+        // component of a directly supplied source path. The broader rooted
+        // copy migration will make the retained identity survive scanning and
+        // content opens in the presence of concurrent namespace mutation.
         for source in srcs {
-            match stat_one(&mut *src_ctl, &source.path, source.follows_root())? {
+            check_operator_directory(
+                &mut *src_ctl,
+                &parent_path(&source.path),
+                false,
+                operator_symlink_policy(&args),
+            )?;
+        }
+        // Native selectors are structural: validate every selected root before
+        // a missing --into target can be created. Contents selectors require
+        // a directory and resolve a selected link only under --follow.
+        for source in srcs {
+            match stat_one(
+                &mut *src_ctl,
+                &source.path,
+                source.follows_root(args.native_follow),
+            )? {
                 Some(entry) => {
                     validate_native_source_type(&source.path, source.selection, entry.kind)?
                 }
@@ -1438,7 +1396,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let operator_directory = if dst_is_dir {
         operator_dst_root.clone()
     } else {
-        parent_path(&operator_dst_root)
+        // Exact --follow placement selects the referent itself. Its retained
+        // authority is therefore the referent's parent, which may differ from
+        // the parent of the operator's symlink spelling.
+        parent_path(&dst_root)
     };
     let request_prefix = if dst_is_dir {
         dst_root.clone()
@@ -1454,7 +1415,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &mut *dst_ctl,
             &operator_directory,
             allow_missing,
-            args.insecure_links,
+            opts.operator_symlink_policy,
         )?
     } else {
         None
@@ -1517,9 +1478,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let remote = dst.is_remote();
         for s in srcs {
             // Only a directory source can trigger the recurse-into-itself trap.
-            // Judge the source the way the scan will: --files-from and
-            // trailing-slash sources are followed through a symlinked root.
-            let follow_root = args.files_from.is_some() || s.follows_root();
+            // Judge the source the way the scan will, including the interface's
+            // explicit selected-root link policy.
+            let follow_root = args.files_from.is_some() || s.follows_root(args.native_follow);
             let src_is_dir = matches!(stat_one(&mut *src_ctl, &s.path, follow_root)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
@@ -1561,7 +1522,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         &opts,
     )?;
     opts.partial_id
-        .set(crate::checkpoint::partial_id(&identity))
+        .set(crate::resume::partial_id(&identity))
         .expect("partial identity set once");
     if debug() {
         eprintln!(
@@ -1569,20 +1530,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
-
-    let checkpoint_state = checkpoint_setup(
-        &args,
-        srcs,
-        DestinationRoot {
-            path: &dst_root,
-            existed: dst_existed,
-            is_container: dst_is_dir,
-            entry_is_dir: dst_entry_is_dir,
-            exact: args.placement == Placement::As,
-        },
-        &mut *dst_ctl,
-        &identity,
-    )?;
 
     // A signed receiver cannot fall back to replaying its one-time SSH grant.
     // Settle its TCP reachability before any destination creation, preserving
@@ -1637,7 +1584,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 &mut *dst_ctl,
                 selection,
                 request_prefix.clone(),
-                args.insecure_links,
+                opts.operator_symlink_policy,
             )?;
             if create_root {
                 mutation_root_condition = TargetCondition::Matches {
@@ -1667,17 +1614,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if guard_containers {
             container_guard = Some(target_container(&dst_root, &created));
         }
-    }
-    let checkpoint_completed = checkpoint_state
-        .as_ref()
-        .map(|state| state.completed.clone());
-    let checkpoint_writer = checkpoint_state
-        .as_ref()
-        .and_then(|state| state.checkpoint.clone());
-    if let Some(checkpoint) = &checkpoint_writer {
-        let _ = checkpoint_slot.set(CheckpointShared {
-            checkpoint: Some(checkpoint.clone()),
-        });
     }
     if debug() {
         eprintln!(
@@ -1774,8 +1710,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         sched: &sched,
         progress: &progress,
         opts: &opts,
-        completed: checkpoint_completed,
-        checkpoint: checkpoint_writer,
         destination_tree_known_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
@@ -1871,7 +1805,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     {
         let src_root = src.path.clone();
         let contents = src.copies_contents();
-        let follow_root = src.follows_root();
+        let follow_root = src.follows_root(args.native_follow);
         // A bare directory source goes to dest/basename even when dest doesn't
         // exist yet; a non-directory source only does so when dest is a directory
         // (decided once the root entry is seen).
@@ -2144,24 +2078,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
 
-    // Settle an explicit checkpoint. A recording failure only makes a retry
-    // recheck more files. The user-selected state persists until they remove it.
-    if let Some(state) = &checkpoint_state {
-        let failed = state.checkpoint.as_ref().and_then(|checkpoint| {
-            checkpoint
-                .close()
-                .err()
-                .map(|e| format!("{e:#}"))
-                .or_else(|| checkpoint.take_error())
-        });
-        // Error-class output: a real I/O failure that -q must not swallow,
-        // even though the exit code still describes the (complete) copy.
-        if let Some(e) = failed {
-            eprintln!(
-                "syq: warning: checkpoint recording stopped ({e}); a retry will recheck files completed after that point"
-            );
-        }
-    }
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
     // With --results -, the machine owns stdout: every human summary line
@@ -2445,15 +2361,15 @@ fn check_operator_directory(
     conn: &mut dyn Conn,
     path: &[u8],
     allow_missing: bool,
-    insecure_links: bool,
+    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<Option<DirectoryAnchor>> {
     match ok(
         conn.call(Request::CheckOperatorDirectory {
             path: path.to_vec(),
             allow_missing,
-            insecure_links,
+            symlink_policy,
         })?,
-        "destination path",
+        "operator path",
     )? {
         Response::DirectorySelection(selection) => Ok(selection),
         other => bail!("unexpected response {other:?}"),
@@ -2480,14 +2396,14 @@ fn activate_control_destination(
     conn: &mut dyn Conn,
     selection: DirectoryAnchor,
     request_prefix: PathBytes,
-    insecure_links: bool,
+    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<DestinationAnchor> {
     let anchor = DestinationAnchor {
         operator_path: selection.path,
         request_prefix,
         dev: selection.dev,
         ino: selection.ino,
-        insecure_links,
+        symlink_policy,
     };
     match ok(
         conn.call(Request::AnchorDestination {
@@ -2495,7 +2411,7 @@ fn activate_control_destination(
             expected_dev: anchor.dev,
             expected_ino: anchor.ino,
             request_prefix: anchor.request_prefix.clone(),
-            insecure_links,
+            symlink_policy,
         })?,
         "anchor destination root",
     )? {
@@ -2510,7 +2426,7 @@ fn worker_destination_request(anchor: &DestinationAnchor) -> Request {
         expected_dev: anchor.dev,
         expected_ino: anchor.ino,
         request_prefix: anchor.request_prefix.clone(),
-        insecure_links: anchor.insecure_links,
+        symlink_policy: anchor.symlink_policy,
     }
 }
 
@@ -2643,6 +2559,47 @@ fn follow_dir_symlink(
         }
     }
     Ok((path.to_vec(), entry))
+}
+
+/// Resolve a symlink in the last component of a directly supplied native
+/// pathname. Unlike rsync's directory-only compatibility behavior, explicit
+/// `--follow` selects the referent regardless of its type. Placement forms
+/// that allow a missing target may create the referent of a dangling chain.
+fn follow_operator_symlink(
+    conn: &mut dyn Conn,
+    path: &[u8],
+    entry: Option<Entry>,
+    allow_missing: bool,
+) -> Result<(PathBytes, Option<Entry>)> {
+    let Some(mut current) = entry else {
+        return Ok((path.to_vec(), None));
+    };
+    let mut current_path = path.to_vec();
+    for _ in 0..40 {
+        if current.kind != Kind::Symlink {
+            return Ok((current_path, Some(current)));
+        }
+        let target = current
+            .link
+            .as_deref()
+            .context("symlink entry did not include its target")?;
+        current_path = if target.starts_with(b"/") {
+            target.to_vec()
+        } else {
+            join(&parent_path(&current_path), target)
+        };
+        match stat_one(conn, &current_path, false)? {
+            Some(entry) => current = entry,
+            None if allow_missing => return Ok((current_path, None)),
+            None => {
+                bail!(
+                    "operator path {} resolves through a dangling symlink",
+                    display(path)
+                )
+            }
+        }
+    }
+    bail!("too many symlink levels in operator path {}", display(path))
 }
 
 fn display(p: &[u8]) -> String {
@@ -2942,9 +2899,6 @@ fn path_has_partial_component(path: &[u8]) -> bool {
         .any(|part| is_partial_name(OsStr::from_bytes(part)))
 }
 
-/// What to checkpoint for a quick-check-identical file once metadata repair succeeds.
-type QuickCheckRecord = (PathBytes, Entry);
-
 struct Planner<'a> {
     dst: &'a mut dyn Conn,
     sched: &'a Sched,
@@ -2960,9 +2914,6 @@ struct Planner<'a> {
     /// that virtual replacement exists, lstat would follow an old in-tree
     /// symlink in an intermediate component and inspect the wrong subtree.
     dry_run_replaced_dirs: std::collections::HashSet<PathBytes>,
-    completed:
-        Option<std::sync::Arc<std::collections::HashMap<PathBytes, crate::checkpoint::Completed>>>,
-    checkpoint: Option<std::sync::Arc<crate::checkpoint::Checkpoint>>,
     /// Once syq has observed a missing remote destination root, every mapped
     /// path is missing too. Avoid WAN round trips for impossible descendants;
     /// local stats stay cheap and warm filesystem metadata for the writers.
@@ -3081,12 +3032,10 @@ struct Mapped {
 /// What --delete found on the destination that the source doesn't have.
 #[derive(Default)]
 struct Deletes {
-    /// (path, display name, destination-relative path) of files, symlinks and
-    /// specials to unlink; the relative path is the journal's key.
-    leaves: Vec<(PathBytes, String, PathBytes)>,
-    /// Directories by depth, removed deepest-first once they are empty; the
-    /// relative path is the journal's key, as for leaves.
-    dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String, PathBytes)>>,
+    /// (path, display name) of files, symlinks and specials to unlink.
+    leaves: Vec<(PathBytes, String)>,
+    /// Directories by depth, removed deepest-first once they are empty.
+    dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String)>>,
 }
 
 impl Deletes {
@@ -3673,8 +3622,8 @@ impl Planner<'_> {
             // Every source entry claims its destination here, before any
             // decision about it: that blocks two sources from mapping onto one
             // path, and it is what makes --delete safe — whatever happens
-            // below (skip, filter, unsupported type, resumed from a journal),
-            // a path the source has is never an extra.
+            // below (skip, filter, unsupported type), a path the source has is
+            // never an extra.
             let claim = match e.kind {
                 Kind::Dir => Claim::Dir,
                 Kind::File => Claim::File {
@@ -3786,7 +3735,7 @@ impl Planner<'_> {
                     self.dst,
                     selection,
                     root.clone(),
-                    self.opts.insecure_links,
+                    self.opts.operator_symlink_policy,
                 )?;
                 self.mutation_root_condition = TargetCondition::Matches {
                     dev: anchor.dev,
@@ -3835,7 +3784,7 @@ impl Planner<'_> {
         let Mapped {
             dst_root,
             dirs,
-            mut others,
+            others,
             dir_stats,
             mut other_stats,
         } = mapped;
@@ -3971,9 +3920,6 @@ impl Planner<'_> {
                     }
                 }
             } else if !opts.verify_only {
-                // A directory about to occupy a checkpoint-complete file's
-                // path needs a write-ahead invalidation (see the fn).
-                planned.retain(|(_, dst_rel, _, _)| self.invalidate_completion(dst_rel));
                 // Create new dirs; also "create" existing ones we can't yet
                 // write into (0o700 not set) so apply() opens them up.
                 let mut new_dirs: Vec<Op> = planned
@@ -4130,29 +4076,6 @@ impl Planner<'_> {
         if others.is_empty() {
             return Ok(());
         }
-        // An explicitly requested checkpoint may trust a matching source
-        // fingerprint without a destination stat. This runs after the mapping
-        // loop above, so a skipped file has already claimed its destination
-        // (--delete never treats it as an extra).
-        if self.completed.is_some() && !opts.checksum {
-            let completed = self.completed.clone().unwrap();
-            let mut kept = Vec::with_capacity(others.len());
-            for p in others.into_iter() {
-                let virtually_missing =
-                    opts.dry_run && Self::under_any(&self.dry_run_replaced_dirs, &p.dst, dst_root);
-                if p.e.kind == Kind::File && !virtually_missing {
-                    if let Some(c) = completed.get(&p.dst_rel) {
-                        if c.matches(&p.e, opts.flags) {
-                            self.progress.files_skipped.fetch_add(1, Relaxed);
-                            self.progress.bytes_skipped.fetch_add(p.e.size, Relaxed);
-                            continue;
-                        }
-                    }
-                }
-                kept.push(p);
-            }
-            others = kept;
-        }
         let stats = if self.destination_tree_known_missing {
             vec![None; others.len()]
         } else if let Some(stats) = &mut other_stats {
@@ -4172,9 +4095,7 @@ impl Planner<'_> {
         };
         let mut ops: Vec<Op> = Vec::new();
         let mut op_names: Vec<QueuedLeafOp> = Vec::new();
-        // Metadata repairs for quick-check-identical files, each with the
-        // checkpoint record once the repair has actually succeeded.
-        let mut meta_fixes: Vec<(Op, Option<QuickCheckRecord>)> = Vec::new();
+        let mut meta_fixes: Vec<Op> = Vec::new();
         for (p, dst_entry) in others.into_iter().zip(stats) {
             let Planned {
                 src: src_path,
@@ -4330,28 +4251,20 @@ impl Planner<'_> {
                                     }
                                     continue;
                                 }
-                                meta_fixes.push((
-                                    Op::SetFileMetaIfSame {
-                                        path: dst_path.clone(),
-                                        condition: match target_condition {
-                                            TargetCondition::Any => target_identity(d),
-                                            condition => condition,
-                                        },
-                                        meta: e.meta(),
-                                        flags: ff,
+                                meta_fixes.push(Op::SetFileMetaIfSame {
+                                    path: dst_path.clone(),
+                                    condition: match target_condition {
+                                        TargetCondition::Any => target_identity(d),
+                                        condition => condition,
                                     },
-                                    self.checkpoint
-                                        .as_ref()
-                                        .map(|_| (dst_rel.clone(), e.clone())),
-                                ));
+                                    meta: e.meta(),
+                                    flags: ff,
+                                });
                                 continue;
                             }
                         }
                         self.progress.files_skipped.fetch_add(1, Relaxed);
                         self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
-                        if let Some(checkpoint) = &self.checkpoint {
-                            checkpoint.record_complete(&dst_rel, &e, "quick-check");
-                        }
                     } else if opts.dry_run {
                         self.progress.files_total.fetch_add(1, Relaxed);
                         self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -4463,9 +4376,6 @@ impl Planner<'_> {
                         }
                         continue;
                     }
-                    if !self.invalidate_completion(&dst_rel) {
-                        continue;
-                    }
                     op_names.push(QueuedLeafOp {
                         dst_rel: dst_rel.clone(),
                         action: "create_symlink",
@@ -4546,9 +4456,6 @@ impl Planner<'_> {
                         }
                         continue;
                     }
-                    if !self.invalidate_completion(&dst_rel) {
-                        continue;
-                    }
                     op_names.push(QueuedLeafOp {
                         dst_rel: dst_rel.clone(),
                         action: "create_special",
@@ -4579,17 +4486,8 @@ impl Planner<'_> {
             }
         }
         if !meta_fixes.is_empty() {
-            let (ops, records): (Vec<Op>, Vec<_>) = meta_fixes.into_iter().unzip();
-            for (err, rec) in self.apply(ops)?.into_iter().zip(records) {
-                match err {
-                    Some(err) => self.progress.error(&format!("syq: {err}")),
-                    None => {
-                        // Only now is the file complete in every respect.
-                        if let (Some(checkpoint), Some((rel, entry))) = (&self.checkpoint, rec) {
-                            checkpoint.record_complete(&rel, &entry, "quick-check");
-                        }
-                    }
-                }
+            for err in self.apply(meta_fixes)?.into_iter().flatten() {
+                self.progress.error(&format!("syq: {err}"));
             }
         }
         if !ops.is_empty() {
@@ -4970,32 +4868,6 @@ impl Planner<'_> {
         });
     }
 
-    /// Write-ahead invalidation for a transfer-time type change: something
-    /// non-regular is about to occupy a path the checkpoint recorded as a
-    /// complete file. False = the intent could not be persisted; the caller
-    /// must not create the entry (a checkpointed retry would otherwise trust
-    /// the stale Complete record).
-    fn invalidate_completion(&self, dst_rel: &[u8]) -> bool {
-        let (Some(completed), Some(checkpoint)) = (&self.completed, &self.checkpoint) else {
-            return true;
-        };
-        if dst_rel.is_empty() || !completed.contains_key(dst_rel) {
-            return true;
-        }
-        if checkpoint
-            .record_deleted_batch(std::iter::once(dst_rel))
-            .is_ok()
-        {
-            true
-        } else {
-            self.progress.error(&format!(
-                "syq: {}: cannot persist checkpoint invalidation; not replacing it",
-                display(dst_rel)
-            ));
-            false
-        }
-    }
-
     /// --ignore-existing / --existing for a leaf, given what's on the destination.
     fn skip_existing(&self, dst_entry: &Option<Entry>) -> bool {
         (self.opts.ignore_existing && dst_entry.is_some())
@@ -5097,13 +4969,13 @@ impl Planner<'_> {
                         } else {
                             if e.kind == Kind::Dir {
                                 let depth = full.iter().filter(|&&c| c == b'/').count();
-                                found.dirs.entry(depth).or_default().push((
-                                    full,
-                                    format!("{rel}/"),
-                                    dst_rel,
-                                ));
+                                found
+                                    .dirs
+                                    .entry(depth)
+                                    .or_default()
+                                    .push((full, format!("{rel}/")));
                             } else {
-                                found.leaves.push((full, rel, dst_rel));
+                                found.leaves.push((full, rel));
                             }
                         }
                     }
@@ -5128,16 +5000,12 @@ impl Planner<'_> {
             res?;
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
-                for (path, rel, dst_rel) in v {
+                for (path, rel) in v {
                     if protected.contains(&path) {
                         self.progress
                             .eprintln(&format!("syq: not deleting {rel}: it holds ignored paths"));
                     } else {
-                        self.deletes
-                            .dirs
-                            .entry(d)
-                            .or_default()
-                            .push((path, rel, dst_rel));
+                        self.deletes.dirs.entry(d).or_default().push((path, rel));
                     }
                 }
             }
@@ -5160,13 +5028,12 @@ impl Planner<'_> {
                 if let Some(results) = self.progress.results_writer() {
                     let blocked = leaves
                         .iter()
-                        .map(|(_, _, dst_rel)| (dst_rel, "file"))
-                        .chain(
-                            dirs.values()
-                                .flatten()
-                                .map(|(_, _, dst_rel)| (dst_rel, "dir")),
-                        );
-                    for (dst_rel, kind) in blocked {
+                        .map(|(p, _)| (p, "file"))
+                        .chain(dirs.values().flatten().map(|(p, _)| (p, "dir")));
+                    for (p, kind) in blocked {
+                        let Some(dst_rel) = strip_dst_root(p, &self.root_path) else {
+                            continue;
+                        };
                         results.emit_operation(&crate::results::OperationRecord {
                             action: "delete",
                             dst: dst_rel,
@@ -5187,37 +5054,20 @@ impl Planner<'_> {
             }
         }
         let mut n = 0u64;
-        let checkpoint = self.checkpoint.clone();
-        let completed = self.completed.clone();
-        let completion_recorded = move |dst_rel: &PathBytes| {
-            completed
-                .as_ref()
-                .is_some_and(|map| map.contains_key(dst_rel))
-        };
-        // Set when deletion intents could not be made durable: from then on
-        // nothing more is deleted — the checkpoint's stale Complete records
-        // would otherwise outlive the files they describe.
-        let intents_failed = std::cell::Cell::new(false);
-        #[cfg(debug_assertions)]
-        let mut held_after_delete = false;
-        let mut run = |me: &mut Self,
-                       items: &[(PathBytes, String, PathBytes)],
-                       rmdir: bool|
-         -> Result<()> {
+        let mut run = |me: &mut Self, items: &[(PathBytes, String)], rmdir: bool| -> Result<()> {
             for chunk in items.chunks(1000) {
-                if intents_failed.get() {
-                    return Ok(());
-                }
                 if opts.dry_run {
-                    for (_, rel, dst_rel) in chunk {
+                    for (p, rel) in chunk {
                         n += 1;
-                        me.emit_trace(
-                            "delete",
-                            dst_rel,
-                            if rmdir { "dir" } else { "file" },
-                            None,
-                            "destination_only",
-                        );
+                        if let Some(dst_rel) = strip_dst_root(p, &me.root_path) {
+                            me.emit_trace(
+                                "delete",
+                                dst_rel,
+                                if rmdir { "dir" } else { "file" },
+                                None,
+                                "destination_only",
+                            );
+                        }
                         if opts.verbose > 0 {
                             me.progress
                                 .println(&format!("delete {rel} (destination only)"));
@@ -5225,31 +5075,9 @@ impl Planner<'_> {
                     }
                     continue;
                 }
-                // Write-ahead: the invalidation intents go into the checkpoint
-                // before anything is removed — leaves and rmdirs alike (a dir
-                // may sit where a complete file was recorded) — and gate it:
-                // without a persisted intent the mutation must not happen.
-                {
-                    if let Some(c) = &checkpoint {
-                        if let Err(e) = c.record_deleted_batch(
-                            chunk
-                                .iter()
-                                .filter(|(_, _, dst_rel)| {
-                                    !dst_rel.is_empty() && completion_recorded(dst_rel)
-                                })
-                                .map(|(_, _, dst_rel)| dst_rel.as_slice()),
-                        ) {
-                            me.progress.error(&format!(
-                                    "syq: delete: could not persist deletion intents to the checkpoint ({e:#}); leaving the remaining extras in place"
-                                ));
-                            intents_failed.set(true);
-                            return Ok(());
-                        }
-                    }
-                }
                 let ops: Vec<Op> = chunk
                     .iter()
-                    .map(|(p, _, _)| {
+                    .map(|(p, _)| {
                         if rmdir {
                             Op::Rmdir { path: p.clone() }
                         } else {
@@ -5260,16 +5088,7 @@ impl Planner<'_> {
                     })
                     .collect();
                 let errs = me.apply(ops)?;
-                #[cfg(debug_assertions)]
-                if !held_after_delete {
-                    held_after_delete = true;
-                    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_AFTER_DELETE_MS") {
-                        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                            std::thread::sleep(std::time::Duration::from_millis(ms));
-                        }
-                    }
-                }
-                for ((_, rel, dst_rel), err) in chunk.iter().zip(errs) {
+                for ((p, rel), err) in chunk.iter().zip(errs) {
                     let failed = err.is_some();
                     match err {
                         None => {
@@ -5281,6 +5100,9 @@ impl Planner<'_> {
                         Some(e) => me.progress.error(&format!("syq: delete {rel}: {e}")),
                     }
                     if let Some(results) = me.progress.results_writer() {
+                        let Some(dst_rel) = strip_dst_root(p, &me.root_path) else {
+                            continue;
+                        };
                         results.emit_operation(&crate::results::OperationRecord {
                             action: "delete",
                             dst: dst_rel,
@@ -5462,7 +5284,6 @@ struct Worker {
     sched: Arc<Sched>,
     progress: Arc<Progress>,
     opts: Arc<Opts>,
-    checkpoint: CheckpointSlot,
     bwlimit: Option<Arc<BandwidthLimit>>,
     gate: Arc<Gate>,
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
@@ -5880,7 +5701,6 @@ impl Worker {
                     message: None,
                 });
             }
-            self.record_done(&j.rel_bytes, &j.entry);
             if self.opts.verbose > 0 {
                 self.progress.println(&j.rel);
             }
@@ -6471,15 +6291,6 @@ impl Worker {
         }
     }
 
-    /// Record a completed file in the explicit checkpoint, if active.
-    fn record_done(&self, rel_bytes: &[u8], entry: &Entry) {
-        if let Some(shared) = self.checkpoint.get() {
-            if let Some(checkpoint) = &shared.checkpoint {
-                checkpoint.record_complete(rel_bytes, entry, "transferred");
-            }
-        }
-    }
-
     fn finish_file(&mut self, idx: usize) -> Result<()> {
         if self.sched.is_failed(idx) {
             return Ok(());
@@ -6632,7 +6443,6 @@ impl Worker {
                 });
             }
         }
-        self.record_done(&job.rel_bytes, &job.entry);
         if !matched && self.opts.verbose > 0 {
             self.progress.println(&job.rel);
         }

@@ -236,10 +236,20 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   policy: preservation and comparison behavior stay global.
 - An entry claims exactly one object. A `dir` entry claims the
   directory itself, without its contents.
-- Symlinks are never resolved in mapping handling: a symlink maps as a
-  symlink, and a destination path that would traverse a symlink inside
-  the target container fails that entry. Resolve links yourself before
-  emitting if you want targets instead.
+- The command-line path naming a manifest, the `-C` source base, and the
+  `--into` placement are directly supplied paths: native mode refuses to
+  traverse symlinks in them by default, while `--follow` resolves them. Paths
+  inside the manifest are data and are not changed by `--follow`.
+- When `syq map --follow` resolves a named selector, it emits the referent's
+  source-base-relative path so the manifest remains executable without link
+  traversal. It refuses a referent outside that base; pass the real path with a
+  matching `-C` base instead. A followed contents selector keeps ordinary
+  contents-relative entries and requires the consumer to select the same base
+  with `--follow`.
+- Symlinks selected by mapping entries are never resolved by mapping handling:
+  a symlink maps as a symlink, and a destination path that would traverse a
+  symlink inside the target container fails that entry. Resolve links before
+  emitting the manifest if you want targets instead.
 - `kind: "special"` asserts the source's type; it does not override the
   fixed `-rlt` fidelity, which copies no special files. Such an entry is
   a policy exclusion like `--min-size`: the run still succeeds and the

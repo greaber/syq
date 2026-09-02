@@ -398,7 +398,7 @@ fn run_native(mut args: Args) -> Result<i32> {
         args.native_rm_cwd.as_deref(),
         args.native_rm_root.as_deref(),
         &selections,
-        args.native_rm_follow,
+        args.native_follow,
         args.dry_run,
         args.connections,
         &mut |messages| {

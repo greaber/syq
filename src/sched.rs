@@ -22,7 +22,7 @@ pub struct FileJob {
     pub done: Arc<AtomicU64>,
     /// Written directly to the final path (no partial + rename).
     pub inplace: bool,
-    /// Destination-root-relative path, used as the checkpoint key.
+    /// Destination-root-relative path, used in machine-readable results.
     pub rel_bytes: PathBytes,
     /// --mapping: the entry's source path relative to the source base, kept
     /// so `--results` records round-trip as retry mapping entries.

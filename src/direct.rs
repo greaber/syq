@@ -263,13 +263,10 @@ pub fn run(
             destination_policy.port(),
             &destination_policy.host_key_algorithms(),
         ));
-        // Native new/existing forms are deliberately only ordinary initial
-        // pathname checks. The command-restricted receiver cannot currently
-        // represent that lightweight policy, so retain the live constrained
-        // broker without preparing a receiver grant for those forms.
-        let receiver_grant_allowed =
-            args.interface == Interface::Rsync || args.target_existence == Existence::Any;
-        let prepared = (!args.agent_broker_only && receiver_grant_allowed)
+        // Native new/existing placement forms travel in the signed grant as the
+        // root-existence precondition, so they use the receiver like any other
+        // form instead of silently keeping only the constrained broker.
+        let prepared = (!args.agent_broker_only)
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
@@ -311,6 +308,15 @@ pub fn run(
             broker: socket,
         })
     };
+    if (args.max_entries.is_some()
+        || args.max_total_bytes.is_some()
+        || args.max_runtime_secs.is_some())
+        && restricted_grant.is_none()
+    {
+        bail!(
+            "--max-entries, --max-total-bytes, and --max-runtime are command-restricted receiver ceilings, but this transfer does not use the enrolled receiver"
+        );
+    }
     // The follow target must reconnect the way we did: keep an explicit user.
     let src_target = match &srcs[0].user {
         Some(user) => format!("{user}@{src_host}"),
@@ -377,6 +383,9 @@ pub fn run(
     if args.interface != Interface::Rsync && args.checksum {
         remote.push("--hash".into());
     }
+    if args.interface != Interface::Rsync && args.native_follow {
+        remote.push("--follow".into());
+    }
     if args.inplace {
         remote.push("--inplace".into());
     }
@@ -421,9 +430,6 @@ pub fn run(
         }
         if args.existing {
             remote.push("--existing".into());
-        }
-        if let Some(path) = &args.checkpoint {
-            remote.push(format!("--checkpoint={path}"));
         }
     }
     if let Some(maximum) = &args.max_size {
