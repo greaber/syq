@@ -17,16 +17,42 @@ struct ReceiptExpectation {
     request_id: RequestId,
 }
 
-/// Pass the orchestrator's stdout through line by line, keeping the receipt
-/// line to ourselves when one is expected. Returns the last receipt payload.
-fn relay_stdout(stdout: impl std::io::Read, expect_receipt: bool) -> Result<Option<String>> {
+/// The receipt envelope is bounded at 64 MiB; allow for base64 and slack.
+const MAX_RECEIPT_LINE_BYTES: usize = 96 * 1024 * 1024;
+
+/// Pass the orchestrator's stdout through byte for byte, keeping only the
+/// receipt line to ourselves. Used only when a receipt is expected; other
+/// transfers inherit stdout untouched. Returns the last receipt payload.
+fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<Vec<u8>>> {
+    use std::io::Write;
+    let prefix = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut out = std::io::stdout().lock();
+    let mut line = Vec::new();
     let mut receipt = None;
-    for line in std::io::BufReader::new(stdout).lines() {
-        let line = line.context("read remote orchestrator output")?;
-        match line.strip_prefix(crate::receipt::RECEIPT_LINE_PREFIX) {
-            Some(payload) if expect_receipt => receipt = Some(payload.to_owned()),
-            _ => println!("{line}"),
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .context("read remote orchestrator output")?;
+        if read == 0 {
+            break;
         }
+        if let Some(payload) = line.strip_prefix(prefix) {
+            if payload.len() > MAX_RECEIPT_LINE_BYTES {
+                bail!("the relayed receipt line exceeds {MAX_RECEIPT_LINE_BYTES} bytes");
+            }
+            let payload = payload
+                .strip_suffix(b"\n")
+                .unwrap_or(payload)
+                .strip_suffix(b"\r")
+                .unwrap_or(payload);
+            receipt = Some(payload.to_vec());
+            continue;
+        }
+        out.write_all(&line)
+            .and_then(|()| out.flush())
+            .context("relay remote orchestrator output")?;
     }
     Ok(receipt)
 }
@@ -36,7 +62,7 @@ fn relay_stdout(stdout: impl std::io::Read, expect_receipt: bool) -> Result<Opti
 /// what the source-side orchestrator reported.
 fn settle_receipt(
     expectation: &ReceiptExpectation,
-    payload: Option<&str>,
+    payload: Option<&[u8]>,
     src_host: &str,
     dst_host: &str,
     verbose: bool,
@@ -47,7 +73,7 @@ fn settle_receipt(
         );
     };
     let envelope = base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(payload.trim())
+        .decode(payload.trim_ascii())
         .context("decode the receipt relayed from the source host")?;
     let receipt = crate::receipt::verify(&envelope, &expectation.public_key)
         .with_context(|| format!("verify the receipt from {dst_host}"))?;
@@ -785,16 +811,24 @@ pub fn run(
     }
     let run = || {
         let mut cmd = make_command();
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+        cmd.stdin(Stdio::null()).stderr(Stdio::inherit());
+        if receipt_expectation.is_none() {
+            // Nothing to intercept: leave stdout to the terminal or pipe the
+            // user gave us, bytes and all.
+            let status = cmd
+                .status()
+                .with_context(|| format!("spawn {:?}", rsh[0]))?;
+            return Ok::<_, anyhow::Error>((status, None));
+        }
+        cmd.stdout(Stdio::piped());
         let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", rsh[0]))?;
         let stdout = child.stdout.take().expect("piped stdout");
-        let receipt = relay_stdout(stdout, receipt_expectation.is_some())?;
+        // Always reap the child, even when relaying its output failed.
+        let relayed = relay_stdout(stdout);
         let status = child
             .wait()
             .with_context(|| format!("wait for {:?}", rsh[0]))?;
-        Ok::<_, anyhow::Error>((status, receipt))
+        Ok((status, relayed?))
     };
     let (mut status, mut receipt_payload) = run()?;
     if helper_missing(status.code(), spec.auto_helper) {
@@ -1073,7 +1107,13 @@ mod tests {
                 .encode(crate::receipt::sign(&receipt, &key).unwrap())
         };
         let settle = |expectation: &ReceiptExpectation, payload: Option<&str>| {
-            settle_receipt(expectation, payload, "host-a", "host-b", false)
+            settle_receipt(
+                expectation,
+                payload.map(str::as_bytes),
+                "host-a",
+                "host-b",
+                false,
+            )
         };
 
         let good = encode(&ledger, request_id);
@@ -1103,16 +1143,17 @@ mod tests {
         };
         assert!(settle(&mismatched, Some(&good)).is_err());
 
-        // The relay keeps the receipt line and passes everything else on.
-        let output = format!(
-            "syq: transferred 1 files\n{}{good}\n",
-            crate::receipt::RECEIPT_LINE_PREFIX
-        );
+        // The relay keeps the receipt line, byte for byte, and passes
+        // everything else on, including bytes that are not UTF-8.
+        let mut output = b"syq: transferred 1 files\xff\r\n".to_vec();
+        output.extend_from_slice(crate::receipt::RECEIPT_LINE_PREFIX.as_bytes());
+        output.extend_from_slice(good.as_bytes());
+        output.extend_from_slice(b"\r\n");
         assert_eq!(
-            relay_stdout(output.as_bytes(), true).unwrap().as_deref(),
-            Some(good.as_str())
+            relay_stdout(output.as_slice()).unwrap().as_deref(),
+            Some(good.as_bytes())
         );
-        assert_eq!(relay_stdout(output.as_bytes(), false).unwrap(), None);
+        assert_eq!(relay_stdout(b"plain\n".as_slice()).unwrap(), None);
     }
 
     #[test]
