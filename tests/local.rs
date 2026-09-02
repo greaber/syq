@@ -501,6 +501,49 @@ fn native_copy_accepts_copy_only_operational_controls() {
 }
 
 #[test]
+fn native_hash_repairs_equal_metadata_content_mismatches() {
+    let t = Tmp::new();
+    let expected = vec![b'a'; 5 * 1024 * 1024];
+    let mut corrupted = expected.clone();
+    corrupted[2_500_000] = b'b';
+    write(&t.path("src/file"), &expected);
+    set_mtime(&t.path("src/file"), 1_600_000_000);
+
+    for (command, destination) in [("cp", "copied"), ("cp-prune", "pruned")] {
+        write(&t.path(&format!("{destination}/file")), &corrupted);
+        set_mtime(&t.path(&format!("{destination}/file")), 1_600_000_000);
+        if command == "cp-prune" {
+            write(&t.path(&format!("{destination}/extra")), b"remove");
+        }
+
+        run_native_ok(&[
+            command,
+            "--src-src",
+            &t.s("src"),
+            "--into-existing",
+            &t.s(destination),
+        ]);
+        assert_eq!(read(&t.path(&format!("{destination}/file"))), corrupted);
+        if command == "cp-prune" {
+            write(&t.path(&format!("{destination}/extra")), b"remove");
+        }
+
+        run_native_ok(&[
+            command,
+            "--hash",
+            "--src-src",
+            &t.s("src"),
+            "--into-existing",
+            &t.s(destination),
+        ]);
+        assert_eq!(read(&t.path(&format!("{destination}/file"))), expected);
+        if command == "cp-prune" {
+            assert!(!t.path(&format!("{destination}/extra")).exists());
+        }
+    }
+}
+
+#[test]
 fn native_copy_named_selector_preserves_a_root_symlink() {
     use std::os::unix::fs::symlink;
 
@@ -4149,6 +4192,7 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
         ["rm", "--no-tcp", "source", "", ""].as_slice(),
         ["rm", "--bwlimit", "1M", "source", ""].as_slice(),
         ["rm", "--no-compress", "source", "", ""].as_slice(),
+        ["rm", "--hash", "source", "", ""].as_slice(),
         ["rm", "--stats", "source", "", ""].as_slice(),
     ] {
         let args: Vec<_> = args.iter().copied().filter(|arg| !arg.is_empty()).collect();

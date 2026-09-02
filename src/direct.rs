@@ -369,6 +369,9 @@ pub fn run(
     if !args.compress {
         remote.push("--no-compress".into());
     }
+    if args.interface != Interface::Rsync && args.checksum {
+        remote.push("--hash".into());
+    }
     if let Some(j) = args.connections_opt {
         remote.push("-j".into());
         remote.push(j.to_string());

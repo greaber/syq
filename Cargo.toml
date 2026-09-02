@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc", "use-std"] }
 jwalk = "0.9"
 ignore = "0.4"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3 = "1"
 zstd = "0.13"
 libc = "0.2"
 shell-words = "1"
