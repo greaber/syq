@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
@@ -215,6 +216,58 @@ exec /bin/sh -c "$1"
 
             self.assertEqual(result.status, syq.OperationStatus.SUCCESS)
             self.assertEqual(destination.read_bytes(), b"remote coordinator")
+
+
+@unittest.skipUnless(
+    EXECUTABLE and EXPECTED_VERSION,
+    "candidate compatibility requires SYQ_CANDIDATE_EXECUTABLE and version",
+)
+class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_client_uses_the_candidate_native_surface(self) -> None:
+        assert EXECUTABLE is not None
+        assert EXPECTED_VERSION is not None
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "source").mkdir()
+            (root / "source" / "a").write_bytes(b"async")
+            client = syq.AsyncClient(executable=EXECUTABLE, process_cwd=root)
+
+            self.assertEqual(await client.version(), EXPECTED_VERSION)
+            preview = await client.cp(
+                src_src="source", into="destination", dry_run=True
+            )
+            self.assertEqual(preview.files_transferred, 1)
+            self.assertEqual(preview.bytes_transferred, len(b"async"))
+
+            physical_temp = root / "async-physical-temp"
+            physical_temp.mkdir()
+            temporary_alias = root / "async-temporary-alias"
+            temporary_alias.symlink_to(physical_temp, target_is_directory=True)
+            named_temporary_file = tempfile.NamedTemporaryFile
+
+            def create_through_alias(**kwargs):
+                return named_temporary_file(dir=temporary_alias, **kwargs)
+
+            async with client.map(src_src="source") as mapping:
+                with mock.patch(
+                    "syq.async_client.tempfile.NamedTemporaryFile",
+                    side_effect=create_through_alias,
+                ):
+                    copied = await client.cp(
+                        mapping=mapping, cwd=mapping.cwd, into="destination"
+                    )
+            self.assertEqual(copied.files_transferred, 1)
+            self.assertEqual((root / "destination" / "a").read_bytes(), b"async")
+
+            (root / "destination" / "extra").write_bytes(b"remove")
+            pruned = await client.cp(
+                src_src="source",
+                into_existing="destination",
+                prune=True,
+                max_delete=1,
+            )
+            self.assertEqual(pruned.deletions_completed, 1)
+            self.assertFalse((root / "destination" / "extra").exists())
 
 
 if __name__ == "__main__":
