@@ -511,13 +511,25 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
     flags.to_string()
 }
 
-/// The endpoint half of a job identity: `user@host` (the user matters — two
-/// accounts on one host see different destinations), or `local`.
+/// The endpoint half of a job identity: `user@host[:port]` (the user and an
+/// explicit port matter — they may select different filesystems), or `local`.
 fn endpoint_identity(l: &Location) -> String {
     match (&l.user, &l.host) {
         (_, None) => "local".into(),
-        (Some(u), Some(h)) => format!("{u}@{h}"),
-        (None, Some(h)) => h.clone(),
+        (user, Some(host)) => {
+            // Preserve the established portless identity byte-for-byte. A
+            // port-qualified native endpoint gets a distinct, unambiguous
+            // spelling; IPv6 needs brackets before the port separator.
+            let host = match l.port {
+                Some(port) if host.contains(':') => format!("[{host}]:{port}"),
+                Some(port) => format!("{host}:{port}"),
+                None => host.clone(),
+            };
+            match user {
+                Some(user) => format!("{user}@{host}"),
+                None => host,
+            }
+        }
     }
 }
 
@@ -720,11 +732,21 @@ pub fn run(args: Args) -> Result<i32> {
         .map(|(_, sources)| sources)
         .unwrap_or(&[]);
     let (dst, original_srcs) = locs.split_last().unwrap();
+    let direct_paths_are_utf8 = original_srcs
+        .iter()
+        .chain(std::iter::once(dst))
+        .all(|location| std::str::from_utf8(&location.path).is_ok());
     let direct_remote_to_remote = original_srcs[0].is_remote()
         && dst.is_remote()
         && !original_srcs[0].same_host(dst)
         && !args.relay
-        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local);
+        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
+        // Native auto placement relays raw path bytes because they cannot be
+        // represented in the remote coordinator's argv. Validate direct-only
+        // controls against the topology that will actually run.
+        && (args.interface == Interface::Rsync
+            || args.run_at != RunAt::Auto
+            || direct_paths_are_utf8);
     if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
     {
         bail!(
@@ -847,10 +869,6 @@ pub fn run(args: Args) -> Result<i32> {
                     "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
                 );
             }
-            let direct_paths_are_utf8 = srcs
-                .iter()
-                .chain(std::iter::once(dst))
-                .all(|location| std::str::from_utf8(&location.path).is_ok());
             if args.interface == Interface::Rsync
                 || direct_paths_are_utf8
                 || args.run_at == RunAt::Source
@@ -2576,9 +2594,13 @@ fn display_location(loc: &Location, path: &[u8]) -> String {
     } else {
         host.clone()
     };
-    match &loc.user {
-        Some(user) => format!("{user}@{host}:{path}"),
-        None => format!("{host}:{path}"),
+    let endpoint = match &loc.user {
+        Some(user) => format!("{user}@{host}"),
+        None => host,
+    };
+    match loc.port {
+        Some(port) => format!("{endpoint}:{port}:{path}"),
+        None => format!("{endpoint}:{path}"),
     }
 }
 
@@ -6276,6 +6298,51 @@ mod tests {
         let second = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/raw-\xfe"));
         assert_ne!(path_identity(first), path_identity(second));
         assert!(path_identity(first).starts_with('\0'));
+    }
+
+    #[test]
+    fn explicit_ssh_port_is_part_of_endpoint_identity() {
+        let location = |host: &str, port| Location {
+            user: Some("alice".into()),
+            host: Some(host.into()),
+            port,
+            path: b"/data".to_vec(),
+            selection: SourceSelection::Named,
+        };
+
+        assert_eq!(endpoint_identity(&location("backup", None)), "alice@backup");
+        assert_eq!(
+            endpoint_identity(&location("backup", Some(2200))),
+            "alice@backup:2200"
+        );
+        assert_eq!(
+            endpoint_identity(&location("backup", Some(2222))),
+            "alice@backup:2222"
+        );
+        assert_eq!(
+            endpoint_identity(&location("2001:db8::1", Some(2200))),
+            "alice@[2001:db8::1]:2200"
+        );
+    }
+
+    #[test]
+    fn dry_run_location_labels_include_explicit_ssh_port() {
+        let location = |host: &str, port| Location {
+            user: Some("alice".into()),
+            host: Some(host.into()),
+            port: Some(port),
+            path: b"/data".to_vec(),
+            selection: SourceSelection::Named,
+        };
+
+        assert_eq!(
+            display_location(&location("backup", 2200), b"/data"),
+            "alice@backup:2200:/data"
+        );
+        assert_eq!(
+            display_location(&location("2001:db8::1", 2222), b"/data"),
+            "alice@[2001:db8::1]:2222:/data"
+        );
     }
 
     #[test]

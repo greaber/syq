@@ -83,7 +83,6 @@ fn source_setup_rsh(rsh: &[String], explicit_rsh: bool) -> Vec<String> {
 fn destination_rsh(
     explicit_rsh: Option<&str>,
     same_host: bool,
-    endpoint_port: Option<u16>,
     agent_forwarding: Option<&AgentForwarding>,
     constrained_rsh: Option<&str>,
 ) -> Option<String> {
@@ -91,10 +90,7 @@ fn destination_rsh(
         return None;
     }
     if let Some(explicit) = explicit_rsh {
-        return Some(match endpoint_port {
-            Some(port) => format!("{explicit} -p {port}"),
-            None => explicit.to_owned(),
-        });
+        return Some(explicit.to_owned());
     }
     match agent_forwarding {
         // A uses the broker to authenticate to B, but B must never receive it.
@@ -105,22 +101,11 @@ fn destination_rsh(
         // agent, but does not require host-bound authentication from OpenSSH
         // versions that predate the constrained broker's 8.9 floor.
         Some(AgentForwarding::Unrestricted) => {
-            let mut command =
-                "ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no".to_owned();
-            if let Some(port) = endpoint_port {
-                command.push_str(&format!(" -p {port}"));
-            }
-            Some(command)
+            Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no".to_owned())
         }
         // With no forwarded agent, preserve hostA's own IdentityAgent and
         // authentication configuration while preventing another forwarding hop.
-        Some(AgentForwarding::Disabled) | None => {
-            let mut command = "ssh -a".to_owned();
-            if let Some(port) = endpoint_port {
-                command.push_str(&format!(" -p {port}"));
-            }
-            Some(command)
-        }
+        Some(AgentForwarding::Disabled) | None => Some("ssh -a".to_owned()),
     }
 }
 
@@ -218,18 +203,18 @@ fn endpoint_arg(
     } else {
         host.to_string()
     };
-    match login_user.or(location.user.as_deref()) {
+    let endpoint = match login_user.or(location.user.as_deref()) {
         Some(user) => format!("{user}@{host}"),
         None => host,
-    }
-}
-
-fn endpoint_display(location: &Location) -> String {
-    let endpoint = endpoint_arg(location, None, None);
+    };
     match location.port {
         Some(port) => format!("{endpoint}:{port}"),
         None => endpoint,
     }
+}
+
+fn endpoint_display(location: &Location) -> String {
+    endpoint_arg(location, None, None)
 }
 
 fn native_placement_arg(args: &Args) -> Result<&'static str> {
@@ -530,7 +515,6 @@ fn run_remote(
     if let Some(remote_shell) = destination_rsh(
         args.rsh.as_deref(),
         same_host,
-        peer.port,
         default_ssh_agent_policy.as_ref(),
         constrained_rsh.as_deref(),
     ) {
@@ -671,7 +655,7 @@ fn run_remote(
         if args.dry_run {
             internal_environment.push((
                 "SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST",
-                source_target.clone(),
+                coordinator_target.clone(),
             ));
         }
         if !args.no_progress && !args.quiet && std::io::stderr().is_terminal() {
@@ -1029,7 +1013,7 @@ mod tests {
         };
         let hardened = constrained_destination_rsh(2222, "ssh-ed25519");
         assert_eq!(
-            destination_rsh(None, false, None, Some(&constrained), Some(&hardened)),
+            destination_rsh(None, false, Some(&constrained), Some(&hardened)),
             Some(hardened.clone())
         );
         let hardened_words = shell_words::split(&hardened).unwrap();
@@ -1050,29 +1034,23 @@ mod tests {
             assert!(hardened_words.iter().any(|word| word == required));
         }
         assert_eq!(
-            destination_rsh(
-                None,
-                false,
-                None,
-                Some(&AgentForwarding::Unrestricted),
-                None
-            ),
+            destination_rsh(None, false, Some(&AgentForwarding::Unrestricted), None),
             Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no".into())
         );
         assert_eq!(
-            destination_rsh(None, false, None, Some(&AgentForwarding::Disabled), None),
+            destination_rsh(None, false, Some(&AgentForwarding::Disabled), None),
             Some("ssh -a".into())
         );
         assert_eq!(
-            destination_rsh(Some("custom-rsh"), false, None, None, None),
+            destination_rsh(Some("custom-rsh"), false, None, None),
             Some("custom-rsh".into())
         );
         assert_eq!(
-            destination_rsh(Some("ssh -J jump"), false, Some(2200), None, None),
-            Some("ssh -J jump -p 2200".into())
+            destination_rsh(Some("ssh -J jump"), false, None, None),
+            Some("ssh -J jump".into())
         );
         assert_eq!(
-            destination_rsh(None, true, None, Some(&constrained), Some(&hardened)),
+            destination_rsh(None, true, Some(&constrained), Some(&hardened)),
             None
         );
     }
@@ -1102,6 +1080,14 @@ mod tests {
         assert_eq!(
             endpoint_arg(&destination, Some("backup"), Some("2001:db8::1")),
             "backup@[2001:db8::1]"
+        );
+        let destination = Location {
+            port: Some(2200),
+            ..destination
+        };
+        assert_eq!(
+            endpoint_arg(&destination, Some("backup"), Some("vault.internal")),
+            "backup@vault.internal:2200"
         );
     }
 

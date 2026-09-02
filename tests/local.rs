@@ -8181,6 +8181,89 @@ fn native_run_at_target_reverses_the_remote_ssh_edge() {
 }
 
 #[test]
+fn native_target_dry_run_labels_the_real_endpoints_and_ports() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    write(&t.path("src/file"), b"planned");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&ssh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "--dry-run",
+            "--from",
+            "hostA:2200",
+            "--src-src",
+            &t.s("src"),
+            "--to",
+            "hostB:2222",
+            "--run-at",
+            "target",
+            "--into",
+            &t.s("dst"),
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("run target-side native dry-run");
+
+    assert_output_ok(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "mapping: hostA:2200:{} -> hostB:2222:{}",
+            t.s("src"),
+            t.s("dst")
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("-> hostA:2200:"), "{stdout}");
+    let ssh_log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        ssh_log.lines().any(|line| line.contains("-p 2222")),
+        "{ssh_log}"
+    );
+    assert!(
+        ssh_log.lines().any(|line| line.contains("-p 2200")),
+        "{ssh_log}"
+    );
+}
+
+#[test]
+fn native_auto_raw_path_relay_rejects_direct_only_controls() {
+    let mut raw_source = b"/source-".to_vec();
+    raw_source.push(0xff);
+    let raw_source = std::ffi::OsString::from_vec(raw_source);
+
+    for option in [
+        "--detach",
+        "--no-forward-agent",
+        "--agent-broker-only",
+        "--unrestricted-agent-forwarding",
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("cp")
+            .arg(option)
+            .args(["--from", "hostA", "--src"])
+            .arg(&raw_source)
+            .args(["--to", "hostB", "--as", "/target"])
+            .run()
+            .expect("reject a direct-only option before automatic relay");
+
+        assert!(!out.status.success(), "{option} unexpectedly succeeded");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains("direct"), "{option}: {stderr}");
+        assert!(
+            !stderr.contains("relaying raw path bytes"),
+            "{option} entered relay execution: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn native_run_at_local_relays_between_remote_endpoints() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
