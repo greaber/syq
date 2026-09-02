@@ -16,9 +16,9 @@ syq map --src-src photos \
 
 rsync hardcodes single instances of this idea as flags (`--iconv` is a
 filename transform; `-R` with `/./` anchors is a placement transform).
-With a mapping, the transform is yours — any tool that can edit JSON
-lines — and syq refuses case-fold collisions that a hand-rolled rename
-loop would silently overwrite.
+With a mapping, any tool that can edit JSON lines can do the
+transform, and syq refuses case-fold collisions that a hand-rolled
+rename loop would silently overwrite.
 
 ## The format
 
@@ -101,18 +101,23 @@ For a one-shot copy, GNU tar can do this rename more simply:
 tar -C src -cf - --transform='s/.*/\L&/' . | ssh nas 'tar -C /pub -xf -'
 ```
 
-Use that when it fits. Where it stops fitting: the case-fold collision
-above extracts with exit 0 and the last writer silently wins (measured,
-not speculated); every run resends every byte, and an interrupted pipe
-leaves truncated files in place; the stream is one connection,
-unverified; the transform sees only the *name*, so the mtime- and
-size-based examples below are out of its reach; and it rewrites symlink
-targets by default, which breaks links pointing outside the tree.
-rsync itself has no rename option at all — keeping rsync's delta and
-resume means a symlink staging farm (`ln -sf` into a lowercased
-`staging/` tree, then `rsync -aL staging/ nas:/pub/`), where `-f`
-again resolves collisions silently and the farm must be rebuilt and
-cleaned up around every run.
+That is a reasonable choice for a one-time transfer. Its limits:
+
+- The case-fold collision above extracts with exit 0; the last writer
+  wins and one file's content is lost without warning.
+- Every run resends every byte: no delta, no resume, and an
+  interrupted pipe leaves truncated files in place.
+- The data flows over one unverified connection.
+- The transform sees only the name, so the mtime- and size-based
+  examples below cannot be expressed.
+- Symlink targets are rewritten too by default, which breaks links
+  pointing outside the tree.
+
+rsync itself has no rename option. Keeping rsync's delta and resume
+means a symlink staging farm: `ln -sf` each file into a lowercased
+`staging/` tree, then `rsync -aL staging/ nas:/pub/`. The `-f` again
+resolves collisions silently, and the farm must be rebuilt and cleaned
+up around every run.
 
 ### Repartition into `YEAR/MM/` folders by modification time
 
@@ -148,12 +153,11 @@ syq map --src-src data \
   | syq cp --mapping - -C data --to nas --into /big
 ```
 
-rsync spells this exact transform as a dedicated flag:
-`rsync -a --min-size=1M data/ nas:/big/`. That is the pattern in
-miniature: a few transforms earned rsync flags over the years
-(`--min-size`, `--iconv`); most never will — there is no
-`--lowercase` and no `--partition-by-date` — but as mapping transforms
-they are all the same one-line shape.
+rsync has a dedicated flag for this exact transform:
+`rsync -a --min-size=1M data/ nas:/big/`. A few transforms of this
+kind got rsync flags over the years (`--min-size`, `--iconv`); most,
+like lowercasing or date partitioning, never did. As mapping
+transforms they all have the same shape.
 
 ## Producing a mapping yourself
 
