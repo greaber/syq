@@ -61,3 +61,10 @@ testing a different syq release.
 The package targets Python 3.10 or newer on Linux and macOS and has no runtime
 Python dependencies. See the [SDK compatibility policy](../README.md) for the
 release mapping.
+
+## Proposed native API
+
+The next typed layer is being designed in
+[Proposed Python native API](NATIVE_API.md). That document is a specification
+for review, not an implemented usage guide. The process adapter described above
+remains the current public API.

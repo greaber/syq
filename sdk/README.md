@@ -14,6 +14,10 @@ will be added after syq's versioned NDJSON automation interface is released.
 The executable remains authoritative for argument semantics, filesystem
 behavior, exit status, and safety checks.
 
+The proposed Python-native surface is documented separately in
+[`python/NATIVE_API.md`](python/NATIVE_API.md). It is a design specification,
+not a description of the currently released package.
+
 | Ecosystem | Package/module | Source |
 |---|---|---|
 | Python | `syq` | [`python/`](python/) |
