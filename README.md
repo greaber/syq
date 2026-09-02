@@ -491,7 +491,10 @@ command properties visible in receiver requests, such as destination scopes,
 publication, preservation, and existing-object policy, resource limits, and
 whether a requested mutation could have survived the signed filter traversal. HostA still cannot
 escape those checks or independently authenticate to hostB with the enrollment
-key.
+key. The boundary runs between the two hosts, not inside hostB: the receiver
+runs as the enrolled account and remembers what it created by pathname, so a
+local writer who can already modify the destination tree is outside its
+guarantee, exactly as for the ordinary engine.
 
 The command-restricted path requires encrypted TCP data connections. Ordered
 filter rules and `--delete-excluded` are included in a V3 signed grant: the
