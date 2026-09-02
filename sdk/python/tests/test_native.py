@@ -168,7 +168,6 @@ class NativeClientTests(unittest.TestCase):
             no_compress=True,
             bwlimit="10M",
             connections=4,
-            reuse_connection=True,
             max_entries=100,
             max_total_bytes="2G",
             max_runtime="30m",
@@ -201,7 +200,7 @@ class NativeClientTests(unittest.TestCase):
             "cp", "--src", "--src-dir", "--from", "--follow", "--to",
             "--into-existing", "--prune", "--max-delete", "--dry-run",
             "--hash", "--no-compress", "--bwlimit", "--connections",
-            "--reuse-connection", "--max-entries", "--max-total-bytes",
+            "--max-entries", "--max-total-bytes",
             "--max-runtime", "--ignore", "--ignore-from", "--preserve",
             "--inplace", "--max-size", "--min-size", "--results=-",
         ):

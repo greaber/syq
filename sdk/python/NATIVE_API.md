@@ -208,7 +208,6 @@ syq.cp(
     no_compress=False,
     bwlimit=None,
     connections=None,
-    reuse_connection=False,
     run_at=None,
     rsh=None,
     syq_path=None,
@@ -263,16 +262,16 @@ Copy selectors may be absolute, with the same behavior as native `cp`. Input
 paths accept text and byte path-like objects on supported Unix systems; byte
 paths are not decoded merely to build argv.
 
-`follow`, `hash`, `no_compress`, `bwlimit`, `connections`, `reuse_connection`, `ignore`,
+`follow`, `hash`, `no_compress`, `bwlimit`, `connections`, `ignore`,
 `ignore_from`, `preserve`, `inplace`, `max_size`, `min_size`, and `dry_run`
 retain the exact native meanings. `max_entries`, `max_total_bytes`, and
 `max_runtime` expose the native command-restricted receiver ceilings and are
 therefore accepted only for a direct remote-to-remote copy using an enrolled
 receiver. Rate, size, and duration values accept the native spellings; the
 Python API does not replace them with differently defined unit types.
-`reuse_connection` keeps the implicit SSH control connection alive under the
-same native constraints and five-minute reuse window; the library does not
-maintain a separate connection pool.
+Managed SSH persistence scopes (`--pscope`) and receiver receipts
+(`--receipt`) are not yet exposed; they are classified as follow-up in
+`native-api.json`.
 
 Native ignore rules form one ordered stream: `--ignore` and `--ignore-from`
 take effect in command-line order, and the last matching rule wins. A simple

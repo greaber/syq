@@ -395,7 +395,6 @@ def _copy_arguments(
     no_compress: bool,
     bwlimit: str | int | None,
     connections: int | None,
-    reuse_connection: bool,
     max_entries: int | None,
     max_total_bytes: str | int | None,
     max_runtime: str | int | None,
@@ -471,8 +470,6 @@ def _copy_arguments(
     connections = _positive_integer(connections, option="--connections")
     if connections is not None:
         argv.extend(("--connections", str(connections)))
-    if reuse_connection:
-        argv.append("--reuse-connection")
     max_entries = _nonnegative_integer(max_entries, option="--max-entries")
     if max_entries is not None:
         argv.extend(("--max-entries", str(max_entries)))
@@ -703,7 +700,6 @@ class Client:
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
-        reuse_connection: bool = False,
         run_at: str | None = None,
         rsh: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
@@ -752,7 +748,6 @@ class Client:
             no_compress=no_compress,
             bwlimit=bwlimit,
             connections=connections,
-            reuse_connection=reuse_connection,
             max_entries=max_entries,
             max_total_bytes=max_total_bytes,
             max_runtime=max_runtime,
@@ -865,7 +860,6 @@ class Client:
             no_compress=False,
             bwlimit=None,
             connections=None,
-            reuse_connection=False,
             max_entries=None,
             max_total_bytes=None,
             max_runtime=None,

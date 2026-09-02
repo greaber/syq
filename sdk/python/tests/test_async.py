@@ -61,7 +61,6 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             into_existing="out",
             dry_run=True,
             hash=True,
-            reuse_connection=True,
             max_entries=100,
             max_total_bytes="2G",
             max_runtime="30m",
@@ -75,7 +74,6 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--results=-", self.argv())
         self.assertNotIn("--quiet", self.argv())
         self.assertIn("--follow", self.argv())
-        self.assertIn("--reuse-connection", self.argv())
         self.assertIn("--max-entries", self.argv())
         self.assertIn("--max-total-bytes", self.argv())
         self.assertIn("--max-runtime", self.argv())
