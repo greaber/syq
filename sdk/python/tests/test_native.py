@@ -16,16 +16,21 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 args = sys.argv[1:]
 marker = os.environ.get("SYQ_FAKE_DESCENDANT")
 if marker:
+    descendant_delay = os.environ.get("SYQ_FAKE_DESCENDANT_DELAY", "0.6")
     subprocess.Popen([
         sys.executable, "-c",
-        "import pathlib,sys,time; time.sleep(0.6); pathlib.Path(sys.argv[1]).write_text('survived')",
-        marker,
+        "import pathlib,sys,time; time.sleep(float(sys.argv[2])); pathlib.Path(sys.argv[1]).write_text('survived')",
+        marker, descendant_delay,
     ])
     open(marker + ".ready", "w").close()
+pause = os.environ.get("SYQ_FAKE_PAUSE")
+if pause:
+    time.sleep(float(pause))
 log = os.environ.get("SYQ_FAKE_ARGV")
 if log:
     with open(log, "w", encoding="utf-8") as output:

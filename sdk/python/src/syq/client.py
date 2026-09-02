@@ -512,6 +512,27 @@ def _copy_arguments(
     return argv, source_count
 
 
+def _mapping_line(entry: MappingEntry, *, index: int) -> bytes:
+    if not isinstance(entry, MappingEntry):
+        raise TypeError(f"mapping[{index}] must be a MappingEntry")
+    return (
+        json.dumps(
+            _mapping_json(entry),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _write_mapping_manifest(
+    manifest: BinaryIO, mapping: Iterable[MappingEntry]
+) -> None:
+    for index, entry in enumerate(mapping):
+        manifest.write(_mapping_line(entry, index=index))
+    manifest.flush()
+
+
 class MapStream(Iterable[MappingEntry]):
     """A context-managed, streaming ``syq map`` result."""
 
@@ -789,18 +810,7 @@ class Client:
         with tempfile.NamedTemporaryFile(
             mode="wb", prefix="syq-python-mapping-", suffix=".ndjson"
         ) as manifest:
-            for index, entry in enumerate(mapping):
-                if not isinstance(entry, MappingEntry):
-                    raise TypeError(f"mapping[{index}] must be a MappingEntry")
-                manifest.write(
-                    json.dumps(
-                        _mapping_json(entry),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                    + b"\n"
-                )
-            manifest.flush()
+            _write_mapping_manifest(manifest, mapping)
             argv.extend(("--mapping", os.path.realpath(manifest.name)))
             return self._typed(
                 argv,

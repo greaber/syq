@@ -2,6 +2,7 @@
 
 from importlib.metadata import version as distribution_version
 
+from .async_client import AsyncClient, AsyncMapStream
 from .bootstrap import PINNED_SYQ_VERSION, SyqInstallError, managed_executable
 from .client import Client, MapStream, Result, run, version
 from .errors import (
@@ -42,6 +43,8 @@ map = _default_client.map
 
 __all__ = [
     "PINNED_SYQ_VERSION",
+    "AsyncClient",
+    "AsyncMapStream",
     "AutomationEvent",
     "Client",
     "CpResult",

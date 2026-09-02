@@ -61,6 +61,28 @@ def observe(event: syq.AutomationEvent) -> None:
 result = syq.cp("data", into="backup", on_event=observe)
 ```
 
+Asyncio applications use the same command names and result types. Native
+asyncio subprocesses keep the event loop responsive; async callbacks are
+awaited in stream order:
+
+```python
+import asyncio
+import syq
+
+client = syq.AsyncClient(process_cwd="/srv/jobs")
+events = asyncio.Queue()
+
+async def observe(event: syq.AutomationEvent) -> None:
+    await events.put(event)
+
+result = await client.cp(
+    "data",
+    to="server",
+    into="backup",
+    on_event=observe,
+)
+```
+
 Mapping output is streaming and context-managed. Passing Python mapping
 entries to `cp` first materializes the complete iterable on disk, so a failed
 transform cannot launch a copy with only a valid prefix:
@@ -76,10 +98,21 @@ with syq.map(src_src="photos") as mapping:
     result = syq.cp(mapping=entries, cwd=mapping.cwd, into="published")
 ```
 
+The async mapping stream is lazy and uses an async context manager:
+
+```python
+async with client.map(src_src="photos") as mapping:
+    result = await client.cp(
+        mapping=mapping,
+        cwd=mapping.cwd,
+        into="published",
+    )
+```
+
 The source tree may contain typed support ahead of the latest released syq
-pin. During that development interval, use `Client(executable=...)` with the
-candidate binary; the next SDK release updates the immutable pin only after
-candidate conformance tests pass.
+pin. During that development interval, use `Client(executable=...)` or
+`AsyncClient(executable=...)` with the candidate binary; the next SDK release
+updates the immutable pin only after candidate conformance tests pass.
 
 The managed executable is stored below
 `$XDG_CACHE_HOME/syq/sdk/python/v0.1.8/` or, when `XDG_CACHE_HOME` is not an

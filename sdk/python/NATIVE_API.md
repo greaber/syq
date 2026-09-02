@@ -577,16 +577,36 @@ Raw execution returns raw bytes and a process status. It does not parse human
 output, infer native objects from argv, or claim the structured completion
 guarantees of typed methods.
 
-## Synchrony and resource ownership
+## Synchrony, asyncio, and resource ownership
 
-`Client` is synchronous. `on_event` provides live observation without
-requiring every caller to manage threads and pipes. `AsyncClient` is developed
-as a follow-up layer over the same value objects and protocol contract.
+`Client` is synchronous. `AsyncClient` exposes `run`, `version`, typed `cp`
+(including `prune=True`), and `map` using native asyncio subprocesses rather
+than a thread wrapper. Its command parameters, result objects, validation, and
+failure types are shared with `Client`; commands such as `rm` remain available
+through `await client.run(["rm", ...])`.
 
-Every object that owns a subprocess is a context manager. Normal method calls
-reap before returning. Early context exit, timeout, interruption, callback
-failure, or decoder failure terminates and verifies the whole process group so
-SSH transports and other descendants cannot survive as stale work.
+```python
+client = syq.AsyncClient(process_cwd="/srv/jobs")
+result = await client.cp("project", to="server", into="/backup")
+
+async with client.map(src_src="photos") as mapping:
+    result = await client.cp(mapping=mapping, cwd=mapping.cwd, into="photos")
+```
+
+`AsyncClient.map()` returns `AsyncMapStream` directly; the subprocess starts
+lazily on context entry or first iteration, so there is no extra `await`
+before `async with`. Its `on_event` accepts either an ordinary callback or an
+awaitable callback. Awaitable callbacks run in record order and count toward
+the operation timeout. An ordinary callback runs on the event-loop thread and
+should return quickly.
+
+Normal method calls reap before returning. Early mapping-context exit,
+timeout, cancellation, callback failure, or decoder failure kills and reaps
+the whole owned process group so SSH transports and other descendants cannot
+survive as stale work. Python mapping iterables are fully materialized in a
+worker thread before `cp` starts. Async iterables are consumed incrementally
+and flushed in bounded chunks, also before process launch. Cancellation waits
+for any in-flight owned temporary-file write before removing the file.
 
 ## Compatibility and versioning
 
@@ -638,6 +658,7 @@ The initial typed API does not provide:
 | Typed `cp`, including `prune=True` | Automation v1 | Implemented |
 | Typed `rm` | Native `rm` result stream | Awaiting product support |
 | Typed `dry_run=True` | Automation-v1 trace records | Implemented |
+| Asyncio native commands and mapping stream | Same contracts as `Client` | Implemented |
 
 The source inventory `native-api.json` records the disposition of every native
 option. Rust tests require new options to appear there. A feature PR may put an

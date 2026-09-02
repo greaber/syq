@@ -42,6 +42,20 @@ class NativeApiInventoryTests(unittest.TestCase):
                 self.assertEqual(
                     inspect.signature(module_function), method_without_self
                 )
+                async_signature = inspect.signature(
+                    getattr(syq.AsyncClient, python_name)
+                )
+                self.assertEqual(set(async_signature.parameters), parameters)
+                self.assertEqual(
+                    [
+                        (parameter.name, parameter.kind, parameter.default)
+                        for parameter in async_signature.parameters.values()
+                    ],
+                    [
+                        (parameter.name, parameter.kind, parameter.default)
+                        for parameter in method_signature.parameters.values()
+                    ],
+                )
 
 
 if __name__ == "__main__":
