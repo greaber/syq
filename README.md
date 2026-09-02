@@ -157,7 +157,7 @@ syq cp --ignore '*.tmp' --src-src project --to server --into /app
 syq cp --follow --src-src current-project --to server --into /app
 syq cp --preserve=permissions,ownership project --to server --into /backup
 syq cp --inplace disk.img --to server --as-existing /images/disk.img
-syq cp-prune --src-src build --to server --into-existing /srv/app
+syq cp --prune --src-src build --to server --into-existing /srv/app
 syq rm cache old-output
 syq rm --from server --cwd /srv --src old-output
 syq rm --root /srv --src-dir cache
@@ -179,8 +179,7 @@ symlink. A trailing slash is ordinary path spelling and has no semantic effect.
 directory, while `--src-dir DIR` requires a directory. Without `--follow`, a
 symlink satisfies `--src-file` and is copied as a symlink, while it fails the
 `--src-dir` precondition. With `--follow`, the precondition and copy both apply
-to the referent. These typed selectors are available to `cp`, `cp-prune`, and
-`rm`.
+to the referent. These typed selectors are available to `cp` and `rm`.
 `--src-src DIR` selects a directory's contents and merges them directly into
 the target container. `--srcs PATH...`, `--src-srcs DIR...`, `--src-files
 PATH...`, and `--src-dirs DIR...` are bulk conveniences for the corresponding
@@ -267,11 +266,11 @@ command-restricted remote-to-remote path the precondition is also signed: the
 receiver checks it against the enrolled root when it claims the grant, and a
 `new` root can only be created without replacing anything.
 
-`cp` copies or updates mapped source objects and keeps unrelated target
-objects. `cp-prune` uses the same mapping and transfer engine, then applies the
-existing safe deletion planner to remove target-only descendants in mapped
-directory scopes. It never removes a source and requires explicit placement;
-`--max-delete N` keeps its all-or-nothing deletion budget.
+`cp` copies or updates mapped source objects and keeps unrelated target objects
+by default. With `--prune`, it then applies the existing safe deletion planner
+to remove target-only descendants in mapped directory scopes. Pruning never
+removes a source and requires explicit placement; `--max-delete N` keeps its
+all-or-nothing deletion budget.
 
 Native `rm` resolves every explicit selector at the endpoint and pins the
 result before it makes its first change. Missing selectors are successful and
@@ -323,36 +322,37 @@ ACLs, and xattrs are not preserved.
 
 All native commands accept `--follow`, `-n`/`--dry-run`, `-v`/`--verbose`,
 `-q`/`--quiet`, `-j`/`--connections`, `--progress`/`--no-progress`, and
-`--progress-json` in addition to their endpoint and selector options. `cp` and `cp-prune` also
-accept `--hash`, `--no-compress`, `--bwlimit RATE`, `--stats`,
+`--progress-json` in addition to their endpoint and selector options. `cp` also
+accepts `--hash`, `--no-compress`, `--bwlimit RATE`, `--stats`,
 `--reuse-connection`, repeatable
 `--ignore PATTERN`/`--ignore-from FILE`, `--preserve`, and `--inplace`. Filters
 use the gitignore semantics described below and apply at every source root;
-`cp-prune` protects excluded destination paths from pruning. `--hash`
+`--prune` protects excluded destination paths from pruning. `--hash`
 compares existing regular-file contents with full BLAKE3 digests instead of
 trusting equal size and modification time; it does not add a second
 post-transfer verification pass. The bandwidth limit applies only to file
 data, not scanning, hashing, metadata, or pruning. A
 native copy may also use `--max-size SIZE` or `--min-size SIZE` to skip regular
 source files outside that inclusive range. Those files remain part of the
-source population, so `cp-prune` protects any corresponding destination paths.
+source population, so `--prune` protects any corresponding destination paths.
 A command-restricted remote-to-remote copy currently refuses `--min-size` and
-refuses `--max-size` with `cp-prune`, as described below. A
+refuses `--max-size` with `--prune`, as described below. A
 command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit, signed filters, and the selected staged or in-place publication
 policy. A receiver installed by an older syq rejects an extension or unsupported
 policy safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment
 to the current binary. On a direct remote-to-remote copy through that
-receiver, `cp` and `cp-prune` also accept the receiver ceilings
+receiver, `cp` also accepts the receiver ceilings
 `--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
 (`s`, `m`, or `h`; at most 23h), and `--receipt hashed`, which asks the
 receiver to record a BLAKE3 digest of every file it publishes in its signed
 receipt. They are signed into the grant and enforced or honored by hostB, and
 are refused anywhere else because nothing would act on them.
 `cp` additionally accepts `--mapping` and `--results`
-(see [MAPPINGS.md](MAPPINGS.md)). `cp-prune` additionally
-accepts `--max-delete`; `rm` additionally accepts `--root` plus
-its endpoint-side removal semantics.
+(see [MAPPINGS.md](MAPPINGS.md)), but neither can be combined with `--prune`:
+mapping manifests define no deletion region, and the preview results schema
+does not yet represent deletions. `--max-delete` requires `--prune`; `rm`
+additionally accepts `--root` plus its endpoint-side removal semantics.
 
 Other comparison and selection controls, block and split sizing, and
 SSH/transport configuration remain available only through `syq rsync`.
@@ -620,7 +620,7 @@ with deletion because filtered source files could otherwise make hostA's
 deletion plan ambiguous. Explicit `-j` values above 64 are also refused; auto
 tuning may use up to that signed ceiling.
 
-Deletion through the receiver (`cp-prune`, or `--delete` on the rsync-shaped
+Deletion through the receiver (`cp --prune`, or `--delete` on the rsync-shaped
 command) requires an explicit `--max-delete`, so the deletion authority a
 compromised hostA could exercise inside the scope is always stated on the
 command line rather than defaulting to a hundred million; `--max-delete 0`
@@ -1275,7 +1275,7 @@ syq rsync -a --ignore 'logs/*' --ignore '!logs/keep/' src/ dst/ # everything in 
 syq rsync -a --ignore-from .gitignore --ignore '!dist/' repo/ host:repo/
 syq rsync -a --ignore '*' --ignore '!*/' --ignore '!*.jpg' photos/ bak/ # copy only *.jpg
 syq cp --ignore-from .gitignore --src-src repo --to host --into repo
-syq cp-prune --ignore cache/ --src-src build --into-existing deploy
+syq cp --prune --ignore cache/ --src-src build --into-existing deploy
 ```
 
 Rules of thumb (they're git's): `foo` matches a file or directory named `foo`
@@ -1286,8 +1286,9 @@ it is transferred or even scanned — which is why "only `*.jpg`" needs the
 (this is a filter on the walk, not git's notion of what's tracked). The source
 root itself is never ignored; with several sources each is filtered from its
 own root. `-n` previews the selected scope and intended changes. The same rules
-are available on native `cp` and `cp-prune`. Neither native `rm` nor compatibility
-`--rm` takes filters: removal always selects the whole explicit tree.
+are available on native `cp`, with or without `--prune`. Neither native `rm`
+nor compatibility `--rm` takes filters: removal always selects the whole
+explicit tree.
 
 As in git, a `!` rule cannot re-include something whose parent directory is
 ignored: `logs/**` prunes `logs/keep` itself, so `!logs/keep/**` after it has
