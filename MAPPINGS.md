@@ -255,8 +255,8 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   a policy exclusion like `--min-size`: the run still succeeds and the
   entry appears only in the excluded aggregate. Filter with
   `jq -c 'select(.kind != "special")'` to drop such entries up front.
-- Mappings define no deletion region, so `--mapping` is not available
-  on `cp-prune`.
+- Mappings define no deletion region, so `--mapping` cannot be combined
+  with `--prune`.
 - Duplicate lines are errors, even identical ones: a duplicate almost
   always means a generator bug. Deduplicate in your generator if you
   union overlapping fragments.
