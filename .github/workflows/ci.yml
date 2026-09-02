@@ -4,6 +4,7 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -42,7 +43,7 @@ jobs:
       - run: scripts/test-installer.sh
       - run: scripts/test-release-tools.sh
       - run: scripts/test-secret-tools.sh
-      - run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-homebrew-formula.sh scripts/test-secret-tools.sh
+      - run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-homebrew-formula.sh scripts/test-python-sdk-release-tools.sh scripts/test-secret-tools.sh
 
   sdks:
     runs-on: ubuntu-latest
@@ -55,12 +56,28 @@ jobs:
           python-version: "3.10"
       - name: Install pinned Python tooling
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
+      - name: Require the SDK mapping for the latest syq release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          pinned_tag=$(jq -er .tag sdk/python/src/syq/syq-release-manifest.json)
+          test "$pinned_tag" = "$latest_tag" || {
+            echo "Python SDK pins $pinned_tag, but the latest syq release is $latest_tag" >&2
+            exit 1
+          }
+      - name: Build the candidate syq executable
+        run: cargo build --locked --bin syq
       - name: Test and reproducibly package Python SDK
         env:
           PYTHONPATH: sdk/python/src
+          SYQ_CANDIDATE_EXECUTABLE: ${{ github.workspace }}/target/debug/syq
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
           XDG_CACHE_HOME: ${{ runner.temp }}/syq-sdk-cache
         run: |
+          SYQ_CANDIDATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          export SYQ_CANDIDATE_VERSION
+          scripts/test-python-sdk-release-tools.sh
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
           export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")

@@ -27,7 +27,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           scripts/verify-release-tag.sh \
-            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master
+            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master sdks
 
   build-python:
     name: build Python SDK

@@ -7,7 +7,9 @@ immutable: never move a release tag or attempt to replace an uploaded package.
 
 ### PyPI
 
-In the existing PyPI account, create a pending GitHub trusted publisher with:
+The repository already has a protected GitHub environment named `pypi`. It
+requires maintainer approval and accepts only `sdk-python-v*` tags. In the
+existing PyPI account, create a pending GitHub trusted publisher with:
 
 - PyPI project name: `syq`
 - GitHub owner: `greaber`
@@ -15,10 +17,8 @@ In the existing PyPI account, create a pending GitHub trusted publisher with:
 - workflow: `publish-sdks.yml`
 - environment: `pypi`
 
-Create a protected GitHub environment named `pypi`, require a maintainer's
-approval, and restrict it to `sdk-python-v*` release tags. A pending publisher
-does not reserve the name; the first successful workflow run creates the
-project.
+The pending publisher is the remaining account-side setup. It does not reserve
+the name; the first successful workflow run creates the project.
 
 ### npm
 
@@ -57,10 +57,11 @@ Go has no publisher account or central name reservation. The module path in
 tag commits the project to `github.com/greaber/syq/sdk/go`; changing to a
 future vanity domain would create a different Go module.
 
-Extend the repository's release-tag ruleset to restrict creation, update, and
-deletion of `sdk-python-v*`, `sdk-js-v*`, and `sdk/go/v*` tags to release
-maintainers. Like binary releases, every SDK release uses a signed annotated
-tag whose signature GitHub recognizes.
+The repository's release-tag ruleset restricts creation, update, deletion, and
+non-fast-forward changes for `sdk-python-v*`, `sdk-js-v*`, and `sdk/go/v*` tags
+to the release maintainer, alongside the existing `v*` protection. Like binary
+releases, every SDK release uses a signed annotated tag whose signature GitHub
+recognizes.
 
 ## Release checks
 
@@ -84,18 +85,55 @@ git tag -s sdk-python-v0.0.1 -m 'Python SDK 0.0.1'
 git push origin sdk-python-v0.0.1
 ```
 
-After the manually published `0.0.1` package is byte-for-byte verified, create
-its tag and configure trusted publishing. Subsequent JavaScript tags use the
-version in `js/package.json` normally:
+The first Python tag uses the pending trusted publisher configured above; do
+not upload `0.0.1` locally. The protected workflow creates the PyPI project and
+publishes the already-tested distributions with OIDC. PyPI does not reserve the
+name until that workflow successfully publishes, so create the pending
+publisher immediately before the tag.
+
+JavaScript `0.0.1` is the package that requires the manual bootstrap publish.
+After those exact bytes are verified and its trusted publisher is configured,
+subsequent JavaScript tags use the version in `js/package.json` normally:
 
 ```sh
 git tag -s sdk-js-v0.0.1 -m 'JavaScript SDK 0.0.1'
 git push origin sdk-js-v0.0.1
 ```
 
-Those tags run `.github/workflows/publish-sdks.yml`, which verifies the tag,
-version, tests, package contents, pinned download, and executable identity
+Those tags run `.github/workflows/publish-sdks.yml`, which verifies that the
+signed tag targets a `master` commit whose `sdks` check passed, then verifies
+the version, tests, package contents, pinned download, and executable identity
 before entering the protected publishing environment.
+
+## Automated Python follow-up to a syq release
+
+The `sdks` CI job builds the syq executable from the commit under test and runs
+the Python adapter's candidate compatibility tests against it. These exercise
+the reported version, a real disposable local copy, argument boundaries, and
+failure retention. The syq release tag verifier requires `sdks` alongside the
+Rust and platform checks, so a failing adapter blocks publication of the syq
+release itself. The same job requires the packaged Python manifest to match the
+latest immutable syq release. Until the generated mapping pull request lands,
+subsequent development therefore cannot acquire a green release-eligible
+`sdks` check or consume the same next Python patch version.
+
+After `.github/workflows/release.yml` completes successfully and the GitHub
+release is immutable, `.github/workflows/prepare-python-sdk.yml` downloads its
+exact signed manifest and prepares the next Python patch version. It opens an
+`automation/python-sdk-vX.Y.Z` pull request containing the version, manifest,
+cache-path documentation, lockfile, and mapping-table updates, then explicitly
+dispatches the normal CI and compatibility workflows. GitHub intentionally
+suppresses ordinary workflow events caused by its own token, which is why the
+dispatch is explicit. The repository keeps the default workflow token read
+only, permits trusted Actions workflows to create pull requests, and grants
+write scopes only inside this preparation workflow.
+
+Review and merge that pull request normally. The final publication remains a
+deliberate release-authority action: create the signed annotated
+`sdk-python-v<version>` tag and approve the protected `pypi` environment. The
+tag then publishes through OIDC without a local upload or long-lived PyPI
+credential. Keeping the tag signature manual avoids placing maintainer signing
+authority in CI; PyPI availability cannot block publication of syq itself.
 
 Python distributions use a pinned interpreter and the tagged commit timestamp
 as `SOURCE_DATE_EPOCH`, and the source archive is repacked with normalized
