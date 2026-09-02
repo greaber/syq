@@ -482,13 +482,15 @@ impl RestrictedAuthority {
     fn reserve_bytes(&self, path: &[u8], partial_id: proto::PartialId, size: u64) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         let key = (path.to_vec(), partial_id);
-        let previous = state.reserved.get(&key).copied().unwrap_or(0);
-        if size <= previous {
+        // An existing declaration only grows; a new one is registered even
+        // at zero length, so an empty file can still be published.
+        let previous = state.reserved.get(&key).copied();
+        if previous.is_some_and(|previous| size <= previous) {
             return Ok(());
         }
         let total = state
             .reserved_bytes
-            .checked_add(size - previous)
+            .checked_add(size - previous.unwrap_or(0))
             .context("signed reservation byte counter overflow")?;
         if total > self.copy.limits.max_total_bytes {
             bail!("signed grant total-byte limit exceeded by file preparation");
@@ -4140,6 +4142,9 @@ mod tests {
         );
         let mut as_directory = apply(mkdir(&link));
         assert!(authority.authorize(&mut as_directory, false).is_err());
+        authority
+            .authorize(&mut prepare_request(&link), false)
+            .unwrap();
         let mut publish = finalize_request(&link, Any);
         authority.authorize(&mut publish, false).unwrap();
         assert_eq!(
@@ -5058,7 +5063,7 @@ mod tests {
     fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
-        fs::create_dir(&root).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
         // The helper grant allows 16 bytes in total and per file.
         let authority = test_authority(&root, DeletionPolicyV1::Forbid, 16);
         let prepare = |name: &str, size| Request::Prepare {
@@ -5090,6 +5095,44 @@ mod tests {
             guard: None,
         };
         assert!(authority.authorize(&mut seed, false).is_err());
+
+        // An empty file is declared at zero length and can be published.
+        authority
+            .authorize(&mut prepare("empty", 0), false)
+            .unwrap();
+        let mut publish_empty = Request::Finalize {
+            path: root.join("target/empty").as_os_str().as_bytes().to_vec(),
+            inplace: false,
+            partial_id: [1; 16],
+            meta: proto::Meta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        authority.authorize(&mut publish_empty, false).unwrap();
+        // A file never declared under this grant cannot be published.
+        let mut publish_foreign = Request::Finalize {
+            path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
+            inplace: false,
+            partial_id: [9; 16],
+            meta: proto::Meta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        assert!(authority.authorize(&mut publish_foreign, false).is_err());
     }
 
     #[test]
