@@ -147,8 +147,20 @@ connection, so enable it only for a trusted release host rather than globally.
    gh run watch --exit-status "$(gh run list --workflow ci.yml --branch master --commit "$(git rev-parse master)" --json databaseId --jq '.[0].databaseId')"
    ```
 
-   Then create and push a signed annotated tag matching the package version.
-   Its signing key and email must be configured on your GitHub account so
+   Run the read-only preflight before creating the tag:
+
+   ```sh
+   scripts/release-preflight.sh v0.1.9
+   ```
+
+   It requires the exact clean, synchronized `master` tip; matching Cargo
+   metadata; successful required checks on that SHA; an SSH tag-signing key
+   registered with GitHub; the selected-Actions allowlist; the protected
+   `release` environment, tag policy, variables, and secret names; and absence
+   of the tag or version from GitHub, crates.io, and the Homebrew tap. It makes
+   no local or remote changes. Then create and push a signed annotated tag
+   matching the package version. Its signing key and email must be configured
+   on your GitHub account so
    GitHub reports the tag-object signature as verified:
 
    ```sh
@@ -156,8 +168,10 @@ connection, so enable it only for a trusted release host rather than globally.
    git push origin v0.1.0
    ```
 
-3. Approve the protected `release` environment for the publishing job, then
-   approve it again when the separate Homebrew tap job is ready. The workflow
+3. Approve the protected `release` environment once. The same protected job
+   publishes the release and updates Homebrew, so the deploy key is never
+   exposed to an unapproved job and a second approval adds no distinct trust
+   boundary. The workflow
    first verifies that the annotated tag's signature is valid and that it
    directly targets the workflow commit, that this commit is reachable
    from protected `master`, and that the `rust`, `sdks`, `macos`, and
@@ -172,6 +186,16 @@ connection, so enable it only for a trusted release host rather than globally.
    workflow opens a pull request for the next SDK patch release using this
    immutable syq manifest. PyPI publication remains a separate signed-tag and
    protected-environment action, so a registry outage cannot block syq.
+   Track the complete state at any time with:
+
+   ```sh
+   scripts/release-status.sh v0.1.9
+   scripts/release-status.sh --json v0.1.9
+   ```
+
+   The report correlates the exact tag commit, release runs and pending
+   environments, GitHub release state, crates.io, the mapped PyPI SDK version,
+   and the Homebrew formula without modifying any of them.
 4. Verify one or more downloaded artifacts and exercise all install paths:
 
    ```sh
@@ -217,6 +241,18 @@ managed remote-helper cache. The manifest's `helper_id: v<release>-p0` and the
 binary's `--remote-helper-id` output are deprecated compatibility shims for
 updaters through 0.1.1; `p0` is fixed and must not be treated or bumped as a
 protocol version.
+
+## CI scope
+
+The required `rust`, `sdks`, `linux-arm64`, `macos`, and `conformance` check
+names are stable. A checked-in path classifier lets those jobs finish with a
+small successful validation for documentation-only changes. SDK-only changes
+still run the full `sdks` job, including generated Python mappings, while the
+native and platform jobs finish quickly. Any Rust, test, script, build,
+installer, release-workflow, or otherwise unclassified path runs the complete
+native, SDK, platform, and conformance suites. Manual workflow runs also run
+everything. This keeps branch protection and release-tag verification attached
+to the same check names without repeatedly rebuilding unaffected code.
 
 ## macOS signing
 

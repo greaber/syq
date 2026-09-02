@@ -230,39 +230,18 @@ jobs:
           version=${GITHUB_REF_NAME#v}
           scripts/verify-crates-io-package.sh \
             "$version" "target/package/syq-$version.crate"
-      - name: Carry the verified published formula to the tap job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: homebrew-formula
-          path: dist/syq.rb
-          if-no-files-found: error
-          retention-days: 1
-
-  homebrew:
-    name: update Homebrew tap
-    needs: release
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: read
-    steps:
       - name: Check out project-owned tap
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: greaber/homebrew-tap
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           path: tap
-      - name: Download generated formula
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: homebrew-formula
-          path: formula
       - name: Commit formula update
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p tap/Formula
-          cp formula/syq.rb tap/Formula/syq.rb
+          cp dist/syq.rb tap/Formula/syq.rb
           cd tap
           git diff --check
           git add Formula/syq.rb
