@@ -323,6 +323,9 @@ pub struct Args {
     pub max_total_bytes: Option<u64>,
     #[arg(skip)]
     pub max_runtime_secs: Option<u32>,
+    /// Native-only: ask the command-restricted receiver for a hashed receipt.
+    #[arg(skip)]
+    pub receipt_hashed: bool,
     /// Skip regular files that are newer on the destination (directories,
     /// symlinks and specials are unaffected)
     #[arg(short = 'u', long)]
@@ -697,6 +700,15 @@ struct NativeCopyOperationalArgs {
     /// Command-restricted receiver ceiling: the signed grant expires DURATION after it is issued, e.g. 30m or 2h (direct remote-to-remote only; at most 23h)
     #[arg(long, value_name = "DURATION")]
     max_runtime: Option<String>,
+    /// Receipt detail from the command-restricted receiver: sizes of published files (default) or also a BLAKE3 digest of each (direct remote-to-remote only)
+    #[arg(long, value_name = "MODE", value_enum)]
+    receipt: Option<ReceiptMode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReceiptMode {
+    Sizes,
+    Hashed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1095,6 +1107,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     if args.max_entries.is_some()
         || args.max_total_bytes.is_some()
         || args.max_runtime_secs.is_some()
+        || args.receipt_hashed
     {
         // These are assertions for hostB's enrolled receiver to enforce; with
         // no such receiver in the topology, nothing would enforce them, so
@@ -1103,7 +1116,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
         if !(src_remote && dst_remote) {
             bail!(
-                "--max-entries, --max-total-bytes, and --max-runtime are command-restricted receiver ceilings; they apply only to direct remote-to-remote copies"
+                "--max-entries, --max-total-bytes, --max-runtime, and --receipt address the command-restricted receiver; they apply only to direct remote-to-remote copies"
             );
         }
     }
@@ -1276,7 +1289,9 @@ fn apply_native_copy_operational(
         max_entries,
         max_total_bytes,
         max_runtime,
+        receipt,
     } = operational;
+    args.receipt_hashed = receipt == Some(ReceiptMode::Hashed);
     args.max_entries = max_entries;
     args.max_total_bytes = max_total_bytes.as_deref().map(parse_size).transpose()?;
     args.max_runtime_secs = max_runtime

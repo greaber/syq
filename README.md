@@ -345,8 +345,10 @@ policy safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment
 to the current binary. On a direct remote-to-remote copy through that
 receiver, `cp` and `cp-prune` also accept the receiver ceilings
 `--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
-(`s`, `m`, or `h`; at most 23h). They are signed into the grant and enforced
-by hostB, and are refused anywhere else because nothing would enforce them.
+(`s`, `m`, or `h`; at most 23h), and `--receipt hashed`, which asks the
+receiver to record a BLAKE3 digest of every file it publishes in its signed
+receipt. They are signed into the grant and enforced or honored by hostB, and
+are refused anywhere else because nothing would act on them.
 `cp` additionally accepts `--mapping` and `--results`
 (see [MAPPINGS.md](MAPPINGS.md)). `cp-prune` additionally
 accepts `--max-delete`; `rm` additionally accepts `--root` plus

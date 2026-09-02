@@ -310,11 +310,12 @@ pub fn run(
     };
     if (args.max_entries.is_some()
         || args.max_total_bytes.is_some()
-        || args.max_runtime_secs.is_some())
+        || args.max_runtime_secs.is_some()
+        || args.receipt_hashed)
         && restricted_grant.is_none()
     {
         bail!(
-            "--max-entries, --max-total-bytes, and --max-runtime are command-restricted receiver ceilings, but this transfer does not use the enrolled receiver"
+            "--max-entries, --max-total-bytes, --max-runtime, and --receipt address the command-restricted receiver, but this transfer does not use the enrolled receiver"
         );
     }
     // The follow target must reconnect the way we did: keep an explicit user.
