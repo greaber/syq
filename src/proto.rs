@@ -11,8 +11,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 pub const MIN_HASH_BLOCK_BYTES: u64 = 64 * 1024;
 pub const MAX_HASH_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
-// Postcard encodes a u64 as a base-128 varint of at most ten bytes.
-const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 10;
+const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
 const HASH_RESPONSE_OVERHEAD: u64 = 24;
 const COMPRESS_MIN: usize = 512;
 const COMPRESS_LEVEL: i32 = 1;
@@ -30,6 +29,8 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
 
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
+/// Full BLAKE3 digest used whenever content equality affects copy behavior.
+pub type ContentDigest = [u8; 32];
 
 /// Stable identifier for one logical copy command. Destination partial names
 /// include this value so unrelated commands never write the same staged inode.
@@ -147,7 +148,7 @@ pub struct SmallPut {
     pub partial_id: PartialId,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
-    pub hash: u64,
+    pub hash: ContentDigest,
     pub meta: Meta,
     pub flags: u8,
     pub condition: TargetCondition,
@@ -159,7 +160,7 @@ pub struct SmallPut {
 pub struct SmallBlock {
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
-    pub hash: u64,
+    pub hash: ContentDigest,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -425,7 +426,7 @@ pub enum Request {
         partial_id: PartialId,
         attempt: u32,
         off: u64,
-        hash: u64,
+        hash: ContentDigest,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         guard: Option<ContainerGuard>,
@@ -498,21 +499,21 @@ pub enum Response {
     },
     Applied(Vec<Option<String>>),
     PartialSize(Option<u64>),
-    Hashes(Vec<u64>),
+    Hashes(Vec<ContentDigest>),
     HeldHashes {
-        hashes: Vec<u64>,
+        hashes: Vec<ContentDigest>,
         len: u64,
     },
     Block {
         off: u64,
-        hash: u64,
+        hash: ContentDigest,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
     SmallBlocks(Vec<std::result::Result<SmallBlock, String>>),
     FileHash {
         size: u64,
-        hash: u128,
+        hash: ContentDigest,
     },
     Path(PathBytes),
     TransportStats(Option<TcpSocketStats>),
@@ -586,7 +587,7 @@ impl SizeHint for Response {
                 blocks
                     .iter()
                     .map(|block| match block {
-                        Ok(block) => block.data.len() + 16,
+                        Ok(block) => block.data.len() + 40,
                         Err(error) => error.len() + 8,
                     })
                     .sum::<usize>()
@@ -612,7 +613,7 @@ impl SizeHint for Response {
                     + others.as_ref().map_or(0, |items| items.len() * 96)
                     + 32
             }
-            Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 9 + 24,
+            Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 32 + 24,
             _ => 256,
         }
     }
@@ -716,7 +717,7 @@ mod tests {
         FrameWriter::new(&mut frame, compress)
             .write_msg(&Response::Block {
                 off: 7,
-                hash: 11,
+                hash: [11; 32],
                 data,
             })
             .unwrap();
@@ -738,7 +739,7 @@ mod tests {
                 hash,
                 data: decoded,
             } => {
-                assert_eq!((off, hash), (7, 11));
+                assert_eq!((off, hash), (7, [11; 32]));
                 assert_eq!(decoded, data);
             }
             other => panic!("unexpected response {other:?}"),

@@ -16,13 +16,16 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use xxhash_rust::xxh3::{xxh3_128, xxh3_64, Xxh3};
 
 pub const PARTIAL_MARKER: &str = ".syq-part.";
 const FD_CACHE_MAX: usize = 16;
 const COMMON_NAME_MAX: usize = 255;
 const COMPACT_HASH_BYTES: usize = 10;
 const NAME_MAX_CACHE_CAP: usize = 1024;
+
+pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
+    *blake3::hash(data).as_bytes()
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Default)]
@@ -2119,7 +2122,7 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 /// Hash exactly `len` bytes in fixed blocks. A short reader contributes the
 /// bytes it has and empty hashes for the missing blocks, matching both source
 /// and destination behavior through one implementation.
-fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<u64>> {
+fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<ContentDigest>> {
     if !hash_response_fits(block, len) {
         bail!("hash block size or response count is outside protocol limits");
     }
@@ -2137,10 +2140,10 @@ fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<u64>>
             }
             got += read;
         }
-        hashes.push(xxh3_64(&buf[..got]));
+        hashes.push(content_digest(&buf[..got]));
         if got < want {
             while hashes.len() < n {
-                hashes.push(xxh3_64(&[]));
+                hashes.push(content_digest(&[]));
             }
             break;
         }
@@ -2436,7 +2439,7 @@ impl FsOps {
         len: u64,
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
-    ) -> Result<(Vec<u64>, u64)> {
+    ) -> Result<(Vec<ContentDigest>, u64)> {
         let p = resolve(path);
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
@@ -2740,12 +2743,12 @@ impl FsOps {
         &mut self,
         target: PartialTarget<'_>,
         data: &[u8],
-        hash: u64,
+        hash: ContentDigest,
         meta: &Meta,
         flags: u8,
         condition: TargetCondition,
     ) -> Result<()> {
-        if xxh3_64(data) != hash {
+        if content_digest(data) != hash {
             bail!("block hash mismatch on receive");
         }
         let p = resolve(target.path);
@@ -2808,7 +2811,7 @@ impl FsOps {
         block: u64,
         len: u64,
         guard: Option<&ContainerGuard>,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Vec<ContentDigest>> {
         let p = resolve(path);
         let p = if which == Which::Partial {
             if guard.is_some() {
@@ -2855,7 +2858,7 @@ impl FsOps {
         let mut data = vec![0u8; len as usize];
         f.read_exact_at(&mut data, off)
             .with_context(|| format!("read {} @{off}+{len}", p.display()))?;
-        let hash = xxh3_64(&data);
+        let hash = content_digest(&data);
         Ok(Response::Block { off, hash, data })
     }
 
@@ -2865,10 +2868,10 @@ impl FsOps {
         inplace: bool,
         attempt: u32,
         off: u64,
-        hash: u64,
+        hash: ContentDigest,
         data: &[u8],
     ) -> Result<()> {
-        if xxh3_64(data) != hash {
+        if content_digest(data) != hash {
             bail!("block hash mismatch on receive @{off}");
         }
         let p = resolve(target.path);
@@ -3028,7 +3031,7 @@ impl FsOps {
         } else {
             open_existing_regular(&p, false)?
         };
-        let mut h = Xxh3::new();
+        let mut h = blake3::Hasher::new();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
         loop {
@@ -3039,10 +3042,9 @@ impl FsOps {
             h.update(&buf[..n]);
             size += n as u64;
         }
-        let _ = xxh3_128; // keep the symbol in case of future use
         Ok(Response::FileHash {
             size,
-            hash: h.digest128(),
+            hash: *h.finalize().as_bytes(),
         })
     }
 
@@ -4014,13 +4016,25 @@ mod tests {
         assert_eq!(
             hashes,
             vec![
-                xxh3_64(&vec![b'a'; block]),
-                xxh3_64(&vec![b'b'; block]),
-                xxh3_64(b"tail"),
-                xxh3_64(b""),
+                content_digest(&vec![b'a'; block]),
+                content_digest(&vec![b'b'; block]),
+                content_digest(b"tail"),
+                content_digest(b""),
             ]
         );
         assert!(hash_reader(&mut &b"x"[..], 0, 1).is_err());
         assert!(hash_reader(&mut &b"x"[..], 1, 1).is_err());
+    }
+
+    #[test]
+    fn content_digest_is_full_blake3() {
+        assert_eq!(
+            content_digest(b""),
+            [
+                0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc,
+                0xc9, 0x49, 0x9b, 0xcb, 0x25, 0xc9, 0xad, 0xc1, 0x12, 0xb7, 0xcc, 0x9a, 0x93, 0xca,
+                0xe4, 0x1f, 0x32, 0x62,
+            ]
+        );
     }
 }

@@ -2631,7 +2631,7 @@ mod tests {
             path: target.clone(),
             partial_id: [1; 16],
             data: vec![0; 4],
-            hash: 0,
+            hash: [0; 32],
             meta: proto::Meta {
                 mode: 0o644,
                 uid: 0,
@@ -2662,7 +2662,7 @@ mod tests {
             partial_id: [0; 16],
             attempt: 0,
             off: 0,
-            hash: 0,
+            hash: [0; 32],
             data: vec![0; 5],
             guard: None,
         };
@@ -2867,7 +2867,7 @@ mod tests {
             path: path.as_os_str().as_bytes().to_vec(),
             partial_id: [1; 16],
             data: b"new".to_vec(),
-            hash: xxhash_rust::xxh3::xxh3_64(b"new"),
+            hash: crate::fsops::content_digest(b"new"),
             meta: proto::Meta {
                 mode,
                 uid: 0,
@@ -3043,7 +3043,7 @@ mod tests {
         }
 
         authority.copy.limits.hash_block_bytes = proto::MIN_HASH_BLOCK_BYTES;
-        let excessive_entries = proto::MAX_FRAME as u64 / 10 + 1;
+        let excessive_entries = proto::MAX_FRAME as u64 / 32 + 1;
         let mut excessive = request(
             proto::MIN_HASH_BLOCK_BYTES,
             excessive_entries * proto::MIN_HASH_BLOCK_BYTES,
@@ -3070,7 +3070,7 @@ mod tests {
             partial_id: [0; 16],
             attempt: 0,
             off,
-            hash: 0,
+            hash: [0; 32],
             data: vec![0; 256],
             guard: None,
         };
@@ -3184,7 +3184,7 @@ mod tests {
             path: target.clone(),
             partial_id: [1; 16],
             data: vec![0],
-            hash: 0,
+            hash: [0; 32],
             meta: proto::Meta {
                 mode: 0o600,
                 uid: 0,

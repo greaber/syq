@@ -154,6 +154,7 @@ syq cp --from server --cwd /data --src a --src b --into ./data
 syq cp --src-file report --src-dir assets --into /backup
 syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
 syq cp report --to server --as-new /reports/final
+syq cp --hash report --to server --as-existing /reports/final
 syq cp-prune --src-src build --to server --into-existing /srv/app
 syq rm cache old-output
 syq rm --from server --cwd /srv --src old-output
@@ -250,15 +251,18 @@ call are not rolled back. Native `rm` has no detached mode.
 The first native fidelity default is exactly `-rlt`: it recurses through
 directories, copies symlinks as symlinks, and retains mtimes. Owner, group,
 modes, special files,
-hard links, ACLs, xattrs, filtering, comparison policy, and the automation API
+hard links, ACLs, xattrs, filtering, other copy policies, and the automation API
 are intentionally not frozen by this first grammar. Use `syq rsync` when the
 current compatibility options for those capabilities are needed.
 
 All native commands accept `-n`/`--dry-run`, `-v`/`--verbose`, `-q`/`--quiet`,
 `-j`/`--connections`, `--progress`/`--no-progress`, and `--progress-json` in
 addition to their endpoint and selector options. `cp` and `cp-prune` also
-accept `--no-compress`, `--bwlimit RATE`, and `--stats`; the bandwidth limit
-applies only to file data, not scanning, hashing, metadata, or pruning. A
+accept `--hash`, `--no-compress`, `--bwlimit RATE`, and `--stats`. `--hash`
+compares existing regular-file contents with full BLAKE3 digests instead of
+trusting equal size and modification time; it does not add a second
+post-transfer verification pass. The bandwidth limit applies only to file
+data, not scanning, hashing, metadata, or pruning. A
 command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit. A receiver installed by an older syq rejects that V2 grant
 safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment to the
@@ -266,8 +270,8 @@ current binary. `cp-prune` additionally
 accepts `--max-delete`; `rm` additionally accepts `--root` and `--follow` plus
 its endpoint-side removal semantics.
 
-Preservation policies, filters, comparison controls, block and split sizing,
-and SSH/transport configuration remain available only through `syq rsync`;
+Preservation policies, filters, other comparison and write controls, block and
+split sizing, and SSH/transport configuration remain available only through `syq rsync`;
 sharing the transfer engine does not expose those options in native mode.
 Remote-to-remote copies still use the ordinary automatic transport. Native raw
 path bytes are relayed through syq's protocol when they cannot be represented
@@ -318,7 +322,7 @@ explicitly say otherwise.
 | `--insecure-links` | Allow a receiving process to follow destination-path symlinks owned by other users (unsafe legacy opt-out) |
 | `--progress-json` | One JSON line per second on stderr |
 | `--stats` | Summary counts at the end |
-| `-c`, `--checksum` | Compare every file block by block instead of size+mtime; repair mismatches |
+| `-c`, `--checksum` | Compare every file with BLAKE3 instead of size+mtime; repair mismatches (native spelling: `--hash`) |
 | `--verify-only` | Hash every file in the run's scope on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
 | `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
@@ -785,9 +789,9 @@ needed for this normal resumption. Resume works at two levels.
 
 - Files whose size and mtime already match are skipped (the rsync quick check).
 - If this job's range-transfer `.name.syq-part.<job-id>` exists, both sides
-  hash it and the source in `--block-size` blocks and only the mismatching
-  blocks are sent. A leftover is reused only when it can be safely opened as a
-  singly-linked regular file without following a symlink; numeric ownership is
+  hash it and the source with full BLAKE3 digests in `--block-size` blocks and
+  only the mismatching blocks are sent. A leftover is reused only when it can
+  be safely opened as a singly-linked regular file without following a symlink; numeric ownership is
   deliberately not required because NFS root squashing and some FUSE/CIFS
   mounts remap it. A safe leftover that cannot be made mode `0600` is discarded
   and recreated instead of permanently blocking that file. Anything else is
@@ -895,9 +899,10 @@ modify destination files during a transfer.
 
 Always:
 
-- Every block carries an xxh3 hash checked on receipt (read side and write
-  side); a mismatch aborts that file with an error (exit 23) rather than
-  silently continuing — it indicates transport corruption, which is rare.
+- Every transferred block carries a full BLAKE3 digest computed by the reader
+  and checked by the receiver; a mismatch aborts that file with an error (exit
+  23) rather than silently continuing — it indicates transport corruption,
+  which is rare.
 - After a file completes, the source is re-stat'ed. If its size or mtime
   changed during the transfer the file is redone (up to three attempts), then
   reported as an error.
@@ -907,10 +912,19 @@ Always:
 
 On request:
 
-- `--verify-only` hashes every file on both sides in parallel and reports
-  `DIFFERS` / `MISSING`.
-- `-c` does the block comparison for every file, not just ones that fail the
-  quick check, and repairs what differs.
+- `--verify-only` hashes every file on both sides with BLAKE3 in parallel and
+  reports `DIFFERS` / `MISSING`.
+- `-c`/`--checksum` (`--hash` in the native interface) does the BLAKE3 block
+  comparison for every file, not just ones that fail the quick check, and
+  repairs what differs.
+
+Full BLAKE3 digests replaced XXH3 for content decisions in September 2026 so a
+digest match is collision-resistant rather than merely a fast corruption
+check. In one release-mode, single-thread CPU microbenchmark with 4 MiB inputs
+on an AMD EPYC 9454P, BLAKE3 processed 6.69 GB/s, compared with 31.25 GB/s for
+XXH3 and 1.86 GB/s for SHA-256. This is design-rationale data, not an end-to-end
+copy-speed claim; filesystem and transport work usually dominate, and syq
+hashes concurrently across workers.
 
 Not verified: directory and symlink metadata are set but not read back; a
 source that changes *between* the final re-stat and the next block of another

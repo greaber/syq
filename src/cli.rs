@@ -619,6 +619,9 @@ struct NativeOperationalArgs {
 struct NativeCopyOperationalArgs {
     #[command(flatten)]
     common: NativeOperationalArgs,
+    /// Hash existing source and destination files instead of trusting size and modification time
+    #[arg(long)]
+    hash: bool,
     /// Disable transport compression
     #[arg(long)]
     no_compress: bool,
@@ -964,10 +967,12 @@ fn apply_native_copy_operational(
 ) -> Result<()> {
     let NativeCopyOperationalArgs {
         common,
+        hash,
         no_compress,
         bwlimit,
         stats,
     } = operational;
+    args.checksum = hash;
     args.no_compress = no_compress;
     if no_compress {
         args.compress = false;
@@ -1392,6 +1397,13 @@ mod tests {
         assert!(!args.owner);
         assert!(!args.group);
         assert!(!args.devices);
+    }
+
+    #[test]
+    fn native_hash_selects_content_comparison() {
+        let argv = ["--hash", "source", "--into", "destination"].map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        assert!(args.checksum);
     }
 
     #[test]

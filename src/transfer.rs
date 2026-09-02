@@ -8,7 +8,7 @@ use crate::conn::{
     ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
     TcpPairStats,
 };
-use crate::fsops::{is_partial_name, join};
+use crate::fsops::{content_digest, is_partial_name, join};
 use crate::progress::{commas, human, Progress, WorkerStatus};
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
@@ -19,7 +19,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::sync::Mutex;
-use xxhash_rust::xxh3::xxh3_64;
 
 const WINDOW: usize = 4;
 const MAX_ATTEMPTS: u32 = 3;
@@ -5100,19 +5099,18 @@ impl Worker {
             }
         };
         let mut blocks = blocks.into_iter();
-        let mut data: Vec<Result<Vec<u8>>> = jobs
+        let mut data: Vec<Result<SmallBlock>> = jobs
             .iter()
             .map(|job| {
                 if job.entry.size == 0 {
-                    return Ok(Vec::new());
+                    return Ok(SmallBlock {
+                        data: Vec::new(),
+                        hash: content_digest(&[]),
+                    });
                 }
                 match blocks.next() {
-                    Some(Ok(SmallBlock { data, hash }))
-                        if data.len() as u64 == job.entry.size && xxh3_64(&data) == hash =>
-                    {
-                        Ok(data)
-                    }
-                    Some(Ok(_)) => Err(anyhow::anyhow!("block size or hash mismatch on read")),
+                    Some(Ok(block)) if block.data.len() as u64 == job.entry.size => Ok(block),
+                    Some(Ok(_)) => Err(anyhow::anyhow!("block size mismatch on read")),
                     Some(Err(error)) => Err(anyhow::anyhow!("read: {error}")),
                     None => Err(anyhow::anyhow!("missing block in read small batch")),
                 }
@@ -5125,19 +5123,26 @@ impl Worker {
         let flags = publication_metadata_flags(self.opts.flags);
         let mut sent: Vec<bool> = Vec::with_capacity(jobs.len());
         let mut puts = Vec::with_capacity(jobs.len());
-        for (j, d) in jobs.iter().zip(data.iter_mut()) {
-            let Ok(bytes) = d else {
-                sent.push(false);
-                continue;
+        for (j, block) in jobs.iter().zip(data.iter_mut()) {
+            let SmallBlock { data, hash } = match block {
+                Ok(block) => std::mem::replace(
+                    block,
+                    SmallBlock {
+                        data: Vec::new(),
+                        hash: content_digest(&[]),
+                    },
+                ),
+                Err(_) => {
+                    sent.push(false);
+                    continue;
+                }
             };
-            let bytes = std::mem::take(bytes);
-            let hash = xxh3_64(&bytes);
             let mut meta = j.entry.meta();
             meta.mode = self.create_mode(j);
             puts.push(SmallPut {
                 path: j.dst.clone(),
                 partial_id: self.partial_id(),
-                data: bytes,
+                data,
                 hash,
                 meta,
                 flags,
@@ -5654,14 +5659,14 @@ impl Worker {
         })
     }
 
-    fn hashes(response: Response) -> Result<Vec<u64>> {
+    fn hashes(response: Response) -> Result<Vec<ContentDigest>> {
         match response {
             Response::Hashes(hashes) => Ok(hashes),
             other => bail!("unexpected response {other:?}"),
         }
     }
 
-    fn destination_hashes(response: Response) -> Result<(Vec<u64>, Option<u64>)> {
+    fn destination_hashes(response: Response) -> Result<(Vec<ContentDigest>, Option<u64>)> {
         match response {
             Response::Hashes(hashes) => Ok((hashes, None)),
             Response::HeldHashes { hashes, len } => Ok((hashes, Some(len))),
@@ -5670,8 +5675,8 @@ impl Worker {
     }
 
     fn different_ranges(
-        source: &[u64],
-        destination: &[u64],
+        source: &[ContentDigest],
+        destination: &[ContentDigest],
         block: u64,
         size: u64,
     ) -> Vec<(u64, u64)> {
@@ -5749,9 +5754,6 @@ impl Worker {
             };
             self.t[0] += t0.elapsed().as_secs_f64();
             reads_out -= 1;
-            if xxh3_64(&data) != hash {
-                bail!("block hash mismatch on read @{off}");
-            }
             let n = data.len() as u64;
             let t0 = std::time::Instant::now();
             self.dst.send(Request::WriteRange {
