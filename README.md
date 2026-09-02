@@ -631,14 +631,16 @@ key.
 
 HostA also cannot misreport what landed. Every command-restricted transfer
 ends with hostB issuing a signed receipt: the files it published with their
-sizes (and BLAKE3 digests with `--receipt hashed`), what it deleted, the hashes
+sizes (and BLAKE3 digests with `--receipt hashed`), in-place files from the
+moment their bytes change and marked complete only once their final step ran,
+what it deleted, the hashes
 it computed for `--verify-only` and `--hash`, how many requests it refused, and
 its entry and byte totals, bound to the enrollment and the one-time request ID
 and signed with a key only hostB holds. HostA relays the receipt as one line
 of its output; the local machine verifies it against the public key recorded
 at enrollment and fails the transfer if the receipt is missing, does not
-verify, names a different grant, or records refused requests, whatever hostA
-reported. `-v` prints the verified totals. Enrollments made before receipts
+verify, names a different grant, records refused requests, or lists an
+incomplete in-place file while hostA reported success. `-v` prints the verified totals. Enrollments made before receipts
 existed must be refreshed with `syq enrollment add` first. The receipt is hostB's view
 of hostB: it says nothing about what hostA omitted or invented. The boundary runs between the two hosts, not inside hostB: the receiver
 runs as the enrolled account and remembers what it created by pathname, so a

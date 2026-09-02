@@ -125,6 +125,7 @@ fn settle_receipt(
     payload: Option<&[u8]>,
     src_host: &str,
     dst_host: &str,
+    orchestrator_succeeded: bool,
     verbose: bool,
 ) -> Result<()> {
     let Some(payload) = payload else {
@@ -154,6 +155,16 @@ fn settle_receipt(
                 .map(String::as_str)
                 .unwrap_or("(no message recorded)")
         );
+    }
+    if receipt.incomplete_count > 0 {
+        let message = format!(
+            "{} in-place file(s) on {dst_host} were written but never completed",
+            receipt.incomplete_count
+        );
+        if orchestrator_succeeded {
+            bail!("{message}, yet {src_host} reported success");
+        }
+        eprintln!("syq: warning: {message}");
     }
     if verbose {
         eprintln!(
@@ -1029,6 +1040,7 @@ fn run_remote(
             receipt_payload.as_deref(),
             &coordinator_host,
             peer.host.as_deref().unwrap_or("the peer endpoint"),
+            code == 0,
             args.verbose > 0,
         )?;
     }
@@ -1336,7 +1348,14 @@ mod tests {
             request_id,
         };
         let mut ledger = crate::receipt::Ledger::default();
-        ledger.published.insert(b"/dst/a".to_vec(), (3, None));
+        ledger.published.insert(
+            b"/dst/a".to_vec(),
+            crate::receipt::Published {
+                size: 3,
+                digest: None,
+                complete: true,
+            },
+        );
         let encode = |ledger: &crate::receipt::Ledger, request_id| {
             let receipt = ledger
                 .receipt(enrollment_id, request_id, 1_900_000_000, 1, 3)
@@ -1350,6 +1369,7 @@ mod tests {
                 payload.map(str::as_bytes),
                 "host-a",
                 "host-b",
+                true,
                 false,
             )
         };
@@ -1368,6 +1388,29 @@ mod tests {
         refused.record_refusal("receiver mutation is outside the signed destination scopes");
         let refused = encode(&refused, request_id);
         assert!(settle(&expectation, Some(&refused)).is_err());
+
+        // An incomplete in-place file contradicts a successful orchestrator
+        // but is only a warning beside a failure it already reported.
+        let mut partial = crate::receipt::Ledger::default();
+        partial.published.insert(
+            b"/dst/image".to_vec(),
+            crate::receipt::Published {
+                size: 9,
+                digest: None,
+                complete: false,
+            },
+        );
+        let partial = encode(&partial, request_id);
+        assert!(settle(&expectation, Some(&partial)).is_err());
+        settle_receipt(
+            &expectation,
+            Some(partial.as_bytes()),
+            "host-a",
+            "host-b",
+            false,
+            false,
+        )
+        .unwrap();
 
         // And it must verify against the enrollment's key.
         let stranger = ssh_key::PrivateKey::new(
