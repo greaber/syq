@@ -25,11 +25,49 @@ const COMPACT_HASH_BYTES: usize = 10;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
 #[cfg(target_os = "linux")]
-fn is_nfs_file(file: &File) -> bool {
+#[derive(Clone, Copy, Default)]
+struct FileSystemTraits {
+    is_nfs: bool,
+    synchronous: bool,
+    measured_local_source: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CopyLocalPolicy {
+    inplace: bool,
+    allow_sequential_nfs_fallback: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn file_system_traits(file: &File) -> FileSystemTraits {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
     unsafe {
-        libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) == 0
-            && stats.assume_init().f_type as u32 == libc::NFS_SUPER_MAGIC as u32
+        if libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) != 0 {
+            return FileSystemTraits::default();
+        }
+        let stats = stats.assume_init();
+        let file_system_type = stats.f_type as u32;
+        let mut mount_stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // Unknown mount flags are treated as synchronous so a metadata-query
+        // failure cannot opt an unmeasured topology into the shortcut.
+        let synchronous = if libc::fstatvfs(file.as_raw_fd(), mount_stats.as_mut_ptr()) == 0 {
+            mount_stats.assume_init().f_flag & libc::ST_SYNCHRONOUS != 0
+        } else {
+            true
+        };
+        FileSystemTraits {
+            is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
+            synchronous,
+            // Keep the automatic optimization confined to the source
+            // filesystems actually exercised by the ext-family and XFS NFS
+            // benchmarks. Unknown or network-backed sources retain adaptive
+            // range reads until measured independently.
+            measured_local_source: matches!(
+                file_system_type,
+                t if t == libc::EXT4_SUPER_MAGIC as u32
+                    || t == libc::XFS_SUPER_MAGIC as u32
+            ),
+        }
     }
 }
 
@@ -2512,15 +2550,19 @@ impl FsOps {
     /// cannot be offloaded, use one sequential userspace writer instead. Other
     /// unsupported filesystems return "EXDEV" for the parallel streaming path.
     #[cfg(target_os = "linux")]
-    pub fn copy_local(
+    fn copy_local(
         &mut self,
         src: &[u8],
         dst: &[u8],
-        inplace: bool,
+        policy: CopyLocalPolicy,
         partial_id: &PartialId,
         size: u64,
         mode: u32,
     ) -> Result<()> {
+        let CopyLocalPolicy {
+            inplace,
+            allow_sequential_nfs_fallback,
+        } = policy;
         let sp = resolve(src);
         let s = open_existing_regular(&sp, false)?;
         // The kernel copy reads the source through the page cache, so the
@@ -2564,12 +2606,36 @@ impl FsOps {
             }
             d
         };
-        let destination_is_nfs = is_nfs_file(&d)
-            || cfg!(debug_assertions) && std::env::var_os("SYQ_TEST_COPY_LOCAL_NFS").is_some();
+        let source_fs = file_system_traits(&s);
+        let destination_fs = file_system_traits(&d);
+        #[cfg(debug_assertions)]
+        let source_fs = FileSystemTraits {
+            is_nfs: source_fs.is_nfs
+                || std::env::var_os("SYQ_TEST_COPY_LOCAL_SOURCE_NFS").is_some(),
+            measured_local_source: source_fs.measured_local_source
+                || std::env::var_os("SYQ_TEST_COPY_LOCAL_SOURCE_DISK").is_some(),
+            ..source_fs
+        };
+        #[cfg(debug_assertions)]
+        let destination_fs = FileSystemTraits {
+            is_nfs: destination_fs.is_nfs || std::env::var_os("SYQ_TEST_COPY_LOCAL_NFS").is_some(),
+            synchronous: destination_fs.synchronous
+                || std::env::var_os("SYQ_TEST_COPY_LOCAL_NFS_SYNC").is_some(),
+            ..destination_fs
+        };
+        // The measured fast path is a local filesystem feeding an ordinary
+        // asynchronous NFS mount. NFS reads can benefit from parallelism, and
+        // a synchronous destination makes every write syscall wait for the
+        // server, so let the normal adaptive range path handle either case.
+        let use_sequential_nfs_fallback = allow_sequential_nfs_fallback
+            && !source_fs.is_nfs
+            && source_fs.measured_local_source
+            && destination_fs.is_nfs
+            && !destination_fs.synchronous;
         let mut userspace_fallback = false;
         #[cfg(debug_assertions)]
         if !inplace && std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
-            if destination_is_nfs {
+            if use_sequential_nfs_fallback {
                 userspace_fallback = true;
             } else {
                 drop(d);
@@ -2600,7 +2666,7 @@ impl FsOps {
                         libc::EXDEV | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL
                     )
                 {
-                    if destination_is_nfs {
+                    if use_sequential_nfs_fallback {
                         userspace_fallback = true;
                         continue;
                     }
@@ -2655,11 +2721,11 @@ impl FsOps {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub fn copy_local(
+    fn copy_local(
         &mut self,
         _src: &[u8],
         _dst: &[u8],
-        _inplace: bool,
+        _policy: CopyLocalPolicy,
         _partial_id: &PartialId,
         _size: u64,
         _mode: u32,
@@ -3118,11 +3184,22 @@ impl FsOps {
                 src,
                 dst,
                 inplace,
+                allow_sequential_nfs_fallback,
                 partial_id,
                 size,
                 mode,
             } => self
-                .copy_local(src, dst, *inplace, partial_id, *size, *mode)
+                .copy_local(
+                    src,
+                    dst,
+                    CopyLocalPolicy {
+                        inplace: *inplace,
+                        allow_sequential_nfs_fallback: *allow_sequential_nfs_fallback,
+                    },
+                    partial_id,
+                    *size,
+                    *mode,
+                )
                 .map(|_| Response::Ok),
             Request::PutSmallBatch(puts) => Ok(Response::Applied(
                 puts.iter()

@@ -1254,10 +1254,13 @@ When source and destination are on the same machine, syq copies each file with
 does a reflink or a straight in-kernel copy, and on NFS 4.2 the *server* copies
 the file internally (no client round trip). Measured: a single 8 GB file
 /raid→/raid at 24.8 GB/s vs 2.5 GB/s for `cp`; NFS→NFS at 3.3 GB/s vs 0.4.
-If the kernel cannot offload a cross-mount copy *into NFS*, the receiver uses
-one sequential reader/writer for that file. That avoids both per-inode NFS
-write contention and needless transport framing and hashing. An unsupported
-non-NFS destination retains the parallel, hash-resumable streaming fallback.
+If the kernel cannot offload a cross-mount copy from a recognized local disk
+filesystem into an ordinary asynchronous NFS mount, the receiver automatically
+uses one sequential reader/writer for that file. That avoids both per-inode NFS
+write contention and needless transport framing and hashing. NFS-to-NFS copies,
+other source filesystem types, synchronous NFS destinations, an explicit fixed
+worker count above one, and unsupported non-NFS destinations retain the
+parallel, hash-resumable streaming fallback.
 `-c`, any existing partial, and `--bwlimit` disable the receiver-side shortcut.
 Small new bwlimited files that fit in one paced transfer block retain the
 `PutSmall` exception described above.
@@ -1268,11 +1271,14 @@ Local↔NFS copies are a local→local syq run (`syq rsync -a -j16 /raid/x /mnt/
 and benefit from parallelism across files and on reads: measured on a 20 Gbit
 NFSv4.2 mount, reads of one 4 GB file reached 858 MiB/s with `-j8` vs ~400 MB/s
 for `cp`, and 20,000 small files were written in 28 s vs 72 s for `cp -r`.
-Writes into one NFS inode are instead serialized by the receiver when the
-kernel cannot offload them. On a fresh 4 GiB `/raid`→NFS copy, that changed syq
-from 21.44 s with 32 range writers to a 9.93 s median with one sequential
-receiver-side writer, versus a 10.94 s median for `cp` (two interleaved runs).
-The reciprocal NFS→`/raid` copy retained parallel range reads at 1.13 GiB/s.
+Writes from a recognized local disk filesystem into one asynchronous NFS inode
+are instead serialized automatically by the receiver when the kernel cannot
+offload them.
+On a fresh 4 GiB `/raid`→NFS copy, that changed syq from 21.44 s with 32 range
+writers to a 9.93 s median with one sequential receiver-side writer, versus a
+10.94 s median for `cp` (two interleaved runs). Synchronous destinations and
+NFS sources retain the adaptive parallel path; the reciprocal NFS→`/raid` copy
+reached 1.13 GiB/s with parallel range reads.
 Separate files still run concurrently and have reached ~650 MB/s in aggregate.
 Mounting with `nconnect=8` (NFS 4.1+; needs an unmount/mount, not a remount) can
 add headroom for those concurrent files and other NFS traffic.

@@ -6342,12 +6342,49 @@ fn copy_local_nfs_exdev_uses_sequential_receiver_fallback() {
         .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_NFS", "1")
+        .env("SYQ_TEST_COPY_LOCAL_SOURCE_DISK", "1")
         .env("SYQ_TEST_FAIL_READ_RANGE", "1")
         .run()
         .unwrap();
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), contents);
     assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_nfs_exdev_keeps_automatic_parallel_cases() {
+    let cases: &[(&[&str], Option<&str>)] = &[
+        (&[], Some("SYQ_TEST_COPY_LOCAL_SOURCE_NFS")),
+        (&[], Some("SYQ_TEST_COPY_LOCAL_NFS_SYNC")),
+        (&["-j", "2"], None),
+    ];
+    for (extra_args, extra_env) in cases {
+        let t = Tmp::new();
+        let contents = vec![b'x'; 8 * 1024 * 1024];
+        write(&t.path("src"), &contents);
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut command = compat_command();
+        command
+            .args(["-a", "--no-progress"])
+            .args(*extra_args)
+            .args([&src, &dst])
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_NFS", "1")
+            .env("SYQ_TEST_COPY_LOCAL_SOURCE_DISK", "1")
+            .env("SYQ_TEST_FAIL_READ_RANGE", "1");
+        if let Some(name) = extra_env {
+            command.env(name, "1");
+        }
+        let out = command.run().unwrap();
+        assert!(!out.status.success(), "case unexpectedly used one writer");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("test read-range failure"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[cfg(debug_assertions)]

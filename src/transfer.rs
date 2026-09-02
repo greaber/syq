@@ -53,6 +53,9 @@ pub struct Opts {
     pub verify_only: bool,
     pub inplace: bool,
     pub same_host: bool,
+    /// Automatic copies and explicit -j1 may use one direct userspace writer
+    /// for the proven local-filesystem -> asynchronous-NFS topology.
+    pub allow_sequential_nfs_fallback: bool,
     pub dst_remote: bool,
     pub restricted_receiver: bool,
     pub dry_run: bool,
@@ -846,6 +849,7 @@ pub fn run(args: Args) -> Result<i32> {
         verify_only: args.verify_only,
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
+        allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
         dry_run: args.dry_run,
@@ -5323,6 +5327,7 @@ impl Worker {
             src: job.src.clone(),
             dst: job.dst.clone(),
             inplace,
+            allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
             partial_id: self.partial_id(),
             size: job.entry.size,
             mode,

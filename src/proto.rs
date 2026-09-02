@@ -391,12 +391,14 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Receiver-side copy of a same-machine file (copy_file_range when
-    /// possible, sequential userspace fallback for an NFS destination).
-    /// Err("EXDEV") tells the caller to use the normal streaming path.
+    /// possible, optionally a sequential userspace fallback for a local
+    /// source and asynchronous NFS destination). Err("EXDEV") tells the
+    /// caller to use the normal streaming path.
     CopyLocal {
         src: PathBytes,
         dst: PathBytes,
         inplace: bool,
+        allow_sequential_nfs_fallback: bool,
         partial_id: PartialId,
         size: u64,
         mode: u32,
