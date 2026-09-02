@@ -3308,43 +3308,27 @@ impl Planner<'_> {
         }
         self.progress.scanned.fetch_add(1, Relaxed);
 
-        // Explicit destinations seen (duplicates are hard errors), what the
-        // planner was given for each destination path, and which of those
-        // were synthesized ancestors an explicit entry may still upgrade.
-        let mut manifest_dsts: HashSet<PathBytes> = HashSet::new();
+        // Phase 1: read and validate the whole manifest before any entry is
+        // applied. Parse errors, duplicate destinations, and declared-kind
+        // ancestor conflicts refuse the run (the --into container was
+        // already created, as with --files-from); the price is memory
+        // proportional to the manifest, which the multi-source preflight
+        // already accepts. Conflicts only observable
+        // at execution (an undeclared ancestor that is not a directory,
+        // destination state) still fail entries individually below.
+        let entries = read_mapping_manifest(reader)?;
+
+        // Phase 2: stat sources and plan in chunks, overlapping with
+        // transfer work exactly like any other single-source scan. `emitted`
+        // is what the planner was given for each destination path;
+        // `synthesized` are implicit ancestors an explicit entry may still
+        // upgrade.
         let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
         let mut synthesized: HashSet<PathBytes> = HashSet::new();
-        let mut line_number = 0u64;
-        let mut done = false;
-        while !done {
-            let mut chunk: Vec<(u64, ManifestEntry)> = Vec::new();
-            while chunk.len() < crate::scan::BATCH {
-                let mut line = String::new();
-                let n = reader
-                    .read_line(&mut line)
-                    .map_err(|e| anyhow::anyhow!("--mapping: read: {e}"))?;
-                if n == 0 {
-                    done = true;
-                    break;
-                }
-                line_number += 1;
-                let text = line.trim_end_matches('\n').trim_end_matches('\r');
-                if text.is_empty() {
-                    continue;
-                }
-                let entry = parse_manifest_entry(text)
-                    .map_err(|e| anyhow::anyhow!("--mapping line {line_number}: {e}"))?;
-                if !manifest_dsts.insert(entry.dst.clone()) {
-                    bail!(
-                        "--mapping line {line_number}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)",
-                        display(&entry.dst)
-                    );
-                }
-                chunk.push((line_number, entry));
-            }
-            if chunk.is_empty() {
-                continue;
-            }
+        let mut remaining = entries.into_iter().peekable();
+        while remaining.peek().is_some() {
+            let chunk: Vec<(u64, ManifestEntry)> =
+                remaining.by_ref().take(crate::scan::BATCH).collect();
             let stats = stat_many(
                 src,
                 chunk.iter().map(|(_, m)| join(src_root, &m.src)).collect(),
@@ -3588,7 +3572,6 @@ impl Planner<'_> {
                 Claim::Weak if e.kind == Kind::Other => {
                     // Unknown type: never transferred.
                     self.progress.files_excluded.fetch_add(1, Relaxed);
-                    self.emit_mapping_entry_skipped(&e, &dst_rel);
                 }
                 Claim::Weak => {
                     // Symlink without -l, special without -D.
@@ -3597,7 +3580,6 @@ impl Planner<'_> {
                             .eprintln(&format!("skipping non-regular file \"{rel}\""));
                     }
                     self.progress.files_excluded.fetch_add(1, Relaxed);
-                    self.emit_mapping_entry_skipped(&e, &dst_rel);
                 }
                 Claim::File { .. } | Claim::Leaf => others.push(Planned {
                     src,
@@ -4665,37 +4647,6 @@ impl Planner<'_> {
                 attempts: None,
                 retryable: Some(retryable),
                 message: Some(message),
-            });
-        }
-    }
-
-    /// A mapping entry excluded by policy (a special file or unknown type
-    /// under the fixed -rlt fidelity): visible in the results stream as a
-    /// skipped operation, not a failure — the same class as a --min-size
-    /// exclusion, and never selected by the retry filter.
-    fn emit_mapping_entry_skipped(&self, e: &Entry, dst_rel: &[u8]) {
-        if !self.mapping_mode {
-            return;
-        }
-        if let Some(results) = self.progress.results_writer() {
-            let (action, kind) = match e.kind {
-                Kind::Symlink => ("create_symlink", "symlink"),
-                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
-                    ("create_special", "special")
-                }
-                _ => ("transfer_file", "file"),
-            };
-            let src = self.mapping_source_rel(dst_rel);
-            results.emit_operation(&crate::results::OperationRecord {
-                action,
-                dst: dst_rel,
-                src: src.as_deref(),
-                kind,
-                disposition: "skipped",
-                bytes: None,
-                attempts: None,
-                retryable: None,
-                message: Some("not copied by native cp's fixed -rlt policy"),
             });
         }
     }
@@ -6767,4 +6718,58 @@ fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
     }
     let rest = path.strip_prefix(dst_root)?;
     Some(rest.strip_prefix(b"/").unwrap_or(rest))
+}
+
+/// Phase-1 manifest read for `--mapping`: parse every line and run the
+/// parse-level preflight (duplicate destinations; an entry whose destination
+/// is a strict ancestor of another entry's destination must not declare a
+/// non-directory kind) before anything is written. Whether an undeclared
+/// ancestor really is a directory is only knowable from the source and is
+/// checked during execution.
+fn read_mapping_manifest(reader: &mut dyn std::io::BufRead) -> Result<Vec<(u64, ManifestEntry)>> {
+    let mut entries: Vec<(u64, ManifestEntry)> = Vec::new();
+    let mut declared: std::collections::HashMap<PathBytes, Option<DeclaredKind>> =
+        std::collections::HashMap::new();
+    let mut line_number = 0u64;
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| anyhow::anyhow!("--mapping: read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        line_number += 1;
+        let text = line.trim_end_matches('\n').trim_end_matches('\r');
+        if text.is_empty() {
+            continue;
+        }
+        let entry = parse_manifest_entry(text)
+            .map_err(|e| anyhow::anyhow!("--mapping line {line_number}: {e}"))?;
+        if declared.insert(entry.dst.clone(), entry.kind).is_some() {
+            bail!(
+                "--mapping line {line_number}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)",
+                display(&entry.dst)
+            );
+        }
+        entries.push((line_number, entry));
+    }
+    for (line_number, entry) in &entries {
+        for (i, &byte) in entry.dst.iter().enumerate() {
+            if byte != b'/' {
+                continue;
+            }
+            if let Some(Some(kind)) = declared.get(&entry.dst[..i]) {
+                if !matches!(kind, DeclaredKind::Dir) {
+                    bail!(
+                        "--mapping line {line_number}: destination ancestor {} of {} is mapped with kind {:?}, not dir",
+                        display(&entry.dst[..i]),
+                        display(&entry.dst),
+                        kind.label()
+                    );
+                }
+            }
+        }
+    }
+    Ok(entries)
 }

@@ -8366,7 +8366,7 @@ fn entry_line(src: &str, dst: &str, kind: Option<&str>) -> String {
 }
 
 #[test]
-fn native_cp_mapping_renames_creates_ancestors_and_streams_stdin() {
+fn native_cp_mapping_renames_creates_ancestors_and_reads_stdin() {
     let t = Tmp::new();
     write(&t.path("src/Berlin/IMG.JPG"), b"img");
     write(&t.path("src/Notes.TXT"), b"hello");
@@ -8836,14 +8836,53 @@ fn native_cp_mapping_specials_are_visible_skips_not_failures() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    let skipped = lines
-        .iter()
-        .find(|v| v["type"] == "operation_result" && v["dst"]["value"] == "pipe")
-        .expect("skipped record");
-    assert_eq!(skipped["disposition"], "skipped");
-    assert_eq!(skipped["kind"], "special");
-    assert!(skipped.get("retryable").is_none());
+    // Excluded entries are aggregate-only: no per-entry record, no failure.
+    assert!(
+        !lines
+            .iter()
+            .any(|v| v["type"] == "operation_result" && v["dst"]["value"] == "pipe"),
+        "policy exclusions appear only in terminal aggregates"
+    );
     let last = lines.last().unwrap();
     assert_eq!(last["status"], "success");
     assert_eq!(last["files_excluded"], 1);
+}
+
+#[test]
+fn native_cp_mapping_whole_manifest_preflight_writes_nothing() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    write(&t.path("src/b.txt"), b"b");
+    // A duplicate destination far apart: refused with nothing written,
+    // even though the first entries were valid.
+    let mut manifest = String::new();
+    manifest.push_str(&entry_line("a.txt", "same.txt", None));
+    for i in 0..5000 {
+        manifest.push_str(&entry_line("b.txt", &format!("fill/{i}.txt"), None));
+    }
+    manifest.push_str(&entry_line("b.txt", "same.txt", None));
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate destination"));
+    // The --into container is created eagerly as with --files-from, but no
+    // entry may have been applied.
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+    // Declared-kind ancestor conflict is refused up front too.
+    let conflict = format!(
+        "{}{}",
+        entry_line("a.txt", "p", Some("file")),
+        entry_line("b.txt", "p/q.txt", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(conflict.as_bytes()),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not dir"));
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
 }
