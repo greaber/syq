@@ -1171,6 +1171,7 @@ impl FsOps {
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }
             | Request::TransportStats
+            | Request::Receipt
             | Request::Shutdown => {}
         }
         Ok(req)
@@ -3519,6 +3520,7 @@ impl FsOps {
             | Request::Scan { .. }
             | Request::NativeRemove { .. }
             | Request::TransportStats
+            | Request::Receipt
             | Request::Shutdown
             | Request::TcpListen { .. } => Err(anyhow!("unexpected request")),
         };

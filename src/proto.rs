@@ -466,6 +466,9 @@ pub enum Request {
     /// socket. SSH data transports report None at the orchestrator instead of
     /// sending this request.
     TransportStats,
+    /// Ask a command-restricted receiver for its signed receipt. Issuing it
+    /// ends the grant's mutation authority.
+    Receipt,
     Shutdown,
 }
 
@@ -527,6 +530,8 @@ pub enum Response {
     },
     Path(PathBytes),
     TransportStats(Option<TcpSocketStats>),
+    /// A signed receipt envelope (see receipt.rs).
+    Receipt(#[serde(with = "serde_bytes")] Vec<u8>),
     Ok,
     Err(String),
 }

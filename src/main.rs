@@ -13,6 +13,7 @@ mod native_map;
 mod native_rm;
 mod progress;
 mod proto;
+mod receipt;
 mod remote_helper;
 mod restricted;
 mod results;
