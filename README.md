@@ -481,15 +481,22 @@ local→hostA login and ordinary enrollment SSH sessions, but hostA never gets
 access to it.
 
 The restriction protects hostB; it does not make hostA a trustworthy source.
-A compromised hostA can omit source files, alter their contents, lie about
-source metadata, or stop the transfer. It still cannot escape the signed
-destination scopes or independently authenticate to hostB with the enrollment
+A compromised hostA can invent the source tree wholesale: names, object types,
+metadata, and file bytes need not correspond to anything on hostA's filesystem.
+It can also omit entries or stop the transfer. HostB can enforce only signed
+command properties visible in receiver requests, such as destination scopes,
+publication and preservation policy, resource limits, and whether a requested
+mutation could have survived the signed filter traversal. HostA still cannot
+escape those checks or independently authenticate to hostB with the enrollment
 key.
 
 The command-restricted path requires encrypted TCP data connections. Ordered
 filter rules and `--delete-excluded` are included in a V3 signed grant: the
 receiver requires destination scans to use the exact policy and rejects
-mutations of excluded paths unless their deletion was explicitly authorized.
+mutations that could only descend through a pruned source directory unless
+their deletion was explicitly authorized. Each source's actual mapped
+destination root is signed, so an explicitly selected named source remains a
+root even when it overlaps an ignored path from another contents source.
 The signed publication policy distinguishes atomic staged writes from
 `--inplace`; in-place requests use descriptor-relative opens and writes beneath
 the enrolled root and cannot silently switch back to staged publication.

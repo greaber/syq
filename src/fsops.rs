@@ -2674,12 +2674,15 @@ impl FsOps {
             && !destination_fs.synchronous;
         let mut userspace_fallback = false;
         #[cfg(debug_assertions)]
-        if !inplace && std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
+        if std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
             if use_sequential_nfs_fallback {
                 userspace_fallback = true;
             } else {
                 drop(d);
-                fs::remove_file(&target).with_context(|| format!("remove {}", target.display()))?;
+                if !inplace {
+                    fs::remove_file(&target)
+                        .with_context(|| format!("remove {}", target.display()))?;
+                }
                 bail!("EXDEV");
             }
         }
@@ -2710,14 +2713,11 @@ impl FsOps {
                         userspace_fallback = true;
                         continue;
                     }
-                    if inplace {
-                        drop(d);
-                        let _ = fs::remove_file(&target);
-                    } else {
+                    drop(d);
+                    if !inplace {
                         // The planner probed before this empty sidecar existed.
                         // A content-identical fallback completes through its
                         // retained basis fd and would otherwise orphan it.
-                        drop(d);
                         fs::remove_file(&target)
                             .with_context(|| format!("remove {}", target.display()))?;
                     }

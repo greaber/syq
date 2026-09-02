@@ -82,6 +82,7 @@ const MAX_COPY_BYTES: u64 = i64::MAX as u64;
 const MAX_CONNECTIONS: u16 = 64;
 const MAX_FILTER_RULES: usize = 4096;
 const MAX_FILTER_RULE_BYTES: usize = 4096;
+const MAX_FILTER_ROOTS: usize = 1024;
 const CLAIM_MAGIC: &[u8; 8] = b"SYQCLM\0\0";
 const CLAIM_VERSION: u16 = 1;
 const CLAIM_RECORD_LEN: usize = CLAIM_MAGIC.len() + 2 + 8 + 32 + 32;
@@ -320,13 +321,15 @@ pub(crate) struct FilterPolicyV3 {
     /// Ordered gitignore-style rules, anchored independently at every source
     /// root mapped into the signed destination scopes.
     pub ignore: Vec<String>,
+    /// Canonical receiver-side roots produced by those source mappings.
+    pub destination_roots: Vec<Vec<u8>>,
     /// Permit ignored destination paths to be removed by a prune operation.
     pub delete_excluded: bool,
 }
 
 impl FilterPolicyV3 {
     fn is_active(&self) -> bool {
-        !self.ignore.is_empty() || self.delete_excluded
+        !self.ignore.is_empty() || !self.destination_roots.is_empty() || self.delete_excluded
     }
 
     fn validate(&self, grant: &GrantV1) -> Result<()> {
@@ -339,6 +342,35 @@ impl FilterPolicyV3 {
             }
         }
         crate::scan::build_ignore(&self.ignore).context("validate signed filter policy")?;
+        if self.ignore.is_empty() {
+            if !self.destination_roots.is_empty() {
+                bail!("signed filter roots require filter rules");
+            }
+        } else {
+            if self.destination_roots.is_empty() || self.destination_roots.len() > MAX_FILTER_ROOTS
+            {
+                bail!("signed filter-root count is outside the supported range");
+            }
+            let GrantOperationV1::Copy(copy) = &grant.operation;
+            for root in &self.destination_roots {
+                validate_absolute_path(root)?;
+                if !copy.mutation_scopes.iter().any(|scope| {
+                    root == &scope.path
+                        || (scope.descendants
+                            && root.starts_with(&scope.path)
+                            && root.get(scope.path.len()) == Some(&b'/'))
+                }) {
+                    bail!("signed filter root is outside the destination mutation scopes");
+                }
+            }
+            if self
+                .destination_roots
+                .windows(2)
+                .any(|roots| roots[0] >= roots[1])
+            {
+                bail!("signed filter roots must be sorted and unique");
+            }
+        }
         if self.delete_excluded {
             let GrantOperationV1::Copy(copy) = &grant.operation;
             if copy.policy.deletion == DeletionPolicyV1::Forbid {
@@ -501,6 +533,10 @@ pub(crate) fn sign_grant(
     // no-op so such commands retain the oldest compatible grant encoding.
     if filters.ignore.is_empty() {
         filters.delete_excluded = false;
+        filters.destination_roots.clear();
+    } else {
+        filters.destination_roots.sort();
+        filters.destination_roots.dedup();
     }
     filters.validate(&grant)?;
     // Keep emitting the oldest form capable of representing the request so
@@ -2233,6 +2269,7 @@ mod tests {
 
         let filters = FilterPolicyV3 {
             ignore: vec!["*.tmp".into(), "!keep.tmp".into()],
+            destination_roots: vec![b"/srv/archive/project".to_vec()],
             delete_excluded: false,
         };
         let filtered = sign_grant(fixture_grant(46), 0, filters.clone(), &private).unwrap();
@@ -2247,6 +2284,13 @@ mod tests {
         )
         .expect("OpenSSH must accept the signed filter extension");
         assert_eq!(verified.into_parts().2, filters);
+
+        let outside = FilterPolicyV3 {
+            ignore: vec!["*.tmp".into()],
+            destination_roots: vec![b"/srv/outside".to_vec()],
+            delete_excluded: false,
+        };
+        assert!(sign_grant(fixture_grant(47), 0, outside, &private).is_err());
     }
 
     #[test]

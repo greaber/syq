@@ -260,17 +260,7 @@ impl RestrictedAuthority {
     ) -> Result<Self> {
         let GrantOperationV1::Copy(copy) = grant.operation;
         let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
-        let filter_roots = match copy.policy.placement {
-            DestinationPlacementV1::ExactPath | DestinationPlacementV1::DirectoryContents => {
-                vec![copy.destination.clone()]
-            }
-            DestinationPlacementV1::DirectoryAsChild => copy
-                .mutation_scopes
-                .iter()
-                .filter(|scope| scope.path != copy.destination)
-                .map(|scope| scope.path.clone())
-                .collect(),
-        };
+        let filter_roots = filters.destination_roots.clone();
         let root_path = Path::new(&config.root);
         let destination = Path::new(std::ffi::OsStr::from_bytes(&copy.destination));
         let relative = destination.strip_prefix(root_path).with_context(|| {
@@ -406,10 +396,10 @@ impl RestrictedAuthority {
             under_root = true;
             let relative = &path[root.len() + 1..];
             let relative = Path::new(OsStr::from_bytes(relative));
-            if !matcher
-                .matched_path_or_any_parents(relative, is_dir)
-                .is_ignore()
-            {
+            let pruned_by_ancestor = relative.ancestors().skip(1).any(|ancestor| {
+                !ancestor.as_os_str().is_empty() && matcher.matched(ancestor, true).is_ignore()
+            });
+            if !pruned_by_ancestor && !matcher.matched(relative, is_dir).is_ignore() {
                 return false;
             }
         }
@@ -2189,6 +2179,28 @@ fn grant_for(
     Ok(grant)
 }
 
+fn filter_destination_roots(
+    args: &Args,
+    sources: &[Location],
+    destination: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    let mut roots = Vec::with_capacity(sources.len());
+    for source in sources {
+        if args.placement == Placement::As || source.copies_contents() {
+            roots.push(destination.to_vec());
+        } else {
+            let basename = source.basename();
+            if basename.is_empty() {
+                bail!("named source has no destination basename for signed filters");
+            }
+            roots.push(crate::fsops::join(destination, &basename));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 pub(crate) fn prepare_transfer(
     args: &Args,
     sources: &[Location],
@@ -2240,6 +2252,11 @@ pub(crate) fn prepare_transfer(
         args.bwlimit_bytes,
         FilterPolicyV3 {
             ignore: args.ignore_lines.clone(),
+            destination_roots: filter_destination_roots(
+                args,
+                sources,
+                canonical_destination.as_bytes(),
+            )?,
             delete_excluded: args.delete_excluded,
         },
         &private_key,
@@ -2514,7 +2531,7 @@ mod tests {
         deletion: DeletionPolicyV1,
         maximum_bytes: u64,
         max_file_data_bytes_per_second: u64,
-        filters: FilterPolicyV3,
+        mut filters: FilterPolicyV3,
         publication: PublicationPolicyV1,
     ) -> RestrictedAuthority {
         let opened = Root::open(root).unwrap();
@@ -2532,6 +2549,9 @@ mod tests {
             receiver_path: "/usr/bin/syq".into(),
         };
         let destination = root.join("target");
+        if !filters.ignore.is_empty() && filters.destination_roots.is_empty() {
+            filters.destination_roots = vec![destination.as_os_str().as_bytes().to_vec()];
+        }
         let grant = GrantV1 {
             enrollment_id: id,
             target_login: "receiver".into(),
@@ -2791,7 +2811,8 @@ mod tests {
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let policy = FilterPolicyV3 {
-            ignore: vec!["ignored/".into()],
+            ignore: vec!["ignored/".into(), "!ignored/file".into()],
+            destination_roots: Vec::new(),
             delete_excluded: false,
         };
         let authority = test_authority_with_policy(
@@ -2849,6 +2870,7 @@ mod tests {
             0,
             FilterPolicyV3 {
                 ignore: policy.ignore,
+                destination_roots: Vec::new(),
                 delete_excluded: true,
             },
             PublicationPolicyV1::AtomicStaged,
@@ -2860,6 +2882,56 @@ mod tests {
         delete_excluded
             .authorize(&mut permitted_delete, false)
             .unwrap();
+    }
+
+    #[test]
+    fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let destination = root.join("target").as_os_str().as_bytes().to_vec();
+        let mut args = Args::try_parse_from([
+            "syq rsync",
+            "-r",
+            "host-a:tree/",
+            "host-a:cache",
+            "host-b:/target",
+        ])
+        .unwrap();
+        args.normalize();
+        args.placement = Placement::Into;
+        let sources = [
+            Location::parse("host-a:tree/").unwrap(),
+            Location::parse("host-a:cache").unwrap(),
+        ];
+        let destination_roots = filter_destination_roots(&args, &sources, &destination).unwrap();
+        let cache = root.join("target/cache").as_os_str().as_bytes().to_vec();
+        assert_eq!(destination_roots, vec![destination, cache.clone()]);
+
+        let authority = test_authority_with_policy(
+            &root,
+            DeletionPolicyV1::Forbid,
+            16,
+            0,
+            FilterPolicyV3 {
+                ignore: vec!["cache/".into()],
+                destination_roots,
+                delete_excluded: false,
+            },
+            PublicationPolicyV1::AtomicStaged,
+        );
+        let prepare = |path| Request::Prepare {
+            path,
+            size: 4,
+            inplace: false,
+            partial_id: [2; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        let mut cache_root = prepare(cache.clone());
+        authority.authorize(&mut cache_root, false).unwrap();
+        let mut cache_child = prepare(crate::fsops::join(&cache, b"file"));
+        authority.authorize(&mut cache_child, false).unwrap();
     }
 
     #[test]

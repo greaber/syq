@@ -6754,6 +6754,40 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
+fn native_inplace_exdev_fallback_preserves_hardlink_aliases() {
+    let t = Tmp::new();
+    let contents = vec![b'n'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+    write(&t.path("dst"), &vec![b'o'; contents.len()]);
+    fs::hard_link(t.path("dst"), t.path("alias")).unwrap();
+    set_mtime(&t.path("src"), 1_700_000_000);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+    let original_inode = fs::metadata(t.path("dst")).unwrap().ino();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--inplace",
+            "--src",
+            &t.s("src"),
+            "--as",
+            &t.s("dst"),
+            "-q",
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .output()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), contents);
+    assert_eq!(read(&t.path("alias")), contents);
+    assert_eq!(fs::metadata(t.path("dst")).unwrap().ino(), original_inode);
+    assert_eq!(fs::metadata(t.path("alias")).unwrap().ino(), original_inode);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
 fn copy_local_nfs_exdev_uses_sequential_receiver_fallback() {
     let t = Tmp::new();
     let contents = vec![b'x'; 8 * 1024 * 1024];
