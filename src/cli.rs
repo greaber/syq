@@ -755,6 +755,16 @@ struct NativeCopyFields {
     operational: NativeCopyOperationalArgs,
 }
 
+#[derive(clap::Args, Debug, Default)]
+struct NativeSizeSelectionArgs {
+    /// Skip regular source files larger than SIZE; cp-prune protects their destination paths
+    #[arg(long, value_name = "SIZE")]
+    max_size: Option<String>,
+    /// Skip regular source files smaller than SIZE; cp-prune protects their destination paths
+    #[arg(long, value_name = "SIZE")]
+    min_size: Option<String>,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "syq cp",
@@ -766,6 +776,8 @@ struct NativeCopyFields {
 struct NativeCopyCommand {
     #[command(flatten)]
     copy: NativeCopyFields,
+    #[command(flatten)]
+    size_selection: NativeSizeSelectionArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -779,6 +791,8 @@ struct NativeCopyCommand {
 struct NativeCopyPruneCommand {
     #[command(flatten)]
     copy: NativeCopyFields,
+    #[command(flatten)]
+    size_selection: NativeSizeSelectionArgs,
     /// Refuse all removals if more than N are planned
     #[arg(long, value_name = "N")]
     max_delete: Option<u64>,
@@ -824,24 +838,35 @@ fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
 fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     let mut full_argv = vec![OsString::from(command_label(interface))];
     full_argv.extend_from_slice(argv);
-    let (mut parsed, matches, max_delete) = if interface == Interface::NativeCpPrune {
+    let (mut parsed, matches, max_delete, size_selection) = if interface == Interface::NativeCpPrune
+    {
         let matches = NativeCopyPruneCommand::command()
             .try_get_matches_from(full_argv)
             .unwrap_or_else(|error| error.exit());
         let parsed = NativeCopyPruneCommand::from_arg_matches(&matches)?;
-        (parsed.copy, matches, parsed.max_delete)
+        (
+            parsed.copy,
+            matches,
+            parsed.max_delete,
+            parsed.size_selection,
+        )
     } else if interface == Interface::NativeMap {
         let matches = NativeMapCommand::command()
             .try_get_matches_from(full_argv)
             .unwrap_or_else(|error| error.exit());
         let parsed = NativeMapCommand::from_arg_matches(&matches)?;
-        (parsed.copy, matches, None)
+        (
+            parsed.copy,
+            matches,
+            None,
+            NativeSizeSelectionArgs::default(),
+        )
     } else {
         let matches = NativeCopyCommand::command()
             .try_get_matches_from(full_argv)
             .unwrap_or_else(|error| error.exit());
         let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
-        (parsed.copy, matches, None)
+        (parsed.copy, matches, None, parsed.size_selection)
     };
     // `syq map` keeps `-C` out of selector paths so emitted `src` values stay
     // relative to it; the walk joins it back.
@@ -1020,6 +1045,8 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.locations = locations;
     args.delete = interface == Interface::NativeCpPrune;
     args.max_delete = max_delete;
+    args.max_size = size_selection.max_size;
+    args.min_size = size_selection.min_size;
     args.native_map_cwd = map_cwd;
     args.native_map_target = native_map_target;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
@@ -1660,6 +1687,8 @@ mod tests {
             "!keep.tmp",
             "--preserve=permissions,ownership,specials",
             "--inplace",
+            "--min-size=1K",
+            "--max-size=1M",
             "source",
             "--into",
             "destination",
@@ -1672,6 +1701,8 @@ mod tests {
         assert!(args.group);
         assert!(args.devices);
         assert!(args.inplace);
+        assert_eq!(args.min_size.as_deref(), Some("1K"));
+        assert_eq!(args.max_size.as_deref(), Some("1M"));
     }
 
     #[test]

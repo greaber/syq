@@ -582,6 +582,73 @@ fn native_filters_apply_to_copy_and_protect_pruned_paths() {
 }
 
 #[test]
+fn native_size_limits_select_regular_files_and_protect_pruned_paths() {
+    let t = Tmp::new();
+    write(&t.path("src/small"), b"s");
+    write(&t.path("src/in-range"), b"1234");
+    write(&t.path("src/large"), b"12345678");
+
+    run_native_ok(&[
+        "cp",
+        "--min-size",
+        "2",
+        "--max-size",
+        "4",
+        "--src-src",
+        &t.s("src"),
+        "--into",
+        &t.s("copied"),
+    ]);
+    assert_eq!(listing(&t.path("copied")), ["in-range"]);
+
+    write(&t.path("pruned/small"), b"old-small");
+    write(&t.path("pruned/in-range"), b"old-in-range");
+    write(&t.path("pruned/large"), b"old-large");
+    write(&t.path("pruned/extra"), b"remove");
+    run_native_ok(&[
+        "cp-prune",
+        "--min-size=2",
+        "--max-size=4",
+        "--src-src",
+        &t.s("src"),
+        "--into-existing",
+        &t.s("pruned"),
+    ]);
+    assert_eq!(read(&t.path("pruned/small")), b"old-small");
+    assert_eq!(read(&t.path("pruned/in-range")), b"1234");
+    assert_eq!(read(&t.path("pruned/large")), b"old-large");
+    assert!(!t.path("pruned/extra").exists());
+}
+
+#[test]
+fn native_size_limits_fail_before_destination_mutation() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    for (option, value, destination) in [
+        ("--min-size", "tiny", "min-destination"),
+        ("--max-size", "18446744073709551616", "max-destination"),
+    ] {
+        let output = native_syq(&[
+            "cp",
+            option,
+            value,
+            "--src-src",
+            &t.s("src"),
+            "--into",
+            &t.s(destination),
+        ]);
+        assert!(!output.status.success(), "{option} accepted {value:?}");
+        assert!(
+            stderr_of(&output).contains("bad size"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert!(!t.path(destination).exists());
+    }
+}
+
+#[test]
 fn native_preserve_policy_controls_permissions_and_special_files() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"new");

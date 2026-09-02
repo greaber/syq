@@ -271,6 +271,11 @@ compares existing regular-file contents with full BLAKE3 digests instead of
 trusting equal size and modification time; it does not add a second
 post-transfer verification pass. The bandwidth limit applies only to file
 data, not scanning, hashing, metadata, or pruning. A
+native copy may also use `--max-size SIZE` or `--min-size SIZE` to skip regular
+source files outside that inclusive range. Those files remain part of the
+source population, so `cp-prune` protects any corresponding destination paths.
+A command-restricted remote-to-remote copy currently refuses `--min-size` and
+refuses `--max-size` with `cp-prune`, as described below. A
 command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit, signed filters, and the selected staged or in-place publication
 policy. A receiver installed by an older syq rejects an extension or unsupported
