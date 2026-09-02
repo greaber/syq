@@ -2402,6 +2402,18 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
             "--inplace cannot be combined with --ignore-existing, --existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
+    if !args.dry_run
+        && !args.verify_only
+        && (args.delete || args.interface == Interface::NativeCpPrune)
+        && args.max_delete.is_none()
+    {
+        // The signed deletion count is the only bound on what a compromised
+        // hostA can remove inside the scope, so make it an explicit choice
+        // instead of a silent hundred-million default.
+        bail!(
+            "deletion through the command-restricted receiver needs an explicit --max-delete ceiling"
+        );
+    }
     if !args.files_from_lines.is_empty()
         || args.files_from.is_some()
         || args.native_mapping.is_some()
@@ -2453,9 +2465,43 @@ fn grant_for(
     } else {
         DeletionPolicyV1::Forbid
     };
+    let max_entries = args.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
+    let max_total_bytes = args.max_total_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    let max_file_bytes = args
+        .max_size
+        .as_deref()
+        .map(crate::cli::parse_size)
+        .transpose()?
+        .unwrap_or(DEFAULT_MAX_BYTES)
+        .min(max_total_bytes);
     let max_deletions = match deletion {
         DeletionPolicyV1::Forbid => 0,
-        DeletionPolicyV1::DeleteDestinationOnly => args.max_delete.unwrap_or(DEFAULT_MAX_ENTRIES),
+        DeletionPolicyV1::DeleteDestinationOnly => args
+            .max_delete
+            .context("deletion through the command-restricted receiver needs --max-delete")?
+            .min(max_entries),
+    };
+    let (not_after, max_runtime_seconds) = match args.max_runtime_secs {
+        None => (
+            issued_at
+                .checked_add(GRANT_VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
+                .context("signed grant expiration overflow")?,
+            DEFAULT_RUNTIME_SECONDS,
+        ),
+        Some(runtime) => {
+            if runtime > DEFAULT_RUNTIME_SECONDS {
+                bail!(
+                    "--max-runtime exceeds the {}-hour signed grant ceiling",
+                    DEFAULT_RUNTIME_SECONDS / 3600
+                );
+            }
+            (
+                issued_at
+                    .checked_add(i64::from(runtime))
+                    .context("signed grant expiration overflow")?,
+                runtime,
+            )
+        }
     };
     let copies_contents = sources.iter().any(Location::copies_contents);
     let placement = match args.placement {
@@ -2514,9 +2560,7 @@ fn grant_for(
         request_id: RequestId::random()?,
         issued_at,
         not_before: issued_at.saturating_sub(CLOCK_SKEW_SECONDS),
-        not_after: issued_at
-            .checked_add(GRANT_VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
-            .context("signed grant expiration overflow")?,
+        not_after,
         operation: GrantOperationV1::Copy(CopyOperationV1 {
             destination: destination_bytes,
             mutation_scopes,
@@ -2547,15 +2591,9 @@ fn grant_for(
                 tcp_port_hi,
             },
             limits: CopyLimitsV1 {
-                max_entries: DEFAULT_MAX_ENTRIES,
-                max_total_bytes: DEFAULT_MAX_BYTES,
-                max_file_bytes: args
-                    .max_size
-                    .as_deref()
-                    .map(crate::cli::parse_size)
-                    .transpose()?
-                    .unwrap_or(DEFAULT_MAX_BYTES)
-                    .min(DEFAULT_MAX_BYTES),
+                max_entries,
+                max_total_bytes,
+                max_file_bytes,
                 hash_block_bytes: crate::cli::parse_size(&args.block_size)?
                     .clamp(proto::MIN_HASH_BLOCK_BYTES, proto::MAX_HASH_BLOCK_BYTES),
                 max_connections: u16::try_from(if args.connections_opt.is_some() {
@@ -2565,7 +2603,7 @@ fn grant_for(
                 })
                 .context("connection maximum exceeds grant representation")?,
                 max_deletions,
-                max_runtime_seconds: DEFAULT_RUNTIME_SECONDS,
+                max_runtime_seconds,
             },
         }),
     };
@@ -4776,6 +4814,109 @@ mod tests {
             guard: None,
         };
         authority.authorize(&mut observe_container, false).unwrap();
+    }
+
+    #[test]
+    fn explicit_ceilings_are_signed_and_deletion_needs_a_stated_budget() {
+        let id = EnrollmentId::random();
+        let source = Location::parse("host-a:source").unwrap();
+        let parse = |options: &[&str]| {
+            let mut argv = vec!["syq rsync", "-r"];
+            argv.extend_from_slice(options);
+            argv.extend_from_slice(&["host-a:source", "host-b:/backup"]);
+            let mut args = Args::try_parse_from(argv).unwrap();
+            args.normalize();
+            args
+        };
+
+        // Defaults are the wide built-in ceilings and the 24-hour validity.
+        let default_args = parse(&[]);
+        let default_grant = grant_for(
+            &default_args,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup",
+        )
+        .unwrap();
+        let GrantOperationV1::Copy(default_copy) = &default_grant.operation;
+        assert_eq!(default_copy.limits.max_entries, DEFAULT_MAX_ENTRIES);
+        assert_eq!(default_copy.limits.max_total_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(default_copy.limits.max_file_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(
+            default_copy.limits.max_runtime_seconds,
+            DEFAULT_RUNTIME_SECONDS
+        );
+        assert_eq!(
+            default_grant.not_after - default_grant.not_before,
+            GRANT_VALIDITY_SECONDS
+        );
+
+        // Explicit ceilings land in the signed limits; the per-file bound
+        // never exceeds the total, and the validity shrinks to the runtime.
+        let mut ceilings = parse(&["--max-size", "3M"]);
+        ceilings.max_entries = Some(12);
+        ceilings.max_total_bytes = Some(2 << 20);
+        ceilings.max_runtime_secs = Some(1800);
+        let grant = grant_for(
+            &ceilings,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup",
+        )
+        .unwrap();
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(copy.limits.max_entries, 12);
+        assert_eq!(copy.limits.max_total_bytes, 2 << 20);
+        assert_eq!(copy.limits.max_file_bytes, 2 << 20);
+        assert_eq!(copy.limits.max_runtime_seconds, 1800);
+        assert_eq!(grant.not_after - grant.issued_at, 1800);
+        assert_eq!(grant.issued_at - grant.not_before, CLOCK_SKEW_SECONDS);
+
+        let mut too_long = parse(&[]);
+        too_long.max_runtime_secs = Some(DEFAULT_RUNTIME_SECONDS + 1);
+        assert!(grant_for(
+            &too_long,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup"
+        )
+        .is_err());
+
+        // Deletion authority must be stated; it is then capped by the entry
+        // ceiling so the grant stays self-consistent.
+        let unbounded = parse(&["--delete"]);
+        assert!(grant_for(
+            &unbounded,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup"
+        )
+        .is_err());
+        let mut bounded = parse(&["--delete", "--max-delete", "40"]);
+        bounded.max_entries = Some(30);
+        let grant = grant_for(
+            &bounded,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup",
+        )
+        .unwrap();
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(
+            copy.policy.deletion,
+            DeletionPolicyV1::DeleteDestinationOnly
+        );
+        assert_eq!(copy.limits.max_deletions, 30);
+        // A read-only run plans no deletion, so it needs no budget.
+        let preview = parse(&["--delete", "--dry-run"]);
+        let grant = grant_for(&preview, &[source], id, "backup", "/backup").unwrap();
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicyV1::Forbid);
     }
 
     #[test]

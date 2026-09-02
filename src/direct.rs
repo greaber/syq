@@ -308,6 +308,15 @@ pub fn run(
             broker: socket,
         })
     };
+    if (args.max_entries.is_some()
+        || args.max_total_bytes.is_some()
+        || args.max_runtime_secs.is_some())
+        && restricted_grant.is_none()
+    {
+        bail!(
+            "--max-entries, --max-total-bytes, and --max-runtime are command-restricted receiver ceilings, but this transfer does not use the enrolled receiver"
+        );
+    }
     // The follow target must reconnect the way we did: keep an explicit user.
     let src_target = match &srcs[0].user {
         Some(user) => format!("{user}@{src_host}"),

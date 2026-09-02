@@ -278,7 +278,12 @@ command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit, signed filters, and the selected staged or in-place publication
 policy. A receiver installed by an older syq rejects an extension or unsupported
 policy safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment
-to the current binary. `cp` additionally accepts `--mapping` and `--results`
+to the current binary. On a direct remote-to-remote copy through that
+receiver, `cp` and `cp-prune` also accept the receiver ceilings
+`--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
+(`s`, `m`, or `h`; at most 23h). They are signed into the grant and enforced
+by hostB, and are refused anywhere else because nothing would enforce them.
+`cp` additionally accepts `--mapping` and `--results`
 (see [MAPPINGS.md](MAPPINGS.md)). `cp-prune` additionally
 accepts `--max-delete`; `rm` additionally accepts `--root` and `--follow` plus
 its endpoint-side removal semantics.
@@ -528,6 +533,14 @@ receiver cannot enforce those semantics independently of hostA.
 with deletion because filtered source files could otherwise make hostA's
 deletion plan ambiguous. Explicit `-j` values above 64 are also refused; auto
 tuning may use up to that signed ceiling.
+
+Deletion through the receiver (`cp-prune`, or `--delete` on the rsync-shaped
+command) requires an explicit `--max-delete`, so the deletion authority a
+compromised hostA could exercise inside the scope is always stated on the
+command line rather than defaulting to a hundred million. The other signed
+ceilings default to 100 million entries, 8 TiB of file data, and a 23-hour
+grant; native `--max-entries`, `--max-total-bytes`, and `--max-runtime` lower
+them for one transfer, which bounds what a claimed grant is worth to hostA.
 
 `--dry-run` and `--verify-only` are cryptographically read-only: the signed
 grant marks them as such and the receiver rejects every mutation even if hostA

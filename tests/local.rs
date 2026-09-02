@@ -717,6 +717,56 @@ fn native_cp_prune_removes_only_target_extras_after_copy() {
 }
 
 #[test]
+fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"data");
+    for option in [
+        "--max-entries=5",
+        "--max-total-bytes=1M",
+        "--max-runtime=30m",
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                option,
+                "--src-src",
+                &t.s("src"),
+                "--into",
+                &t.s("dst"),
+            ])
+            .run()
+            .unwrap();
+        assert!(!out.status.success(), "{option}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("apply only to direct remote-to-remote copies"),
+            "{option}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!t.path("dst").exists(), "{option} copied anyway");
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--max-runtime=0m",
+            "--src-src",
+            &t.s("src"),
+            "--to",
+            "hostb",
+            "--into",
+            "/dst",
+        ])
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("at least one second"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn native_rejects_transport_configuration() {
     for option in ["--rsh", "--syq-path", "--no-tcp", "--relay"] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
