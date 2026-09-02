@@ -764,6 +764,17 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
     ]);
     assert_eq!(read(&t.path("followed/file")), b"data");
 
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--src",
+        &t.s("link"),
+        "--into",
+        &t.s("named-followed"),
+    ]);
+    assert_eq!(read(&t.path("named-followed/link/file")), b"data");
+    assert!(!t.path("named-followed/real").exists());
+
     fs::create_dir(t.path("through-link")).unwrap();
     symlink("../real", t.path("through-link/parent")).unwrap();
     let refused = native_syq(&[
@@ -815,6 +826,51 @@ fn native_copy_placement_links_use_the_same_follow_policy() {
     ]);
     assert_eq!(read(&t.path("created-referent")), b"new");
     assert!(t.path("dangling-link").is_symlink());
+
+    fs::create_dir_all(t.path("links")).unwrap();
+    write(&t.path("elsewhere/relative-referent"), b"old-relative");
+    symlink(
+        "../elsewhere/relative-referent",
+        t.path("links/relative-link"),
+    )
+    .unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-existing",
+        &t.s("links/relative-link"),
+    ]);
+    assert_eq!(read(&t.path("elsewhere/relative-referent")), b"new");
+    assert!(t.path("links/relative-link").is_symlink());
+
+    let absolute_referent = t.path("elsewhere/absolute-referent");
+    write(&absolute_referent, b"old-absolute");
+    symlink(&absolute_referent, t.path("links/absolute-link")).unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-existing",
+        &t.s("links/absolute-link"),
+    ]);
+    assert_eq!(read(&absolute_referent), b"new");
+    assert!(t.path("links/absolute-link").is_symlink());
+
+    symlink(
+        "../elsewhere/created-external-referent",
+        t.path("links/dangling-external-link"),
+    )
+    .unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-new",
+        &t.s("links/dangling-external-link"),
+    ]);
+    assert_eq!(read(&t.path("elsewhere/created-external-referent")), b"new");
+    assert!(t.path("links/dangling-external-link").is_symlink());
 
     fs::create_dir(t.path("real-container")).unwrap();
     symlink("real-container", t.path("container-link")).unwrap();

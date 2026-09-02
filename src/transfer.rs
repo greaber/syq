@@ -1400,7 +1400,10 @@ pub fn run(args: Args) -> Result<i32> {
     let operator_directory = if dst_is_dir {
         operator_dst_root.clone()
     } else {
-        parent_path(&operator_dst_root)
+        // Exact --follow placement selects the referent itself. Its retained
+        // authority is therefore the referent's parent, which may differ from
+        // the parent of the operator's symlink spelling.
+        parent_path(&dst_root)
     };
     let request_prefix = if dst_is_dir {
         dst_root.clone()
