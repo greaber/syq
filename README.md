@@ -355,17 +355,16 @@ receiver, `cp` also accepts the receiver ceilings
 (`s`, `m`, or `h`; at most 23h). They are signed into the grant and enforced
 by hostB, and are refused anywhere else because nothing would enforce them.
 `cp` additionally accepts `--mapping` (see [MAPPINGS.md](MAPPINGS.md))
-and `--results`, a machine-readable NDJSON outcome stream
-(see [docs/automation-v1.md](docs/automation-v1.md)). For a direct
-remote-to-remote copy, `--results -` streams the remote coordinator's
-NDJSON back to the invoking terminal. A named results file requires
-`--run-at local`; direct remote coordinators reject it rather than
-creating a surprising remote file. `--results` is also rejected with
-`--detach`, because its stream would no longer remain attached.
-`--mapping` cannot be combined with `--prune` because mapping manifests
-define no deletion region; `--results` covers `--prune` runs, including
-their removals. `--max-delete` requires `--prune`; `rm` additionally
-accepts `--root` plus its endpoint-side removal semantics.
+and `--results -`, a machine-readable NDJSON outcome stream on stdout —
+redirect to keep a file (see
+[docs/automation-v1.md](docs/automation-v1.md)). For a direct
+remote-to-remote copy the stream rides the coordinator connection back
+to the invoking terminal. `--results` is rejected with `--detach`,
+because its stream would no longer remain attached. `--mapping` cannot
+be combined with `--prune` because mapping manifests define no deletion
+region; `--results` covers `--prune` runs, including their removals.
+`--max-delete` requires `--prune`; `rm` additionally accepts `--root`
+plus its endpoint-side removal semantics.
 
 Native `cp` exposes the remote runtime and transport controls
 directly: `--rsh COMMAND`, `--syq-path PATH`, `--no-bootstrap`, `--no-tcp`,

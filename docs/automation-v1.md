@@ -1,7 +1,7 @@
 # Automation results, schema version 1
 
-`syq cp --results FILE` writes a machine-readable NDJSON stream of
-operation outcomes. This document is the contract for that stream:
+`syq cp --results -` writes a machine-readable NDJSON stream of
+operation outcomes to stdout. This document is the contract for that stream:
 what each record means, which fields a consumer may rely on, and how
 exit codes correspond to terminal statuses. The machine-checkable
 counterpart is [`schemas/automation-v1.schema.json`](../schemas/automation-v1.schema.json);
@@ -14,37 +14,29 @@ this stream, and the two formats never mix.
 ## The channel
 
 ```text
-syq cp [--prune] ... --results FILE|-
+syq cp [--prune] ... --results -
 ```
 
-One mechanism, two spellings. With `FILE`, the stream is a sidecar
-beside the ordinary human output: watch progress on the terminal,
-keep the records. With `-`, the machine owns stdout — syq suppresses
-its own human stdout (no `-q` needed); stderr stays human-readable
-and is not part of the contract. `--results` is not available on
+The stream is NDJSON on stdout. The machine owns stdout: syq
+suppresses its own human stdout output (no `-q` needed), and stderr
+stays human-readable — progress, warnings, errors — and is not part
+of the contract. `-` is the only accepted target; to keep a file,
+redirect: `--results - > run.ndjson`. syq never resolves or creates
+an operator-supplied output path — whatever opens the stream's
+destination (a shell redirect, a pipe, a supervisor) does so with its
+own authority before the run starts. `--results` is not available on
 `syq map` (its stdout is the manifest format) or, yet, on other
 commands. `--dry-run` composes; see below.
 
 The results writer lives with the transfer coordinator. For a direct
-remote-to-remote copy, use `--results -`: the stream rides the
-coordinator connection back to the invoking terminal. A named results
-file is accepted only when the coordinator is local (including
-`--run-at local`) — a local-looking pathname is never interpreted on
-a remote host. `--results` cannot be combined with `--detach`,
-because the caller would not remain attached for the stream and its
-terminal record.
-
-A `FILE` inside the transfer's own endpoints is refused before
-anything is created — the run would copy, overwrite, or prune its own
-results file. The check uses the transfer's own `~` expansion and
-resolves symlinks, and a `FILE` that turns out to be the `--mapping`
-manifest is refused before the manifest is touched. A source file
-that is the results file by any other alias — hard links included —
-is caught by filesystem identity during the scan and fails as a
-`conflict` instead of being copied. (Mapping runs check only
-destination containment up front: their source base defaults to `.`,
-and they read only manifest-listed paths — the identity check covers
-their entries.)
+remote-to-remote copy the stream rides the coordinator connection
+back to the invoking terminal, and the remote coordinator owns it end
+to end — run record, sequence numbers, and terminal record all come
+from one writer. If the transport collapses, the relayed stream can
+end without a terminal record; that is the standard unknown-outcome
+case below. `--results` cannot be combined with `--detach`, because
+the caller would not remain attached for the stream and its terminal
+record.
 
 Records land in `seq` order. Error and terminal records are flushed
 immediately. If writing the stream itself fails, syq warns once on

@@ -761,111 +761,43 @@ pub fn run(args: Args) -> Result<i32> {
         crate::fsops::check_operator_path_no_symlinks(mapping, false, false)
             .map_err(|error| anyhow::anyhow!("--mapping: {error}"))?;
     }
-    if let Some(results) = args.native_results.as_deref() {
-        // Topology refusals come before the stream exists: a refused run
-        // must not have created or truncated a results file. These mirror
-        // run_transfer's coordinator placement (native only — rsync never
-        // sets native_results).
+    let mut results_setup = args.native_results.is_some();
+    if results_setup {
+        // The stream target is stdout, full stop (the CLI accepts only
+        // `--results -`): the shell owns turning a name into a file, so
+        // syq never resolves or creates an operator-supplied output path.
         if args.detach {
             bail!(
                 "--results cannot be used with --detach because the remote result stream would not remain attached"
             );
         }
-        if results != b"-" && args.locations.len() >= 2 {
+        let coordinator_is_remote = args.locations.len() >= 2 && {
             let source = &args.locations[0];
             let dst = args.locations.last().expect("locations checked above");
             let direct_paths_are_utf8 = args
                 .locations
                 .iter()
                 .all(|location| std::str::from_utf8(&location.path).is_ok());
-            let coordinator_is_remote = source.is_remote()
+            source.is_remote()
                 && dst.is_remote()
                 && !args.relay
                 && args.run_at != RunAt::Local
-                && (args.run_at != RunAt::Auto || direct_paths_are_utf8);
-            if coordinator_is_remote {
-                bail!(
-                    "--results FILE is written by the transfer coordinator, which is remote for this copy; use --results - to stream NDJSON here or --run-at local to create a local file"
-                );
-            }
-        }
-        let out: Box<dyn std::io::Write + Send> = if results == b"-" {
-            // The machine owns stdout: suppress every human stdout line.
-            progress.suppress_stdout();
-            Box::new(std::io::stdout())
-        } else {
-            if !args.native_follow {
-                crate::fsops::check_operator_path_no_symlinks(results, false, true)
-                    .map_err(|error| anyhow::anyhow!("--results: {error}"))?;
-            }
-            let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
-            // Refuse a results file inside the transfer's own endpoints:
-            // creating it truncates whatever is there, a source walk would
-            // copy it mid-write, and --prune deletes it as destination-only.
-            // Endpoint paths go through the transfer's own `~` expansion,
-            // and comparison resolves symlinks (longest existing prefix),
-            // so an endpoint reached through an alias still matches.
-            // Mapping runs read only manifest-listed source paths, so only
-            // their destination containment is checked here (the source
-            // base defaults to `.`, which would refuse every relative
-            // path); source files that are the results file by any alias —
-            // hard links included — fail by filesystem identity below.
-            let results_operand = std::path::Path::new(OsStr::from_bytes(results));
-            let results_abs = resolved_absolute(results_operand)?;
-            for (index, location) in args.locations.iter().enumerate() {
-                if location.host.is_some() {
-                    continue;
-                }
-                let is_destination = args.locations.len() >= 2 && index + 1 == args.locations.len();
-                if !is_destination && args.native_mapping.is_some() {
-                    continue;
-                }
-                let root = resolved_absolute(&crate::fsops::resolve(&location.path))?;
-                if results_abs.starts_with(&root) {
-                    bail!(
-                        "--results {}: refusing to write inside the transfer's {} {}; the run would copy, overwrite, or delete its own results file",
-                        path.display(),
-                        if is_destination { "destination" } else { "source" },
-                        std::path::Path::new(OsStr::from_bytes(&location.path)).display()
-                    );
-                }
-            }
-            // Open without truncating so identity checks run before any
-            // data is lost, then record the file's (dev, ino): the scan
-            // compares every local source file against it, which catches
-            // aliases no path comparison can see.
-            // truncate(false): truncation is deferred to set_len below,
-            // after the identity checks, so a refusal loses nothing.
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
-                .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?;
-            let identity = {
-                use std::os::unix::fs::MetadataExt;
-                let meta = file
-                    .metadata()
-                    .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?;
-                (meta.dev(), meta.ino())
-            };
-            if let Some(mapping) = args.native_mapping.as_deref().filter(|m| *m != b"-") {
-                use std::os::unix::fs::MetadataExt;
-                let manifest = std::path::Path::new(OsStr::from_bytes(mapping));
-                if std::fs::metadata(manifest).is_ok_and(|m| (m.dev(), m.ino()) == identity) {
-                    bail!(
-                        "--results {}: it is the --mapping manifest; writing the stream would destroy the input",
-                        path.display()
-                    );
-                }
-            }
-            if args.locations.first().is_some_and(|s| s.host.is_none()) {
-                progress.set_results_identity(identity);
-            }
-            file.set_len(0)
-                .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?;
-            Box::new(std::io::BufWriter::new(file))
+                && (args.run_at != RunAt::Auto || direct_paths_are_utf8)
         };
+        // The machine owns stdout either way: suppress every human stdout
+        // line so the stream stays parseable.
+        progress.suppress_stdout();
+        if coordinator_is_remote {
+            // The remote coordinator owns the stream end to end: it emits
+            // the run record, sequence numbers, and terminal record, and
+            // this process only pipes the bytes through. Attaching a local
+            // writer too would put a second run record and a restarted seq
+            // into the same stdout.
+            results_setup = false;
+        }
+    }
+    if results_setup {
+        let out: Box<dyn std::io::Write + Send> = Box::new(std::io::stdout());
         let writer = Arc::new(crate::results::ResultsWriter::new(out));
         let run_id = {
             let mut bytes = [0u8; 16];
@@ -1029,21 +961,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         bail!(
             "--reuse-connection is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
-        );
-    }
-    if args.detach && args.native_results.is_some() {
-        bail!(
-            "--results cannot be used with --detach because the remote result stream would not remain attached"
-        );
-    }
-    if args
-        .native_results
-        .as_deref()
-        .is_some_and(|results| results != b"-")
-        && coordinator_is_remote
-    {
-        bail!(
-            "--results FILE is written by the transfer coordinator, which is remote for this copy; use --results - to stream NDJSON here or --run-at local to create a local file"
         );
     }
     if args.restricted_grant.is_some()
@@ -3666,11 +3583,6 @@ impl Planner<'_> {
         // upgrade.
         let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
         let mut synthesized: HashSet<PathBytes> = HashSet::new();
-        // An entry naming the run's own --results file would copy the
-        // stream mid-write; fail such entries instead. The comparison is
-        // filesystem identity from the stat the scan already did, so every
-        // alias — dot components, symlinked bases, hard links — is caught.
-        let results_identity = self.progress.results_identity();
         let mut remaining = entries.into_iter().peekable();
         while remaining.peek().is_some() {
             let chunk: Vec<(u64, ManifestEntry)> =
@@ -3701,21 +3613,6 @@ impl Planner<'_> {
                     );
                     continue;
                 };
-                if e.kind == Kind::File
-                    && results_identity.is_some_and(|(dev, ino)| e.dev == dev && e.ino == ino)
-                {
-                    let message = format!(
-                        "--mapping line {line_number}: source {} is the run's own --results file",
-                        display(&m.src)
-                    );
-                    self.progress.error_classified(
-                        &format!("syq: {message}"),
-                        Some("conflict"),
-                        None,
-                    );
-                    self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
-                    continue;
-                }
                 if let Some(declared) = m.kind {
                     if !declared.matches(e.kind) {
                         let message = format!(
@@ -4484,23 +4381,6 @@ impl Planner<'_> {
                 Kind::File => {
                     if self.unusable_files.contains(&dst_path) {
                         // register_namespace reported it; nothing can stage here.
-                        continue;
-                    }
-                    // A walked source that is the run's own --results file —
-                    // through any alias, hard links included — must fail
-                    // visibly, not copy the stream mid-write. Mapping
-                    // entries fail earlier in scan_mapping with their line
-                    // number and a retryable failed record.
-                    if self
-                        .progress
-                        .results_identity()
-                        .is_some_and(|(dev, ino)| e.dev == dev && e.ino == ino)
-                    {
-                        self.progress.error_classified(
-                            &format!("syq: {rel}: source is the run's own --results file"),
-                            Some("conflict"),
-                            None,
-                        );
                         continue;
                     }
                     // Never copy a file onto itself (same path, hardlink, or a
@@ -7301,64 +7181,6 @@ struct QueuedLeafOp {
 
 /// The container-relative spelling of a full destination path; None for the
 /// container itself.
-/// Fold `.`/`..` components of an already-absolute path without touching
-/// the filesystem.
-fn fold_components(joined: &std::path::Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    for component in joined.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Absolute lexical form: joined to the cwd with `.`/`..` folded, without
-/// touching the filesystem, so containment can be checked before anything
-/// is created.
-fn lexical_absolute(path: &std::path::Path) -> Result<std::path::PathBuf> {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("resolve current directory")?
-            .join(path)
-    };
-    Ok(fold_components(&joined))
-}
-
-/// Like [`lexical_absolute`], but with symlinks resolved as far as the
-/// filesystem allows: the longest existing prefix is canonicalized and any
-/// not-yet-existing remainder appended, so a destination reached through a
-/// symlink alias compares equal to its real path.
-fn resolved_absolute(path: &std::path::Path) -> Result<std::path::PathBuf> {
-    let lexical = lexical_absolute(path)?;
-    let mut existing = lexical.as_path();
-    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        match std::fs::canonicalize(existing) {
-            Ok(mut canonical) => {
-                for component in remainder.iter().rev() {
-                    canonical.push(component);
-                }
-                return Ok(canonical);
-            }
-            Err(_) => match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    remainder.push(name.to_os_string());
-                    existing = parent;
-                }
-                _ => return Ok(lexical),
-            },
-        }
-    }
-}
-
 fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
     if path == dst_root {
         return None;

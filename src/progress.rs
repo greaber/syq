@@ -56,11 +56,6 @@ pub struct Progress {
     /// `--results`: machine-readable NDJSON outcome stream, set once after
     /// construction so workers and the planner reach it with no plumbing.
     results: std::sync::OnceLock<Arc<crate::results::ResultsWriter>>,
-    /// The results file's filesystem identity (dev, ino), set only when
-    /// the source endpoint is local, so any source file that is the run's
-    /// own results file — through any alias, hard links included — can be
-    /// failed instead of copied.
-    results_identity: std::sync::OnceLock<(u64, u64)>,
 }
 
 struct TermState {
@@ -110,20 +105,11 @@ impl Progress {
             stop: AtomicBool::new(false),
             suppress_stdout: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
-            results_identity: std::sync::OnceLock::new(),
         })
     }
 
     pub fn set_results(&self, writer: Arc<crate::results::ResultsWriter>) {
         let _ = self.results.set(writer);
-    }
-
-    pub fn set_results_identity(&self, identity: (u64, u64)) {
-        let _ = self.results_identity.set(identity);
-    }
-
-    pub fn results_identity(&self) -> Option<(u64, u64)> {
-        self.results_identity.get().copied()
     }
 
     pub fn results_writer(&self) -> Option<&Arc<crate::results::ResultsWriter>> {

@@ -273,9 +273,9 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
 
 ## Machine-readable results
 
-`syq cp --results FILE` (with or without `--prune`) writes an
-NDJSON outcome stream beside the ordinary human output; with `-` the
-machine owns stdout and syq suppresses its own human stdout. The
+`syq cp --results -` (with or without `--prune`) writes an NDJSON
+outcome stream to stdout and suppresses syq's own human stdout output;
+redirect (`--results - > r.ndjson`) to keep a file. The
 full contract — every record type and field, the exit-code table,
 the JSON Schema, and example streams — is
 [docs/automation-v1.md](docs/automation-v1.md). In brief: the
@@ -291,20 +291,18 @@ metadata-only updates are not yet reported per operation. A missing
 terminal record means the run did not finish; a terminal status other
 than `success` or `partial` means entries may be unsettled.
 
-The results writer lives with the transfer coordinator. For a direct
-remote-to-remote copy, use `--results -` to stream its NDJSON back over the
-coordinator connection. A named results file is accepted only when the
-coordinator is local, including `--run-at local`; this avoids interpreting a
-local-looking pathname on a remote host. `--results` cannot be combined with
-`--detach`, because the caller would no longer be attached for the complete
-stream and its terminal record.
+The results writer lives with the transfer coordinator; for a direct
+remote-to-remote copy the stream rides the coordinator connection back to
+the invoking terminal. `--results` cannot be combined with `--detach`,
+because the caller would no longer be attached for the complete stream and
+its terminal record.
 
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:
 
 ```bash
 set -o pipefail
-syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
+syq cp --mapping big.ndjson -C src --to nas --into /data --results - > r.ndjson
 jq -cs 'if (.[-1].type? // "") != "result"
         then "incomplete results stream (no terminal record)" | halt_error
         elif (.[-1].status != "success" and .[-1].status != "partial")

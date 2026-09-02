@@ -833,9 +833,9 @@ struct NativeCopyFields {
     /// dst paths are relative to the --into container
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     mapping: Option<OsString>,
-    /// Write the machine-readable NDJSON result stream to FILE; `-` writes
-    /// it to stdout and suppresses human stdout output. A named file
-    /// requires a local coordinator. Automation schema version 1
+    /// Write the machine-readable NDJSON result stream to stdout (`-` is
+    /// the only accepted target; redirect to keep a file) and suppress
+    /// human stdout output. Automation schema version 1
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     results: Option<OsString>,
     /// Keep the ssh control connection alive for 5 minutes after the run and
@@ -964,6 +964,11 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     let results = parsed.results.take();
     if results.is_some() && interface == Interface::NativeMap {
         bail!("--results is only available on syq cp");
+    }
+    if results.as_deref().is_some_and(|target| target != "-") {
+        bail!(
+            "--results writes the NDJSON stream to stdout and accepts only `-`; redirect to keep a file: --results - > run.ndjson"
+        );
     }
     if parsed.reuse_connection && interface == Interface::NativeMap {
         bail!("--reuse-connection is only available on syq cp");
