@@ -473,6 +473,7 @@ fn native_copy_accepts_copy_only_operational_controls() {
             &t.s("copied"),
             "--bwlimit",
             "1G",
+            "--no-compress",
             "--stats",
             "--no-progress",
         ])
@@ -4147,6 +4148,7 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
         ["cp", "--delete", "source", "--into", "dest"].as_slice(),
         ["rm", "--no-tcp", "source", "", ""].as_slice(),
         ["rm", "--bwlimit", "1M", "source", ""].as_slice(),
+        ["rm", "--no-compress", "source", "", ""].as_slice(),
         ["rm", "--stats", "source", "", ""].as_slice(),
     ] {
         let args: Vec<_> = args.iter().copied().filter(|arg| !arg.is_empty()).collect();

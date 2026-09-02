@@ -619,6 +619,9 @@ struct NativeOperationalArgs {
 struct NativeCopyOperationalArgs {
     #[command(flatten)]
     common: NativeOperationalArgs,
+    /// Disable transport compression
+    #[arg(long)]
+    no_compress: bool,
     /// Limit aggregate file-data throughput (default unit: KiB/s; 0 disables)
     #[arg(long, value_name = "RATE")]
     bwlimit: Option<String>,
@@ -961,9 +964,14 @@ fn apply_native_copy_operational(
 ) -> Result<()> {
     let NativeCopyOperationalArgs {
         common,
+        no_compress,
         bwlimit,
         stats,
     } = operational;
+    args.no_compress = no_compress;
+    if no_compress {
+        args.compress = false;
+    }
     args.bwlimit_bytes = bwlimit
         .as_deref()
         .map(crate::bwlimit::parse_rate)

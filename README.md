@@ -257,12 +257,16 @@ current compatibility options for those capabilities are needed.
 All native commands accept `-n`/`--dry-run`, `-v`/`--verbose`, `-q`/`--quiet`,
 `-j`/`--connections`, `--progress`/`--no-progress`, and `--progress-json` in
 addition to their endpoint and selector options. `cp` and `cp-prune` also
-accept `--bwlimit RATE` and `--stats`; the bandwidth limit applies only to file
-data, not scanning, hashing, metadata, or pruning. `cp-prune` additionally
+accept `--no-compress`, `--bwlimit RATE`, and `--stats`; the bandwidth limit
+applies only to file data, not scanning, hashing, metadata, or pruning. A
+command-restricted remote-to-remote receiver independently enforces the signed
+aggregate limit. A receiver installed by an older syq rejects that V2 grant
+safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment to the
+current binary. `cp-prune` additionally
 accepts `--max-delete`; `rm` additionally accepts `--root` and `--follow` plus
 its endpoint-side removal semantics.
 
-Preservation policies, filters, comparison controls, low-level transfer tuning,
+Preservation policies, filters, comparison controls, block and split sizing,
 and SSH/transport configuration remain available only through `syq rsync`;
 sharing the transfer engine does not expose those options in native mode.
 Remote-to-remote copies still use the ordinary automatic transport. Native raw
@@ -454,8 +458,8 @@ The command-restricted path requires atomic staged publication and encrypted
 TCP data connections. `--inplace`, `--no-tcp`, `--tcp-plain`,
 `--tcp-congestion`, `--update`, `--existing`, `--ignore-existing`, native
 `--*-new`/`--*-existing`,
-`--ignore`/`--ignore-from`, `--files-from`, `--min-size`, a nonzero
-`--bwlimit`, `--syq-path`, and `--no-bootstrap` currently fail closed because
+`--ignore`/`--ignore-from`, `--files-from`, `--min-size`, `--syq-path`, and
+`--no-bootstrap` currently fail closed because
 the receiver cannot enforce those semantics independently of hostA.
 `--max-size` is enforced as a signed per-file limit, but is refused together
 with deletion because filtered source files could otherwise make hostA's

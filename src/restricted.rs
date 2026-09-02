@@ -240,6 +240,7 @@ pub(crate) struct RestrictedAuthority {
     guard: ContainerGuard,
     destination: Vec<u8>,
     copy: CopyOperationV1,
+    file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
     receiver_umask: u32,
     deadline: Instant,
     control_open: AtomicBool,
@@ -247,7 +248,12 @@ pub(crate) struct RestrictedAuthority {
 }
 
 impl RestrictedAuthority {
-    fn new(config: &ReceiverEnrollment, grant: GrantV1, deadline: Instant) -> Result<Self> {
+    fn new(
+        config: &ReceiverEnrollment,
+        grant: GrantV1,
+        max_file_data_bytes_per_second: u64,
+        deadline: Instant,
+    ) -> Result<Self> {
         let GrantOperationV1::Copy(copy) = grant.operation;
         let root_path = Path::new(&config.root);
         let destination = Path::new(std::ffi::OsStr::from_bytes(&copy.destination));
@@ -270,6 +276,8 @@ impl RestrictedAuthority {
             },
         )?;
         let receiver_umask = read_process_umask();
+        let file_data_limit = (max_file_data_bytes_per_second > 0)
+            .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         Ok(Self {
             guard: ContainerGuard {
                 root: config.root.as_bytes().to_vec(),
@@ -278,6 +286,7 @@ impl RestrictedAuthority {
             },
             destination: copy.destination.clone(),
             copy,
+            file_data_limit,
             receiver_umask,
             deadline,
             control_open: AtomicBool::new(true),
@@ -702,6 +711,13 @@ impl RestrictedAuthority {
     fn charge_bytes(&self, path: &[u8], offset: u64, bytes: usize) -> Result<()> {
         self.check_mutation_path(path)?;
         let bytes = u64::try_from(bytes).context("request byte count overflow")?;
+        if self
+            .file_data_limit
+            .as_ref()
+            .is_some_and(|limit| bytes > limit.burst_bytes())
+        {
+            bail!("request exceeds the signed file-data rate-limit burst");
+        }
         let end = offset.checked_add(bytes).context("file offset overflow")?;
         if end > self.copy.limits.max_file_bytes {
             bail!("signed grant per-file byte limit exceeded");
@@ -713,6 +729,11 @@ impl RestrictedAuthority {
             .context("signed transfer byte counter overflow")?;
         if state.transferred_bytes > self.copy.limits.max_total_bytes {
             bail!("signed grant total-byte limit exceeded");
+        }
+        drop(state);
+        if let Some(limit) = &self.file_data_limit {
+            limit.wait(bytes);
+            self.check_deadline()?;
         }
         Ok(())
     }
@@ -1002,6 +1023,16 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::PutSmallBatch(puts) => {
+                if let Some(limit) = &self.file_data_limit {
+                    let bytes = puts.iter().try_fold(0u64, |total, put| {
+                        total
+                            .checked_add(put.data.len() as u64)
+                            .context("small-file batch byte count overflow")
+                    })?;
+                    if bytes > limit.burst_bytes() {
+                        bail!("small-file batch exceeds the signed file-data rate-limit burst");
+                    }
+                }
                 for put in puts {
                     self.charge_bytes(&put.path, 0, put.data.len())?;
                     self.constrain_receiver_mode(
@@ -1904,10 +1935,9 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
         || !args.files_from_lines.is_empty()
         || args.files_from.is_some()
         || args.min_size.is_some()
-        || args.bwlimit_bytes != 0
     {
         bail!(
-            "--ignore/--ignore-from, --files-from, --min-size, and --bwlimit are not yet independently enforceable by the command-restricted receiver"
+            "--ignore/--ignore-from, --files-from, and --min-size are not yet independently enforceable by the command-restricted receiver"
         );
     }
     if args.syq_path.is_some() || args.no_bootstrap {
@@ -2115,6 +2145,7 @@ pub(crate) fn prepare_transfer(
             destination_login,
             &canonical_destination,
         )?,
+        args.bwlimit_bytes,
         &private_key,
     )?;
     Ok(PreparedTransfer {
@@ -2166,8 +2197,13 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         revocation_file: None,
     };
     let verified = delegation::verify_and_claim(&envelope, &context, &policy, &replay)?;
-    let (grant, deadline) = verified.into_parts();
-    let authority = std::sync::Arc::new(RestrictedAuthority::new(&config, grant, deadline)?);
+    let (grant, max_file_data_bytes_per_second, deadline) = verified.into_parts();
+    let authority = std::sync::Arc::new(RestrictedAuthority::new(
+        &config,
+        grant,
+        max_file_data_bytes_per_second,
+        deadline,
+    )?);
     crate::server::run_restricted(authority)
 }
 
@@ -2357,6 +2393,15 @@ mod tests {
         deletion: DeletionPolicyV1,
         maximum_bytes: u64,
     ) -> RestrictedAuthority {
+        test_authority_with_rate(root, deletion, maximum_bytes, 0)
+    }
+
+    fn test_authority_with_rate(
+        root: &Path,
+        deletion: DeletionPolicyV1,
+        maximum_bytes: u64,
+        max_file_data_bytes_per_second: u64,
+    ) -> RestrictedAuthority {
         let opened = Root::open(root).unwrap();
         let identity = opened.identity();
         let id = EnrollmentId::random();
@@ -2422,6 +2467,7 @@ mod tests {
         RestrictedAuthority::new(
             &config,
             grant,
+            max_file_data_bytes_per_second,
             Instant::now() + std::time::Duration::from_secs(60),
         )
         .unwrap()
@@ -3009,6 +3055,53 @@ mod tests {
                 .to_string(),
             "hash response would exceed protocol limits"
         );
+    }
+
+    #[test]
+    fn signed_file_data_rate_is_enforced_across_requests() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority_with_rate(&root, DeletionPolicyV1::Forbid, 1024, 1024);
+        let target = root.join("target").as_os_str().as_bytes().to_vec();
+        let request = |off| Request::WriteRange {
+            path: target.clone(),
+            inplace: false,
+            partial_id: [0; 16],
+            attempt: 0,
+            off,
+            hash: 0,
+            data: vec![0; 256],
+            guard: None,
+        };
+
+        let started = Instant::now();
+        authority.authorize(&mut request(0), false).unwrap();
+        authority.authorize(&mut request(256), false).unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "signed aggregate rate limit did not pace consecutive writes"
+        );
+
+        let mut oversized = request(512);
+        if let Request::WriteRange { data, .. } = &mut oversized {
+            data.resize(513, 0);
+        }
+        assert_eq!(
+            authority
+                .authorize(&mut oversized, false)
+                .unwrap_err()
+                .to_string(),
+            "request exceeds the signed file-data rate-limit burst"
+        );
+    }
+
+    #[test]
+    fn command_restricted_validation_accepts_a_signed_rate_limit() {
+        let mut args = Args::try_parse_from(["syq", "source", "destination"]).unwrap();
+        args.normalize();
+        args.bwlimit_bytes = 1024;
+        validate_restricted_args(&args).unwrap();
     }
 
     #[test]

@@ -366,7 +366,7 @@ pub fn run(
     if !short.is_empty() {
         remote.push(format!("-{short}"));
     }
-    if args.interface == Interface::Rsync && !args.compress {
+    if !args.compress {
         remote.push("--no-compress".into());
     }
     if let Some(j) = args.connections_opt {
