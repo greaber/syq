@@ -2150,6 +2150,38 @@ fn generate_receipt_key(id: EnrollmentId) -> Result<PrivateKey> {
 
 const RECEIPT_KEY_FILE: &str = "receipt-key";
 
+/// The enrollment's receipt key: generated on first install and kept by
+/// every later install, so a refresh after a syq upgrade, or a retry after
+/// a lost reply, always reports the key the local side already holds.
+/// Rotation is explicit: revoke, then enroll again.
+fn ensure_receipt_key(state: &Path, id: EnrollmentId) -> Result<PrivateKey> {
+    if let Some(existing) = load_receipt_key(state)? {
+        return Ok(existing);
+    }
+    let key = generate_receipt_key(id)?;
+    atomic_write(
+        state,
+        RECEIPT_KEY_FILE,
+        key.to_openssh(LineEnding::LF)
+            .context("encode receipt signing key")?
+            .as_bytes(),
+        0o600,
+    )?;
+    Ok(key)
+}
+
+/// The receipt signing key an install left in the state directory, if any.
+fn load_receipt_key(state: &Path) -> Result<Option<PrivateKey>> {
+    let path = state.join(RECEIPT_KEY_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let encoded = delegation::read_secure_regular(&path, "receipt signing key", 128 * 1024)?;
+    PrivateKey::from_openssh(&encoded)
+        .context("parse receipt signing key")
+        .map(Some)
+}
+
 fn signer_name(id: EnrollmentId) -> String {
     format!("syq-enrollment-{id}")
 }
@@ -2299,16 +2331,7 @@ pub(crate) fn remote_install() -> Result<()> {
             .context("restricted receiver path is not UTF-8")?
             .to_owned(),
     };
-    let receipt_key = generate_receipt_key(request.id)?;
-    atomic_write(
-        &state,
-        RECEIPT_KEY_FILE,
-        receipt_key
-            .to_openssh(LineEnding::LF)
-            .context("encode receipt signing key")?
-            .as_bytes(),
-        0o600,
-    )?;
+    let receipt_key = ensure_receipt_key(&state, request.id)?;
     let receipt_public_key = receipt_key
         .public_key()
         .to_openssh()
@@ -3180,19 +3203,6 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
     crate::server::run_restricted(authority)
 }
 
-/// The receipt signing key an install left in the state directory, if any;
-/// enrollments installed before receipts existed have none.
-fn load_receipt_key(state: &Path) -> Result<Option<PrivateKey>> {
-    let path = state.join(RECEIPT_KEY_FILE);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let encoded = delegation::read_secure_regular(&path, "receipt signing key", 128 * 1024)?;
-    PrivateKey::from_openssh(&encoded)
-        .context("parse receipt signing key")
-        .map(Some)
-}
-
 fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
     if original.len() > 128 * 1024 {
         bail!("restricted receiver command exceeds size limit");
@@ -3601,6 +3611,21 @@ mod tests {
         let again = generate_receipt_key(id).unwrap();
         assert_ne!(again.public_key().to_openssh().unwrap(), public);
         ssh_key::PublicKey::from_openssh(&public).unwrap();
+
+        // An install keeps the key it finds, so a refresh or a retried
+        // install reports the same public key the local side already has.
+        let (_, home) = current_account().unwrap();
+        let temporary = tempfile::tempdir_in(home).unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let state = temporary.path().join("state");
+        ensure_directory(&state, 0o700).unwrap();
+        let first = ensure_receipt_key(&state, id).unwrap();
+        let second = ensure_receipt_key(&state, id).unwrap();
+        assert_eq!(
+            first.public_key().to_openssh().unwrap(),
+            second.public_key().to_openssh().unwrap()
+        );
+        assert!(state.join(RECEIPT_KEY_FILE).is_file());
 
         // Metadata written before receipt keys existed has no key and is
         // listed as needing a refresh rather than failing to load.
