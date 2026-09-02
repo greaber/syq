@@ -10,11 +10,13 @@ pub mod enrollment;
 mod fsops;
 mod identity;
 mod janky_cat;
+mod native_map;
 mod native_rm;
 mod progress;
 mod proto;
 mod remote_helper;
 mod restricted;
+mod results;
 mod rm;
 #[allow(dead_code)]
 mod rooted;
@@ -174,6 +176,8 @@ fn main() {
     let quiet = args.quiet;
     let result = if args.follow {
         direct::follow(&args)
+    } else if args.interface == cli::Interface::NativeMap {
+        native_map::run(&args)
     } else if args.rm {
         rm::run(args)
     } else {

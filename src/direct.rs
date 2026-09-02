@@ -335,6 +335,7 @@ pub fn run(
         Interface::NativeCp => "cp",
         Interface::NativeCpPrune => "cp-prune",
         Interface::NativeRm => bail!("native rm cannot be a remote-to-remote transfer"),
+        Interface::NativeMap => bail!("syq map runs locally and is never remoted"),
     }
     .into()];
     let mut short = String::new();

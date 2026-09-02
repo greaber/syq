@@ -266,7 +266,8 @@ data, not scanning, hashing, metadata, or pruning. A
 command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit. A receiver installed by an older syq rejects that V2 grant
 safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment to the
-current binary. `cp-prune` additionally
+current binary. `cp` additionally accepts `--mapping` and `--results` (see
+[MAPPINGS.md](MAPPINGS.md)). `cp-prune` additionally
 accepts `--max-delete`; `rm` additionally accepts `--root` and `--follow` plus
 its endpoint-side removal semantics.
 
@@ -276,6 +277,25 @@ sharing the transfer engine does not expose those options in native mode.
 Remote-to-remote copies still use the ordinary automatic transport. Native raw
 path bytes are relayed through syq's protocol when they cannot be represented
 in a direct remote shell command.
+
+## Mappings
+
+Placement can also be data instead of flags: `syq map` prints the resolved
+selection and placement of a command as JSON lines, and `syq cp --mapping`
+executes such a manifest — a generalized `--as` covering many entries, each
+with its own destination. Between the two, any tool that edits JSON can
+reshape a transfer:
+
+```bash
+set -o pipefail
+syq map --src-src photos \
+  | jq '.dst.value |= ascii_downcase' \
+  | syq cp --mapping - -C photos --to nas --into /pub
+```
+
+Conflicting destinations are refused before any byte moves. See
+[MAPPINGS.md](MAPPINGS.md) for the format, more one-line transforms, and
+limits.
 
 ## Rsync compatibility
 
@@ -462,7 +482,8 @@ The command-restricted path requires atomic staged publication and encrypted
 TCP data connections. `--inplace`, `--no-tcp`, `--tcp-plain`,
 `--tcp-congestion`, `--update`, `--existing`, `--ignore-existing`, native
 `--*-new`/`--*-existing`,
-`--ignore`/`--ignore-from`, `--files-from`, `--min-size`, `--syq-path`, and
+`--ignore`/`--ignore-from`, `--files-from`, `--mapping`, `--min-size`,
+`--syq-path`, and
 `--no-bootstrap` currently fail closed because
 the receiver cannot enforce those semantics independently of hostA.
 `--max-size` is enforced as a signed per-file limit, but is refused together
@@ -1279,7 +1300,9 @@ the root itself are rejected. A listed path that doesn't exist is an error
 (exit 23) and the rest is still copied. The destination must be a directory (an
 existing file there is an error, never replaced). `--files-from` can't be
 combined with `--ignore`/`--ignore-from` or `--delete`; for a remote-to-remote copy
-it needs `--relay` (the list is read on this machine).
+it needs `--relay` (the list is read on this machine). To also choose each
+entry's destination path, use a native mapping instead (see
+[MAPPINGS.md](MAPPINGS.md)).
 
 ## Parallel removal (`--rm`)
 

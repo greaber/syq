@@ -530,7 +530,11 @@ struct SourceMapping<'a> {
     sub: &'a [u8],
 }
 
-fn validate_native_source_type(path: &[u8], selection: SourceSelection, kind: Kind) -> Result<()> {
+pub(crate) fn validate_native_source_type(
+    path: &[u8],
+    selection: SourceSelection,
+    kind: Kind,
+) -> Result<()> {
     match selection {
         SourceSelection::Contents if kind != Kind::Dir => {
             bail!("contents selector {} is not a directory", display(path))
@@ -956,6 +960,20 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
+    if let Some(results) = args.native_results.as_deref() {
+        let out: Box<dyn std::io::Write + Send> = if results == b"-" {
+            Box::new(std::io::stdout())
+        } else {
+            let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
+            Box::new(std::io::BufWriter::new(
+                std::fs::File::create(&path)
+                    .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?,
+            ))
+        };
+        let writer = Arc::new(crate::results::ResultsWriter::new(out));
+        writer.emit_run(args.native_mapping.is_some());
+        progress.set_results(writer);
+    }
     let sched = Arc::new(Sched::new(block, min_split));
 
     // Workers connect on their own threads once the control connections are
@@ -1682,6 +1700,9 @@ pub fn run(args: Args) -> Result<i32> {
         } else {
             None
         },
+        src_overrides: std::collections::HashMap::new(),
+        implicit_dirs: std::collections::HashSet::new(),
+        mapping_mode: false,
         create_root: if create_root && multiple_distinct_sources {
             Some((dst_root.clone(), root_create_condition))
         } else {
@@ -1689,7 +1710,7 @@ pub fn run(args: Args) -> Result<i32> {
         },
         destination_anchor: &destination_anchor,
         use_operator_anchor,
-        keep_dirs: args.files_from.is_some(),
+        keep_dirs: args.files_from.is_some() || args.native_mapping.is_some(),
         delete_roots: Vec::new(),
         deletes: Deletes::default(),
         dry_run_changes: {
@@ -1703,7 +1724,28 @@ pub fn run(args: Args) -> Result<i32> {
 
     let mut scan_err = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
-    if args.files_from.is_some() {
+    if let Some(mapping) = args.native_mapping.as_deref() {
+        let src = &srcs[0];
+        let open = || -> Result<Box<dyn std::io::BufRead>> {
+            if mapping == b"-" {
+                return Ok(Box::new(std::io::stdin().lock()));
+            }
+            let path = std::path::PathBuf::from(OsStr::from_bytes(mapping).to_os_string());
+            Ok(Box::new(std::io::BufReader::new(
+                std::fs::File::open(&path)
+                    .map_err(|e| anyhow::anyhow!("--mapping {}: {e}", path.display()))?,
+            )))
+        };
+        match open().and_then(|mut reader| {
+            st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, &mut *reader)
+        }) {
+            Ok(()) => dry_run_mappings.push(DryRunMapping {
+                target: dst_root.clone(),
+                semantics: "entries selected by --mapping",
+            }),
+            Err(e) => scan_err = Some(e),
+        }
+    } else if args.files_from.is_some() {
         let src = &srcs[0];
         match st.scan_files_from(
             &mut *src_ctl,
@@ -1719,7 +1761,10 @@ pub fn run(args: Args) -> Result<i32> {
             Err(e) => scan_err = Some(e),
         }
     }
-    for src in srcs.iter().filter(|_| args.files_from.is_none()) {
+    for src in srcs
+        .iter()
+        .filter(|_| args.files_from.is_none() && args.native_mapping.is_none())
+    {
         let src_root = src.path.clone();
         let contents = src.copies_contents();
         let follow_root = src.follows_root();
@@ -1909,6 +1954,7 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let max_delete_hit = st.max_delete_hit;
     let dry_run_changes = std::mem::take(&mut st.dry_run_changes);
+    let created_counts = (st.dirs_created, st.links_created, st.specials_created);
     drop(st);
 
     progress.stop();
@@ -2067,7 +2113,7 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
-    Ok(if aborted {
+    let exit_code = if aborted {
         1
     } else if errors > 0 {
         23
@@ -2075,7 +2121,32 @@ pub fn run(args: Args) -> Result<i32> {
         25
     } else {
         0
-    })
+    };
+    if let Some(results) = progress.results_writer() {
+        results.emit_result(&crate::results::ResultRecord {
+            status: if aborted {
+                "aborted"
+            } else if max_delete_hit {
+                "refused"
+            } else if errors > 0 {
+                "partial"
+            } else {
+                "success"
+            },
+            exit_code,
+            files_transferred: progress.files_done.load(Relaxed),
+            files_unchanged: progress.files_skipped.load(Relaxed),
+            files_excluded: progress.files_excluded.load(Relaxed),
+            directories_created: created_counts.0,
+            symlinks_created: created_counts.1,
+            specials_created: created_counts.2,
+            errors,
+            bytes_transferred: progress.bytes_done.load(Relaxed),
+            bytes_unchanged: progress.bytes_skipped.load(Relaxed),
+            elapsed_ms: progress.start.elapsed().as_millis() as u64,
+        });
+    }
+    Ok(exit_code)
 }
 
 fn st_dirs(p: &Progress) -> u64 {
@@ -2813,6 +2884,15 @@ struct Planner<'a> {
     /// Several sources: mapped batches waiting for all scans to finish
     /// (see `Mapped`). None with a single source, where batches stream.
     buffer: Option<Vec<Mapped>>,
+    /// --mapping: per-destination source override. A manifest entry's `path`
+    /// carries the destination-relative path so claims, ordering, and job
+    /// naming work unchanged; the read side looks the actual source up here.
+    src_overrides: std::collections::HashMap<PathBytes, PathBytes>,
+    /// --mapping: full destination paths of implicit ancestor directories no
+    /// entry names, created with default metadata (no deferred stamping).
+    implicit_dirs: std::collections::HashSet<PathBytes>,
+    /// This run consumes a --mapping manifest (identity entries included).
+    mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
     root_path: PathBytes,
     exact_condition: TargetCondition,
@@ -3203,6 +3283,145 @@ impl Planner<'_> {
         Ok(())
     }
 
+    /// Consume an NDJSON mapping manifest: each entry claims exactly one
+    /// source object (relative to `src_root`) at an explicit destination
+    /// (relative to `dst_root`). Entries stream: chunks are planned and
+    /// applied before the manifest ends, so `--mapping -` starts work long
+    /// before stdin closes. Destination ancestors no entry names are
+    /// synthesized as implicit directories with default metadata.
+    fn scan_mapping(
+        &mut self,
+        src: &mut dyn Conn,
+        src_root: &[u8],
+        dst_root: &[u8],
+        reader: &mut dyn std::io::BufRead,
+    ) -> Result<()> {
+        use std::collections::{HashMap, HashSet};
+        self.mapping_mode = true;
+        match stat_one(src, src_root, true)? {
+            Some(e) if e.kind == Kind::Dir => {}
+            Some(_) => bail!(
+                "--mapping: source base {} is not a directory",
+                display(src_root)
+            ),
+            None => bail!(
+                "--mapping: source base {} does not exist",
+                display(src_root)
+            ),
+        }
+        self.progress.scanned.fetch_add(1, Relaxed);
+
+        // Phase 1: read and validate the whole manifest before any entry is
+        // applied. Parse errors, duplicate destinations, and declared-kind
+        // ancestor conflicts refuse the run (the --into container was
+        // already created, as with --files-from); the price is memory
+        // proportional to the manifest, which the multi-source preflight
+        // already accepts. Conflicts only observable
+        // at execution (an undeclared ancestor that is not a directory,
+        // destination state) still fail entries individually below.
+        let entries = read_mapping_manifest(reader)?;
+
+        // Phase 2: stat sources and plan in chunks; as with any native
+        // copy, transfers begin once planning completes. `emitted`
+        // is what the planner was given for each destination path;
+        // `synthesized` are implicit ancestors an explicit entry may still
+        // upgrade.
+        let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
+        let mut synthesized: HashSet<PathBytes> = HashSet::new();
+        let mut remaining = entries.into_iter().peekable();
+        while remaining.peek().is_some() {
+            let chunk: Vec<(u64, ManifestEntry)> =
+                remaining.by_ref().take(crate::scan::BATCH).collect();
+            let stats = stat_many(
+                src,
+                chunk.iter().map(|(_, m)| join(src_root, &m.src)).collect(),
+                false,
+            )?;
+            let mut batch: Vec<Entry> = Vec::new();
+            for ((line_number, m), st) in chunk.into_iter().zip(stats) {
+                let Some(e) = st else {
+                    let message = format!(
+                        "--mapping line {line_number}: source {} does not exist",
+                        display(&m.src)
+                    );
+                    self.progress.error(&format!("syq: {message}"));
+                    self.emit_mapping_entry_failed(&m, "unknown", &message);
+                    continue;
+                };
+                if let Some(declared) = m.kind {
+                    if !declared.matches(e.kind) {
+                        let message = format!(
+                            "--mapping line {line_number}: source {} is {}, not the declared {}",
+                            display(&m.src),
+                            kind_label(e.kind),
+                            declared.label(),
+                        );
+                        self.progress.error(&format!("syq: {message}"));
+                        self.emit_mapping_entry_failed(&m, "no", &message);
+                        continue;
+                    }
+                }
+                // Destination ancestors: consistent with what earlier entries
+                // established, with missing ones synthesized parent-first.
+                let mut conflict = false;
+                let mut chain: Vec<PathBytes> = Vec::new();
+                for (i, &byte) in m.dst.iter().enumerate() {
+                    if byte != b'/' {
+                        continue;
+                    }
+                    let anc = &m.dst[..i];
+                    match emitted.get(anc) {
+                        Some(Kind::Dir) => {}
+                        Some(_) => {
+                            self.progress.error(&format!(
+                                "syq: --mapping line {line_number}: destination ancestor {} was mapped as a non-directory",
+                                display(anc)
+                            ));
+                            conflict = true;
+                            break;
+                        }
+                        None => chain.push(anc.to_vec()),
+                    }
+                }
+                if conflict {
+                    continue;
+                }
+                match emitted.get(&m.dst) {
+                    None => {}
+                    Some(Kind::Dir) if e.kind == Kind::Dir && synthesized.remove(&m.dst) => {
+                        // An explicit directory entry for a path an earlier
+                        // entry implied: upgrade it from default metadata to
+                        // this entry's metadata.
+                        self.implicit_dirs.remove(&join(dst_root, &m.dst));
+                    }
+                    Some(_) => {
+                        self.progress.error(&format!(
+                            "syq: --mapping line {line_number}: destination {} was already used as a directory",
+                            display(&m.dst)
+                        ));
+                        continue;
+                    }
+                }
+                for anc in chain {
+                    self.implicit_dirs.insert(join(dst_root, &anc));
+                    emitted.insert(anc.clone(), Kind::Dir);
+                    synthesized.insert(anc.clone());
+                    batch.push(implicit_dir_entry(anc));
+                }
+                emitted.insert(m.dst.clone(), e.kind);
+                if m.src != m.dst {
+                    self.src_overrides.insert(m.dst.clone(), m.src);
+                }
+                let mut e = e;
+                e.path = m.dst;
+                batch.push(e);
+            }
+            self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+            self.handle_batch(batch, src_root, b"", dst_root)?;
+        }
+        Ok(())
+    }
+
     /// Walk `src_root/rel` and plan its entries under the same relative prefix.
     fn scan_subtree(
         &mut self,
@@ -3347,7 +3566,10 @@ impl Planner<'_> {
             let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
                 continue;
             };
-            let src = join(src_root, &e.path);
+            let src = match self.src_overrides.get(&e.path) {
+                Some(actual) => join(src_root, actual),
+                None => join(src_root, &e.path),
+            };
             match claim {
                 Claim::Dir => dirs.push((dst, dst_rel, e)),
                 Claim::Weak if e.kind == Kind::Other => {
@@ -3582,7 +3804,10 @@ impl Planner<'_> {
                                 ));
                             }
                         }
-                        Some(d) if metadata_differs(e, d, meta_flags) => {
+                        Some(d)
+                            if metadata_differs(e, d, meta_flags)
+                                && !self.implicit_dirs.contains(p) =>
+                        {
                             self.dry_run_changes.metadata_directories.insert(p.clone());
                             if opts.verbose > 0 {
                                 self.progress.println(&format!(
@@ -3664,6 +3889,7 @@ impl Planner<'_> {
                     let errs = self.apply(new_dirs)?;
                     let mut failed = 0;
                     for ((name, condition), err) in op_info.iter().zip(errs) {
+                        let created = err.is_none();
                         if let Some(err) = err {
                             failed += 1;
                             self.progress.error(&format!("syq: {err}"));
@@ -3673,6 +3899,35 @@ impl Planner<'_> {
                         } else if opts.verbose > 0 {
                             self.progress.println(&format!("{}/", display(name)));
                         }
+                        if let (Some(results), Some(dst_rel)) = (
+                            self.progress.results_writer(),
+                            strip_dst_root(name, dst_root),
+                        ) {
+                            // An implicit --mapping ancestor has no source and
+                            // is not independently retryable: the entries
+                            // beneath it carry the actionable retry records.
+                            let implicit = self.implicit_dirs.contains(name);
+                            let src = if implicit {
+                                None
+                            } else {
+                                self.mapping_source_rel(dst_rel)
+                            };
+                            results.emit_operation(&crate::results::OperationRecord {
+                                action: "create_directory",
+                                dst: dst_rel,
+                                src: src.as_deref(),
+                                kind: "dir",
+                                disposition: if created { "succeeded" } else { "failed" },
+                                bytes: None,
+                                attempts: None,
+                                retryable: (!created).then_some(if implicit {
+                                    "no"
+                                } else {
+                                    "unknown"
+                                }),
+                                message: None,
+                            });
+                        }
                     }
                     self.dirs_created += (n - failed) as u64;
                 }
@@ -3681,6 +3936,12 @@ impl Planner<'_> {
                     flags &= !flags::MODE;
                 }
                 for (p, _, e, s) in &planned {
+                    // Implicit --mapping ancestors keep the metadata their
+                    // creation gave them; only named entries stamp source
+                    // metadata.
+                    if self.implicit_dirs.contains(p) {
+                        continue;
+                    }
                     let depth = p.iter().filter(|&&c| c == b'/').count();
                     let mut meta = e.meta();
                     let mut flags = flags;
@@ -3757,7 +4018,7 @@ impl Planner<'_> {
             )?
         };
         let mut ops: Vec<Op> = Vec::new();
-        let mut op_names: Vec<String> = Vec::new();
+        let mut op_names: Vec<QueuedLeafOp> = Vec::new();
         // Metadata repairs for quick-check-identical files, each with the
         // checkpoint record once the repair has actually succeeded.
         let mut meta_fixes: Vec<(Op, Option<QuickCheckRecord>)> = Vec::new();
@@ -4023,7 +4284,12 @@ impl Planner<'_> {
                     if !self.invalidate_completion(&dst_rel) {
                         continue;
                     }
-                    op_names.push(format!("{rel} -> {}", display(&target)));
+                    op_names.push(QueuedLeafOp {
+                        dst_rel: dst_rel.clone(),
+                        action: "create_symlink",
+                        kind: "symlink",
+                        name: format!("{rel} -> {}", display(&target)),
+                    });
                     ops.push(Op::Symlink {
                         path: dst_path.clone(),
                         target,
@@ -4090,7 +4356,12 @@ impl Planner<'_> {
                     if !self.invalidate_completion(&dst_rel) {
                         continue;
                     }
-                    op_names.push(rel);
+                    op_names.push(QueuedLeafOp {
+                        dst_rel: dst_rel.clone(),
+                        action: "create_special",
+                        kind: "special",
+                        name: rel,
+                    });
                     ops.push(Op::Mknod {
                         path: dst_path.clone(),
                         mode: e.mode,
@@ -4131,13 +4402,35 @@ impl Planner<'_> {
         if !ops.is_empty() {
             let errs = self.apply(ops)?;
             // Two ops per item: creation then metadata.
-            for (i, name) in op_names.iter().enumerate() {
+            for (i, queued) in op_names.iter().enumerate() {
                 let e1 = errs.get(2 * i).cloned().flatten();
                 let e2 = errs.get(2 * i + 1).cloned().flatten();
-                if let Some(e) = e1.or(e2) {
+                let error = e1.or(e2);
+                if let Some(e) = &error {
                     self.progress.error(&format!("syq: {e}"));
+                    match queued.action {
+                        "create_symlink" => self.links_created -= 1,
+                        _ => self.specials_created -= 1,
+                    }
                 } else if opts.verbose > 0 {
-                    self.progress.println(name);
+                    self.progress.println(&queued.name);
+                }
+                if let Some(results) = self.progress.results_writer() {
+                    results.emit_operation(&crate::results::OperationRecord {
+                        action: queued.action,
+                        dst: &queued.dst_rel,
+                        src: self.mapping_source_rel(&queued.dst_rel).as_deref(),
+                        kind: queued.kind,
+                        disposition: if error.is_none() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                        bytes: None,
+                        attempts: None,
+                        retryable: error.is_some().then_some("unknown"),
+                        message: error.as_deref(),
+                    });
                 }
             }
         }
@@ -4316,6 +4609,51 @@ impl Planner<'_> {
 
     /// Display name for a source entry: its destination-relative path, or the
     /// source's basename when a single file is copied to an exact destination.
+    /// --mapping: the manifest source path (base-relative) for a destination,
+    /// so `--results` records round-trip as retry mapping entries. None
+    /// outside mapping mode, where no base-relative source spelling exists.
+    fn mapping_source_rel(&self, dst_rel: &[u8]) -> Option<PathBytes> {
+        if !self.mapping_mode {
+            return None;
+        }
+        Some(
+            self.src_overrides
+                .get(dst_rel)
+                .cloned()
+                .unwrap_or_else(|| dst_rel.to_vec()),
+        )
+    }
+
+    /// A mapping entry that failed before any job existed (missing source,
+    /// declared-kind mismatch): the error was already counted; this emits the
+    /// per-entry result record retry tooling filters on.
+    fn emit_mapping_entry_failed(
+        &self,
+        entry: &ManifestEntry,
+        retryable: &'static str,
+        message: &str,
+    ) {
+        if let Some(results) = self.progress.results_writer() {
+            let (action, kind) = match entry.kind {
+                Some(DeclaredKind::Dir) => ("create_directory", "dir"),
+                Some(DeclaredKind::Symlink) => ("create_symlink", "symlink"),
+                Some(DeclaredKind::Special) => ("create_special", "special"),
+                _ => ("transfer_file", "file"),
+            };
+            results.emit_operation(&crate::results::OperationRecord {
+                action,
+                dst: &entry.dst,
+                src: Some(&entry.src),
+                kind,
+                disposition: "failed",
+                bytes: None,
+                attempts: None,
+                retryable: Some(retryable),
+                message: Some(message),
+            });
+        }
+    }
+
     fn rel_name(&self, src_root: &[u8], sub_b: &[u8], path: &[u8]) -> String {
         let r = join(sub_b, path);
         if r.is_empty() {
@@ -4390,6 +4728,7 @@ impl Planner<'_> {
         dst_entry: Option<Entry>,
     ) {
         let target_condition = self.exact_condition_for(&dst);
+        let src_rel = self.mapping_source_rel(&rel_bytes);
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
@@ -4404,6 +4743,7 @@ impl Planner<'_> {
             attempts: 0,
             done: Arc::new(AtomicU64::new(0)),
             inplace: false,
+            src_rel,
         });
     }
 
@@ -5196,7 +5536,9 @@ impl Worker {
             .zip(results.into_iter().zip(now.into_iter()))
         {
             if let Err(e) = res {
-                self.progress.error(&format!("syq: {}: {e:#}", j.rel));
+                let message = format!("{e:#}");
+                self.progress.error(&format!("syq: {}: {message}", j.rel));
+                self.emit_file_result_failed(j, "unknown", &message);
                 self.sched.fail_file(*idx);
                 continue;
             }
@@ -5238,6 +5580,11 @@ impl Worker {
                         "syq: {}: source changed during transfer (or vanished)",
                         j.rel
                     ));
+                    self.emit_file_result_failed(
+                        j,
+                        "yes",
+                        "source changed during transfer (or vanished)",
+                    );
                     self.sched.fail_file(*idx);
                 }
                 continue;
@@ -5245,6 +5592,19 @@ impl Worker {
             self.progress.add_bytes(j.entry.size);
             j.done.store(j.entry.size, Relaxed);
             self.progress.files_done.fetch_add(1, Relaxed);
+            if let Some(results) = self.progress.results_writer() {
+                results.emit_operation(&crate::results::OperationRecord {
+                    action: "transfer_file",
+                    dst: &j.rel_bytes,
+                    src: j.src_rel.as_deref(),
+                    kind: "file",
+                    disposition: "succeeded",
+                    bytes: Some(j.entry.size),
+                    attempts: Some(u64::from(j.attempts) + 1),
+                    retryable: None,
+                    message: None,
+                });
+            }
             self.record_done(&j.rel_bytes, &j.entry);
             if self.opts.verbose > 0 {
                 self.progress.println(&j.rel);
@@ -5259,11 +5619,31 @@ impl Worker {
             return Err(e);
         }
         if !self.sched.is_failed(idx) {
-            let rel = self.sched.jobs.lock().unwrap()[idx].rel.clone();
-            self.progress.error(&format!("syq: {rel}: {e:#}"));
+            let job = self.job(idx);
+            let message = format!("{e:#}");
+            self.progress.error(&format!("syq: {}: {message}", job.rel));
+            self.emit_file_result_failed(&job, "unknown", &message);
             self.sched.fail_file(idx);
         }
         Ok(())
+    }
+
+    /// One failed-transfer result record; the error itself was already
+    /// counted and printed by the caller.
+    fn emit_file_result_failed(&self, job: &FileJob, retryable: &'static str, message: &str) {
+        if let Some(results) = self.progress.results_writer() {
+            results.emit_operation(&crate::results::OperationRecord {
+                action: "transfer_file",
+                dst: &job.rel_bytes,
+                src: job.src_rel.as_deref(),
+                kind: "file",
+                disposition: "failed",
+                bytes: None,
+                attempts: Some(u64::from(job.attempts) + 1),
+                retryable: Some(retryable),
+                message: Some(message),
+            });
+        }
     }
 
     fn job(&self, idx: usize) -> FileJob {
@@ -5952,6 +6332,19 @@ impl Worker {
             self.progress.files_skipped.fetch_add(1, Relaxed);
         } else {
             self.progress.files_done.fetch_add(1, Relaxed);
+            if let Some(results) = self.progress.results_writer() {
+                results.emit_operation(&crate::results::OperationRecord {
+                    action: "transfer_file",
+                    dst: &job.rel_bytes,
+                    src: job.src_rel.as_deref(),
+                    kind: "file",
+                    disposition: "succeeded",
+                    bytes: Some(job.entry.size),
+                    attempts: Some(u64::from(job.attempts) + 1),
+                    retryable: None,
+                    message: None,
+                });
+            }
         }
         self.record_done(&job.rel_bytes, &job.entry);
         if !matched && self.opts.verbose > 0 {
@@ -6172,4 +6565,217 @@ mod tests {
         assert!(output.contains("receive unavailable, send-buffer unavailable"));
         assert!(output.contains("tcp ECN CE deliveries: unavailable"));
     }
+}
+
+/// One parsed `--mapping` manifest entry.
+struct ManifestEntry {
+    src: PathBytes,
+    dst: PathBytes,
+    kind: Option<DeclaredKind>,
+}
+
+/// The manifest's `kind` field: disambiguation of the request, not a
+/// precondition. A mismatch fails that entry the way a missing source does.
+#[derive(Clone, Copy)]
+enum DeclaredKind {
+    File,
+    Dir,
+    Symlink,
+    Special,
+}
+
+impl DeclaredKind {
+    fn matches(self, kind: Kind) -> bool {
+        match self {
+            DeclaredKind::File => kind == Kind::File,
+            DeclaredKind::Dir => kind == Kind::Dir,
+            DeclaredKind::Symlink => kind == Kind::Symlink,
+            DeclaredKind::Special => matches!(
+                kind,
+                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
+            ),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DeclaredKind::File => "file",
+            DeclaredKind::Dir => "dir",
+            DeclaredKind::Symlink => "symlink",
+            DeclaredKind::Special => "special",
+        }
+    }
+}
+
+fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
+    use base64::Engine as _;
+    // Unknown keys are rejected so a typo cannot be silently dropped; the
+    // known informational fields (`size`, `mtime`, a tagged path's `display`)
+    // are accepted and ignored so `syq map` output and future automation
+    // records round-trip.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WirePath {
+        encoding: String,
+        value: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        display: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireEntry {
+        src: WirePath,
+        dst: WirePath,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        size: Option<u64>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        mtime: Option<i64>,
+    }
+    let entry: WireEntry = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let decode = |path: WirePath, which: &str| -> Result<PathBytes> {
+        let bytes = match path.encoding.as_str() {
+            "utf-8" => path.value.into_bytes(),
+            "base64" => base64::engine::general_purpose::STANDARD
+                .decode(path.value.as_bytes())
+                .map_err(|e| anyhow::anyhow!("{which}: invalid base64 path: {e}"))?,
+            other => bail!("{which}: unknown path encoding {other:?}"),
+        };
+        validate_manifest_path(&bytes, which)?;
+        Ok(bytes)
+    };
+    let src = decode(entry.src, "src")?;
+    let dst = decode(entry.dst, "dst")?;
+    let kind = match entry.kind.as_deref() {
+        None => None,
+        Some("file") => Some(DeclaredKind::File),
+        Some("dir") => Some(DeclaredKind::Dir),
+        Some("symlink") => Some(DeclaredKind::Symlink),
+        Some("special") => Some(DeclaredKind::Special),
+        Some(other) => bail!("unknown kind {other:?}"),
+    };
+    Ok(ManifestEntry { src, dst, kind })
+}
+
+fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
+    if path.is_empty() {
+        bail!("{which} path is empty");
+    }
+    if path[0] == b'/' {
+        bail!(
+            "{which} path {:?} is absolute; mapping entries are root-relative",
+            String::from_utf8_lossy(path)
+        );
+    }
+    if path.contains(&0) {
+        bail!("{which} path contains NUL");
+    }
+    for component in path.split(|&byte| byte == b'/') {
+        if component.is_empty() || component == b"." || component == b".." {
+            bail!(
+                "{which} path {:?} contains an empty, `.`, or `..` component",
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A destination ancestor directory no manifest entry names: created with
+/// default metadata (mode through the umask, natural mtime; see
+/// `Planner::implicit_dirs`).
+fn implicit_dir_entry(path: PathBytes) -> Entry {
+    Entry {
+        path,
+        kind: Kind::Dir,
+        size: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        dev: 0,
+        ino: 0,
+        ctime: 0,
+        ctime_nsec: 0,
+        link: None,
+    }
+}
+
+/// A queued symlink/special creation: the display string for -v plus the
+/// machine-readable identity `--results` records need.
+struct QueuedLeafOp {
+    dst_rel: PathBytes,
+    action: &'static str,
+    kind: &'static str,
+    name: String,
+}
+
+/// The container-relative spelling of a full destination path; None for the
+/// container itself.
+fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
+    if path == dst_root {
+        return None;
+    }
+    let rest = path.strip_prefix(dst_root)?;
+    Some(rest.strip_prefix(b"/").unwrap_or(rest))
+}
+
+/// Phase-1 manifest read for `--mapping`: parse every line and run the
+/// parse-level preflight (duplicate destinations; an entry whose destination
+/// is a strict ancestor of another entry's destination must not declare a
+/// non-directory kind) before anything is written. Whether an undeclared
+/// ancestor really is a directory is only knowable from the source and is
+/// checked during execution.
+fn read_mapping_manifest(reader: &mut dyn std::io::BufRead) -> Result<Vec<(u64, ManifestEntry)>> {
+    let mut entries: Vec<(u64, ManifestEntry)> = Vec::new();
+    let mut declared: std::collections::HashMap<PathBytes, Option<DeclaredKind>> =
+        std::collections::HashMap::new();
+    let mut line_number = 0u64;
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| anyhow::anyhow!("--mapping: read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        line_number += 1;
+        let text = line.trim_end_matches('\n').trim_end_matches('\r');
+        if text.is_empty() {
+            continue;
+        }
+        let entry = parse_manifest_entry(text)
+            .map_err(|e| anyhow::anyhow!("--mapping line {line_number}: {e}"))?;
+        if declared.insert(entry.dst.clone(), entry.kind).is_some() {
+            bail!(
+                "--mapping line {line_number}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)",
+                display(&entry.dst)
+            );
+        }
+        entries.push((line_number, entry));
+    }
+    for (line_number, entry) in &entries {
+        for (i, &byte) in entry.dst.iter().enumerate() {
+            if byte != b'/' {
+                continue;
+            }
+            if let Some(Some(kind)) = declared.get(&entry.dst[..i]) {
+                if !matches!(kind, DeclaredKind::Dir) {
+                    bail!(
+                        "--mapping line {line_number}: destination ancestor {} of {} is mapped with kind {:?}, not dir",
+                        display(&entry.dst[..i]),
+                        display(&entry.dst),
+                        kind.label()
+                    );
+                }
+            }
+        }
+    }
+    Ok(entries)
 }

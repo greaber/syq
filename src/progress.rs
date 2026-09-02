@@ -45,6 +45,9 @@ pub struct Progress {
     workers: Mutex<Vec<Option<WorkerStatus>>>,
     term: Mutex<TermState>,
     stop: AtomicBool,
+    /// `--results`: machine-readable NDJSON outcome stream, set once after
+    /// construction so workers and the planner reach it with no plumbing.
+    results: std::sync::OnceLock<Arc<crate::results::ResultsWriter>>,
 }
 
 struct TermState {
@@ -87,7 +90,16 @@ impl Progress {
                 last_json: None,
             }),
             stop: AtomicBool::new(false),
+            results: std::sync::OnceLock::new(),
         })
+    }
+
+    pub fn set_results(&self, writer: Arc<crate::results::ResultsWriter>) {
+        let _ = self.results.set(writer);
+    }
+
+    pub fn results_writer(&self) -> Option<&Arc<crate::results::ResultsWriter>> {
+        self.results.get()
     }
 
     pub fn set_worker(&self, id: usize, s: Option<WorkerStatus>) {
@@ -122,6 +134,9 @@ impl Progress {
     pub fn error(&self, line: &str) {
         self.errors.fetch_add(1, Relaxed);
         self.eprintln(line);
+        if let Some(results) = self.results.get() {
+            results.emit_error(line);
+        }
     }
 
     pub fn warning(&self, code: &str, count: u64, message: &str) {

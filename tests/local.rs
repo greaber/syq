@@ -8265,3 +8265,706 @@ fn files_from_unwritable_destination_root_fails_and_is_left_alone() {
     assert_eq!(mode, 0o500, "the unlisted root keeps its mode");
     assert!(!t.path("dst/a").exists());
 }
+
+// ---- syq map ----
+
+fn syq_map_in(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("map")
+        .args(args)
+        .current_dir(dir)
+        .run()
+        .expect("run syq map")
+}
+
+fn map_lines(out: &Output) -> Vec<serde_json::Value> {
+    assert!(
+        out.status.success(),
+        "syq map failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout.clone())
+        .expect("map output is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("map line is JSON"))
+        .collect()
+}
+
+fn map_path(value: &serde_json::Value, key: &str) -> String {
+    assert_eq!(value[key]["encoding"], "utf-8");
+    value[key]["value"]
+        .as_str()
+        .expect("tagged path value")
+        .to_string()
+}
+
+#[test]
+fn native_map_contents_emits_identity_parent_first() {
+    let t = Tmp::new();
+    write(&t.path("src/Berlin/IMG.JPG"), b"img");
+    write(&t.path("src/Notes.TXT"), b"hello");
+    std::os::unix::fs::symlink("Notes.TXT", t.path("src/Link.TXT")).unwrap();
+    let lines = map_lines(&syq_map_in(&t.path(""), &["--src-src", "src"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["Berlin", "Berlin/IMG.JPG", "Link.TXT", "Notes.TXT"]);
+    for v in &lines {
+        assert_eq!(map_path(v, "src"), map_path(v, "dst"));
+    }
+    assert_eq!(lines[0]["kind"], "dir");
+    assert!(lines[0].get("size").is_none());
+    assert_eq!(lines[1]["kind"], "file");
+    assert_eq!(lines[1]["size"], 3);
+    assert!(lines[1]["mtime"].is_i64());
+    assert_eq!(lines[2]["kind"], "symlink");
+    assert!(lines[2].get("size").is_none());
+    assert_eq!(lines[3]["kind"], "file");
+}
+
+#[test]
+fn native_map_named_cwd_and_as_rename() {
+    let t = Tmp::new();
+    write(&t.path("photos/x/a.jpg"), b"a");
+    // Named selector: dst gains the basename prefix.
+    let lines = map_lines(&syq_map_in(&t.path(""), &["photos"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["photos", "photos/x", "photos/x/a.jpg"]);
+    for v in &lines {
+        assert_eq!(map_path(v, "src"), map_path(v, "dst"));
+    }
+    // -C: emitted src stays relative to the base.
+    let lines = map_lines(&syq_map_in(&t.path(""), &["-C", "photos", "--src", "x"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["x", "x/a.jpg"]);
+    assert_eq!(map_path(&lines[0], "src"), "x");
+    // --as renames the single selected root; src spelling is unchanged.
+    let lines = map_lines(&syq_map_in(&t.path(""), &["photos", "--as", "album"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["album", "album/x", "album/x/a.jpg"]);
+    let srcs: Vec<String> = lines.iter().map(|v| map_path(v, "src")).collect();
+    assert_eq!(srcs, ["photos", "photos/x", "photos/x/a.jpg"]);
+}
+
+#[test]
+fn native_map_refusals() {
+    let t = Tmp::new();
+    write(&t.path("d1/n"), b"1");
+    write(&t.path("d2/n"), b"2");
+    let refuse = |args: &[&str], needle: &str| {
+        let out = syq_map_in(&t.path(""), args);
+        assert!(!out.status.success(), "expected failure for {args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(stderr.contains(needle), "stderr for {args:?}: {stderr}");
+    };
+    refuse(&["/etc"], "root-relative");
+    refuse(&["--src-src", "d1", "--src-src", "d2"], "only selector");
+    refuse(&["--src-src", "d1", "d2"], "only selector");
+    refuse(&["d1/n", "d2/n"], "same destination name");
+    refuse(&["d1", "--into-new", "z"], "never contacts a destination");
+    refuse(&["d1", "--from", "remotehost"], "not yet supported");
+}
+
+#[test]
+fn native_map_refuses_non_utf8_names() {
+    let t = Tmp::new();
+    write(&t.path("src/ok.txt"), b"ok");
+    let bad = t
+        .path("src")
+        .join(std::ffi::OsString::from_vec(b"bad\xff.dat".to_vec()));
+    write(&bad, b"x");
+    let out = syq_map_in(&t.path(""), &["--src-src", "src"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("UTF-8"), "stderr: {stderr}");
+}
+
+// ---- syq cp --mapping ----
+
+fn syq_cp_in(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
+    cmd.arg("cp").args(args).current_dir(dir);
+    match stdin {
+        None => cmd.run().expect("run syq cp"),
+        Some(data) => {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().expect("spawn syq cp");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(data)
+                .expect("write manifest");
+            child.wait_with_output().expect("wait syq cp")
+        }
+    }
+}
+
+fn entry_line(src: &str, dst: &str, kind: Option<&str>) -> String {
+    let kind = kind.map_or(String::new(), |k| format!(",\"kind\":\"{k}\""));
+    format!(
+        "{{\"src\":{{\"encoding\":\"utf-8\",\"value\":\"{src}\"}},\"dst\":{{\"encoding\":\"utf-8\",\"value\":\"{dst}\"}}{kind}}}\n"
+    )
+}
+
+#[test]
+fn native_cp_mapping_renames_creates_ancestors_and_reads_stdin() {
+    let t = Tmp::new();
+    write(&t.path("src/Berlin/IMG.JPG"), b"img");
+    write(&t.path("src/Notes.TXT"), b"hello");
+    write(&t.path("dst/unrelated.txt"), b"keep");
+    let manifest = format!(
+        "{}{}{}",
+        entry_line("Berlin", "berlin", Some("dir")),
+        entry_line("Berlin/IMG.JPG", "berlin/2024/07/img.jpg", Some("file")),
+        entry_line("Notes.TXT", "notes.txt", None),
+    );
+    // Dry run writes nothing.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-n", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.path("dst/berlin").exists());
+    // Real run from stdin: renames, implicit 2024/07 ancestors, keeps extras.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "cp failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("dst/berlin/2024/07/img.jpg")), b"img");
+    assert_eq!(read(&t.path("dst/notes.txt")), b"hello");
+    assert_eq!(read(&t.path("dst/unrelated.txt")), b"keep");
+    // Rerun converges cleanly.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert!(out.status.success());
+}
+
+#[test]
+fn native_cp_mapping_file_manifest_and_base64_src() {
+    let t = Tmp::new();
+    let bad = t
+        .path("src")
+        .join(std::ffi::OsString::from_vec(b"caf\xe9.txt".to_vec()));
+    write(&bad, b"latin1 name");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"caf\xe9.txt");
+    let manifest = format!(
+        "{{\"src\":{{\"encoding\":\"base64\",\"value\":\"{b64}\"}},\"dst\":{{\"encoding\":\"utf-8\",\"value\":\"cafe.txt\"}}}}\n"
+    );
+    write(&t.path("m.ndjson"), manifest.as_bytes());
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "m.ndjson", "-C", "src", "--into", "out", "-q"],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "cp failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("out/cafe.txt")), b"latin1 name");
+}
+
+#[test]
+fn native_cp_mapping_entry_failures_are_partial_not_fatal() {
+    let t = Tmp::new();
+    write(&t.path("src/real.txt"), b"real");
+    fs::create_dir_all(t.path("src/adir")).unwrap();
+    let manifest = format!(
+        "{}{}{}",
+        entry_line("missing.txt", "a.txt", None),
+        entry_line("adir", "b.txt", Some("file")),
+        entry_line("real.txt", "c.txt", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(stderr.contains("not the declared file"), "{stderr}");
+    assert_eq!(read(&t.path("dst/c.txt")), b"real");
+    assert!(!t.path("dst/a.txt").exists());
+    assert!(!t.path("dst/b.txt").exists());
+}
+
+#[test]
+fn native_cp_mapping_hard_refusals() {
+    let t = Tmp::new();
+    write(&t.path("src/x.txt"), b"x");
+    let refuse = |manifest: &str, needle: &str| {
+        let out = syq_cp_in(
+            &t.path(""),
+            &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+            Some(manifest.as_bytes()),
+        );
+        assert!(!out.status.success(), "expected refusal for {manifest:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(stderr.contains(needle), "wanted {needle:?} in: {stderr}");
+    };
+    let dup = format!(
+        "{}{}",
+        entry_line("x.txt", "same", None),
+        entry_line("x.txt", "same", None)
+    );
+    refuse(&dup, "duplicate destination");
+    refuse(
+        "{\"src\":{\"encoding\":\"utf-8\",\"value\":\"x.txt\"},\"dst\":{\"encoding\":\"utf-8\",\"value\":\"../out\"}}\n",
+        "component",
+    );
+    refuse(
+        "{\"src\":{\"encoding\":\"utf-8\",\"value\":\"/etc/passwd\"},\"dst\":{\"encoding\":\"utf-8\",\"value\":\"y\"}}\n",
+        "absolute",
+    );
+    refuse(
+        "{\"src\":{\"encoding\":\"utf-8\",\"value\":\"x.txt\"},\"dst\":{\"encoding\":\"utf-8\",\"value\":\"y\"},\"knd\":\"file\"}\n",
+        "unknown field",
+    );
+    // Parse-level grammar refusals.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "src/x.txt", "--into", "dst"],
+        Some(b""),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("replaces source selectors"));
+    let out = syq_cp_in(&t.path(""), &["--mapping", "-", "--as", "exact"], Some(b""));
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--as conflicts with --mapping"));
+}
+
+#[test]
+fn native_cp_mapping_end_to_end_map_pipeline() {
+    let t = Tmp::new();
+    write(&t.path("src/Berlin/IMG.JPG"), b"img");
+    write(&t.path("src/Notes.TXT"), b"hello");
+    // syq map | (lowercase transform) | syq cp --mapping -
+    let map_out = syq_map_in(&t.path(""), &["--src-src", "src"]);
+    assert!(map_out.status.success());
+    let transformed: String = String::from_utf8(map_out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let lower = v["dst"]["value"].as_str().unwrap().to_lowercase();
+            v["dst"]["value"] = serde_json::Value::String(lower);
+            format!("{v}\n")
+        })
+        .collect();
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "pub", "-q"],
+        Some(transformed.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("pub/berlin/img.jpg")), b"img");
+    assert_eq!(read(&t.path("pub/notes.txt")), b"hello");
+}
+
+// ---- syq cp --results ----
+
+#[test]
+fn native_cp_results_stream_success_and_partial() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"abc");
+    std::os::unix::fs::symlink("a.txt", t.path("src/l")).unwrap();
+    let manifest = format!(
+        "{}{}{}",
+        entry_line("a.txt", "x/a.txt", Some("file")),
+        entry_line("l", "l", Some("symlink")),
+        entry_line("gone.txt", "g.txt", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(out.status.code(), Some(23));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("results line is JSON"))
+        .collect();
+    // Envelope: schema v0, strictly increasing seq, run first, result last.
+    for (i, v) in lines.iter().enumerate() {
+        assert_eq!(v["schema"], "syq.automation");
+        assert_eq!(v["schema_version"], 0);
+        assert_eq!(v["seq"], i as u64);
+    }
+    assert_eq!(lines[0]["type"], "run");
+    assert_eq!(lines[0]["mapping"], true);
+    let last = lines.last().unwrap();
+    assert_eq!(last["type"], "result");
+    assert_eq!(last["status"], "partial");
+    assert_eq!(last["exit_code"], 23);
+    assert_eq!(last["files_transferred"], 1);
+    assert_eq!(last["symlinks_created"], 1);
+    assert!(last["directories_created"].as_u64().unwrap() >= 1);
+    assert_eq!(last["errors"], 1);
+    let ops: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|v| v["type"] == "operation_result")
+        .collect();
+    let find = |dst: &str| {
+        *ops.iter()
+            .find(|v| v["dst"]["value"] == dst)
+            .unwrap_or_else(|| panic!("no operation_result for {dst}"))
+    };
+    let file = find("x/a.txt");
+    assert_eq!(file["action"], "transfer_file");
+    assert_eq!(file["disposition"], "succeeded");
+    assert_eq!(file["kind"], "file");
+    assert_eq!(file["bytes"], 3);
+    assert_eq!(file["src"]["value"], "a.txt");
+    let dir = find("x");
+    assert_eq!(dir["action"], "create_directory");
+    assert_eq!(dir["disposition"], "succeeded");
+    let link = find("l");
+    assert_eq!(link["action"], "create_symlink");
+    assert_eq!(link["disposition"], "succeeded");
+    let failed = find("g.txt");
+    assert_eq!(failed["disposition"], "failed");
+    assert_eq!(failed["retryable"], "unknown");
+    assert_eq!(failed["src"]["value"], "gone.txt");
+    // A failed record round-trips as a retry mapping entry.
+    let retry = format!(
+        "{{\"src\":{},\"dst\":{},\"kind\":{}}}\n",
+        failed["src"], failed["dst"], failed["kind"]
+    );
+    write(&t.path("src/gone.txt"), b"late");
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r2.ndjson",
+            "-q",
+        ],
+        Some(retry.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "retry failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("dst/g.txt")), b"late");
+    let last: serde_json::Value = String::from_utf8(read(&t.path("r2.ndjson")))
+        .unwrap()
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .unwrap();
+    assert_eq!(last["status"], "success");
+    assert_eq!(last["exit_code"], 0);
+    // An error record accompanied the failure in the first run.
+    assert!(
+        lines
+            .iter()
+            .any(|v| v["type"] == "error"
+                && v["message"].as_str().unwrap().contains("does not exist"))
+    );
+}
+
+#[test]
+fn native_cp_results_without_mapping_and_refusals() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "out",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["mapping"], false);
+    let op = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["dst"]["value"] == "f.txt")
+        .expect("transfer record");
+    assert_eq!(op["disposition"], "succeeded");
+    assert!(op.get("src").is_none(), "non-mapping records carry no src");
+    assert_eq!(lines.last().unwrap()["status"], "success");
+    // map and cp-prune refuse --results.
+    let out = syq_map_in(&t.path(""), &["--src-src", "src", "--results", "r.ndjson"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only available on syq cp"));
+}
+
+// ---- review-round fixes ----
+
+#[test]
+fn native_map_normalizes_dot_components_and_rejects_dotdot() {
+    let t = Tmp::new();
+    write(&t.path("photos/a.jpg"), b"a");
+    let lines = map_lines(&syq_map_in(&t.path(""), &["./photos"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["photos", "photos/a.jpg"]);
+    assert_eq!(map_path(&lines[0], "src"), "photos");
+    let out = syq_map_in(&t.path("photos"), &["--src", "../photos"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`..` component"));
+}
+
+#[test]
+fn native_cp_results_refuses_dry_run() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"x");
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-n",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not support --dry-run"));
+}
+
+#[test]
+fn native_cp_results_implicit_dir_failure_is_not_a_retry_entry() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"abc");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o555)).unwrap();
+    let manifest = entry_line("a.txt", "sub/a.txt", None);
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let dir = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["dst"]["value"] == "sub")
+        .expect("implicit dir record");
+    assert_eq!(dir["disposition"], "failed");
+    assert_eq!(dir["retryable"], "no");
+    assert!(dir.get("src").is_none(), "implicit dirs have no source");
+    // The documented retry filter selects only records that are valid
+    // mapping entries: failed, retryable, carrying a src.
+    let retryable: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|v| {
+            v["type"] == "operation_result"
+                && v["disposition"] == "failed"
+                && v["retryable"] != "no"
+        })
+        .collect();
+    assert!(!retryable.is_empty(), "the file failure is retryable");
+    for v in &retryable {
+        assert!(v.get("src").is_some(), "retry candidates carry src: {v}");
+    }
+}
+
+#[test]
+fn native_cp_mapping_specials_are_visible_skips_not_failures() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"abc");
+    fs::create_dir_all(t.path("src")).unwrap();
+    let fifo = t.path("src/pipe");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let manifest = format!(
+        "{}{}",
+        entry_line("a.txt", "a.txt", None),
+        entry_line("pipe", "pipe", Some("special")),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.path("dst/pipe").exists());
+    assert_eq!(read(&t.path("dst/a.txt")), b"abc");
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    // Excluded entries are aggregate-only: no per-entry record, no failure.
+    assert!(
+        !lines
+            .iter()
+            .any(|v| v["type"] == "operation_result" && v["dst"]["value"] == "pipe"),
+        "policy exclusions appear only in terminal aggregates"
+    );
+    let last = lines.last().unwrap();
+    assert_eq!(last["status"], "success");
+    assert_eq!(last["files_excluded"], 1);
+}
+
+#[test]
+fn native_cp_mapping_whole_manifest_preflight_writes_nothing() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    write(&t.path("src/b.txt"), b"b");
+    // A duplicate destination far apart: refused with nothing written,
+    // even though the first entries were valid.
+    let mut manifest = String::new();
+    manifest.push_str(&entry_line("a.txt", "same.txt", None));
+    for i in 0..5000 {
+        manifest.push_str(&entry_line("b.txt", &format!("fill/{i}.txt"), None));
+    }
+    manifest.push_str(&entry_line("b.txt", "same.txt", None));
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate destination"));
+    // The --into container is created eagerly as with --files-from, but no
+    // entry may have been applied.
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+    // Declared-kind ancestor conflict is refused up front too.
+    let conflict = format!(
+        "{}{}",
+        entry_line("a.txt", "p", Some("file")),
+        entry_line("b.txt", "p/q.txt", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(conflict.as_bytes()),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not dir"));
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+}
+
+#[test]
+fn native_mapping_and_map_respect_typed_selectors() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"f");
+    fs::create_dir_all(t.path("src/d")).unwrap();
+    // --mapping rejects typed selectors instead of silently discarding them.
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "--src-dir",
+            "absent",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+        ],
+        Some(b""),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("replaces source selectors"));
+    // syq map enforces typed-selector preconditions like native cp.
+    let out = syq_map_in(&t.path("src"), &["--src-file", "d"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is a directory"));
+    let out = syq_map_in(&t.path("src"), &["--src-dir", "f.txt"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not a directory"));
+    // Happy paths still emit.
+    let lines = map_lines(&syq_map_in(
+        &t.path("src"),
+        &["--src-dir", "d", "--src-file", "f.txt"],
+    ));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["d", "f.txt"]);
+}

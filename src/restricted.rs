@@ -1934,10 +1934,11 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     if !args.ignore_lines.is_empty()
         || !args.files_from_lines.is_empty()
         || args.files_from.is_some()
+        || args.native_mapping.is_some()
         || args.min_size.is_some()
     {
         bail!(
-            "--ignore/--ignore-from, --files-from, and --min-size are not yet independently enforceable by the command-restricted receiver"
+            "--ignore/--ignore-from, --files-from, --mapping, and --min-size are not yet independently enforceable by the command-restricted receiver"
         );
     }
     if args.syq_path.is_some() || args.no_bootstrap {

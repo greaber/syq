@@ -24,6 +24,9 @@ pub struct FileJob {
     pub inplace: bool,
     /// Destination-root-relative path, used as the checkpoint key.
     pub rel_bytes: PathBytes,
+    /// --mapping: the entry's source path relative to the source base, kept
+    /// so `--results` records round-trip as retry mapping entries.
+    pub src_rel: Option<PathBytes>,
 }
 
 pub struct RangeState {
