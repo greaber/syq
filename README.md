@@ -332,8 +332,9 @@ All native commands accept `--follow`, `-n`/`--dry-run`, `-v`/`--verbose`,
 `-q`/`--quiet`, `-j`/`--connections`, `--progress`/`--no-progress`, and
 `--progress-json` in addition to their endpoint and selector options. `cp` also
 accepts `--hash`, `--no-compress`, `--bwlimit RATE`, `--stats`,
-`--reuse-connection`, repeatable
-`--ignore PATTERN`/`--ignore-from FILE`, `--preserve`, and `--inplace`. Filters
+repeatable `--ignore PATTERN`/`--ignore-from FILE`, `--preserve`, and
+`--inplace`. Native `cp` and `rm` also accept an isolated SSH persistence
+scope through `--pscope PATH`. Filters
 use the gitignore semantics described below and apply at every source root;
 `--prune` protects excluded destination paths from pruning. `--hash`
 compares existing regular-file contents with full BLAKE3 digests instead of
@@ -406,6 +407,60 @@ and `--tcp-congestion` work with ordinary and explicitly managed SSH modes but
 remain fail-closed on that receiver until its authenticated worker-session
 join protocol represents them. Other comparison and selection controls, and
 block and split sizing, remain available only through `syq rsync`.
+
+## Persistent SSH connections
+
+For interactive use, enable SSH connection persistence once:
+
+```sh
+syq persist on
+syq persist status
+syq persist off
+```
+
+While it is on, transfer and removal commands that use syq's implicit SSH
+transport keep one control connection per `user@host:port` alive for five
+minutes after its last session (OpenSSH `ControlMaster` with
+`ControlPersist`). Later commands reuse that authenticated connection, cutting
+per-command setup to milliseconds and avoiding another hardware-token
+interaction. `status` shows the global scope and its recorded endpoints;
+`off` disables the policy, asks every live syq-owned master to exit, and
+removes the global runtime scope. The durable preference lives in
+`$XDG_CONFIG_HOME/syq/persistence-v1.json` (normally under `~/.config`), while
+control sockets live in a private per-user runtime directory.
+
+Scripts can avoid changing that shared preference by creating an isolated
+persistence scope:
+
+```sh
+pscope=$(syq persist on --ephemeral) || exit
+trap 'syq persist off --pscope "$pscope"' EXIT
+
+syq cp --pscope "$pscope" first --to server --into /backup
+syq cp --pscope "$pscope" second --to server --into /backup
+syq persist status --pscope "$pscope"
+```
+
+`on --ephemeral` prints exactly the new private scope path. Passing that path
+with `--pscope` lets separately launched or parallel commands share only that
+scope, independently of the global setting. `off --pscope` closes its live
+masters and removes it. If a script is killed before its cleanup trap runs,
+the masters still leave after their five-minute idle limit; the inert scope
+can be inspected or removed later with the printed path. Scope paths beginning
+with a literal `~` or containing `${...}` are refused because OpenSSH expands
+those forms before opening a control socket.
+
+During either persistence window, anything able to act as the same local user
+can open sessions through the socket without touching the key or agent. This
+is comparable to sudo's credential cache; do not enable it where that window
+is unacceptable. Data connections are unaffected: they remain separate TCP
+streams (or independent SSH processes under `--no-tcp`), so bulk throughput
+does not change. Persistence is not applied to an explicit `--rsh`, a remote
+transfer coordinator, or command-restricted receiver authentication. A global
+preference is simply ignored on those paths; an explicit `--pscope` is refused
+when the requested topology cannot honor it. Use `--relay` with `syq rsync` or
+`--run-at local` with native syntax to keep a remote-to-remote copy's reusable
+connections on the invoking machine.
 
 ## Mappings
 
@@ -481,7 +536,7 @@ explicitly say otherwise.
 | `--tcp-plain` | TCP data connections without encryption (trusted networks only) |
 | `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
 | `--tcp-congestion ALGO` | Linux: use `ALGO` on both ends of direct TCP data sockets; the host default is unchanged |
-| `--reuse-connection` | Keep the implicit ssh control connection alive 5 minutes after the run and reuse it on later runs to the same endpoint (see below) |
+| `--pscope PATH` | Use an isolated SSH persistence scope created by `syq persist on --ephemeral` |
 | `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `--ignore`) |
 | `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
@@ -514,24 +569,6 @@ per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
 value by one byte, and `0` means unlimited. SYQ counts uncompressed file bytes;
 protocol overhead is not counted, and transport compression may make the actual
 network rate lower. Scanning, hashing, and metadata operations are not limited.
-
-`--reuse-connection` keeps the implicit ssh control connection alive in the
-background for five minutes after a run (OpenSSH ControlMaster with
-ControlPersist) and reuses it on later runs to the same `user@host`, cutting
-per-run connection setup to milliseconds — useful for scripted bursts of small
-copies. The socket lives in a private per-user runtime directory. During the
-window, anyone able to act as your local user can open sessions to that host
-through the socket without touching your key or agent — comparable to sudo's
-credential caching, and notably a hardware-token approval is not required for
-reuse; do not enable it where that window is unacceptable. Data connections
-are unaffected: they remain separate TCP streams (or independent ssh
-processes under `--no-tcp`), so throughput does not change. Not available
-with an explicit `-e`/`--rsh`. Explicit endpoint ports are part of the reuse
-identity. Direct remote-to-remote transfers refuse it because a remote
-coordinator has no reusable local master, so use `--relay` with `syq rsync` or
-`--run-at local` with native syntax; the command-restricted path additionally
-refuses it because its host-bound authentication is verified on each fresh
-connection.
 
 Remote transfers use fast zstd level-1 compression by default. Each protocol
 frame is sent compressed only when that representation is smaller, so archives,

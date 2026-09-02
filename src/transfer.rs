@@ -105,14 +105,18 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             }
             let ssh_multiplexer = if args.rsh.is_some() {
                 None
-            } else if args.reuse_connection && args.restricted_grant.is_none() {
-                Some(Arc::new(SshMultiplexer::persistent(
-                    loc.user.as_deref(),
-                    h,
-                    loc.port,
-                )?))
-            } else {
+            } else if args.restricted_grant.is_some() {
                 Some(Arc::new(SshMultiplexer::new()?))
+            } else {
+                match crate::persistence::scope_for_implicit_ssh(args.pscope.as_deref())? {
+                    Some(scope) => Some(Arc::new(SshMultiplexer::persistent(
+                        &scope,
+                        loc.user.as_deref(),
+                        h,
+                        loc.port,
+                    )?)),
+                    None => Some(Arc::new(SshMultiplexer::new()?)),
+                }
             };
             Endpoint::Remote(RemoteSpec {
                 local_process: false,
@@ -797,14 +801,14 @@ pub fn run(args: Args) -> Result<i32> {
             "--detach, --no-forward-agent, and --agent-broker-only apply only to a direct copy between two different remote endpoints"
         );
     }
-    if args.reuse_connection && coordinator_is_remote {
+    if args.pscope_explicit && coordinator_is_remote {
         if args.interface == Interface::Rsync {
             bail!(
-                "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
+                "--pscope is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
             );
         }
         bail!(
-            "--reuse-connection is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
+            "--pscope is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
         );
     }
     if args.detach && args.native_results.is_some() {
@@ -897,6 +901,47 @@ pub fn run(args: Args) -> Result<i32> {
             }
         }
     }
+    // A remote coordinator owns both SSH edges. Hand off before constructing
+    // local endpoints so the invoking machine neither reads its persistence
+    // policy nor creates records for connections it will never open.
+    if coordinator_is_remote {
+        if args.rsh.is_some() {
+            let rsh = parse_rsh(&args.rsh)?;
+            if !rsh[0].ends_with("ssh")
+                && srcs
+                    .iter()
+                    .chain(std::iter::once(dst))
+                    .any(|location| location.port.is_some())
+            {
+                bail!(
+                    "an explicit endpoint SSH port requires the default ssh or an --rsh command whose executable is ssh"
+                );
+            }
+        }
+        if args.connections_default {
+            args.connections = tune::START_SSH;
+        }
+        if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
+            return crate::direct::run_at_target(&args, srcs, dst, source_operand_count);
+        }
+        return crate::direct::run(&args, srcs, dst, source_operand_count);
+    }
+    if srcs[0].is_remote() && dst.is_remote() {
+        if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
+            args.relay = true;
+        }
+        if !args.quiet {
+            if args.relay {
+                eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
+            } else {
+                eprintln!(
+                    "syq: remote-to-remote transfer: relaying raw path bytes through this machine"
+                );
+            }
+        }
+    } else if args.interface != Interface::Rsync && args.run_at != RunAt::Auto {
+        bail!("--run-at currently applies only to copies between two remote endpoints");
+    }
     let src_ep = endpoint(&srcs[0], &args)?;
     let mut dst_ep = endpoint(dst, &args)?;
     if args.tcp_congestion.is_some() && !src_ep.is_remote() && !dst_ep.is_remote() {
@@ -920,34 +965,6 @@ pub fn run(args: Args) -> Result<i32> {
         } else {
             tune::START_LOCAL
         };
-    }
-    if src_ep.is_remote() && dst_ep.is_remote() {
-        if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
-            args.relay = true;
-        }
-        if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
-            return crate::direct::run_at_target(&args, srcs, dst, source_operand_count);
-        }
-        if !args.relay {
-            if args.interface == Interface::Rsync
-                || direct_paths_are_utf8
-                || args.run_at == RunAt::Source
-            {
-                // Let the remote orchestrator observe the original source count so
-                // repeated file sources keep multi-source destination semantics.
-                return crate::direct::run(&args, srcs, dst, source_operand_count);
-            }
-            if !args.quiet {
-                eprintln!(
-                    "syq: remote-to-remote transfer: relaying raw path bytes through this machine"
-                );
-            }
-        }
-        if args.relay && !args.quiet {
-            eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
-        }
-    } else if args.interface != Interface::Rsync && args.run_at != RunAt::Auto {
-        bail!("--run-at currently applies only to copies between two remote endpoints");
     }
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {

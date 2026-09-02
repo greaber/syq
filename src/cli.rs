@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Interface {
@@ -252,11 +253,12 @@ pub struct Args {
         conflicts_with_all = ["no_tcp", "rm", "follow"]
     )]
     pub tcp_congestion: Option<String>,
-    /// Keep the implicit ssh control connection alive for 5 minutes after the
-    /// run and reuse it on later runs to the same endpoint (OpenSSH
-    /// ControlMaster); reused runs skip connection setup and re-authentication
-    #[arg(long, conflicts_with = "rsh")]
-    pub reuse_connection: bool,
+    /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    #[arg(long, value_name = "PATH", conflicts_with = "rsh")]
+    pub pscope: Option<PathBuf>,
+    /// Whether --pscope was supplied rather than selected by the user-level policy
+    #[arg(skip)]
+    pub pscope_explicit: bool,
     /// Remote-to-remote: start the transfer detached on the source host (survives losing this
     /// ssh session) and return; progress goes to a log you can watch with --follow
     #[arg(long)]
@@ -423,7 +425,7 @@ impl Args {
             // remain top-level. Internal helper switches are handled in main.
             "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv),
             _ => bail!(
-                "expected a command (`cp`, `rm`, `map`, or `rsync`); rsync-shaped syntax now starts with `syq rsync`"
+                "expected a command (`cp`, `rm`, `map`, `rsync`, or `persist`); rsync-shaped syntax now starts with `syq rsync`"
             ),
         }
     }
@@ -564,7 +566,7 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a copy's resolved selection and placement as NDJSON\n  rsync        Use the retained rsync-shaped command surface\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a copy's resolved selection and placement as NDJSON\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -853,11 +855,6 @@ struct NativeCopyFields {
     /// Automation schema version 0, an unstable preview
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     results: Option<OsString>,
-    /// Keep the ssh control connection alive for 5 minutes after the run and
-    /// reuse it on later runs to the same endpoint (OpenSSH ControlMaster);
-    /// reused runs skip connection setup and re-authentication
-    #[arg(long)]
-    reuse_connection: bool,
     #[command(flatten)]
     operational: NativeCopyOperationalArgs,
 }
@@ -887,6 +884,9 @@ struct NativeCopyCommand {
     size_selection: NativeSizeSelectionArgs,
     #[command(flatten)]
     remote: NativeRemoteArgs,
+    /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    #[arg(long, value_name = "PATH")]
+    pscope: Option<PathBuf>,
     /// After copying, remove target-only objects in mapped directory scopes;
     /// ignored and size-excluded source paths remain protected
     #[arg(long, conflicts_with_all = ["mapping", "results"])]
@@ -921,6 +921,9 @@ struct NativeRmCommand {
     selection: NativeRmSelectionArgs,
     #[command(flatten)]
     operational: NativeOperationalArgs,
+    /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    #[arg(long, value_name = "PATH")]
+    pscope: Option<PathBuf>,
 }
 
 fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
@@ -934,7 +937,7 @@ fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
 fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     let mut full_argv = vec![OsString::from(command_label(interface))];
     full_argv.extend_from_slice(argv);
-    let (mut parsed, remote, matches, prune, max_delete, size_selection) =
+    let (mut parsed, remote, pscope, matches, prune, max_delete, size_selection) =
         if interface == Interface::NativeMap {
             let matches = NativeMapCommand::command()
                 .try_get_matches_from(full_argv)
@@ -943,6 +946,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             (
                 parsed.copy,
                 NativeRemoteArgs::default(),
+                None,
                 matches,
                 false,
                 None,
@@ -956,14 +960,15 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             (
                 parsed.copy,
                 parsed.remote,
+                parsed.pscope,
                 matches,
                 parsed.prune,
                 parsed.max_delete,
                 parsed.size_selection,
             )
         };
-    if parsed.reuse_connection && remote.rsh.is_some() {
-        bail!("--reuse-connection cannot be used with --rsh");
+    if pscope.is_some() && remote.rsh.is_some() {
+        bail!("--pscope cannot be used with --rsh");
     }
     // `syq map` keeps `-C` out of selector paths so emitted `src` values stay
     // relative to it; the walk joins it back.
@@ -979,9 +984,6 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     let results = parsed.results.take();
     if results.is_some() && interface != Interface::NativeCp {
         bail!("--results is only available on syq cp");
-    }
-    if parsed.reuse_connection && interface == Interface::NativeMap {
-        bail!("--reuse-connection is only available on syq cp");
     }
     if results.is_some() && parsed.operational.common.dry_run {
         // Dry-run trace output is a deliberately deferred automation
@@ -1151,7 +1153,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.native_map_target = native_map_target;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
-    args.reuse_connection = parsed.reuse_connection;
+    args.pscope = pscope;
     args.native_follow = parsed.selection.follow;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
@@ -1265,6 +1267,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     args.native_rm_cwd = parsed.selection.cwd.map(OsStringExt::into_vec);
     args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
     args.native_follow = parsed.selection.follow;
+    args.pscope = parsed.pscope;
     args.rm = true;
     apply_native_operational(&mut args, parsed.operational);
     Ok(args)
@@ -1978,9 +1981,9 @@ mod tests {
     }
 
     #[test]
-    fn native_reuse_connection_rejects_an_explicit_remote_shell() {
+    fn native_persistence_scope_rejects_an_explicit_remote_shell() {
         let argv = [
-            "--reuse-connection",
+            "--pscope=/tmp/scope",
             "--rsh=ssh -J jump",
             "source",
             "--into",
@@ -1990,7 +1993,7 @@ mod tests {
         let error = parse_native_copy(&argv, Interface::NativeCp).unwrap_err();
         assert!(error
             .to_string()
-            .contains("--reuse-connection cannot be used with --rsh"));
+            .contains("--pscope cannot be used with --rsh"));
     }
 
     #[test]
