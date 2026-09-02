@@ -239,10 +239,23 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(preview.files_transferred, 1)
             self.assertEqual(preview.bytes_transferred, len(b"async"))
 
+            physical_temp = root / "async-physical-temp"
+            physical_temp.mkdir()
+            temporary_alias = root / "async-temporary-alias"
+            temporary_alias.symlink_to(physical_temp, target_is_directory=True)
+            named_temporary_file = tempfile.NamedTemporaryFile
+
+            def create_through_alias(**kwargs):
+                return named_temporary_file(dir=temporary_alias, **kwargs)
+
             async with client.map(src_src="source") as mapping:
-                copied = await client.cp(
-                    mapping=mapping, cwd=mapping.cwd, into="destination"
-                )
+                with mock.patch(
+                    "syq.async_client.tempfile.NamedTemporaryFile",
+                    side_effect=create_through_alias,
+                ):
+                    copied = await client.cp(
+                        mapping=mapping, cwd=mapping.cwd, into="destination"
+                    )
             self.assertEqual(copied.files_transferred, 1)
             self.assertEqual((root / "destination" / "a").read_bytes(), b"async")
 

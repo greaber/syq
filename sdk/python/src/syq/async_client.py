@@ -23,6 +23,7 @@ from typing import BinaryIO, TypeVar
 from .bootstrap import managed_executable
 from .client import (
     Argument,
+    IgnoreSelector,
     PathArgument,
     Result,
     Selector,
@@ -53,6 +54,7 @@ from .protocol import AutomationDecoder, parse_mapping_line
 AsyncEventCallback = Callable[[AutomationEvent], object | Awaitable[object]]
 _T = TypeVar("_T")
 _LINE_LIMIT = 16 * 1024 * 1024
+_STDERR_LIMIT = 8 * 1024
 
 
 def _kill_process_group(process: asyncio.subprocess.Process) -> None:
@@ -83,6 +85,21 @@ async def _complete_task(
 
 async def _wait_for_exit(process: asyncio.subprocess.Process) -> int:
     return await _complete_task(asyncio.create_task(process.wait()))
+
+
+async def _read_stderr_tail(stderr: asyncio.StreamReader) -> bytes:
+    tail = bytearray()
+    while True:
+        chunk = await stderr.read(64 * 1024)
+        if not chunk:
+            return bytes(tail)
+        if len(chunk) >= _STDERR_LIMIT:
+            tail[:] = chunk[-_STDERR_LIMIT:]
+            continue
+        excess = len(tail) + len(chunk) - _STDERR_LIMIT
+        if excess > 0:
+            del tail[:excess]
+        tail.extend(chunk)
 
 
 async def _write_async_mapping_manifest(
@@ -195,7 +212,6 @@ class _AsyncLineProcess:
         self,
         argv: tuple[Argument, ...],
         process: asyncio.subprocess.Process,
-        stderr_file: BinaryIO,
         timeout: float | None,
     ) -> None:
         self.argv = argv
@@ -204,8 +220,12 @@ class _AsyncLineProcess:
         self._deadline = None if timeout is None else loop.time() + timeout
         self._process = process
         assert process.stdout is not None
+        assert process.stderr is not None
         self._stdout = process.stdout
-        self._stderr_file = stderr_file
+        self._stderr_task = asyncio.create_task(
+            _read_stderr_tail(process.stderr),
+            name="syq-stderr-drain",
+        )
         self.returncode: int | None = None
         self.stderr = b""
         self._closed = False
@@ -220,7 +240,6 @@ class _AsyncLineProcess:
         env: Mapping[str, str] | None,
         timeout: float | None,
     ) -> _AsyncLineProcess:
-        stderr_file: BinaryIO = tempfile.TemporaryFile()
         try:
             spawn = asyncio.create_task(
                 asyncio.create_subprocess_exec(
@@ -229,7 +248,7 @@ class _AsyncLineProcess:
                     env=env,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=stderr_file,
+                    stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
                     limit=_LINE_LIMIT,
                 )
@@ -240,12 +259,8 @@ class _AsyncLineProcess:
                 process = spawn.result()
                 _kill_process_group(process)
                 await _wait_for_exit(process)
-            stderr_file.close()
             raise
-        except BaseException:
-            stderr_file.close()
-            raise
-        return cls(argv, process, stderr_file, timeout)
+        return cls(argv, process, timeout)
 
     def _remaining(self) -> float | None:
         if self._deadline is None:
@@ -276,8 +291,10 @@ class _AsyncLineProcess:
         if self.returncode is not None:
             return self.returncode
         self.returncode = await self._before_deadline(self._process.wait())
-        self._capture_stderr()
-        self._close_file()
+        self.stderr = await self._before_deadline(
+            asyncio.shield(self._stderr_task)
+        )
+        self._closed = True
         return self.returncode
 
     async def abort(self) -> None:
@@ -287,19 +304,8 @@ class _AsyncLineProcess:
         if self.returncode is None:
             self.returncode = await _wait_for_exit(self._process)
         if not self._closed:
-            self._capture_stderr()
-            self._close_file()
-
-    def _capture_stderr(self) -> None:
-        self._stderr_file.flush()
-        end = self._stderr_file.seek(0, os.SEEK_END)
-        self._stderr_file.seek(max(0, end - 8192))
-        self.stderr = self._stderr_file.read()
-
-    def _close_file(self) -> None:
-        if not self._closed:
+            self.stderr = await _complete_task(self._stderr_task)
             self._closed = True
-            self._stderr_file.close()
 
 
 class AsyncMapStream(AsyncIterator[MappingEntry]):
@@ -532,7 +538,7 @@ class AsyncClient:
         max_entries: int | None = None,
         max_total_bytes: str | int | None = None,
         max_runtime: str | int | None = None,
-        ignore: str | Iterable[str] | None = None,
+        ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
         inplace: bool = False,
@@ -641,7 +647,7 @@ class AsyncClient:
                     )
                 )
                 await _complete_task(materialize, on_cancel=cancelled.set)
-            argv.extend(("--mapping", manifest.name))
+            argv.extend(("--mapping", os.path.realpath(manifest.name)))
             result = await self._typed(
                 argv,
                 prune=False,

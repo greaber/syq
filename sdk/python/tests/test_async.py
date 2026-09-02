@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import syq
 
@@ -159,6 +160,44 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             await self.client.cp(mapping=broken(), cwd="source", into="target")
         self.assertFalse(self.argv_log.exists())
 
+    async def test_generated_mapping_path_resolves_temp_directory_symlinks(
+        self,
+    ) -> None:
+        physical = self.root / "physical-tmp"
+        physical.mkdir()
+        alias = self.root / "tmp-alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        named_temporary_file = tempfile.NamedTemporaryFile
+
+        def create_through_alias(**kwargs):
+            return named_temporary_file(dir=alias, **kwargs)
+
+        with mock.patch(
+            "syq.async_client.tempfile.NamedTemporaryFile",
+            side_effect=create_through_alias,
+        ):
+            await self.client.cp(
+                mapping=[syq.MappingEntry("a", "a")],
+                cwd="source",
+                into="target",
+            )
+        argv = self.argv()
+        manifest = Path(argv[argv.index("--mapping") + 1])
+        self.assertEqual(manifest.parent, physical.resolve())
+
+    async def test_ignore_stream_preserves_native_cross_option_order(self) -> None:
+        await self.client.cp(
+            "source",
+            into="target",
+            ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"],
+        )
+        argv = self.argv()
+        start = argv.index("--ignore-from")
+        self.assertEqual(
+            argv[start : start + 4],
+            ["--ignore-from", "rules", "--ignore", "!keep.tmp"],
+        )
+
     async def test_cancelling_sync_mapping_stops_after_current_entry(self) -> None:
         started = threading.Event()
         yielded = 0
@@ -207,6 +246,25 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(syq.SyqProtocolError, "exceeds"):
             await client.cp("source", into="target")
+
+    async def test_streaming_stderr_is_bounded_without_a_temporary_spool(
+        self,
+    ) -> None:
+        client = syq.AsyncClient(
+            executable=self.executable,
+            env={
+                **self.env,
+                "SYQ_FAKE_SHAPE": "truncated",
+                "SYQ_FAKE_STDERR_BYTES": str(2 * 1024 * 1024),
+            },
+        )
+        with mock.patch(
+            "syq.async_client.tempfile.TemporaryFile",
+            side_effect=AssertionError("stderr must not be spooled"),
+        ):
+            with self.assertRaises(syq.SyqProtocolError) as caught:
+                await client.cp("source", into="target")
+        self.assertEqual(caught.exception.stderr, b"x" * 8192)
 
     async def test_protocol_failure_kills_post_exit_descendants(self) -> None:
         marker = self.root / "protocol-descendant"
