@@ -9724,75 +9724,333 @@ fn mappings_md_drop_specials_example_works_verbatim() {
     assert!(!t.path("dst/pipe").exists());
 }
 
-#[test]
-fn reuse_connection_flag_surface() {
-    let t = Tmp::new();
-    write(&t.path("src/a.txt"), b"a");
-    // Conflicts with an explicit remote shell on the rsync surface.
-    let out = syq(&[
-        "-a",
-        "--reuse-connection",
-        "-e",
-        "ssh -p 2222",
-        &t.s("src/"),
-        &t.s("dst"),
-    ]);
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(stderr.contains("--rsh"), "{stderr}");
-    // syq map never connects; the flag is refused there.
-    let out = syq_map_in(&t.path(""), &["--src-src", "src", "--reuse-connection"]);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("only available on syq cp"));
-    // Local copies accept it as a no-op on both surfaces.
-    let out = syq_cp_in(
-        &t.path(""),
-        &[
-            "--src-src",
-            "src",
-            "--into",
-            "out",
-            "--reuse-connection",
-            "-q",
-        ],
-        None,
-    );
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(read(&t.path("out/a.txt")), b"a");
-    let out = syq(&["-a", "--reuse-connection", &t.s("src/"), &t.s("out2")]);
-    assert!(out.status.success());
+fn persistence_command(t: &Tmp, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .arg("persist")
+        .args(args)
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"));
+    command
+}
+
+fn ephemeral_scope(t: &Tmp) -> PathBuf {
+    let output = persistence_command(t, &["on", "--ephemeral"])
+        .run()
+        .expect("create ephemeral persistence scope");
+    assert_output_ok(&output);
+    let path = output.stdout.strip_suffix(b"\n").unwrap();
+    PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()))
 }
 
 #[test]
-fn reuse_connection_refused_for_direct_remote_to_remote() {
-    let out = syq(&["-a", "--reuse-connection", "hostA:src/", "hostB:dst/"]);
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(
-        stderr.contains("direct remote-to-remote"),
-        "stderr: {stderr}"
+fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("runtime")).unwrap();
+
+    let status = persistence_command(&t, &["status"]).run().unwrap();
+    assert_output_ok(&status);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("is off"));
+
+    let enabled = persistence_command(&t, &["on"]).run().unwrap();
+    assert_output_ok(&enabled);
+    let global_scope = String::from_utf8(enabled.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("scope: "))
+        .map(PathBuf::from)
+        .expect("global scope path");
+    assert!(global_scope.is_dir());
+
+    let scope = ephemeral_scope(&t);
+    assert!(scope.is_dir());
+    assert_ne!(scope, global_scope);
+    assert_eq!(
+        fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
+        0o700
     );
 
-    let out = native_syq(&[
-        "cp",
-        "--reuse-connection",
-        "--from",
-        "hostA",
-        "--src-src",
-        "src",
-        "--to",
-        "hostB",
-        "--run-at",
-        "target",
-        "--into",
-        "dst",
-    ]);
+    write(&t.path("src/a.txt"), b"a");
+    let copy = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--pscope"])
+        .arg(&scope)
+        .args(["--src-src", &t.s("src"), "--into", &t.s("out"), "-q"])
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .run()
+        .unwrap();
+    assert_output_ok(&copy);
+    assert_eq!(read(&t.path("out/a.txt")), b"a");
+
+    let scoped_status = persistence_command(&t, &["status", "--pscope", scope.to_str().unwrap()])
+        .run()
+        .unwrap();
+    assert_output_ok(&scoped_status);
+    assert!(String::from_utf8_lossy(&scoped_status.stdout).contains("connections: 0"));
+
+    let closed = persistence_command(&t, &["off", "--pscope", scope.to_str().unwrap()])
+        .run()
+        .unwrap();
+    assert_output_ok(&closed);
+    assert!(!scope.exists());
+    assert!(global_scope.exists(), "ephemeral off changed global scope");
+
+    let disabled = persistence_command(&t, &["off"]).run().unwrap();
+    assert_output_ok(&disabled);
+    assert!(!global_scope.exists());
+    let status = persistence_command(&t, &["status"]).run().unwrap();
+    assert_output_ok(&status);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("is off"));
+}
+
+#[test]
+fn absent_user_config_environment_keeps_ordinary_commands_nonpersistent() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"no home required");
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--src"])
+        .arg(t.path("src"))
+        .args(["--as"])
+        .arg(t.path("dst"))
+        .arg("-q")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("HOME")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst")), b"no home required");
+}
+
+#[test]
+fn durable_and_ephemeral_policies_reach_implicit_ssh_connections() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("runtime")).unwrap();
+    let ssh = fake_ssh(&t);
+    write(&t.path("src"), b"persistent");
+
+    let enabled = persistence_command(&t, &["on"]).run().unwrap();
+    assert_output_ok(&enabled);
+    let global_scope = String::from_utf8(enabled.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("scope: "))
+        .unwrap()
+        .to_owned();
+    let mut copy = Command::new(env!("CARGO_BIN_EXE_syq"));
+    copy.args(["cp", "--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args(["--no-tcp", "-j", "1"])
+        .arg(t.path("src"))
+        .args(["--to", "backup.example:2222", "--as"])
+        .arg(t.path("global-dst"))
+        .arg("-q")
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+        );
+    let output = copy.run().unwrap();
+    assert_output_ok(&output);
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(log.contains("ControlMaster=auto"), "{log}");
+    assert!(log.contains("ControlPersist=300"), "{log}");
+    assert!(
+        log.contains(&format!("ControlPath={global_scope}/cm-")),
+        "{log}"
+    );
+    let status = persistence_command(&t, &["status"]).run().unwrap();
+    assert_output_ok(&status);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("backup.example:2222"));
+
+    // Stand in for the OpenSSH master at the recorded socket and verify that
+    // `persist off` asks that exact endpoint to exit before removing the scope.
+    let record = fs::read_dir(&global_scope)
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        .expect("endpoint record");
+    let socket_name = record
+        .file_name()
+        .to_string_lossy()
+        .strip_suffix(".json")
+        .unwrap()
+        .to_owned();
+    let socket_path = Path::new(&global_scope).join(socket_name);
+    let _master = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let close_ssh = t.path("close-bin/ssh");
+    executable(
+        &close_ssh,
+        br#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_CLOSE_LOG"
+exit 0
+"#,
+    );
+    let mut off = persistence_command(&t, &["off"]);
+    off.env(
+        "PATH",
+        format!(
+            "{}:/usr/bin:/bin",
+            close_ssh.parent().unwrap().to_string_lossy()
+        ),
+    )
+    .env("FAKE_CLOSE_LOG", t.path("close.log"));
+    assert_output_ok(&off.run().unwrap());
+    let close_log = fs::read_to_string(t.path("close.log")).unwrap();
+    assert!(close_log.contains("-O exit"), "{close_log}");
+    assert!(close_log.contains("-p 2222"), "{close_log}");
+    assert!(close_log.ends_with("-- backup.example\n"), "{close_log}");
+    assert!(!Path::new(&global_scope).exists());
+
+    let scope = ephemeral_scope(&t);
+    fs::write(t.path("rsh.log"), b"").unwrap();
+    let mut scoped_copy = Command::new(env!("CARGO_BIN_EXE_syq"));
+    scoped_copy
+        .args(["cp", "--pscope"])
+        .arg(&scope)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args(["--no-tcp", "-j", "1"])
+        .arg(t.path("src"))
+        .args(["--to", "backup.example:2222", "--as"])
+        .arg(t.path("scoped-dst"))
+        .arg("-q")
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+        );
+    let output = scoped_copy.run().unwrap();
+    assert_output_ok(&output);
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        log.contains(&format!("ControlPath={}/cm-", scope.display())),
+        "{log}"
+    );
+    assert_output_ok(
+        &persistence_command(&t, &["off", "--pscope", scope.to_str().unwrap()])
+            .run()
+            .unwrap(),
+    );
+}
+
+#[test]
+fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("runtime")).unwrap();
+    let scope = ephemeral_scope(&t);
+    write(&t.path("src/a"), b"a");
+
+    let compat = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", "-a", "--pscope"])
+        .arg(&scope)
+        .args([&t.s("src/"), &t.s("compat"), "--no-progress"])
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .run()
+        .unwrap();
+    assert_output_ok(&compat);
+    assert_eq!(read(&t.path("compat/a")), b"a");
+
+    write(&t.path("remove-me"), b"gone");
+    let removal = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rm", "--pscope"])
+        .arg(&scope)
+        .args(["--src", "remove-me", "-q"])
+        .current_dir(&t.0)
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .run()
+        .unwrap();
+    assert_output_ok(&removal);
+    assert!(!t.path("remove-me").exists());
+
+    let map = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["map", "--pscope"])
+        .arg(&scope)
+        .args(["--src", &t.s("src/a")])
+        .run()
+        .unwrap();
+    assert!(!map.status.success());
+    assert!(
+        stderr_of(&map).contains("unexpected argument '--pscope'"),
+        "{}",
+        stderr_of(&map)
+    );
+
+    let victim = t.path("victim");
+    fs::create_dir(&victim).unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+    let attack = t.path("not-a-scope");
+    std::os::unix::fs::symlink(&victim, &attack).unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--pscope"])
+        .arg(&attack)
+        .args(["--src", &t.s("src/a"), "--as", &t.s("no-copy"), "-q"])
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .run()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert_eq!(
+        fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn explicit_pscope_is_refused_for_remote_coordinators() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("runtime")).unwrap();
+    let scope = ephemeral_scope(&t);
+    let scope = scope.to_str().unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "rsync",
+            "-a",
+            "--pscope",
+            scope,
+            "hostA:src/",
+            "hostB:dst/",
+            "--no-progress",
+        ])
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .run()
+        .unwrap();
     assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr_of(&out).contains("direct remote-to-remote"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--pscope",
+            scope,
+            "--from",
+            "hostA",
+            "--src-src",
+            "src",
+            "--to",
+            "hostB",
+            "--run-at",
+            "target",
+            "--into",
+            "dst",
+            "-q",
+        ])
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
     assert!(stderr.contains("remote transfer coordinator"), "{stderr}");
     assert!(stderr.contains("--run-at local"), "{stderr}");
 }

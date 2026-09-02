@@ -105,14 +105,16 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             }
             let ssh_multiplexer = if args.rsh.is_some() {
                 None
-            } else if args.reuse_connection && args.restricted_grant.is_none() {
-                Some(Arc::new(SshMultiplexer::persistent(
-                    loc.user.as_deref(),
-                    h,
-                    loc.port,
-                )?))
             } else {
-                Some(Arc::new(SshMultiplexer::new()?))
+                match (args.pscope.as_deref(), args.restricted_grant.is_none()) {
+                    (Some(scope), true) => Some(Arc::new(SshMultiplexer::persistent(
+                        scope,
+                        loc.user.as_deref(),
+                        h,
+                        loc.port,
+                    )?)),
+                    _ => Some(Arc::new(SshMultiplexer::new()?)),
+                }
             };
             Endpoint::Remote(RemoteSpec {
                 local_process: false,
@@ -797,15 +799,21 @@ pub fn run(args: Args) -> Result<i32> {
             "--detach, --no-forward-agent, and --agent-broker-only apply only to a direct copy between two different remote endpoints"
         );
     }
-    if args.reuse_connection && coordinator_is_remote {
+    if args.pscope_explicit && coordinator_is_remote {
         if args.interface == Interface::Rsync {
             bail!(
-                "--reuse-connection is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
+                "--pscope is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
             );
         }
         bail!(
-            "--reuse-connection is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
+            "--pscope is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
         );
+    }
+    if coordinator_is_remote {
+        // A durable local preference is a capability, not a demand that every
+        // topology support persistence. The remote coordinator owns its SSH
+        // edges, so do not create misleading local endpoint records for them.
+        args.pscope = None;
     }
     if args.detach && args.native_results.is_some() {
         bail!(
