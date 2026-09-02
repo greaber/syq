@@ -134,8 +134,9 @@ Git-derived identity when an explicit source-built helper is used.
   `cargo build --release` (needs the Xcode command-line tools, `xcode-select
   --install`, for the bundled zstd C library). The tool is otherwise pure Rust
   and uses only POSIX calls; Linux-only optimizations (`fallocate`,
-  glibc `mallopt`) are compiled out automatically. copy_file_range's local
-  fast path is Linux-only; on macOS same-machine copies use the normal path.
+  glibc `mallopt`) are compiled out automatically. The receiver-side
+  same-machine copy fast path is Linux-only; on macOS those copies use the
+  normal path.
 - For a manually installed binary that is portable across distributions (for
   example, a host with an older glibc), build a static binary:
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
@@ -1274,30 +1275,41 @@ NFS, where every unlink is a round trip, `-j32` removed 20,000 files in 2.5 s
 versus 9.7 s for `rm -rf`; on a local SSD `rm -rf` is already fast and syq is
 no faster.
 
-## Same-machine copies (copy_file_range)
+## Same-machine copies (copy_file_range and NFS)
 
 When source and destination are on the same machine, syq copies each file with
 `copy_file_range(2)` instead of streaming bytes through userspace: the kernel
 does a reflink or a straight in-kernel copy, and on NFS 4.2 the *server* copies
 the file internally (no client round trip). Measured: a single 8 GB file
 /raid→/raid at 24.8 GB/s vs 2.5 GB/s for `cp`; NFS→NFS at 3.3 GB/s vs 0.4.
-Hashing is skipped on this path (there's no wire to corrupt it); `-c`, any
-existing partial, and `--bwlimit` disable this shortcut. Existing partials and
-larger bwlimited files use the hash-resumable streaming path. Small new
-bwlimited files that fit in one paced transfer block retain the `PutSmall`
-exception described above.
+If the kernel cannot offload a cross-mount copy from a recognized local disk
+filesystem into an ordinary asynchronous NFS mount, the receiver automatically
+uses one sequential reader/writer for that file. That avoids both per-inode NFS
+write contention and needless transport framing and hashing. NFS-to-NFS copies,
+other source filesystem types, synchronous NFS destinations, an explicit fixed
+worker count above one, and unsupported non-NFS destinations retain the
+parallel, hash-resumable streaming fallback.
+`-c`, any existing partial, and `--bwlimit` disable the receiver-side shortcut.
+Small new bwlimited files that fit in one paced transfer block retain the
+`PutSmall` exception described above.
 
 ## NFS
 
 Local↔NFS copies are a local→local syq run (`syq rsync -a -j16 /raid/x /mnt/nfs/x`)
-and benefit from the same parallelism: measured on a 20 Gbit NFSv4.2 mount,
-reads of one 4 GB file 858 MiB/s with `-j8` vs ~400 MB/s for `cp`; 20,000
-small files written in 28 s vs 72 s for `cp -r`. Writes of a *single* file
-were capped at ~250 MB/s regardless of `-j`, while eight files written in
-parallel reached ~650 MB/s: the per-file limit comes from the NFS client's one
-TCP connection and per-inode write serialization. Mounting with
-`nconnect=8` (NFS 4.1+; needs an unmount/mount, not a remount) is the usual
-fix for that.
+and benefit from parallelism across files and on reads: measured on a 20 Gbit
+NFSv4.2 mount, reads of one 4 GB file reached 858 MiB/s with `-j8` vs ~400 MB/s
+for `cp`, and 20,000 small files were written in 28 s vs 72 s for `cp -r`.
+Writes from a recognized local disk filesystem into one asynchronous NFS inode
+are instead serialized automatically by the receiver when the kernel cannot
+offload them.
+On a fresh 4 GiB `/raid`→NFS copy, that changed syq from 21.44 s with 32 range
+writers to a 9.93 s median with one sequential receiver-side writer, versus a
+10.94 s median for `cp` (two interleaved runs). Synchronous destinations and
+NFS sources retain the adaptive parallel path; the reciprocal NFS→`/raid` copy
+reached 1.13 GiB/s with parallel range reads.
+Separate files still run concurrently and have reached ~650 MB/s in aggregate.
+Mounting with `nconnect=8` (NFS 4.1+; needs an unmount/mount, not a remount) can
+add headroom for those concurrent files and other NFS traffic.
 
 ## Performance notes
 
