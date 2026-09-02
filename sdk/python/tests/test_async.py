@@ -103,6 +103,51 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream.cwd, Path.cwd() / "source")
         self.assertEqual(self.argv()[0], "cp")
 
+    async def test_cp_forwards_native_remote_controls(self) -> None:
+        await self.client.cp(
+            "source",
+            from_="source:2222",
+            to="target:2200",
+            into="out",
+            run_at="local",
+            rsh="ssh -F config",
+            syq_path="/opt/syq",
+            no_bootstrap=True,
+            tcp_plain=True,
+            tcp_ports="49000-49010",
+            tcp_congestion="bbr",
+        )
+        argv = self.argv()
+        for expected in (
+            "--run-at",
+            "--rsh",
+            "--syq-path",
+            "--no-bootstrap",
+            "--tcp-plain",
+            "--tcp-ports",
+            "--tcp-congestion",
+        ):
+            self.assertIn(expected, argv)
+
+        for parameter, option in (
+            ({"no_tcp": True}, "--no-tcp"),
+            ({"no_forward_agent": True}, "--no-forward-agent"),
+            (
+                {"unrestricted_agent_forwarding": True},
+                "--unrestricted-agent-forwarding",
+            ),
+            ({"agent_broker_only": True}, "--agent-broker-only"),
+        ):
+            with self.subTest(option=option):
+                await self.client.cp(
+                    "source",
+                    from_="source",
+                    to="target",
+                    into="out",
+                    **parameter,
+                )
+                self.assertIn(option, self.argv())
+
     async def test_mapping_failure_happens_before_process_start(self) -> None:
         self.argv_log.unlink(missing_ok=True)
 
