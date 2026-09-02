@@ -3434,6 +3434,32 @@ mod tests {
     }
 
     #[test]
+    fn exact_destination_observation_scope_excludes_its_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 4);
+        let destination = root.join("target").as_os_str().as_bytes().to_vec();
+        let parent = root.as_os_str().as_bytes().to_vec();
+
+        let mut exact = Request::StatMany {
+            paths: vec![destination],
+            follow: false,
+            guard: None,
+        };
+        authority.authorize(&mut exact, false).unwrap();
+
+        let mut parent = Request::Canonicalize {
+            path: parent,
+            guard: None,
+        };
+        let error = authority.authorize(&mut parent, false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("observation is outside the signed destination scopes"));
+    }
+
+    #[test]
     fn signed_filters_bind_scans_mutations_and_prune_protection() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");

@@ -474,6 +474,43 @@ fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum DestinationIdentityPlan {
+    /// The command-restricted enrollment already supplied the canonical
+    /// parent plus literal placement leaf. No receiver observation is needed.
+    Enrolled(std::path::PathBuf),
+    /// Canonicalize the complete destination spelling.
+    Canonicalize(PathBytes),
+    /// Canonicalize only the parent, then restore the literal placement leaf.
+    CanonicalizeParent {
+        parent: PathBytes,
+        exact_path: PathBytes,
+    },
+}
+
+fn destination_identity_plan(
+    exact_native_destination: bool,
+    restricted_receiver: bool,
+    operator_dst_root: &[u8],
+    destination_path: &[u8],
+) -> DestinationIdentityPlan {
+    if exact_native_destination && restricted_receiver {
+        // Direct setup replaces the public operand with the enrolled
+        // destination: a canonical parent plus its literal leaf. The signed
+        // grant binds these same absolute bytes. Asking the receiver to
+        // canonicalize the parent would both be unnecessary and exceed the
+        // exact destination's observation scope.
+        DestinationIdentityPlan::Enrolled(crate::fsops::resolve(destination_path))
+    } else if exact_native_destination {
+        DestinationIdentityPlan::CanonicalizeParent {
+            parent: parent_path(operator_dst_root),
+            exact_path: operator_dst_root.to_vec(),
+        }
+    } else {
+        DestinationIdentityPlan::Canonicalize(destination_path.to_vec())
+    }
+}
+
 /// Encode the content/metadata-affecting options into the job identity.
 fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
     let source_modes: Vec<&str> = srcs
@@ -1240,26 +1277,35 @@ pub fn run(args: Args) -> Result<i32> {
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
     let operator_dst_root = clean_root(&dst.path);
-    // Exact native placement names a directory entry. Canonicalize only its
-    // parent, then restore the operator-supplied leaf: canonicalizing the
-    // whole path would dereference an existing leaf symlink and give both the
-    // self-copy guard and resumable-job identity the wrong destination.
+    // Exact native placement names a directory entry, so its identity is the
+    // canonical parent plus the operator-supplied leaf. Ordinary endpoints
+    // compute that form here; restricted setup already supplied and signed
+    // it. Canonicalizing the whole path would dereference an existing leaf
+    // symlink and give the self-copy guard and resumable-job identity the
+    // wrong destination.
     let exact_native_destination =
         args.interface != Interface::Rsync && args.placement == Placement::As;
-    let canonical_dst_path = if exact_native_destination {
-        parent_path(&operator_dst_root)
-    } else {
-        dst.path.clone()
-    };
-    let (dst_root_entry, mut dst_canonical) = stat_and_canonicalize(
-        &mut *dst_ctl,
+    let identity_plan = destination_identity_plan(
+        exact_native_destination,
+        args.restricted_grant.is_some(),
         &operator_dst_root,
-        &canonical_dst_path,
-        dst.is_remote(),
-    )?;
-    if exact_native_destination {
-        append_final_component(&mut dst_canonical, &operator_dst_root);
-    }
+        &dst.path,
+    );
+    let (dst_root_entry, dst_canonical) = match identity_plan {
+        DestinationIdentityPlan::Enrolled(canonical) => (
+            stat_one(&mut *dst_ctl, &operator_dst_root, false)?,
+            canonical,
+        ),
+        DestinationIdentityPlan::Canonicalize(path) => {
+            stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root, &path, dst.is_remote())?
+        }
+        DestinationIdentityPlan::CanonicalizeParent { parent, exact_path } => {
+            let (entry, mut canonical) =
+                stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root, &parent, dst.is_remote())?;
+            append_final_component(&mut canonical, &exact_path);
+            (entry, canonical)
+        }
+    };
     // Rsync retains its destination-directory compatibility rule. Native
     // container placement keeps the named symlink by default or resolves its
     // complete chain under --follow. Exact native placement always selects
@@ -6444,6 +6490,25 @@ mod tests {
                 "clean_root({given:?})"
             );
         }
+    }
+
+    #[test]
+    fn restricted_exact_identity_uses_the_enrolled_leaf_without_observing_its_parent() {
+        assert_eq!(
+            destination_identity_plan(true, true, b"/enrolled/root/link", b"/enrolled/root/link",),
+            DestinationIdentityPlan::Enrolled(std::path::PathBuf::from("/enrolled/root/link"))
+        );
+        assert_eq!(
+            destination_identity_plan(false, true, b"/enrolled/root", b"/enrolled/root"),
+            DestinationIdentityPlan::Canonicalize(b"/enrolled/root".to_vec())
+        );
+        assert_eq!(
+            destination_identity_plan(true, false, b"links/exact", b"links/exact"),
+            DestinationIdentityPlan::CanonicalizeParent {
+                parent: b"links".to_vec(),
+                exact_path: b"links/exact".to_vec(),
+            }
+        );
     }
 
     #[test]
