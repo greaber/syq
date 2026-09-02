@@ -564,7 +564,7 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a copy's resolved selection and placement as NDJSON\n  rsync        Use the retained rsync-shaped command surface\n  enroll       Pre-enroll a command-restricted remote destination\n  enrollments  List local command-restricted enrollments\n  revoke       Revoke a command-restricted enrollment\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a copy's resolved selection and placement as NDJSON\n  rsync        Use the retained rsync-shaped command surface\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 

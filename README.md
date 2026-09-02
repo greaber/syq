@@ -346,7 +346,7 @@ refuses `--max-size` with `--prune`, as described below. A
 command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit, signed filters, and the selected staged or in-place publication
 policy. A receiver installed by an older syq rejects an extension or unsupported
-policy safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment
+policy safely; rerun `syq enrollment add HOST:DEST` to refresh an existing enrollment
 to the current binary. On a direct remote-to-remote copy through that
 receiver, `cp` also accepts the receiver ceilings
 `--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
@@ -639,7 +639,7 @@ of its output; the local machine verifies it against the public key recorded
 at enrollment and fails the transfer if the receipt is missing, does not
 verify, names a different grant, or records refused requests, whatever hostA
 reported. `-v` prints the verified totals. Enrollments made before receipts
-existed must be refreshed with `syq enroll` first. The receipt is hostB's view
+existed must be refreshed with `syq enrollment add` first. The receipt is hostB's view
 of hostB: it says nothing about what hostA omitted or invented. The boundary runs between the two hosts, not inside hostB: the receiver
 runs as the enrolled account and remembers what it created by pathname, so a
 local writer who can already modify the destination tree is outside its
@@ -668,7 +668,7 @@ an observed object.
 Native `--into-new`/`--as-new` and `--into-existing`/`--as-existing` travel as
 a signed root precondition in a V4 grant, checked against the enrolled root
 when the grant is claimed; an older installed receiver rejects that grant
-safely until `syq enroll` refreshes it. `--update` still fails closed because
+safely until `syq enrollment add` refreshes it. `--update` still fails closed because
 it compares against source modification times that only hostA reports.
 `--no-tcp`, `--tcp-plain`, `--tcp-congestion`, `--files-from`, `--mapping`,
 `--min-size`, `--syq-path`, and `--no-bootstrap` also fail closed because the
@@ -690,7 +690,7 @@ them for one transfer, which bounds what a claimed grant is worth to hostA.
 `--dry-run` and `--verify-only` are cryptographically read-only: the signed
 grant marks them as such and the receiver rejects every mutation even if hostA
 sends one. They use an existing enrollment but do not install one; run
-`syq enroll` first when previewing or verifying a new destination.
+`syq enrollment add` first when previewing or verifying a new destination.
 Destination-root symlinks are also refused in this mode; enroll the explicit
 referent so the signed pathname and opened root identify the same object.
 
@@ -702,18 +702,20 @@ exact-path interpretation is denied. Use a trailing slash (`hostA:dir/`), the
 native `--as`/`--into` placement spelling, or create the destination directory
 first when that distinction matters.
 
-Use `syq enroll [USER@]HOST:DEST [--via [USER@]HOST]` to pre-enroll,
-`syq enrollments` to list local enrollments, and `syq revoke ID [--via ...]` to
+Use `syq enrollment add [USER@]HOST:DEST [--via [USER@]HOST]` to pre-enroll,
+`syq enrollment list` to list local enrollments, and
+`syq enrollment revoke ID [--via ...]` to
 remove the forced key and both sides' per-enrollment state. Before changing
 hostB, syq durably records a pending enrollment and its private key locally. If
 the installation response is lost, the next enrollment of the same endpoint
-and destination retries the same ID safely; `syq enrollments` labels that state
-`pending`, and `syq revoke` can remove either pending or active state. Running
-`syq enroll` again for an active destination also refreshes the installed
+and destination retries the same ID safely; `syq enrollment list` labels that
+state `pending`, and `syq enrollment revoke` can remove either pending or
+active state. Running `syq enrollment add` again for an active destination
+also refreshes the installed
 receiver to the exact local syq binary; the receipt key is kept for the life
 of the enrollment, so a refresh, or a retry after a lost reply, never leaves
 the two sides holding different keys. To rotate it, revoke and enroll again.
-`syq enrollments` marks enrollments made before receipt keys existed as
+`syq enrollment list` marks enrollments made before receipt keys existed as
 `no-receipt-key` until refreshed. Revocation leaves that shared binary
 because other enrollments may use it. It prevents new receiver sessions. A
 session that already claimed its signed request can finish an operation already
