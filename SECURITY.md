@@ -2,9 +2,8 @@
 
 The security design (least-privilege remote-to-remote transfers, hardening
 against hostile filesystems, and release integrity) is described in
-[docs/security.md](docs/security.md); the factual threat inventory compared
-with rsync 3.5.0 is [docs/threat-inventory.md](docs/threat-inventory.md).
-This file covers supported versions and how to report a vulnerability.
+[docs/security.md](docs/security.md). This file covers supported versions and
+how to report a vulnerability.
 
 ## Supported versions
 

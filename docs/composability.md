@@ -7,10 +7,9 @@ instead of a scrolling log. The classical commands fuse planning and
 execution, which is why every serious deployment ends up wrapping `cp`,
 `rsync`, and `rm` in scripts that re-derive what those tools already knew.
 
-This document describes what syq offers today under three headings, then the
-automation interface that is in design. [Mappings](mappings.md) is the
-detailed guide to the manifest format; the [command reference](reference.md)
-has the exact option semantics.
+This document describes what syq offers under three headings.
+[Mappings](mappings.md) is the detailed guide to the manifest format; the
+[command reference](reference.md) has the exact option semantics.
 
 ## Planning before execution
 
@@ -57,8 +56,7 @@ plan and the write, and a partially executed plan cannot always be rolled back.
 Syq's staged writes make each *file* appear atomically complete, and the
 deterministic partial-file names make reruns converge, but the run as a whole
 is not reversible. The current preflight is also an assessment of the tree at
-that moment, not a frozen ledger that can later be executed unchanged; a plan
-you can hand back to syq is part of the automation interface below.
+that moment, not a frozen ledger that can later be executed unchanged.
 
 ## Selection and placement as data
 
@@ -118,8 +116,8 @@ or a stream can express too:
   ```
 
   This is what an exit code cannot express: which entries failed, and whether
-  a retry could help. The records carry `schema_version: 0`, an explicitly
-  unstable preview of the automation interface below.
+  a retry could help. The records carry `schema_version: 0`: the format is an
+  explicitly unstable preview and may change between releases.
 
 ## Reruns converge
 
@@ -132,24 +130,3 @@ different commands into one tree produce the union of their files. The
 [resume section](reference.md#resume-and-checkpoints) has the exact rules and
 the one deliberate exception, `--checkpoint`, which trusts recorded
 completions to skip destination lookups on very large repeated jobs.
-
-## Programs and the Python SDK
-
-A preview Python SDK lives in
-[sdk/python](https://github.com/greaber/syq/tree/master/sdk/python). It runs
-the `syq` executable with an argument array (never a shell), pins one exact,
-tested syq release, and downloads and verifies that release's official binary
-on first use, so the pairing an application tested is the pairing it ships. It
-deliberately exposes only raw execution and version discovery today and does
-not parse human output.
-
-Its typed surface will follow syq's versioned NDJSON automation interface,
-which is in design. Its shape: a mapping is the input half (selection and
-placement as a manifest, shipped as `--mapping`); an enveloped event stream is
-the output half (the `--results` preview is its first slice); and a dry-run
-*trace* of intended operations, in the same vocabulary as results, is the plan
-you can inspect, filter, and hand back. The contract will be versioned, with
-fixtures, before the SDK claims a stable copy API. Until then, `--dry-run`,
-exit codes, `--progress-json`, `--results`, and mappings are the composition
-points, and the executable remains authoritative for semantics, exit status,
-and safety checks.

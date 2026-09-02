@@ -388,4 +388,3 @@ add headroom for those concurrent files and other NFS traffic.
   network.
 - `SYQ_DEBUG=1` prints connect times and where each worker and each remote
   server spent its time (blocked on reads, pipe writes, acks; waiting, handling).
-

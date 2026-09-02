@@ -1,9 +1,9 @@
 # syq
 
 Syq is fast, safe, programmable *file motion*: copying and deleting files and
-directory trees on one machine or across a network, with moving to follow. It
-is built for the jobs where `cp -r`, `rm -r`, and rsync are too slow or too
-trusting. Compared with rsync, the headline differences for a casual user are:
+directory trees on one machine or across a network. It is built for the jobs
+where `cp -r`, `rm -r`, and rsync are too slow or too trusting. Compared with
+rsync, the headline differences for a casual user are:
 
 - **Much faster in many common situations**: fast LANs and lossy WANs, many
   small files and a few giant ones. Syq parallelizes across files and inside
@@ -23,9 +23,8 @@ Unsafe agent forwarding (`ssh -A`) lets anyone who compromises a server you
 log into use all of your ssh keys, against every host they can name, for as
 long as you stay logged in. It is one of the most common insecure habits among
 otherwise careful people, because the alternatives were inconvenient. Syq's
-answer, a constrained agent broker plus a command-restricted receiver, is not
-specific to file transfer. Today it is wired into syq's own transfers;
-[Security](docs/security.md) explains how it works and where it can go.
+answer is a constrained agent broker plus a command-restricted receiver;
+[Security](docs/security.md) explains how they work and what each protects.
 
 ## Install
 
@@ -59,7 +58,7 @@ syq cp project --to server --into /backup          # → /backup/project
 syq cp --src-src project --to server --into /app   # contents of project → /app
 syq rm --root /srv --src-dir cache                 # remove /srv/cache; never leave /srv
 set -o pipefail                                    # so a failed producer fails the pipeline
-syq map --src-src photos | jq '.dst.value |= ascii_downcase' \
+syq map --src-src photos | jq -c '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C photos --to nas --into /pub   # placement as data
 ```
 
@@ -208,8 +207,7 @@ type, and runs native `rm` and the restricted receiver entirely on
 descriptor-relative operations. It has not reached parity: ordinary copies
 still address descendants by pathname, so a parent directory swapped for a
 symlink mid-transfer is a known gap, and syq's always-on resume files assume
-their directory is not writable by untrusted users. The threat-by-threat
-ledger is [the threat inventory](docs/threat-inventory.md).
+their directory is not writable by untrusted users.
 
 **Least privilege for remote transfers.** For a remote-to-remote copy, the
 default gives hostA neither your agent nor a credential. A temporary local
@@ -223,8 +221,8 @@ anything else.
 
 **Release integrity.** Releases are built by a protected workflow from signed
 tags and published with attestations and an Ed25519-signed manifest. Every
-remote helper, SDK-managed binary, and self-update is verified against that
-manifest before it runs.
+remote helper and self-update is verified against that manifest before it
+runs.
 
 [Security](docs/security.md) explains all three, what each protects, and what
 it does not. Report vulnerabilities as described in [SECURITY.md](https://github.com/greaber/syq/blob/master/SECURITY.md).
@@ -240,18 +238,18 @@ it does not. Report vulnerabilities as described in [SECURITY.md](https://github
    verb first, make endpoints, selection, and placement explicit, and add what
    rsync lacks: a parallel `rm`, exact placement, mappings. Native mode is
    experimental, and its grammar may change between releases.
-3. **Programmatic.** `--progress-json`, `--results`, and a preview
-   [Python SDK](https://github.com/greaber/syq/tree/master/sdk/python) that
-   runs a pinned, verified syq. A versioned NDJSON automation interface with
-   first-class plans is in design; the SDK's typed surface will follow it.
+3. **Programmatic.** `--progress-json` streams progress, `--results` writes a
+   machine-readable outcome per operation (an unstable, versioned preview
+   format), and mappings let a program supply selection and placement as
+   data. See [Composability](docs/composability.md).
 
 ## Status and limitations
 
 Syq is 0.1.x software with release binaries for Linux (x86-64, ARM64) and
 macOS (Apple Silicon, Intel). `syq rsync` is the most stable surface; native
-commands and the automation interface are experimental. Not implemented yet:
-rsync filter rules, `--link-dest`, hard links (`-H`), ACLs and xattrs, sparse
-files, rolling-checksum delta transfer, rsync daemon mode, and `mv`. The
+commands and the `--results` format are experimental. Not implemented: rsync
+filter rules, `--link-dest`, hard links (`-H`), ACLs and xattrs, sparse files,
+rolling-checksum delta transfer, and rsync daemon mode. The
 [compatibility record](docs/rsync-compat.md) has the complete list with
 reasons.
 
@@ -265,9 +263,9 @@ reasons.
 - [Speed](docs/speed.md) and [Server tuning](docs/server-tuning.md)
 - [Remote-to-remote transfers](docs/remote-to-remote.md)
 - [Composability](docs/composability.md) and [Mappings](docs/mappings.md)
-- [Security](docs/security.md) and [Threat inventory](docs/threat-inventory.md)
+- [Security](docs/security.md)
 - [Rsync compatibility record](docs/rsync-compat.md)
-- [Security policy](https://github.com/greaber/syq/blob/master/SECURITY.md) and [Releasing](https://github.com/greaber/syq/blob/master/RELEASING.md)
+- [Security policy](https://github.com/greaber/syq/blob/master/SECURITY.md)
 
 ## License
 

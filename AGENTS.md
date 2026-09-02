@@ -177,6 +177,11 @@ outlive its premise and steer later work in the wrong direction.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
   sync. A behavior change lands in `docs/reference.md` (or the topical
   document that owns it), not in a new README section.
+- `README.md` and `docs/` are written for users. They describe what the code
+  on `master` does. Plans, roadmap items, design directions, internal status,
+  unreleased or unvetted components, and notes to future maintainers do not
+  belong there; they go in `current-plans/` or a design note. State a
+  limitation as a fact about today's behavior, not as an intention.
 - Copy failures must be visible. Do not make an incomplete or truncated result
   look successful.
 - Exercise copy, resume, verification, and removal behavior in disposable

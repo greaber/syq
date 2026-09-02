@@ -41,9 +41,7 @@ yet been applied everywhere.
 
 ### Where syq stands
 
-The [threat inventory](threat-inventory.md) is the detailed, threat-by-threat
-ledger, written against a specific code snapshot and compared with rsync 3.5.0.
-The summary, grouped by whether syq matches rsync, is:
+Compared with rsync 3.5:
 
 **Matches or exceeds rsync.**
 
@@ -76,12 +74,9 @@ The summary, grouped by whether syq matches rsync, is:
   but many operations on descendants still use pathnames relative to it. An
   attacker who can replace an intermediate directory with a symlink between
   syq's plan and its write can redirect that write. Rsync holds the parent
-  descriptor for every leaf. This is the most important open item; the
-  descriptor-rooted primitives already used by the restricted receiver and
-  native `rm` are the intended fix for the ordinary engine.
-- **Ordinary source enumeration** is not uniformly rooted either, so the
-  guarantee against a source-side symlink race needs a code-level audit beyond
-  the passing regression cases.
+  descriptor for every leaf.
+- **Ordinary source enumeration** is not uniformly rooted either, so the same
+  caveat applies to a source tree that an attacker can modify during the copy.
 - **Resume files.** Syq always keeps partials, at deterministic names
   (`.name.syq-part.<job-id>`) so a rerun finds its state without a state file.
   Rsync's equivalent, `--partial-dir`, is opt-in and its manual warns that the
@@ -92,10 +87,10 @@ The summary, grouped by whether syq matches rsync, is:
   they cannot prove who created a predictable pathname. Do not run a
   privileged copy into a directory writable by untrusted users.
 - **Protocol robustness.** Frames are length-bounded and several requests have
-  specific limits, but there is no fuzzing corpus or resource envelope
-  comparable to rsync's.
+  specific limits, but the peer protocol has not been fuzzed the way rsync's
+  has.
 
-### What to do today
+### What to do
 
 - Prefer native `cp` and `cp-prune` when you do not need owner, mode, or
   device preservation; they cannot be asked to create a setuid file.
@@ -238,26 +233,17 @@ two hosts sharing a private host key are the same host to the broker.
 
 ### Beyond copying
 
-The broker is not specific to file transfer. "Forward my agent to this host,
+The broker is not specific to file transfer: "forward my agent to this host,
 usable only to log into that user on that other host" is what most people
-actually want from `ssh -A`: pushing from a build host to one git server,
-running a configuration tool from a jump host, running rsync itself from hostA
-to hostB. Today the broker exists only inside syq's transfers (the default
-remote-to-remote path and `--agent-broker-only`); exposing it as a standalone
-command is the natural next step and is under consideration. Its requirements
-would be the same: OpenSSH 8.9 or newer on all three hosts and exact host keys
-in your local `known_hosts`.
+actually want from `ssh -A`. It runs today as part of syq's remote-to-remote
+transfers, in the default path and in `--agent-broker-only`; it is not
+available as a standalone command.
 
-The enrollment-and-grant layers generalize in a different direction: they turn
-a Unix account into a set of narrow, revocable *transfer capabilities*. The
-receiver accepts a small typed protocol rather than shell commands, which is
-what makes it auditable, and a grant names an operation, a root, and limits.
-The same shape supports read-only publishing, write-without-delete deposits,
-mirroring, and append-only backup targets where committed snapshots sit
-outside the uploader's authority. Those policies are design directions, not
-shipped features; the current receiver enforces the copy, verify, and delete
-semantics syq's transfers need, and the project deliberately does not intend
-to grow it into a general remote-command-authorization system.
+The enrollment and grant layers likewise turn a Unix account into narrow,
+revocable transfer capabilities. The receiver accepts a small typed protocol
+rather than shell commands, which is what makes it auditable, and a grant names
+an operation, a root, and limits. The policies it enforces are the copy,
+verify, and delete semantics of syq's own transfers.
 
 ## Release and bootstrap integrity
 
@@ -283,25 +269,6 @@ verified:
   manifest at most once a day and print a reminder; nothing is installed as a
   side effect of a copy. `syq --self-update` installs after the same
   verification, and only for installs it owns (never over Homebrew or Cargo).
-- **The Python SDK pins a release.** Each SDK release pins one syq release and verifies the
-  downloaded binary against the manifest embedded in the package before every
-  use.
 - **Source builds are honest about identity.** A checkout build carries its Git
   revision, is not an immutable release, and cannot populate the managed
   helper cache; peers must present matching build identities to connect.
-
-## Known gaps and direction
-
-In priority order, as the maintainers see it:
-
-1. Descriptor-rooted descendant operations for the ordinary copy engine and
-   source scan, closing the parity gap with rsync's held-parent model.
-2. A live two-host integration exercise of the broker and restricted receiver
-   with a hardware token, beyond the current protocol-level tests.
-3. A fuzzing corpus and resource envelope for the peer protocol.
-4. A standalone broker command.
-5. Transfer-capability policies (deposit, read-only) on the enrolled receiver.
-
-The [threat inventory](threat-inventory.md) records the evidence behind each
-of these at a named code snapshot and should be re-inspected whenever the
-filesystem or receiver code changes.

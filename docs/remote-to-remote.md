@@ -270,4 +270,3 @@ provide another persistent authentication policy. Reattach with
 An explicit `--checkpoint` path belongs to the machine running the
 orchestrator: normally the invoking machine, but hostA for a direct or detached
 remote-to-remote copy (`--relay` keeps it local).
-
