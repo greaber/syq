@@ -209,6 +209,12 @@ jobs:
           persist-credentials: false
       - if: needs.scope.outputs.native == 'true'
         run: cargo check --locked --all-targets
+      - name: Exercise macOS symlink descriptor pinning
+        if: needs.scope.outputs.native == 'true'
+        run: >-
+          cargo test --locked
+          rooted::tests::operator_resolver_selects_a_last_component_symlink_without_following_it
+          -- --exact
       - if: needs.scope.outputs.native == 'true'
         run: scripts/test-installer.sh
       - if: needs.scope.outputs.native == 'true'

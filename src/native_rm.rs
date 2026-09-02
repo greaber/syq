@@ -8,20 +8,23 @@
 //! selected symlink and symlinks encountered below a selected directory are
 //! unlinked as entries; neither is followed.
 
-use crate::proto::{NativeRemoveKind, NativeRemoveOutcome, NativeRemoveSelection, PathBytes};
+use crate::proto::{
+    NativeRemoveKind, NativeRemoveOutcome, NativeRemoveSelection, OperatorSymlinkPolicy, PathBytes,
+};
+use crate::rooted::{
+    OperatorFinalComponent, OperatorResolver, OperatorSymlinkHop, PinnedLeaf as RootedPinnedLeaf,
+    PinnedPath, RootMetadata,
+};
 use anyhow::{bail, Context, Result};
-use std::collections::VecDeque;
 use std::ffi::CString;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const SYMLINK_LIMIT: usize = 40;
 const EVENT_BATCH: usize = 200;
 const EVENT_POLL: Duration = Duration::from_millis(100);
 const EVENT_FLUSH: Duration = Duration::from_millis(100);
@@ -97,18 +100,27 @@ enum ResolvedSelection {
     Directory(PinnedDirectory),
 }
 
-struct Cursor {
-    directory: File,
-    anchor: Option<PinnedName>,
-}
-
 struct Resolver {
-    base: File,
-    confined: bool,
+    resolver: OperatorResolver,
     follow: bool,
 }
 
 impl Resolver {
+    fn new(base: &File, confined: bool, follow: bool) -> Result<Self> {
+        Ok(Self {
+            resolver: OperatorResolver::beneath(
+                base,
+                confined,
+                if follow {
+                    OperatorSymlinkPolicy::FollowAll
+                } else {
+                    OperatorSymlinkPolicy::Refuse
+                },
+            )?,
+            follow,
+        })
+    }
+
     fn resolve(
         &self,
         selection: &NativeRemoveSelection,
@@ -116,21 +128,59 @@ impl Resolver {
     ) -> Result<ResolvedSelection> {
         validate_selector(&selection.path)?;
         let label = selection.path.clone();
-        let mut components = path_components(&selection.path);
-        let initial = Cursor {
-            directory: self.base.try_clone().context("duplicate removal base")?,
-            anchor: None,
-        };
-        let mut stack = vec![initial];
-        let mut symlinks = 0usize;
+        let mut hops = Vec::new();
+        let resolved = self.resolver.resolve(
+            &selection.path,
+            OperatorFinalComponent::Entry {
+                follow_symlink: self.follow,
+            },
+            true,
+            &mut hops,
+        );
+        append_selector_hops(&selection.path, &hops, traces);
+        let resolved = resolved.with_context(|| {
+            format!(
+                "resolve selector {:?}",
+                String::from_utf8_lossy(&selection.path)
+            )
+        })?;
 
-        loop {
-            let Some(component) = components.pop_front() else {
-                let current = stack.last().expect("resolver stack is nonempty");
-                let identity = identity_from_file(&current.directory)?;
+        match resolved {
+            PinnedPath::Missing(_) => {
+                traces.push(format!(
+                    "selector {:?} is absent",
+                    String::from_utf8_lossy(&label)
+                ));
+                Ok(ResolvedSelection::Missing)
+            }
+            PinnedPath::Leaf(leaf) => {
+                let identity = identity_from_root(leaf.metadata());
+                require_kind(selection.kind, identity, &label)?;
+                traces.push(format!(
+                    "selector {:?} resolved to {} {}:{}",
+                    String::from_utf8_lossy(&label),
+                    if identity.is_symlink() {
+                        "symlink"
+                    } else {
+                        "non-directory"
+                    },
+                    identity.dev,
+                    identity.ino
+                ));
+                let (name, object) = pinned_name_from_root(leaf);
+                Ok(ResolvedSelection::Leaf(PinnedLeaf {
+                    name,
+                    _object: object,
+                    label,
+                }))
+            }
+            PinnedPath::Directory(directory) => {
+                let identity = identity_from_root(directory.metadata());
                 require_kind(selection.kind, identity, &label)?;
                 let remove_root = selection.kind != NativeRemoveKind::Contents;
-                if remove_root && current.anchor.is_none() {
+                let (directory, name) = directory.into_parts();
+                let name = name.map(|name| pinned_name_from_root(name).0);
+                if remove_root && name.is_none() {
                     bail!(
                         "selector {:?} resolves to a directory without a removable name; select its contents explicitly instead",
                         String::from_utf8_lossy(&label)
@@ -142,195 +192,45 @@ impl Resolver {
                     identity.dev,
                     identity.ino
                 ));
-                return Ok(ResolvedSelection::Directory(PinnedDirectory {
-                    directory: current
-                        .directory
-                        .try_clone()
-                        .context("pin selected directory")?,
-                    name: current.anchor.as_ref().map(duplicate_name).transpose()?,
+                Ok(ResolvedSelection::Directory(PinnedDirectory {
+                    directory,
+                    name,
                     label,
                     remove_root,
-                }));
-            };
-
-            if component == b"." {
-                continue;
+                }))
             }
-            if component == b".." {
-                if stack.len() > 1 {
-                    stack.pop();
-                } else if self.confined {
-                    bail!(
-                        "selector {:?} follows a symlink outside --root",
-                        String::from_utf8_lossy(&selection.path)
-                    );
-                } else {
-                    let parent = open_directory_at(&stack[0].directory, b"..")
-                        .context("resolve symlink target parent")?;
-                    stack[0] = Cursor {
-                        directory: parent,
-                        anchor: None,
-                    };
-                }
-                continue;
-            }
-
-            let current = stack.last().expect("resolver stack is nonempty");
-            let identity = match metadata_at(current.directory.as_raw_fd(), &component) {
-                Ok(identity) => identity,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    traces.push(format!(
-                        "selector {:?} is absent",
-                        String::from_utf8_lossy(&label)
-                    ));
-                    return Ok(ResolvedSelection::Missing);
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "resolve selector {:?}",
-                            String::from_utf8_lossy(&selection.path)
-                        )
-                    });
-                }
-            };
-
-            let final_component = components.is_empty();
-            if identity.is_symlink() {
-                if !self.follow {
-                    if !final_component {
-                        bail!(
-                            "selector {:?} encounters symlink component {:?}; pass --follow to resolve symlinks",
-                            String::from_utf8_lossy(&selection.path),
-                            String::from_utf8_lossy(&component)
-                        );
-                    }
-                    require_kind(selection.kind, identity, &label)?;
-                    traces.push(format!(
-                        "selector {:?} resolved to symlink {}:{}",
-                        String::from_utf8_lossy(&label),
-                        identity.dev,
-                        identity.ino
-                    ));
-                    return Ok(ResolvedSelection::Leaf(PinnedLeaf {
-                        name: PinnedName {
-                            parent: PinnedParent::File(
-                                current
-                                    .directory
-                                    .try_clone()
-                                    .context("pin selected symlink parent")?,
-                            ),
-                            name: component_cstring(&component)?,
-                            identity,
-                        },
-                        // Linux can hold an O_PATH descriptor for a symlink,
-                        // but macOS has no corresponding portable open mode.
-                        // The pinned parent/name plus identity check is the
-                        // same mechanism used for symlinks found in a tree.
-                        _object: None,
-                        label,
-                    }));
-                }
-                symlinks += 1;
-                if symlinks > SYMLINK_LIMIT {
-                    bail!(
-                        "too many symlinks while resolving selector {:?}",
-                        String::from_utf8_lossy(&selection.path)
-                    );
-                }
-                let target = read_link_at(current.directory.as_raw_fd(), &component)?;
-                traces.push(format!(
-                    "selector {:?}: symlink {:?} -> {:?}",
-                    String::from_utf8_lossy(&selection.path),
-                    String::from_utf8_lossy(&component),
-                    String::from_utf8_lossy(&target)
-                ));
-                if target.starts_with(b"/") {
-                    if self.confined {
-                        bail!(
-                            "selector {:?} has an absolute symlink target outside --root",
-                            String::from_utf8_lossy(&selection.path)
-                        );
-                    }
-                    stack = vec![Cursor {
-                        directory: open_start(true)?,
-                        anchor: None,
-                    }];
-                }
-                let mut target_components = path_components(&target);
-                target_components.append(&mut components);
-                components = target_components;
-                continue;
-            }
-
-            if identity.is_dir() {
-                let directory = open_directory_at(&current.directory, &component)
-                    .with_context(|| format!("open directory component {:?}", bytes(&component)))?;
-                require_same_identity(identity, identity_from_file(&directory)?, "directory")?;
-                let anchor = PinnedName {
-                    parent: PinnedParent::File(
-                        current
-                            .directory
-                            .try_clone()
-                            .context("pin selected directory parent")?,
-                    ),
-                    name: component_cstring(&component)?,
-                    identity,
-                };
-                if final_component {
-                    require_kind(selection.kind, identity, &label)?;
-                    traces.push(format!(
-                        "selector {:?} resolved to directory {}:{}",
-                        String::from_utf8_lossy(&label),
-                        identity.dev,
-                        identity.ino
-                    ));
-                    return Ok(ResolvedSelection::Directory(PinnedDirectory {
-                        directory,
-                        name: Some(anchor),
-                        label,
-                        remove_root: selection.kind != NativeRemoveKind::Contents,
-                    }));
-                }
-                stack.push(Cursor {
-                    directory,
-                    anchor: Some(anchor),
-                });
-                continue;
-            }
-
-            if !final_component {
-                bail!(
-                    "non-directory component {:?} in selector {:?}",
-                    String::from_utf8_lossy(&component),
-                    String::from_utf8_lossy(&selection.path)
-                );
-            }
-            require_kind(selection.kind, identity, &label)?;
-            let object = open_metadata_at(current.directory.as_raw_fd(), &component)
-                .with_context(|| format!("pin selector {:?}", bytes(&label)))?;
-            require_same_identity(identity, identity_from_file(&object)?, "object")?;
-            traces.push(format!(
-                "selector {:?} resolved to non-directory {}:{}",
-                String::from_utf8_lossy(&label),
-                identity.dev,
-                identity.ino
-            ));
-            return Ok(ResolvedSelection::Leaf(PinnedLeaf {
-                name: PinnedName {
-                    parent: PinnedParent::File(
-                        current
-                            .directory
-                            .try_clone()
-                            .context("pin selected object parent")?,
-                    ),
-                    name: component_cstring(&component)?,
-                    identity,
-                },
-                _object: Some(object),
-                label,
-            }));
         }
+    }
+}
+
+fn append_selector_hops(path: &[u8], hops: &[OperatorSymlinkHop], traces: &mut Vec<String>) {
+    for hop in hops {
+        traces.push(format!(
+            "selector {:?}: symlink {:?} -> {:?}",
+            String::from_utf8_lossy(path),
+            String::from_utf8_lossy(&hop.component),
+            String::from_utf8_lossy(&hop.target)
+        ));
+    }
+}
+
+fn pinned_name_from_root(leaf: RootedPinnedLeaf) -> (PinnedName, Option<File>) {
+    let (parent, name, metadata, object) = leaf.into_parts();
+    (
+        PinnedName {
+            parent: PinnedParent::File(parent),
+            name,
+            identity: identity_from_root(metadata),
+        },
+        object,
+    )
+}
+
+fn identity_from_root(metadata: RootMetadata) -> Identity {
+    Identity {
+        dev: metadata.dev,
+        ino: metadata.ino,
+        file_type: metadata.file_type(),
     }
 }
 
@@ -404,7 +304,7 @@ fn open_base(
         ));
         return Ok((directory, false));
     }
-    let directory = open_start(false)?;
+    let directory = resolve_base_path(b".", false, "endpoint working directory", traces)?;
     let identity = identity_from_file(&directory)?;
     traces.push(format!(
         "endpoint working directory pinned as {}:{}",
@@ -425,80 +325,31 @@ fn resolve_base_path(
     if path.contains(&0) {
         bail!("{option} contains NUL");
     }
-    let mut components = path_components(path);
-    let mut stack = vec![Cursor {
-        directory: open_start(path.starts_with(b"/"))?,
-        anchor: None,
-    }];
-    let mut symlinks = 0usize;
-    while let Some(component) = components.pop_front() {
-        if component == b"." {
-            continue;
-        }
-        if component == b".." {
-            if stack.len() > 1 {
-                stack.pop();
-            } else {
-                let parent = open_directory_at(&stack[0].directory, b"..")
-                    .with_context(|| format!("resolve {option} parent"))?;
-                stack[0] = Cursor {
-                    directory: parent,
-                    anchor: None,
-                };
-            }
-            continue;
-        }
-        let current = stack.last().expect("base resolver stack is nonempty");
-        let identity = metadata_at(current.directory.as_raw_fd(), &component)
-            .with_context(|| format!("resolve {option} {:?}", bytes(path)))?;
-        if identity.is_symlink() {
-            if !follow {
-                bail!(
-                    "{option} {:?} encounters symlink component {:?}; pass --follow to resolve symlinks",
-                    String::from_utf8_lossy(path),
-                    String::from_utf8_lossy(&component)
-                );
-            }
-            symlinks += 1;
-            if symlinks > SYMLINK_LIMIT {
-                bail!(
-                    "too many symlinks while resolving {option} {:?}",
-                    bytes(path)
-                );
-            }
-            let target = read_link_at(current.directory.as_raw_fd(), &component)?;
-            traces.push(format!(
-                "{option} {:?}: symlink {:?} -> {:?}",
-                String::from_utf8_lossy(path),
-                String::from_utf8_lossy(&component),
-                String::from_utf8_lossy(&target)
-            ));
-            if target.starts_with(b"/") {
-                stack = vec![Cursor {
-                    directory: open_start(true)?,
-                    anchor: None,
-                }];
-            }
-            let mut target_components = path_components(&target);
-            target_components.append(&mut components);
-            components = target_components;
-            continue;
-        }
-        if !identity.is_dir() {
-            bail!("{option} {:?} is not a directory", bytes(path));
-        }
-        let directory = open_directory_at(&current.directory, &component)
-            .with_context(|| format!("open {option} component {:?}", bytes(&component)))?;
-        require_same_identity(identity, identity_from_file(&directory)?, "base directory")?;
-        stack.push(Cursor {
-            directory,
-            anchor: None,
-        });
+    let mut hops = Vec::new();
+    let selected = OperatorResolver::resolve_process(
+        path,
+        if follow {
+            OperatorSymlinkPolicy::FollowAll
+        } else {
+            OperatorSymlinkPolicy::Refuse
+        },
+        OperatorFinalComponent::Directory,
+        false,
+        &mut hops,
+    );
+    for hop in &hops {
+        traces.push(format!(
+            "{option} {:?}: symlink {:?} -> {:?}",
+            String::from_utf8_lossy(path),
+            String::from_utf8_lossy(&hop.component),
+            String::from_utf8_lossy(&hop.target)
+        ));
     }
-    stack
-        .pop()
-        .map(|cursor| cursor.directory)
-        .context("base path did not resolve to a directory")
+    let selected = selected.with_context(|| format!("resolve {option} {:?}", bytes(path)))?;
+    let PinnedPath::Directory(directory) = selected else {
+        bail!("{option} {:?} is not a directory", bytes(path));
+    };
+    Ok(directory.into_parts().0)
 }
 
 struct DirectoryJob {
@@ -603,11 +454,7 @@ pub(crate) fn remove(
 ) -> Result<()> {
     let mut traces = Vec::new();
     let (base, confined) = open_base(cwd, root, follow_symlinks, &mut traces)?;
-    let resolver = Resolver {
-        base,
-        confined,
-        follow: follow_symlinks,
-    };
+    let resolver = Resolver::new(&base, confined, follow_symlinks)?;
 
     // This phase is deliberately complete before the worker pool starts: a
     // later selector can never acquire a new meaning because an earlier one
@@ -929,26 +776,6 @@ fn remove_pinned(name: &PinnedName, directory: bool) -> Result<()> {
         .context("remove pinned object")
 }
 
-fn duplicate_name(name: &PinnedName) -> Result<PinnedName> {
-    Ok(PinnedName {
-        parent: match &name.parent {
-            PinnedParent::File(file) => {
-                PinnedParent::File(file.try_clone().context("duplicate pinned parent")?)
-            }
-            PinnedParent::Directory(job) => PinnedParent::Directory(job.clone()),
-        },
-        name: name.name.clone(),
-        identity: name.identity,
-    })
-}
-
-fn path_components(path: &[u8]) -> VecDeque<Vec<u8>> {
-    path.split(|byte| *byte == b'/')
-        .filter(|component| !component.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect()
-}
-
 fn join_label(parent: &[u8], child: &[u8]) -> PathBytes {
     let mut path = parent.to_vec();
     if !path.is_empty() && !path.ends_with(b"/") {
@@ -960,15 +787,6 @@ fn join_label(parent: &[u8], child: &[u8]) -> PathBytes {
 
 fn bytes(path: &[u8]) -> String {
     String::from_utf8_lossy(path).into_owned()
-}
-
-fn open_start(root: bool) -> Result<File> {
-    let path = if root { Path::new("/") } else { Path::new(".") };
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("open removal base {}", path.display()))
 }
 
 fn component_cstring(component: &[u8]) -> Result<CString> {
@@ -988,19 +806,6 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
             | libc::O_NOCTTY
             | libc::O_CLOEXEC,
     )
-}
-
-fn open_metadata_at(parent: RawFd, component: &[u8]) -> io::Result<File> {
-    let component = CString::new(component)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL"))?;
-    #[cfg(target_os = "linux")]
-    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    #[cfg(target_os = "macos")]
-    let flags = libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let flags =
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-    open_at(parent, &component, flags)
 }
 
 fn open_at(parent: RawFd, name: &CString, flags: libc::c_int) -> io::Result<File> {
@@ -1083,38 +888,6 @@ fn require_same_identity(expected: Identity, actual: Identity, what: &str) -> Re
         );
     }
     Ok(())
-}
-
-fn read_link_at(parent: RawFd, component: &[u8]) -> Result<Vec<u8>> {
-    let component = component_cstring(component)?;
-    let mut buffer = vec![0u8; 256];
-    loop {
-        let read = loop {
-            let result = unsafe {
-                libc::readlinkat(
-                    parent,
-                    component.as_ptr(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                )
-            };
-            if result >= 0 {
-                break result as usize;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error).context("read selector symlink");
-            }
-        };
-        if read < buffer.len() {
-            buffer.truncate(read);
-            return Ok(buffer);
-        }
-        if buffer.len() >= 1024 * 1024 {
-            bail!("symlink target exceeds size limit");
-        }
-        buffer.resize(buffer.len() * 2, 0);
-    }
 }
 
 struct DirectoryStream(*mut libc::DIR);
@@ -1218,9 +991,9 @@ fn get_errno() -> libc::c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, OpenOptionsExt};
 
     fn selector(path: &[u8], kind: NativeRemoveKind) -> NativeRemoveSelection {
         NativeRemoveSelection {
