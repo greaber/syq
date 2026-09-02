@@ -27,9 +27,15 @@ commands. `--dry-run` composes; see below.
 
 A `FILE` inside the transfer's own endpoints is refused before
 anything is created — the run would copy, overwrite, or prune its own
-results file. Mapping runs check only destination containment: their
-source base defaults to `.`, and they read only manifest-listed
-paths.
+results file. The check uses the transfer's own `~` expansion and
+resolves symlinks, and a `FILE` that turns out to be the `--mapping`
+manifest is refused before the manifest is touched. A source file
+that is the results file by any other alias — hard links included —
+is caught by filesystem identity during the scan and fails as a
+`conflict` instead of being copied. (Mapping runs check only
+destination containment up front: their source base defaults to `.`,
+and they read only manifest-listed paths — the identity check covers
+their entries.)
 
 Records land in `seq` order. Error and terminal records are flushed
 immediately. If writing the stream itself fails, syq warns once on

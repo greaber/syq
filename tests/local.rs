@@ -10035,3 +10035,133 @@ fn native_cp_mapping_entry_naming_results_file_fails() {
     assert_eq!(failed["retryable"], "no");
     assert_eq!(lines.last().unwrap()["status"], "partial");
 }
+
+#[test]
+fn native_cp_results_hard_link_alias_fails_the_source_file() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    write(&t.path("src/g.txt"), b"other");
+    // The results path is a hard link to a source file: no path comparison
+    // can see it, but the scan's stat identity does. The truncation is
+    // inherent to --results pointing there; the guarantee is a visible
+    // failure instead of silently copying the stream.
+    std::fs::hard_link(t.path("src/f.txt"), t.path("r.ndjson")).unwrap();
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("own --results file"));
+    assert!(!t.path("dst/f.txt").exists());
+    assert_eq!(read(&t.path("dst/g.txt")), b"other");
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.last().unwrap()["status"], "partial");
+}
+
+#[test]
+fn native_cp_mapping_symlinked_base_alias_fails_the_entry() {
+    let t = Tmp::new();
+    write(&t.path("real-src/f.txt"), b"data");
+    write(&t.path("real-src/r.ndjson"), b"stale");
+    std::os::unix::fs::symlink("real-src", t.path("src-link")).unwrap();
+    let manifest = format!(
+        "{}{}",
+        entry_line("f.txt", "f.txt", Some("file")),
+        entry_line("r.ndjson", "copied.ndjson", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--follow",
+            "-C",
+            "src-link",
+            "--mapping",
+            "-",
+            "--into",
+            "dst",
+            "--results",
+            "real-src/r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("own --results file"));
+    assert_eq!(read(&t.path("dst/f.txt")), b"data");
+    assert!(!t.path("dst/copied.ndjson").exists());
+}
+
+#[test]
+fn native_cp_results_as_mapping_manifest_is_refused_without_truncation() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    let manifest = entry_line("f.txt", "f.txt", Some("file"));
+    write(&t.path("m.ndjson"), manifest.as_bytes());
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "-C",
+            "src",
+            "--mapping",
+            "m.ndjson",
+            "--into",
+            "dst",
+            "--results",
+            "m.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("--mapping manifest"),
+        "{}",
+        stderr_of(&out)
+    );
+    // Refused before truncation: the manifest survives byte for byte.
+    assert_eq!(read(&t.path("m.ndjson")), manifest.as_bytes());
+    assert!(!t.path("dst/f.txt").exists());
+}
+
+#[test]
+fn native_cp_results_tilde_destination_containment_is_refused() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    write(&t.path("home/dst/keep.txt"), b"k");
+    // The destination is spelled `~/dst`; the guard must expand it the way
+    // the transfer will, or --prune deletes the results file.
+    let results = t.path("home/dst/r.ndjson");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--prune",
+            "--src-src",
+            "src",
+            "--into",
+            "~/dst",
+            "--results",
+        ])
+        .arg(&results)
+        .current_dir(t.path(""))
+        .env("HOME", t.path("home"))
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("refusing to write inside"), "{stderr}");
+    assert!(!results.exists());
+    assert!(t.path("home/dst/keep.txt").exists());
+}

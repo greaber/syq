@@ -702,13 +702,14 @@ pub fn run(args: Args) -> Result<i32> {
             // Refuse a results file inside the transfer's own endpoints:
             // creating it truncates whatever is there, a source walk would
             // copy it mid-write, and --prune deletes it as destination-only.
-            // Comparison resolves symlinks (longest existing prefix), so an
-            // endpoint reached through an alias still matches. Mapping runs
-            // read only manifest-listed source paths, so only their
-            // destination containment is checked here (the source base
-            // defaults to `.`, which would refuse every relative path);
-            // individual entries naming the results file fail in
-            // scan_mapping via the identity recorded below.
+            // Endpoint paths go through the transfer's own `~` expansion,
+            // and comparison resolves symlinks (longest existing prefix),
+            // so an endpoint reached through an alias still matches.
+            // Mapping runs read only manifest-listed source paths, so only
+            // their destination containment is checked here (the source
+            // base defaults to `.`, which would refuse every relative
+            // path); source files that are the results file by any alias —
+            // hard links included — fail by filesystem identity below.
             let results_operand = std::path::Path::new(OsStr::from_bytes(results));
             let results_abs = resolved_absolute(results_operand)?;
             for (index, location) in args.locations.iter().enumerate() {
@@ -719,8 +720,7 @@ pub fn run(args: Args) -> Result<i32> {
                 if !is_destination && args.native_mapping.is_some() {
                     continue;
                 }
-                let root =
-                    resolved_absolute(std::path::Path::new(OsStr::from_bytes(&location.path)))?;
+                let root = resolved_absolute(&crate::fsops::resolve(&location.path))?;
                 if results_abs.starts_with(&root) {
                     bail!(
                         "--results {}: refusing to write inside the transfer's {} {}; the run would copy, overwrite, or delete its own results file",
@@ -730,13 +730,41 @@ pub fn run(args: Args) -> Result<i32> {
                     );
                 }
             }
-            if args.locations.first().is_some_and(|s| s.host.is_none()) {
-                progress.set_results_path(lexical_absolute(results_operand)?, results_abs);
+            // Open without truncating so identity checks run before any
+            // data is lost, then record the file's (dev, ino): the scan
+            // compares every local source file against it, which catches
+            // aliases no path comparison can see.
+            // truncate(false): truncation is deferred to set_len below,
+            // after the identity checks, so a refusal loses nothing.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?;
+            let identity = {
+                use std::os::unix::fs::MetadataExt;
+                let meta = file
+                    .metadata()
+                    .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?;
+                (meta.dev(), meta.ino())
+            };
+            if let Some(mapping) = args.native_mapping.as_deref().filter(|m| *m != b"-") {
+                use std::os::unix::fs::MetadataExt;
+                let manifest = std::path::Path::new(OsStr::from_bytes(mapping));
+                if std::fs::metadata(manifest).is_ok_and(|m| (m.dev(), m.ino()) == identity) {
+                    bail!(
+                        "--results {}: it is the --mapping manifest; writing the stream would destroy the input",
+                        path.display()
+                    );
+                }
             }
-            Box::new(std::io::BufWriter::new(
-                std::fs::File::create(&path)
-                    .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?,
-            ))
+            if args.locations.first().is_some_and(|s| s.host.is_none()) {
+                progress.set_results_identity(identity);
+            }
+            file.set_len(0)
+                .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?;
+            Box::new(std::io::BufWriter::new(file))
         };
         let writer = Arc::new(crate::results::ResultsWriter::new(out));
         let run_id = {
@@ -3451,18 +3479,11 @@ impl Planner<'_> {
         // upgrade.
         let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
         let mut synthesized: HashSet<PathBytes> = HashSet::new();
-        // An entry naming the run's own --results file would copy the stream
-        // mid-write (creating the stream already truncated whatever was
-        // there); fail such entries instead. Comparing against both the
-        // lexical and resolved results paths catches direct spellings, dot
-        // components, and a results file whose parent is a resolved alias;
-        // a source reached through its own distinct symlink is not chased
-        // per entry.
-        let results_guard = self.progress.results_path().cloned();
-        let guard_cwd = match &results_guard {
-            Some(_) => Some(std::env::current_dir().context("resolve current directory")?),
-            None => None,
-        };
+        // An entry naming the run's own --results file would copy the
+        // stream mid-write; fail such entries instead. The comparison is
+        // filesystem identity from the stat the scan already did, so every
+        // alias — dot components, symlinked bases, hard links — is caught.
+        let results_identity = self.progress.results_identity();
         let mut remaining = entries.into_iter().peekable();
         while remaining.peek().is_some() {
             let chunk: Vec<(u64, ManifestEntry)> =
@@ -3493,26 +3514,20 @@ impl Planner<'_> {
                     );
                     continue;
                 };
-                if e.kind == Kind::File {
-                    if let (Some((lexical, resolved)), Some(cwd)) = (&results_guard, &guard_cwd) {
-                        let joined = join(src_root, &m.src);
-                        let src_abs = fold_components(
-                            &cwd.join(std::path::Path::new(OsStr::from_bytes(&joined))),
-                        );
-                        if src_abs == *lexical || src_abs == *resolved {
-                            let message = format!(
-                                "--mapping line {line_number}: source {} is the run's own --results file",
-                                display(&m.src)
-                            );
-                            self.progress.error_classified(
-                                &format!("syq: {message}"),
-                                Some("conflict"),
-                                None,
-                            );
-                            self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
-                            continue;
-                        }
-                    }
+                if e.kind == Kind::File
+                    && results_identity.is_some_and(|(dev, ino)| e.dev == dev && e.ino == ino)
+                {
+                    let message = format!(
+                        "--mapping line {line_number}: source {} is the run's own --results file",
+                        display(&m.src)
+                    );
+                    self.progress.error_classified(
+                        &format!("syq: {message}"),
+                        Some("conflict"),
+                        None,
+                    );
+                    self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
+                    continue;
                 }
                 if let Some(declared) = m.kind {
                     if !declared.matches(e.kind) {
@@ -4282,6 +4297,23 @@ impl Planner<'_> {
                 Kind::File => {
                     if self.unusable_files.contains(&dst_path) {
                         // register_namespace reported it; nothing can stage here.
+                        continue;
+                    }
+                    // A walked source that is the run's own --results file —
+                    // through any alias, hard links included — must fail
+                    // visibly, not copy the stream mid-write. Mapping
+                    // entries fail earlier in scan_mapping with their line
+                    // number and a retryable failed record.
+                    if self
+                        .progress
+                        .results_identity()
+                        .is_some_and(|(dev, ino)| e.dev == dev && e.ino == ino)
+                    {
+                        self.progress.error_classified(
+                            &format!("syq: {rel}: source is the run's own --results file"),
+                            Some("conflict"),
+                            None,
+                        );
                         continue;
                     }
                     // Never copy a file onto itself (same path, hardlink, or a
