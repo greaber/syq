@@ -702,10 +702,15 @@ pub fn run(args: Args) -> Result<i32> {
             // Refuse a results file inside the transfer's own endpoints:
             // creating it truncates whatever is there, a source walk would
             // copy it mid-write, and --prune deletes it as destination-only.
-            // Mapping runs read only manifest-listed source paths, so only
-            // their destination containment is checked (the source base
-            // defaults to `.`, which would refuse every relative path).
-            let results_abs = lexical_absolute(std::path::Path::new(OsStr::from_bytes(results)))?;
+            // Comparison resolves symlinks (longest existing prefix), so an
+            // endpoint reached through an alias still matches. Mapping runs
+            // read only manifest-listed source paths, so only their
+            // destination containment is checked here (the source base
+            // defaults to `.`, which would refuse every relative path);
+            // individual entries naming the results file fail in
+            // scan_mapping via the identity recorded below.
+            let results_operand = std::path::Path::new(OsStr::from_bytes(results));
+            let results_abs = resolved_absolute(results_operand)?;
             for (index, location) in args.locations.iter().enumerate() {
                 if location.host.is_some() {
                     continue;
@@ -715,7 +720,7 @@ pub fn run(args: Args) -> Result<i32> {
                     continue;
                 }
                 let root =
-                    lexical_absolute(std::path::Path::new(OsStr::from_bytes(&location.path)))?;
+                    resolved_absolute(std::path::Path::new(OsStr::from_bytes(&location.path)))?;
                 if results_abs.starts_with(&root) {
                     bail!(
                         "--results {}: refusing to write inside the transfer's {} {}; the run would copy, overwrite, or delete its own results file",
@@ -724,6 +729,9 @@ pub fn run(args: Args) -> Result<i32> {
                         std::path::Path::new(OsStr::from_bytes(&location.path)).display()
                     );
                 }
+            }
+            if args.locations.first().is_some_and(|s| s.host.is_none()) {
+                progress.set_results_path(lexical_absolute(results_operand)?, results_abs);
             }
             Box::new(std::io::BufWriter::new(
                 std::fs::File::create(&path)
@@ -1975,6 +1983,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     let aborted = sched.is_aborted();
+    if opts.dry_run {
+        st.flush_dry_directory_traces();
+    }
     let mut deleted = 0u64;
     let mut delete_plan = if opts.delete {
         DeletePlan::Skipped("the copy plan did not complete")
@@ -2786,6 +2797,11 @@ struct DryRunMapping {
 struct DryRunChanges {
     regular_files: u64,
     directories: std::collections::HashSet<PathBytes>,
+    /// Planned directory creations in plan order, traced only after the
+    /// whole scan settles: a later explicit mapping entry can upgrade a
+    /// synthesized ancestor, and an already-streamed trace could not gain
+    /// its `src`.
+    directory_creates: Vec<(PathBytes, &'static str)>,
     symlinks: u64,
     specials: u64,
     metadata_files: u64,
@@ -3435,6 +3451,18 @@ impl Planner<'_> {
         // upgrade.
         let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
         let mut synthesized: HashSet<PathBytes> = HashSet::new();
+        // An entry naming the run's own --results file would copy the stream
+        // mid-write (creating the stream already truncated whatever was
+        // there); fail such entries instead. Comparing against both the
+        // lexical and resolved results paths catches direct spellings, dot
+        // components, and a results file whose parent is a resolved alias;
+        // a source reached through its own distinct symlink is not chased
+        // per entry.
+        let results_guard = self.progress.results_path().cloned();
+        let guard_cwd = match &results_guard {
+            Some(_) => Some(std::env::current_dir().context("resolve current directory")?),
+            None => None,
+        };
         let mut remaining = entries.into_iter().peekable();
         while remaining.peek().is_some() {
             let chunk: Vec<(u64, ManifestEntry)> =
@@ -3465,6 +3493,27 @@ impl Planner<'_> {
                     );
                     continue;
                 };
+                if e.kind == Kind::File {
+                    if let (Some((lexical, resolved)), Some(cwd)) = (&results_guard, &guard_cwd) {
+                        let joined = join(src_root, &m.src);
+                        let src_abs = fold_components(
+                            &cwd.join(std::path::Path::new(OsStr::from_bytes(&joined))),
+                        );
+                        if src_abs == *lexical || src_abs == *resolved {
+                            let message = format!(
+                                "--mapping line {line_number}: source {} is the run's own --results file",
+                                display(&m.src)
+                            );
+                            self.progress.error_classified(
+                                &format!("syq: {message}"),
+                                Some("conflict"),
+                                None,
+                            );
+                            self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
+                            continue;
+                        }
+                    }
+                }
                 if let Some(declared) = m.kind {
                     if !declared.matches(e.kind) {
                         let message = format!(
@@ -3930,18 +3979,13 @@ impl Planner<'_> {
                             // directory entry that upgrades a synthesized
                             // ancestor from an earlier chunk plans the same
                             // path again, and a live run's stat would filter
-                            // it while a dry run has nothing to stat.
+                            // it while a dry run has nothing to stat. The
+                            // trace itself is deferred (see
+                            // directory_creates).
                             if self.dry_run_changes.directories.insert(p.clone()) {
-                                if let Some(dst_rel) = strip_dst_root(p, dst_root) {
-                                    self.emit_trace_with_src(
-                                        "create_directory",
-                                        dst_rel,
-                                        "dir",
-                                        None,
-                                        "destination_missing",
-                                        !self.implicit_dirs.contains(p),
-                                    );
-                                }
+                                self.dry_run_changes
+                                    .directory_creates
+                                    .push((p.clone(), "destination_missing"));
                                 if opts.verbose > 0 {
                                     self.progress.println(&format!(
                                         "create directory {} (destination missing)",
@@ -3953,23 +3997,16 @@ impl Planner<'_> {
                         Some(d) if d.kind != Kind::Dir => {
                             if self.dry_run_changes.directories.insert(p.clone()) {
                                 self.dry_run_changes.type_replacements += 1;
-                            }
-                            if let Some(dst_rel) = strip_dst_root(p, dst_root) {
-                                self.emit_trace_with_src(
-                                    "create_directory",
-                                    dst_rel,
-                                    "dir",
-                                    None,
-                                    "type_differs",
-                                    !self.implicit_dirs.contains(p),
-                                );
-                            }
-                            if opts.verbose > 0 {
-                                self.progress.println(&format!(
-                                    "replace with directory {} (destination is {})",
-                                    display_directory(p),
-                                    kind_label(d.kind)
-                                ));
+                                self.dry_run_changes
+                                    .directory_creates
+                                    .push((p.clone(), "type_differs"));
+                                if opts.verbose > 0 {
+                                    self.progress.println(&format!(
+                                        "replace with directory {} (destination is {})",
+                                        display_directory(p),
+                                        kind_label(d.kind)
+                                    ));
+                                }
                             }
                         }
                         Some(d)
@@ -4365,6 +4402,10 @@ impl Planner<'_> {
                         self.progress.files_total.fetch_add(1, Relaxed);
                         self.progress.bytes_total.fetch_add(e.size, Relaxed);
                         self.progress.files_done.fetch_add(1, Relaxed);
+                        // Dry aggregates mean planned work, bytes included —
+                        // files_done already moves here, so bytes_done must
+                        // too or the terminal record contradicts its traces.
+                        self.progress.bytes_done.fetch_add(e.size, Relaxed);
                         self.dry_run_changes.regular_files += 1;
                         if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::File) {
                             self.dry_run_changes.type_replacements += 1;
@@ -5144,6 +5185,27 @@ impl Planner<'_> {
 
     /// Remove what plan_deletes found: leaves first, then directories deepest
     /// first. Returns the number of entries removed (or that would be, with -n).
+    /// Emit the dry run's deferred create_directory traces, after the whole
+    /// scan has settled which directories are implicit and which mapping
+    /// entries claimed them — so a directory synthesized in one chunk and
+    /// upgraded by an explicit entry in a later one still traces with that
+    /// entry's `src`.
+    fn flush_dry_directory_traces(&mut self) {
+        let creates = std::mem::take(&mut self.dry_run_changes.directory_creates);
+        for (path, reason) in creates {
+            if let Some(dst_rel) = strip_dst_root(&path, &self.root_path) {
+                self.emit_trace_with_src(
+                    "create_directory",
+                    dst_rel,
+                    "dir",
+                    None,
+                    reason,
+                    !self.implicit_dirs.contains(&path),
+                );
+            }
+        }
+    }
+
     fn run_deletes(&mut self) -> Result<u64> {
         let opts = self.opts;
         let leaves = std::mem::take(&mut self.deletes.leaves);
@@ -6956,18 +7018,10 @@ struct QueuedLeafOp {
 
 /// The container-relative spelling of a full destination path; None for the
 /// container itself.
-/// Absolute lexical form: joined to the cwd with `.`/`..` folded, without
-/// touching the filesystem, so containment can be checked before anything
-/// is created.
-fn lexical_absolute(path: &std::path::Path) -> Result<std::path::PathBuf> {
+/// Fold `.`/`..` components of an already-absolute path without touching
+/// the filesystem.
+fn fold_components(joined: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("resolve current directory")?
-            .join(path)
-    };
     let mut out = std::path::PathBuf::new();
     for component in joined.components() {
         match component {
@@ -6978,7 +7032,48 @@ fn lexical_absolute(path: &std::path::Path) -> Result<std::path::PathBuf> {
             other => out.push(other),
         }
     }
-    Ok(out)
+    out
+}
+
+/// Absolute lexical form: joined to the cwd with `.`/`..` folded, without
+/// touching the filesystem, so containment can be checked before anything
+/// is created.
+fn lexical_absolute(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory")?
+            .join(path)
+    };
+    Ok(fold_components(&joined))
+}
+
+/// Like [`lexical_absolute`], but with symlinks resolved as far as the
+/// filesystem allows: the longest existing prefix is canonicalized and any
+/// not-yet-existing remainder appended, so a destination reached through a
+/// symlink alias compares equal to its real path.
+fn resolved_absolute(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let lexical = lexical_absolute(path)?;
+    let mut existing = lexical.as_path();
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut canonical) => {
+                for component in remainder.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(_) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    remainder.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => return Ok(lexical),
+            },
+        }
+    }
 }
 
 fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {

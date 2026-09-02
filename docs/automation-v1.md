@@ -100,7 +100,12 @@ entry), `kind` (`file`|`dir`|`symlink`|`special`), and `disposition`:
 Optional: `bytes`, `attempts`, and on failures `retryable`
 (`yes`|`no`|`unknown`), `class`, `os_kind`, `message`. Unchanged and
 excluded entries emit no per-operation records; they are aggregated
-in the terminal record only.
+in the terminal record only. Metadata-only updates (permissions,
+ownership, or times reconciled on an otherwise unchanged object) are
+not reported per operation in v1 — a live run emits no record for
+them, while a dry run does emit a `metadata_differs` trace for the
+same situation. Closing that asymmetry with a metadata result action
+is a candidate additive extension.
 
 ### `error` — one per counted error
 

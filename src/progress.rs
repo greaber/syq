@@ -56,6 +56,10 @@ pub struct Progress {
     /// `--results`: machine-readable NDJSON outcome stream, set once after
     /// construction so workers and the planner reach it with no plumbing.
     results: std::sync::OnceLock<Arc<crate::results::ResultsWriter>>,
+    /// The results file's (lexical, symlink-resolved) absolute paths, set
+    /// only when the source endpoint is local, so mapping entries naming
+    /// the run's own results file can be failed instead of copied.
+    results_path: std::sync::OnceLock<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 struct TermState {
@@ -105,11 +109,20 @@ impl Progress {
             stop: AtomicBool::new(false),
             suppress_stdout: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
+            results_path: std::sync::OnceLock::new(),
         })
     }
 
     pub fn set_results(&self, writer: Arc<crate::results::ResultsWriter>) {
         let _ = self.results.set(writer);
+    }
+
+    pub fn set_results_path(&self, lexical: std::path::PathBuf, resolved: std::path::PathBuf) {
+        let _ = self.results_path.set((lexical, resolved));
+    }
+
+    pub fn results_path(&self) -> Option<&(std::path::PathBuf, std::path::PathBuf)> {
+        self.results_path.get()
     }
 
     pub fn results_writer(&self) -> Option<&Arc<crate::results::ResultsWriter>> {

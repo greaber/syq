@@ -13,7 +13,8 @@
 //! error; `trace` records instead of operation results on dry runs; exactly
 //! one terminal `result` whose numbers also feed the human summary, so the
 //! two cannot disagree. Unchanged and excluded entries are aggregated in
-//! the terminal record only.
+//! the terminal record only, and metadata-only updates are not reported
+//! per operation (dry runs do trace them as `metadata_differs`).
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};

@@ -9624,8 +9624,11 @@ fn native_cp_results_dry_and_live_directory_totals_agree() {
             .map(|line| serde_json::from_str(line).unwrap())
             .unwrap();
         // The missing container is outside per-entry accounting on both
-        // sides; sub is the one counted directory either way.
+        // sides; sub is the one counted directory either way, and dry
+        // aggregates mean planned work — bytes included.
         assert_eq!(last["directories_created"], 1, "{mode}");
+        assert_eq!(last["files_transferred"], 1, "{mode}");
+        assert_eq!(last["bytes_transferred"], 1, "{mode}");
     }
 }
 
@@ -9737,15 +9740,18 @@ fn native_cp_mapping_cross_chunk_directory_upgrade_emits_one_trace() {
         Some(manifest.as_bytes()),
     );
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let x_traces = String::from_utf8(read(&t.path("r.ndjson")))
+    let x_traces: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .filter(|v| {
             v["type"] == "trace" && v["action"] == "create_directory" && v["dst"]["value"] == "x"
         })
-        .count();
-    assert_eq!(x_traces, 1);
+        .collect();
+    assert_eq!(x_traces.len(), 1);
+    // The explicit entry claimed the directory, so the (deferred) trace
+    // carries its src even though an earlier chunk synthesized the path.
+    assert_eq!(x_traces[0]["src"]["value"], "xdir");
 }
 
 #[test]
@@ -9954,4 +9960,78 @@ fn automation_v1_live_streams_validate_against_schema() {
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
         assert_automation_v1_stream(&validator, &content, "failed");
     }
+}
+
+#[test]
+fn native_cp_results_follow_alias_containment_is_refused() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    write(&t.path("real-dst/keep.txt"), b"k");
+    std::os::unix::fs::symlink("real-dst", t.path("dst")).unwrap();
+    // The destination is named through a symlink while the results file
+    // uses the real path; resolved comparison must still see containment.
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--follow",
+            "--prune",
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "real-dst/r.ndjson",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("refusing to write inside"), "{stderr}");
+    assert!(!t.path("real-dst/r.ndjson").exists());
+    assert!(t.path("real-dst/keep.txt").exists());
+}
+
+#[test]
+fn native_cp_mapping_entry_naming_results_file_fails() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    let manifest = format!(
+        "{}{}",
+        entry_line("f.txt", "f.txt", Some("file")),
+        // The results file lives inside the mapping base, which is legal —
+        // but an entry naming it must fail instead of copying the stream.
+        entry_line("r.ndjson", "copied.ndjson", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "-C",
+            "src",
+            "--mapping",
+            "-",
+            "--into",
+            "dst",
+            "--results",
+            "src/r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("own --results file"));
+    assert_eq!(read(&t.path("dst/f.txt")), b"data");
+    assert!(!t.path("dst/copied.ndjson").exists());
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("src/r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failed = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["disposition"] == "failed")
+        .expect("failed record for the results-file entry");
+    assert_eq!(failed["src"]["value"], "r.ndjson");
+    assert_eq!(failed["class"], "conflict");
+    assert_eq!(failed["retryable"], "no");
+    assert_eq!(lines.last().unwrap()["status"], "partial");
 }
