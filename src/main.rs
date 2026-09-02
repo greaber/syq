@@ -11,8 +11,10 @@ mod identity;
 mod janky_cat;
 mod native_map;
 mod native_rm;
+mod persistence;
 mod progress;
 mod proto;
+mod receipt;
 mod remote_helper;
 mod restricted;
 mod results;
@@ -142,6 +144,15 @@ fn main() {
             }
         }
     }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("persist") {
+        match persistence::run(&argv[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("syq persist: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Some(result) = restricted::dispatch_management(&argv) {
         match result {
             Ok(code) => std::process::exit(code),
@@ -173,6 +184,7 @@ fn main() {
         }
         return;
     }
+    persistence::mark_explicit_scope(&mut args);
     let quiet = args.quiet;
     let result = if args.follow {
         direct::follow(&args)

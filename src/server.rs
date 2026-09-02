@@ -334,6 +334,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Request::TransportStats => {
                 w.write_msg(&Response::TransportStats(reader.tcp_stats()))?;
             }
+            Request::Receipt => match &authority {
+                Some(authority) => match authority.issue_receipt() {
+                    Ok(envelope) => w.write_msg(&Response::Receipt(envelope))?,
+                    Err(error) => w.write_msg(&Response::Err(format!("{error:#}")))?,
+                },
+                None => w.write_msg(&Response::Err(
+                    "receipts are issued only by a command-restricted receiver".into(),
+                ))?,
+            },
             other => {
                 let t0 = std::time::Instant::now();
                 let resp = ops.handle(&other);

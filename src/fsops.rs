@@ -2,7 +2,10 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::proto::*;
-use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
+use crate::rooted::{
+    OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root, RootIdentity,
+    RootMetadata,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -216,88 +219,37 @@ fn select_operator_directory(
     if raw.contains(&0) {
         bail!("destination path contains NUL");
     }
-
-    let absolute = raw.starts_with(b"/");
-    let mut directory = open_operator_directory_start(absolute)?;
-    let mut remaining: VecDeque<Vec<u8>> = raw
-        .split(|byte| *byte == b'/')
-        .filter(|component| !component.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect();
-    let mut symlink_hops = 0usize;
-
-    while let Some(component) = remaining.pop_front() {
-        if component == b"." {
-            continue;
+    let mut hops = Vec::new();
+    match OperatorResolver::resolve_process(
+        raw,
+        symlink_policy,
+        OperatorFinalComponent::Directory,
+        allow_missing,
+        &mut hops,
+    )? {
+        PinnedPath::Directory(directory) => {
+            let (directory, _) = directory.into_parts();
+            let selection = OperatorDirectorySelection {
+                path: path_bytes(&path),
+                directory,
+                missing: VecDeque::new(),
+            };
+            let anchor = selection.anchor()?;
+            Ok((selection, Some(anchor)))
         }
-        if component == b".." {
-            directory = open_operator_directory_at(&directory, b"..")?;
-            continue;
-        }
-
-        let metadata = match operator_lstat_at(&directory, &component) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound && allow_missing => {
-                remaining.push_front(component);
-                let selection = OperatorDirectorySelection {
+        PinnedPath::Missing(missing) => {
+            let (directory, missing) = missing.into_parts();
+            Ok((
+                OperatorDirectorySelection {
                     path: path_bytes(&path),
                     directory,
-                    missing: remaining,
-                };
-                return Ok((selection, None));
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            let euid = unsafe { libc::geteuid() };
-            match symlink_policy {
-                OperatorSymlinkPolicy::Refuse => bail!(
-                    "refusing symlink component {:?}; pass --follow to resolve symlinks",
-                    OsStr::from_bytes(&component)
-                ),
-                OperatorSymlinkPolicy::TrustedOwner
-                    if !operator_symlink_owner_is_trusted(metadata.st_uid, euid) =>
-                {
-                    bail!(
-                        "refusing symlink component {:?} owned by uid {}; expected uid 0 or receiver uid {}",
-                        OsStr::from_bytes(&component),
-                        metadata.st_uid,
-                        euid
-                    );
-                }
-                OperatorSymlinkPolicy::TrustedOwner | OperatorSymlinkPolicy::FollowAll => {}
-            }
-            symlink_hops += 1;
-            if symlink_hops > 40 {
-                bail!("too many symlink levels in destination path");
-            }
-            let target = operator_readlink_at(&directory, &component)?;
-            if target.starts_with(b"/") {
-                directory = open_operator_directory_start(true)?;
-            }
-            let mut expanded: VecDeque<Vec<u8>> = target
-                .split(|byte| *byte == b'/')
-                .filter(|part| !part.is_empty())
-                .map(<[u8]>::to_vec)
-                .collect();
-            expanded.append(&mut remaining);
-            remaining = expanded;
-            continue;
+                    missing,
+                },
+                None,
+            ))
         }
-
-        if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
-        }
-        directory = open_operator_directory_at(&directory, &component)?;
+        PinnedPath::Leaf(_) => bail!("destination path is not a directory"),
     }
-
-    let selection = OperatorDirectorySelection {
-        path: path_bytes(&path),
-        directory,
-        missing: VecDeque::new(),
-    };
-    let anchor = selection.anchor()?;
-    Ok((selection, Some(anchor)))
 }
 
 /// Check the current spelling of an operator-supplied local path without
@@ -319,56 +271,30 @@ pub(crate) fn check_operator_path_no_symlinks(
     if raw.contains(&0) {
         bail!("operator path contains NUL");
     }
-
-    let mut directory = open_operator_directory_start(raw.starts_with(b"/"))?;
-    let mut remaining: VecDeque<Vec<u8>> = raw
-        .split(|byte| *byte == b'/')
-        .filter(|component| !component.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect();
-    while let Some(component) = remaining.pop_front() {
-        if component == b"." {
-            continue;
-        }
-        if component == b".." {
-            directory = open_operator_directory_at(&directory, b"..")?;
-            continue;
-        }
-
-        let final_component = remaining.is_empty();
-        let metadata = match operator_lstat_at(&directory, &component) {
-            Ok(metadata) => metadata,
-            Err(error)
-                if final_component
-                    && allow_missing_final
-                    && error.kind() == io::ErrorKind::NotFound =>
-            {
-                return Ok(());
+    let mut hops = Vec::new();
+    match OperatorResolver::resolve_process(
+        raw,
+        OperatorSymlinkPolicy::Refuse,
+        OperatorFinalComponent::Entry {
+            follow_symlink: false,
+        },
+        allow_missing_final,
+        &mut hops,
+    )? {
+        PinnedPath::Directory(_) => Ok(()),
+        PinnedPath::Leaf(leaf) if !leaf.metadata().is_symlink() || allow_final_symlink => Ok(()),
+        PinnedPath::Leaf(_) => bail!(
+            "operator path encounters a last-component symlink; pass --follow to resolve symlinks"
+        ),
+        PinnedPath::Missing(missing) => {
+            let (_, components) = missing.into_parts();
+            if components.len() == 1 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(libc::ENOENT).into())
             }
-            Err(error) => return Err(error.into()),
-        };
-        if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            if final_component && allow_final_symlink {
-                return Ok(());
-            }
-            bail!(
-                "operator path encounters symlink component {:?}; pass --follow to resolve symlinks",
-                OsStr::from_bytes(&component)
-            );
         }
-        if final_component {
-            return Ok(());
-        }
-        if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
-        }
-        directory = open_operator_directory_at(&directory, &component)?;
     }
-    Ok(())
-}
-
-fn operator_symlink_owner_is_trusted(owner: u32, euid: u32) -> bool {
-    owner == 0 || owner == euid
 }
 
 fn operator_directory_flags() -> libc::c_int {
@@ -448,38 +374,6 @@ fn operator_lstat_at(parent: &File, component: &[u8]) -> io::Result<libc::stat> 
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
-    }
-}
-
-fn operator_readlink_at(parent: &File, component: &[u8]) -> io::Result<Vec<u8>> {
-    let component = CString::new(component).expect("path component was checked for NUL");
-    let mut capacity = 256usize;
-    loop {
-        let mut target = Vec::<u8>::with_capacity(capacity);
-        let length = unsafe {
-            libc::readlinkat(
-                parent.as_raw_fd(),
-                component.as_ptr(),
-                target.as_mut_ptr().cast(),
-                capacity,
-            )
-        };
-        if length < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        let length = length as usize;
-        if length < capacity {
-            unsafe { target.set_len(length) };
-            return Ok(target);
-        }
-        capacity = capacity
-            .checked_mul(2)
-            .filter(|next| *next <= libc::PATH_MAX as usize * 2)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENAMETOOLONG))?;
     }
 }
 
@@ -1171,6 +1065,7 @@ impl FsOps {
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }
             | Request::TransportStats
+            | Request::Receipt
             | Request::Shutdown => {}
         }
         Ok(req)
@@ -3519,6 +3414,7 @@ impl FsOps {
             | Request::Scan { .. }
             | Request::NativeRemove { .. }
             | Request::TransportStats
+            | Request::Receipt
             | Request::Shutdown
             | Request::TcpListen { .. } => Err(anyhow!("unexpected request")),
         };
@@ -4095,14 +3991,6 @@ mod tests {
             .contains("appeared after the new-target precondition"));
 
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn operator_symlink_trust_is_root_or_receiver_ownership() {
-        assert!(operator_symlink_owner_is_trusted(0, 1000));
-        assert!(operator_symlink_owner_is_trusted(1000, 1000));
-        assert!(!operator_symlink_owner_is_trusted(1001, 1000));
-        assert!(!operator_symlink_owner_is_trusted(1000, 0));
     }
 
     #[test]

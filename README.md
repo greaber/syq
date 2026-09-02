@@ -332,8 +332,9 @@ All native commands accept `--follow`, `-n`/`--dry-run`, `-v`/`--verbose`,
 `-q`/`--quiet`, `-j`/`--connections`, `--progress`/`--no-progress`, and
 `--progress-json` in addition to their endpoint and selector options. `cp` also
 accepts `--hash`, `--no-compress`, `--bwlimit RATE`, `--stats`,
-`--reuse-connection`, repeatable
-`--ignore PATTERN`/`--ignore-from FILE`, `--preserve`, and `--inplace`. Filters
+repeatable `--ignore PATTERN`/`--ignore-from FILE`, `--preserve`, and
+`--inplace`. Native `cp` and `rm` also accept an isolated SSH persistence
+scope through `--pscope PATH`. Filters
 use the gitignore semantics described below and apply at every source root;
 `--prune` protects excluded destination paths from pruning. `--hash`
 compares existing regular-file contents with full BLAKE3 digests instead of
@@ -348,12 +349,14 @@ refuses `--max-size` with `--prune`, as described below. A
 command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit, signed filters, and the selected staged or in-place publication
 policy. A receiver installed by an older syq rejects an extension or unsupported
-policy safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment
+policy safely; rerun `syq enrollment add HOST:DEST` to refresh an existing enrollment
 to the current binary. On a direct remote-to-remote copy through that
 receiver, `cp` also accepts the receiver ceilings
 `--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
-(`s`, `m`, or `h`; at most 23h). They are signed into the grant and enforced
-by hostB, and are refused anywhere else because nothing would enforce them.
+(`s`, `m`, or `h`; at most 23h), and `--receipt hashed`, which asks the
+receiver to record a BLAKE3 digest of every file it publishes in its signed
+receipt. They are signed into the grant and enforced or honored by hostB, and
+are refused anywhere else because nothing would act on them.
 `cp` additionally accepts `--mapping` (see [MAPPINGS.md](MAPPINGS.md))
 and `--results -`, a machine-readable NDJSON outcome stream on stdout —
 redirect to keep a file (see
@@ -404,6 +407,60 @@ and `--tcp-congestion` work with ordinary and explicitly managed SSH modes but
 remain fail-closed on that receiver until its authenticated worker-session
 join protocol represents them. Other comparison and selection controls, and
 block and split sizing, remain available only through `syq rsync`.
+
+## Persistent SSH connections
+
+For interactive use, enable SSH connection persistence once:
+
+```sh
+syq persist on
+syq persist status
+syq persist off
+```
+
+While it is on, transfer and removal commands that use syq's implicit SSH
+transport keep one control connection per `user@host:port` alive for five
+minutes after its last session (OpenSSH `ControlMaster` with
+`ControlPersist`). Later commands reuse that authenticated connection, cutting
+per-command setup to milliseconds and avoiding another hardware-token
+interaction. `status` shows the global scope and its recorded endpoints;
+`off` disables the policy, asks every live syq-owned master to exit, and
+removes the global runtime scope. The durable preference lives in
+`$XDG_CONFIG_HOME/syq/persistence-v1.json` (normally under `~/.config`), while
+control sockets live in a private per-user runtime directory.
+
+Scripts can avoid changing that shared preference by creating an isolated
+persistence scope:
+
+```sh
+pscope=$(syq persist on --ephemeral) || exit
+trap 'syq persist off --pscope "$pscope"' EXIT
+
+syq cp --pscope "$pscope" first --to server --into /backup
+syq cp --pscope "$pscope" second --to server --into /backup
+syq persist status --pscope "$pscope"
+```
+
+`on --ephemeral` prints exactly the new private scope path. Passing that path
+with `--pscope` lets separately launched or parallel commands share only that
+scope, independently of the global setting. `off --pscope` closes its live
+masters and removes it. If a script is killed before its cleanup trap runs,
+the masters still leave after their five-minute idle limit; the inert scope
+can be inspected or removed later with the printed path. Scope paths beginning
+with a literal `~` or containing `${...}` are refused because OpenSSH expands
+those forms before opening a control socket.
+
+During either persistence window, anything able to act as the same local user
+can open sessions through the socket without touching the key or agent. This
+is comparable to sudo's credential cache; do not enable it where that window
+is unacceptable. Data connections are unaffected: they remain separate TCP
+streams (or independent SSH processes under `--no-tcp`), so bulk throughput
+does not change. Persistence is not applied to an explicit `--rsh`, a remote
+transfer coordinator, or command-restricted receiver authentication. A global
+preference is simply ignored on those paths; an explicit `--pscope` is refused
+when the requested topology cannot honor it. Use `--relay` with `syq rsync` or
+`--run-at local` with native syntax to keep a remote-to-remote copy's reusable
+connections on the invoking machine.
 
 ## Mappings
 
@@ -479,7 +536,7 @@ explicitly say otherwise.
 | `--tcp-plain` | TCP data connections without encryption (trusted networks only) |
 | `--tcp-ports LO-HI` | Port range the remote listens on for TCP data (default 47600-47699) |
 | `--tcp-congestion ALGO` | Linux: use `ALGO` on both ends of direct TCP data sockets; the host default is unchanged |
-| `--reuse-connection` | Keep the implicit ssh control connection alive 5 minutes after the run and reuse it on later runs to the same endpoint (see below) |
+| `--pscope PATH` | Use an isolated SSH persistence scope created by `syq persist on --ephemeral` |
 | `--ignore PATTERN` | Skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--ignore-from FILE` | Read ignore patterns from a file (repeatable, stacks with `--ignore`) |
 | `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
@@ -512,24 +569,6 @@ per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
 value by one byte, and `0` means unlimited. SYQ counts uncompressed file bytes;
 protocol overhead is not counted, and transport compression may make the actual
 network rate lower. Scanning, hashing, and metadata operations are not limited.
-
-`--reuse-connection` keeps the implicit ssh control connection alive in the
-background for five minutes after a run (OpenSSH ControlMaster with
-ControlPersist) and reuses it on later runs to the same `user@host`, cutting
-per-run connection setup to milliseconds — useful for scripted bursts of small
-copies. The socket lives in a private per-user runtime directory. During the
-window, anyone able to act as your local user can open sessions to that host
-through the socket without touching your key or agent — comparable to sudo's
-credential caching, and notably a hardware-token approval is not required for
-reuse; do not enable it where that window is unacceptable. Data connections
-are unaffected: they remain separate TCP streams (or independent ssh
-processes under `--no-tcp`), so throughput does not change. Not available
-with an explicit `-e`/`--rsh`. Explicit endpoint ports are part of the reuse
-identity. Direct remote-to-remote transfers refuse it because a remote
-coordinator has no reusable local master, so use `--relay` with `syq rsync` or
-`--run-at local` with native syntax; the command-restricted path additionally
-refuses it because its host-bound authentication is verified on each fresh
-connection.
 
 Remote transfers use fast zstd level-1 compression by default. Each protocol
 frame is sent compressed only when that representation is smaller, so archives,
@@ -627,7 +666,22 @@ command properties visible in receiver requests, such as destination scopes,
 publication, preservation, and existing-object policy, resource limits, and
 whether a requested mutation could have survived the signed filter traversal. HostA still cannot
 escape those checks or independently authenticate to hostB with the enrollment
-key. The boundary runs between the two hosts, not inside hostB: the receiver
+key.
+
+HostA also cannot misreport what landed. Every command-restricted transfer
+ends with hostB issuing a signed receipt: the files it published with their
+sizes (and BLAKE3 digests with `--receipt hashed`), in-place files from the
+moment their bytes change and marked complete only once their final step ran,
+what it deleted, the hashes
+it computed for `--verify-only` and `--hash`, how many requests it refused, and
+its entry and byte totals, bound to the enrollment and the one-time request ID
+and signed with a key only hostB holds. HostA relays the receipt as one line
+of its output; the local machine verifies it against the public key recorded
+at enrollment and fails the transfer if the receipt is missing, does not
+verify, names a different grant, records refused requests, or lists an
+incomplete in-place file while hostA reported success. `-v` prints the verified totals. Enrollments made before receipts
+existed must be refreshed with `syq enrollment add` first. The receipt is hostB's view
+of hostB: it says nothing about what hostA omitted or invented. The boundary runs between the two hosts, not inside hostB: the receiver
 runs as the enrolled account and remembers what it created by pathname, so a
 local writer who can already modify the destination tree is outside its
 guarantee, exactly as for the ordinary engine.
@@ -655,7 +709,7 @@ an observed object.
 Native `--into-new`/`--as-new` and `--into-existing`/`--as-existing` travel as
 a signed root precondition in a V4 grant, checked against the enrolled root
 when the grant is claimed; an older installed receiver rejects that grant
-safely until `syq enroll` refreshes it. `--update` still fails closed because
+safely until `syq enrollment add` refreshes it. `--update` still fails closed because
 it compares against source modification times that only hostA reports.
 `--no-tcp`, `--tcp-plain`, `--tcp-congestion`, `--files-from`, `--mapping`,
 `--min-size`, `--syq-path`, and `--no-bootstrap` also fail closed because the
@@ -677,7 +731,7 @@ them for one transfer, which bounds what a claimed grant is worth to hostA.
 `--dry-run` and `--verify-only` are cryptographically read-only: the signed
 grant marks them as such and the receiver rejects every mutation even if hostA
 sends one. They use an existing enrollment but do not install one; run
-`syq enroll` first when previewing or verifying a new destination.
+`syq enrollment add` first when previewing or verifying a new destination.
 Destination-root symlinks are also refused in this mode; enroll the explicit
 referent so the signed pathname and opened root identify the same object.
 
@@ -689,18 +743,20 @@ exact-path interpretation is denied. Use a trailing slash (`hostA:dir/`), the
 native `--as`/`--into` placement spelling, or create the destination directory
 first when that distinction matters.
 
-Use `syq enroll [USER@]HOST:DEST [--via [USER@]HOST]` to pre-enroll,
-`syq enrollments` to list local enrollments, and `syq revoke ID [--via ...]` to
+Use `syq enrollment add [USER@]HOST:DEST [--via [USER@]HOST]` to pre-enroll,
+`syq enrollment list` to list local enrollments, and
+`syq enrollment revoke ID [--via ...]` to
 remove the forced key and both sides' per-enrollment state. Before changing
 hostB, syq durably records a pending enrollment and its private key locally. If
 the installation response is lost, the next enrollment of the same endpoint
-and destination retries the same ID safely; `syq enrollments` labels that state
-`pending`, and `syq revoke` can remove either pending or active state. Running
-`syq enroll` again for an active destination also refreshes the installed
+and destination retries the same ID safely; `syq enrollment list` labels that
+state `pending`, and `syq enrollment revoke` can remove either pending or
+active state. Running `syq enrollment add` again for an active destination
+also refreshes the installed
 receiver to the exact local syq binary; the receipt key is kept for the life
 of the enrollment, so a refresh, or a retry after a lost reply, never leaves
 the two sides holding different keys. To rotate it, revoke and enroll again.
-`syq enrollments` marks enrollments made before receipt keys existed as
+`syq enrollment list` marks enrollments made before receipt keys existed as
 `no-receipt-key` until refreshed. Revocation leaves that shared binary
 because other enrollments may use it. It prevents new receiver sessions. A
 session that already claimed its signed request can finish an operation already
