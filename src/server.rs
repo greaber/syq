@@ -269,6 +269,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 report_ignored,
                 guard,
             } => {
+                let requested_root = root.clone();
                 let root = match ops.scan_root(&root) {
                     Ok(root) => root,
                     Err(error) => {
@@ -280,7 +281,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 // writer borrow suffices.
                 let warns = std::cell::RefCell::new(Vec::new());
                 let wref = std::cell::RefCell::new(&mut w);
-                let mut sink = |batch| {
+                let mut sink = |batch: Vec<crate::proto::Entry>| {
+                    if let Some(authority) = &authority {
+                        authority.record_scanned(
+                            &requested_root,
+                            batch.iter().map(|entry| entry.path.as_slice()),
+                        )?;
+                    }
                     let mut w = wref.borrow_mut();
                     for m in warns.borrow_mut().drain(..) {
                         w.write_msg(&Response::ScanWarn(m))?;

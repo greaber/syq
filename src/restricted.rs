@@ -122,6 +122,11 @@ struct AuthorityState {
     /// grant the shortcut above: a second creation of the same path races at
     /// the kernel instead of trusting an outcome that has not happened yet.
     provisional: HashSet<Vec<u8>>,
+    /// Bytes each prepared file may occupy on disk before any payload is
+    /// written: preallocation and basis seeding are charged against the
+    /// aggregate ceiling here, once per path at its largest declared size.
+    reserved: HashMap<Vec<u8>, u64>,
+    reserved_bytes: u64,
     transferred_bytes: u64,
     deletions: u64,
     live_connections: u16,
@@ -333,6 +338,8 @@ impl RestrictedAuthority {
                 receiver_modes: HashMap::new(),
                 created: HashSet::new(),
                 provisional: HashSet::new(),
+                reserved: HashMap::new(),
+                reserved_bytes: 0,
                 transferred_bytes: 0,
                 deletions: 0,
                 live_connections: 0,
@@ -464,6 +471,44 @@ impl RestrictedAuthority {
             }
         }
         under_root
+    }
+
+    /// Charge the on-disk size a prepared or seeded file will occupy against
+    /// the signed aggregate byte ceiling. A path is charged once, at the
+    /// largest size declared for it, so retries and resumes do not double
+    /// count while many distinct preparations cannot exceed the ceiling.
+    fn reserve_bytes(&self, path: &[u8], size: u64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.reserved.get(path).copied().unwrap_or(0);
+        if size <= previous {
+            return Ok(());
+        }
+        let total = state
+            .reserved_bytes
+            .checked_add(size - previous)
+            .context("signed reservation byte counter overflow")?;
+        if total > self.copy.limits.max_total_bytes {
+            bail!("signed grant total-byte limit exceeded by file preparation");
+        }
+        state.reserved_bytes = total;
+        state.reserved.insert(path.to_vec(), size);
+        Ok(())
+    }
+
+    /// Charge every entry a destination scan returns against the signed entry
+    /// ceiling, so enumeration is bounded like every other observation.
+    pub(crate) fn record_scanned<'a>(
+        &self,
+        root: &[u8],
+        entries: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<()> {
+        for relative in entries {
+            if relative.is_empty() {
+                continue;
+            }
+            self.record_path(&crate::fsops::join(root, relative))?;
+        }
+        Ok(())
     }
 
     fn record_path(&self, path: &[u8]) -> Result<()> {
@@ -1393,6 +1438,7 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, false, None, pending)?;
+                self.reserve_bytes(path, *len)?;
                 *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
@@ -1429,6 +1475,7 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_prepare(path)?;
+                self.reserve_bytes(path, *size)?;
                 *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
@@ -4918,6 +4965,76 @@ mod tests {
             guard: None,
         };
         assert!(authority.authorize(&mut delete, false).is_err());
+    }
+
+    #[test]
+    fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        // The helper grant allows 16 bytes in total and per file.
+        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 16);
+        let prepare = |name: &str, size| Request::Prepare {
+            path: root
+                .join("target")
+                .join(name)
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+            size,
+            inplace: false,
+            partial_id: [1; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        authority.authorize(&mut prepare("a", 10), false).unwrap();
+        // A second file would take the aggregate past the ceiling.
+        assert!(authority.authorize(&mut prepare("b", 10), false).is_err());
+        // Re-preparing the same file at the same or a larger size charges only
+        // the difference; a retry never double counts.
+        authority.authorize(&mut prepare("a", 10), false).unwrap();
+        authority.authorize(&mut prepare("a", 14), false).unwrap();
+        assert!(authority.authorize(&mut prepare("b", 3), false).is_err());
+        authority.authorize(&mut prepare("b", 2), false).unwrap();
+        let mut seed = Request::SeedBasis {
+            path: root.join("target/b").as_os_str().as_bytes().to_vec(),
+            partial_id: [1; 16],
+            len: 3,
+            guard: None,
+        };
+        assert!(authority.authorize(&mut seed, false).is_err());
+    }
+
+    #[test]
+    fn scanned_entries_count_against_the_entry_ceiling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        // The helper grant allows eight entries.
+        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let target = root.join("target").as_os_str().as_bytes().to_vec();
+        let mut scan = Request::Scan {
+            root: target.clone(),
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: false,
+            guard: None,
+        };
+        authority.authorize(&mut scan, false).unwrap();
+        let names: Vec<Vec<u8>> = (0..7)
+            .map(|index| format!("entry-{index}").into_bytes())
+            .collect();
+        let mut batch: Vec<&[u8]> = vec![b""];
+        batch.extend(names.iter().map(Vec::as_slice));
+        // Root plus seven descendants fills the ceiling exactly.
+        authority.record_scanned(&target, batch).unwrap();
+        assert!(authority
+            .record_scanned(&target, [b"entry-7".as_slice()])
+            .is_err());
+        // Already counted entries may be listed again.
+        authority
+            .record_scanned(&target, [b"entry-0".as_slice()])
+            .unwrap();
     }
 
     #[test]
