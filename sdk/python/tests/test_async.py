@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -113,6 +114,37 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             await self.client.cp(mapping=broken(), cwd="source", into="target")
         self.assertFalse(self.argv_log.exists())
 
+    async def test_cancelling_sync_mapping_stops_after_current_entry(self) -> None:
+        started = threading.Event()
+        yielded = 0
+
+        def slow_mapping():
+            nonlocal yielded
+            for index in range(5):
+                started.set()
+                time.sleep(0.2)
+                yielded += 1
+                yield syq.MappingEntry(f"{index}", f"{index}")
+
+        task = asyncio.create_task(
+            self.client.cp(
+                mapping=slow_mapping(), cwd="source", into="target"
+            )
+        )
+        deadline = time.monotonic() + 2
+        while not started.is_set():
+            if time.monotonic() >= deadline:
+                self.fail("mapping materialization did not start")
+            await asyncio.sleep(0.01)
+
+        started_at = time.monotonic()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertLess(time.monotonic() - started_at, 0.7)
+        self.assertLess(yielded, 5)
+        self.assertFalse(self.argv_log.exists())
+
     async def test_additive_events_are_not_delivered_as_none(self) -> None:
         events: list[syq.AutomationEvent] = []
         client = syq.AsyncClient(
@@ -130,6 +162,23 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(syq.SyqProtocolError, "exceeds"):
             await client.cp("source", into="target")
+
+    async def test_protocol_failure_kills_post_exit_descendants(self) -> None:
+        marker = self.root / "protocol-descendant"
+        client = syq.AsyncClient(
+            executable=self.executable,
+            env={
+                **self.env,
+                "SYQ_FAKE_DESCENDANT": os.fspath(marker),
+                "SYQ_FAKE_DESCENDANT_DELAY": "0.6",
+                "SYQ_FAKE_SHAPE": "truncated",
+            },
+        )
+        with self.assertRaisesRegex(syq.SyqProtocolError, "terminal result"):
+            await client.cp("source", into="target")
+        self.assertTrue(marker.with_suffix(".ready").exists())
+        await asyncio.sleep(0.8)
+        self.assertFalse(marker.exists())
 
     async def test_early_map_context_exit_kills_the_process_group(self) -> None:
         marker = self.root / "map-descendant"

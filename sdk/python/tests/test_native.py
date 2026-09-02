@@ -26,7 +26,8 @@ if marker:
         sys.executable, "-c",
         "import pathlib,sys,time; time.sleep(float(sys.argv[2])); pathlib.Path(sys.argv[1]).write_text('survived')",
         marker, descendant_delay,
-    ])
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+       stderr=subprocess.DEVNULL)
     open(marker + ".ready", "w").close()
 pause = os.environ.get("SYQ_FAKE_PAUSE")
 if pause:

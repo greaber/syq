@@ -237,7 +237,7 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 src_src="source", into="destination", dry_run=True
             )
             self.assertEqual(preview.files_transferred, 1)
-            self.assertEqual(preview.bytes_transferred, 0)
+            self.assertEqual(preview.bytes_transferred, len(b"async"))
 
             async with client.map(src_src="source") as mapping:
                 copied = await client.cp(

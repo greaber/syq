@@ -605,8 +605,10 @@ timeout, cancellation, callback failure, or decoder failure kills and reaps
 the whole owned process group so SSH transports and other descendants cannot
 survive as stale work. Python mapping iterables are fully materialized in a
 worker thread before `cp` starts. Async iterables are consumed incrementally
-and flushed in bounded chunks, also before process launch. Cancellation waits
-for any in-flight owned temporary-file write before removing the file.
+and flushed in bounded chunks, also before process launch. Cancellation asks
+synchronous materialization to stop between iterator and temporary-file
+operations, then waits only for an in-flight operation before removing the
+file.
 
 ## Compatibility and versioning
 

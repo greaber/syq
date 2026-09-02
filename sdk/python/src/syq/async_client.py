@@ -7,6 +7,7 @@ import inspect
 import os
 import signal
 import tempfile
+import threading
 from collections.abc import (
     AsyncIterable,
     AsyncIterator,
@@ -30,7 +31,6 @@ from .client import (
     _mapping_line,
     _text_arg,
     _values,
-    _write_mapping_manifest,
 )
 from .errors import (
     SyqInvocationError,
@@ -61,7 +61,9 @@ def _kill_process_group(process: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _complete_task(task: asyncio.Task[_T]) -> _T:
+async def _complete_task(
+    task: asyncio.Task[_T], *, on_cancel: Callable[[], None] | None = None
+) -> _T:
     """Let owned cleanup finish, then propagate any intervening cancellation."""
 
     cancellation: asyncio.CancelledError | None = None
@@ -69,6 +71,8 @@ async def _complete_task(task: asyncio.Task[_T]) -> _T:
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError as error:
+            if cancellation is None and on_cancel is not None:
+                on_cancel()
             cancellation = error
     result = task.result()
     if cancellation is not None:
@@ -99,6 +103,26 @@ async def _write_async_mapping_manifest(
         await _complete_task(write)
     flush = asyncio.create_task(asyncio.to_thread(manifest.flush))
     await _complete_task(flush)
+
+
+def _write_sync_mapping_manifest(
+    manifest: BinaryIO,
+    mapping: Iterable[MappingEntry],
+    cancelled: threading.Event,
+) -> None:
+    iterator = iter(mapping)
+    index = 0
+    while not cancelled.is_set():
+        try:
+            entry = next(iterator)
+        except StopIteration:
+            break
+        if cancelled.is_set():
+            break
+        manifest.write(_mapping_line(entry, index=index))
+        index += 1
+    if not cancelled.is_set():
+        manifest.flush()
 
 
 async def _run(
@@ -184,6 +208,7 @@ class _AsyncLineProcess:
         self.returncode: int | None = None
         self.stderr = b""
         self._closed = False
+        self._aborted = False
 
     @classmethod
     async def start(
@@ -255,12 +280,14 @@ class _AsyncLineProcess:
         return self.returncode
 
     async def abort(self) -> None:
-        if self._closed:
-            return
-        _kill_process_group(self._process)
-        self.returncode = await _wait_for_exit(self._process)
-        self._capture_stderr()
-        self._close_file()
+        if not self._aborted:
+            self._aborted = True
+            _kill_process_group(self._process)
+        if self.returncode is None:
+            self.returncode = await _wait_for_exit(self._process)
+        if not self._closed:
+            self._capture_stderr()
+            self._close_file()
 
     def _capture_stderr(self) -> None:
         self._stderr_file.flush()
@@ -578,10 +605,16 @@ class AsyncClient:
             if isinstance(mapping, AsyncIterable):
                 await _write_async_mapping_manifest(manifest, mapping)
             else:
+                cancelled = threading.Event()
                 materialize = asyncio.create_task(
-                    asyncio.to_thread(_write_mapping_manifest, manifest, mapping)
+                    asyncio.to_thread(
+                        _write_sync_mapping_manifest,
+                        manifest,
+                        mapping,
+                        cancelled,
+                    )
                 )
-                await _complete_task(materialize)
+                await _complete_task(materialize, on_cancel=cancelled.set)
             argv.extend(("--mapping", manifest.name))
             result = await self._typed(
                 argv,
