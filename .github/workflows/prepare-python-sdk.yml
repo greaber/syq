@@ -72,9 +72,11 @@ jobs:
           python_version=$(python3 -c \
             'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
           syq_version=$(jq -er .version "$RELEASE_MANIFEST")
-          echo 'changed=true' >> "$GITHUB_OUTPUT"
-          echo "python_version=$python_version" >> "$GITHUB_OUTPUT"
-          echo "syq_version=$syq_version" >> "$GITHUB_OUTPUT"
+          {
+            echo 'changed=true'
+            echo "python_version=$python_version"
+            echo "syq_version=$syq_version"
+          } >> "$GITHUB_OUTPUT"
       - name: Commit the prepared release and open a pull request
         if: steps.prepare.outputs.changed == 'true'
         env:
@@ -111,7 +113,7 @@ jobs:
             "- bumps the Python SDK to $PYTHON_VERSION" \
             "- embeds the exact signed v$SYQ_VERSION release manifest" \
             "- updates the documented SDK-to-syq mapping" \
-            "The native pull-request checks were approved explicitly because GitHub puts workflow runs caused by GITHUB_TOKEN into an approval-required state. Review and merge this pull request normally; publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
+            "The native pull-request checks are approved explicitly because GitHub puts workflow runs caused by GITHUB_TOKEN into an approval-required state. Auto-merge is requested after those required checks are registered; publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
           pr_url=$(gh pr create \
             --base master \
             --head "$branch" \
@@ -119,46 +121,7 @@ jobs:
             --body "$body")
           echo "Created $pr_url"
           head_sha=$(git rev-parse HEAD)
-          deadline=$((SECONDS + 60))
-          observed='[]'
-          while test "$SECONDS" -lt "$deadline"; do
-            observed=$(gh run list \
-              --branch "$branch" \
-              --event pull_request \
-              --limit 20 \
-              --json conclusion,databaseId,headSha,status,url,workflowName)
-            if jq -e --arg head_sha "$head_sha" '
-              any(.[]; .headSha == $head_sha and .workflowName == "ci") and
-              any(.[]; .headSha == $head_sha and .workflowName == "rsync compatibility")
-            ' <<<"$observed" >/dev/null; then
-              break
-            fi
-            echo "Waiting for GitHub to register the approval-required pull-request workflow runs for $head_sha"
-            sleep 5
-          done
-          if ! jq -e --arg head_sha "$head_sha" '
-            any(.[]; .headSha == $head_sha and .workflowName == "ci") and
-            any(.[]; .headSha == $head_sha and .workflowName == "rsync compatibility")
-          ' <<<"$observed" >/dev/null; then
-            echo "Timed out waiting for approval-required pull-request workflow runs for $head_sha; last observed state:" >&2
-            jq -c . <<<"$observed" >&2
-            exit 1
-          fi
-          for workflow_name in ci 'rsync compatibility'; do
-            run=$(jq -cer --arg head_sha "$head_sha" --arg workflow_name "$workflow_name" '
-              [.[] | select(
-                .headSha == $head_sha and .workflowName == $workflow_name
-              )] | max_by(.databaseId)
-            ' <<<"$observed")
-            run_id=$(jq -er .databaseId <<<"$run")
-            status=$(jq -er .status <<<"$run")
-            conclusion=$(jq -r '.conclusion // empty' <<<"$run")
-            if test "$conclusion" = action_required; then
-              gh api --method POST \
-                "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/approve" \
-                >/dev/null
-              echo "Approved $workflow_name pull-request workflow run $run_id for $head_sha"
-            else
-              echo "$workflow_name pull-request workflow run $run_id is already $status${conclusion:+/$conclusion}"
-            fi
-          done
+          scripts/approve-generated-pr-runs.sh \
+            "$GITHUB_REPOSITORY" "$branch" "$head_sha"
+          gh pr merge "$pr_url" --auto --merge --match-head-commit "$head_sha"
+          echo "Requested auto-merge for $pr_url at $head_sha"

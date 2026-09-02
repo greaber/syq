@@ -135,18 +135,25 @@ exact signed manifest and prepares the next Python patch version. It opens an
 cache-path documentation, lockfile, and mapping-table updates. GitHub places
 pull-request workflow runs caused by its own token into an approval-required
 state. The preparation workflow waits until GitHub has registered both native
-runs for the exact generated commit, then approves them through the Actions API
-so the required checks remain attached to the pull request. The repository
+runs for the exact generated commit, verifies that the pull request and native
+events belong to the trusted repository, then approves them through the
+Actions API so the required checks remain attached to the pull request. The
+fixture-tested helper has a bounded deadline and reports its last observed
+state on failure. Once the runs exist, the workflow requests auto-merge; GitHub
+still waits for every required check and branch-protection rule. The repository
 keeps the default workflow token read only, permits trusted Actions workflows
 to create pull requests, and grants write scopes only inside this preparation
 workflow.
 
-Review and merge that pull request normally. The final publication remains a
-deliberate release-authority action: create the signed annotated
+The generated pull request merges automatically after its required checks.
+Reviewers may still stop auto-merge while it is pending. The final publication
+remains a deliberate release-authority action: create the signed annotated
 `sdk-python-v<version>` tag and approve the protected `pypi` environment. The
 tag then publishes through OIDC without a local upload or long-lived PyPI
 credential. Keeping the tag signature manual avoids placing maintainer signing
-authority in CI; PyPI availability cannot block publication of syq itself.
+authority in CI. The additional PyPI environment approval is intentionally
+retained as defense in depth for a separate package registry; PyPI availability
+cannot block publication of syq itself.
 
 Python distributions use a pinned interpreter and the tagged commit timestamp
 as `SOURCE_DATE_EPOCH`, and the source archive is repacked with normalized
