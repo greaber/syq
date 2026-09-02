@@ -1509,10 +1509,6 @@ mod tests {
         RelativePath::new(path).unwrap()
     }
 
-    fn operator_path(path: &Path) -> Vec<u8> {
-        path.as_os_str().as_bytes().to_vec()
-    }
-
     #[test]
     fn operator_resolver_selects_a_last_component_symlink_without_following_it() {
         let tree = TestDir::new("operator-leaf-link");
@@ -1522,17 +1518,20 @@ mod tests {
         symlink(&outside, &selected).unwrap();
         let original = fs::symlink_metadata(&selected).unwrap();
 
+        let base = File::open(tree.path()).unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
         let mut hops = Vec::new();
-        let result = OperatorResolver::resolve_process(
-            &operator_path(&selected),
-            OperatorSymlinkPolicy::Refuse,
-            OperatorFinalComponent::Entry {
-                follow_symlink: false,
-            },
-            false,
-            &mut hops,
-        )
-        .unwrap();
+        let result = resolver
+            .resolve(
+                b"selected",
+                OperatorFinalComponent::Entry {
+                    follow_symlink: false,
+                },
+                false,
+                &mut hops,
+            )
+            .unwrap();
         let PinnedPath::Leaf(leaf) = result else {
             panic!("last-component symlink was not selected as a leaf");
         };
@@ -1570,30 +1569,34 @@ mod tests {
         fs::write(&outside, b"outside").unwrap();
         symlink("real", tree.path().join("container")).unwrap();
         symlink(&outside, real.join("leaf")).unwrap();
-        let selected = tree.path().join("container/leaf");
+        let base = File::open(tree.path()).unwrap();
 
         let mut hops = Vec::new();
-        assert!(OperatorResolver::resolve_process(
-            &operator_path(&selected),
-            OperatorSymlinkPolicy::Refuse,
-            OperatorFinalComponent::Entry {
-                follow_symlink: false,
-            },
-            false,
-            &mut hops,
-        )
-        .is_err());
+        let refusing =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+        assert!(refusing
+            .resolve(
+                b"container/leaf",
+                OperatorFinalComponent::Entry {
+                    follow_symlink: false,
+                },
+                false,
+                &mut hops,
+            )
+            .is_err());
 
-        let result = OperatorResolver::resolve_process(
-            &operator_path(&selected),
-            OperatorSymlinkPolicy::FollowAll,
-            OperatorFinalComponent::Entry {
-                follow_symlink: false,
-            },
-            false,
-            &mut hops,
-        )
-        .unwrap();
+        let following =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::FollowAll).unwrap();
+        let result = following
+            .resolve(
+                b"container/leaf",
+                OperatorFinalComponent::Entry {
+                    follow_symlink: false,
+                },
+                false,
+                &mut hops,
+            )
+            .unwrap();
         let PinnedPath::Leaf(leaf) = result else {
             panic!("last-component symlink was unexpectedly followed");
         };
@@ -1685,15 +1688,18 @@ mod tests {
         let selected = tree.path().join("selected");
         fs::create_dir(&selected).unwrap();
         let original = fs::metadata(&selected).unwrap();
+        let base = File::open(tree.path()).unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
         let mut hops = Vec::new();
-        let result = OperatorResolver::resolve_process(
-            &operator_path(&selected),
-            OperatorSymlinkPolicy::Refuse,
-            OperatorFinalComponent::Directory,
-            false,
-            &mut hops,
-        )
-        .unwrap();
+        let result = resolver
+            .resolve(
+                b"selected",
+                OperatorFinalComponent::Directory,
+                false,
+                &mut hops,
+            )
+            .unwrap();
         let PinnedPath::Directory(directory) = result else {
             panic!("directory was not selected");
         };
