@@ -10,7 +10,7 @@ python -m pip install syq
 
 Package installation does not download an executable. The first call that
 needs syq downloads the exact release pinned by this SDK into the user cache.
-For Python package `0.0.1`, that release is syq `0.1.5`.
+For Python package `0.0.2`, that release is syq `0.1.7`.
 
 ```python
 import syq
@@ -32,8 +32,8 @@ print(plan.stdout.decode())
 ```
 
 The managed executable is stored below
-`$XDG_CACHE_HOME/syq/sdk/python/v0.1.5/` or, when `XDG_CACHE_HOME` is not an
-absolute path, `~/.cache/syq/sdk/python/v0.1.5/`. The SDK checks the complete
+`$XDG_CACHE_HOME/syq/sdk/python/v0.1.7/` or, when `XDG_CACHE_HOME` is not an
+absolute path, `~/.cache/syq/sdk/python/v0.1.7/`. The SDK checks the complete
 cached binary against its embedded release manifest before every use. A corrupt
 or missing cache entry is replaced atomically with a freshly downloaded,
 verified binary.

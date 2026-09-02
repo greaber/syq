@@ -32,6 +32,7 @@ The current mapping is:
 | Python SDK | syq executable |
 |---|---|
 | `0.0.1` | `0.1.5` |
+| `0.0.2` | `0.1.7` |
 
 The two version numbers do not need to match, but the mapping is immutable for
 a published SDK release. Multiple SDK releases may pin the same syq release.
