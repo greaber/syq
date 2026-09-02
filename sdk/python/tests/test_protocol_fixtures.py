@@ -42,6 +42,8 @@ class AutomationFixtureTests(unittest.TestCase):
                 self.assertIsInstance(events[0], syq.RunEvent)
                 self.assertIs(events[-1], result)
                 self.assertIsInstance(result, syq.CpResult)
+                if dry_run:
+                    self.assertEqual(result.bytes_transferred, 8)
 
         partial = AutomationDecoder(prune=False, mapping=True, dry_run=False)
         partial_events = [

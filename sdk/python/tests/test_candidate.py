@@ -39,7 +39,9 @@ class CandidateCompatibilityTests(unittest.TestCase):
             )
             self.assertTrue(preview.dry_run)
             self.assertEqual(preview.files_transferred, 1)
-            self.assertEqual(preview.bytes_transferred, 0)
+            self.assertEqual(
+                preview.bytes_transferred, len(b"candidate compatibility\n")
+            )
             self.assertFalse(destination.exists())
             self.assertTrue(
                 any(
