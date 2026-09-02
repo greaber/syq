@@ -311,7 +311,7 @@ pub fn run(
     if (args.max_entries.is_some()
         || args.max_total_bytes.is_some()
         || args.max_runtime_secs.is_some()
-        || args.receipt_hashed)
+        || args.receipt_requested)
         && restricted_grant.is_none()
     {
         bail!(

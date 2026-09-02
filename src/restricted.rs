@@ -149,7 +149,12 @@ struct AuthorityState {
     tcp_listener_started: bool,
     /// What hostB will attest to in its receipt.
     ledger: crate::receipt::Ledger,
-    /// Once the receipt is issued nothing may change what it describes.
+    /// Requests authorized for execution whose outcome has not been settled
+    /// yet, across every connection. The receipt waits for zero.
+    in_flight: u64,
+    /// Set when the receipt is being issued: no new mutation is authorized
+    /// from then on, so the receipt describes a final state.
+    receipt_closing: bool,
     receipt_issued: bool,
 }
 
@@ -286,6 +291,8 @@ pub(crate) struct RestrictedAuthority {
     deadline: Instant,
     control_open: AtomicBool,
     state: Mutex<AuthorityState>,
+    /// Signalled whenever an in-flight request settles.
+    settled: std::sync::Condvar,
 }
 
 impl RestrictedAuthority {
@@ -370,6 +377,7 @@ impl RestrictedAuthority {
             receiver_umask,
             deadline,
             control_open: AtomicBool::new(true),
+            settled: std::sync::Condvar::new(),
             state: Mutex::new(AuthorityState {
                 paths: HashSet::new(),
                 receiver_modes: HashMap::new(),
@@ -382,6 +390,8 @@ impl RestrictedAuthority {
                 live_connections: 0,
                 tcp_listener_started: false,
                 ledger: crate::receipt::Ledger::default(),
+                in_flight: 0,
+                receipt_closing: false,
                 receipt_issued: false,
             }),
         };
@@ -394,20 +404,66 @@ impl RestrictedAuthority {
         let key = self.receipt_key.as_ref().context(
             "this receiver has no receipt key; rerun `syq enroll` to refresh the enrollment",
         )?;
-        let receipt = {
-            let mut state = self.state.lock().unwrap();
-            if state.receipt_issued {
-                bail!("the receipt for this grant has already been issued");
+        // Close the grant first, then wait for every request already
+        // authorized on any connection to execute and settle, so the receipt
+        // describes a final state rather than a snapshot with work in flight.
+        let mut state = self.state.lock().unwrap();
+        if state.receipt_issued || state.receipt_closing {
+            bail!("the receipt for this grant has already been issued");
+        }
+        state.receipt_closing = true;
+        while state.in_flight > 0 {
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                bail!(
+                    "{} request(s) were still in flight at the grant deadline; no receipt can be issued",
+                    state.in_flight
+                );
             }
-            state.receipt_issued = true;
-            state.ledger.receipt(
-                self.enrollment_id,
-                self.request_id,
-                now()?,
-                state.paths.len() as u64,
-                state.transferred_bytes,
-            )?
+            state = self.settled.wait_timeout(state, remaining).unwrap().0;
+        }
+        state.receipt_issued = true;
+        let unhashed: Vec<Vec<u8>> = if self.receipt_policy.hashed {
+            state
+                .ledger
+                .published
+                .iter()
+                .filter(|(_, (_, digest))| digest.is_none())
+                .map(|(path, _)| path.clone())
+                .collect()
+        } else {
+            Vec::new()
         };
+        drop(state);
+        // Hashed receipts must carry a digest for every published file; a
+        // file that cannot be read back is a receipt failure, not a gap.
+        let mut digests = Vec::with_capacity(unhashed.len());
+        for path in unhashed {
+            let digest = self.digest_published(&path).with_context(|| {
+                format!(
+                    "hash published file {} for the receipt",
+                    String::from_utf8_lossy(&path)
+                )
+            })?;
+            digests.push((path, digest));
+        }
+        let mut state = self.state.lock().unwrap();
+        for (path, digest) in digests {
+            if let Some(entry) = state.ledger.published.get_mut(&path) {
+                entry.1 = Some(digest);
+            }
+        }
+        let receipt = state.ledger.receipt(
+            self.enrollment_id,
+            self.request_id,
+            now()?,
+            state.paths.len() as u64,
+            state.transferred_bytes,
+        )?;
+        drop(state);
         crate::receipt::sign(&receipt, key)
     }
 
@@ -672,9 +728,11 @@ impl RestrictedAuthority {
         if self.copy.options.dry_run || self.copy.options.verify_only {
             bail!("signed read-only transfer forbids destination mutations");
         }
-        if self.state.lock().unwrap().receipt_issued {
+        let state = self.state.lock().unwrap();
+        if state.receipt_issued || state.receipt_closing {
             bail!("the signed grant is closed: its receipt has been issued");
         }
+        drop(state);
         Self::validate_request_path(path)?;
         if !self
             .copy
@@ -707,8 +765,9 @@ impl RestrictedAuthority {
         let Settlement {
             creations,
             outcomes,
+            tracked,
         } = settlement;
-        if creations.is_empty() && outcomes.is_empty() {
+        if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
         }
         let failed = |index: usize| match response {
@@ -716,34 +775,24 @@ impl RestrictedAuthority {
             proto::Response::Applied(results) => results.get(index).is_some_and(Option::is_some),
             _ => false,
         };
-        // Hash published files before taking the state lock so other
-        // connections are not held up behind the read.
-        let outcomes: Vec<(PendingOutcome, Option<[u8; 32]>)> = outcomes
-            .into_iter()
-            .map(|outcome| {
-                let digest = match &outcome {
-                    PendingOutcome::Publish { index, path, .. }
-                        if self.receipt_policy.hashed && !failed(*index) =>
-                    {
-                        self.digest_published(path).ok()
-                    }
-                    _ => None,
-                };
-                (outcome, digest)
-            })
-            .collect();
         let mut state = self.state.lock().unwrap();
+        if tracked {
+            state.in_flight = state.in_flight.saturating_sub(1);
+            self.settled.notify_all();
+        }
         for creation in creations {
             state.provisional.remove(&creation.path);
             if creation.persist && !failed(creation.index) {
                 state.created.insert(creation.path);
             }
         }
-        for (outcome, digest) in outcomes {
+        for outcome in outcomes {
             match outcome {
                 PendingOutcome::Publish { index, path, size } if !failed(index) => {
                     state.ledger.deleted.remove(&path);
-                    state.ledger.published.insert(path, (size, digest));
+                    // Digests for hashed receipts are computed when the
+                    // receipt is issued, once the file is final.
+                    state.ledger.published.insert(path, (size, None));
                 }
                 PendingOutcome::Delete { index, path } if !failed(index) => {
                     state.ledger.published.remove(&path);
@@ -1465,11 +1514,28 @@ impl RestrictedAuthority {
     pub(crate) fn authorize(&self, request: &mut Request, over_ssh: bool) -> Result<Settlement> {
         let mut pending = Vec::new();
         let mut outcomes = Vec::new();
+        // Requests the server executes and then settles; the receipt waits
+        // for all of them. The others are answered inline without settling.
+        let tracked = !matches!(
+            request,
+            Request::Hello { .. }
+                | Request::Scan { .. }
+                | Request::TcpListen { .. }
+                | Request::TransportStats
+                | Request::Receipt
+                | Request::Shutdown
+        );
         match self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes) {
-            Ok(()) => Ok(Settlement {
-                creations: pending,
-                outcomes,
-            }),
+            Ok(()) => {
+                if tracked {
+                    self.state.lock().unwrap().in_flight += 1;
+                }
+                Ok(Settlement {
+                    creations: pending,
+                    outcomes,
+                    tracked,
+                })
+            }
             Err(error) => {
                 // Nothing of a refused request executes, including the
                 // entries authorized before the refusing one.
@@ -1789,6 +1855,8 @@ impl RestrictedAuthority {
 pub(crate) struct Settlement {
     creations: Vec<PendingCreation>,
     outcomes: Vec<PendingOutcome>,
+    /// The request counts as in flight until settled.
+    tracked: bool,
 }
 
 /// One receipt-relevant effect of a request, confirmed by `settle`.
@@ -4477,6 +4545,31 @@ mod tests {
         );
     }
 
+    fn existence_authority_with_receipt(
+        root: &Path,
+        hashed: bool,
+        deadline_ms: u64,
+    ) -> RestrictedAuthority {
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let mut authority = test_authority_with_receipt(
+            root,
+            DeletionPolicyV1::DeleteDestinationOnly,
+            1024,
+            0,
+            FilterPolicyV3::default(),
+            PublicationPolicyV1::AtomicStaged,
+            ExistingDestinationPolicyV1::Replace,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+            Some((key, hashed)),
+        )
+        .unwrap();
+        // Waiting for in-flight requests is bounded by the grant deadline;
+        // keep tests from sitting out the full minute.
+        authority.deadline = Instant::now() + std::time::Duration::from_millis(deadline_ms);
+        authority
+    }
+
     #[test]
     fn receipt_attests_confirmed_outcomes_and_closes_the_grant() {
         let temporary = tempfile::tempdir().unwrap();
@@ -4530,10 +4623,12 @@ mod tests {
             },
         );
 
-        // A confirmed staged publication is hashed from the published file.
-        authority
+        // A confirmed staged publication is hashed from the published file
+        // when the receipt is issued.
+        let settlement = authority
             .authorize(&mut prepare_request(&fresh), false)
             .unwrap();
+        authority.settle(settlement, &proto::Response::Ok);
         let mut publish = finalize_request(&fresh, proto::TargetCondition::Any);
         let settlement = authority.authorize(&mut publish, false).unwrap();
         fs::write(&fresh, b"data").unwrap();
@@ -4598,6 +4693,25 @@ mod tests {
             .authorize(&mut prepare_request(&target.join("late")), false)
             .is_err());
         assert!(authority.issue_receipt().is_err());
+
+        // A request still in flight holds the receipt back; a hashed receipt
+        // fails outright when a published file cannot be read back.
+        let waiting = existence_authority_with_receipt(&root, true, 200);
+        let settlement = waiting
+            .authorize(&mut prepare_request(&target.join("inflight")), false)
+            .unwrap();
+        assert!(waiting.issue_receipt().is_err());
+        waiting.settle(settlement, &proto::Response::Ok);
+        let hashing = existence_authority_with_receipt(&root, true, 5_000);
+        let unreadable = target.join("unreadable");
+        let settlement = hashing
+            .authorize(&mut prepare_request(&unreadable), false)
+            .unwrap();
+        hashing.settle(settlement, &proto::Response::Ok);
+        let mut publish = finalize_request(&unreadable, proto::TargetCondition::Any);
+        let settlement = hashing.authorize(&mut publish, false).unwrap();
+        hashing.settle(settlement, &proto::Response::Ok);
+        assert!(hashing.issue_receipt().is_err());
         let mut observe = Request::StatMany {
             paths: vec![path_bytes(&kept)],
             follow: false,

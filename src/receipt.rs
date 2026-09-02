@@ -23,6 +23,9 @@ const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 2 + 4 + 4;
 /// very large transfer stays a bounded single line on the relay path.
 pub(crate) const LIST_LIMIT: usize = 65_536;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Lists whose encodings together exceed this travel as their digest only,
+/// whatever their entry count, so a receipt of long paths still fits.
+pub(crate) const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_REFUSAL_SAMPLES: usize = 8;
 
@@ -118,9 +121,13 @@ impl Ledger {
             })
             .collect();
         let list_digest = list_digest(&published, &deleted, &observed)?;
+        let encoded_lists = postcard::to_stdvec(&published)?.len()
+            + postcard::to_stdvec(&deleted)?.len()
+            + postcard::to_stdvec(&observed)?.len();
         let lists_truncated = published.len() > LIST_LIMIT
             || deleted.len() > LIST_LIMIT
-            || observed.len() > LIST_LIMIT;
+            || observed.len() > LIST_LIMIT
+            || encoded_lists > MAX_LIST_BYTES;
         let published_bytes = published
             .iter()
             .try_fold(0u64, |total, item| total.checked_add(item.size))
@@ -316,6 +323,32 @@ mod tests {
         let mut truncated = envelope.clone();
         truncated.pop();
         assert!(verify(&truncated, &public).is_err());
+    }
+
+    #[test]
+    fn long_paths_truncate_by_encoded_size() {
+        let mut ledger = Ledger::default();
+        let long = vec![b'p'; 4096];
+        for index in 0..(MAX_LIST_BYTES / 4096 + 2) {
+            let mut path = format!("/{index:08}/").into_bytes();
+            path.extend_from_slice(&long);
+            ledger.published.insert(path, (1, None));
+        }
+        let receipt = ledger
+            .receipt(
+                EnrollmentId::random(),
+                RequestId::fresh(1_900_000_000).unwrap(),
+                1_900_000_000,
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(receipt.lists_truncated);
+        assert!(receipt.published.is_empty());
+        let signer = key(4);
+        let envelope = sign(&receipt, &signer).unwrap();
+        assert!(envelope.len() < MAX_LIST_BYTES);
+        verify(&envelope, &signer.public_key().to_openssh().unwrap()).unwrap();
     }
 
     #[test]

@@ -323,7 +323,10 @@ pub struct Args {
     pub max_total_bytes: Option<u64>,
     #[arg(skip)]
     pub max_runtime_secs: Option<u32>,
-    /// Native-only: ask the command-restricted receiver for a hashed receipt.
+    /// Native-only: `--receipt` was given at all, and whether it asked the
+    /// command-restricted receiver for a hashed receipt.
+    #[arg(skip)]
+    pub receipt_requested: bool,
     #[arg(skip)]
     pub receipt_hashed: bool,
     /// Skip regular files that are newer on the destination (directories,
@@ -1107,7 +1110,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     if args.max_entries.is_some()
         || args.max_total_bytes.is_some()
         || args.max_runtime_secs.is_some()
-        || args.receipt_hashed
+        || args.receipt_requested
     {
         // These are assertions for hostB's enrolled receiver to enforce; with
         // no such receiver in the topology, nothing would enforce them, so
@@ -1291,6 +1294,7 @@ fn apply_native_copy_operational(
         max_runtime,
         receipt,
     } = operational;
+    args.receipt_requested = receipt.is_some();
     args.receipt_hashed = receipt == Some(ReceiptMode::Hashed);
     args.max_entries = max_entries;
     args.max_total_bytes = max_total_bytes.as_deref().map(parse_size).transpose()?;

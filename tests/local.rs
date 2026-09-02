@@ -1040,6 +1040,7 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
         "--max-entries=5",
         "--max-total-bytes=1M",
         "--max-runtime=30m",
+        "--receipt=sizes",
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
