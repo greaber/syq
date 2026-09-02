@@ -110,20 +110,6 @@ pub(crate) struct PinnedLeaf {
 }
 
 impl PinnedLeaf {
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            parent: self.parent.try_clone().context("duplicate pinned parent")?,
-            name: self.name.clone(),
-            metadata: self.metadata,
-            object: self
-                .object
-                .as_ref()
-                .map(|object| object.try_clone())
-                .transpose()
-                .context("duplicate pinned object")?,
-        })
-    }
-
     pub(crate) fn metadata(&self) -> RootMetadata {
         self.metadata
     }
@@ -173,7 +159,14 @@ pub(crate) enum PinnedPath {
 
 struct OperatorCursor {
     directory: File,
-    entry: Option<PinnedLeaf>,
+    entry: Option<OperatorEntry>,
+}
+
+/// How the cursor's directory was selected. Intermediate cursors deliberately
+/// omit a parent descriptor; only the final capability retains one.
+struct OperatorEntry {
+    name: CString,
+    metadata: RootMetadata,
 }
 
 /// Descriptor-retaining component resolver for paths supplied directly by an
@@ -247,16 +240,30 @@ impl OperatorResolver {
             let Some(component) = components.pop_front() else {
                 let current = stack.last().expect("operator resolver stack is nonempty");
                 let metadata = root_metadata_from_std(&current.directory.metadata()?)?;
+                let entry = if let Some(entry) = &current.entry {
+                    let parent = &stack
+                        .iter()
+                        .rev()
+                        .nth(1)
+                        .expect("a selected entry has a parent cursor")
+                        .directory;
+                    Some(PinnedLeaf {
+                        parent: parent
+                            .try_clone()
+                            .context("pin selected directory parent")?,
+                        name: entry.name.clone(),
+                        metadata: entry.metadata,
+                        object: None,
+                    })
+                } else {
+                    None
+                };
                 return Ok(PinnedPath::Directory(PinnedDirectory {
                     directory: current
                         .directory
                         .try_clone()
                         .context("pin selected directory")?,
-                    entry: current
-                        .entry
-                        .as_ref()
-                        .map(PinnedLeaf::try_clone)
-                        .transpose()?,
+                    entry,
                     metadata,
                 }));
             };
@@ -358,25 +365,24 @@ impl OperatorResolver {
                     root_metadata_from_std(&directory.metadata()?)?,
                     "operator directory",
                 )?;
-                let entry = PinnedLeaf {
-                    parent: current
-                        .directory
-                        .try_clone()
-                        .context("pin selected directory parent")?,
-                    name,
-                    metadata,
-                    object: None,
-                };
                 if final_name {
                     return Ok(PinnedPath::Directory(PinnedDirectory {
                         directory,
-                        entry: Some(entry),
+                        entry: Some(PinnedLeaf {
+                            parent: current
+                                .directory
+                                .try_clone()
+                                .context("pin selected directory parent")?,
+                            name,
+                            metadata,
+                            object: None,
+                        }),
                         metadata,
                     }));
                 }
                 stack.push(OperatorCursor {
                     directory,
-                    entry: Some(entry),
+                    entry: Some(OperatorEntry { name, metadata }),
                 });
                 continue;
             }
@@ -1478,6 +1484,7 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -1694,7 +1701,7 @@ mod tests {
         let mut hops = Vec::new();
         let result = resolver
             .resolve(
-                b"selected",
+                b"selected/.",
                 OperatorFinalComponent::Directory,
                 false,
                 &mut hops,
@@ -1718,6 +1725,58 @@ mod tests {
             (replacement.dev(), replacement.ino())
         );
         assert!(entry.is_some());
+    }
+
+    #[test]
+    fn operator_resolver_handles_deep_path_with_low_fd_limit() {
+        const CHILD_ENV: &str = "SYQ_TEST_OPERATOR_RESOLVER_LOW_FD_CHILD";
+        const TEST_NAME: &str =
+            "rooted::tests::operator_resolver_handles_deep_path_with_low_fd_limit";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "low-FD resolver subprocess failed");
+            return;
+        }
+
+        let tree = TestDir::new("operator-low-fd");
+        let path = (0..40)
+            .map(|index| format!("component-{index:02}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        fs::create_dir_all(tree.path().join(&path)).unwrap();
+        let base = File::open(tree.path()).unwrap();
+
+        let mut limits: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        assert!(
+            limits.rlim_max >= 64,
+            "hard file-descriptor limit is below 64"
+        );
+        limits.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+        let result = resolver
+            .resolve(
+                path.as_bytes(),
+                OperatorFinalComponent::Directory,
+                false,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let PinnedPath::Directory(directory) = result else {
+            panic!("deep directory was not selected");
+        };
+        assert!(directory.metadata().is_dir());
     }
 
     #[test]
