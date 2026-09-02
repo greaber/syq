@@ -880,14 +880,8 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         bail!("--mapping is only available on syq cp");
     }
     let results = parsed.results.take();
-    if results.is_some() && interface != Interface::NativeCp {
-        bail!("--results is only available on syq cp");
-    }
-    if results.is_some() && parsed.operational.common.dry_run {
-        // Dry-run trace output is a deliberately deferred automation
-        // feature; a version-0 results stream reusing the live counters
-        // would claim planned work as transferred.
-        bail!("--results does not support --dry-run yet");
+    if results.is_some() && interface == Interface::NativeMap {
+        bail!("--results is only available on syq cp and cp-prune");
     }
     let mut locations = if mapping.is_some() {
         let has_selectors = !(parsed.selection.src.is_empty()

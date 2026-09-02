@@ -739,6 +739,127 @@ fn handle_tcp_setup_error(
 }
 
 pub fn run(args: Args) -> Result<i32> {
+    // The results stream and progress exist before anything else can fail,
+    // so every run that got past argument parsing settles with a terminal
+    // record — fatal setup failures included (spec: automation v1).
+    let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
+    let progress = Progress::new(
+        args.connections,
+        show_progress,
+        args.progress,
+        args.width,
+        !args.quiet && args.progress_json,
+    );
+    if let Some(results) = args.native_results.as_deref() {
+        let out: Box<dyn std::io::Write + Send> = if results == b"-" {
+            // The machine owns stdout: suppress every human stdout line.
+            progress.suppress_stdout();
+            Box::new(std::io::stdout())
+        } else {
+            let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
+            Box::new(std::io::BufWriter::new(
+                std::fs::File::create(&path)
+                    .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?,
+            ))
+        };
+        let writer = Arc::new(crate::results::ResultsWriter::new(out));
+        let run_id = {
+            let mut bytes = [0u8; 16];
+            getrandom::fill(&mut bytes).context("generate run ID")?;
+            let mut hex = String::with_capacity(32);
+            for byte in bytes {
+                use std::fmt::Write as _;
+                write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+            }
+            hex
+        };
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        writer.emit_run(&crate::results::RunRecord {
+            run_id: &run_id,
+            started_at,
+            mode: if args.interface == Interface::NativeCpPrune {
+                "cp-prune"
+            } else {
+                "cp"
+            },
+            mapping: args.native_mapping.is_some(),
+            dry_run: args.dry_run,
+            endpoints: run_endpoints(&args.locations),
+        });
+        progress.set_results(writer);
+    }
+    let dry_run = args.dry_run;
+    let outcome = run_transfer(args, Arc::clone(&progress));
+    if outcome.is_err() {
+        // The error text reaches stderr via main; the stream still gets its
+        // terminal record so a consumer never mistakes a handled fatal for a
+        // crash (only a real crash leaves the terminal record missing).
+        if let Some(results) = progress.results_writer() {
+            results.emit_result(&crate::results::ResultRecord {
+                status: "failed",
+                exit_code: 1,
+                dry_run,
+                files_transferred: progress.files_done.load(Relaxed),
+                files_unchanged: progress.files_skipped.load(Relaxed),
+                files_excluded: progress.files_excluded.load(Relaxed),
+                directories_created: 0,
+                symlinks_created: 0,
+                specials_created: 0,
+                errors: progress.errors.load(Relaxed),
+                bytes_transferred: progress.bytes_done.load(Relaxed),
+                bytes_unchanged: progress.bytes_skipped.load(Relaxed),
+                elapsed_ms: progress.start.elapsed().as_millis() as u64,
+                deletions_planned: None,
+                deletions_completed: None,
+                deletions_blocked: None,
+            });
+        }
+    }
+    outcome
+}
+
+fn run_endpoints(locations: &[Location]) -> Vec<crate::results::EndpointRecord> {
+    let mut endpoints = Vec::new();
+    if let Some(source) = locations.first() {
+        endpoints.push(crate::results::EndpointRecord {
+            role: "source",
+            host: source.host.clone(),
+            user: source.user.clone(),
+        });
+    }
+    if locations.len() >= 2 {
+        if let Some(destination) = locations.last() {
+            endpoints.push(crate::results::EndpointRecord {
+                role: "destination",
+                host: destination.host.clone(),
+                user: destination.user.clone(),
+            });
+        }
+    }
+    endpoints
+}
+
+fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
+    let io = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())?;
+    Some(match io.kind() {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        std::io::ErrorKind::InvalidInput => "invalid_input",
+        _ => match io.raw_os_error() {
+            Some(libc::ENOSPC) => "no_space",
+            Some(libc::EROFS) => "read_only",
+            _ => "other",
+        },
+    })
+}
+
+fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut args = args;
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
     let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
@@ -901,6 +1022,11 @@ pub fn run(args: Args) -> Result<i32> {
                 .chain(std::iter::once(dst))
                 .all(|location| std::str::from_utf8(&location.path).is_ok());
             if args.interface == Interface::Rsync || direct_paths_are_utf8 {
+                if args.native_results.is_some() {
+                    bail!(
+                        "--results is not yet supported for direct remote-to-remote transfers: the orchestrator runs on the source host and cannot feed a local stream"
+                    );
+                }
                 // Let the remote orchestrator observe the original source count so
                 // repeated file sources keep multi-source destination semantics.
                 return crate::direct::run(&args, srcs, dst, source_operand_count);
@@ -952,28 +1078,6 @@ pub fn run(args: Args) -> Result<i32> {
         max_size,
         min_size,
     });
-    let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(
-        args.connections,
-        show_progress,
-        args.progress,
-        args.width,
-        !args.quiet && args.progress_json,
-    );
-    if let Some(results) = args.native_results.as_deref() {
-        let out: Box<dyn std::io::Write + Send> = if results == b"-" {
-            Box::new(std::io::stdout())
-        } else {
-            let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
-            Box::new(std::io::BufWriter::new(
-                std::fs::File::create(&path)
-                    .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?,
-            ))
-        };
-        let writer = Arc::new(crate::results::ResultsWriter::new(out));
-        writer.emit_run(args.native_mapping.is_some());
-        progress.set_results(writer);
-    }
     let sched = Arc::new(Sched::new(block, min_split));
 
     // Workers connect on their own threads once the control connections are
@@ -1964,6 +2068,56 @@ pub fn run(args: Args) -> Result<i32> {
     progress.clear();
 
     let errors = progress.errors.load(Relaxed);
+    let exit_code = if aborted {
+        1
+    } else if errors > 0 {
+        23
+    } else if max_delete_hit {
+        25
+    } else {
+        0
+    };
+    let (deletions_planned, deletions_completed, deletions_blocked) = if opts.delete {
+        let planned = match delete_plan {
+            DeletePlan::Planned(n) => n,
+            _ => 0,
+        };
+        (
+            Some(planned),
+            Some(deleted),
+            Some(if max_delete_hit { planned } else { 0 }),
+        )
+    } else {
+        (None, None, None)
+    };
+    // Hard v1 rule: the human summary below renders from this same struct,
+    // so the numbers a person reads and a machine parses cannot disagree.
+    let terminal = crate::results::ResultRecord {
+        status: if aborted {
+            "aborted"
+        } else if max_delete_hit {
+            "refused"
+        } else if errors > 0 {
+            "partial"
+        } else {
+            "success"
+        },
+        exit_code,
+        dry_run: opts.dry_run,
+        files_transferred: progress.files_done.load(Relaxed),
+        files_unchanged: progress.files_skipped.load(Relaxed),
+        files_excluded: progress.files_excluded.load(Relaxed),
+        directories_created: created_counts.0,
+        symlinks_created: created_counts.1,
+        specials_created: created_counts.2,
+        errors,
+        bytes_transferred: progress.bytes_done.load(Relaxed),
+        bytes_unchanged: progress.bytes_skipped.load(Relaxed),
+        elapsed_ms: progress.start.elapsed().as_millis() as u64,
+        deletions_planned,
+        deletions_completed,
+        deletions_blocked,
+    };
 
     if !aborted
         && errors == 0
@@ -2010,7 +2164,9 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
-    if !args.quiet && !aborted {
+    // With --results -, the machine owns stdout: every human summary line
+    // (which all render from the same terminal record) is suppressed.
+    if !args.quiet && !aborted && !progress.stdout_suppressed() {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
                 println!(
@@ -2040,20 +2196,20 @@ pub fn run(args: Args) -> Result<i32> {
             );
         } else {
             println!(
-                "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs{}{}{}",
-                commas(progress.files_done.load(Relaxed)),
-                human(done),
-                human(progress.bytes_skipped.load(Relaxed)),
-                commas(progress.files_skipped.load(Relaxed)),
-                commas(st_dirs(&progress)),
+                "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
+                commas(terminal.files_transferred),
+                human(terminal.bytes_transferred),
+                human(terminal.bytes_unchanged),
+                commas(terminal.files_unchanged),
+                commas(terminal.directories_created),
                 deletion_summary(delete_plan, deleted, opts.max_delete),
                 format_args!(
                     ", {} at {}/s",
                     crate::progress::hms(elapsed),
-                    human((done as f64 / elapsed.max(0.001)) as u64)
+                    human((terminal.bytes_transferred as f64 / elapsed.max(0.001)) as u64)
                 ),
-                if errors > 0 {
-                    format!(", {errors} errors")
+                if terminal.errors > 0 {
+                    format!(", {} errors", terminal.errors)
                 } else {
                     String::new()
                 }
@@ -2113,48 +2269,10 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
-    let exit_code = if aborted {
-        1
-    } else if errors > 0 {
-        23
-    } else if max_delete_hit {
-        25
-    } else {
-        0
-    };
     if let Some(results) = progress.results_writer() {
-        results.emit_result(&crate::results::ResultRecord {
-            status: if aborted {
-                "aborted"
-            } else if max_delete_hit {
-                "refused"
-            } else if errors > 0 {
-                "partial"
-            } else {
-                "success"
-            },
-            exit_code,
-            files_transferred: progress.files_done.load(Relaxed),
-            files_unchanged: progress.files_skipped.load(Relaxed),
-            files_excluded: progress.files_excluded.load(Relaxed),
-            directories_created: created_counts.0,
-            symlinks_created: created_counts.1,
-            specials_created: created_counts.2,
-            errors,
-            bytes_transferred: progress.bytes_done.load(Relaxed),
-            bytes_unchanged: progress.bytes_skipped.load(Relaxed),
-            elapsed_ms: progress.start.elapsed().as_millis() as u64,
-        });
+        results.emit_result(&terminal);
     }
     Ok(exit_code)
-}
-
-fn st_dirs(p: &Progress) -> u64 {
-    p.scanned.load(Relaxed).saturating_sub(
-        p.files_total.load(Relaxed)
-            + p.files_skipped.load(Relaxed)
-            + p.files_excluded.load(Relaxed),
-    )
 }
 
 /// lstat (or stat, with `follow`) each path on `conn`.
@@ -3345,7 +3463,13 @@ impl Planner<'_> {
                         display(&m.src)
                     );
                     self.progress.error(&format!("syq: {message}"));
-                    self.emit_mapping_entry_failed(&m, "unknown", &message);
+                    self.emit_mapping_entry_failed(
+                        &m,
+                        "unknown",
+                        "io",
+                        Some("not_found"),
+                        &message,
+                    );
                     continue;
                 };
                 if let Some(declared) = m.kind {
@@ -3357,7 +3481,7 @@ impl Planner<'_> {
                             declared.label(),
                         );
                         self.progress.error(&format!("syq: {message}"));
-                        self.emit_mapping_entry_failed(&m, "no", &message);
+                        self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
                         continue;
                     }
                 }
@@ -3785,6 +3909,15 @@ impl Planner<'_> {
                     match destination {
                         None => {
                             self.dry_run_changes.directories.insert(p.clone());
+                            if let Some(dst_rel) = strip_dst_root(p, dst_root) {
+                                self.emit_trace(
+                                    "create_directory",
+                                    dst_rel,
+                                    "dir",
+                                    None,
+                                    "destination_missing",
+                                );
+                            }
                             if opts.verbose > 0 {
                                 self.progress.println(&format!(
                                     "create directory {} (destination missing)",
@@ -3795,6 +3928,15 @@ impl Planner<'_> {
                         Some(d) if d.kind != Kind::Dir => {
                             if self.dry_run_changes.directories.insert(p.clone()) {
                                 self.dry_run_changes.type_replacements += 1;
+                            }
+                            if let Some(dst_rel) = strip_dst_root(p, dst_root) {
+                                self.emit_trace(
+                                    "create_directory",
+                                    dst_rel,
+                                    "dir",
+                                    None,
+                                    "type_differs",
+                                );
                             }
                             if opts.verbose > 0 {
                                 self.progress.println(&format!(
@@ -3809,6 +3951,15 @@ impl Planner<'_> {
                                 && !self.implicit_dirs.contains(p) =>
                         {
                             self.dry_run_changes.metadata_directories.insert(p.clone());
+                            if let Some(dst_rel) = strip_dst_root(p, dst_root) {
+                                self.emit_trace(
+                                    "create_directory",
+                                    dst_rel,
+                                    "dir",
+                                    None,
+                                    "metadata_differs",
+                                );
+                            }
                             if opts.verbose > 0 {
                                 self.progress.println(&format!(
                                     "update metadata {} (requested directory metadata differs)",
@@ -3925,6 +4076,8 @@ impl Planner<'_> {
                                 } else {
                                     "unknown"
                                 }),
+                                class: (!created).then_some("io"),
+                                os_kind: None,
                                 message: None,
                             });
                         }
@@ -4162,6 +4315,13 @@ impl Planner<'_> {
                                 self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
                                 if opts.dry_run {
                                     self.dry_run_changes.metadata_files += 1;
+                                    self.emit_trace(
+                                        "transfer_file",
+                                        &dst_rel,
+                                        "file",
+                                        None,
+                                        "metadata_differs",
+                                    );
                                     if opts.verbose > 0 {
                                         self.progress.println(&format!(
                                             "update metadata {} (requested file metadata differs)",
@@ -4200,6 +4360,17 @@ impl Planner<'_> {
                         if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::File) {
                             self.dry_run_changes.type_replacements += 1;
                         }
+                        self.emit_trace(
+                            "transfer_file",
+                            &dst_rel,
+                            "file",
+                            Some(e.size),
+                            match &dst_entry {
+                                None => "destination_missing",
+                                Some(d) if d.kind != Kind::File => "type_differs",
+                                Some(_) => "content_differs",
+                            },
+                        );
                         if opts.verbose > 0 {
                             let shown = display(&dst_path);
                             let action = match &dst_entry {
@@ -4260,6 +4431,17 @@ impl Planner<'_> {
                         if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::Symlink) {
                             self.dry_run_changes.type_replacements += 1;
                         }
+                        self.emit_trace(
+                            "create_symlink",
+                            &dst_rel,
+                            "symlink",
+                            None,
+                            match &dst_entry {
+                                None => "destination_missing",
+                                Some(d) if d.kind != Kind::Symlink => "type_differs",
+                                Some(_) => "content_differs",
+                            },
+                        );
                         if opts.verbose > 0 {
                             let shown = display(&dst_path);
                             let action = match &dst_entry {
@@ -4331,6 +4513,17 @@ impl Planner<'_> {
                             if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
                                 self.dry_run_changes.type_replacements += 1;
                             }
+                            self.emit_trace(
+                                "create_special",
+                                &dst_rel,
+                                "special",
+                                None,
+                                match &dst_entry {
+                                    None => "destination_missing",
+                                    Some(d) if d.kind != e.kind => "type_differs",
+                                    Some(_) => "content_differs",
+                                },
+                            );
                             if opts.verbose > 0 {
                                 let shown = display(&dst_path);
                                 let action = match &dst_entry {
@@ -4429,6 +4622,8 @@ impl Planner<'_> {
                         bytes: None,
                         attempts: None,
                         retryable: error.is_some().then_some("unknown"),
+                        class: error.is_some().then_some("io"),
+                        os_kind: None,
                         message: error.as_deref(),
                     });
                 }
@@ -4631,6 +4826,8 @@ impl Planner<'_> {
         &self,
         entry: &ManifestEntry,
         retryable: &'static str,
+        class: &'static str,
+        os_kind: Option<&'static str>,
         message: &str,
     ) {
         if let Some(results) = self.progress.results_writer() {
@@ -4649,7 +4846,33 @@ impl Planner<'_> {
                 bytes: None,
                 attempts: None,
                 retryable: Some(retryable),
+                class: Some(class),
+                os_kind,
                 message: Some(message),
+            });
+        }
+    }
+
+    /// Dry run: one intended mutation, from the same decision point that
+    /// prints the -v explanation, so human and machine reasons cannot
+    /// diverge.
+    fn emit_trace(
+        &self,
+        action: &'static str,
+        dst_rel: &[u8],
+        kind: &'static str,
+        bytes: Option<u64>,
+        reason: &'static str,
+    ) {
+        if let Some(results) = self.progress.results_writer() {
+            let src = self.mapping_source_rel(dst_rel);
+            results.emit_trace(&crate::results::TraceRecord {
+                action,
+                dst: dst_rel,
+                src: src.as_deref(),
+                kind,
+                bytes,
+                reason,
             });
         }
     }
@@ -4934,6 +5157,31 @@ impl Planner<'_> {
                 self.progress.eprintln(&format!(
                     "syq: {planned} deletions planned, more than --max-delete {max}; deleting nothing"
                 ));
+                if let Some(results) = self.progress.results_writer() {
+                    let blocked = leaves
+                        .iter()
+                        .map(|(_, _, dst_rel)| (dst_rel, "file"))
+                        .chain(
+                            dirs.values()
+                                .flatten()
+                                .map(|(_, _, dst_rel)| (dst_rel, "dir")),
+                        );
+                    for (dst_rel, kind) in blocked {
+                        results.emit_operation(&crate::results::OperationRecord {
+                            action: "delete",
+                            dst: dst_rel,
+                            src: None,
+                            kind,
+                            disposition: "blocked",
+                            bytes: None,
+                            attempts: None,
+                            retryable: None,
+                            class: Some("safety_limit"),
+                            os_kind: None,
+                            message: None,
+                        });
+                    }
+                }
                 self.max_delete_hit = true;
                 return Ok(0);
             }
@@ -4961,8 +5209,15 @@ impl Planner<'_> {
                     return Ok(());
                 }
                 if opts.dry_run {
-                    for (_, rel, _) in chunk {
+                    for (_, rel, dst_rel) in chunk {
                         n += 1;
+                        me.emit_trace(
+                            "delete",
+                            dst_rel,
+                            if rmdir { "dir" } else { "file" },
+                            None,
+                            "destination_only",
+                        );
                         if opts.verbose > 0 {
                             me.progress
                                 .println(&format!("delete {rel} (destination only)"));
@@ -5014,7 +5269,8 @@ impl Planner<'_> {
                         }
                     }
                 }
-                for ((_, rel, _), err) in chunk.iter().zip(errs) {
+                for ((_, rel, dst_rel), err) in chunk.iter().zip(errs) {
+                    let failed = err.is_some();
                     match err {
                         None => {
                             n += 1;
@@ -5023,6 +5279,21 @@ impl Planner<'_> {
                             }
                         }
                         Some(e) => me.progress.error(&format!("syq: delete {rel}: {e}")),
+                    }
+                    if let Some(results) = me.progress.results_writer() {
+                        results.emit_operation(&crate::results::OperationRecord {
+                            action: "delete",
+                            dst: dst_rel,
+                            src: None,
+                            kind: if rmdir { "dir" } else { "file" },
+                            disposition: if failed { "failed" } else { "succeeded" },
+                            bytes: None,
+                            attempts: None,
+                            retryable: failed.then_some("unknown"),
+                            class: failed.then_some("io"),
+                            os_kind: None,
+                            message: None,
+                        });
                     }
                 }
             }
@@ -5536,9 +5807,10 @@ impl Worker {
             .zip(results.into_iter().zip(now.into_iter()))
         {
             if let Err(e) = res {
+                let os_kind = os_kind_of(&e);
                 let message = format!("{e:#}");
                 self.progress.error(&format!("syq: {}: {message}", j.rel));
-                self.emit_file_result_failed(j, "unknown", &message);
+                self.emit_file_result_failed(j, "unknown", os_kind, &message);
                 self.sched.fail_file(*idx);
                 continue;
             }
@@ -5583,6 +5855,7 @@ impl Worker {
                     self.emit_file_result_failed(
                         j,
                         "yes",
+                        None,
                         "source changed during transfer (or vanished)",
                     );
                     self.sched.fail_file(*idx);
@@ -5602,6 +5875,8 @@ impl Worker {
                     bytes: Some(j.entry.size),
                     attempts: Some(u64::from(j.attempts) + 1),
                     retryable: None,
+                    class: None,
+                    os_kind: None,
                     message: None,
                 });
             }
@@ -5620,9 +5895,10 @@ impl Worker {
         }
         if !self.sched.is_failed(idx) {
             let job = self.job(idx);
+            let os_kind = os_kind_of(&e);
             let message = format!("{e:#}");
             self.progress.error(&format!("syq: {}: {message}", job.rel));
-            self.emit_file_result_failed(&job, "unknown", &message);
+            self.emit_file_result_failed(&job, "unknown", os_kind, &message);
             self.sched.fail_file(idx);
         }
         Ok(())
@@ -5630,7 +5906,13 @@ impl Worker {
 
     /// One failed-transfer result record; the error itself was already
     /// counted and printed by the caller.
-    fn emit_file_result_failed(&self, job: &FileJob, retryable: &'static str, message: &str) {
+    fn emit_file_result_failed(
+        &self,
+        job: &FileJob,
+        retryable: &'static str,
+        os_kind: Option<&'static str>,
+        message: &str,
+    ) {
         if let Some(results) = self.progress.results_writer() {
             results.emit_operation(&crate::results::OperationRecord {
                 action: "transfer_file",
@@ -5641,6 +5923,8 @@ impl Worker {
                 bytes: None,
                 attempts: Some(u64::from(job.attempts) + 1),
                 retryable: Some(retryable),
+                class: Some("io"),
+                os_kind,
                 message: Some(message),
             });
         }
@@ -6342,6 +6626,8 @@ impl Worker {
                     bytes: Some(job.entry.size),
                     attempts: Some(u64::from(job.attempts) + 1),
                     retryable: None,
+                    class: None,
+                    os_kind: None,
                     message: None,
                 });
             }

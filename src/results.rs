@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
 pub const SCHEMA: &str = "syq.automation";
-pub const SCHEMA_VERSION: u64 = 0;
+pub const SCHEMA_VERSION: u64 = 1;
 
 pub struct ResultsWriter {
     out: Mutex<Box<dyn Write + Send>>,
@@ -38,12 +38,52 @@ pub struct OperationRecord<'a> {
     pub bytes: Option<u64>,
     pub attempts: Option<u64>,
     pub retryable: Option<&'static str>,
+    pub class: Option<&'static str>,
+    pub os_kind: Option<&'static str>,
     pub message: Option<&'a str>,
+}
+
+pub struct RunRecord<'a> {
+    pub run_id: &'a str,
+    pub started_at: i64,
+    pub mode: &'static str,
+    pub mapping: bool,
+    pub dry_run: bool,
+    pub endpoints: Vec<EndpointRecord>,
+}
+
+pub struct EndpointRecord {
+    pub role: &'static str,
+    pub host: Option<String>,
+    pub user: Option<String>,
+}
+
+pub struct ProgressRecord {
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub bytes_unchanged: u64,
+    pub files_done: u64,
+    pub files_total: u64,
+    pub files_unchanged: u64,
+    pub files_excluded: u64,
+    pub scanned: u64,
+    pub scan_done: bool,
+    pub elapsed_ms: u64,
+}
+
+pub struct TraceRecord<'a> {
+    pub action: &'static str,
+    pub dst: &'a [u8],
+    pub src: Option<&'a [u8]>,
+    pub kind: &'static str,
+    pub bytes: Option<u64>,
+    pub reason: &'static str,
 }
 
 pub struct ResultRecord {
     pub status: &'static str,
     pub exit_code: i32,
+    pub dry_run: bool,
     pub files_transferred: u64,
     pub files_unchanged: u64,
     pub files_excluded: u64,
@@ -54,6 +94,10 @@ pub struct ResultRecord {
     pub bytes_transferred: u64,
     pub bytes_unchanged: u64,
     pub elapsed_ms: u64,
+    /// cp-prune only; None keeps the fields out of the record.
+    pub deletions_planned: Option<u64>,
+    pub deletions_completed: Option<u64>,
+    pub deletions_blocked: Option<u64>,
 }
 
 impl ResultsWriter {
@@ -65,20 +109,95 @@ impl ResultsWriter {
         }
     }
 
-    pub fn emit_run(&self, mapping: bool) {
+    pub fn emit_run(&self, run: &RunRecord) {
+        let endpoints: Vec<serde_json::Value> = run
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                let mut value = serde_json::json!({
+                    "role": endpoint.role,
+                    "kind": if endpoint.host.is_some() { "ssh" } else { "local" },
+                });
+                let object = value.as_object_mut().expect("endpoint is an object");
+                if let Some(host) = &endpoint.host {
+                    object.insert("host".into(), host.as_str().into());
+                }
+                if let Some(user) = &endpoint.user {
+                    object.insert("user".into(), user.as_str().into());
+                }
+                value
+            })
+            .collect();
         self.write(serde_json::json!({
             "type": "run",
+            "run_id": run.run_id,
+            "started_at": run.started_at,
             "syq_version": env!("CARGO_PKG_VERSION"),
-            "mode": "cp",
-            "mapping": mapping,
+            "mode": run.mode,
+            "mapping": run.mapping,
+            "dry_run": run.dry_run,
+            "endpoints": endpoints,
         }));
     }
 
-    pub fn emit_error(&self, message: &str) {
+    pub fn emit_progress(&self, progress: &ProgressRecord) {
         self.write(serde_json::json!({
+            "type": "progress",
+            "bytes_done": progress.bytes_done,
+            "bytes_total": progress.bytes_total,
+            "bytes_unchanged": progress.bytes_unchanged,
+            "files_done": progress.files_done,
+            "files_total": progress.files_total,
+            "files_unchanged": progress.files_unchanged,
+            "files_excluded": progress.files_excluded,
+            "scanned": progress.scanned,
+            "scan_done": progress.scan_done,
+            "elapsed_ms": progress.elapsed_ms,
+        }));
+    }
+
+    /// Dry run only: one intended mutation, sharing `operation_result`'s
+    /// identity fields, with the reason the mutation is needed.
+    pub fn emit_trace(&self, trace: &TraceRecord) {
+        let mut record = serde_json::json!({
+            "type": "trace",
+            "action": trace.action,
+            "dst": tagged(trace.dst),
+            "kind": trace.kind,
+            "reason": trace.reason,
+        });
+        let object = record.as_object_mut().expect("record is an object");
+        if let Some(src) = trace.src {
+            object.insert("src".into(), tagged(src));
+        }
+        if let Some(bytes) = trace.bytes {
+            object.insert("bytes".into(), bytes.into());
+        }
+        self.write(record);
+    }
+
+    pub fn emit_error(&self, message: &str) {
+        self.emit_error_classified(message, None, None);
+    }
+
+    pub fn emit_error_classified(
+        &self,
+        message: &str,
+        class: Option<&'static str>,
+        os_kind: Option<&'static str>,
+    ) {
+        let mut record = serde_json::json!({
             "type": "error",
             "message": message,
-        }));
+        });
+        let object = record.as_object_mut().expect("record is an object");
+        if let Some(class) = class {
+            object.insert("class".into(), class.into());
+        }
+        if let Some(os_kind) = os_kind {
+            object.insert("os_kind".into(), os_kind.into());
+        }
+        self.write(record);
     }
 
     pub fn emit_operation(&self, op: &OperationRecord) {
@@ -102,6 +221,12 @@ impl ResultsWriter {
         if let Some(retryable) = op.retryable {
             object.insert("retryable".into(), retryable.into());
         }
+        if let Some(class) = op.class {
+            object.insert("class".into(), class.into());
+        }
+        if let Some(os_kind) = op.os_kind {
+            object.insert("os_kind".into(), os_kind.into());
+        }
         if let Some(message) = op.message {
             object.insert("message".into(), message.into());
         }
@@ -110,10 +235,11 @@ impl ResultsWriter {
 
     /// The terminal record; flushes the stream. Nothing may be written after.
     pub fn emit_result(&self, result: &ResultRecord) {
-        self.write(serde_json::json!({
+        let mut record = serde_json::json!({
             "type": "result",
             "status": result.status,
             "exit_code": result.exit_code,
+            "dry_run": result.dry_run,
             "files_transferred": result.files_transferred,
             "files_unchanged": result.files_unchanged,
             "files_excluded": result.files_excluded,
@@ -124,7 +250,18 @@ impl ResultsWriter {
             "bytes_transferred": result.bytes_transferred,
             "bytes_unchanged": result.bytes_unchanged,
             "elapsed_ms": result.elapsed_ms,
-        }));
+        });
+        let object = record.as_object_mut().expect("record is an object");
+        if let Some(planned) = result.deletions_planned {
+            object.insert("deletions_planned".into(), planned.into());
+        }
+        if let Some(completed) = result.deletions_completed {
+            object.insert("deletions_completed".into(), completed.into());
+        }
+        if let Some(blocked) = result.deletions_blocked {
+            object.insert("deletions_blocked".into(), blocked.into());
+        }
+        self.write(record);
         if !self.dead.load(Relaxed) {
             if let Err(error) = self.out.lock().unwrap().flush() {
                 self.mark_dead(&error);

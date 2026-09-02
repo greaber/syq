@@ -4991,12 +4991,13 @@ fn delete_never_removes_paths_the_source_has_but_skips() {
     // The hardlinked file is "the same file" and skipped, and stays.
     let so = run_ok(&["-rt", "--delete", &t.s("src/"), &t.s("dst")]);
     assert_eq!(listing(&t.path("dst")), ["hard", "link", "plain"]);
-    // Skipped files are not reported as directories.
-    assert!(so.contains(", 1 dirs"), "{so}");
+    // Skipped files are not reported as directories; the existing
+    // destination root means nothing was created.
+    assert!(so.contains(", 0 dirs created"), "{so}");
     write(&t.path("src2/big"), b"bb");
     let so = run_ok(&["-a", "--max-size", "1", &t.s("src2/"), &t.s("dst2")]);
     assert!(
-        so.contains("transferred 0 files") && so.contains(", 1 dirs"),
+        so.contains("transferred 0 files") && so.contains(", 1 dirs created"),
         "{so}"
     );
 }
@@ -8873,14 +8874,23 @@ fn native_cp_results_stream_success_and_partial() {
         .lines()
         .map(|line| serde_json::from_str(line).expect("results line is JSON"))
         .collect();
-    // Envelope: schema v0, strictly increasing seq, run first, result last.
+    // Envelope: schema v1, strictly increasing seq, run first, result last.
     for (i, v) in lines.iter().enumerate() {
         assert_eq!(v["schema"], "syq.automation");
-        assert_eq!(v["schema_version"], 0);
+        assert_eq!(v["schema_version"], 1);
         assert_eq!(v["seq"], i as u64);
     }
     assert_eq!(lines[0]["type"], "run");
     assert_eq!(lines[0]["mapping"], true);
+    assert_eq!(lines[0]["mode"], "cp");
+    assert_eq!(lines[0]["dry_run"], false);
+    assert_eq!(lines[0]["run_id"].as_str().unwrap().len(), 32);
+    assert!(lines[0]["started_at"].as_i64().unwrap() > 0);
+    let endpoints = lines[0]["endpoints"].as_array().unwrap();
+    assert_eq!(endpoints.len(), 2);
+    assert_eq!(endpoints[0]["role"], "source");
+    assert_eq!(endpoints[0]["kind"], "local");
+    assert_eq!(endpoints[1]["role"], "destination");
     let last = lines.last().unwrap();
     assert_eq!(last["type"], "result");
     assert_eq!(last["status"], "partial");
@@ -9015,9 +9025,9 @@ fn native_map_normalizes_dot_components_and_rejects_dotdot() {
 }
 
 #[test]
-fn native_cp_results_refuses_dry_run() {
+fn native_cp_results_dry_run_emits_traces() {
     let t = Tmp::new();
-    write(&t.path("src/f.txt"), b"x");
+    write(&t.path("src/f.txt"), b"data");
     let out = syq_cp_in(
         &t.path(""),
         &[
@@ -9028,11 +9038,168 @@ fn native_cp_results_refuses_dry_run() {
             "--results",
             "r.ndjson",
             "-n",
+            "-q",
         ],
         None,
     );
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("does not support --dry-run"));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.path("dst/f.txt").exists(), "dry run must not write");
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["type"], "run");
+    assert_eq!(lines[0]["dry_run"], true);
+    let trace = lines
+        .iter()
+        .find(|v| v["type"] == "trace" && v["dst"]["value"] == "f.txt")
+        .expect("trace record for the planned file");
+    assert_eq!(trace["action"], "transfer_file");
+    assert_eq!(trace["kind"], "file");
+    assert_eq!(trace["reason"], "destination_missing");
+    assert_eq!(trace["bytes"], 4);
+    assert!(
+        !lines.iter().any(|v| v["type"] == "operation_result"),
+        "dry runs settle nothing"
+    );
+    let last = lines.last().unwrap();
+    assert_eq!(last["type"], "result");
+    assert_eq!(last["dry_run"], true);
+    assert_eq!(last["status"], "success");
+    assert_eq!(last["files_transferred"], 1, "planned, per dry_run: true");
+}
+
+#[test]
+fn native_cp_results_fatal_failure_emits_terminal_record() {
+    let t = Tmp::new();
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "absent",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["type"], "run");
+    let last = lines.last().unwrap();
+    assert_eq!(last["type"], "result");
+    assert_eq!(last["status"], "failed");
+    assert_eq!(last["exit_code"], 1);
+}
+
+#[test]
+fn native_cp_results_stdout_mode_owns_stdout() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"abc");
+    // No -q: the machine owns stdout anyway; the human summary is suppressed.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst", "--results", "-"],
+        None,
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for line in stdout.lines() {
+        let value: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|_| panic!("non-JSON stdout line: {line}"));
+        assert_eq!(value["schema"], "syq.automation");
+    }
+    assert!(stdout.lines().count() >= 2, "run and result at least");
+}
+
+#[test]
+fn native_cp_prune_results_cover_deletions() {
+    let t = Tmp::new();
+    write(&t.path("src/keep.txt"), b"k");
+    write(&t.path("dst/keep.txt"), b"k");
+    write(&t.path("dst/extra.txt"), b"x");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp-prune",
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ])
+        .current_dir(t.path(""))
+        .run()
+        .expect("run cp-prune");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.path("dst/extra.txt").exists());
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["mode"], "cp-prune");
+    let delete = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["action"] == "delete")
+        .expect("delete record");
+    assert_eq!(delete["dst"]["value"], "extra.txt");
+    assert_eq!(delete["disposition"], "succeeded");
+    let last = lines.last().unwrap();
+    assert_eq!(last["deletions_planned"], 1);
+    assert_eq!(last["deletions_completed"], 1);
+    assert_eq!(last["deletions_blocked"], 0);
+    // --max-delete 0 refuses: blocked records, refused status, exit 25.
+    write(&t.path("dst/extra2.txt"), b"x");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp-prune",
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r2.ndjson",
+            "--max-delete",
+            "0",
+            "-q",
+        ])
+        .current_dir(t.path(""))
+        .run()
+        .expect("run cp-prune");
+    assert_eq!(out.status.code(), Some(25));
+    assert!(t.path("dst/extra2.txt").exists());
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r2.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let blocked = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["disposition"] == "blocked")
+        .expect("blocked record");
+    assert_eq!(blocked["action"], "delete");
+    assert_eq!(blocked["class"], "safety_limit");
+    let last = lines.last().unwrap();
+    assert_eq!(last["status"], "refused");
+    assert_eq!(last["exit_code"], 25);
+    assert_eq!(last["deletions_blocked"], 1);
 }
 
 #[test]
