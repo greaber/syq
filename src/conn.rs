@@ -813,15 +813,20 @@ impl SshMultiplexer {
         })
     }
 
-    pub(crate) fn persistent(user: Option<&str>, host: &str) -> Result<Self> {
+    pub(crate) fn persistent(user: Option<&str>, host: &str, port: Option<u16>) -> Result<Self> {
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let directory = base.join(format!("syq-cm-{}", unsafe { libc::geteuid() }));
-        Self::persistent_in(directory, user, host)
+        Self::persistent_in(directory, user, host, port)
     }
 
-    fn persistent_in(directory: PathBuf, user: Option<&str>, host: &str) -> Result<Self> {
+    fn persistent_in(
+        directory: PathBuf,
+        user: Option<&str>,
+        host: &str,
+        port: Option<u16>,
+    ) -> Result<Self> {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -878,6 +883,10 @@ impl SshMultiplexer {
         hasher.update(user.unwrap_or("").as_bytes());
         hasher.update(b"@");
         hasher.update(host.as_bytes());
+        if let Some(port) = port {
+            hasher.update(b":");
+            hasher.update(port.to_be_bytes());
+        }
         let digest = hasher.finalize();
         let mut name = String::from("cm-");
         for byte in &digest[..8] {
@@ -928,6 +937,7 @@ pub struct RemoteSpec {
     pub local_process: bool,
     pub user: Option<String>,
     pub host: String,
+    pub port: Option<u16>,
     pub rsh: Vec<String>,
     pub syq_path: Option<String>,
     /// Install and use the versioned helper rather than resolving `syq` on PATH.
@@ -956,6 +966,7 @@ impl RemoteSpec {
             local_process: true,
             user: None,
             host: "127.0.0.1".into(),
+            port: None,
             rsh: vec!["local".into()],
             syq_path: None,
             auto_helper: false,
@@ -972,9 +983,18 @@ impl RemoteSpec {
         if self.local_process {
             return "local receiver".into();
         }
-        match &self.user {
-            Some(u) => format!("{u}@{}", self.host),
-            None => self.host.clone(),
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        let endpoint = match &self.user {
+            Some(user) => format!("{user}@{host}"),
+            None => host,
+        };
+        match self.port {
+            Some(port) => format!("{endpoint}:{port}"),
+            None => endpoint,
         }
     }
 
@@ -1060,6 +1080,9 @@ impl RemoteSpec {
             cmd.args(["-o", CIPHERS]);
             if let Some(u) = &self.user {
                 cmd.args(["-l", u]);
+            }
+            if let Some(port) = self.port {
+                cmd.args(["-p", &port.to_string()]);
             }
             cmd.arg("--");
         } else if let Some(u) = &self.user {
@@ -1455,6 +1478,12 @@ impl RemoteSpec {
         let out = Command::new(&self.rsh[0])
             .args(&self.rsh[1..])
             .arg("-G")
+            .args(
+                self.port
+                    .map(|port| vec!["-p".to_owned(), port.to_string()])
+                    .unwrap_or_default(),
+            )
+            .arg("--")
             .arg(&self.host)
             .output()
             .ok()?;
@@ -2287,6 +2316,7 @@ mod tests {
             local_process: false,
             user: None,
             host: "remote.example".into(),
+            port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
             auto_helper: false,
@@ -2555,6 +2585,7 @@ mod tests {
             local_process: false,
             user: None,
             host: "example".to_string(),
+            port: None,
             rsh: vec!["ssh".to_string()],
             syq_path: None,
             auto_helper: false,
@@ -2590,6 +2621,7 @@ mod tests {
             local_process: false,
             user: None,
             host: "example".into(),
+            port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
             auto_helper: false,
@@ -2633,11 +2665,15 @@ mod tests {
         let base = directory.path().to_path_buf();
         // The socket name is stable per endpoint, and a dead leftover at the
         // path is cleared so a fresh master can bind.
-        let probe = SshMultiplexer::persistent_in(base.clone(), Some("u"), "example").unwrap();
+        let probe =
+            SshMultiplexer::persistent_in(base.clone(), Some("u"), "example", None).unwrap();
         std::fs::write(&probe.path, b"stale").unwrap();
         let multiplexer =
-            SshMultiplexer::persistent_in(base.clone(), Some("u"), "example").unwrap();
+            SshMultiplexer::persistent_in(base.clone(), Some("u"), "example", None).unwrap();
         assert_eq!(probe.path, multiplexer.path);
+        let alternate_port =
+            SshMultiplexer::persistent_in(base.clone(), Some("u"), "example", Some(2222)).unwrap();
+        assert_ne!(multiplexer.path, alternate_port.path);
         assert!(!multiplexer.path.exists());
         assert_eq!(
             std::fs::metadata(&base).unwrap().permissions().mode() & 0o777,
@@ -2648,6 +2684,7 @@ mod tests {
             local_process: false,
             user: Some("u".into()),
             host: "example".into(),
+            port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
             auto_helper: false,
@@ -2687,7 +2724,7 @@ mod tests {
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
         let attack = outer.path().join("syq-cm-attack");
         std::os::unix::fs::symlink(&victim, &attack).unwrap();
-        assert!(SshMultiplexer::persistent_in(attack, Some("u"), "example").is_err());
+        assert!(SshMultiplexer::persistent_in(attack, Some("u"), "example", None).is_err());
         // The victim's permissions were never modified through the symlink.
         assert_eq!(
             std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,

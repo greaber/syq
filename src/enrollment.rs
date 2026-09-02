@@ -322,7 +322,10 @@ fn line_contains_transport_key(line: &[u8], key: &TransportPublicKey) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SshEndpoint(String);
+pub struct SshEndpoint {
+    target: String,
+    port: Option<u16>,
+}
 
 impl SshEndpoint {
     /// Parse the deliberately narrow endpoint syntax accepted by automatic
@@ -343,11 +346,65 @@ impl SshEndpoint {
         if host == "none" {
             bail!("none is not an enrollment host");
         }
-        Ok(Self(value.to_owned()))
+        Ok(Self {
+            target: value.to_owned(),
+            port: None,
+        })
+    }
+
+    /// Construct an endpoint already split by the native endpoint parser.
+    /// Arguments are still passed to OpenSSH as distinct words; `target` is
+    /// quoted separately if it must appear inside a ProxyCommand.
+    pub(crate) fn from_parts(user: &str, host: &str, port: Option<u16>) -> Result<Self> {
+        if user.is_empty()
+            || host.is_empty()
+            || user
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_whitespace())
+            || host
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_whitespace())
+        {
+            bail!("invalid native enrollment endpoint");
+        }
+        Ok(Self {
+            // OpenSSH takes a literal IPv6 address without URI-style
+            // brackets. Brackets belong only in syq's endpoint grammar and
+            // human-facing labels; -p carries the port separately.
+            target: format!("{user}@{host}"),
+            port,
+        })
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.target
+    }
+
+    pub(crate) fn label(&self) -> String {
+        let target = match self.target.rsplit_once('@') {
+            Some((user, host)) if host.contains(':') => format!("{user}@[{host}]"),
+            _ => self.target.clone(),
+        };
+        match self.port {
+            Some(port) => format!("{target}:{port}"),
+            None => target,
+        }
+    }
+
+    fn append_connection_args(&self, args: &mut Vec<String>) {
+        if let Some(port) = self.port {
+            args.extend(["-p".to_owned(), port.to_string()]);
+        }
+        args.extend(["--".to_owned(), self.target.clone()]);
+    }
+
+    fn proxy_target(&self) -> String {
+        let mut words = Vec::new();
+        if let Some(port) = self.port {
+            words.extend(["-p".to_owned(), port.to_string()]);
+        }
+        words.extend(["--".to_owned(), self.target.clone()]);
+        shell_words::join(words)
     }
 }
 
@@ -438,13 +495,12 @@ pub(crate) fn enrollment_ssh_args_raw(
             // end-to-end with HostB.
             args.push("-o".to_owned());
             args.push(format!(
-                "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W '[%h]:%p' -- {}",
-                jump.as_str()
+                "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W '[%h]:%p' {}",
+                jump.proxy_target()
             ));
         }
     }
-    args.push("--".to_owned());
-    args.push(target.as_str().to_owned());
+    target.append_connection_args(&mut args);
     args.push(remote_command.to_owned());
     args
 }
@@ -663,6 +719,28 @@ mod tests {
                 "/opt/syq/enroll",
             ]
         );
+    }
+
+    #[test]
+    fn native_endpoint_port_reaches_direct_and_proxy_routes() {
+        let target = SshEndpoint::from_parts("backup", "2001:db8::1", Some(2222)).unwrap();
+        let jump = SshEndpoint::from_parts("alice", "jump.example", Some(2200)).unwrap();
+        let command = EnrollmentRemoteCommand::new(Path::new("/opt/syq/enroll"), &[]).unwrap();
+        let args = enrollment_ssh_args(
+            &target,
+            EnrollmentRoute::ProxyJump { jump: &jump },
+            &command,
+        );
+        assert!(args.windows(2).any(|args| args == ["-p", "2222"]));
+        assert!(args.iter().any(|arg| {
+            arg.contains("ProxyCommand=")
+                && arg.contains("-p 2200")
+                && arg.contains("alice@jump.example")
+        }));
+        assert_eq!(target.as_str(), "backup@2001:db8::1");
+        assert_eq!(target.label(), "backup@[2001:db8::1]:2222");
+        assert!(args.iter().any(|arg| arg == "backup@2001:db8::1"));
+        assert!(!args.iter().any(|arg| arg.contains("[2001:db8::1]")));
     }
 
     #[test]
