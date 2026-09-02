@@ -85,8 +85,8 @@ pub struct Opts {
     pub ignore_existing: bool,
     /// --existing: never create a destination path that doesn't exist.
     pub existing: bool,
-    /// Follow foreign-owned symlinks in the operator-selected destination.
-    pub insecure_links: bool,
+    /// Symlink policy for the operator-selected destination path.
+    pub operator_symlink_policy: OperatorSymlinkPolicy,
     /// --max-size / --min-size: regular files outside the range are not transferred.
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
@@ -121,6 +121,20 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             })
         }
     })
+}
+
+fn operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+    if args.interface == Interface::Rsync {
+        if args.insecure_links {
+            OperatorSymlinkPolicy::FollowAll
+        } else {
+            OperatorSymlinkPolicy::TrustedOwner
+        }
+    } else if args.native_follow {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    }
 }
 
 /// Open a control connection. It bypasses the data-connection connect
@@ -535,6 +549,10 @@ pub(crate) fn validate_native_source_type(
     kind: Kind,
 ) -> Result<()> {
     match selection {
+        SourceSelection::Contents | SourceSelection::Directory if kind == Kind::Symlink => bail!(
+            "selector {} is a symlink; pass --follow to resolve symlinks",
+            display(path)
+        ),
         SourceSelection::Contents if kind != Kind::Dir => {
             bail!("contents selector {} is not a directory", display(path))
         }
@@ -587,7 +605,7 @@ struct DestinationAnchor {
     request_prefix: PathBytes,
     dev: u64,
     ino: u64,
-    insecure_links: bool,
+    symlink_policy: OperatorSymlinkPolicy,
 }
 type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
 
@@ -832,7 +850,7 @@ pub fn run(args: Args) -> Result<i32> {
         update: args.update,
         ignore_existing: args.ignore_existing,
         existing: args.existing,
-        insecure_links: args.insecure_links,
+        operator_symlink_policy: operator_symlink_policy(&args),
         max_size,
         min_size,
     });
@@ -844,10 +862,23 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
+    if let Some(mapping) = args
+        .native_mapping
+        .as_deref()
+        .filter(|mapping| *mapping != b"-")
+        .filter(|_| !args.native_follow)
+    {
+        crate::fsops::check_operator_path_no_symlinks(mapping, false, false)
+            .map_err(|error| anyhow::anyhow!("--mapping: {error}"))?;
+    }
     if let Some(results) = args.native_results.as_deref() {
         let out: Box<dyn std::io::Write + Send> = if results == b"-" {
             Box::new(std::io::stdout())
         } else {
+            if !args.native_follow {
+                crate::fsops::check_operator_path_no_symlinks(results, false, true)
+                    .map_err(|error| anyhow::anyhow!("--results: {error}"))?;
+            }
             let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
             Box::new(std::io::BufWriter::new(
                 std::fs::File::create(&path)
@@ -1120,11 +1151,19 @@ pub fn run(args: Args) -> Result<i32> {
         &dst.path,
         dst.is_remote(),
     )?;
-    // A destination that is a symlink to a directory is that directory (as
-    // for rsync). Use the resolved target path for all planning and metadata,
-    // so ordinary in-tree symlinks can still be replaced instead of followed.
-    let (dst_root, mut dst_root_entry) =
-        follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?;
+    // Rsync retains its destination-directory compatibility rule. Native
+    // paths instead use one explicit policy: keep the named symlink as the
+    // object by default, or resolve the complete chain under --follow.
+    let (dst_root, mut dst_root_entry) = match args.interface {
+        Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?,
+        _ if args.native_follow => follow_operator_symlink(
+            &mut *dst_ctl,
+            &operator_dst_root,
+            dst_root_entry,
+            args.target_existence != Existence::Existing,
+        )?,
+        _ => (operator_dst_root.clone(), dst_root_entry),
+    };
     if debug() {
         eprintln!(
             "syq: destination stat complete at {:.2}s",
@@ -1150,6 +1189,17 @@ pub fn run(args: Args) -> Result<i32> {
     }
     let dst_is_dir = match args.placement {
         Placement::Into => {
+            if args.interface != Interface::Rsync
+                && !args.native_follow
+                && dst_root_entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.kind == Kind::Symlink)
+            {
+                bail!(
+                    "--into target {} is a symlink; pass --follow to resolve symlinks",
+                    display(&dst_root)
+                );
+            }
             if dst_existed && !dst_entry_is_dir {
                 bail!(
                     "--into target {} exists but is not a directory",
@@ -1187,11 +1237,27 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     if args.interface != Interface::Rsync {
-        // Native selectors are structural: validate every selected root before
-        // a missing --into target can be created. Contents selectors follow
-        // their root and additionally require it to resolve to a directory.
+        // This semantic preflight rejects a static symlink in every parent
+        // component of a directly supplied source path. The broader rooted
+        // copy migration will make the retained identity survive scanning and
+        // content opens in the presence of concurrent namespace mutation.
         for source in srcs {
-            match stat_one(&mut *src_ctl, &source.path, source.follows_root())? {
+            check_operator_directory(
+                &mut *src_ctl,
+                &parent_path(&source.path),
+                false,
+                operator_symlink_policy(&args),
+            )?;
+        }
+        // Native selectors are structural: validate every selected root before
+        // a missing --into target can be created. Contents selectors require
+        // a directory and resolve a selected link only under --follow.
+        for source in srcs {
+            match stat_one(
+                &mut *src_ctl,
+                &source.path,
+                source.follows_root(args.native_follow),
+            )? {
                 Some(entry) => {
                     validate_native_source_type(&source.path, source.selection, entry.kind)?
                 }
@@ -1212,7 +1278,10 @@ pub fn run(args: Args) -> Result<i32> {
     let operator_directory = if dst_is_dir {
         operator_dst_root.clone()
     } else {
-        parent_path(&operator_dst_root)
+        // Exact --follow placement selects the referent itself. Its retained
+        // authority is therefore the referent's parent, which may differ from
+        // the parent of the operator's symlink spelling.
+        parent_path(&dst_root)
     };
     let request_prefix = if dst_is_dir {
         dst_root.clone()
@@ -1228,7 +1297,7 @@ pub fn run(args: Args) -> Result<i32> {
             &mut *dst_ctl,
             &operator_directory,
             allow_missing,
-            args.insecure_links,
+            opts.operator_symlink_policy,
         )?
     } else {
         None
@@ -1291,9 +1360,9 @@ pub fn run(args: Args) -> Result<i32> {
         let remote = dst.is_remote();
         for s in srcs {
             // Only a directory source can trigger the recurse-into-itself trap.
-            // Judge the source the way the scan will: --files-from and
-            // trailing-slash sources are followed through a symlinked root.
-            let follow_root = args.files_from.is_some() || s.follows_root();
+            // Judge the source the way the scan will, including the interface's
+            // explicit selected-root link policy.
+            let follow_root = args.files_from.is_some() || s.follows_root(args.native_follow);
             let src_is_dir = matches!(stat_one(&mut *src_ctl, &s.path, follow_root)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
@@ -1397,7 +1466,7 @@ pub fn run(args: Args) -> Result<i32> {
                 &mut *dst_ctl,
                 selection,
                 request_prefix.clone(),
-                args.insecure_links,
+                opts.operator_symlink_policy,
             )?;
             if create_root {
                 mutation_root_condition = TargetCondition::Matches {
@@ -1618,7 +1687,7 @@ pub fn run(args: Args) -> Result<i32> {
     {
         let src_root = src.path.clone();
         let contents = src.copies_contents();
-        let follow_root = src.follows_root();
+        let follow_root = src.follows_root(args.native_follow);
         // A bare directory source goes to dest/basename even when dest doesn't
         // exist yet; a non-directory source only does so when dest is a directory
         // (decided once the root entry is seen).
@@ -2160,15 +2229,15 @@ fn check_operator_directory(
     conn: &mut dyn Conn,
     path: &[u8],
     allow_missing: bool,
-    insecure_links: bool,
+    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<Option<DirectoryAnchor>> {
     match ok(
         conn.call(Request::CheckOperatorDirectory {
             path: path.to_vec(),
             allow_missing,
-            insecure_links,
+            symlink_policy,
         })?,
-        "destination path",
+        "operator path",
     )? {
         Response::DirectorySelection(selection) => Ok(selection),
         other => bail!("unexpected response {other:?}"),
@@ -2195,14 +2264,14 @@ fn activate_control_destination(
     conn: &mut dyn Conn,
     selection: DirectoryAnchor,
     request_prefix: PathBytes,
-    insecure_links: bool,
+    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<DestinationAnchor> {
     let anchor = DestinationAnchor {
         operator_path: selection.path,
         request_prefix,
         dev: selection.dev,
         ino: selection.ino,
-        insecure_links,
+        symlink_policy,
     };
     match ok(
         conn.call(Request::AnchorDestination {
@@ -2210,7 +2279,7 @@ fn activate_control_destination(
             expected_dev: anchor.dev,
             expected_ino: anchor.ino,
             request_prefix: anchor.request_prefix.clone(),
-            insecure_links,
+            symlink_policy,
         })?,
         "anchor destination root",
     )? {
@@ -2225,7 +2294,7 @@ fn worker_destination_request(anchor: &DestinationAnchor) -> Request {
         expected_dev: anchor.dev,
         expected_ino: anchor.ino,
         request_prefix: anchor.request_prefix.clone(),
-        insecure_links: anchor.insecure_links,
+        symlink_policy: anchor.symlink_policy,
     }
 }
 
@@ -2358,6 +2427,47 @@ fn follow_dir_symlink(
         }
     }
     Ok((path.to_vec(), entry))
+}
+
+/// Resolve a symlink in the last component of a directly supplied native
+/// pathname. Unlike rsync's directory-only compatibility behavior, explicit
+/// `--follow` selects the referent regardless of its type. Placement forms
+/// that allow a missing target may create the referent of a dangling chain.
+fn follow_operator_symlink(
+    conn: &mut dyn Conn,
+    path: &[u8],
+    entry: Option<Entry>,
+    allow_missing: bool,
+) -> Result<(PathBytes, Option<Entry>)> {
+    let Some(mut current) = entry else {
+        return Ok((path.to_vec(), None));
+    };
+    let mut current_path = path.to_vec();
+    for _ in 0..40 {
+        if current.kind != Kind::Symlink {
+            return Ok((current_path, Some(current)));
+        }
+        let target = current
+            .link
+            .as_deref()
+            .context("symlink entry did not include its target")?;
+        current_path = if target.starts_with(b"/") {
+            target.to_vec()
+        } else {
+            join(&parent_path(&current_path), target)
+        };
+        match stat_one(conn, &current_path, false)? {
+            Some(entry) => current = entry,
+            None if allow_missing => return Ok((current_path, None)),
+            None => {
+                bail!(
+                    "operator path {} resolves through a dangling symlink",
+                    display(path)
+                )
+            }
+        }
+    }
+    bail!("too many symlink levels in operator path {}", display(path))
 }
 
 fn display(p: &[u8]) -> String {
@@ -3487,7 +3597,7 @@ impl Planner<'_> {
                     self.dst,
                     selection,
                     root.clone(),
-                    self.opts.insecure_links,
+                    self.opts.operator_symlink_policy,
                 )?;
                 self.mutation_root_condition = TargetCondition::Matches {
                     dev: anchor.dev,

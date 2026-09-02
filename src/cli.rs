@@ -65,12 +65,12 @@ pub struct Args {
     /// not joined into selector strings by the orchestrator.
     #[arg(skip)]
     pub native_rm_cwd: Option<Vec<u8>>,
-    /// Symlink-free containment boundary for native removal.
+    /// Endpoint-side containment boundary for native removal.
     #[arg(skip)]
     pub native_rm_root: Option<Vec<u8>>,
-    /// Permit symlinks while resolving the native removal base/selectors.
+    /// Permit symlinks while resolving directly supplied native endpoint paths.
     #[arg(skip)]
-    pub native_rm_follow: bool,
+    pub native_follow: bool,
     /// Source-side base for `syq map` selectors, joined at walk time so the
     /// emitted `src` values stay relative to it.
     #[arg(skip)]
@@ -461,7 +461,7 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
         .map(crate::bwlimit::parse_rate)
         .transpose()?
         .unwrap_or(0);
-    args.ignore_lines = ordered_ignore_lines(&args.ignore, &args.ignore_from, matches)?;
+    args.ignore_lines = ordered_ignore_lines(&args.ignore, &args.ignore_from, matches, true)?;
     if let Some(f) = &args.files_from {
         // Check this before reading the list (it may be stdin) and before
         // anything connects: the list lives on this machine, but a direct
@@ -488,6 +488,7 @@ fn ordered_ignore_lines(
     ignore: &[String],
     ignore_from: &[String],
     matches: &clap::ArgMatches,
+    follow_paths: bool,
 ) -> Result<Vec<String>> {
     let mut items: Vec<(usize, bool, String)> = Vec::new();
     if let Some(indices) = matches.indices_of("ignore") {
@@ -509,6 +510,10 @@ fn ordered_ignore_lines(
     let mut lines = Vec::new();
     for (_, from_file, value) in items {
         if from_file {
+            if !follow_paths {
+                crate::fsops::check_operator_path_no_symlinks(value.as_bytes(), false, false)
+                    .map_err(|error| anyhow::anyhow!("--ignore-from {value}: {error}"))?;
+            }
             let text = std::fs::read_to_string(&value)
                 .map_err(|error| anyhow::anyhow!("--ignore-from {value}: {error}"))?;
             let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
@@ -537,6 +542,9 @@ struct NativeSelectionArgs {
     /// Resolve relative source selectors from DIR at the source endpoint
     #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
     cwd: Option<OsString>,
+    /// Follow symlinks while resolving directly supplied endpoint paths
+    #[arg(long)]
+    follow: bool,
     /// Select a named source object (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src: Vec<OsString>,
@@ -580,31 +588,31 @@ struct NativeRmSelectionArgs {
         conflicts_with = "root"
     )]
     cwd: Option<OsString>,
-    /// Confine resolution and removal beneath symlink-free DIR
+    /// Confine resolution and removal beneath DIR
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     root: Option<OsString>,
-    /// Follow symlinks while resolving --cwd and source selectors
+    /// Follow symlinks while resolving directly supplied endpoint paths
     #[arg(long)]
     follow: bool,
-    /// Select an object without constraining its terminal type (repeatable)
+    /// Select an object without constraining the selected object's type (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src: Vec<OsString>,
     /// Select a directory's contents, retaining the directory (repeatable)
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     src_src: Vec<OsString>,
-    /// Select a non-directory terminal object (repeatable)
+    /// Select a non-directory object (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src_file: Vec<OsString>,
     /// Select a directory tree (repeatable)
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     src_dir: Vec<OsString>,
-    /// Select several non-directory terminal objects
+    /// Select several non-directory objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
     src_files: Vec<OsString>,
     /// Select several directory trees
     #[arg(long, value_name = "DIR", num_args = 1..)]
     src_dirs: Vec<OsString>,
-    /// Select several objects without constraining their terminal type
+    /// Select several objects without constraining their selected types
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
     /// Select the contents of several directories
@@ -1042,6 +1050,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.native_map_target = native_map_target;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
+    args.native_follow = parsed.selection.follow;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
         // through the source connection; a direct remote-to-remote copy has
@@ -1134,7 +1143,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     args.locations = locations;
     args.native_rm_cwd = parsed.selection.cwd.map(OsStringExt::into_vec);
     args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
-    args.native_rm_follow = parsed.selection.follow;
+    args.native_follow = parsed.selection.follow;
     args.rm = true;
     apply_native_operational(&mut args, parsed.operational);
     Ok(args)
@@ -1232,7 +1241,7 @@ fn apply_native_copy_operational(
         .unwrap_or(0);
     args.bwlimit = bwlimit;
     args.stats = stats;
-    args.ignore_lines = ordered_ignore_lines(&ignore, &ignore_from, matches)?;
+    args.ignore_lines = ordered_ignore_lines(&ignore, &ignore_from, matches, args.native_follow)?;
     args.ignore = ignore;
     args.ignore_from = ignore_from;
     args.inplace = inplace;
@@ -1671,6 +1680,7 @@ mod tests {
     #[test]
     fn native_copy_policies_lower_to_the_shared_engine() {
         let argv = [
+            "--follow",
             "--ignore",
             "*.tmp",
             "--ignore",
@@ -1685,6 +1695,7 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        assert!(args.native_follow);
         assert_eq!(args.ignore_lines, ["*.tmp", "!keep.tmp"]);
         assert!(args.perms);
         assert!(args.owner);
@@ -1836,13 +1847,13 @@ impl Location {
         }
     }
 
-    pub fn follows_root(&self) -> bool {
+    pub fn follows_root(&self, native_follow: bool) -> bool {
         match self.selection {
-            SourceSelection::Named => true,
-            SourceSelection::Contents => true,
-            SourceSelection::NamedNoFollow | SourceSelection::File | SourceSelection::Directory => {
-                false
-            }
+            SourceSelection::Named
+            | SourceSelection::Contents
+            | SourceSelection::NamedNoFollow
+            | SourceSelection::File
+            | SourceSelection::Directory => native_follow,
             SourceSelection::Rsync => self.copies_contents(),
         }
     }

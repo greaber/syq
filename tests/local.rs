@@ -432,8 +432,18 @@ fn native_copy_typed_selectors_are_source_preconditions() {
         &t.s("followed-link"),
     ]);
     assert!(!followed_link.status.success());
-    assert!(stderr_of(&followed_link).contains("--src-dir selector"));
+    assert!(stderr_of(&followed_link).contains("pass --follow"));
     assert!(!t.path("followed-link").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--src-dir",
+        &t.s("src/link"),
+        "--into-new",
+        &t.s("followed-link"),
+    ]);
+    assert_eq!(read(&t.path("followed-link/link/child")), b"child");
 }
 
 #[test]
@@ -732,6 +742,245 @@ fn native_copy_named_selector_preserves_a_root_symlink() {
 }
 
 #[test]
+fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real/file"), b"data");
+    symlink("real", t.path("link")).unwrap();
+
+    let refused = native_syq(&["cp", "--src-src", &t.s("link"), "--into", &t.s("refused")]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(!t.path("refused").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--src-src",
+        &t.s("link"),
+        "--into",
+        &t.s("followed"),
+    ]);
+    assert_eq!(read(&t.path("followed/file")), b"data");
+
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--src",
+        &t.s("link"),
+        "--into",
+        &t.s("named-followed"),
+    ]);
+    assert_eq!(read(&t.path("named-followed/link/file")), b"data");
+    assert!(!t.path("named-followed/real").exists());
+
+    fs::create_dir(t.path("through-link")).unwrap();
+    symlink("../real", t.path("through-link/parent")).unwrap();
+    let refused = native_syq(&[
+        "cp",
+        "--src",
+        &t.s("through-link/parent/file"),
+        "--as",
+        &t.s("never-created"),
+    ]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(!t.path("never-created").exists());
+}
+
+#[test]
+fn native_copy_placement_links_use_the_same_follow_policy() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("source"), b"new");
+    write(&t.path("referent"), b"old");
+    symlink("referent", t.path("exact-link")).unwrap();
+
+    run_native_ok(&["cp", &t.s("source"), "--as-existing", &t.s("exact-link")]);
+    assert_eq!(read(&t.path("exact-link")), b"new");
+    assert_eq!(read(&t.path("referent")), b"old");
+    assert!(!t.path("exact-link").is_symlink());
+
+    write(&t.path("referent"), b"old-again");
+    fs::remove_file(t.path("exact-link")).unwrap();
+    symlink("referent", t.path("exact-link")).unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-existing",
+        &t.s("exact-link"),
+    ]);
+    assert_eq!(read(&t.path("referent")), b"new");
+    assert!(t.path("exact-link").is_symlink());
+
+    symlink("created-referent", t.path("dangling-link")).unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-new",
+        &t.s("dangling-link"),
+    ]);
+    assert_eq!(read(&t.path("created-referent")), b"new");
+    assert!(t.path("dangling-link").is_symlink());
+
+    fs::create_dir_all(t.path("links")).unwrap();
+    write(&t.path("elsewhere/relative-referent"), b"old-relative");
+    symlink(
+        "../elsewhere/relative-referent",
+        t.path("links/relative-link"),
+    )
+    .unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-existing",
+        &t.s("links/relative-link"),
+    ]);
+    assert_eq!(read(&t.path("elsewhere/relative-referent")), b"new");
+    assert!(t.path("links/relative-link").is_symlink());
+
+    let absolute_referent = t.path("elsewhere/absolute-referent");
+    write(&absolute_referent, b"old-absolute");
+    symlink(&absolute_referent, t.path("links/absolute-link")).unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-existing",
+        &t.s("links/absolute-link"),
+    ]);
+    assert_eq!(read(&absolute_referent), b"new");
+    assert!(t.path("links/absolute-link").is_symlink());
+
+    symlink(
+        "../elsewhere/created-external-referent",
+        t.path("links/dangling-external-link"),
+    )
+    .unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-new",
+        &t.s("links/dangling-external-link"),
+    ]);
+    assert_eq!(read(&t.path("elsewhere/created-external-referent")), b"new");
+    assert!(t.path("links/dangling-external-link").is_symlink());
+
+    fs::create_dir(t.path("real-container")).unwrap();
+    symlink("real-container", t.path("container-link")).unwrap();
+    let refused = native_syq(&[
+        "cp",
+        &t.s("source"),
+        "--into-existing",
+        &t.s("container-link"),
+    ]);
+    assert!(!refused.status.success());
+    assert!(!t.path("real-container/source").exists());
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--into-existing",
+        &t.s("container-link"),
+    ]);
+    assert_eq!(read(&t.path("real-container/source")), b"new");
+}
+
+#[test]
+fn native_copy_control_file_paths_use_the_common_follow_policy() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"data");
+    write(&t.path("rules"), b"*.tmp\n");
+    symlink("rules", t.path("rules-link")).unwrap();
+
+    let refused = native_syq(&[
+        "cp",
+        "--ignore-from",
+        &t.s("rules-link"),
+        "--src-src",
+        &t.s("src"),
+        "--into",
+        &t.s("ignored-output"),
+    ]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(!t.path("ignored-output").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--ignore-from",
+        &t.s("rules-link"),
+        "--src-src",
+        &t.s("src"),
+        "--into",
+        &t.s("followed-output"),
+    ]);
+    assert_eq!(read(&t.path("followed-output/keep")), b"data");
+
+    write(
+        &t.path("manifest"),
+        entry_line("keep", "renamed", None).as_bytes(),
+    );
+    symlink("manifest", t.path("manifest-link")).unwrap();
+    let refused = native_syq(&[
+        "cp",
+        "--mapping",
+        &t.s("manifest-link"),
+        "--cwd",
+        &t.s("src"),
+        "--into",
+        &t.s("mapping-output"),
+    ]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(!t.path("mapping-output").exists());
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--mapping",
+        &t.s("manifest-link"),
+        "--cwd",
+        &t.s("src"),
+        "--into",
+        &t.s("mapping-output"),
+    ]);
+    assert_eq!(read(&t.path("mapping-output/renamed")), b"data");
+
+    symlink("real-results", t.path("results-link")).unwrap();
+    let refused = native_syq(&[
+        "cp",
+        "--results",
+        &t.s("results-link"),
+        &t.s("src/keep"),
+        "--as",
+        &t.s("results-output"),
+    ]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(!t.path("real-results").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--results",
+        &t.s("results-link"),
+        &t.s("src/keep"),
+        "--as",
+        &t.s("results-output"),
+    ]);
+    assert!(!read(&t.path("real-results")).is_empty());
+}
+
+#[test]
 fn native_copy_preserves_non_utf8_selector_bytes() {
     let t = Tmp::new();
     let mut name = b"non-utf8-".to_vec();
@@ -880,7 +1129,7 @@ fn native_rm_directory_selector_rejects_a_selected_symlink_before_mutation() {
 }
 
 #[test]
-fn native_rm_follow_removes_the_terminal_object_and_leaves_the_link() {
+fn native_rm_follow_removes_the_referent_and_leaves_the_link() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
@@ -894,7 +1143,7 @@ fn native_rm_follow_removes_the_terminal_object_and_leaves_the_link() {
 }
 
 #[test]
-fn native_rm_follow_contents_empties_the_terminal_directory_and_keeps_the_link() {
+fn native_rm_follow_contents_empties_the_referent_directory_and_keeps_the_link() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
@@ -1007,7 +1256,7 @@ fn native_rm_rejects_absolute_dot_and_dotdot_selectors_before_mutation() {
 }
 
 #[test]
-fn native_rm_root_rejects_base_symlinks_and_symlink_excursions() {
+fn native_rm_root_uses_the_common_follow_policy_and_still_confines_selectors() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
@@ -1016,7 +1265,11 @@ fn native_rm_root_rejects_base_symlinks_and_symlink_excursions() {
     symlink("root", t.path("root-link")).unwrap();
     symlink("../../root/inside", t.path("root/escape")).unwrap();
 
-    let base_link = native_syq(&[
+    let base_link = native_syq(&["rm", "--root", &t.s("root-link"), "--src", "victim"]);
+    assert!(!base_link.status.success());
+    assert_eq!(read(&t.path("root/victim")), b"keep");
+
+    run_native_ok(&[
         "rm",
         "--root",
         &t.s("root-link"),
@@ -1024,7 +1277,8 @@ fn native_rm_root_rejects_base_symlinks_and_symlink_excursions() {
         "--src",
         "victim",
     ]);
-    assert!(!base_link.status.success());
+    assert!(!t.path("root/victim").exists());
+    write(&t.path("root/victim"), b"keep");
 
     let excursion = native_syq(&[
         "rm",
@@ -7737,6 +7991,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "cp",
             "--from",
             "fake",
+            "--follow",
             "--src-src",
             &t.s("src"),
             "--to",
@@ -7766,7 +8021,12 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     assert_eq!(metadata.mode() & 0o777, 0o640);
     assert!(!t.path("dst/skip.tmp").exists());
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
-    for option in ["--ignore=*.tmp", "--preserve=permissions", "--inplace"] {
+    for option in [
+        "--follow",
+        "--ignore=*.tmp",
+        "--preserve=permissions",
+        "--inplace",
+    ] {
         assert!(
             log.contains(option),
             "source command omitted {option}: {log}"
@@ -7893,6 +8153,48 @@ fn native_map_contents_emits_identity_parent_first() {
     assert_eq!(lines[2]["kind"], "symlink");
     assert!(lines[2].get("size").is_none());
     assert_eq!(lines[3]["kind"], "file");
+}
+
+#[test]
+fn native_map_uses_the_common_source_follow_policy() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real/file"), b"data");
+    symlink("real", t.path("link")).unwrap();
+
+    let refused = syq_map_in(&t.path(""), &["--src-src", "link"]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("pass --follow"));
+
+    let lines = map_lines(&syq_map_in(&t.path(""), &["--follow", "--src-src", "link"]));
+    assert_eq!(lines.len(), 1);
+    assert_eq!(map_path(&lines[0], "src"), "file");
+    assert_eq!(lines[0]["kind"], "file");
+
+    let named = syq_map_in(&t.path(""), &["--follow", "--src", "link"]);
+    let lines = map_lines(&named);
+    assert_eq!(map_path(&lines[0], "src"), "real");
+    assert_eq!(map_path(&lines[0], "dst"), "link");
+    assert_eq!(map_path(&lines[1], "src"), "real/file");
+    assert_eq!(map_path(&lines[1], "dst"), "link/file");
+
+    let destination = Tmp::new();
+    let copied = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "--cwd",
+            ".",
+            "--into",
+            &destination.s("mapped"),
+            "-q",
+        ],
+        Some(&named.stdout),
+    );
+    assert_output_ok(&copied);
+    assert_eq!(read(&destination.path("mapped/link/file")), b"data");
 }
 
 #[test]

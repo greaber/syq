@@ -383,7 +383,7 @@ fn open_base(
         bail!("--cwd and --root are mutually exclusive");
     }
     if let Some(path) = root {
-        let directory = resolve_base_path(path, false, "--root", traces)?;
+        let directory = resolve_base_path(path, follow, "--root", traces)?;
         let identity = identity_from_file(&directory)?;
         traces.push(format!(
             "--root {:?} pinned as {}:{}",
@@ -454,7 +454,7 @@ fn resolve_base_path(
         if identity.is_symlink() {
             if !follow {
                 bail!(
-                    "{option} {:?} encounters symlink component {:?}",
+                    "{option} {:?} encounters symlink component {:?}; pass --follow to resolve symlinks",
                     String::from_utf8_lossy(path),
                     String::from_utf8_lossy(&component)
                 );
@@ -1379,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_removes_terminal_object_and_leaves_link() {
+    fn follow_removes_referent_and_leaves_link() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("real")).unwrap();
         fs::write(temp.path().join("real/file"), b"data").unwrap();
