@@ -532,18 +532,18 @@ impl RestrictedAuthority {
             _ => false,
         };
         let mut state = self.state.lock().unwrap();
-        for (index, path) in settlement.0 {
-            state.provisional.remove(&path);
-            if !failed(index) {
-                state.created.insert(path);
+        for creation in settlement.0 {
+            state.provisional.remove(&creation.path);
+            if creation.persist && !failed(creation.index) {
+                state.created.insert(creation.path);
             }
         }
     }
 
-    fn forget_provisional(&self, pending: &[(usize, Vec<u8>)]) {
+    fn forget_provisional(&self, pending: &[PendingCreation]) {
         let mut state = self.state.lock().unwrap();
-        for (_, path) in pending {
-            state.provisional.remove(path);
+        for creation in pending {
+            state.provisional.remove(&creation.path);
         }
     }
 
@@ -564,7 +564,7 @@ impl RestrictedAuthority {
         condition: &mut proto::TargetCondition,
         directory: bool,
         index: usize,
-        pending: &mut Vec<(usize, Vec<u8>)>,
+        pending: &mut Vec<PendingCreation>,
     ) -> Result<()> {
         use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let policy = self.copy.policy.existing;
@@ -627,11 +627,17 @@ impl RestrictedAuthority {
                     ),
                 }
                 if !directory {
-                    // The replacement this request makes is its own from here
-                    // on: metadata later in the same batch lands on the new
+                    // Metadata later in this same batch lands on the new
                     // inode, not the one it replaces, so it must not be
-                    // pinned to the old identity.
-                    pending.push((index, path.to_vec()));
+                    // pinned to the old identity. The replacement is never
+                    // remembered beyond this request: a later request must
+                    // again observe and pin whatever is there, or a chain of
+                    // replacements could change the object's type.
+                    pending.push(PendingCreation {
+                        index,
+                        path: path.to_vec(),
+                        persist: false,
+                    });
                 }
                 Ok(())
             }
@@ -656,7 +662,11 @@ impl RestrictedAuthority {
                     ),
                 }
                 self.state.lock().unwrap().provisional.insert(path.to_vec());
-                pending.push((index, path.to_vec()));
+                pending.push(PendingCreation {
+                    index,
+                    path: path.to_vec(),
+                    persist: true,
+                });
                 Ok(())
             }
             ExistingDestinationPolicyV1::UpdateIfOlder => {
@@ -675,15 +685,15 @@ impl RestrictedAuthority {
         path: &[u8],
         is_dir: bool,
         condition: Option<&mut proto::TargetCondition>,
-        pending: &[(usize, Vec<u8>)],
+        pending: &[PendingCreation],
     ) -> Result<()> {
         use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let label = String::from_utf8_lossy(path);
         // A creation earlier in this same request (a symlink followed by its
         // metadata, say) counts: the batch executes in order, so the
         // metadata only ever lands on this request's own creation.
-        let own =
-            self.created_by_this_grant(path) || pending.iter().any(|(_, created)| created == path);
+        let own = self.created_by_this_grant(path)
+            || pending.iter().any(|creation| creation.path == path);
         match self.copy.policy.existing {
             ExistingDestinationPolicyV1::Skip if is_dir || own => Ok(()),
             ExistingDestinationPolicyV1::Skip => {
@@ -1114,7 +1124,7 @@ impl RestrictedAuthority {
         &self,
         operation: &mut Op,
         index: usize,
-        pending: &mut Vec<(usize, Vec<u8>)>,
+        pending: &mut Vec<PendingCreation>,
     ) -> Result<()> {
         let path = match &*operation {
             Op::Mkdir { path, .. }
@@ -1241,7 +1251,7 @@ impl RestrictedAuthority {
         &self,
         request: &mut Request,
         over_ssh: bool,
-        pending: &mut Vec<(usize, Vec<u8>)>,
+        pending: &mut Vec<PendingCreation>,
     ) -> Result<()> {
         self.check_deadline()?;
         match request {
@@ -1502,7 +1512,17 @@ impl RestrictedAuthority {
 /// Creations an authorized request recorded provisionally, keyed by the
 /// operation or small-put index the executor reports on.
 #[derive(Debug, Default)]
-pub(crate) struct Settlement(Vec<(usize, Vec<u8>)>);
+pub(crate) struct Settlement(Vec<PendingCreation>);
+
+/// One object a request creates or replaces. Only creations that `persist`
+/// become the grant's own once confirmed; a `MustExist` replacement counts
+/// only for the rest of its own request.
+#[derive(Debug)]
+pub(crate) struct PendingCreation {
+    index: usize,
+    path: Vec<u8>,
+    persist: bool,
+}
 
 fn current_account() -> Result<(String, PathBuf)> {
     let uid = unsafe { libc::geteuid() };
@@ -3918,10 +3938,29 @@ mod tests {
         let after = fs::symlink_metadata(&link).unwrap();
         assert_ne!(after.ino(), before.ino());
 
-        // Afterwards the replacement is this grant's own object.
+        // A later request must observe and pin the replacement afresh; it
+        // is not a creation the grant may now treat as its own, so neither a
+        // type change nor an unpinned publication is possible.
         let mut touch = apply(set_meta(&link));
         authority.authorize(&mut touch, false).unwrap();
-        assert_eq!(op_condition(&touch), Any);
+        assert_eq!(
+            op_condition(&touch),
+            Matches {
+                dev: after.dev(),
+                ino: after.ino(),
+            }
+        );
+        let mut as_directory = apply(mkdir(&link));
+        assert!(authority.authorize(&mut as_directory, false).is_err());
+        let mut publish = finalize_request(&link, Any);
+        authority.authorize(&mut publish, false).unwrap();
+        assert_eq!(
+            finalize_condition(&publish),
+            Matches {
+                dev: after.dev(),
+                ino: after.ino(),
+            }
+        );
     }
 
     #[test]
