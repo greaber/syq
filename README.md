@@ -412,8 +412,12 @@ credential caching, and notably a hardware-token approval is not required for
 reuse; do not enable it where that window is unacceptable. Data connections
 are unaffected: they remain separate TCP streams (or independent ssh
 processes under `--no-tcp`), so throughput does not change. Not available
-with an explicit `-e`/`--rsh` or with the command-restricted remote-to-remote
-path, whose host-bound authentication is verified on each fresh connection.
+with an explicit `-e`/`--rsh`. Direct remote-to-remote transfers refuse it —
+the orchestrator runs on the source host, where no reusable local master
+exists — so add `--relay` to keep the orchestrator and its reusable
+connections on this machine; the command-restricted path additionally
+refuses it because its host-bound authentication is verified on each fresh
+connection.
 
 Remote transfers use fast zstd level-1 compression by default. Each protocol
 frame is sent compressed only when that representation is smaller, so archives,
