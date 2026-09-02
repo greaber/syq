@@ -40,8 +40,7 @@ spent its time.
    On a rerun, both sides hash the partial or the differing destination file in
    blocks and only mismatching blocks move, so appends and in-place changes are
    cheap and an interrupted copy resumes where it stopped. Files whose size and
-   mtime match are skipped outright. See [Resume and
-   checkpoints](reference.md#resume-and-checkpoints).
+   mtime match are skipped outright. See [Resume](reference.md#resume).
 5. **Small-file pipelining and setup overlap.** Small files travel as
    pipelined whole-file requests in batches instead of one round trip per
    file. Workers connect while the source is still being scanned, address
@@ -59,11 +58,9 @@ spent its time.
    and up to 32 handshakes at a time; and it halves its concurrency when sshd's
    `MaxStartups` sheds a connection.
 8. **Metadata latency hidden, not multiplied.** Parallel stat and I/O hide the
-   per-operation latency of NFS, FUSE, and object-backed filesystems, and an
-   explicit `--checkpoint` skips destination lookups for files it has already
-   proved complete. Syq does not do fewer metadata operations per file than
-   rsync: staged publication costs a rename per file, and it deliberately does
-   not `fsync` transfer data.
+   per-operation latency of NFS, FUSE, and object-backed filesystems. Syq does
+   not do fewer metadata operations per file than rsync: staged publication
+   costs a rename per file, and it deliberately does not `fsync` transfer data.
 9. **One authentication for direct remote-to-remote transfers.** The default
    restricted path authenticates hostB once with the enrollment key and then
    runs token-authenticated TCP workers; `--agent-broker-only` instead pays an
@@ -131,8 +128,6 @@ These options buy speed by giving something up; the default is the safe side.
 - `--no-compress` saves the compression attempt on a very fast LAN.
 - `-j N` fixes the connection count and disables tuning; `--bwlimit` caps
   throughput to be polite on a shared link.
-- `--checkpoint` skips destination lookups for recorded files and therefore
-  trusts that nothing else modified them.
 
 The rest of this document describes each mechanism in detail.
 

@@ -5,8 +5,11 @@ also copy directly between two remote hosts, `syq rsync hostA:src hostB:dst`
 (natively, `syq cp --from hostA ... --to hostB ...`), and it does so without
 handing hostA your ssh agent. This document describes the topology, the
 default least-privilege authentication path, what it does and does not
-protect, the options that fail closed under it, and the escape hatches. The
-design rationale and threat model are in [Security](security.md).
+protect, the signed policies and the options that fail closed under it, and
+the escape hatches. The design rationale and threat model are in
+[Security](security.md); native topology and transport options (`--run-at`,
+ports, `--rsh`, receiver ceilings) are in the
+[command reference](reference.md#native-commands).
 
 ## Topology
 
@@ -76,8 +79,8 @@ cannot supply special bits or turn this path into chmod authority over existing
 objects. A new directory does retain a setgid bit inherited from its destination
 parent by hostB's kernel; that bit is read from the newly created inode and is
 not accepted from HostA's mode proposal. Preserved modes are bound to the
-receiver-observed inode fingerprint; atomic publication fails if that object
-changes instead of carrying its mode onto a replacement. Hash requests must use
+receiver-observed inode fingerprint; publication fails if that object changes
+instead of carrying its mode onto a replacement. Hash requests must use
 the signed block size, and the receiver rejects any request whose hash vector
 could exceed the protocol frame
 limit.
@@ -94,24 +97,61 @@ access to it.
 ## What the restriction does and does not protect
 
 The restriction protects hostB; it does not make hostA a trustworthy source.
-A compromised hostA can omit source files, alter their contents, lie about
-source metadata, or stop the transfer. It still cannot escape the signed
-destination scopes or independently authenticate to hostB with the enrollment
-key.
+A compromised hostA can invent the source tree wholesale: names, object types,
+metadata, and file bytes need not correspond to anything on hostA's filesystem.
+It can also omit entries or stop the transfer. HostB can enforce only signed
+command properties visible in receiver requests, such as destination scopes,
+publication, preservation, and existing-object policy, resource limits, and
+whether a requested mutation could have survived the signed filter traversal. HostA still cannot
+escape those checks or independently authenticate to hostB with the enrollment
+key. The boundary runs between the two hosts, not inside hostB: the receiver
+runs as the enrolled account and remembers what it created by pathname, so a
+local writer who can already modify the destination tree is outside its
+guarantee, exactly as for the ordinary engine.
 
-## Options that fail closed under the restricted path
+## Signed policies and options that fail closed
 
-The command-restricted path requires atomic staged publication and encrypted
-TCP data connections. `--inplace`, `--no-tcp`, `--tcp-plain`,
-`--tcp-congestion`, `--update`, `--existing`, `--ignore-existing`, native
-`--*-new`/`--*-existing`,
-`--ignore`/`--ignore-from`, `--files-from`, `--mapping`, `--min-size`,
-`--syq-path`, and `--no-bootstrap` currently fail closed because
-the receiver cannot enforce those semantics independently of hostA.
+The command-restricted path requires encrypted TCP data connections. Ordered
+filter rules and `--delete-excluded` are included in a V3 signed grant: the
+receiver requires destination scans to use the exact policy and rejects
+mutations that could only descend through a pruned source directory unless
+their deletion was explicitly authorized. Each source's actual mapped
+destination root is signed, so an explicitly selected named source remains a
+root even when it overlaps an ignored path from another contents source.
+The signed publication policy distinguishes atomic staged writes from
+`--inplace`; in-place requests use descriptor-relative opens and writes beneath
+the enrolled root and cannot silently switch back to staged publication.
+The existing-object policy is signed and enforced by the receiver. Under
+`--ignore-existing` every creation and publication is forced to no-replace
+creation, and metadata or content changes to any non-directory that existed
+before the transfer are refused; existing directories are reused, as in the
+ordinary engine. Under `--existing` the receiver refuses to create any object
+and pins each update to the object it observed, so an existing object cannot
+change type. `--inplace` is refused together with `--ignore-existing`,
+`--existing`, or `--as-new` on this path, because an in-place write opens the
+final pathname directly and can neither be made no-replace nor be pinned to
+an observed object.
+Native `--into-new`/`--as-new` and `--into-existing`/`--as-existing` travel as
+a signed root precondition in a V4 grant, checked against the enrolled root
+when the grant is claimed; an older installed receiver rejects that grant
+safely until `syq enroll` refreshes it. `--update` still fails closed because
+it compares against source modification times that only hostA reports.
+`--no-tcp`, `--tcp-plain`, `--tcp-congestion`, `--files-from`, `--mapping`,
+`--min-size`, `--syq-path`, and `--no-bootstrap` also fail closed because the
+receiver cannot enforce those semantics independently of hostA.
 `--max-size` is enforced as a signed per-file limit, but is refused together
 with deletion because filtered source files could otherwise make hostA's
 deletion plan ambiguous. Explicit `-j` values above 64 are also refused; auto
 tuning may use up to that signed ceiling.
+
+Deletion through the receiver (`cp --prune`, or `--delete` on the rsync-shaped
+command) requires an explicit `--max-delete`, so the deletion authority a
+compromised hostA could exercise inside the scope is always stated on the
+command line rather than defaulting to a hundred million; `--max-delete 0`
+signs a grant that forbids deletion outright. The other signed
+ceilings default to 100 million entries, 8 TiB of file data, and a 23-hour
+grant; native `--max-entries`, `--max-total-bytes`, and `--max-runtime` lower
+them for one transfer, which bounds what a claimed grant is worth to hostA.
 
 `--dry-run` and `--verify-only` are cryptographically read-only: the signed
 grant marks them as such and the receiver rejects every mutation even if hostA
@@ -193,11 +233,11 @@ cache beyond the live SSH sessions and the broker socket's lifetime.
 The constrained path requires OpenSSH 8.9 or newer session-bind and host-bound
 authentication support on the local machine, hostA, and hostB; a local
 `SSH_AUTH_SOCK`; and exact plain host keys for both hosts in the effective local
-`known_hosts` files. Host-certificate/CA-only trust is refused until syq can
-validate certificate principals and validity as strictly as OpenSSH. Static
+`known_hosts` files. Host-certificate/CA-only trust is refused because syq does
+not validate certificate principals and validity as strictly as OpenSSH. Static
 `HostKeyAlgorithms` and `RequiredRSASize` policy is enforced. A configured
 `KnownHostsCommand` or `RevokedHostKeys` KRL is refused because the broker does
-not yet reproduce those dynamic or external revocation checks. Local
+not reproduce those dynamic or external revocation checks. Local
 `CertificateFile` and implicit `IdentityFile` certificate expansion supports the
 ordinary OpenSSH percent tokens except `%C`; named-user tildes are also refused
 rather than guessed. Credential and host-key algorithms that syq's SSH library
@@ -253,7 +293,7 @@ port, static known-hosts files, host-key algorithms, RSA size, and configured or
 implicit user certificates. The default constrained broker requires already
 recorded exact keys for hostA and hostB before connecting; it never learns a key
 through hostA or silently accepts one. Dynamic `KnownHostsCommand`, external
-`RevokedHostKeys`, and host-certificate trust are currently refused as described
+`RevokedHostKeys`, and host-certificate trust are refused as described
 above. If first-contact trust is appropriate, establish it with ordinary SSH
 (directly or through the configured jump path) before starting the transfer.
 An explicit `-e 'ssh -o StrictHostKeyChecking=accept-new'` bypasses the broker
@@ -267,6 +307,3 @@ progress to a log on hostA. HostA needs its own hostB credential because a
 temporary local broker cannot survive detachment. An explicit `--rsh` may
 provide another persistent authentication policy. Reattach with
 `syq --follow hostA:LOG` to stream that progress.
-An explicit `--checkpoint` path belongs to the machine running the
-orchestrator: normally the invoking machine, but hostA for a direct or detached
-remote-to-remote copy (`--relay` keeps it local).

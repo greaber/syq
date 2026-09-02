@@ -63,12 +63,12 @@ Compared with rsync 3.5:
   with `unlinkat`. A name swapped to a different inode is refused, not deleted.
 - The restricted remote-to-remote receiver performs every operation relative
   to an opened root; descendant symlinks are payload, never traversal.
-- Native `cp` and `cp-prune` default to `-rlt`: no owner, group, mode, device,
-  ACL, or xattr is applied unless the rsync-shaped flags ask for it, and ACLs
-  and xattrs are not implemented at all. Several classes of rsync
-  vulnerability are simply unreachable.
+- Native `cp` defaults to `-rlt`: no owner, group, mode, or device is applied
+  unless `--preserve` or the rsync-shaped flags ask for it, and ACLs and
+  xattrs are not implemented at all. Several classes of rsync vulnerability
+  are simply unreachable.
 
-**Not yet at parity.**
+**Where rsync is stronger.**
 
 - **Descendant parents in ordinary copies.** The destination root is retained,
   but many operations on descendants still use pathnames relative to it. An
@@ -92,8 +92,8 @@ Compared with rsync 3.5:
 
 ### What to do
 
-- Prefer native `cp` and `cp-prune` when you do not need owner, mode, or
-  device preservation; they cannot be asked to create a setuid file.
+- Prefer native `cp` without `--preserve` when you do not need owner, mode,
+  or device preservation; it cannot be asked to create a setuid file.
 - Treat every destination directory as a trust boundary for resume state, as
   you would rsync's `--partial-dir`. This matters most when syq runs as root.
 - Leave `--insecure-links` off.
@@ -188,10 +188,16 @@ owns), durably claims the nonce before doing anything, enforces the deadline,
 and then accepts protocol requests only within the signed scope. Redemption is
 at most once; a replayed request is rejected.
 
-Options whose semantics the receiver cannot enforce independently of hostA
-fail closed rather than trusting hostA: filters, `--files-from`, `--mapping`,
-`--inplace`, unencrypted or ssh data transport, and several others (the
-[complete list](remote-to-remote.md#options-that-fail-closed-under-the-restricted-path)
+Filters, `--inplace`, preservation, existing-object policy, and placement
+preconditions are signed into the grant and enforced by the receiver on its
+own. Deletion through the receiver requires an explicit `--max-delete`, and
+the native `--max-entries`, `--max-total-bytes`, and `--max-runtime` options
+lower the signed ceilings for one transfer, so what a claimed grant is worth to
+hostA is always bounded on the command line. Options whose semantics the
+receiver cannot enforce independently of hostA fail closed rather than
+trusting hostA: `--files-from`, `--mapping`, `--update`, unencrypted or ssh
+data transport, and several others (the
+[complete list](remote-to-remote.md#signed-policies-and-options-that-fail-closed)
 is in the remote-to-remote guide). `--dry-run` and `--verify-only` are marked
 read-only in the grant, and the receiver rejects every mutation under them even
 if hostA sends one.
@@ -220,7 +226,7 @@ data path that would need one.
 |---|---|---|---|
 | Default (enrolled receiver + broker) | A signed single-use grant; broker signs with the enrollment key for this path only | Yes: cannot escape the destination, widen semantics, exceed limits, or replay | A → B directly |
 | `--agent-broker-only` | Broker access to your ambient agent, valid only for hostA→user@hostB | Partially: cannot reach other hosts or users, but has that account's full authority during the session | A → B directly |
-| `--relay` | Nothing | Yes, by never involving hostA in authentication | A → you → B, at your bandwidth |
+| `--relay` (natively `--run-at local`) | Nothing | Yes, by never involving hostA in authentication | A → you → B, at your bandwidth |
 | `--no-forward-agent` | Nothing; hostA must already hold its own hostB credential | Out of syq's hands | A → B directly |
 | `--unrestricted-agent-forwarding` | Your whole agent, as `ssh -A` would | No; compatibility escape hatch with a warning `-q` cannot silence | A → B directly |
 | `-e CMD` | Whatever the command does | Whatever the command does | A → B directly |

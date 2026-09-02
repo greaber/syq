@@ -67,7 +67,7 @@ Emission refuses names that are not valid UTF-8 (so published
 one-line transforms are safe by construction); mappings you author
 yourself may use the base64 form for such names.
 
-In this first version `syq map` reads a local source (`--from` is
+`syq map` reads a local source (`--from` is
 refused), and takes either `--src-src DIR` as the only selector or any
 number of relative named selectors. It never contacts a destination,
 so `--to` and `--into` do not change what is emitted and the
@@ -236,17 +236,27 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
   policy: preservation and comparison behavior stay global.
 - An entry claims exactly one object. A `dir` entry claims the
   directory itself, without its contents.
-- Symlinks are never resolved in mapping handling: a symlink maps as a
-  symlink, and a destination path that would traverse a symlink inside
-  the target container fails that entry. Resolve links yourself before
-  emitting if you want targets instead.
+- The command-line path naming a manifest, the `-C` source base, and the
+  `--into` placement are directly supplied paths: native mode refuses to
+  traverse symlinks in them by default, while `--follow` resolves them. Paths
+  inside the manifest are data and are not changed by `--follow`.
+- When `syq map --follow` resolves a named selector, it emits the referent's
+  source-base-relative path so the manifest remains executable without link
+  traversal. It refuses a referent outside that base; pass the real path with a
+  matching `-C` base instead. A followed contents selector keeps ordinary
+  contents-relative entries and requires the consumer to select the same base
+  with `--follow`.
+- Symlinks selected by mapping entries are never resolved by mapping handling:
+  a symlink maps as a symlink, and a destination path that would traverse a
+  symlink inside the target container fails that entry. Resolve links before
+  emitting the manifest if you want targets instead.
 - `kind: "special"` asserts the source's type; it does not override the
   fixed `-rlt` fidelity, which copies no special files. Such an entry is
   a policy exclusion like `--min-size`: the run still succeeds and the
   entry appears only in the excluded aggregate. Filter with
   `jq -c 'select(.kind != "special")'` to drop such entries up front.
-- Mappings define no deletion region, so `--mapping` is not available
-  on `cp-prune`.
+- Mappings define no deletion region, so `--mapping` cannot be combined
+  with `--prune`.
 - Duplicate lines are errors, even identical ones: a duplicate almost
   always means a generator bug. Deduplicate in your generator if you
   union overlapping fragments.
@@ -270,9 +280,17 @@ failed mapping entry, an `error` record per counted error, and exactly
 one terminal `result` with the exit code and aggregate counts. The
 records carry `schema_version: 0` — an unstable preview of the planned
 automation interface; unchanged and excluded entries appear only in
-the terminal aggregates, and metadata-only updates are not yet
+the terminal aggregates, and metadata-only updates are not
 reported per operation. A missing terminal record means the run did
 not finish.
+
+The results writer lives with the transfer coordinator. For a direct
+remote-to-remote copy, use `--results -` to stream its NDJSON back over the
+coordinator connection. A named results file is accepted only when the
+coordinator is local, including `--run-at local`; this avoids interpreting a
+local-looking pathname on a remote host. `--results` cannot be combined with
+`--detach`, because the caller would no longer be attached for the complete
+stream and its terminal record.
 
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:

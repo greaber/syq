@@ -127,6 +127,4 @@ that differs is hashed in blocks and only the mismatching blocks move; and
 because the partial-file name is derived from the logical command rather than
 chosen at random, the rerun finds its own state without a state file. Two
 different commands into one tree produce the union of their files. The
-[resume section](reference.md#resume-and-checkpoints) has the exact rules and
-the one deliberate exception, `--checkpoint`, which trusts recorded
-completions to skip destination lookups on very large repeated jobs.
+[resume section](reference.md#resume) has the exact rules.

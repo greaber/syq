@@ -94,7 +94,7 @@ Today its biggest strengths are speed and secure remote-to-remote transfers.
 Its composability story is still developing but is arguably already ahead of
 rsync's. On filesystem hardening, rsync, and especially [its security
 design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md), has
-been a great teacher; the student has not yet surpassed the master, and the
+been a great teacher; the student has not surpassed the master, and the
 gaps are documented rather than hidden.
 
 ## Speed
@@ -234,7 +234,7 @@ it does not. Report vulnerabilities as described in [SECURITY.md](https://github
    The biggest missing piece is rsync's filter rules; `--ignore` takes
    gitignore syntax instead. The [compatibility record](docs/rsync-compat.md)
    lists what matches, what differs on purpose, and what is missing.
-2. **Native mode.** `syq cp`, `syq cp-prune`, `syq rm`, and `syq map` put the
+2. **Native mode.** `syq cp`, `syq rm`, and `syq map` put the
    verb first, make endpoints, selection, and placement explicit, and add what
    rsync lacks: a parallel `rm`, exact placement, mappings. Native mode is
    experimental, and its grammar may change between releases.
