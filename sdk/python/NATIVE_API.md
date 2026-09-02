@@ -431,7 +431,8 @@ frozen dataclasses corresponding to its known records: `RunEvent`, sampled
 and the terminal `CpResult`. Additive unknown record types are validated for a
 well-formed envelope and sequence position, then ignored.
 
-The schema in [AUTOMATION.md](../../AUTOMATION.md), not this document, owns
+The product's [automation-v1 contract](../../docs/automation-v1.md) and
+[JSON Schema](../../schemas/automation-v1.schema.json), not this document, own
 their exact fields and enum members. The Python types expose every stable
 schema field without parsing display text.
 
@@ -504,8 +505,9 @@ not automatically rerun operations. Retry timing, attempt limits, and whether
 the source/destination state is still appropriate belong to the application.
 
 An incomplete stream cannot produce a complete retry manifest: unobserved
-operations may exist. Retry helpers therefore become usable only after a
-terminal result whose status says every queued operation settled.
+operations may exist. Collected entries must not be used until the terminal
+result arrives with status `success` or `partial`, the two statuses for which
+automation v1 guarantees that every queued operation settled.
 
 ## Raw execution
 
