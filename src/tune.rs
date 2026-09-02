@@ -1055,6 +1055,7 @@ mod tests {
             local_process: false,
             user: Some("user".into()),
             host: host.into(),
+            port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
             auto_helper: false,
