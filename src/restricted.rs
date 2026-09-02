@@ -626,6 +626,13 @@ impl RestrictedAuthority {
                         "requested identity for {label} does not match the object the receiver observed"
                     ),
                 }
+                if !directory {
+                    // The replacement this request makes is its own from here
+                    // on: metadata later in the same batch lands on the new
+                    // inode, not the one it replaces, so it must not be
+                    // pinned to the old identity.
+                    pending.push((index, path.to_vec()));
+                }
                 Ok(())
             }
             ExistingDestinationPolicyV1::Skip | ExistingDestinationPolicyV1::Replace => {
@@ -682,6 +689,7 @@ impl RestrictedAuthority {
             ExistingDestinationPolicyV1::Skip => {
                 bail!("signed grant retains existing objects: {label} may not be modified")
             }
+            ExistingDestinationPolicyV1::MustExist if own => Ok(()),
             ExistingDestinationPolicyV1::MustExist => {
                 // Updates are pinned to the observed object, like
                 // publications: nothing hostA supplies names an inode on its
@@ -3859,6 +3867,61 @@ mod tests {
         assert!(authority.authorize(&mut bogus, false).is_err());
         let mut absent = apply(set_meta(&missing));
         assert!(authority.authorize(&mut absent, false).is_err());
+    }
+
+    #[test]
+    fn must_exist_replacement_and_metadata_execute_as_one_batch() {
+        use proto::TargetCondition::{Any, Matches};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let link = target.join("link");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink("old-target", &link).unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::MustExist,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap();
+        let before = fs::symlink_metadata(&link).unwrap();
+
+        // A changed symlink is replaced and then given its metadata in one
+        // ordinary batch. The replacement is pinned to the old inode; the
+        // metadata must land on the new one.
+        let mut batch = Request::Apply {
+            ops: vec![symlink_op(&link), set_meta(&link)],
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut batch, false).unwrap();
+        let Request::Apply {
+            ops,
+            guard: Some(guard),
+        } = &batch
+        else {
+            unreachable!()
+        };
+        assert!(matches!(
+            ops[0],
+            Op::Symlink { condition: Matches { dev, ino }, .. }
+                if (dev, ino) == (before.dev(), before.ino())
+        ));
+        assert!(matches!(ops[1], Op::SetMeta { condition: Any, .. }));
+        let results = crate::fsops::FsOps::new().apply(ops, Some(guard));
+        assert!(results.iter().all(Option::is_none), "{results:?}");
+        authority.settle(settlement, &proto::Response::Applied(results));
+        assert_eq!(
+            fs::read_link(&link).unwrap().as_os_str().as_bytes(),
+            b"elsewhere"
+        );
+        let after = fs::symlink_metadata(&link).unwrap();
+        assert_ne!(after.ino(), before.ino());
+
+        // Afterwards the replacement is this grant's own object.
+        let mut touch = apply(set_meta(&link));
+        authority.authorize(&mut touch, false).unwrap();
+        assert_eq!(op_condition(&touch), Any);
     }
 
     #[test]
