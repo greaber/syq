@@ -24,6 +24,13 @@ Their registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELE
    `v*` tags to release maintainers. GitHub's ruleset signature rule applies to
    commits, not annotated tag-object signatures; the release workflow checks
    the latter explicitly through GitHub's tag verification API.
+   The repository's selected-actions policy permits GitHub-owned actions and
+   the exact full-SHA
+   `rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18`
+   reference used by `release.yml`, while continuing to require full-SHA pins
+   and deny verified actions generally. This narrow exception lets the release
+   exchange GitHub OIDC identity for a crates.io credential without broadening
+   the Actions trust boundary beyond the one official Rust action it needs.
 4. Publish the first `syq` version to crates.io manually, then add a GitHub
    trusted publisher for repository `greaber/syq`, workflow `release.yml`, and
    environment `release`. Do not put a long-lived crates.io token in GitHub
