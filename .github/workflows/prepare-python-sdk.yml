@@ -1,0 +1,122 @@
+name: prepare Python SDK release
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: prepare-python-sdk-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out current master
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Install pinned Python tooling
+        run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
+      - name: Validate and download the immutable syq release manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$RELEASE_COMMIT"
+          git merge-base --is-ancestor "$RELEASE_COMMIT" origin/master
+          test "$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isImmutable \
+            --jq '[.tagName, .isDraft, .isImmutable] | @tsv')" = \
+            "$RELEASE_TAG"$'\tfalse\ttrue'
+          mkdir -p "$RUNNER_TEMP/syq-release"
+          gh release download "$RELEASE_TAG" \
+            --pattern syq-release-manifest.json \
+            --dir "$RUNNER_TEMP/syq-release"
+          test "$(jq -er .tag \
+            "$RUNNER_TEMP/syq-release/syq-release-manifest.json")" = \
+            "$RELEASE_TAG"
+      - name: Prepare the next Python SDK mapping
+        id: prepare
+        env:
+          RELEASE_MANIFEST: ${{ runner.temp }}/syq-release/syq-release-manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/prepare-python-sdk-release.py \
+            --manifest "$RELEASE_MANIFEST"
+          uv lock --project sdk/python --offline
+          if git diff --quiet; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          scripts/test-python-sdk-release-tools.sh
+          PYTHONPATH=sdk/python/src \
+            uv run --project sdk/python --frozen \
+            python -m unittest discover -s sdk/python/tests
+          python_version=$(python3 -c \
+            'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
+          syq_version=$(jq -er .version "$RELEASE_MANIFEST")
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          echo "python_version=$python_version" >> "$GITHUB_OUTPUT"
+          echo "syq_version=$syq_version" >> "$GITHUB_OUTPUT"
+      - name: Commit the prepared release and open a pull request
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHON_VERSION: ${{ steps.prepare.outputs.python_version }}
+          SYQ_VERSION: ${{ steps.prepare.outputs.syq_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="automation/python-sdk-v$SYQ_VERSION"
+          existing=$(
+            gh pr list --head "$branch" --state open \
+              --json headRepository,url |
+              jq -r --arg repository "$GITHUB_REPOSITORY" \
+                -f scripts/select-trusted-pr.jq
+          )
+          if test -n "$existing"; then
+            echo "Python SDK update already exists: $existing"
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "Remote branch $branch exists without an open pull request; refusing to overwrite it." >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git add sdk/README.md sdk/python sdk/RELEASING.md
+          git diff --cached --check
+          git commit -m "Pin Python SDK $PYTHON_VERSION to syq $SYQ_VERSION"
+          git push origin "$branch"
+          body=$(printf '%s\n\n%s\n%s\n%s\n\n%s' \
+            "Automated follow-up to the immutable syq v$SYQ_VERSION release." \
+            "- bumps the Python SDK to $PYTHON_VERSION" \
+            "- embeds the exact signed v$SYQ_VERSION release manifest" \
+            "- updates the documented SDK-to-syq mapping" \
+            "The SDK checks were dispatched explicitly because GitHub suppresses ordinary workflow events for branches and pull requests created by GITHUB_TOKEN. Review and merge this pull request normally; publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
+          pr_url=$(gh pr create \
+            --base master \
+            --head "$branch" \
+            --title "Pin Python SDK $PYTHON_VERSION to syq $SYQ_VERSION" \
+            --body "$body")
+          echo "Created $pr_url"
+          gh workflow run ci.yml --ref "$branch"
+          gh workflow run rsync-compat.yml --ref "$branch"

@@ -535,6 +535,18 @@ struct NativeSelectionArgs {
     /// Select a directory's contents (repeatable)
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     src_src: Vec<OsString>,
+    /// Select a named non-directory source object (repeatable)
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    src_file: Vec<OsString>,
+    /// Select a named source directory (repeatable)
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    src_dir: Vec<OsString>,
+    /// Select several named non-directory source objects
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    src_files: Vec<OsString>,
+    /// Select several named source directories
+    #[arg(long, value_name = "DIR", num_args = 1..)]
+    src_dirs: Vec<OsString>,
     /// Select several named source objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
@@ -578,6 +590,12 @@ struct NativeRmSelectionArgs {
     /// Select a directory tree (repeatable)
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     src_dir: Vec<OsString>,
+    /// Select several non-directory terminal objects
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    src_files: Vec<OsString>,
+    /// Select several directory trees
+    #[arg(long, value_name = "DIR", num_args = 1..)]
+    src_dirs: Vec<OsString>,
     /// Select several objects without constraining their terminal type
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
@@ -603,6 +621,30 @@ struct NativeOperationalArgs {
     /// Use a fixed number of parallel connections/workers
     #[arg(short = 'j', long = "connections", value_name = "N")]
     connections: Option<usize>,
+    /// Show progress even when stderr is not a terminal
+    #[arg(long, overrides_with = "no_progress")]
+    progress: bool,
+    /// Never show the human progress display
+    #[arg(long)]
+    no_progress: bool,
+    /// Emit machine-readable progress lines (JSON) on stderr
+    #[arg(long)]
+    progress_json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct NativeCopyOperationalArgs {
+    #[command(flatten)]
+    common: NativeOperationalArgs,
+    /// Disable transport compression
+    #[arg(long)]
+    no_compress: bool,
+    /// Limit aggregate file-data throughput (default unit: KiB/s; 0 disables)
+    #[arg(long, value_name = "RATE")]
+    bwlimit: Option<String>,
+    /// Print transfer statistics at the end
+    #[arg(long)]
+    stats: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -671,7 +713,7 @@ struct NativeCopyFields {
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     results: Option<OsString>,
     #[command(flatten)]
-    operational: NativeOperationalArgs,
+    operational: NativeCopyOperationalArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -680,7 +722,7 @@ struct NativeCopyFields {
     version,
     about = "Copy selected objects with explicit endpoint and placement syntax",
     long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies use fixed rsync -rlt behavior: recursive traversal, symlinks copied as symlinks, and modification times preserved. Permissions, owner, group, devices, and special files are not preserved.",
-    override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | PATH]... PLACEMENT"
+    override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyCommand {
     #[command(flatten)]
@@ -693,7 +735,7 @@ struct NativeCopyCommand {
     version,
     about = "Copy selected objects, then remove target-only objects in mapped scopes",
     long_about = "Copy selected objects, then remove target-only objects in mapped scopes.\n\nCopying uses fixed rsync -rlt behavior: recursive traversal, symlinks copied as symlinks, and modification times preserved. Permissions, owner, group, devices, and special files are not preserved. Removal uses the current post-transfer deletion scopes and guards.",
-    override_usage = "syq cp-prune [OPTIONS] [--src PATH | --src-src DIR | PATH]... PLACEMENT"
+    override_usage = "syq cp-prune [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyPruneCommand {
     #[command(flatten)]
@@ -777,7 +819,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     if results.is_some() && interface != Interface::NativeCp {
         bail!("--results is only available on syq cp");
     }
-    if results.is_some() && parsed.operational.dry_run {
+    if results.is_some() && parsed.operational.common.dry_run {
         // Dry-run trace output is a deliberately deferred automation
         // feature; a version-0 results stream reusing the live counters
         // would claim planned work as transferred.
@@ -878,22 +920,11 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     if placement == Placement::As && mapping.is_some() {
         bail!("--as conflicts with --mapping: each entry's dst is its own --as");
     }
-    if placement == Placement::As
-        && (locations.len() != 1
-            || !matches!(
-                locations[0].selection,
-                SourceSelection::Named | SourceSelection::NamedNoFollow
-            ))
-    {
+    if placement == Placement::As && (locations.len() != 1 || locations[0].copies_contents()) {
         bail!("--as, --as-new, and --as-existing require exactly one ordinary source object");
     }
     if placement == Placement::Into {
-        for source in locations.iter().filter(|source| {
-            matches!(
-                source.selection,
-                SourceSelection::Named | SourceSelection::NamedNoFollow
-            )
-        }) {
+        for source in locations.iter().filter(|source| !source.copies_contents()) {
             if native_basename(&source.path).is_none() {
                 bail!(
                     "named source {:?} has no target basename; use --src-src to select directory contents",
@@ -960,7 +991,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             bail!("--mapping with a remote-to-remote copy is not supported; one end must be local");
         }
     }
-    apply_native_operational(&mut args, parsed.operational);
+    apply_native_copy_operational(&mut args, parsed.operational)?;
     apply_internal_native_direct(&mut args)?;
     Ok(args)
 }
@@ -1004,6 +1035,16 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
             "src_dir",
             SourceSelection::Directory,
             &parsed.selection.src_dir,
+        ),
+        (
+            "src_files",
+            SourceSelection::File,
+            &parsed.selection.src_files,
+        ),
+        (
+            "src_dirs",
+            SourceSelection::Directory,
+            &parsed.selection.src_dirs,
         ),
     ] {
         if let Some(indices) = matches.indices_of(id) {
@@ -1049,6 +1090,10 @@ fn lower_native_selection(
         ("srcs", SourceSelection::NamedNoFollow, &parsed.srcs),
         ("src_src", SourceSelection::Contents, &parsed.src_src),
         ("src_srcs", SourceSelection::Contents, &parsed.src_srcs),
+        ("src_file", SourceSelection::File, &parsed.src_file),
+        ("src_dir", SourceSelection::Directory, &parsed.src_dir),
+        ("src_files", SourceSelection::File, &parsed.src_files),
+        ("src_dirs", SourceSelection::Directory, &parsed.src_dirs),
     ] {
         if let Some(indices) = matches.indices_of(id) {
             ordered.extend(
@@ -1093,6 +1138,34 @@ fn apply_native_operational(args: &mut Args, operational: NativeOperationalArgs)
     args.verbose = operational.verbose;
     args.quiet = operational.quiet;
     args.connections_opt = operational.connections;
+    args.progress = operational.progress;
+    args.no_progress = operational.no_progress;
+    args.progress_json = operational.progress_json;
+}
+
+fn apply_native_copy_operational(
+    args: &mut Args,
+    operational: NativeCopyOperationalArgs,
+) -> Result<()> {
+    let NativeCopyOperationalArgs {
+        common,
+        no_compress,
+        bwlimit,
+        stats,
+    } = operational;
+    args.no_compress = no_compress;
+    if no_compress {
+        args.compress = false;
+    }
+    args.bwlimit_bytes = bwlimit
+        .as_deref()
+        .map(crate::bwlimit::parse_rate)
+        .transpose()?
+        .unwrap_or(0);
+    args.bwlimit = bwlimit;
+    args.stats = stats;
+    apply_native_operational(args, common);
+    Ok(())
 }
 
 /// Direct remote-to-remote execution needs a few automatically derived engine
@@ -1648,21 +1721,13 @@ impl Location {
         }
     }
 
-    /// Native contents selectors must name directories; rsync's trailing-slash
-    /// spelling keeps its existing scan-time behavior.
-    pub fn requires_directory(&self) -> bool {
-        matches!(
-            self.selection,
-            SourceSelection::Contents | SourceSelection::Directory
-        )
-    }
-
     pub fn follows_root(&self) -> bool {
         match self.selection {
             SourceSelection::Named => true,
             SourceSelection::Contents => true,
-            SourceSelection::NamedNoFollow => false,
-            SourceSelection::File | SourceSelection::Directory => true,
+            SourceSelection::NamedNoFollow | SourceSelection::File | SourceSelection::Directory => {
+                false
+            }
             SourceSelection::Rsync => self.copies_contents(),
         }
     }

@@ -1,9 +1,12 @@
 //! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
-use crate::cli::{parse_rsh, parse_size, Args, Existence, Interface, Location, Placement};
+use crate::cli::{
+    parse_rsh, parse_size, Args, Existence, Interface, Location, Placement, SourceSelection,
+};
 use crate::conn::{
-    ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, TcpCandidate, TcpPairStats,
+    ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
+    TcpPairStats,
 };
 use crate::fsops::{is_partial_name, join};
 use crate::progress::{commas, human, Progress, WorkerStatus};
@@ -13,7 +16,7 @@ use crate::tune::{self, Gate};
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::sync::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
@@ -24,17 +27,23 @@ pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 const FAST_BATCH_FILES: usize = 128;
 // Larger batches trade filesystem overlap for fewer request/ack turns. On the
 // measured 262 ms path, 4,096 one-byte files at eight workers improved from a
-// 9.68 s to an 8.72 s median at 512; keep the change confined to high RTT TCP.
+// 9.68 s to an 8.72 s median at 512. Direct TCP exposes its RTT; remote SSH
+// does not, but needs the same amortization and remains bounded by bytes below.
 const HIGH_RTT_FAST_BATCH_FILES: usize = 512;
 const HIGH_RTT_US: u64 = 100_000;
 const FAST_BATCH_BYTES: u64 = 16 << 20;
 const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 
-fn fast_batch_file_limit(src_rtt_us: Option<u64>, dst_rtt_us: Option<u64>) -> usize {
-    if src_rtt_us
-        .into_iter()
-        .chain(dst_rtt_us)
-        .any(|rtt| rtt >= HIGH_RTT_US)
+fn fast_batch_file_limit(
+    src_rtt_us: Option<u64>,
+    dst_rtt_us: Option<u64>,
+    remote_ssh_data: bool,
+) -> usize {
+    if remote_ssh_data
+        || src_rtt_us
+            .into_iter()
+            .chain(dst_rtt_us)
+            .any(|rtt| rtt >= HIGH_RTT_US)
     {
         HIGH_RTT_FAST_BATCH_FILES
     } else {
@@ -53,6 +62,9 @@ pub struct Opts {
     pub verify_only: bool,
     pub inplace: bool,
     pub same_host: bool,
+    /// Automatic copies and explicit -j1 may use one direct userspace writer
+    /// for the proven local-filesystem -> asynchronous-NFS topology.
+    pub allow_sequential_nfs_fallback: bool,
     pub dst_remote: bool,
     pub restricted_receiver: bool,
     pub dry_run: bool,
@@ -84,21 +96,31 @@ pub struct Opts {
 pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     Ok(match &loc.host {
         None => Endpoint::Local,
-        Some(h) => Endpoint::Remote(RemoteSpec {
-            local_process: false,
-            user: loc.user.clone(),
-            host: h.clone(),
-            rsh: parse_rsh(&args.rsh)?,
-            syq_path: args.syq_path.clone(),
-            auto_helper: args.restricted_grant.is_none()
-                && args.syq_path.is_none()
-                && !args.no_bootstrap,
-            restricted_grant: args.restricted_grant.clone(),
-            helper_install: Default::default(),
-            quiet: args.quiet,
-            tcp: Default::default(),
-            diagnostics: Default::default(),
-        }),
+        Some(h) => {
+            let rsh = parse_rsh(&args.rsh)?;
+            let ssh_multiplexer = args
+                .rsh
+                .is_none()
+                .then(SshMultiplexer::new)
+                .transpose()?
+                .map(Arc::new);
+            Endpoint::Remote(RemoteSpec {
+                local_process: false,
+                user: loc.user.clone(),
+                host: h.clone(),
+                rsh,
+                syq_path: args.syq_path.clone(),
+                auto_helper: args.restricted_grant.is_none()
+                    && args.syq_path.is_none()
+                    && !args.no_bootstrap,
+                restricted_grant: args.restricted_grant.clone(),
+                helper_install: Default::default(),
+                ssh_multiplexer,
+                quiet: args.quiet,
+                tcp: Default::default(),
+                diagnostics: Default::default(),
+            })
+        }
     })
 }
 
@@ -505,8 +527,28 @@ struct DestinationRoot<'a> {
 struct SourceMapping<'a> {
     follow_root: bool,
     contents: bool,
-    require_directory: bool,
+    selection: SourceSelection,
     sub: &'a [u8],
+}
+
+fn validate_native_source_type(path: &[u8], selection: SourceSelection, kind: Kind) -> Result<()> {
+    match selection {
+        SourceSelection::Contents if kind != Kind::Dir => {
+            bail!("contents selector {} is not a directory", display(path))
+        }
+        SourceSelection::Directory if kind != Kind::Dir => {
+            bail!("--src-dir selector {} is not a directory", display(path))
+        }
+        SourceSelection::File if kind == Kind::Dir => {
+            bail!("--src-file selector {} is a directory", display(path))
+        }
+        SourceSelection::Rsync
+        | SourceSelection::Named
+        | SourceSelection::NamedNoFollow
+        | SourceSelection::File
+        | SourceSelection::Directory
+        | SourceSelection::Contents => Ok(()),
+    }
 }
 
 fn copy_identity(
@@ -649,6 +691,48 @@ fn read_umask() -> u32 {
         libc::umask(m);
         m as u32
     }
+}
+
+fn handle_tcp_setup_error(
+    args: &Args,
+    spec: &RemoteSpec,
+    ports: (u16, u16),
+    error: anyhow::Error,
+    sched: &Sched,
+    progress: &Progress,
+) -> Result<()> {
+    if crate::conn::is_tcp_congestion_error(&error) {
+        sched.abort();
+        progress.stop();
+        return Err(error).with_context(|| {
+            format!(
+                "{} could not apply --tcp-congestion {}",
+                spec.label(),
+                args.tcp_congestion.as_deref().unwrap_or_default()
+            )
+        });
+    }
+    if spec.restricted_grant.is_some() {
+        sched.abort();
+        progress.stop();
+        return Err(error).with_context(|| {
+            format!(
+                "{}: a signed receiver uses its one SSH authorization for the control connection, so encrypted TCP data connections are required",
+                spec.label()
+            )
+        });
+    }
+    if !args.quiet || debug() {
+        let congestion_note =
+            crate::conn::tcp_congestion_fallback_note(args.tcp_congestion.as_deref());
+        eprintln!(
+            "syq: {}: data over ssh (TCP ports {}-{} not reachable: {error:#}{congestion_note}); a Tailscale address or an open port is faster",
+            spec.label(),
+            ports.0,
+            ports.1
+        );
+    }
+    Ok(())
 }
 
 pub fn run(args: Args) -> Result<i32> {
@@ -846,6 +930,7 @@ pub fn run(args: Args) -> Result<i32> {
         verify_only: args.verify_only,
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
+        allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
         dry_run: args.dry_run,
@@ -898,6 +983,7 @@ pub fn run(args: Args) -> Result<i32> {
     let destination_anchor_required = args.restricted_grant.is_none();
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
         Arc::new(Mutex::new(Vec::new()));
+    let connect_after_file_plan = Arc::new(AtomicBool::new(false));
     let transport_stats: Arc<Mutex<Vec<TcpPairStats>>> = Arc::new(Mutex::new(Vec::new()));
     let spawn_worker: Arc<dyn Fn(usize) + Send + Sync> = {
         let (
@@ -912,6 +998,7 @@ pub fn run(args: Args) -> Result<i32> {
             destination_anchor,
             bwlimit,
             transport_stats,
+            connect_after_file_plan,
         ) = (
             src_ep.clone(),
             dst_ep.clone(),
@@ -924,6 +1011,7 @@ pub fn run(args: Args) -> Result<i32> {
             destination_anchor.clone(),
             bwlimit.clone(),
             transport_stats.clone(),
+            connect_after_file_plan.clone(),
         );
         let compress = args.compress;
         let collect_tcp_stats = args.stats;
@@ -939,6 +1027,7 @@ pub fn run(args: Args) -> Result<i32> {
                 destination_anchor,
                 bwlimit,
                 transport_stats,
+                connect_after_file_plan,
             ) = (
                 src_ep.clone(),
                 dst_ep.clone(),
@@ -950,8 +1039,23 @@ pub fn run(args: Args) -> Result<i32> {
                 destination_anchor.clone(),
                 bwlimit.clone(),
                 transport_stats.clone(),
+                connect_after_file_plan.clone(),
             );
             let h = std::thread::spawn(move || -> Result<()> {
+                if connect_after_file_plan.load(Relaxed) && !sched.wait_for_anticipated_file_work()
+                {
+                    gate.mark_absent(id);
+                    return Ok(());
+                }
+                let initial_destination = if destination_anchor_required {
+                    Some(worker_destination_request(
+                        destination_anchor
+                            .get()
+                            .context("destination root was not anchored before workers started")?,
+                    ))
+                } else {
+                    None
+                };
                 let mut failures = 0u32;
                 loop {
                     if !gate.retained(id) {
@@ -959,12 +1063,18 @@ pub fn run(args: Args) -> Result<i32> {
                         return Ok(());
                     }
                     let t0 = std::time::Instant::now();
-                    let conns = src_ep
-                        .connect(compress)
-                        .and_then(|src| Ok((src, dst_ep.connect(compress)?)));
-                    let (src, mut dst) = match conns {
+                    let conns = src_ep.connect(compress).and_then(|src| {
+                        Ok((
+                            src,
+                            dst_ep.connect_with_request(compress, initial_destination.clone())?,
+                        ))
+                    });
+                    let (src, dst) = match conns {
                         Ok(conns) => conns,
-                        Err(error) if crate::conn::is_tcp_congestion_error(&error) => {
+                        Err(error)
+                            if crate::conn::is_tcp_congestion_error(&error)
+                                || crate::conn::is_worker_initialization_error(&error) =>
+                        {
                             gate.mark_failed(id);
                             return Err(error);
                         }
@@ -985,18 +1095,13 @@ pub fn run(args: Args) -> Result<i32> {
                             continue;
                         }
                     };
-                    if destination_anchor_required {
-                        let anchor = destination_anchor
-                            .get()
-                            .context("destination root was not anchored before workers started")?;
-                        if let Err(error) = anchor_worker_destination(&mut *dst, anchor) {
-                            gate.mark_failed(id);
-                            return Err(error);
-                        }
-                    }
                     gate.mark_ready(id);
+                    let remote_ssh_data = [&src_ep, &dst_ep]
+                        .into_iter()
+                        .filter_map(real_remote_spec)
+                        .any(|spec| spec.data_transport() == DataTransport::Ssh);
                     let fast_batch_files =
-                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us());
+                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us(), remote_ssh_data);
                     let mut worker = Worker {
                         id,
                         src,
@@ -1096,89 +1201,30 @@ pub fn run(args: Args) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
-    if use_tcp {
-        let ports = parse_ports(&args.tcp_ports)?;
+    let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
+    let mut pending_tcp_setups = Vec::new();
+    if let Some(ports) = tcp_ports {
         for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
             if let Endpoint::Remote(spec) = ep {
-                if let Err(e) = spec.setup_tcp(
+                match spec.begin_tcp_setup(
                     &mut **ctl,
                     args.tcp_plain,
                     ports,
                     args.tcp_congestion.as_deref(),
                 ) {
-                    if crate::conn::is_tcp_congestion_error(&e) {
-                        return Err(e).with_context(|| {
-                            format!(
-                                "{} could not apply --tcp-congestion {}",
-                                spec.label(),
-                                args.tcp_congestion.as_deref().unwrap_or_default()
-                            )
-                        });
+                    Ok(pending) => pending_tcp_setups.push((spec.clone(), pending)),
+                    Err(error) => {
+                        handle_tcp_setup_error(&args, spec, ports, error, &sched, &progress)?;
                     }
-                    if spec.restricted_grant.is_some() {
-                        sched.abort();
-                        progress.stop();
-                        return Err(e).with_context(|| {
-                            format!(
-                                "{}: a signed receiver uses its one SSH authorization for the control connection, so encrypted TCP data connections are required",
-                                spec.label()
-                            )
-                        });
-                    }
-                    if !args.quiet || debug() {
-                        let congestion_note = crate::conn::tcp_congestion_fallback_note(
-                            args.tcp_congestion.as_deref(),
-                        );
-                        eprintln!(
-                            "syq: {}: data over ssh (TCP ports {}-{} not reachable: {e:#}{congestion_note}); a Tailscale address or an open port is faster",
-                            spec.label(),
-                            ports.0,
-                            ports.1
-                        );
-                    }
-                    continue;
-                }
-                if debug() {
-                    eprintln!(
-                        "syq: {}: tcp data port {:?}",
-                        spec.label(),
-                        spec.tcp
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .map(|i| (i.addrs.clone(), i.port))
-                    );
                 }
             }
         }
     }
-    let all_remote_endpoints_use_tcp = use_tcp
-        && [&src_ep, &dst_ep].into_iter().all(|ep| match ep {
-            Endpoint::Local => true,
-            Endpoint::Remote(spec) => spec
-                .tcp
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|info| !info.failed),
-        });
-    if autotune && all_remote_endpoints_use_tcp && (src_ep.is_remote() || dst_ep.is_remote()) {
-        args.connections = tune::START_TCP;
-        gate.set_active(args.connections);
-    }
-    let tuning_key = autotune.then(|| tune::path_key(&src_ep, &dst_ep)).flatten();
-    let remembered_start = tuning_key.as_deref().and_then(tune::cached);
-    if let Some(remembered) = remembered_start {
-        args.connections = remembered;
-        gate.set_active(remembered);
-    }
-    print_transport_diagnostics(&args, &src_ep, &dst_ep);
-    if args.verbose >= 2 {
-        if let Some(remembered) = remembered_start {
-            eprintln!(
-                "syq: auto-tuning: starting with {remembered} connections remembered for this path"
-            );
-        }
+    if debug() {
+        eprintln!(
+            "syq: TCP route probes started at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
     }
     // One spelling for the destination root: every derived key — claims,
     // delete roots, destination-walk paths, receiver-computed sidecar names —
@@ -1198,6 +1244,12 @@ pub fn run(args: Args) -> Result<i32> {
     // so ordinary in-tree symlinks can still be replaced instead of followed.
     let (dst_root, mut dst_root_entry) =
         follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?;
+    if debug() {
+        eprintln!(
+            "syq: destination stat complete at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
     let mut dst_initially_missing = dst_root_entry.is_none();
     let mut dst_existed = dst_root_entry.is_some();
     let mut dst_entry_is_dir = dst_root_entry
@@ -1259,13 +1311,9 @@ pub fn run(args: Args) -> Result<i32> {
         // their root and additionally require it to resolve to a directory.
         for source in srcs {
             match stat_one(&mut *src_ctl, &source.path, source.follows_root())? {
-                Some(entry) if source.requires_directory() && entry.kind != Kind::Dir => {
-                    bail!(
-                        "contents selector {} is not a directory",
-                        display(&source.path)
-                    )
+                Some(entry) => {
+                    validate_native_source_type(&source.path, source.selection, entry.kind)?
                 }
-                Some(_) => {}
                 None => bail!("source {} does not exist", display(&source.path)),
             }
         }
@@ -1304,6 +1352,12 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         None
     };
+    if debug() {
+        eprintln!(
+            "syq: destination selection complete at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
     if use_operator_anchor && dst_is_dir {
         let planned_identity = dst_root_entry.as_ref().map(|entry| (entry.dev, entry.ino));
         let selected_identity = directory_selection
@@ -1402,6 +1456,12 @@ pub fn run(args: Args) -> Result<i32> {
     opts.partial_id
         .set(crate::checkpoint::partial_id(&identity))
         .expect("partial identity set once");
+    if debug() {
+        eprintln!(
+            "syq: copy identity complete at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
 
     let checkpoint_state = checkpoint_setup(
         &args,
@@ -1416,6 +1476,28 @@ pub fn run(args: Args) -> Result<i32> {
         &mut *dst_ctl,
         &identity,
     )?;
+
+    // A signed receiver cannot fall back to replaying its one-time SSH grant.
+    // Settle its TCP reachability before any destination creation, preserving
+    // the pre-mutation failure boundary even though ordinary route probes may
+    // overlap the rest of destination preflight.
+    if pending_tcp_setups
+        .iter()
+        .any(|(spec, _)| spec.restricted_grant.is_some())
+    {
+        for (spec, pending) in std::mem::take(&mut pending_tcp_setups) {
+            if let Err(error) = spec.finish_tcp_setup(pending) {
+                handle_tcp_setup_error(
+                    &args,
+                    &spec,
+                    tcp_ports.expect("pending TCP setup has a port range"),
+                    error,
+                    &sched,
+                    &progress,
+                )?;
+            }
+        }
+    }
 
     // Create a missing directory destination — never in the read-only modes,
     // and never under --existing. With several sources this waits until
@@ -1490,6 +1572,93 @@ pub fn run(args: Args) -> Result<i32> {
             checkpoint: Some(checkpoint.clone()),
         });
     }
+    if debug() {
+        eprintln!(
+            "syq: destination preflight complete at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
+    for (spec, pending) in pending_tcp_setups {
+        if let Err(error) = spec.finish_tcp_setup(pending) {
+            handle_tcp_setup_error(
+                &args,
+                &spec,
+                tcp_ports.expect("pending TCP setup has a port range"),
+                error,
+                &sched,
+                &progress,
+            )?;
+        }
+        if debug() {
+            eprintln!(
+                "syq: {}: tcp data port {:?}",
+                spec.label(),
+                spec.tcp
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|info| (info.addrs.clone(), info.port))
+            );
+        }
+    }
+    if debug() {
+        eprintln!(
+            "syq: data transport setup complete at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    let all_remote_endpoints_use_tcp = use_tcp
+        && [&src_ep, &dst_ep]
+            .into_iter()
+            .all(|endpoint| match endpoint {
+                Endpoint::Local => true,
+                Endpoint::Remote(spec) => spec
+                    .tcp
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|info| !info.failed),
+            });
+    if autotune && all_remote_endpoints_use_tcp && (src_ep.is_remote() || dst_ep.is_remote()) {
+        args.connections = tune::START_TCP;
+        gate.set_active(args.connections);
+    }
+    let tuning_key = autotune.then(|| tune::path_key(&src_ep, &dst_ep)).flatten();
+    let remembered_start = tuning_key.as_deref().and_then(tune::cached);
+    if let Some(remembered) = remembered_start {
+        args.connections = remembered;
+        gate.set_active(remembered);
+    }
+    print_transport_diagnostics(&args, &src_ep, &dst_ep);
+    if args.verbose >= 2 {
+        if let Some(remembered) = remembered_start {
+            eprintln!(
+                "syq: auto-tuning: starting with {remembered} connections remembered for this path"
+            );
+        }
+    }
+    let destination_tree_known_missing = dst.is_remote()
+        && dst_initially_missing
+        && !opts.ignore_existing
+        && !opts.update
+        && !opts.checksum;
+    let mut workers_started = false;
+    if all_remote_endpoints_use_tcp
+        && destination_tree_known_missing
+        && !opts.dry_run
+        && !opts.inplace
+        && !opts.verify_only
+        && (!destination_anchor_required || destination_anchor.get().is_some())
+    {
+        // The planner signals as soon as a source batch contains regular files,
+        // before remote sidecar resolution and directory creation. Empty trees
+        // therefore open no data connections, while fresh file trees cover TCP
+        // authentication with work the control connection must do anyway.
+        connect_after_file_plan.store(true, Relaxed);
+        spawn_workers(args.connections);
+        workers_started = true;
+    }
 
     let ticker = progress.spawn_ticker();
 
@@ -1500,11 +1669,7 @@ pub fn run(args: Args) -> Result<i32> {
         opts: &opts,
         completed: checkpoint_completed,
         checkpoint: checkpoint_writer,
-        destination_tree_known_missing: dst.is_remote()
-            && dst_initially_missing
-            && !opts.ignore_existing
-            && !opts.update
-            && !opts.checksum,
+        destination_tree_known_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         dry_run_replaced_dirs: std::collections::HashSet::new(),
@@ -1614,7 +1779,7 @@ pub fn run(args: Args) -> Result<i32> {
             SourceMapping {
                 follow_root,
                 contents,
-                require_directory: src.requires_directory(),
+                selection: src.selection,
                 sub: &sub,
             },
             DestinationRoot {
@@ -1636,6 +1801,12 @@ pub fn run(args: Args) -> Result<i32> {
         if let Err(e) = st.finish_planning() {
             scan_err = Some(e);
         }
+    }
+    if debug() {
+        eprintln!(
+            "syq: payload planning complete at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
     }
     if st.source_partials > 0 && !args.quiet && scan_err.is_none() && !st.collision {
         let count = st.source_partials;
@@ -1663,7 +1834,27 @@ pub fn run(args: Args) -> Result<i32> {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
             } else {
-                spawn_workers(args.connections);
+                let multiplex_small_files = !opts.verify_only
+                    && !opts.inplace
+                    && bwlimit.is_none()
+                    && sched
+                        .jobs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|job| job.entry.size <= opts.block && job.dst_entry.is_none());
+                if multiplex_small_files {
+                    for spec in [&src_ep, &dst_ep]
+                        .into_iter()
+                        .filter_map(real_remote_spec)
+                        .filter(|spec| spec.data_transport() == DataTransport::Ssh)
+                    {
+                        spec.set_ssh_multiplexing(true);
+                    }
+                }
+                if !workers_started {
+                    spawn_workers(args.connections);
+                }
             }
         }
         // No worker opens a sidecar until every payload/sidecar namespace
@@ -1708,6 +1899,12 @@ pub fn run(args: Args) -> Result<i32> {
         },
         None => None,
     };
+    if debug() {
+        eprintln!(
+            "syq: file workers complete at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
 
     let aborted = sched.is_aborted();
     let mut deleted = 0u64;
@@ -1745,6 +1942,12 @@ pub fn run(args: Args) -> Result<i32> {
     }
     if !aborted && !opts.dry_run && !opts.verify_only {
         st.apply_deferred()?;
+    }
+    if debug() {
+        eprintln!(
+            "syq: deferred metadata complete at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
     }
     let max_delete_hit = st.max_delete_hit;
     let dry_run_changes = std::mem::take(&mut st.dry_run_changes);
@@ -2180,19 +2383,13 @@ fn activate_control_destination(
     }
 }
 
-fn anchor_worker_destination(conn: &mut dyn Conn, anchor: &DestinationAnchor) -> Result<()> {
-    match ok(
-        conn.call(Request::AnchorDestination {
-            path: Some(anchor.operator_path.clone()),
-            expected_dev: anchor.dev,
-            expected_ino: anchor.ino,
-            request_prefix: anchor.request_prefix.clone(),
-            insecure_links: anchor.insecure_links,
-        })?,
-        "anchor worker destination root",
-    )? {
-        Response::Ok => Ok(()),
-        other => bail!("unexpected response {other:?}"),
+fn worker_destination_request(anchor: &DestinationAnchor) -> Request {
+    Request::AnchorDestination {
+        path: Some(anchor.operator_path.clone()),
+        expected_dev: anchor.dev,
+        expected_ino: anchor.ino,
+        request_prefix: anchor.request_prefix.clone(),
+        insecure_links: anchor.insecure_links,
     }
 }
 
@@ -2829,7 +3026,7 @@ impl Planner<'_> {
         let SourceMapping {
             follow_root,
             contents,
-            require_directory,
+            selection,
             sub,
         } = source;
         let dst_root = destination.path;
@@ -2847,9 +3044,7 @@ impl Planner<'_> {
             if first {
                 first = false;
                 if let Some(root) = batch.first() {
-                    if require_directory && root.kind != Kind::Dir {
-                        bail!("contents selector {} is not a directory", display(src_root));
-                    }
+                    validate_native_source_type(src_root, selection, root.kind)?;
                     if destination.exact && destination.entry_is_dir && root.kind != Kind::Dir {
                         bail!(
                             "destination {} is an existing directory; cannot replace it with non-directory source {}",
@@ -3279,6 +3474,9 @@ impl Planner<'_> {
         dst_root: &[u8],
     ) -> Result<()> {
         let namespace_files = self.collect_namespace_files(&batch, src_root, sub, dst_root);
+        if !namespace_files.is_empty() {
+            self.sched.anticipate_file_work();
+        }
         if self.collision {
             return Ok(());
         }
@@ -5507,8 +5705,9 @@ impl Worker {
                 }
             }
         };
-        // Same-machine copy: let the kernel move the bytes (reflink / NFS
-        // server-side copy) instead of streaming them through userspace.
+        // Same-machine copy: let the receiver move the bytes directly (kernel
+        // offload, or one sequential writer for cross-mount NFS) instead of
+        // framing, hashing and scheduling them through the transport.
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
         if self.opts.same_host
@@ -5696,13 +5895,15 @@ impl Worker {
         self.sched.jobs.lock().unwrap()[idx].inplace = v;
     }
 
-    /// Attempt an in-kernel same-host copy. Ok(true) = done; Ok(false) =
-    /// kernel can't offload, caller should stream; Err = real failure.
+    /// Attempt a receiver-side same-host copy. Ok(true) = done; Ok(false) =
+    /// receiver cannot use its direct path, so the caller should stream;
+    /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
     fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
         // Write to a partial and let finish_file rename it, so an interrupted
-        // copy_file_range never leaves a final-named file the quick check could
-        // mistake for complete. Only --inplace writes the final path directly.
+        // A receiver-side copy never leaves a final-named file the quick check
+        // could mistake for complete. Only --inplace writes the final path
+        // directly.
         let inplace = self.opts.inplace
             && job.target_condition == TargetCondition::Any
             && job.container_guard.is_none();
@@ -5712,6 +5913,7 @@ impl Worker {
             src: job.src.clone(),
             dst: job.dst.clone(),
             inplace,
+            allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
             partial_id: self.partial_id(),
             size: job.entry.size,
             mode,
@@ -6240,15 +6442,22 @@ mod tests {
     }
 
     #[test]
-    fn fast_batch_ceiling_only_grows_on_high_rtt_tcp() {
-        assert_eq!(fast_batch_file_limit(None, None), FAST_BATCH_FILES);
-        assert_eq!(fast_batch_file_limit(Some(99_999), None), FAST_BATCH_FILES);
+    fn fast_batch_ceiling_grows_on_high_rtt_tcp_or_remote_ssh() {
+        assert_eq!(fast_batch_file_limit(None, None, false), FAST_BATCH_FILES);
         assert_eq!(
-            fast_batch_file_limit(None, Some(HIGH_RTT_US)),
+            fast_batch_file_limit(Some(99_999), None, false),
+            FAST_BATCH_FILES
+        );
+        assert_eq!(
+            fast_batch_file_limit(None, Some(HIGH_RTT_US), false),
             HIGH_RTT_FAST_BATCH_FILES
         );
         assert_eq!(
-            fast_batch_file_limit(Some(262_000), Some(1_000)),
+            fast_batch_file_limit(Some(262_000), Some(1_000), false),
+            HIGH_RTT_FAST_BATCH_FILES
+        );
+        assert_eq!(
+            fast_batch_file_limit(None, None, true),
             HIGH_RTT_FAST_BATCH_FILES
         );
     }

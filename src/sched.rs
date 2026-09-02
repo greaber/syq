@@ -59,6 +59,9 @@ struct Inner {
     fast_probing: usize,
     /// Workers currently processing one pipelined small-file batch.
     fast_batches: usize,
+    /// Planning has observed at least one regular file, before destination
+    /// namespace checks and directory creation make it runnable.
+    file_work_anticipated: bool,
     scan_done: bool,
     abort: bool,
 }
@@ -84,6 +87,7 @@ impl Sched {
                 probing: 0,
                 fast_probing: 0,
                 fast_batches: 0,
+                file_work_anticipated: false,
                 scan_done: false,
                 abort: false,
             }),
@@ -104,6 +108,28 @@ impl Sched {
         self.inner.lock().unwrap().files.push((size, Reverse(idx)));
         self.cv.notify_one();
         idx
+    }
+
+    /// Let speculative TCP workers warm while the planner performs remote
+    /// namespace and directory work for a batch that contains regular files.
+    pub fn anticipate_file_work(&self) {
+        self.inner.lock().unwrap().file_work_anticipated = true;
+        self.cv.notify_all();
+    }
+
+    /// Wait to learn whether planning found any regular files. False means the
+    /// scan ended or aborted without one, so an eager worker need not connect.
+    pub fn wait_for_anticipated_file_work(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            if inner.file_work_anticipated {
+                return true;
+            }
+            if inner.scan_done || inner.abort {
+                return false;
+            }
+            inner = self.cv.wait(inner).unwrap();
+        }
     }
 
     pub fn requeue(&self, idx: usize) {
@@ -389,6 +415,25 @@ impl Sched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eager_connections_wait_for_a_planned_file_and_skip_empty_scans() {
+        let with_file = Arc::new(Sched::new(64, 128));
+        let waiter = {
+            let sched = with_file.clone();
+            std::thread::spawn(move || sched.wait_for_anticipated_file_work())
+        };
+        with_file.anticipate_file_work();
+        assert!(waiter.join().unwrap());
+
+        let empty = Arc::new(Sched::new(64, 128));
+        let waiter = {
+            let sched = empty.clone();
+            std::thread::spawn(move || sched.wait_for_anticipated_file_work())
+        };
+        empty.scan_done();
+        assert!(!waiter.join().unwrap());
+    }
 
     #[test]
     fn tail_gate_combines_bytes_file_credit_and_duration_requirement() {

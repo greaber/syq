@@ -376,6 +376,131 @@ fn native_copy_uses_explicit_endpoints_cwd_and_option_safe_selectors() {
 }
 
 #[test]
+fn native_copy_typed_selectors_are_source_preconditions() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"file");
+    write(&t.path("src/dir/child"), b"child");
+    symlink("dir", t.path("src/link")).unwrap();
+
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("src"),
+        "--src-file",
+        "file",
+        "--src-dir",
+        "dir",
+        "--src-file",
+        "link",
+        "--into-new",
+        &t.s("copied"),
+    ]);
+    assert_eq!(read(&t.path("copied/file")), b"file");
+    assert_eq!(read(&t.path("copied/dir/child")), b"child");
+    assert_eq!(
+        fs::read_link(t.path("copied/link")).unwrap(),
+        Path::new("dir")
+    );
+
+    run_native_ok(&[
+        "cp",
+        "--src-file",
+        &t.s("src/file"),
+        "--as-new",
+        &t.s("exact"),
+    ]);
+    assert_eq!(read(&t.path("exact")), b"file");
+
+    let wrong_directory = native_syq(&[
+        "cp",
+        "--src-dir",
+        &t.s("src/file"),
+        "--into-new",
+        &t.s("wrong-directory"),
+    ]);
+    assert!(!wrong_directory.status.success());
+    assert!(stderr_of(&wrong_directory).contains("--src-dir selector"));
+    assert!(!t.path("wrong-directory").exists());
+
+    let followed_link = native_syq(&[
+        "cp",
+        "--src-dir",
+        &t.s("src/link"),
+        "--into-new",
+        &t.s("followed-link"),
+    ]);
+    assert!(!followed_link.status.success());
+    assert!(stderr_of(&followed_link).contains("--src-dir selector"));
+    assert!(!t.path("followed-link").exists());
+}
+
+#[test]
+fn native_cp_prune_checks_all_typed_sources_before_mutation() {
+    let t = Tmp::new();
+    write(&t.path("src/good"), b"new");
+    write(&t.path("src/not-a-file/child"), b"child");
+    write(&t.path("dst/good"), b"old");
+    write(&t.path("dst/extra"), b"keep");
+
+    let output = native_syq(&[
+        "cp-prune",
+        "--src-file",
+        &t.s("src/good"),
+        "--src-file",
+        &t.s("src/not-a-file"),
+        "--into-existing",
+        &t.s("dst"),
+    ]);
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("--src-file selector"));
+    assert_eq!(read(&t.path("dst/good")), b"old");
+    assert_eq!(read(&t.path("dst/extra")), b"keep");
+}
+
+#[test]
+fn native_copy_accepts_copy_only_operational_controls() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-file",
+            &t.s("src/file"),
+            "--as-new",
+            &t.s("copied"),
+            "--bwlimit",
+            "1G",
+            "--no-compress",
+            "--stats",
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("copied")), b"payload");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("scanned entries:"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let invalid = native_syq(&[
+        "cp",
+        &t.s("src/file"),
+        "--as-new",
+        &t.s("invalid"),
+        "--bwlimit",
+        "fast",
+    ]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(stderr_of(&invalid).contains("bad --bwlimit"));
+    assert!(!t.path("invalid").exists());
+}
+
+#[test]
 fn native_copy_named_selector_preserves_a_root_symlink() {
     use std::os::unix::fs::symlink;
 
@@ -771,6 +896,30 @@ fn native_rm_typed_selectors_check_every_type_before_mutation() {
 }
 
 #[test]
+fn native_rm_accepts_bulk_typed_selectors() {
+    let t = Tmp::new();
+    write(&t.path("base/file-a"), b"a");
+    write(&t.path("base/file-b"), b"b");
+    write(&t.path("base/dir-a/child"), b"a");
+    write(&t.path("base/dir-b/child"), b"b");
+
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s("base"),
+        "--src-files",
+        "file-a",
+        "file-b",
+        "--src-dirs",
+        "dir-a",
+        "dir-b",
+        "--progress-json",
+        "--no-progress",
+    ]);
+    assert!(listing(&t.path("base")).is_empty());
+}
+
+#[test]
 fn native_rm_overlapping_pinned_selections_are_idempotent() {
     let t = Tmp::new();
     write(&t.path("tree/child/file"), b"data");
@@ -920,6 +1069,52 @@ else
 fi
 export HOME PATH
 printf '%s\n' "$1" >> "$FAKE_RSH_LOG"
+exec /bin/sh -c "$1"
+"#,
+    );
+    path
+}
+
+/// An ssh-shaped remote shell that accepts the control session, rejects every
+/// multiplexed worker like an sshd with `MaxSessions 1`, and accepts workers
+/// that disable `ControlPath`.
+fn fake_ssh_rejecting_multiplexed_workers(t: &Tmp) -> PathBuf {
+    let path = t.path("bin/ssh");
+    executable(
+        &path,
+        br#"#!/bin/sh
+control_master=unset
+control_path=unset
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o)
+            option=$2
+            shift 2
+            case "$option" in
+                ControlMaster=*) control_master=${option#ControlMaster=} ;;
+                ControlPath=*) control_path=${option#ControlPath=} ;;
+            esac
+            ;;
+        -l)
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            exit 98
+            ;;
+    esac
+done
+shift
+printf '%s|%s\n' "$control_master" "$control_path" >> "$FAKE_RSH_LOG"
+if [ "$control_master" = no ] && [ "$control_path" != none ]; then
+    exit 255
+fi
+HOME="$FAKE_REMOTE_HOME"
+PATH=/usr/bin:/bin
+export HOME PATH
 exec /bin/sh -c "$1"
 "#,
     );
@@ -1815,6 +2010,76 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     assert!(
         stderr.contains("concurrency: starting with 16 connections (auto-tuned)"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"in-place over reachable TCP");
+    let remote = format!("127.0.0.1:{}", t.s("dst"));
+
+    let out = compat_command()
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--tcp-plain", "--inplace", "-a", "-j", "1"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .run()
+        .expect("run in-place copy over reachable TCP");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"in-place over reachable TCP");
+}
+
+#[test]
+fn multiplexed_worker_refusal_falls_back_to_independent_ssh() {
+    let t = Tmp::new();
+    fake_ssh_rejecting_multiplexed_workers(&t);
+    write(&t.path("src"), b"independent SSH fallback");
+    let remote = format!("fake:{}", t.s("dst"));
+
+    let out = compat_command()
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--no-tcp", "-a", "-j", "1"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .run()
+        .expect("run copy when the SSH server rejects multiplexed workers");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"independent SSH fallback");
+    let invocations = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        invocations
+            .lines()
+            .any(|line| line.starts_with("yes|") && !line.ends_with("|none")),
+        "control connection did not enable its private socket:\n{invocations}"
+    );
+    assert!(
+        invocations
+            .lines()
+            .any(|line| line.starts_with("no|") && !line.ends_with("|none")),
+        "no multiplexed worker was attempted:\n{invocations}"
+    );
+    assert!(
+        invocations.lines().any(|line| line == "no|none"),
+        "no independent worker fallback was attempted:\n{invocations}"
     );
 }
 
@@ -3823,6 +4088,10 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
     write(&t.path("sources/a"), b"a");
     write(&t.path("sources/tree/f"), b"tree");
     write(&t.path("sources/contents/b"), b"b");
+    write(&t.path("sources/file-a"), b"file-a");
+    write(&t.path("sources/file-b"), b"file-b");
+    write(&t.path("sources/dir-a/c"), b"dir-a");
+    write(&t.path("sources/dir-b/d"), b"dir-b");
     write(&t.path("sources/z"), b"z");
 
     run_native_ok(&[
@@ -3832,6 +4101,12 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         "tree",
         "--src-srcs",
         "contents",
+        "--src-files",
+        "file-a",
+        "file-b",
+        "--src-dirs",
+        "dir-a",
+        "dir-b",
         "--src",
         "z",
         "--cwd",
@@ -3842,7 +4117,13 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         &t.s("dest"),
     ]);
 
-    assert_eq!(listing(&t.path("dest")), ["a", "b", "tree", "tree/f", "z"]);
+    assert_eq!(
+        listing(&t.path("dest")),
+        [
+            "a", "b", "dir-a", "dir-a/c", "dir-b", "dir-b/d", "file-a", "file-b", "tree", "tree/f",
+            "z",
+        ]
+    );
 }
 
 #[test]
@@ -3866,6 +4147,9 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
         ["cp", "-a", "source", "--into", "dest"].as_slice(),
         ["cp", "--delete", "source", "--into", "dest"].as_slice(),
         ["rm", "--no-tcp", "source", "", ""].as_slice(),
+        ["rm", "--bwlimit", "1M", "source", ""].as_slice(),
+        ["rm", "--no-compress", "source", "", ""].as_slice(),
+        ["rm", "--stats", "source", "", ""].as_slice(),
     ] {
         let args: Vec<_> = args.iter().copied().filter(|arg| !arg.is_empty()).collect();
         let out = native_syq(&args);
@@ -6329,6 +6613,62 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), contents);
     assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_nfs_exdev_uses_sequential_receiver_fallback() {
+    let t = Tmp::new();
+    let contents = vec![b'x'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_NFS", "1")
+        .env("SYQ_TEST_COPY_LOCAL_SOURCE_DISK", "1")
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_nfs_exdev_keeps_automatic_parallel_cases() {
+    let cases: &[(&[&str], Option<&str>)] = &[
+        (&[], Some("SYQ_TEST_COPY_LOCAL_SOURCE_NFS")),
+        (&[], Some("SYQ_TEST_COPY_LOCAL_NFS_SYNC")),
+        (&["-j", "2"], None),
+    ];
+    for (extra_args, extra_env) in cases {
+        let t = Tmp::new();
+        let contents = vec![b'x'; 8 * 1024 * 1024];
+        write(&t.path("src"), &contents);
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut command = compat_command();
+        command
+            .args(["-a", "--no-progress"])
+            .args(*extra_args)
+            .args([&src, &dst])
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_NFS", "1")
+            .env("SYQ_TEST_COPY_LOCAL_SOURCE_DISK", "1")
+            .env("SYQ_TEST_FAIL_READ_RANGE", "1");
+        if let Some(name) = extra_env {
+            command.env(name, "1");
+        }
+        let out = command.run().unwrap();
+        assert!(!out.status.success(), "case unexpectedly used one writer");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("test read-range failure"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[cfg(debug_assertions)]

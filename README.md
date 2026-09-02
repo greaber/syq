@@ -134,8 +134,9 @@ Git-derived identity when an explicit source-built helper is used.
   `cargo build --release` (needs the Xcode command-line tools, `xcode-select
   --install`, for the bundled zstd C library). The tool is otherwise pure Rust
   and uses only POSIX calls; Linux-only optimizations (`fallocate`,
-  glibc `mallopt`) are compiled out automatically. copy_file_range's local
-  fast path is Linux-only; on macOS same-machine copies use the normal path.
+  glibc `mallopt`) are compiled out automatically. The receiver-side
+  same-machine copy fast path is Linux-only; on macOS those copies use the
+  normal path.
 - For a manually installed binary that is portable across distributions (for
   example, a host with an older glibc), build a static binary:
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
@@ -150,6 +151,8 @@ target placement in separate arguments:
 syq cp project --to server --into /backup       # named object → /backup/project
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
+syq cp --src-file report --src-dir assets --into /backup
+syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
 syq cp report --to server --as-new /reports/final
 syq cp-prune --src-src build --to server --into-existing /srv/app
 syq rm cache old-output
@@ -169,12 +172,17 @@ any `.` or `..` component.
 Bare paths and repeatable `--src PATH` select named objects. A named directory
 keeps its basename at the target; a named symlink is copied as a symlink. A
 trailing slash is ordinary path spelling and has no semantic effect.
+`--src-file PATH` adds the precondition that the named object is not a
+directory, while `--src-dir DIR` requires a directory; on a match they copy
+exactly like `--src`, including copying a selected symlink rather than following
+it. These typed selectors are available to `cp`, `cp-prune`, and `rm`.
 `--src-src DIR` selects a directory's contents and merges them directly into
-the target container. `--srcs PATH...` and `--src-srcs DIR...` are bulk
-conveniences for those two canonical selectors. Symlinks found while traversing
-a directory are copied as symlinks and are never followed. Singular selector
-options consume their next argument even when it begins with `-`, so every Unix
-filename is expressible without losing raw path bytes.
+the target container. `--srcs PATH...`, `--src-srcs DIR...`, `--src-files
+PATH...`, and `--src-dirs DIR...` are bulk conveniences for the corresponding
+singular selectors. Symlinks found while traversing a directory are copied as
+symlinks and are never followed. Singular selector options consume their next
+argument even when it begins with `-`, so every Unix filename is expressible
+without losing raw path bytes.
 
 Placement is always explicit in this initial native surface:
 
@@ -225,7 +233,7 @@ would leave it, even if later components would re-enter. `--cwd` is not a
 containment boundary when `--follow` is used.
 
 For removal, `--src PATH` and bare paths accept either a terminal file or
-directory and remove that object, recursively for a directory.
+directory and remove that object, recursively for a directory. As with copy,
 `--src-file PATH` requires a non-directory terminal object, while
 `--src-dir DIR` requires a directory and removes its entire tree.
 `--src-src DIR` requires a directory, removes its contents, and retains the
@@ -246,18 +254,25 @@ hard links, ACLs, xattrs, filtering, comparison policy, and the automation API
 are intentionally not frozen by this first grammar. Use `syq rsync` when the
 current compatibility options for those capabilities are needed.
 
-The native commands accept only `-n`/`--dry-run`, `-v`/`--verbose`,
-`-q`/`--quiet`, and `-j`/`--connections` in addition to the endpoint,
-selector, cwd, and placement options above. `cp` additionally accepts
-`--mapping` and `--results` (see [MAPPINGS.md](MAPPINGS.md)); `cp-prune`
-additionally accepts
-`--max-delete`; `rm` additionally accepts `--root` and `--follow` plus its
-typed selectors. Preservation policies, filters, comparison controls, progress
-interfaces, and SSH/transport configuration remain available only through
-`syq rsync`; sharing the transfer engine does not expose those options in
-native mode. Remote-to-remote copies still use the ordinary automatic
-transport. Native raw path bytes are relayed through syq's protocol when they
-cannot be represented in a direct remote shell command.
+All native commands accept `-n`/`--dry-run`, `-v`/`--verbose`, `-q`/`--quiet`,
+`-j`/`--connections`, `--progress`/`--no-progress`, and `--progress-json` in
+addition to their endpoint and selector options. `cp` and `cp-prune` also
+accept `--no-compress`, `--bwlimit RATE`, and `--stats`; the bandwidth limit
+applies only to file data, not scanning, hashing, metadata, or pruning. A
+command-restricted remote-to-remote receiver independently enforces the signed
+aggregate limit. A receiver installed by an older syq rejects that V2 grant
+safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment to the
+current binary. `cp` additionally accepts `--mapping` and `--results` (see
+[MAPPINGS.md](MAPPINGS.md)). `cp-prune` additionally
+accepts `--max-delete`; `rm` additionally accepts `--root` and `--follow` plus
+its endpoint-side removal semantics.
+
+Preservation policies, filters, comparison controls, block and split sizing,
+and SSH/transport configuration remain available only through `syq rsync`;
+sharing the transfer engine does not expose those options in native mode.
+Remote-to-remote copies still use the ordinary automatic transport. Native raw
+path bytes are relayed through syq's protocol when they cannot be represented
+in a direct remote shell command.
 
 ## Mappings
 
@@ -462,9 +477,9 @@ The command-restricted path requires atomic staged publication and encrypted
 TCP data connections. `--inplace`, `--no-tcp`, `--tcp-plain`,
 `--tcp-congestion`, `--update`, `--existing`, `--ignore-existing`, native
 `--*-new`/`--*-existing`,
-`--ignore`/`--ignore-from`, `--files-from`, `--mapping`, `--min-size`, a
-nonzero
-`--bwlimit`, `--syq-path`, and `--no-bootstrap` currently fail closed because
+`--ignore`/`--ignore-from`, `--files-from`, `--mapping`, `--min-size`,
+`--syq-path`, and
+`--no-bootstrap` currently fail closed because
 the receiver cannot enforce those semantics independently of hostA.
 `--max-size` is enforced as a signed per-file limit, but is refused together
 with deletion because filtered source files could otherwise make hostA's
@@ -728,14 +743,21 @@ source's mode with `-p`.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.
-Workers connect while the source is scanned but begin file data only after
-the mapped payload/sidecar namespace preflight completes.
+Workers receive no file work until the mapped payload/sidecar namespace
+preflight completes. For a fresh remote destination with a selected TCP route,
+they begin connecting as soon as a source batch proves that file work exists,
+overlapping authentication with sidecar resolution and directory creation;
+an empty tree opens no worker connection.
 The data connections — by default separate TCP sockets carrying AES-256-GCM
-records (under `--no-tcp`, separate `ssh` processes instead), each its own flow
-and cipher — carry only "read range" / "write range" requests. Files go
-onto a largest-first queue; when a worker runs dry it steals the back half of
-the remaining range of whichever file has the most left, so the tail of a
-transfer stays parallel without pre-deciding chunk counts.
+records — carry only "read range" / "write range" requests. When data uses SSH
+(through `--no-tcp` or TCP fallback), a transfer consisting entirely of fresh
+small files opens worker sessions over the already-authenticated OpenSSH control
+connection; larger or mixed workloads retain separate `ssh` processes, TCP
+flows, and cipher processes. A custom `-e` command keeps its own SSH
+multiplexing policy. Files go onto a largest-first queue; when a worker runs dry
+it steals the back half of the remaining range of whichever file has the most
+left, so the tail of a transfer stays parallel without pre-deciding chunk
+counts.
 
 On the receiving side a file that needs content changes is written beside its
 destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
@@ -1023,6 +1045,12 @@ connections (where each stream is capped by OpenSSH's 2 MB window) it
 reaches line rate (~110 MB/s, where a fixed `-j 8` managed 44) about 30 s
 after the connections are up.
 
+On the same kind of long path (262 ms), a fresh 2,000-file / 8 MiB tree over
+`--no-tcp` took 11.29 s in two verified runs after fresh-small-file workers
+began reusing the authenticated control connection, versus 16.85 s with eight
+independently authenticated worker connections. Larger and mixed workloads
+still use independent SSH connections so they retain multi-flow throughput.
+
 `-j N` fixes the count and disables tuning. Use it when you know better (a
 spinning disk that must not be read in parallel: `-j 1`), or to be polite on
 a shared link.
@@ -1078,7 +1106,11 @@ ssh (silenced by `-q`). When several NICs of
 comparable speed are reachable (e.g. an 8-rail RoCE fabric), syq spreads its
 data connections across all of them (multipath) — it keeps only paths within
 2x of the fastest, so it never drags a fast transfer down by mixing in a slow
-link. Single-homed hosts and laptops use the one best path, unchanged. With ufw:
+link. Every candidate still gets its complete bounded probe window, but those
+independent probes run while the control connection prepares the destination.
+Worker Hello and destination anchoring are likewise sent in one
+pipelined setup turn. Single-homed hosts and laptops use the one best path,
+unchanged. With ufw:
 
 ```sh
 sudo ufw allow from 192.0.2.0/24  to any port 47600:47699 proto tcp   # example LAN
@@ -1269,30 +1301,41 @@ NFS, where every unlink is a round trip, `-j32` removed 20,000 files in 2.5 s
 versus 9.7 s for `rm -rf`; on a local SSD `rm -rf` is already fast and syq is
 no faster.
 
-## Same-machine copies (copy_file_range)
+## Same-machine copies (copy_file_range and NFS)
 
 When source and destination are on the same machine, syq copies each file with
 `copy_file_range(2)` instead of streaming bytes through userspace: the kernel
 does a reflink or a straight in-kernel copy, and on NFS 4.2 the *server* copies
 the file internally (no client round trip). Measured: a single 8 GB file
 /raid→/raid at 24.8 GB/s vs 2.5 GB/s for `cp`; NFS→NFS at 3.3 GB/s vs 0.4.
-Hashing is skipped on this path (there's no wire to corrupt it); `-c`, any
-existing partial, and `--bwlimit` disable this shortcut. Existing partials and
-larger bwlimited files use the hash-resumable streaming path. Small new
-bwlimited files that fit in one paced transfer block retain the `PutSmall`
-exception described above.
+If the kernel cannot offload a cross-mount copy from a recognized local disk
+filesystem into an ordinary asynchronous NFS mount, the receiver automatically
+uses one sequential reader/writer for that file. That avoids both per-inode NFS
+write contention and needless transport framing and hashing. NFS-to-NFS copies,
+other source filesystem types, synchronous NFS destinations, an explicit fixed
+worker count above one, and unsupported non-NFS destinations retain the
+parallel, hash-resumable streaming fallback.
+`-c`, any existing partial, and `--bwlimit` disable the receiver-side shortcut.
+Small new bwlimited files that fit in one paced transfer block retain the
+`PutSmall` exception described above.
 
 ## NFS
 
 Local↔NFS copies are a local→local syq run (`syq rsync -a -j16 /raid/x /mnt/nfs/x`)
-and benefit from the same parallelism: measured on a 20 Gbit NFSv4.2 mount,
-reads of one 4 GB file 858 MiB/s with `-j8` vs ~400 MB/s for `cp`; 20,000
-small files written in 28 s vs 72 s for `cp -r`. Writes of a *single* file
-were capped at ~250 MB/s regardless of `-j`, while eight files written in
-parallel reached ~650 MB/s: the per-file limit comes from the NFS client's one
-TCP connection and per-inode write serialization. Mounting with
-`nconnect=8` (NFS 4.1+; needs an unmount/mount, not a remount) is the usual
-fix for that.
+and benefit from parallelism across files and on reads: measured on a 20 Gbit
+NFSv4.2 mount, reads of one 4 GB file reached 858 MiB/s with `-j8` vs ~400 MB/s
+for `cp`, and 20,000 small files were written in 28 s vs 72 s for `cp -r`.
+Writes from a recognized local disk filesystem into one asynchronous NFS inode
+are instead serialized automatically by the receiver when the kernel cannot
+offload them.
+On a fresh 4 GiB `/raid`→NFS copy, that changed syq from 21.44 s with 32 range
+writers to a 9.93 s median with one sequential receiver-side writer, versus a
+10.94 s median for `cp` (two interleaved runs). Synchronous destinations and
+NFS sources retain the adaptive parallel path; the reciprocal NFS→`/raid` copy
+reached 1.13 GiB/s with parallel range reads.
+Separate files still run concurrently and have reached ~650 MB/s in aggregate.
+Mounting with `nconnect=8` (NFS 4.1+; needs an unmount/mount, not a remount) can
+add headroom for those concurrent files and other NFS traffic.
 
 ## Performance notes
 
@@ -1306,8 +1349,10 @@ fix for that.
   server sheds one — sshd's `MaxStartups` (default 10) randomly rejects
   sessions beyond 10 being set up at once — syq halves that number for the
   rest of the run and retries. Raising `MaxStartups` can reduce setup time for
-  ssh data connections, but increases the resources available to
-  unauthenticated clients; see [Server performance tuning](SERVER-TUNING.md).
+  independent ssh data connections; fresh-small-file workers using default ssh
+  reuse the authenticated control connection instead. A higher limit increases
+  the resources available to unauthenticated clients; see
+  [Server performance tuning](SERVER-TUNING.md).
   Auto-tuning starts at 16 for TCP data, or 8 for ssh data, and only opens more
   once they have been shown to pay.
 - Preferred direct remote→remote uses one enrollment-key authentication for the

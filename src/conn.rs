@@ -11,7 +11,9 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub trait Conn: Send {
     fn send(&mut self, req: Request) -> Result<()>;
@@ -98,6 +100,56 @@ pub(crate) fn tcp_congestion_fallback_note(requested: Option<&str>) -> String {
             format!("; requested congestion control {algorithm} is not used by the SSH fallback")
         })
         .unwrap_or_default()
+}
+
+/// A worker reached the receiver, but its destination anchor was rejected.
+/// Retrying or changing transports cannot repair a failed identity check.
+#[derive(Debug)]
+struct WorkerInitializationError(String);
+
+impl std::fmt::Display for WorkerInitializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkerInitializationError {}
+
+pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<WorkerInitializationError>())
+}
+
+/// OpenSSH accepted the control connection but rejected a multiplexed worker
+/// session. Independent SSH connections may still be permitted (for example,
+/// with `MaxSessions 1`), so callers can safely disable reuse and retry.
+#[derive(Debug)]
+struct MultiplexedSshSessionError(String);
+
+impl std::fmt::Display for MultiplexedSshSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MultiplexedSshSessionError {}
+
+fn is_multiplexed_ssh_session_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<MultiplexedSshSessionError>())
+}
+
+fn worker_initialization_response(response: Response) -> Result<()> {
+    match response {
+        Response::Ok => Ok(()),
+        Response::Err(error) => Err(WorkerInitializationError(error).into()),
+        other => Err(WorkerInitializationError(format!(
+            "unexpected worker initialization response {other:?}"
+        ))
+        .into()),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -399,6 +451,7 @@ pub struct RemoteConn {
     dead: bool,
     peer: Option<PeerInfo>,
     tcp_socket: Option<TcpStream>,
+    multiplexed_ssh: bool,
 }
 
 const READ_AHEAD: usize = 4;
@@ -491,6 +544,13 @@ impl RemoteConn {
         if let Some(child) = &mut self.child {
             for _ in 0..20 {
                 if let Ok(Some(status)) = child.try_wait() {
+                    if self.multiplexed_ssh && status.code() == Some(255) {
+                        return MultiplexedSshSessionError(format!(
+                            "{}: multiplexed SSH session was rejected ({status})",
+                            self.label
+                        ))
+                        .into();
+                    }
                     return anyhow!("{}: remote syq exited ({status})", self.label);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -691,6 +751,21 @@ pub struct TcpProbe {
     pub candidates: Vec<TcpCandidate>,
 }
 
+/// TCP listener state whose route probes are running in the background.
+///
+/// The listener must be requested over the authenticated control connection,
+/// but probing its advertised addresses does not use that connection. Keeping
+/// the probe join handle here lets destination preflight cover the bounded
+/// reachability window without weakening route selection.
+pub(crate) struct PendingTcpSetup {
+    port: u16,
+    key: Option<Vec<u8>>,
+    token: Vec<u8>,
+    congestion_control: Option<String>,
+    remote_congestion_control: Option<String>,
+    probe: std::thread::JoinHandle<Vec<TcpCandidate>>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RemoteDiagnostics {
     pub peer: Option<PeerInfo>,
@@ -703,6 +778,43 @@ pub enum DataTransport {
     Ssh,
     EncryptedTcp,
     PlaintextTcp,
+}
+
+#[derive(Debug)]
+pub(crate) struct SshMultiplexer {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    reuse_for_workers: AtomicBool,
+}
+
+impl SshMultiplexer {
+    pub(crate) fn new() -> Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("syq-ssh-")
+            .tempdir()
+            .context("create private SSH control directory")?;
+        let path = directory.path().join("socket");
+        Ok(Self {
+            _directory: directory,
+            path,
+            reuse_for_workers: AtomicBool::new(false),
+        })
+    }
+
+    fn set_reuse_for_workers(&self, reuse: bool) {
+        self.reuse_for_workers.store(reuse, Ordering::Relaxed);
+    }
+
+    fn reuse_for_workers(&self) -> bool {
+        self.reuse_for_workers.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SshConnection {
+    Independent,
+    Control,
+    Worker,
 }
 
 #[derive(Clone, Debug)]
@@ -723,6 +835,10 @@ pub struct RemoteSpec {
     pub restricted_grant: Option<String>,
     /// Serializes a first-use install across control and worker clones.
     pub helper_install: std::sync::Arc<std::sync::Mutex<bool>>,
+    /// A private OpenSSH control socket. The control session is always capable
+    /// of multiplexing, but workers use it only after the completed plan shows
+    /// that every payload is a fresh small file.
+    pub(crate) ssh_multiplexer: Option<std::sync::Arc<SshMultiplexer>>,
     /// `-q`: suppress the "falling back to ssh" notice.
     pub quiet: bool,
     /// Shared across clones so workers see the TCP setup done on the control connection.
@@ -742,6 +858,7 @@ impl RemoteSpec {
             auto_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
+            ssh_multiplexer: None,
             quiet,
             tcp: Default::default(),
             diagnostics: Default::default(),
@@ -770,6 +887,12 @@ impl RemoteSpec {
         }
     }
 
+    pub fn set_ssh_multiplexing(&self, reuse: bool) {
+        if let Some(multiplexer) = &self.ssh_multiplexer {
+            multiplexer.set_reuse_for_workers(reuse);
+        }
+    }
+
     pub fn remote_shell_name(&self) -> String {
         std::path::Path::new(&self.rsh[0])
             .file_name()
@@ -784,22 +907,42 @@ impl RemoteSpec {
         }
     }
 
-    fn ssh_command(&self) -> Command {
+    fn ssh_command(&self, connection: SshConnection) -> Command {
         let mut cmd = Command::new(&self.rsh[0]);
         cmd.args(&self.rsh[1..]);
         if self.rsh[0].ends_with("ssh") {
-            // Data connections must not share one TCP stream / cipher process,
-            // and AES-GCM is much faster than OpenSSH's default chacha20 on
-            // CPUs with AES-NI. The list still includes the defaults so
-            // negotiation never fails.
-            cmd.args([
-                "-o",
-                "ControlMaster=no",
-                "-o",
-                "ControlPath=none",
-                "-o",
-                CIPHERS,
-            ]);
+            let multiplex = match (connection, &self.ssh_multiplexer) {
+                (SshConnection::Control, Some(multiplexer)) => Some((multiplexer, true)),
+                (SshConnection::Worker, Some(multiplexer)) => Some((multiplexer, false)),
+                _ => None,
+            };
+            if let Some((multiplexer, master)) = multiplex {
+                if master {
+                    // A failed control command can leave its socket briefly
+                    // behind while OpenSSH exits. This path is private to this
+                    // transfer, so clearing that stale inode before a retry is
+                    // safe and prevents the next master from refusing it.
+                    let _ = std::fs::remove_file(&multiplexer.path);
+                }
+                cmd.arg("-o")
+                    .arg(format!(
+                        "ControlMaster={}",
+                        if master { "yes" } else { "no" }
+                    ))
+                    .arg("-o")
+                    .arg(format!("ControlPath={}", multiplexer.path.display()))
+                    .arg("-o")
+                    .arg("ControlPersist=no");
+            } else {
+                // Large-file data connections need independent TCP streams and
+                // cipher processes. Custom remote-shell commands also keep
+                // their existing policy.
+                cmd.args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+            }
+            // AES-GCM is much faster than OpenSSH's default chacha20 on CPUs
+            // with AES-NI. The list still includes the defaults so negotiation
+            // never fails.
+            cmd.args(["-o", CIPHERS]);
             if let Some(u) = &self.user {
                 cmd.args(["-l", u]);
             }
@@ -809,6 +952,20 @@ impl RemoteSpec {
         }
         cmd.arg(&self.host);
         cmd
+    }
+
+    fn ssh_connection(&self, limited: bool) -> SshConnection {
+        if !limited {
+            SshConnection::Control
+        } else if self
+            .ssh_multiplexer
+            .as_ref()
+            .is_some_and(|multiplexer| multiplexer.reuse_for_workers())
+        {
+            SshConnection::Worker
+        } else {
+            SshConnection::Independent
+        }
     }
 
     /// A shell command that runs syq with `args` on this host.  Automatic mode
@@ -828,7 +985,7 @@ impl RemoteSpec {
     /// connections at random when many are being set up at once, so we also
     /// limit how many connects are in flight.
     pub fn connect(&self, compress: bool) -> Result<RemoteConn> {
-        self.connect_with(compress, true)
+        self.connect_with_request(compress, true, None)
     }
 
     /// `limited`: take a connect slot (data connections). The control
@@ -836,7 +993,16 @@ impl RemoteSpec {
     /// queue behind workers. In managed mode the release helper is installed
     /// on first use if the remote lacks it.
     pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
-        let first = self.connect_retried(compress, limited);
+        self.connect_with_request(compress, limited, None)
+    }
+
+    fn connect_with_request(
+        &self,
+        compress: bool,
+        limited: bool,
+        initial_request: Option<Request>,
+    ) -> Result<RemoteConn> {
+        let first = self.connect_retried(compress, limited, initial_request.clone());
         let Err(first_error) = first else {
             return first;
         };
@@ -845,33 +1011,59 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress, limited).with_context(|| {
-            format!(
-                "could not start the {} helper installed on {}",
-                remote_helper::helper_identity(),
-                self.label()
-            )
-        })
+        self.connect_retried(compress, limited, initial_request)
+            .with_context(|| {
+                format!(
+                    "could not start the {} helper installed on {}",
+                    remote_helper::helper_identity(),
+                    self.label()
+                )
+            })
     }
 
-    fn connect_retried(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
+    fn connect_retried(
+        &self,
+        compress: bool,
+        limited: bool,
+        initial_request: Option<Request>,
+    ) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
         for attempt in 0..6 {
             let _slot = limited.then(connect_slot);
-            match self.connect_once(compress) {
+            let ssh_connection = self.ssh_connection(limited);
+            match self.connect_once(compress, ssh_connection, initial_request.clone()) {
                 Ok(c) => return Ok(c),
+                Err(e)
+                    if ssh_connection == SshConnection::Worker
+                        && is_multiplexed_ssh_session_error(&e) =>
+                {
+                    // MaxSessions can reject a new channel on an otherwise
+                    // healthy control connection while still allowing a new
+                    // independently authenticated SSH connection. Disable
+                    // reuse for every later worker and retry immediately.
+                    self.set_ssh_multiplexing(false);
+                    if crate::transfer::debug() {
+                        eprintln!(
+                            "syq: {}: multiplexed SSH worker rejected; using independent SSH connections",
+                            self.label()
+                        );
+                    }
+                    last = Some(e);
+                    continue;
+                }
                 // Don't retry what won't change: a missing binary (127) or a
                 // build identity mismatch.
                 Err(e)
                     if attempt == 5
-                        || e.to_string().contains("build identity mismatch")
-                        || e.to_string().contains("exit status: 127")
-                        || e.to_string().contains(&format!(
+                        || format!("{e:#}").contains("build identity mismatch")
+                        || is_worker_initialization_error(&e)
+                        || format!("{e:#}").contains("exit status: 127")
+                        || format!("{e:#}").contains(&format!(
                             "exit status: {}",
                             remote_helper::HELPER_MISSING_EXIT
                         ))
-                        || e.to_string().contains(&format!(
+                        || format!("{e:#}").contains(&format!(
                             "exit status: {}",
                             remote_helper::HELPER_NOT_EXECUTABLE_EXIT
                         )) =>
@@ -903,7 +1095,12 @@ impl RemoteSpec {
         Err(last.unwrap())
     }
 
-    fn connect_once(&self, compress: bool) -> Result<RemoteConn> {
+    fn connect_once(
+        &self,
+        compress: bool,
+        ssh_connection: SshConnection,
+        initial_request: Option<Request>,
+    ) -> Result<RemoteConn> {
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = &self.restricted_grant {
             server_args.push(format!("--restricted-grant={grant}"));
@@ -913,7 +1110,7 @@ impl RemoteSpec {
             command.args(&server_args);
             command
         } else {
-            let mut command = self.ssh_command();
+            let mut command = self.ssh_command(ssh_connection);
             let remote_command = if self.restricted_grant.is_some() {
                 // This text is inspected by the forced receiver through
                 // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
@@ -946,41 +1143,52 @@ impl RemoteSpec {
             dead: false,
             peer: None,
             tcp_socket: None,
+            multiplexed_ssh: ssh_connection == SshConnection::Worker,
         };
-        let conn = hello(conn, compress, Vec::new())?;
+        let conn = hello(conn, compress, Vec::new(), initial_request)?;
         self.record_peer(&conn);
         Ok(conn)
     }
 
     /// Ask the remote (over the control connection) to accept TCP data
-    /// connections; records how to reach it for later `connect` calls.
-    pub fn setup_tcp(
+    /// connections, then begin probing the advertised routes in the
+    /// background. The caller must finish the setup before opening workers.
+    pub(crate) fn begin_tcp_setup(
         &self,
         ctl: &mut dyn Conn,
         plain: bool,
         ports: (u16, u16),
         congestion_control: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<PendingTcpSetup> {
         *self.tcp.lock().unwrap() = None;
         {
             let mut diagnostics = self.diagnostics.lock().unwrap();
             diagnostics.tcp_probe = None;
             diagnostics.tcp_setup_error = None;
         }
-        let result = self.setup_tcp_inner(ctl, plain, ports, congestion_control);
+        let result = self.begin_tcp_setup_inner(ctl, plain, ports, congestion_control);
         if let Err(error) = &result {
             self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
         }
         result
     }
 
-    fn setup_tcp_inner(
+    /// Join background route probes and record the selected TCP data paths.
+    pub(crate) fn finish_tcp_setup(&self, pending: PendingTcpSetup) -> Result<()> {
+        let result = self.finish_tcp_setup_inner(pending);
+        if let Err(error) = &result {
+            self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
+        }
+        result
+    }
+
+    fn begin_tcp_setup_inner(
         &self,
         ctl: &mut dyn Conn,
         plain: bool,
         ports: (u16, u16),
         congestion_control: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<PendingTcpSetup> {
         let key = if plain {
             None
         } else {
@@ -1039,8 +1247,35 @@ impl RemoteSpec {
                 );
             }
         }
-        // Probe which advertised addresses this client can actually reach.
-        probe_reachable(&mut candidates, port);
+        // Probing is independent of the authenticated control stream. Let the
+        // orchestrator do destination preflight and plan payloads while every
+        // candidate receives its complete bounded probe window.
+        let probe = std::thread::spawn(move || {
+            probe_reachable(&mut candidates, port);
+            candidates
+        });
+        Ok(PendingTcpSetup {
+            port,
+            key,
+            token,
+            congestion_control: congestion_control.map(str::to_owned),
+            remote_congestion_control,
+            probe,
+        })
+    }
+
+    fn finish_tcp_setup_inner(&self, pending: PendingTcpSetup) -> Result<()> {
+        let PendingTcpSetup {
+            port,
+            key,
+            token,
+            congestion_control,
+            remote_congestion_control,
+            probe,
+        } = pending;
+        let mut candidates = probe
+            .join()
+            .map_err(|_| anyhow!("TCP route probe thread panicked"))?;
         // Multipath only across comparable-speed NICs: keep those within 2x of
         // the fastest reachable one. Mixing a fast and a slow path (a rail and
         // Tailscale, say) would drag the transfer down, so we don't.
@@ -1089,7 +1324,7 @@ impl RemoteSpec {
             port,
             key,
             token,
-            congestion_control: congestion_control.map(str::to_owned),
+            congestion_control,
             failed: false,
             failure: None,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1119,7 +1354,12 @@ impl RemoteSpec {
     /// reachable data addresses (multipath). Addresses were already probed and
     /// speed-filtered in setup_tcp, so we just round-robin and fall through on
     /// the rare transient failure.
-    fn connect_tcp(&self, info: &TcpInfo, compress: bool) -> Result<RemoteConn> {
+    fn connect_tcp(
+        &self,
+        info: &TcpInfo,
+        compress: bool,
+        initial_request: Option<Request>,
+    ) -> Result<RemoteConn> {
         let n = info.addrs.len();
         let start = info.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
         let mut last = anyhow!("no data address");
@@ -1190,8 +1430,9 @@ impl RemoteSpec {
                 dead: false,
                 peer: None,
                 tcp_socket: Some(tcp_socket),
+                multiplexed_ssh: false,
             };
-            let conn = hello(conn, compress, info.token.clone())?;
+            let conn = hello(conn, compress, info.token.clone(), initial_request.clone())?;
             self.record_peer(&conn);
             return Ok(conn);
         }
@@ -1200,7 +1441,7 @@ impl RemoteSpec {
 }
 
 fn helper_needs_install(e: &anyhow::Error) -> bool {
-    let message = e.to_string();
+    let message = format!("{e:#}");
     message.contains(&format!(
         "exit status: {}",
         remote_helper::HELPER_MISSING_EXIT
@@ -1304,33 +1545,46 @@ impl std::fmt::Debug for TcpInfo {
     }
 }
 
-fn hello(mut conn: RemoteConn, compress: bool, token: Vec<u8>) -> Result<RemoteConn> {
-    {
-        conn.send(Request::Hello {
-            identity: crate::identity::build().to_string(),
-            compress,
-            debug: crate::transfer::debug(),
-            token,
-        })?;
-        match conn.recv() {
-            Ok(Response::HelloOk { identity, platform })
-                if identity == crate::identity::build() =>
-            {
-                conn.peer = Some(PeerInfo { identity, platform });
-                Ok(conn)
-            }
-            Ok(Response::HelloOk { identity, .. }) => {
-                bail!(
-                    "{}: build identity mismatch (remote {identity}, local {})",
-                    conn.label,
-                    crate::identity::build()
-                )
-            }
-            Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
-            Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
-            Err(e) => bail!("{e}\ncould not start the remote syq on {}", conn.label),
+fn hello(
+    mut conn: RemoteConn,
+    compress: bool,
+    token: Vec<u8>,
+    initial_request: Option<Request>,
+) -> Result<RemoteConn> {
+    conn.send(Request::Hello {
+        identity: crate::identity::build().to_string(),
+        compress,
+        debug: crate::transfer::debug(),
+        token,
+    })?;
+    // Worker destination anchoring is independent of the Hello response. Put
+    // it on the wire immediately so the receiver can authenticate, anchor,
+    // and acknowledge within one WAN turn while preserving response order.
+    if let Some(request) = initial_request.as_ref() {
+        conn.send(request.clone())?;
+    }
+    match conn.recv() {
+        Ok(Response::HelloOk { identity, platform }) if identity == crate::identity::build() => {
+            conn.peer = Some(PeerInfo { identity, platform });
+        }
+        Ok(Response::HelloOk { identity, .. }) => {
+            bail!(
+                "{}: build identity mismatch (remote {identity}, local {})",
+                conn.label,
+                crate::identity::build()
+            )
+        }
+        Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
+        Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("could not start the remote syq on {}", conn.label))
         }
     }
+    if initial_request.is_some() {
+        worker_initialization_response(conn.recv()?)?;
+    }
+    Ok(conn)
 }
 
 impl RemoteSpec {
@@ -1366,7 +1620,7 @@ impl RemoteSpec {
     }
 
     fn remote_bootstrap(&self) -> Result<RemoteBootstrap> {
-        let mut cmd = self.ssh_command();
+        let mut cmd = self.ssh_command(SshConnection::Independent);
         cmd.arg(remote_helper::probe_command())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1455,7 +1709,7 @@ impl RemoteSpec {
 
     fn try_direct_helper(&self, target: Target) -> Result<DirectHelper> {
         let script = remote_helper::download_script(target);
-        let mut cmd = self.ssh_command();
+        let mut cmd = self.ssh_command(SshConnection::Independent);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1577,7 +1831,7 @@ impl RemoteSpec {
 
     fn upload_helper(&self, target: Target, binary: &[u8]) -> Result<()> {
         let script = remote_helper::upload_script(target);
-        let mut cmd = self.ssh_command();
+        let mut cmd = self.ssh_command(SshConnection::Independent);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1758,14 +2012,33 @@ impl Endpoint {
     }
 
     pub fn connect(&self, compress: bool) -> Result<Box<dyn Conn>> {
+        self.connect_with_request(compress, None)
+    }
+
+    pub(crate) fn connect_with_request(
+        &self,
+        compress: bool,
+        initial_request: Option<Request>,
+    ) -> Result<Box<dyn Conn>> {
         match self {
-            Endpoint::Local => Ok(Box::new(LocalConn::new())),
+            Endpoint::Local => {
+                let mut conn = LocalConn::new();
+                if let Some(request) = initial_request {
+                    worker_initialization_response(conn.call(request)?)?;
+                }
+                Ok(Box::new(conn))
+            }
             Endpoint::Remote(spec) => {
                 let info = spec.tcp.lock().unwrap().clone();
                 if let Some(info) = info.filter(|i| !i.failed) {
-                    match spec.connect_tcp(&info, compress) {
+                    match spec.connect_tcp(&info, compress, initial_request.clone()) {
                         Ok(c) => return Ok(Box::new(c)),
-                        Err(e) if is_tcp_congestion_error(&e) => return Err(e),
+                        Err(e)
+                            if is_tcp_congestion_error(&e)
+                                || is_worker_initialization_error(&e) =>
+                        {
+                            return Err(e)
+                        }
                         Err(e) => {
                             if spec.restricted_grant.is_some() {
                                 return Err(e).with_context(|| {
@@ -1797,7 +2070,11 @@ impl Endpoint {
                         spec.label()
                     );
                 }
-                Ok(Box::new(spec.connect(compress)?))
+                Ok(Box::new(spec.connect_with_request(
+                    compress,
+                    true,
+                    initial_request,
+                )?))
             }
         }
     }
@@ -1900,6 +2177,7 @@ mod tests {
             auto_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
+            ssh_multiplexer: None,
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
@@ -1916,7 +2194,7 @@ mod tests {
         };
 
         let error = spec
-            .connect_tcp(&info, false)
+            .connect_tcp(&info, false, None)
             .err()
             .expect("unregistered congestion control should fail locally");
         let message = format!("{error:#}");
@@ -1933,6 +2211,74 @@ mod tests {
             tcp_congestion_fallback_note(Some("reno")),
             "; requested congestion control reno is not used by the SSH fallback"
         );
+    }
+
+    #[test]
+    fn rejected_worker_initialization_is_not_a_retryable_transport_error() {
+        let error = worker_initialization_response(Response::Err("destination changed".into()))
+            .unwrap_err();
+        assert!(is_worker_initialization_error(&error));
+        assert!(!is_tcp_congestion_error(&error));
+    }
+
+    #[test]
+    fn hello_sends_worker_initialization_before_waiting_for_its_response() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = FrameReader::new(socket.try_clone().unwrap());
+            assert!(matches!(
+                reader.read_msg::<Request>().unwrap(),
+                Request::Hello { .. }
+            ));
+            assert!(matches!(
+                reader.read_msg::<Request>().unwrap(),
+                Request::AnchorDestination { .. }
+            ));
+
+            let mut writer = FrameWriter::new(socket, false);
+            writer
+                .write_msg(&Response::HelloOk {
+                    identity: crate::identity::build().to_string(),
+                    platform: crate::identity::platform(),
+                })
+                .unwrap();
+            writer.write_msg(&Response::Ok).unwrap();
+        });
+
+        let socket = TcpStream::connect(address).unwrap();
+        let (rx, reader) = spawn_reader(Box::new(socket.try_clone().unwrap()));
+        let conn = RemoteConn {
+            child: None,
+            w: FrameWriter::new(Box::new(socket), false),
+            rx: Some(rx),
+            reader: Some(reader),
+            label: "pipelined hello test".into(),
+            dead: false,
+            peer: None,
+            tcp_socket: None,
+            multiplexed_ssh: false,
+        };
+        let conn = hello(
+            conn,
+            false,
+            Vec::new(),
+            Some(Request::AnchorDestination {
+                path: Some(b"destination".to_vec()),
+                expected_dev: 1,
+                expected_ino: 2,
+                request_prefix: b"destination".to_vec(),
+                insecure_links: false,
+            }),
+        )
+        .unwrap();
+        assert!(conn.peer.is_some());
+        drop(conn);
+        server.join().unwrap();
     }
 
     #[test]
@@ -1978,6 +2324,7 @@ mod tests {
                 dead: false,
                 peer: None,
                 tcp_socket: Some(tcp_socket),
+                multiplexed_ssh: false,
             };
             let timeout = std::time::Duration::from_millis(5);
             let start = std::time::Instant::now();
@@ -2098,11 +2445,12 @@ mod tests {
             auto_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
+            ssh_multiplexer: None,
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
         };
-        let command = spec.ssh_command();
+        let command = spec.ssh_command(SshConnection::Independent);
         assert!(!command
             .get_args()
             .any(|arg| arg.to_string_lossy().starts_with("StrictHostKeyChecking=")));
@@ -2114,8 +2462,52 @@ mod tests {
             "StrictHostKeyChecking=yes".to_string(),
         ];
         assert!(configured
-            .ssh_command()
+            .ssh_command(SshConnection::Independent)
             .get_args()
             .any(|arg| arg == OsStr::new("StrictHostKeyChecking=yes")));
+    }
+
+    #[test]
+    fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
+        let multiplexer = std::sync::Arc::new(SshMultiplexer::new().unwrap());
+        let control_path = format!("ControlPath={}", multiplexer.path.display());
+        let spec = RemoteSpec {
+            local_process: false,
+            user: None,
+            host: "example".into(),
+            rsh: vec!["ssh".into()],
+            syq_path: None,
+            auto_helper: false,
+            restricted_grant: None,
+            helper_install: Default::default(),
+            ssh_multiplexer: Some(multiplexer),
+            quiet: false,
+            tcp: Default::default(),
+            diagnostics: Default::default(),
+        };
+        let args = |connection| {
+            spec.ssh_command(connection)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let control = args(SshConnection::Control);
+        assert!(control.iter().any(|arg| arg == "ControlMaster=yes"));
+        assert!(control.iter().any(|arg| arg == &control_path));
+        assert!(control.iter().any(|arg| arg == "ControlPersist=no"));
+
+        let worker = args(spec.ssh_connection(true));
+        assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
+        assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
+
+        spec.set_ssh_multiplexing(true);
+        let worker = args(spec.ssh_connection(true));
+        assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
+        assert!(worker.iter().any(|arg| arg == &control_path));
+        assert!(!worker.iter().any(|arg| arg == "ControlPath=none"));
+
+        let independent = args(SshConnection::Independent);
+        assert!(independent.iter().any(|arg| arg == "ControlPath=none"));
     }
 }
