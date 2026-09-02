@@ -8633,13 +8633,14 @@ fn native_cp_results_stream_success_and_partial() {
         .unwrap();
     assert_eq!(last["status"], "success");
     assert_eq!(last["exit_code"], 0);
-    // An error record accompanied the failure in the first run.
-    assert!(
-        lines
-            .iter()
-            .any(|v| v["type"] == "error"
-                && v["message"].as_str().unwrap().contains("does not exist"))
-    );
+    // An error record accompanied the failure in the first run, classified
+    // like its adjacent operation record.
+    let error = lines
+        .iter()
+        .find(|v| v["type"] == "error" && v["message"].as_str().unwrap().contains("does not exist"))
+        .expect("classified error record");
+    assert_eq!(error["class"], "io");
+    assert_eq!(error["os_kind"], "not_found");
 }
 
 #[test]
@@ -8702,6 +8703,8 @@ fn native_map_normalizes_dot_components_and_rejects_dotdot() {
 fn native_cp_results_dry_run_emits_traces() {
     let t = Tmp::new();
     write(&t.path("src/f.txt"), b"data");
+    write(&t.path("src/sub/g.txt"), b"gg");
+    std::os::unix::fs::symlink("f.txt", t.path("src/l")).unwrap();
     let out = syq_cp_in(
         &t.path(""),
         &[
@@ -8745,7 +8748,133 @@ fn native_cp_results_dry_run_emits_traces() {
     assert_eq!(last["type"], "result");
     assert_eq!(last["dry_run"], true);
     assert_eq!(last["status"], "success");
-    assert_eq!(last["files_transferred"], 1, "planned, per dry_run: true");
+    assert_eq!(last["files_transferred"], 2, "planned, per dry_run: true");
+    // Planned non-file work comes from the traced changes, not the live
+    // mutation counters (which a dry run never moves).
+    assert!(last["directories_created"].as_u64().unwrap() >= 1);
+    assert_eq!(last["symlinks_created"], 1);
+}
+
+#[test]
+fn native_cp_mapping_dry_run_implicit_ancestor_trace_has_no_src() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    let manifest = entry_line("a.txt", "sub/a.txt", None);
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-n",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert!(out.status.success());
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let dir_trace = lines
+        .iter()
+        .find(|v| v["type"] == "trace" && v["dst"]["value"] == "sub")
+        .expect("implicit ancestor trace");
+    assert!(
+        dir_trace.get("src").is_none(),
+        "implicit ancestors have no source: {dir_trace}"
+    );
+    let file_trace = lines
+        .iter()
+        .find(|v| v["type"] == "trace" && v["dst"]["value"] == "sub/a.txt")
+        .expect("file trace");
+    assert_eq!(file_trace["src"]["value"], "a.txt");
+}
+
+#[test]
+fn native_cp_mapping_ancestor_conflict_gets_failed_record() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    write(&t.path("src/b.txt"), b"b");
+    // x resolves to a file at execution; x/y then conflicts at runtime.
+    let manifest = format!(
+        "{}{}",
+        entry_line("a.txt", "x", None),
+        entry_line("b.txt", "x/y", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(out.status.code(), Some(23));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failed = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["dst"]["value"] == "x/y")
+        .expect("failed record for the conflicting entry");
+    assert_eq!(failed["disposition"], "failed");
+    assert_eq!(failed["retryable"], "no");
+    assert_eq!(failed["class"], "conflict");
+}
+
+#[test]
+fn native_cp_results_preexisting_directory_is_not_reported_created() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f.txt"), b"f");
+    fs::create_dir_all(t.path("dst/sub")).unwrap();
+    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("dst/sub/f.txt")), b"f");
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        !lines
+            .iter()
+            .any(|v| v["type"] == "operation_result" && v["action"] == "create_directory"),
+        "reopening an existing directory for writability is not a creation"
+    );
+    assert_eq!(lines.last().unwrap()["directories_created"], 0);
 }
 
 #[test]
@@ -8803,6 +8932,7 @@ fn native_cp_prune_results_cover_deletions() {
     write(&t.path("src/keep.txt"), b"k");
     write(&t.path("dst/keep.txt"), b"k");
     write(&t.path("dst/extra.txt"), b"x");
+    std::os::unix::fs::symlink("keep.txt", t.path("dst/extra-link")).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp-prune",
@@ -8831,13 +8961,26 @@ fn native_cp_prune_results_cover_deletions() {
     assert_eq!(lines[0]["mode"], "cp-prune");
     let delete = lines
         .iter()
-        .find(|v| v["type"] == "operation_result" && v["action"] == "delete")
+        .find(|v| {
+            v["type"] == "operation_result"
+                && v["action"] == "delete"
+                && v["dst"]["value"] == "extra.txt"
+        })
         .expect("delete record");
-    assert_eq!(delete["dst"]["value"], "extra.txt");
     assert_eq!(delete["disposition"], "succeeded");
+    assert_eq!(delete["kind"], "file");
+    let link_delete = lines
+        .iter()
+        .find(|v| {
+            v["type"] == "operation_result"
+                && v["action"] == "delete"
+                && v["dst"]["value"] == "extra-link"
+        })
+        .expect("symlink delete record");
+    assert_eq!(link_delete["kind"], "symlink", "leaf kinds are preserved");
     let last = lines.last().unwrap();
-    assert_eq!(last["deletions_planned"], 1);
-    assert_eq!(last["deletions_completed"], 1);
+    assert_eq!(last["deletions_planned"], 2);
+    assert_eq!(last["deletions_completed"], 2);
     assert_eq!(last["deletions_blocked"], 0);
     // --max-delete 0 refuses: blocked records, refused status, exit 25.
     write(&t.path("dst/extra2.txt"), b"x");
@@ -8873,6 +9016,39 @@ fn native_cp_prune_results_cover_deletions() {
     let last = lines.last().unwrap();
     assert_eq!(last["status"], "refused");
     assert_eq!(last["exit_code"], 25);
+    assert_eq!(last["deletions_blocked"], 1);
+    // A dry run stays trace-only even when --max-delete blocks: the fact
+    // lives in the aggregates.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp-prune",
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r3.ndjson",
+            "--max-delete",
+            "0",
+            "-n",
+            "-q",
+        ])
+        .current_dir(t.path(""))
+        .run()
+        .expect("run cp-prune");
+    assert_eq!(out.status.code(), Some(25));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r3.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        !lines.iter().any(|v| v["type"] == "operation_result"),
+        "dry runs emit no operation records"
+    );
+    let last = lines.last().unwrap();
+    assert_eq!(last["status"], "refused");
+    assert_eq!(last["dry_run"], true);
     assert_eq!(last["deletions_blocked"], 1);
 }
 

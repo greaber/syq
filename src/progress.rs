@@ -149,10 +149,19 @@ impl Progress {
     }
 
     pub fn error(&self, line: &str) {
+        self.error_classified(line, None, None);
+    }
+
+    pub fn error_classified(
+        &self,
+        line: &str,
+        class: Option<&'static str>,
+        os_kind: Option<&'static str>,
+    ) {
         self.errors.fetch_add(1, Relaxed);
         self.eprintln(line);
         if let Some(results) = self.results.get() {
-            results.emit_error(line);
+            results.emit_error_classified(line, class, os_kind);
         }
     }
 

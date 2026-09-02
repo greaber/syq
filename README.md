@@ -347,8 +347,8 @@ receiver, `cp` and `cp-prune` also accept the receiver ceilings
 `--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
 (`s`, `m`, or `h`; at most 23h). They are signed into the grant and enforced
 by hostB, and are refused anywhere else because nothing would enforce them.
-`cp` additionally accepts `--mapping` and `--results`
-(see [MAPPINGS.md](MAPPINGS.md)). `cp-prune` additionally
+`cp` additionally accepts `--mapping`, and both `cp` and `cp-prune` accept
+`--results` (see [MAPPINGS.md](MAPPINGS.md)). `cp-prune` additionally
 accepts `--max-delete`; `rm` additionally accepts `--root` plus
 its endpoint-side removal semantics.
 

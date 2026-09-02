@@ -766,9 +766,9 @@ struct NativeCopyFields {
     /// dst paths are relative to the --into container
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     mapping: Option<OsString>,
-    /// Write machine-readable NDJSON operation results to FILE (`-` writes
-    /// to stdout; combine with -q). Automation schema version 0, an
-    /// unstable preview
+    /// Write the machine-readable NDJSON result stream to FILE; `-` writes
+    /// it to stdout and suppresses human stdout output. Automation schema
+    /// version 1
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     results: Option<OsString>,
     /// Keep the ssh control connection alive for 5 minutes after the run and

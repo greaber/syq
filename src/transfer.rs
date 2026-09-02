@@ -2002,14 +2002,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     progress.clear();
 
     let errors = progress.errors.load(Relaxed);
-    let exit_code = if aborted {
-        1
+    // One derivation for both, so status and exit code cannot disagree:
+    // aborts trump entry errors, which trump a blocked deletion pass (its
+    // fact survives in deletions_blocked).
+    let (status, exit_code) = if aborted {
+        ("aborted", 1)
     } else if errors > 0 {
-        23
+        ("partial", 23)
     } else if max_delete_hit {
-        25
+        ("refused", 25)
     } else {
-        0
+        ("success", 0)
     };
     let (deletions_planned, deletions_completed, deletions_blocked) = if opts.delete {
         let planned = match delete_plan {
@@ -2027,23 +2030,29 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Hard v1 rule: the human summary below renders from this same struct,
     // so the numbers a person reads and a machine parses cannot disagree.
     let terminal = crate::results::ResultRecord {
-        status: if aborted {
-            "aborted"
-        } else if max_delete_hit {
-            "refused"
-        } else if errors > 0 {
-            "partial"
-        } else {
-            "success"
-        },
+        status,
         exit_code,
         dry_run: opts.dry_run,
         files_transferred: progress.files_done.load(Relaxed),
         files_unchanged: progress.files_skipped.load(Relaxed),
         files_excluded: progress.files_excluded.load(Relaxed),
-        directories_created: created_counts.0,
-        symlinks_created: created_counts.1,
-        specials_created: created_counts.2,
+        // Live counters only move when mutations run; a dry run reports the
+        // planned work it traced instead.
+        directories_created: if opts.dry_run {
+            dry_run_changes.directories.len() as u64
+        } else {
+            created_counts.0
+        },
+        symlinks_created: if opts.dry_run {
+            dry_run_changes.symlinks
+        } else {
+            created_counts.1
+        },
+        specials_created: if opts.dry_run {
+            dry_run_changes.specials
+        } else {
+            created_counts.2
+        },
         errors,
         bytes_transferred: progress.bytes_done.load(Relaxed),
         bytes_unchanged: progress.bytes_skipped.load(Relaxed),
@@ -3032,10 +3041,11 @@ struct Mapped {
 /// What --delete found on the destination that the source doesn't have.
 #[derive(Default)]
 struct Deletes {
-    /// (path, display name) of files, symlinks and specials to unlink.
-    leaves: Vec<(PathBytes, String)>,
+    /// (path, display name, record kind) of files, symlinks and specials to
+    /// unlink; the kind label keeps deletion records truthful.
+    leaves: Vec<(PathBytes, String, &'static str)>,
     /// Directories by depth, removed deepest-first once they are empty.
-    dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String)>>,
+    dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String, &'static str)>>,
 }
 
 impl Deletes {
@@ -3411,7 +3421,11 @@ impl Planner<'_> {
                         "--mapping line {line_number}: source {} does not exist",
                         display(&m.src)
                     );
-                    self.progress.error(&format!("syq: {message}"));
+                    self.progress.error_classified(
+                        &format!("syq: {message}"),
+                        Some("io"),
+                        Some("not_found"),
+                    );
                     self.emit_mapping_entry_failed(
                         &m,
                         "unknown",
@@ -3429,7 +3443,11 @@ impl Planner<'_> {
                             kind_label(e.kind),
                             declared.label(),
                         );
-                        self.progress.error(&format!("syq: {message}"));
+                        self.progress.error_classified(
+                            &format!("syq: {message}"),
+                            Some("conflict"),
+                            None,
+                        );
                         self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
                         continue;
                     }
@@ -3446,10 +3464,16 @@ impl Planner<'_> {
                     match emitted.get(anc) {
                         Some(Kind::Dir) => {}
                         Some(_) => {
-                            self.progress.error(&format!(
-                                "syq: --mapping line {line_number}: destination ancestor {} was mapped as a non-directory",
+                            let message = format!(
+                                "--mapping line {line_number}: destination ancestor {} was mapped as a non-directory",
                                 display(anc)
-                            ));
+                            );
+                            self.progress.error_classified(
+                                &format!("syq: {message}"),
+                                Some("conflict"),
+                                None,
+                            );
+                            self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
                             conflict = true;
                             break;
                         }
@@ -3468,10 +3492,16 @@ impl Planner<'_> {
                         self.implicit_dirs.remove(&join(dst_root, &m.dst));
                     }
                     Some(_) => {
-                        self.progress.error(&format!(
-                            "syq: --mapping line {line_number}: destination {} was already used as a directory",
+                        let message = format!(
+                            "--mapping line {line_number}: destination {} was already used as a directory",
                             display(&m.dst)
-                        ));
+                        );
+                        self.progress.error_classified(
+                            &format!("syq: {message}"),
+                            Some("conflict"),
+                            None,
+                        );
+                        self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
                         continue;
                     }
                 }
@@ -3859,12 +3889,13 @@ impl Planner<'_> {
                         None => {
                             self.dry_run_changes.directories.insert(p.clone());
                             if let Some(dst_rel) = strip_dst_root(p, dst_root) {
-                                self.emit_trace(
+                                self.emit_trace_with_src(
                                     "create_directory",
                                     dst_rel,
                                     "dir",
                                     None,
                                     "destination_missing",
+                                    !self.implicit_dirs.contains(p),
                                 );
                             }
                             if opts.verbose > 0 {
@@ -3879,12 +3910,13 @@ impl Planner<'_> {
                                 self.dry_run_changes.type_replacements += 1;
                             }
                             if let Some(dst_rel) = strip_dst_root(p, dst_root) {
-                                self.emit_trace(
+                                self.emit_trace_with_src(
                                     "create_directory",
                                     dst_rel,
                                     "dir",
                                     None,
                                     "type_differs",
+                                    !self.implicit_dirs.contains(p),
                                 );
                             }
                             if opts.verbose > 0 {
@@ -3901,12 +3933,13 @@ impl Planner<'_> {
                         {
                             self.dry_run_changes.metadata_directories.insert(p.clone());
                             if let Some(dst_rel) = strip_dst_root(p, dst_root) {
-                                self.emit_trace(
+                                self.emit_trace_with_src(
                                     "create_directory",
                                     dst_rel,
                                     "dir",
                                     None,
                                     "metadata_differs",
+                                    !self.implicit_dirs.contains(p),
                                 );
                             }
                             if opts.verbose > 0 {
@@ -3921,7 +3954,13 @@ impl Planner<'_> {
                 }
             } else if !opts.verify_only {
                 // Create new dirs; also "create" existing ones we can't yet
-                // write into (0o700 not set) so apply() opens them up.
+                // write into (0o700 not set) so apply() opens them up. The
+                // latter are not creations: no record, no count.
+                let existing_dirs: std::collections::HashSet<&PathBytes> = planned
+                    .iter()
+                    .filter(|(_, _, _, st)| matches!(st, Some(d) if d.kind == Kind::Dir))
+                    .map(|(p, _, _, _)| p)
+                    .collect();
                 let mut new_dirs: Vec<Op> = planned
                     .iter()
                     .filter(|(path, _, _, st)| {
@@ -3985,16 +4024,28 @@ impl Planner<'_> {
                         .collect();
                     let errs = self.apply(new_dirs)?;
                     let mut failed = 0;
+                    let mut reopened = 0;
                     for ((name, condition), err) in op_info.iter().zip(errs) {
-                        let created = err.is_none();
+                        let preexisting = existing_dirs.contains(name);
+                        let succeeded = err.is_none();
+                        let created = succeeded && !preexisting;
                         if let Some(err) = err {
                             failed += 1;
-                            self.progress.error(&format!("syq: {err}"));
+                            self.progress.error_classified(
+                                &format!("syq: {err}"),
+                                Some("io"),
+                                None,
+                            );
                             if name == &self.root_path && *condition != TargetCondition::Any {
                                 self.collision = true;
                             }
-                        } else if opts.verbose > 0 {
+                        } else if opts.verbose > 0 && !preexisting {
                             self.progress.println(&format!("{}/", display(name)));
+                        }
+                        if preexisting && succeeded {
+                            // Reopened for writability only; nothing was made.
+                            reopened += 1;
+                            continue;
                         }
                         if let (Some(results), Some(dst_rel)) = (
                             self.progress.results_writer(),
@@ -4028,7 +4079,7 @@ impl Planner<'_> {
                             });
                         }
                     }
-                    self.dirs_created += (n - failed) as u64;
+                    self.dirs_created += (n - failed - reopened) as u64;
                 }
                 let mut flags = opts.flags;
                 if !opts.perms {
@@ -4728,6 +4779,11 @@ impl Planner<'_> {
         os_kind: Option<&'static str>,
         message: &str,
     ) {
+        // Dry runs are trace-only: the error record and terminal accounting
+        // still reflect the failure.
+        if self.opts.dry_run {
+            return;
+        }
         if let Some(results) = self.progress.results_writer() {
             let (action, kind) = match entry.kind {
                 Some(DeclaredKind::Dir) => ("create_directory", "dir"),
@@ -4762,8 +4818,20 @@ impl Planner<'_> {
         bytes: Option<u64>,
         reason: &'static str,
     ) {
+        self.emit_trace_with_src(action, dst_rel, kind, bytes, reason, true);
+    }
+
+    fn emit_trace_with_src(
+        &self,
+        action: &'static str,
+        dst_rel: &[u8],
+        kind: &'static str,
+        bytes: Option<u64>,
+        reason: &'static str,
+        with_src: bool,
+    ) {
         if let Some(results) = self.progress.results_writer() {
-            let src = self.mapping_source_rel(dst_rel);
+            let src = with_src.then(|| self.mapping_source_rel(dst_rel)).flatten();
             results.emit_trace(&crate::results::TraceRecord {
                 action,
                 dst: dst_rel,
@@ -4796,10 +4864,14 @@ impl Planner<'_> {
             }
             (Some(Claim::File { .. }), Claim::File { .. }) => Some(true),
             (Some(_), _) => {
-                self.progress.error(&format!(
-                    "syq: {rel}: two sources map to the same destination {} with conflicting types — refusing to clobber it",
-                    display(dst)
-                ));
+                self.progress.error_classified(
+                    &format!(
+                        "syq: {rel}: two sources map to the same destination {} with conflicting types — refusing to clobber it",
+                        display(dst)
+                    ),
+                    Some("conflict"),
+                    None,
+                );
                 self.collision = true;
                 None
             }
@@ -4969,13 +5041,20 @@ impl Planner<'_> {
                         } else {
                             if e.kind == Kind::Dir {
                                 let depth = full.iter().filter(|&&c| c == b'/').count();
-                                found
-                                    .dirs
-                                    .entry(depth)
-                                    .or_default()
-                                    .push((full, format!("{rel}/")));
+                                found.dirs.entry(depth).or_default().push((
+                                    full,
+                                    format!("{rel}/"),
+                                    "dir",
+                                ));
                             } else {
-                                found.leaves.push((full, rel));
+                                let kind = match e.kind {
+                                    Kind::Symlink => "symlink",
+                                    Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
+                                        "special"
+                                    }
+                                    _ => "file",
+                                };
+                                found.leaves.push((full, rel, kind));
                             }
                         }
                     }
@@ -5000,12 +5079,16 @@ impl Planner<'_> {
             res?;
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
-                for (path, rel) in v {
+                for (path, rel, kind) in v {
                     if protected.contains(&path) {
                         self.progress
                             .eprintln(&format!("syq: not deleting {rel}: it holds ignored paths"));
                     } else {
-                        self.deletes.dirs.entry(d).or_default().push((path, rel));
+                        self.deletes
+                            .dirs
+                            .entry(d)
+                            .or_default()
+                            .push((path, rel, kind));
                     }
                 }
             }
@@ -5025,11 +5108,11 @@ impl Planner<'_> {
                 self.progress.eprintln(&format!(
                     "syq: {planned} deletions planned, more than --max-delete {max}; deleting nothing"
                 ));
-                if let Some(results) = self.progress.results_writer() {
+                if let Some(results) = self.progress.results_writer().filter(|_| !opts.dry_run) {
                     let blocked = leaves
                         .iter()
-                        .map(|(p, _)| (p, "file"))
-                        .chain(dirs.values().flatten().map(|(p, _)| (p, "dir")));
+                        .map(|(p, _, kind)| (p, *kind))
+                        .chain(dirs.values().flatten().map(|(p, _, _)| (p, "dir")));
                     for (p, kind) in blocked {
                         let Some(dst_rel) = strip_dst_root(p, &self.root_path) else {
                             continue;
@@ -5054,19 +5137,16 @@ impl Planner<'_> {
             }
         }
         let mut n = 0u64;
-        let mut run = |me: &mut Self, items: &[(PathBytes, String)], rmdir: bool| -> Result<()> {
+        let mut run = |me: &mut Self,
+                       items: &[(PathBytes, String, &'static str)],
+                       rmdir: bool|
+         -> Result<()> {
             for chunk in items.chunks(1000) {
                 if opts.dry_run {
-                    for (p, rel) in chunk {
+                    for (p, rel, kind) in chunk {
                         n += 1;
                         if let Some(dst_rel) = strip_dst_root(p, &me.root_path) {
-                            me.emit_trace(
-                                "delete",
-                                dst_rel,
-                                if rmdir { "dir" } else { "file" },
-                                None,
-                                "destination_only",
-                            );
+                            me.emit_trace("delete", dst_rel, kind, None, "destination_only");
                         }
                         if opts.verbose > 0 {
                             me.progress
@@ -5077,7 +5157,7 @@ impl Planner<'_> {
                 }
                 let ops: Vec<Op> = chunk
                     .iter()
-                    .map(|(p, _)| {
+                    .map(|(p, _, _)| {
                         if rmdir {
                             Op::Rmdir { path: p.clone() }
                         } else {
@@ -5088,7 +5168,7 @@ impl Planner<'_> {
                     })
                     .collect();
                 let errs = me.apply(ops)?;
-                for ((p, rel), err) in chunk.iter().zip(errs) {
+                for ((p, rel, kind), err) in chunk.iter().zip(errs) {
                     let failed = err.is_some();
                     match err {
                         None => {
@@ -5097,7 +5177,11 @@ impl Planner<'_> {
                                 me.progress.println(&format!("deleting {rel}"));
                             }
                         }
-                        Some(e) => me.progress.error(&format!("syq: delete {rel}: {e}")),
+                        Some(e) => me.progress.error_classified(
+                            &format!("syq: delete {rel}: {e}"),
+                            Some("io"),
+                            None,
+                        ),
                     }
                     if let Some(results) = me.progress.results_writer() {
                         let Some(dst_rel) = strip_dst_root(p, &me.root_path) else {
@@ -5107,7 +5191,7 @@ impl Planner<'_> {
                             action: "delete",
                             dst: dst_rel,
                             src: None,
-                            kind: if rmdir { "dir" } else { "file" },
+                            kind,
                             disposition: if failed { "failed" } else { "succeeded" },
                             bytes: None,
                             attempts: None,
@@ -5630,7 +5714,11 @@ impl Worker {
             if let Err(e) = res {
                 let os_kind = os_kind_of(&e);
                 let message = format!("{e:#}");
-                self.progress.error(&format!("syq: {}: {message}", j.rel));
+                self.progress.error_classified(
+                    &format!("syq: {}: {message}", j.rel),
+                    Some("io"),
+                    os_kind,
+                );
                 self.emit_file_result_failed(j, "unknown", os_kind, &message);
                 self.sched.fail_file(*idx);
                 continue;
@@ -5717,7 +5805,11 @@ impl Worker {
             let job = self.job(idx);
             let os_kind = os_kind_of(&e);
             let message = format!("{e:#}");
-            self.progress.error(&format!("syq: {}: {message}", job.rel));
+            self.progress.error_classified(
+                &format!("syq: {}: {message}", job.rel),
+                Some("io"),
+                os_kind,
+            );
             self.emit_file_result_failed(&job, "unknown", os_kind, &message);
             self.sched.fail_file(idx);
         }

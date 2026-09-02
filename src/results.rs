@@ -176,10 +176,6 @@ impl ResultsWriter {
         self.write(record);
     }
 
-    pub fn emit_error(&self, message: &str) {
-        self.emit_error_classified(message, None, None);
-    }
-
     pub fn emit_error_classified(
         &self,
         message: &str,
@@ -198,6 +194,17 @@ impl ResultsWriter {
             object.insert("os_kind".into(), os_kind.into());
         }
         self.write(record);
+        // Error records must be immediately observable, not buffered until
+        // the terminal record.
+        self.flush_now();
+    }
+
+    fn flush_now(&self) {
+        if !self.dead.load(Relaxed) {
+            if let Err(error) = self.out.lock().unwrap().flush() {
+                self.mark_dead(&error);
+            }
+        }
     }
 
     pub fn emit_operation(&self, op: &OperationRecord) {
@@ -262,11 +269,7 @@ impl ResultsWriter {
             object.insert("deletions_blocked".into(), blocked.into());
         }
         self.write(record);
-        if !self.dead.load(Relaxed) {
-            if let Err(error) = self.out.lock().unwrap().flush() {
-                self.mark_dead(&error);
-            }
-        }
+        self.flush_now();
     }
 
     fn write(&self, mut record: serde_json::Value) {
