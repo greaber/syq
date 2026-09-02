@@ -9472,3 +9472,99 @@ fn reuse_connection_refused_for_direct_remote_to_remote() {
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn native_cp_mapping_child_before_explicit_directory_is_order_independent() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    fs::create_dir_all(t.path("src/x")).unwrap();
+    // Child listed before its explicit directory: exactly one directory
+    // record and one counted creation, same as the reversed order.
+    for (name, manifest) in [
+        (
+            "child-first",
+            format!(
+                "{}{}",
+                entry_line("a.txt", "x/a.txt", None),
+                entry_line("x", "x", Some("dir"))
+            ),
+        ),
+        (
+            "dir-first",
+            format!(
+                "{}{}",
+                entry_line("x", "x", Some("dir")),
+                entry_line("a.txt", "x/a.txt", None)
+            ),
+        ),
+    ] {
+        let dst = format!("dst-{name}");
+        let results = format!("r-{name}.ndjson");
+        let out = syq_cp_in(
+            &t.path(""),
+            &[
+                "--mapping",
+                "-",
+                "-C",
+                "src",
+                "--into",
+                &dst,
+                "--results",
+                &results,
+                "-q",
+            ],
+            Some(manifest.as_bytes()),
+        );
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path(&results)))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let dir_records = lines
+            .iter()
+            .filter(|v| v["type"] == "operation_result" && v["action"] == "create_directory")
+            .count();
+        assert_eq!(dir_records, 1, "{name}: one record for x");
+        assert_eq!(lines.last().unwrap()["directories_created"], 1, "{name}");
+    }
+}
+
+#[test]
+fn native_cp_results_dry_and_live_directory_totals_agree() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f.txt"), b"f");
+    for (mode, extra) in [("dry", vec!["-n"]), ("live", vec![])] {
+        let dst = format!("dst-{mode}");
+        let results = format!("r-{mode}.ndjson");
+        let mut args = vec![
+            "--src-src",
+            "src",
+            "--into",
+            &dst,
+            "--results",
+            &results,
+            "-q",
+        ];
+        args.extend(extra);
+        let out = syq_cp_in(&t.path(""), &args, None);
+        assert!(
+            out.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let last: serde_json::Value = String::from_utf8(read(&t.path(&results)))
+            .unwrap()
+            .lines()
+            .last()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .unwrap();
+        // The missing container is outside per-entry accounting on both
+        // sides; sub is the one counted directory either way.
+        assert_eq!(last["directories_created"], 1, "{mode}");
+    }
+}

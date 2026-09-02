@@ -2039,7 +2039,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // Live counters only move when mutations run; a dry run reports the
         // planned work it traced instead.
         directories_created: if opts.dry_run {
-            dry_run_changes.directories.len() as u64
+            // The container itself is created outside per-entry accounting
+            // in live runs; exclude it here so dry and live totals agree.
+            let container = u64::from(dry_run_changes.directories.contains(&dst_root));
+            dry_run_changes.directories.len() as u64 - container
         } else {
             created_counts.0
         },
@@ -3488,8 +3491,17 @@ impl Planner<'_> {
                     Some(Kind::Dir) if e.kind == Kind::Dir && synthesized.remove(&m.dst) => {
                         // An explicit directory entry for a path an earlier
                         // entry implied: upgrade it from default metadata to
-                        // this entry's metadata.
+                        // this entry's metadata. If the synthetic entry is
+                        // still queued in this chunk, replace it — otherwise
+                        // a manifest listing x/a.txt before x would create,
+                        // count, and stamp the directory twice.
                         self.implicit_dirs.remove(&join(dst_root, &m.dst));
+                        if let Some(position) = batch
+                            .iter()
+                            .position(|queued| queued.path == m.dst && queued.kind == Kind::Dir)
+                        {
+                            batch.remove(position);
+                        }
                     }
                     Some(_) => {
                         let message = format!(
@@ -4549,7 +4561,8 @@ impl Planner<'_> {
                 let e2 = errs.get(2 * i + 1).cloned().flatten();
                 let error = e1.or(e2);
                 if let Some(e) = &error {
-                    self.progress.error(&format!("syq: {e}"));
+                    self.progress
+                        .error_classified(&format!("syq: {e}"), Some("io"), None);
                     match queued.action {
                         "create_symlink" => self.links_created -= 1,
                         _ => self.specials_created -= 1,
