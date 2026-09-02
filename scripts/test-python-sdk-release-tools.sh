@@ -54,4 +54,26 @@ if python3 "$script_dir/prepare-python-sdk-release.py" \
 fi
 grep -F 'release manifest has no valid base64 signature' "$work/invalid.out" >/dev/null
 
+trusted_pr='https://github.com/greaber/syq/pull/123'
+cat > "$work/pull-requests.json" <<EOF
+[
+  {
+    "headRepository": {"nameWithOwner": "attacker/syq"},
+    "url": "https://github.com/greaber/syq/pull/122"
+  },
+  {
+    "headRepository": {"nameWithOwner": "greaber/syq"},
+    "url": "$trusted_pr"
+  }
+]
+EOF
+selected_pr=$(jq -r --arg repository greaber/syq \
+  -f "$script_dir/select-trusted-pr.jq" "$work/pull-requests.json")
+test "$selected_pr" = "$trusted_pr"
+selected_pr=$(jq -r --arg repository greaber/syq \
+  -f "$script_dir/select-trusted-pr.jq" \
+  <(jq 'map(select(.headRepository.nameWithOwner != "greaber/syq"))' \
+    "$work/pull-requests.json"))
+test -z "$selected_pr"
+
 echo 'Python SDK release tool tests passed'

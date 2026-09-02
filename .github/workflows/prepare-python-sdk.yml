@@ -85,7 +85,12 @@ jobs:
         run: |
           set -euo pipefail
           branch="automation/python-sdk-v$SYQ_VERSION"
-          existing=$(gh pr list --head "$branch" --state open --json url --jq '.[0].url // empty')
+          existing=$(
+            gh pr list --head "$branch" --state open \
+              --json headRepository,url |
+              jq -r --arg repository "$GITHUB_REPOSITORY" \
+                -f scripts/select-trusted-pr.jq
+          )
           if test -n "$existing"; then
             echo "Python SDK update already exists: $existing"
             exit 0
