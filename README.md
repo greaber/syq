@@ -582,7 +582,20 @@ command properties visible in receiver requests, such as destination scopes,
 publication, preservation, and existing-object policy, resource limits, and
 whether a requested mutation could have survived the signed filter traversal. HostA still cannot
 escape those checks or independently authenticate to hostB with the enrollment
-key. The boundary runs between the two hosts, not inside hostB: the receiver
+key.
+
+HostA also cannot misreport what landed. Every command-restricted transfer
+ends with hostB issuing a signed receipt: the files it published with their
+sizes (and BLAKE3 digests with `--receipt hashed`), what it deleted, the hashes
+it computed for `--verify-only` and `--hash`, how many requests it refused, and
+its entry and byte totals, bound to the enrollment and the one-time request ID
+and signed with a key only hostB holds. HostA relays the receipt as one line
+of its output; the local machine verifies it against the public key recorded
+at enrollment and fails the transfer if the receipt is missing, does not
+verify, names a different grant, or records refused requests, whatever hostA
+reported. `-v` prints the verified totals. Enrollments made before receipts
+existed must be refreshed with `syq enroll` first. The receipt is hostB's view
+of hostB: it says nothing about what hostA omitted or invented. The boundary runs between the two hosts, not inside hostB: the receiver
 runs as the enrolled account and remembers what it created by pathname, so a
 local writer who can already modify the destination tree is outside its
 guarantee, exactly as for the ordinary engine.

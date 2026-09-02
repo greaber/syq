@@ -16,6 +16,9 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const RECEIPT_NAMESPACE: &str = "syq-receipt-v1@greaber.github";
+/// The orchestrator prints the base64 envelope after this prefix as one
+/// stdout line; the invoking machine filters that line out and verifies it.
+pub(crate) const RECEIPT_LINE_PREFIX: &str = "syq-receipt-v1:";
 const WIRE_MAGIC: &[u8; 8] = b"SYQRCPT\0";
 const WIRE_VERSION: u16 = 1;
 const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 2 + 4 + 4;

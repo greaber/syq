@@ -118,10 +118,8 @@ pub(crate) struct PreparedTransfer {
     pub(crate) grant: String,
     pub(crate) enrollment_id: EnrollmentId,
     /// The nonce the grant was signed with; the receipt must name it.
-    #[allow(dead_code)]
     pub(crate) request_id: RequestId,
     /// Verifier for the receipt hostB will issue.
-    #[allow(dead_code)]
     pub(crate) receipt_public_key: String,
 }
 

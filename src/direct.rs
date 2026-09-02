@@ -2,9 +2,85 @@
 //! flows source→destination without passing through this machine.
 
 use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, SourceSelection};
+use crate::delegation::RequestId;
+use crate::enrollment::EnrollmentId;
 use anyhow::{bail, Context, Result};
-use std::io::IsTerminal;
+use base64::Engine as _;
+use std::io::{BufRead, IsTerminal};
 use std::process::{Command, Stdio};
+
+/// What the invoking machine expects hostB's receipt to say about itself.
+#[derive(Clone, Debug)]
+struct ReceiptExpectation {
+    public_key: String,
+    enrollment_id: EnrollmentId,
+    request_id: RequestId,
+}
+
+/// Pass the orchestrator's stdout through line by line, keeping the receipt
+/// line to ourselves when one is expected. Returns the last receipt payload.
+fn relay_stdout(stdout: impl std::io::Read, expect_receipt: bool) -> Result<Option<String>> {
+    let mut receipt = None;
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.context("read remote orchestrator output")?;
+        match line.strip_prefix(crate::receipt::RECEIPT_LINE_PREFIX) {
+            Some(payload) if expect_receipt => receipt = Some(payload.to_owned()),
+            _ => println!("{line}"),
+        }
+    }
+    Ok(receipt)
+}
+
+/// Verify hostB's receipt against the grant this machine signed. A missing,
+/// unverifiable, or mismatching receipt fails the transfer regardless of
+/// what the source-side orchestrator reported.
+fn settle_receipt(
+    expectation: &ReceiptExpectation,
+    payload: Option<&str>,
+    src_host: &str,
+    dst_host: &str,
+    verbose: bool,
+) -> Result<()> {
+    let Some(payload) = payload else {
+        bail!(
+            "the command-restricted receiver on {dst_host} issued no receipt through {src_host}; what landed cannot be verified"
+        );
+    };
+    let envelope = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(payload.trim())
+        .context("decode the receipt relayed from the source host")?;
+    let receipt = crate::receipt::verify(&envelope, &expectation.public_key)
+        .with_context(|| format!("verify the receipt from {dst_host}"))?;
+    if receipt.enrollment_id != expectation.enrollment_id
+        || receipt.request_id != expectation.request_id
+    {
+        bail!(
+            "the receipt from {dst_host} names a different grant than the one this transfer signed"
+        );
+    }
+    if receipt.refused > 0 {
+        bail!(
+            "the receiver on {dst_host} refused {} request(s) from {src_host}; first: {}",
+            receipt.refused,
+            receipt
+                .refusal_samples
+                .first()
+                .map(String::as_str)
+                .unwrap_or("(no message recorded)")
+        );
+    }
+    if verbose {
+        eprintln!(
+            "syq: receipt from {dst_host} verified: {} files published ({}), {} deleted, {} hashed, {} entries touched",
+            receipt.published_count,
+            crate::progress::human(receipt.published_bytes),
+            receipt.deleted_count,
+            receipt.observed_count,
+            receipt.entries
+        );
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 enum AgentForwarding {
@@ -238,6 +314,7 @@ pub fn run(
     let mut constrained_rsh = None;
     let mut restricted_destination_path = None;
     let mut restricted_grant = None;
+    let mut receipt_expectation = None;
     let default_ssh_agent_policy = if args.rsh.is_some() {
         None
     } else if same_host || args.no_forward_agent {
@@ -286,6 +363,11 @@ pub fn run(
         let broker = if let Some(prepared) = prepared {
             restricted_destination_path = Some(prepared.canonical_destination);
             restricted_grant = Some(prepared.grant);
+            receipt_expectation = Some(ReceiptExpectation {
+                public_key: prepared.receipt_public_key.clone(),
+                enrollment_id: prepared.enrollment_id,
+                request_id: prepared.request_id,
+            });
             if !args.quiet {
                 eprintln!(
                     "syq: using command-restricted destination enrollment {}",
@@ -704,19 +786,25 @@ pub fn run(
     let run = || {
         let mut cmd = make_command();
         cmd.stdin(Stdio::null())
-            .stdout(Stdio::inherit())
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        cmd.status().with_context(|| format!("spawn {:?}", rsh[0]))
+        let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", rsh[0]))?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let receipt = relay_stdout(stdout, receipt_expectation.is_some())?;
+        let status = child
+            .wait()
+            .with_context(|| format!("wait for {:?}", rsh[0]))?;
+        Ok::<_, anyhow::Error>((status, receipt))
     };
-    let mut status = run()?;
+    let (mut status, mut receipt_payload) = run()?;
     if helper_missing(status.code(), spec.auto_helper) {
         spec.install_helper()?;
-        status = run()?;
+        (status, receipt_payload) = run()?;
     }
     // Keep the broker alive until the outer SSH connection and all forwarded
     // channels have closed.
     drop(broker_guard);
-    match status.code() {
+    let outcome: Result<i32> = match status.code() {
         Some(0) => Ok(0),
         // 23 (some files failed) and 25 (--max-delete refused) pass through:
         // they are transfer results, and the remote's stderr was inherited so
@@ -745,7 +833,18 @@ pub fn run(
             bail!("remote-to-remote transfer on {src_host} failed (exit {c}); {src_host} may not be able to reach the destination")
         }
         None => bail!("remote syq on {src_host} killed by signal"),
+    };
+    let code = outcome?;
+    if let Some(expectation) = &receipt_expectation {
+        settle_receipt(
+            expectation,
+            receipt_payload.as_deref(),
+            &src_host,
+            dst.host.as_deref().unwrap_or("the destination"),
+            args.verbose > 0,
+        )?;
     }
+    Ok(code)
 }
 
 fn helper_missing(code: Option<i32>, automatic: bool) -> bool {
@@ -951,6 +1050,69 @@ mod tests {
         assert_eq!(broker_connection_limit(None, 8).unwrap(), 65);
         assert_eq!(broker_connection_limit(Some(128), 128).unwrap(), 129);
         assert!(broker_connection_limit(Some(usize::MAX), usize::MAX).is_err());
+    }
+
+    #[test]
+    fn receipts_are_verified_against_the_signed_grant() {
+        let keypair = ssh_key::private::Ed25519Keypair::from_seed(&[5; 32]);
+        let key = ssh_key::PrivateKey::new(keypair.into(), "syq-receipt-test").unwrap();
+        let enrollment_id = EnrollmentId::random();
+        let request_id = RequestId::fresh(1_900_000_000).unwrap();
+        let expectation = ReceiptExpectation {
+            public_key: key.public_key().to_openssh().unwrap(),
+            enrollment_id,
+            request_id,
+        };
+        let mut ledger = crate::receipt::Ledger::default();
+        ledger.published.insert(b"/dst/a".to_vec(), (3, None));
+        let encode = |ledger: &crate::receipt::Ledger, request_id| {
+            let receipt = ledger
+                .receipt(enrollment_id, request_id, 1_900_000_000, 1, 3)
+                .unwrap();
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .encode(crate::receipt::sign(&receipt, &key).unwrap())
+        };
+        let settle = |expectation: &ReceiptExpectation, payload: Option<&str>| {
+            settle_receipt(expectation, payload, "host-a", "host-b", false)
+        };
+
+        let good = encode(&ledger, request_id);
+        settle(&expectation, Some(&good)).unwrap();
+        assert!(settle(&expectation, None).is_err());
+        assert!(settle(&expectation, Some("not a receipt")).is_err());
+
+        // The receipt must name the grant this machine signed.
+        let other = encode(&ledger, RequestId::fresh(1_900_000_001).unwrap());
+        assert!(settle(&expectation, Some(&other)).is_err());
+
+        // A refused request fails the transfer whatever hostA reported.
+        let mut refused = crate::receipt::Ledger::default();
+        refused.record_refusal("receiver mutation is outside the signed destination scopes");
+        let refused = encode(&refused, request_id);
+        assert!(settle(&expectation, Some(&refused)).is_err());
+
+        // And it must verify against the enrollment's key.
+        let stranger = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[6; 32]).into(),
+            "stranger",
+        )
+        .unwrap();
+        let mismatched = ReceiptExpectation {
+            public_key: stranger.public_key().to_openssh().unwrap(),
+            ..expectation.clone()
+        };
+        assert!(settle(&mismatched, Some(&good)).is_err());
+
+        // The relay keeps the receipt line and passes everything else on.
+        let output = format!(
+            "syq: transferred 1 files\n{}{good}\n",
+            crate::receipt::RECEIPT_LINE_PREFIX
+        );
+        assert_eq!(
+            relay_stdout(output.as_bytes(), true).unwrap().as_deref(),
+            Some(good.as_str())
+        );
+        assert_eq!(relay_stdout(output.as_bytes(), false).unwrap(), None);
     }
 
     #[test]
