@@ -428,35 +428,53 @@ impl RestrictedAuthority {
             state = self.settled.wait_timeout(state, remaining).unwrap().0;
         }
         state.receipt_issued = true;
-        let unhashed: Vec<Vec<u8>> = if self.receipt_policy.hashed {
-            state
-                .ledger
-                .published
-                .iter()
-                .filter(|(_, (_, digest))| digest.is_none())
-                .map(|(path, _)| path.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let published: Vec<Vec<u8>> = state.ledger.published.keys().cloned().collect();
+        let deleted: Vec<Vec<u8>> = state.ledger.deleted.iter().cloned().collect();
         drop(state);
-        // Hashed receipts must carry a digest for every published file; a
-        // file that cannot be read back is a receipt failure, not a gap.
-        let mut digests = Vec::with_capacity(unhashed.len());
-        for path in unhashed {
-            let digest = self.digest_published(&path).with_context(|| {
-                format!(
-                    "hash published file {} for the receipt",
+        // The grant is closed and nothing is in flight, so the tree is final.
+        // Settlement order need not match filesystem order when hostA raced
+        // a publication against a deletion of the same path, so the receipt
+        // states what is there now: a published path that is gone counts as
+        // deleted, a deleted path that is back is dropped, and sizes (and
+        // digests, for hashed receipts) come from the files themselves. A
+        // published file that cannot be read back is a receipt failure.
+        let mut final_published = Vec::with_capacity(published.len());
+        let mut final_deleted = Vec::new();
+        for path in published {
+            match self.observe_final(&path)? {
+                Some(metadata) if metadata.is_file() => {
+                    let digest = if self.receipt_policy.hashed {
+                        Some(self.digest_published(&path).with_context(|| {
+                            format!(
+                                "hash published file {} for the receipt",
+                                String::from_utf8_lossy(&path)
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
+                    final_published.push((path, metadata.len, digest));
+                }
+                Some(_) => bail!(
+                    "published file {} is no longer a regular file",
                     String::from_utf8_lossy(&path)
-                )
-            })?;
-            digests.push((path, digest));
+                ),
+                None => final_deleted.push(path),
+            }
+        }
+        for path in deleted {
+            if self.observe_final(&path)?.is_none() {
+                final_deleted.push(path);
+            }
         }
         let mut state = self.state.lock().unwrap();
-        for (path, digest) in digests {
-            if let Some(entry) = state.ledger.published.get_mut(&path) {
-                entry.1 = Some(digest);
-            }
+        state.ledger.published.clear();
+        state.ledger.deleted.clear();
+        for (path, size, digest) in final_published {
+            state.ledger.published.insert(path, (size, digest));
+        }
+        for path in final_deleted {
+            state.ledger.deleted.insert(path);
         }
         let receipt = state.ledger.receipt(
             self.enrollment_id,
@@ -467,6 +485,24 @@ impl RestrictedAuthority {
         )?;
         drop(state);
         crate::receipt::sign(&receipt, key)
+    }
+
+    /// Metadata of a touched path in the final tree, with a missing path or
+    /// a missing ancestor reported as absent rather than as an error.
+    fn observe_final(&self, path: &[u8]) -> Result<Option<RootMetadata>> {
+        match self.rooted_metadata(path) {
+            Ok(observed) => Ok(observed),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// BLAKE3 of a file this grant published, read back through the root.
@@ -1527,26 +1563,34 @@ impl RestrictedAuthority {
                 | Request::Receipt
                 | Request::Shutdown
         );
-        match self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes) {
-            Ok(()) => {
-                if tracked {
-                    self.state.lock().unwrap().in_flight += 1;
-                }
-                Ok(Settlement {
-                    creations: pending,
-                    outcomes,
-                    tracked,
-                })
+        // Admission and closure are decided under one lock: a request either
+        // counts as in flight before the receipt can observe the count, or
+        // it is refused because the receipt has started. Authorization may
+        // block afterwards (the file-data limiter, say) without letting the
+        // receipt slip past it.
+        if tracked {
+            let mut state = self.state.lock().unwrap();
+            if state.receipt_issued || state.receipt_closing {
+                bail!("the signed grant is closed: its receipt has been issued");
             }
+            state.in_flight += 1;
+        }
+        match self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes) {
+            Ok(()) => Ok(Settlement {
+                creations: pending,
+                outcomes,
+                tracked,
+            }),
             Err(error) => {
                 // Nothing of a refused request executes, including the
                 // entries authorized before the refusing one.
                 self.forget_provisional(&pending);
-                self.state
-                    .lock()
-                    .unwrap()
-                    .ledger
-                    .record_refusal(&format!("{error:#}"));
+                let mut state = self.state.lock().unwrap();
+                if tracked {
+                    state.in_flight = state.in_flight.saturating_sub(1);
+                    self.settled.notify_all();
+                }
+                state.ledger.record_refusal(&format!("{error:#}"));
                 Err(error)
             }
         }
@@ -4693,6 +4737,7 @@ mod tests {
             path: path_bytes(&gone),
         });
         let settlement = authority.authorize(&mut delete, false).unwrap();
+        fs::remove_file(&gone).unwrap();
         authority.settle(settlement, &proto::Response::Applied(vec![None]));
         let mut outside = prepare_request(&root.join("elsewhere"));
         assert!(authority.authorize(&mut outside, false).is_err());
@@ -4755,14 +4800,54 @@ mod tests {
         hashing.settle(settlement, &proto::Response::Ok);
         let mut publish = finalize_request(&unreadable, proto::TargetCondition::Any);
         let settlement = hashing.authorize(&mut publish, false).unwrap();
+        fs::write(&unreadable, b"sealed").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
         hashing.settle(settlement, &proto::Response::Ok);
         assert!(hashing.issue_receipt().is_err());
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
         let mut observe = Request::StatMany {
             paths: vec![path_bytes(&kept)],
             follow: false,
             guard: None,
         };
-        authority.authorize(&mut observe, false).unwrap();
+        assert!(authority.authorize(&mut observe, false).is_err());
+
+        // The receipt states the final tree, not settlement order: a file
+        // whose publication settled after its deletion but is gone counts as
+        // deleted, and a deletion that settled after a republication of a
+        // file that is present is dropped.
+        let racing = existence_authority_with_receipt(&root, false, 5_000);
+        let vanished = target.join("vanished");
+        let returned = target.join("returned");
+        fs::write(&returned, b"back").unwrap();
+        for path in [&vanished, &returned] {
+            let settlement = racing.authorize(&mut prepare_request(path), false).unwrap();
+            racing.settle(settlement, &proto::Response::Ok);
+            let mut publish = finalize_request(path, proto::TargetCondition::Any);
+            let settlement = racing.authorize(&mut publish, false).unwrap();
+            racing.settle(settlement, &proto::Response::Ok);
+            let mut delete = apply(Op::Unlink {
+                path: path_bytes(path),
+            });
+            let settlement = racing.authorize(&mut delete, false).unwrap();
+            racing.settle(settlement, &proto::Response::Applied(vec![None]));
+        }
+        let envelope = racing.issue_receipt().unwrap();
+        let receipt = crate::receipt::verify(&envelope, &racing_public(&racing)).unwrap();
+        assert_eq!(receipt.deleted, vec![path_bytes(&vanished)]);
+        assert_eq!(receipt.published.len(), 1);
+        assert_eq!(receipt.published[0].path, path_bytes(&returned));
+        assert_eq!(receipt.published[0].size, 4);
+    }
+
+    fn racing_public(authority: &RestrictedAuthority) -> String {
+        authority
+            .receipt_key
+            .as_ref()
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap()
     }
 
     #[test]
