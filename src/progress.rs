@@ -44,6 +44,11 @@ pub struct Progress {
     pub deletions_planned: AtomicU64,
     pub deletions_completed: AtomicU64,
     pub deletions_blocked: AtomicU64,
+    /// Settled creations, mirrored here (like the deletion counters) so a
+    /// fatal-error terminal record reports what the run actually did.
+    pub dirs_created: AtomicU64,
+    pub links_created: AtomicU64,
+    pub specials_created: AtomicU64,
     /// Workers currently allowed to take work (0 = fixed -j, not shown).
     pub active_workers: AtomicU64,
     pub start: Instant,
@@ -93,6 +98,9 @@ impl Progress {
             deletions_planned: AtomicU64::new(0),
             deletions_completed: AtomicU64::new(0),
             deletions_blocked: AtomicU64::new(0),
+            dirs_created: AtomicU64::new(0),
+            links_created: AtomicU64::new(0),
+            specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             start: Instant::now(),
             workers: Mutex::new(vec![None; n_workers]),

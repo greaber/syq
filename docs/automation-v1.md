@@ -44,7 +44,12 @@ stderr and stops writing; the consumer detects this as a missing
 terminal record. Argument and usage errors exit `2` with no stream at
 all — a consumer constructs its own argv, so a usage error is a
 consumer bug and gets no JSON. Every run that gets past argument
-parsing emits a terminal record, fatal setup failures included.
+parsing emits a terminal record, fatal setup failures included — with
+one exception: a remote-coordinator copy refused before the
+coordinator starts leaves stdout empty, because the stream's one
+owner never existed. Treat that like the transport-collapse case:
+no terminal record means the outcome is unknown (here, nothing ran),
+and rerunning is safe.
 
 ## Record envelope
 

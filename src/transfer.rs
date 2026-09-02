@@ -752,15 +752,6 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
-    if let Some(mapping) = args
-        .native_mapping
-        .as_deref()
-        .filter(|mapping| *mapping != b"-")
-        .filter(|_| !args.native_follow)
-    {
-        crate::fsops::check_operator_path_no_symlinks(mapping, false, false)
-            .map_err(|error| anyhow::anyhow!("--mapping: {error}"))?;
-    }
     let mut results_setup = args.native_results.is_some();
     if results_setup {
         // The stream target is stdout, full stop (the CLI accepts only
@@ -819,6 +810,10 @@ pub fn run(args: Args) -> Result<i32> {
     let prune = args.delete;
     let outcome = run_transfer(args, Arc::clone(&progress));
     if outcome.is_err() {
+        // An error can unwind past run_transfer's own ticker shutdown; stop
+        // it here so no progress render races the terminal record below
+        // (the writer additionally seals itself after emit_result).
+        progress.stop();
         // The error text reaches stderr via main; the stream still gets its
         // terminal record so a consumer never mistakes a handled fatal for a
         // crash (only a real crash leaves the terminal record missing).
@@ -830,9 +825,11 @@ pub fn run(args: Args) -> Result<i32> {
                 files_transferred: progress.files_done.load(Relaxed),
                 files_unchanged: progress.files_skipped.load(Relaxed),
                 files_excluded: progress.files_excluded.load(Relaxed),
-                directories_created: 0,
-                symlinks_created: 0,
-                specials_created: 0,
+                // Mutations that settled (and streamed their records)
+                // before the run died must not vanish from the aggregates.
+                directories_created: progress.dirs_created.load(Relaxed),
+                symlinks_created: progress.links_created.load(Relaxed),
+                specials_created: progress.specials_created.load(Relaxed),
                 errors: progress.errors.load(Relaxed),
                 bytes_transferred: progress.bytes_done.load(Relaxed),
                 bytes_unchanged: progress.bytes_skipped.load(Relaxed),
@@ -905,6 +902,17 @@ fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
 }
 
 fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
+    // Post-parse validation lives inside the wrapper's error coverage, so
+    // its failures still settle the stream with a failed terminal record.
+    if let Some(mapping) = args
+        .native_mapping
+        .as_deref()
+        .filter(|mapping| *mapping != b"-")
+        .filter(|_| !args.native_follow)
+    {
+        crate::fsops::check_operator_path_no_symlinks(mapping, false, false)
+            .map_err(|error| anyhow::anyhow!("--mapping: {error}"))?;
+    }
     let mut args = args;
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
     let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
@@ -1874,9 +1882,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         source_partials: 0,
         collision: false,
         deferred: Vec::new(),
-        dirs_created: 0,
-        links_created: 0,
-        specials_created: 0,
         scan_warned: false,
         max_delete_hit: false,
         delete_walk_failed: false,
@@ -2146,8 +2151,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
     let max_delete_hit = st.max_delete_hit;
-    let dry_run_changes = std::mem::take(&mut st.dry_run_changes);
-    let created_counts = (st.dirs_created, st.links_created, st.specials_created);
+    let mut dry_run_changes = std::mem::take(&mut st.dry_run_changes);
+    // The destination container is created outside per-entry accounting in
+    // live runs; drop it here so the terminal record and the human dry-run
+    // summary count the same set (spec: summary renders from the record).
+    dry_run_changes.directories.remove(&dst_root);
+    let created_counts = (
+        progress.dirs_created.load(Relaxed),
+        progress.links_created.load(Relaxed),
+        progress.specials_created.load(Relaxed),
+    );
     drop(st);
 
     progress.stop();
@@ -2194,10 +2207,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // Live counters only move when mutations run; a dry run reports the
         // planned work it traced instead.
         directories_created: if opts.dry_run {
-            // The container itself is created outside per-entry accounting
-            // in live runs; exclude it here so dry and live totals agree.
-            let container = u64::from(dry_run_changes.directories.contains(&dst_root));
-            dry_run_changes.directories.len() as u64 - container
+            dry_run_changes.directories.len() as u64
         } else {
             created_counts.0
         },
@@ -3128,9 +3138,6 @@ struct Planner<'a> {
     /// (dst path, meta, flags, depth, root condition) for directories,
     /// applied deepest-first at the end.
     deferred: Vec<(PathBytes, Meta, u8, usize, TargetCondition)>,
-    dirs_created: u64,
-    links_created: u64,
-    specials_created: u64,
     /// A source scan reported a non-fatal problem (unreadable directory, ...).
     scan_warned: bool,
     /// --max-delete stopped the deletions (exit 25, as rsync).
@@ -4178,7 +4185,7 @@ impl Planner<'_> {
                         self.collision = true;
                         return Ok(());
                     }
-                    self.dirs_created += 1;
+                    self.progress.dirs_created.fetch_add(1, Relaxed);
                     if opts.verbose > 0 {
                         self.progress
                             .println(&format!("{}/", display(&self.root_path)));
@@ -4262,7 +4269,9 @@ impl Planner<'_> {
                             });
                         }
                     }
-                    self.dirs_created += (n - failed - reopened) as u64;
+                    self.progress
+                        .dirs_created
+                        .fetch_add((n - failed - reopened) as u64, Relaxed);
                 }
                 let mut flags = opts.flags;
                 if !opts.perms {
@@ -4634,7 +4643,7 @@ impl Planner<'_> {
                         meta: e.meta(),
                         flags: opts.flags & !flags::MODE,
                     });
-                    self.links_created += 1;
+                    self.progress.links_created.fetch_add(1, Relaxed);
                 }
                 Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
                     if self.skip_existing(&dst_entry) {
@@ -4718,7 +4727,7 @@ impl Planner<'_> {
                         meta,
                         flags,
                     });
-                    self.specials_created += 1;
+                    self.progress.specials_created.fetch_add(1, Relaxed);
                 }
                 Kind::Dir | Kind::Other => unreachable!("handled in the mapping loop"),
             }
@@ -4739,8 +4748,12 @@ impl Planner<'_> {
                     self.progress
                         .error_classified(&format!("syq: {e}"), Some("io"), None);
                     match queued.action {
-                        "create_symlink" => self.links_created -= 1,
-                        _ => self.specials_created -= 1,
+                        "create_symlink" => {
+                            self.progress.links_created.fetch_sub(1, Relaxed);
+                        }
+                        _ => {
+                            self.progress.specials_created.fetch_sub(1, Relaxed);
+                        }
                     }
                 } else if opts.verbose > 0 {
                     self.progress.println(&queued.name);

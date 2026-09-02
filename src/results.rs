@@ -1,8 +1,8 @@
 //! `--results`: an NDJSON stream of machine-readable operation outcomes for
 //! native cp. Automation schema version 1: every record carries `schema`
-//! (`syq.automation`), `schema_version`, and a monotonic `seq`. Records go
-//! to the named file, or to stdout with `-`, which suppresses syq's own
-//! human stdout output so the stream stays parseable.
+//! (`syq.automation`), `schema_version`, and a monotonic `seq`. The stream
+//! is stdout (`--results -`), and syq suppresses its own human stdout
+//! output so the stream stays parseable; a file is a shell redirect.
 //!
 //! Version-1 coverage: one `run` record first (run id, mode, prune/mapping/
 //! dry-run flags, sanitized endpoints); sampled `progress` records; one
@@ -29,6 +29,10 @@ pub struct ResultsWriter {
     /// A record failed to write: reported once on stderr, then nothing
     /// further is written. The consumer sees the missing terminal record.
     dead: AtomicBool,
+    /// The terminal record has been written: the stream is complete and
+    /// nothing may follow it, even from a straggling ticker render racing
+    /// an error unwind. Sealing also makes a second terminal impossible.
+    sealed: AtomicBool,
 }
 
 /// One settled operation. `dst`/`src` are container/base-relative raw path
@@ -112,6 +116,7 @@ impl ResultsWriter {
             out: Mutex::new(out),
             seq: AtomicU64::new(0),
             dead: AtomicBool::new(false),
+            sealed: AtomicBool::new(false),
         }
     }
 
@@ -277,10 +282,11 @@ impl ResultsWriter {
         }
         self.write(record);
         self.flush_now();
+        self.sealed.store(true, Relaxed);
     }
 
     fn write(&self, mut record: serde_json::Value) {
-        if self.dead.load(Relaxed) {
+        if self.dead.load(Relaxed) || self.sealed.load(Relaxed) {
             return;
         }
         // Take the output lock before allocating the sequence number, so
@@ -315,5 +321,81 @@ fn tagged(path: &[u8]) -> serde_json::Value {
             "encoding": "base64",
             "value": base64::engine::general_purpose::STANDARD.encode(path),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn nothing_follows_the_terminal_record() {
+        let sink = Sink::default();
+        let writer = ResultsWriter::new(Box::new(sink.clone()));
+        writer.emit_result(&ResultRecord {
+            status: "failed",
+            exit_code: 1,
+            dry_run: false,
+            files_transferred: 0,
+            files_unchanged: 0,
+            files_excluded: 0,
+            directories_created: 0,
+            symlinks_created: 0,
+            specials_created: 0,
+            errors: 1,
+            bytes_transferred: 0,
+            bytes_unchanged: 0,
+            elapsed_ms: 0,
+            deletions_planned: None,
+            deletions_completed: None,
+            deletions_blocked: None,
+        });
+        let after = sink.0.lock().unwrap().len();
+        // A straggling ticker render (or a second terminal) must be inert.
+        writer.emit_progress(&ProgressRecord {
+            bytes_done: 1,
+            bytes_total: 1,
+            bytes_unchanged: 0,
+            files_done: 1,
+            files_total: 1,
+            files_unchanged: 0,
+            files_excluded: 0,
+            scanned: 1,
+            scan_done: true,
+            elapsed_ms: 1,
+        });
+        writer.emit_result(&ResultRecord {
+            status: "success",
+            exit_code: 0,
+            dry_run: false,
+            files_transferred: 0,
+            files_unchanged: 0,
+            files_excluded: 0,
+            directories_created: 0,
+            symlinks_created: 0,
+            specials_created: 0,
+            errors: 0,
+            bytes_transferred: 0,
+            bytes_unchanged: 0,
+            elapsed_ms: 0,
+            deletions_planned: None,
+            deletions_completed: None,
+            deletions_blocked: None,
+        });
+        assert_eq!(sink.0.lock().unwrap().len(), after);
     }
 }

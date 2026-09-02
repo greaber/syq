@@ -10400,3 +10400,73 @@ fn automation_v1_live_streams_validate_against_schema() {
         assert_automation_v1_stream(&validator, &content, "failed");
     }
 }
+
+#[test]
+fn native_cp_mapping_symlinked_manifest_failure_still_settles_the_stream() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    write(
+        &t.path("manifest"),
+        entry_line("f.txt", "f.txt", None).as_bytes(),
+    );
+    std::os::unix::fs::symlink("manifest", t.path("manifest-link")).unwrap();
+    // Post-parse validation failures still owe the consumer a terminal
+    // record: only a real crash leaves the stream unsettled.
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "manifest-link",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "-",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("pass --follow"));
+    let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.first().unwrap()["type"], "run");
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "failed");
+}
+
+#[test]
+fn native_cp_dry_summary_and_terminal_record_count_the_same_directories() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f.txt"), b"f");
+    // Human summary (no --results): the missing destination container is
+    // outside per-entry accounting, so one directory, matching the record.
+    let human = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst", "-n"],
+        None,
+    );
+    assert!(human.status.success(), "{}", stderr_of(&human));
+    let stdout = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        stdout.contains("1 directory"),
+        "summary should count one directory: {stdout}"
+    );
+    let machine = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst2", "-n", "--results", "-"],
+        None,
+    );
+    assert!(machine.status.success(), "{}", stderr_of(&machine));
+    let terminal: serde_json::Value = String::from_utf8(machine.stdout)
+        .unwrap()
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .unwrap();
+    assert_eq!(terminal["directories_created"], 1);
+}
