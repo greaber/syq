@@ -1240,18 +1240,33 @@ pub fn run(args: Args) -> Result<i32> {
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
     let operator_dst_root = clean_root(&dst.path);
-    let (dst_root_entry, dst_canonical) = stat_and_canonicalize(
+    // Exact native placement names a directory entry. Canonicalize only its
+    // parent, then restore the operator-supplied leaf: canonicalizing the
+    // whole path would dereference an existing leaf symlink and give both the
+    // self-copy guard and resumable-job identity the wrong destination.
+    let exact_native_destination =
+        args.interface != Interface::Rsync && args.placement == Placement::As;
+    let canonical_dst_path = if exact_native_destination {
+        parent_path(&operator_dst_root)
+    } else {
+        dst.path.clone()
+    };
+    let (dst_root_entry, mut dst_canonical) = stat_and_canonicalize(
         &mut *dst_ctl,
         &operator_dst_root,
-        &dst.path,
+        &canonical_dst_path,
         dst.is_remote(),
     )?;
+    if exact_native_destination {
+        append_final_component(&mut dst_canonical, &operator_dst_root);
+    }
     // Rsync retains its destination-directory compatibility rule. Native
-    // paths instead use one explicit policy: keep the named symlink as the
-    // object by default, or resolve the complete chain under --follow.
+    // container placement keeps the named symlink by default or resolves its
+    // complete chain under --follow. Exact native placement always selects
+    // the final directory entry; --follow applies only to its parent path.
     let (dst_root, mut dst_root_entry) = match args.interface {
         Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?,
-        _ if args.native_follow => follow_operator_symlink(
+        _ if args.native_follow && args.placement == Placement::Into => follow_container_symlink(
             &mut *dst_ctl,
             &operator_dst_root,
             dst_root_entry,
@@ -1373,10 +1388,10 @@ pub fn run(args: Args) -> Result<i32> {
     let operator_directory = if dst_is_dir {
         operator_dst_root.clone()
     } else {
-        // Exact --follow placement selects the referent itself. Its retained
-        // authority is therefore the referent's parent, which may differ from
-        // the parent of the operator's symlink spelling.
-        parent_path(&dst_root)
+        // Exact placement always retains the parent of the command-line leaf.
+        // Under --follow that walk may traverse parent symlinks, but it never
+        // changes which final directory entry the command addresses.
+        parent_path(&operator_dst_root)
     };
     let request_prefix = if dst_is_dir {
         dst_root.clone()
@@ -1465,7 +1480,11 @@ pub fn run(args: Args) -> Result<i32> {
             let sn = canonical_path(&mut *src_ctl, &s.path, remote)?;
             // Effective destination(s): the destination itself, plus
             // destination/basename when placement uses it as a container.
-            let mut effs = vec![canonical_path(&mut *src_ctl, &dst.path, remote)?];
+            let mut effs = vec![if exact_native_destination {
+                dst_canonical.clone()
+            } else {
+                canonical_path(&mut *src_ctl, &dst.path, remote)?
+            }];
             if dst_is_dir && !s.copies_contents() && args.files_from.is_none() {
                 let base = s.basename();
                 if !base.is_empty() {
@@ -2402,6 +2421,19 @@ fn parent_path(path: &[u8]) -> PathBytes {
     }
 }
 
+/// Append the final raw component of `path` to an already-canonicalized
+/// parent. Native exact placement deliberately treats this component as a
+/// directory entry rather than resolving through it.
+fn append_final_component(parent: &mut std::path::PathBuf, path: &[u8]) {
+    let component = path
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .filter(|component| !component.is_empty());
+    if let Some(component) = component {
+        parent.push(OsStr::from_bytes(component));
+    }
+}
+
 /// Fetch the destination root's entry and canonical spelling in one network
 /// turn. They are independent read-only queries; sending both before waiting
 /// avoids an otherwise unnecessary RTT on every remote copy.
@@ -2525,11 +2557,11 @@ fn follow_dir_symlink(
     Ok((path.to_vec(), entry))
 }
 
-/// Resolve a symlink in the last component of a directly supplied native
-/// pathname. Unlike rsync's directory-only compatibility behavior, explicit
-/// `--follow` selects the referent regardless of its type. Placement forms
-/// that allow a missing target may create the referent of a dangling chain.
-fn follow_operator_symlink(
+/// Resolve a symlink used as a directly supplied native container. Explicit
+/// `--follow` selects the referent regardless of its type; the caller then
+/// requires the result to be a directory. Placement forms that allow a
+/// missing target may create the referent of a dangling chain.
+fn follow_container_symlink(
     conn: &mut dyn Conn,
     path: &[u8],
     entry: Option<Entry>,

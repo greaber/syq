@@ -82,7 +82,7 @@ pub struct Args {
     /// Endpoint-side containment boundary for native removal.
     #[arg(skip)]
     pub native_rm_root: Option<Vec<u8>>,
-    /// Permit symlinks while resolving directly supplied native endpoint paths.
+    /// Permit symlinks that must be traversed in directly supplied native paths.
     #[arg(skip)]
     pub native_follow: bool,
     /// Source-side base for `syq map` selectors, joined at walk time so the
@@ -570,7 +570,7 @@ struct NativeSelectionArgs {
     /// Resolve relative source selectors from DIR at the source endpoint
     #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
     cwd: Option<OsString>,
-    /// Follow symlinks while resolving directly supplied endpoint paths
+    /// Follow symlinks that must be traversed in directly supplied endpoint paths
     #[arg(long)]
     follow: bool,
     /// Select a named source object (repeatable)
@@ -619,7 +619,7 @@ struct NativeRmSelectionArgs {
     /// Confine resolution and removal beneath DIR
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     root: Option<OsString>,
-    /// Follow symlinks while resolving directly supplied endpoint paths
+    /// Follow symlinks that must be traversed in directly supplied endpoint paths
     #[arg(long)]
     follow: bool,
     /// Select an object without constraining the selected object's type (repeatable)
@@ -804,7 +804,7 @@ struct NativeCopyFields {
         allow_hyphen_values = true
     )]
     into_existing: Option<OsString>,
-    /// Map one named source exactly to PATH
+    /// Map one named source exactly to PATH; never follow its final entry
     #[arg(
         long,
         value_name = "PATH",
@@ -812,7 +812,7 @@ struct NativeCopyFields {
         allow_hyphen_values = true
     )]
     r#as: Option<OsString>,
-    /// Map one named source exactly to PATH, which must not exist
+    /// Map one named source exactly to PATH; its final entry must not exist and is never followed
     #[arg(
         long,
         value_name = "PATH",
@@ -820,7 +820,7 @@ struct NativeCopyFields {
         allow_hyphen_values = true
     )]
     as_new: Option<OsString>,
-    /// Map one named source exactly to PATH, which must exist
+    /// Map one named source exactly to PATH; its final entry must exist and is never followed
     #[arg(
         long,
         value_name = "PATH",
