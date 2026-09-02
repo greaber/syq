@@ -136,12 +136,14 @@ impl ResultsWriter {
         if self.dead.load(Relaxed) {
             return;
         }
+        // Take the output lock before allocating the sequence number, so
+        // records land in the stream in seq order.
+        let mut out = self.out.lock().unwrap();
         let seq = self.seq.fetch_add(1, Relaxed);
         let object = record.as_object_mut().expect("record is an object");
         object.insert("schema".into(), SCHEMA.into());
         object.insert("schema_version".into(), SCHEMA_VERSION.into());
         object.insert("seq".into(), seq.into());
-        let mut out = self.out.lock().unwrap();
         let written = serde_json::to_writer(&mut *out, &record)
             .map_err(std::io::Error::from)
             .and_then(|()| out.write_all(b"\n"));

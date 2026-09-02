@@ -8363,3 +8363,95 @@ fn native_cp_results_without_mapping_and_refusals() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("only available on syq cp"));
 }
+
+// ---- review-round fixes ----
+
+#[test]
+fn native_map_normalizes_dot_components_and_rejects_dotdot() {
+    let t = Tmp::new();
+    write(&t.path("photos/a.jpg"), b"a");
+    let lines = map_lines(&syq_map_in(&t.path(""), &["./photos"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["photos", "photos/a.jpg"]);
+    assert_eq!(map_path(&lines[0], "src"), "photos");
+    let out = syq_map_in(&t.path("photos"), &["--src", "../photos"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`..` component"));
+}
+
+#[test]
+fn native_cp_results_refuses_dry_run() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"x");
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-n",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not support --dry-run"));
+}
+
+#[test]
+fn native_cp_results_implicit_dir_failure_is_not_a_retry_entry() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"abc");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o555)).unwrap();
+    let manifest = entry_line("a.txt", "sub/a.txt", None);
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let dir = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["dst"]["value"] == "sub")
+        .expect("implicit dir record");
+    assert_eq!(dir["disposition"], "failed");
+    assert_eq!(dir["retryable"], "no");
+    assert!(dir.get("src").is_none(), "implicit dirs have no source");
+    // The documented retry filter selects only records that are valid
+    // mapping entries: failed, retryable, carrying a src.
+    let retryable: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|v| {
+            v["type"] == "operation_result"
+                && v["disposition"] == "failed"
+                && v["retryable"] != "no"
+        })
+        .collect();
+    assert!(!retryable.is_empty(), "the file failure is retryable");
+    for v in &retryable {
+        assert!(v.get("src").is_some(), "retry candidates carry src: {v}");
+    }
+}

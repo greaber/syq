@@ -3718,15 +3718,28 @@ impl Planner<'_> {
                             self.progress.results_writer(),
                             strip_dst_root(name, dst_root),
                         ) {
+                            // An implicit --mapping ancestor has no source and
+                            // is not independently retryable: the entries
+                            // beneath it carry the actionable retry records.
+                            let implicit = self.implicit_dirs.contains(name);
+                            let src = if implicit {
+                                None
+                            } else {
+                                self.mapping_source_rel(dst_rel)
+                            };
                             results.emit_operation(&crate::results::OperationRecord {
                                 action: "create_directory",
                                 dst: dst_rel,
-                                src: self.mapping_source_rel(dst_rel).as_deref(),
+                                src: src.as_deref(),
                                 kind: "dir",
                                 disposition: if created { "succeeded" } else { "failed" },
                                 bytes: None,
                                 attempts: None,
-                                retryable: (!created).then_some("unknown"),
+                                retryable: (!created).then_some(if implicit {
+                                    "no"
+                                } else {
+                                    "unknown"
+                                }),
                                 message: None,
                             });
                         }

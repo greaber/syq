@@ -777,6 +777,12 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     if results.is_some() && interface != Interface::NativeCp {
         bail!("--results is only available on syq cp");
     }
+    if results.is_some() && parsed.operational.dry_run {
+        // Dry-run trace output is a deliberately deferred automation
+        // feature; a version-0 results stream reusing the live counters
+        // would claim planned work as transferred.
+        bail!("--results does not support --dry-run yet");
+    }
     let mut locations = if mapping.is_some() {
         let has_selectors = !(parsed.selection.src.is_empty()
             && parsed.selection.src_src.is_empty()
@@ -807,7 +813,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         if parsed.selection.from.is_some() {
             bail!("syq map with a remote source (--from) is not yet supported");
         }
-        for source in &locations {
+        for source in &mut locations {
             if source.path.starts_with(b"/")
                 || source.path == b"~"
                 || source.path.starts_with(b"~/")
@@ -817,6 +823,26 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
                     String::from_utf8_lossy(&source.path)
                 );
             }
+            // Normalize the way --files-from does — drop `.` and empty
+            // components, reject `..` — so emitted paths are always valid
+            // manifest paths.
+            let mut parts: Vec<&[u8]> = Vec::new();
+            for component in source.path.split(|&byte| byte == b'/') {
+                match component {
+                    b"" | b"." => {}
+                    b".." => bail!(
+                        "syq map selector {:?} contains a `..` component",
+                        String::from_utf8_lossy(&source.path)
+                    ),
+                    other => parts.push(other),
+                }
+            }
+            let normalized = parts.join(&b"/"[..]);
+            source.path = if normalized.is_empty() {
+                b".".to_vec()
+            } else {
+                normalized
+            };
         }
         if locations
             .iter()
