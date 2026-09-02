@@ -72,6 +72,9 @@ struct InstallResponse {
     canonical_root: String,
     canonical_destination: String,
     receiver_path: String,
+    /// OpenSSH public key of the receipt signing key hostB generated for
+    /// this enrollment; the local side verifies receipts against it.
+    receipt_public_key: String,
     change: String,
 }
 
@@ -93,6 +96,10 @@ struct LocalEnrollment {
     requested_parent: String,
     canonical_root: String,
     receiver_path: String,
+    /// Absent for enrollments installed before receivers had receipt keys;
+    /// rerunning `syq enroll` refreshes them.
+    #[serde(default)]
+    receipt_public_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1893,6 +1900,19 @@ fn generate_transport_key(id: EnrollmentId) -> Result<PrivateKey> {
         .context("construct restricted transport key")
 }
 
+/// The receiver's own signing key for receipts. It lives only on hostB, in
+/// the enrollment's state directory, and is rotated by every install.
+fn generate_receipt_key(id: EnrollmentId) -> Result<PrivateKey> {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).context("generate receipt signing key")?;
+    let keypair = Ed25519Keypair::from_seed(&seed);
+    seed.fill(0);
+    PrivateKey::new(keypair.into(), format!("syq-receipt:{id}"))
+        .context("construct receipt signing key")
+}
+
+const RECEIPT_KEY_FILE: &str = "receipt-key";
+
 fn signer_name(id: EnrollmentId) -> String {
     format!("syq-enrollment-{id}")
 }
@@ -2042,6 +2062,20 @@ pub(crate) fn remote_install() -> Result<()> {
             .context("restricted receiver path is not UTF-8")?
             .to_owned(),
     };
+    let receipt_key = generate_receipt_key(request.id)?;
+    atomic_write(
+        &state,
+        RECEIPT_KEY_FILE,
+        receipt_key
+            .to_openssh(LineEnding::LF)
+            .context("encode receipt signing key")?
+            .as_bytes(),
+        0o600,
+    )?;
+    let receipt_public_key = receipt_key
+        .public_key()
+        .to_openssh()
+        .context("encode receipt public key")?;
     atomic_write(&state, "config.json", &serde_json::to_vec(&config)?, 0o600)?;
     atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
 
@@ -2066,6 +2100,7 @@ pub(crate) fn remote_install() -> Result<()> {
             .to_str()
             .context("restricted receiver path is not UTF-8")?
             .to_owned(),
+        receipt_public_key,
         change: match change {
             AuthorizedKeysChange::Installed => "installed",
             AuthorizedKeysChange::Unchanged => "unchanged",
@@ -2462,6 +2497,7 @@ fn enroll(
         requested_parent: response.requested_parent,
         canonical_root: response.canonical_root,
         receiver_path: response.receiver_path,
+        receipt_public_key: Some(response.receipt_public_key),
     };
     complete_local_enrollment(&directory, &metadata)?;
     Ok((metadata, directory, response.canonical_destination))
@@ -2947,8 +2983,16 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                     .collect::<HashSet<_>>();
                 for (metadata, _) in active {
                     println!(
-                        "{}\tactive\t{}@{}\t{}",
-                        metadata.id, metadata.target_login, metadata.host, metadata.canonical_root
+                        "{}\tactive\t{}@{}\t{}\t{}",
+                        metadata.id,
+                        metadata.target_login,
+                        metadata.host,
+                        metadata.canonical_root,
+                        if metadata.receipt_public_key.is_some() {
+                            "receipt-key"
+                        } else {
+                            "no-receipt-key"
+                        }
                     );
                 }
                 for (pending, _) in load_pending_enrollments()? {
@@ -3252,6 +3296,36 @@ mod tests {
     }
 
     #[test]
+    fn receipt_keys_are_distinct_per_enrollment_and_older_metadata_still_loads() {
+        let id = EnrollmentId::random();
+        let key = generate_receipt_key(id).unwrap();
+        let public = key.public_key().to_openssh().unwrap();
+        assert!(public.starts_with("ssh-ed25519 "));
+        assert!(public.ends_with(&format!("syq-receipt:{id}")));
+        let again = generate_receipt_key(id).unwrap();
+        assert_ne!(again.public_key().to_openssh().unwrap(), public);
+        ssh_key::PublicKey::from_openssh(&public).unwrap();
+
+        // Metadata written before receipt keys existed has no key and is
+        // listed as needing a refresh rather than failing to load.
+        let current = LocalEnrollment {
+            version: CONFIG_VERSION,
+            id,
+            host: "vault".into(),
+            target_login: "backup".into(),
+            remote_home: "/home/backup".into(),
+            requested_parent: "/archive".into(),
+            canonical_root: "/archive".into(),
+            receiver_path: "/home/backup/.local/libexec/syq-receiver".into(),
+            receipt_public_key: Some(public),
+        };
+        let mut older = serde_json::to_value(&current).unwrap();
+        older.as_object_mut().unwrap().remove("receipt_public_key");
+        let metadata: LocalEnrollment = serde_json::from_value(older).unwrap();
+        assert!(metadata.receipt_public_key.is_none());
+    }
+
+    #[test]
     fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
         let (_, home) = current_account().unwrap();
         let temporary = tempfile::tempdir_in(home).unwrap();
@@ -3291,6 +3365,7 @@ mod tests {
             requested_parent: "/archive".into(),
             canonical_root: "/archive".into(),
             receiver_path: "/home/backup/.local/libexec/syq-receiver".into(),
+            receipt_public_key: None,
         };
         complete_local_enrollment(&directory, &metadata).unwrap();
         assert!(!directory.join("pending.json").exists());

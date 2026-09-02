@@ -507,8 +507,10 @@ parent generates an Ed25519 enrollment key locally, uploads the exact running
 syq as `~/.local/libexec/syq-receiver` on hostB, and appends one managed
 `restrict,command=...` line to hostB's `authorized_keys`. The private enrollment
 key stays under `~/.local/state/syq/restricted/` on the local machine and is
-never copied to hostA. HostB keeps only its forced public key, SSHSIG verifier
-policy, and replay state under `~/.local/share/syq/restricted/`. Before
+never copied to hostA. HostB keeps its forced public key, SSHSIG verifier
+policy, replay state, and a receipt signing key it generates at installation
+under `~/.local/share/syq/restricted/`; the receipt key's public half is
+returned to the local machine and recorded with the enrollment. Before
 publishing the forced key, syq verifies that the installed receiver is a
 regular executable and that it and every path ancestor are trusted-owner- or
 root-owned, non-writable by other users, and free of non-owner ACL grants.
@@ -648,7 +650,9 @@ the installation response is lost, the next enrollment of the same endpoint
 and destination retries the same ID safely; `syq enrollments` labels that state
 `pending`, and `syq revoke` can remove either pending or active state. Running
 `syq enroll` again for an active destination also refreshes the installed
-receiver to the exact local syq binary. Revocation leaves that shared binary
+receiver to the exact local syq binary and rotates its receipt key;
+`syq enrollments` marks enrollments made before receipt keys existed as
+`no-receipt-key` until then. Revocation leaves that shared binary
 because other enrollments may use it. It prevents new receiver sessions. A
 session that already claimed its signed request can finish an operation already
 in progress; later protocol requests are rejected once the signed execution
