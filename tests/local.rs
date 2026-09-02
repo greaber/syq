@@ -447,7 +447,7 @@ fn native_copy_typed_selectors_are_source_preconditions() {
 }
 
 #[test]
-fn native_cp_prune_checks_all_typed_sources_before_mutation() {
+fn native_cp_with_prune_checks_all_typed_sources_before_mutation() {
     let t = Tmp::new();
     write(&t.path("src/good"), b"new");
     write(&t.path("src/not-a-file/child"), b"child");
@@ -455,7 +455,8 @@ fn native_cp_prune_checks_all_typed_sources_before_mutation() {
     write(&t.path("dst/extra"), b"keep");
 
     let output = native_syq(&[
-        "cp-prune",
+        "cp",
+        "--prune",
         "--src-file",
         &t.s("src/good"),
         "--src-file",
@@ -519,35 +520,30 @@ fn native_hash_repairs_equal_metadata_content_mismatches() {
     write(&t.path("src/file"), &expected);
     set_mtime(&t.path("src/file"), 1_600_000_000);
 
-    for (command, destination) in [("cp", "copied"), ("cp-prune", "pruned")] {
+    for (prune, destination) in [(false, "copied"), (true, "pruned")] {
         write(&t.path(&format!("{destination}/file")), &corrupted);
         set_mtime(&t.path(&format!("{destination}/file")), 1_600_000_000);
-        if command == "cp-prune" {
+        if prune {
             write(&t.path(&format!("{destination}/extra")), b"remove");
         }
 
-        run_native_ok(&[
-            command,
-            "--src-src",
-            &t.s("src"),
-            "--into-existing",
-            &t.s(destination),
-        ]);
+        let source = t.s("src");
+        let target = t.s(destination);
+        let mut args = vec!["cp"];
+        if prune {
+            args.push("--prune");
+        }
+        args.extend(["--src-src", &source, "--into-existing", &target]);
+        run_native_ok(&args);
         assert_eq!(read(&t.path(&format!("{destination}/file"))), corrupted);
-        if command == "cp-prune" {
+        if prune {
             write(&t.path(&format!("{destination}/extra")), b"remove");
         }
 
-        run_native_ok(&[
-            command,
-            "--hash",
-            "--src-src",
-            &t.s("src"),
-            "--into-existing",
-            &t.s(destination),
-        ]);
+        args.insert(1, "--hash");
+        run_native_ok(&args);
         assert_eq!(read(&t.path(&format!("{destination}/file"))), expected);
-        if command == "cp-prune" {
+        if prune {
             assert!(!t.path(&format!("{destination}/extra")).exists());
         }
     }
@@ -575,7 +571,8 @@ fn native_filters_apply_to_copy_and_protect_pruned_paths() {
     write(&t.path("pruned/discard.tmp"), b"protected-old-copy");
     write(&t.path("pruned/extra"), b"remove");
     run_native_ok(&[
-        "cp-prune",
+        "cp",
+        "--prune",
         "--ignore-from",
         &t.s("patterns"),
         "--ignore",
@@ -616,7 +613,8 @@ fn native_size_limits_select_regular_files_and_protect_pruned_paths() {
     write(&t.path("pruned/large"), b"old-large");
     write(&t.path("pruned/extra"), b"remove");
     run_native_ok(&[
-        "cp-prune",
+        "cp",
+        "--prune",
         "--min-size=2",
         "--max-size=4",
         "--src-src",
@@ -1014,14 +1012,15 @@ fn native_copy_preserves_non_utf8_selector_bytes() {
 }
 
 #[test]
-fn native_cp_prune_removes_only_target_extras_after_copy() {
+fn native_cp_with_prune_removes_only_target_extras_after_copy() {
     let t = Tmp::new();
     write(&t.path("src/keep"), b"new content");
     write(&t.path("dst/keep"), b"old");
     write(&t.path("dst/extra"), b"extra");
 
     run_native_ok(&[
-        "cp-prune",
+        "cp",
+        "--prune",
         "--src-src",
         &t.s("src"),
         "--into-existing",
@@ -4489,7 +4488,7 @@ fn native_cp_matches_rsync_rlt() {
 }
 
 #[test]
-fn native_cp_prune_matches_rsync_delete() {
+fn native_cp_with_prune_matches_rsync_delete() {
     let t = Tmp::new();
     write(&t.path("src/keep"), b"source");
     for destination in ["rsync", "native"] {
@@ -4499,7 +4498,8 @@ fn native_cp_prune_matches_rsync_delete() {
 
     run_ok(&["-rlt", "--delete", &t.s("src/"), &t.s("rsync/")]);
     run_native_ok(&[
-        "cp-prune",
+        "cp",
+        "--prune",
         "--src-src",
         &t.s("src"),
         "--into-existing",
@@ -4650,6 +4650,13 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
     assert_eq!(implicit.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&implicit.stderr).contains("expected a command"));
 
+    let removed = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp-prune", "source", "--into", "dest"])
+        .run()
+        .unwrap();
+    assert_eq!(removed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&removed.stderr).contains("expected a command"));
+
     for args in [
         ["cp", "-a", "source", "--into", "dest"].as_slice(),
         ["cp", "--delete", "source", "--into", "dest"].as_slice(),
@@ -4668,17 +4675,23 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+
+    let max_delete_without_prune =
+        native_syq(&["cp", "--max-delete", "0", "source", "--into", "dest"]);
+    assert_eq!(max_delete_without_prune.status.code(), Some(2));
+    assert!(stderr_of(&max_delete_without_prune).contains("--prune"));
 }
 
 #[test]
-fn native_cp_prune_keeps_placement_siblings_and_honors_max_delete() {
+fn native_cp_with_prune_keeps_placement_siblings_and_honors_max_delete() {
     let t = Tmp::new();
     write(&t.path("source/tree/keep"), b"keep");
     write(&t.path("named/tree/keep"), b"old");
     write(&t.path("named/tree/extra"), b"extra");
     write(&t.path("named/outside"), b"outside");
     run_native_ok(&[
-        "cp-prune",
+        "cp",
+        "--prune",
         "--src",
         &t.s("source/tree"),
         "--into-existing",
@@ -4689,7 +4702,8 @@ fn native_cp_prune_keeps_placement_siblings_and_honors_max_delete() {
 
     write(&t.path("contents/extra"), b"extra");
     let refused = native_syq(&[
-        "cp-prune",
+        "cp",
+        "--prune",
         "--max-delete",
         "0",
         "--src-src",
@@ -8034,6 +8048,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     write(&t.path("src/skip.tmp"), b"excluded");
     fs::set_permissions(t.path("src/keep"), fs::Permissions::from_mode(0o640)).unwrap();
     write(&t.path("dst/keep"), b"old");
+    write(&t.path("dst/extra"), b"remove");
     let original_inode = fs::metadata(t.path("dst/keep")).unwrap().ino();
 
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -8049,6 +8064,8 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "--ignore=*.tmp",
             "--preserve=permissions",
             "--inplace",
+            "--prune",
+            "--max-delete=1",
             "--into-existing",
             &t.s("dst"),
             "-q",
@@ -8070,12 +8087,15 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     );
     assert_eq!(metadata.mode() & 0o777, 0o640);
     assert!(!t.path("dst/skip.tmp").exists());
+    assert!(!t.path("dst/extra").exists());
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     for option in [
         "--follow",
         "--ignore=*.tmp",
         "--preserve=permissions",
         "--inplace",
+        "--prune",
+        "--max-delete=1",
     ] {
         assert!(
             log.contains(option),
@@ -8479,6 +8499,15 @@ fn native_cp_mapping_hard_refusals() {
     let out = syq_cp_in(&t.path(""), &["--mapping", "-", "--as", "exact"], Some(b""));
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--as conflicts with --mapping"));
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--prune", "--mapping", "-", "-C", "src", "--into", "dst"],
+        Some(b""),
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+    assert!(stderr.contains("--prune"), "{stderr}");
 }
 
 #[test]
@@ -8667,10 +8696,27 @@ fn native_cp_results_without_mapping_and_refusals() {
     assert_eq!(op["disposition"], "succeeded");
     assert!(op.get("src").is_none(), "non-mapping records carry no src");
     assert_eq!(lines.last().unwrap()["status"], "success");
-    // map and cp-prune refuse --results.
+    // map and pruning copies refuse --results.
     let out = syq_map_in(&t.path(""), &["--src-src", "src", "--results", "r.ndjson"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("only available on syq cp"));
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--prune",
+            "--src-src",
+            "src",
+            "--into",
+            "pruned",
+            "--results",
+            "r.ndjson",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+    assert!(stderr.contains("--prune"), "{stderr}");
 }
 
 // ---- review-round fixes ----
