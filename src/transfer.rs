@@ -1,7 +1,9 @@
 //! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
-use crate::cli::{parse_rsh, parse_size, Args, Existence, Interface, Location, Placement};
+use crate::cli::{
+    parse_rsh, parse_size, Args, Existence, Interface, Location, Placement, SourceSelection,
+};
 use crate::conn::{
     ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, TcpCandidate, TcpPairStats,
 };
@@ -505,8 +507,28 @@ struct DestinationRoot<'a> {
 struct SourceMapping<'a> {
     follow_root: bool,
     contents: bool,
-    require_directory: bool,
+    selection: SourceSelection,
     sub: &'a [u8],
+}
+
+fn validate_native_source_type(path: &[u8], selection: SourceSelection, kind: Kind) -> Result<()> {
+    match selection {
+        SourceSelection::Contents if kind != Kind::Dir => {
+            bail!("contents selector {} is not a directory", display(path))
+        }
+        SourceSelection::Directory if kind != Kind::Dir => {
+            bail!("--src-dir selector {} is not a directory", display(path))
+        }
+        SourceSelection::File if kind == Kind::Dir => {
+            bail!("--src-file selector {} is a directory", display(path))
+        }
+        SourceSelection::Rsync
+        | SourceSelection::Named
+        | SourceSelection::NamedNoFollow
+        | SourceSelection::File
+        | SourceSelection::Directory
+        | SourceSelection::Contents => Ok(()),
+    }
 }
 
 fn copy_identity(
@@ -1245,13 +1267,9 @@ pub fn run(args: Args) -> Result<i32> {
         // their root and additionally require it to resolve to a directory.
         for source in srcs {
             match stat_one(&mut *src_ctl, &source.path, source.follows_root())? {
-                Some(entry) if source.requires_directory() && entry.kind != Kind::Dir => {
-                    bail!(
-                        "contents selector {} is not a directory",
-                        display(&source.path)
-                    )
+                Some(entry) => {
+                    validate_native_source_type(&source.path, source.selection, entry.kind)?
                 }
-                Some(_) => {}
                 None => bail!("source {} does not exist", display(&source.path)),
             }
         }
@@ -1573,7 +1591,7 @@ pub fn run(args: Args) -> Result<i32> {
             SourceMapping {
                 follow_root,
                 contents,
-                require_directory: src.requires_directory(),
+                selection: src.selection,
                 sub: &sub,
             },
             DestinationRoot {
@@ -2753,7 +2771,7 @@ impl Planner<'_> {
         let SourceMapping {
             follow_root,
             contents,
-            require_directory,
+            selection,
             sub,
         } = source;
         let dst_root = destination.path;
@@ -2771,9 +2789,7 @@ impl Planner<'_> {
             if first {
                 first = false;
                 if let Some(root) = batch.first() {
-                    if require_directory && root.kind != Kind::Dir {
-                        bail!("contents selector {} is not a directory", display(src_root));
-                    }
+                    validate_native_source_type(src_root, selection, root.kind)?;
                     if destination.exact && destination.entry_is_dir && root.kind != Kind::Dir {
                         bail!(
                             "destination {} is an existing directory; cannot replace it with non-directory source {}",

@@ -376,6 +376,90 @@ fn native_copy_uses_explicit_endpoints_cwd_and_option_safe_selectors() {
 }
 
 #[test]
+fn native_copy_typed_selectors_are_source_preconditions() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"file");
+    write(&t.path("src/dir/child"), b"child");
+    symlink("dir", t.path("src/link")).unwrap();
+
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("src"),
+        "--src-file",
+        "file",
+        "--src-dir",
+        "dir",
+        "--src-file",
+        "link",
+        "--into-new",
+        &t.s("copied"),
+    ]);
+    assert_eq!(read(&t.path("copied/file")), b"file");
+    assert_eq!(read(&t.path("copied/dir/child")), b"child");
+    assert_eq!(
+        fs::read_link(t.path("copied/link")).unwrap(),
+        Path::new("dir")
+    );
+
+    run_native_ok(&[
+        "cp",
+        "--src-file",
+        &t.s("src/file"),
+        "--as-new",
+        &t.s("exact"),
+    ]);
+    assert_eq!(read(&t.path("exact")), b"file");
+
+    let wrong_directory = native_syq(&[
+        "cp",
+        "--src-dir",
+        &t.s("src/file"),
+        "--into-new",
+        &t.s("wrong-directory"),
+    ]);
+    assert!(!wrong_directory.status.success());
+    assert!(stderr_of(&wrong_directory).contains("--src-dir selector"));
+    assert!(!t.path("wrong-directory").exists());
+
+    let followed_link = native_syq(&[
+        "cp",
+        "--src-dir",
+        &t.s("src/link"),
+        "--into-new",
+        &t.s("followed-link"),
+    ]);
+    assert!(!followed_link.status.success());
+    assert!(stderr_of(&followed_link).contains("--src-dir selector"));
+    assert!(!t.path("followed-link").exists());
+}
+
+#[test]
+fn native_cp_prune_checks_all_typed_sources_before_mutation() {
+    let t = Tmp::new();
+    write(&t.path("src/good"), b"new");
+    write(&t.path("src/not-a-file/child"), b"child");
+    write(&t.path("dst/good"), b"old");
+    write(&t.path("dst/extra"), b"keep");
+
+    let output = native_syq(&[
+        "cp-prune",
+        "--src-file",
+        &t.s("src/good"),
+        "--src-file",
+        &t.s("src/not-a-file"),
+        "--into-existing",
+        &t.s("dst"),
+    ]);
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("--src-file selector"));
+    assert_eq!(read(&t.path("dst/good")), b"old");
+    assert_eq!(read(&t.path("dst/extra")), b"keep");
+}
+
+#[test]
 fn native_copy_named_selector_preserves_a_root_symlink() {
     use std::os::unix::fs::symlink;
 

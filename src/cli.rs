@@ -518,6 +518,12 @@ struct NativeSelectionArgs {
     /// Select a directory's contents (repeatable)
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     src_src: Vec<OsString>,
+    /// Select a named non-directory source object (repeatable)
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    src_file: Vec<OsString>,
+    /// Select a named source directory (repeatable)
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    src_dir: Vec<OsString>,
     /// Select several named source objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
@@ -653,7 +659,7 @@ struct NativeCopyFields {
     version,
     about = "Copy selected objects with explicit endpoint and placement syntax",
     long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies use fixed rsync -rlt behavior: recursive traversal, symlinks copied as symlinks, and modification times preserved. Permissions, owner, group, devices, and special files are not preserved.",
-    override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | PATH]... PLACEMENT"
+    override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyCommand {
     #[command(flatten)]
@@ -666,7 +672,7 @@ struct NativeCopyCommand {
     version,
     about = "Copy selected objects, then remove target-only objects in mapped scopes",
     long_about = "Copy selected objects, then remove target-only objects in mapped scopes.\n\nCopying uses fixed rsync -rlt behavior: recursive traversal, symlinks copied as symlinks, and modification times preserved. Permissions, owner, group, devices, and special files are not preserved. Removal uses the current post-transfer deletion scopes and guards.",
-    override_usage = "syq cp-prune [OPTIONS] [--src PATH | --src-src DIR | PATH]... PLACEMENT"
+    override_usage = "syq cp-prune [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyPruneCommand {
     #[command(flatten)]
@@ -733,22 +739,11 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             command_label(interface)
         );
     };
-    if placement == Placement::As
-        && (locations.len() != 1
-            || !matches!(
-                locations[0].selection,
-                SourceSelection::Named | SourceSelection::NamedNoFollow
-            ))
-    {
+    if placement == Placement::As && (locations.len() != 1 || locations[0].copies_contents()) {
         bail!("--as, --as-new, and --as-existing require exactly one ordinary source object");
     }
     if placement == Placement::Into {
-        for source in locations.iter().filter(|source| {
-            matches!(
-                source.selection,
-                SourceSelection::Named | SourceSelection::NamedNoFollow
-            )
-        }) {
+        for source in locations.iter().filter(|source| !source.copies_contents()) {
             if native_basename(&source.path).is_none() {
                 bail!(
                     "named source {:?} has no target basename; use --src-src to select directory contents",
@@ -864,6 +859,8 @@ fn lower_native_selection(
         ("srcs", SourceSelection::NamedNoFollow, &parsed.srcs),
         ("src_src", SourceSelection::Contents, &parsed.src_src),
         ("src_srcs", SourceSelection::Contents, &parsed.src_srcs),
+        ("src_file", SourceSelection::File, &parsed.src_file),
+        ("src_dir", SourceSelection::Directory, &parsed.src_dir),
     ] {
         if let Some(indices) = matches.indices_of(id) {
             ordered.extend(
@@ -1462,21 +1459,13 @@ impl Location {
         }
     }
 
-    /// Native contents selectors must name directories; rsync's trailing-slash
-    /// spelling keeps its existing scan-time behavior.
-    pub fn requires_directory(&self) -> bool {
-        matches!(
-            self.selection,
-            SourceSelection::Contents | SourceSelection::Directory
-        )
-    }
-
     pub fn follows_root(&self) -> bool {
         match self.selection {
             SourceSelection::Named => true,
             SourceSelection::Contents => true,
-            SourceSelection::NamedNoFollow => false,
-            SourceSelection::File | SourceSelection::Directory => true,
+            SourceSelection::NamedNoFollow | SourceSelection::File | SourceSelection::Directory => {
+                false
+            }
             SourceSelection::Rsync => self.copies_contents(),
         }
     }
