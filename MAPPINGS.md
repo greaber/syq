@@ -282,6 +282,8 @@ set -o pipefail
 syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
 jq -cs 'if (.[-1].type? // "") != "result"
         then "incomplete results stream (no terminal record)" | halt_error
+        elif (.[-1].status != "success" and .[-1].status != "partial")
+        then "run stopped early (status \(.[-1].status)); rerun it instead of retrying" | halt_error
         else .[] | select(.type == "operation_result"
                           and .disposition == "failed"
                           and .retryable != "no")
@@ -291,7 +293,9 @@ jq -cs 'if (.[-1].type? // "") != "result"
 
 The jq program first checks the stream's terminal record: a results
 file without one is from a run that did not finish (a crash, a kill),
-so entries the run never reached have no records at all and a retry
-built from the prefix would look complete while it is not. With the
+and a terminal status other than `success` or `partial` (an aborted
+run, say) means queued entries were never settled — in both cases
+entries may have no records at all, so a retry manifest built from
+what is there would look complete while it is not. With the
 terminal record present, the filter is what an exit code cannot
 express: which entries failed, and whether a retry could help.
