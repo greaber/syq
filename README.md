@@ -346,8 +346,10 @@ receiver, `cp` also accepts the receiver ceilings
 `--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
 (`s`, `m`, or `h`; at most 23h). They are signed into the grant and enforced
 by hostB, and are refused anywhere else because nothing would enforce them.
-`cp` additionally accepts `--mapping` and `--results`
-(see [MAPPINGS.md](MAPPINGS.md)). `--mapping` cannot be combined with
+`cp` additionally accepts `--mapping` (see [MAPPINGS.md](MAPPINGS.md))
+and `--results`, a machine-readable NDJSON outcome stream
+(see [docs/automation-v1.md](docs/automation-v1.md)).
+`--mapping` cannot be combined with
 `--prune` because mapping manifests define no deletion region; `--results`
 covers `--prune` runs, including their removals. `--max-delete` requires
 `--prune`; `rm` additionally accepts `--root` plus its endpoint-side

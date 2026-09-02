@@ -271,11 +271,14 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   fail entries individually. `syq map` streams its output. Exit codes
   and output are the ordinary `syq cp` ones.
 
-## Machine-readable results (preview)
+## Machine-readable results
 
 `syq cp --results FILE` (with or without `--prune`) writes an
 NDJSON outcome stream beside the ordinary human output; with `-` the
 machine owns stdout and syq suppresses its own human stdout. The
+full contract — every record type and field, the exit-code table,
+the JSON Schema, and example streams — is
+[docs/automation-v1.md](docs/automation-v1.md). In brief: the
 stream carries `schema_version: 1`: a `run` record (run id, mode,
 endpoints), sampled `progress` records, one `operation_result` per
 settled mutation and per failed mapping entry (with `retryable`, and

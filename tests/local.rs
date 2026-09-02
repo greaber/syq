@@ -9781,3 +9781,177 @@ fn native_cp_prune_fatal_failure_reports_deletion_aggregates() {
     assert_eq!(terminal["deletions_completed"], 0);
     assert_eq!(terminal["deletions_blocked"], 0);
 }
+
+fn automation_v1_validator() -> jsonschema::Validator {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/automation-v1.schema.json"))
+            .expect("schema file is JSON");
+    jsonschema::validator_for(&schema).expect("schema compiles")
+}
+
+/// Every line validates against the committed schema, seq is contiguous
+/// from 0, the first record is `run`, and the last is `result`.
+fn assert_automation_v1_stream(validator: &jsonschema::Validator, content: &str, context: &str) {
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("{context} line {}: not JSON: {e}", i + 1))
+        })
+        .collect();
+    assert!(!records.is_empty(), "{context}: empty stream");
+    for (i, record) in records.iter().enumerate() {
+        if let Err(error) = validator.validate(record) {
+            panic!("{context} line {}: {error}\nrecord: {record}", i + 1);
+        }
+        assert_eq!(record["seq"], i as u64, "{context} line {}", i + 1);
+    }
+    assert_eq!(records[0]["type"], "run", "{context}");
+    assert_eq!(records.last().unwrap()["type"], "result", "{context}");
+}
+
+#[test]
+fn automation_v1_fixtures_validate_against_schema() {
+    let validator = automation_v1_validator();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/automation-v1");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("fixture dir")
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "dry-run.ndjson",
+            "failed.ndjson",
+            "partial.ndjson",
+            "refused.ndjson",
+            "success.ndjson"
+        ]
+    );
+    for name in names {
+        let content = String::from_utf8(read(&dir.join(&name))).unwrap();
+        assert_automation_v1_stream(&validator, &content, &name);
+    }
+    // The strictness is the point: a shape change must fail, not slide by.
+    let mut record: serde_json::Value = serde_json::from_str(
+        String::from_utf8(read(&dir.join("success.ndjson")))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(validator.validate(&record).is_ok());
+    record["surprise"] = serde_json::json!(true);
+    assert!(
+        validator.validate(&record).is_err(),
+        "an unknown field must fail validation"
+    );
+    assert!(
+        validator
+            .validate(&serde_json::json!({
+                "schema": "syq.automation", "schema_version": 1, "seq": 0, "type": "run"
+            }))
+            .is_err(),
+        "missing required fields must fail validation"
+    );
+}
+
+#[test]
+fn automation_v1_live_streams_validate_against_schema() {
+    let validator = automation_v1_validator();
+    let manifest = format!(
+        "{}{}",
+        entry_line("Berlin/IMG.JPG", "berlin/2024/img.jpg", Some("file")),
+        entry_line("Notes.TXT", "notes.txt", None),
+    );
+
+    // success (mapping) and its dry run.
+    for (name, extra) in [("success", &[][..]), ("dry-run", &["-n"][..])] {
+        let t = Tmp::new();
+        write(&t.path("src/Berlin/IMG.JPG"), b"img");
+        write(&t.path("src/Notes.TXT"), b"hello");
+        let mut args = vec!["-C", "src", "--mapping", "-", "--into", "dst"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--results", "r.ndjson", "-q"]);
+        let out = syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes()));
+        assert!(out.status.success(), "{name}: {}", stderr_of(&out));
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
+        assert_automation_v1_stream(&validator, &content, name);
+    }
+
+    // partial: one mapping entry fails. Exit 23.
+    {
+        let t = Tmp::new();
+        write(&t.path("src/Notes.TXT"), b"hello");
+        let out = syq_cp_in(
+            &t.path(""),
+            &[
+                "-C",
+                "src",
+                "--mapping",
+                "-",
+                "--into",
+                "dst",
+                "--results",
+                "r.ndjson",
+                "-q",
+            ],
+            Some(manifest.as_bytes()),
+        );
+        assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
+        assert_automation_v1_stream(&validator, &content, "partial");
+    }
+
+    // refused: --max-delete blocks the deletion pass. Exit 25.
+    {
+        let t = Tmp::new();
+        write(&t.path("src/keep.txt"), b"k");
+        write(&t.path("dst/keep.txt"), b"k");
+        write(&t.path("dst/extra-1.txt"), b"x");
+        write(&t.path("dst/extra-2.txt"), b"x");
+        let out = syq_cp_in(
+            &t.path(""),
+            &[
+                "--prune",
+                "--max-delete",
+                "1",
+                "--src-src",
+                "src",
+                "--into",
+                "dst",
+                "--results",
+                "r.ndjson",
+                "-q",
+            ],
+            None,
+        );
+        assert_eq!(out.status.code(), Some(25), "{}", stderr_of(&out));
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
+        assert_automation_v1_stream(&validator, &content, "refused");
+    }
+
+    // failed: fatal setup failure still yields a valid stream. Exit 1.
+    {
+        let t = Tmp::new();
+        let out = syq_cp_in(
+            &t.path(""),
+            &[
+                "--src-src",
+                "missing",
+                "--into",
+                "dst",
+                "--results",
+                "r.ndjson",
+                "-q",
+            ],
+            None,
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
+        assert_automation_v1_stream(&validator, &content, "failed");
+    }
+}
