@@ -149,6 +149,8 @@ target placement in separate arguments:
 syq cp project --to server --into /backup       # named object → /backup/project
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
+syq cp --from server:2222 data --to backup:2200 --into /archive
+syq cp --from server data --to backup --run-at target --into /archive
 syq cp --src-file report --src-dir assets --into /backup
 syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
 syq cp report --to server --as-new /reports/final
@@ -164,9 +166,13 @@ syq rm --root /srv --src-dir cache
 syq rm --cwd /srv --follow --src-dir current-release
 ```
 
-`--from [USER@]HOST` selects one source endpoint and `--to [USER@]HOST`
-selects one target endpoint; omission means local. A local path containing `:`
-stays local because native mode never guesses endpoints from path text.
+`--from [USER@]HOST[:PORT]` selects one source endpoint and `--to
+[USER@]HOST[:PORT]` selects one target endpoint; omission means local. Enclose
+an IPv6 address in brackets, for example `alice@[2001:db8::1]:2222`. The port
+override is used consistently for the SSH connection, `ssh -G` policy
+resolution, known-host lookup, automatic enrollment, and later enrollment
+reuse. A local path containing `:` stays local because native mode never
+guesses endpoints from path text.
 `--cwd DIR`/`-C DIR` changes where relative source selectors are resolved at
 the source endpoint. Copy selectors may be absolute and then ignore `--cwd`.
 Removal selectors are always relative; native `rm` rejects a leading slash and
@@ -347,16 +353,55 @@ receiver, `cp` also accepts the receiver ceilings
 (`s`, `m`, or `h`; at most 23h). They are signed into the grant and enforced
 by hostB, and are refused anywhere else because nothing would enforce them.
 `cp` additionally accepts `--mapping` and `--results`
-(see [MAPPINGS.md](MAPPINGS.md)), but neither can be combined with `--prune`:
-mapping manifests define no deletion region, and the preview results schema
-does not yet represent deletions. `--max-delete` requires `--prune`; `rm`
-additionally accepts `--root` plus its endpoint-side removal semantics.
+(see [MAPPINGS.md](MAPPINGS.md)). For a direct remote-to-remote copy,
+`--results -` streams the remote coordinator's NDJSON back to the invoking
+terminal. A named results file requires `--run-at local`; direct remote
+coordinators reject it rather than creating a surprising remote file.
+`--results` is also rejected with `--detach`, because its stream would no
+longer remain attached. Neither `--mapping` nor `--results` can be combined
+with `--prune`: mapping manifests define no deletion region, and the preview
+results schema does not yet represent deletions. `--max-delete` requires
+`--prune`; `rm` additionally accepts `--root` plus its endpoint-side removal
+semantics.
 
-Other comparison and selection controls, block and split sizing, and
-SSH/transport configuration remain available only through `syq rsync`.
-Remote-to-remote native copies always use the automatic topology and do not
-expose `--relay`; raw path bytes are relayed internally through syq's protocol
-when they cannot be represented in a direct remote shell command.
+Native `cp` exposes the remote runtime and transport controls
+directly: `--rsh COMMAND`, `--syq-path PATH`, `--no-bootstrap`, `--no-tcp`,
+`--tcp-plain`, `--tcp-ports LO-HI`, and Linux `--tcp-congestion ALGO`. An
+explicit `--rsh` is the complete SSH and agent policy and bypasses automatic
+broker/receiver setup. A port in native endpoint syntax can be combined with
+the default SSH command or an explicit command whose executable is `ssh`; an
+arbitrary remote-shell wrapper must carry its own port option.
+
+For two remote endpoints, `--run-at auto` (the default) places the coordinator
+at the source when the paths can be represented in a remote command and
+otherwise relays raw path bytes locally. `--run-at source` explicitly selects
+a direct push, `--run-at target` selects a direct pull with the SSH edge
+reversed, and `--run-at local` selects a relay without exposing the rsync-only
+`--relay` spelling. Explicit source or target placement therefore requires
+UTF-8 paths. `--run-at` is rejected for copies that do not have two remote
+endpoints.
+
+The default push uses destination-bound agent authentication plus the
+command-restricted write receiver. Default pull fails closed until the
+corresponding read-restricted receiver is implemented; it never silently
+downgrades to authentication-only confinement. Pull is currently available
+with an explicit `--rsh`, `--no-forward-agent` when the target owns source
+credentials, `--agent-broker-only`, or
+`--unrestricted-agent-forwarding`. The authentication options and `--detach`
+apply only to a direct copy between distinct remote endpoints. A detached
+launch requires coordinator-owned credentials (`--no-forward-agent`) or an
+explicit remote-shell policy; the launcher reports a follow target only after
+the detached coordinator has established the transfer route and completed
+destination preflight. If that readiness deadline expires, the launcher
+terminates and verifies the complete detached process group before reporting
+failure.
+
+The one-shot command-restricted write receiver currently requires encrypted
+TCP data connections. Consequently `--no-tcp`, TCP fallback, `--tcp-plain`,
+and `--tcp-congestion` work with ordinary and explicitly managed SSH modes but
+remain fail-closed on that receiver until its authenticated worker-session
+join protocol represents them. Other comparison and selection controls, and
+block and split sizing, remain available only through `syq rsync`.
 
 ## Mappings
 
@@ -477,10 +522,10 @@ credential caching, and notably a hardware-token approval is not required for
 reuse; do not enable it where that window is unacceptable. Data connections
 are unaffected: they remain separate TCP streams (or independent ssh
 processes under `--no-tcp`), so throughput does not change. Not available
-with an explicit `-e`/`--rsh`. Direct remote-to-remote transfers refuse it —
-the orchestrator runs on the source host, where no reusable local master
-exists — so add `--relay` to keep the orchestrator and its reusable
-connections on this machine; the command-restricted path additionally
+with an explicit `-e`/`--rsh`. Explicit endpoint ports are part of the reuse
+identity. Direct remote-to-remote transfers refuse it because a remote
+coordinator has no reusable local master, so use `--relay` with `syq rsync` or
+`--run-at local` with native syntax; the command-restricted path additionally
 refuses it because its host-bound authentication is verified on each fresh
 connection.
 
