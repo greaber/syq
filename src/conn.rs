@@ -2162,6 +2162,65 @@ mod tests {
     }
 
     #[test]
+    fn hello_sends_worker_initialization_before_waiting_for_its_response() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = FrameReader::new(socket.try_clone().unwrap());
+            assert!(matches!(
+                reader.read_msg::<Request>().unwrap(),
+                Request::Hello { .. }
+            ));
+            assert!(matches!(
+                reader.read_msg::<Request>().unwrap(),
+                Request::AnchorDestination { .. }
+            ));
+
+            let mut writer = FrameWriter::new(socket, false);
+            writer
+                .write_msg(&Response::HelloOk {
+                    identity: crate::identity::build().to_string(),
+                    platform: crate::identity::platform(),
+                })
+                .unwrap();
+            writer.write_msg(&Response::Ok).unwrap();
+        });
+
+        let socket = TcpStream::connect(address).unwrap();
+        let (rx, reader) = spawn_reader(Box::new(socket.try_clone().unwrap()));
+        let conn = RemoteConn {
+            child: None,
+            w: FrameWriter::new(Box::new(socket), false),
+            rx: Some(rx),
+            reader: Some(reader),
+            label: "pipelined hello test".into(),
+            dead: false,
+            peer: None,
+            tcp_socket: None,
+        };
+        let conn = hello(
+            conn,
+            false,
+            Vec::new(),
+            Some(Request::AnchorDestination {
+                path: Some(b"destination".to_vec()),
+                expected_dev: 1,
+                expected_ino: 2,
+                request_prefix: b"destination".to_vec(),
+                insecure_links: false,
+            }),
+        )
+        .unwrap();
+        assert!(conn.peer.is_some());
+        drop(conn);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn transport_stats_response_wait_has_a_deadline() {
         let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
         let timeout = std::time::Duration::from_millis(20);
