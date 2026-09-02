@@ -146,9 +146,32 @@ The kernel's [IP sysctl documentation][ip-sysctl] describes `tcp_rmem`,
 `tcp_wmem`, and the global socket limits. Kernel and distribution defaults
 change, which is another reason to inspect the running host.
 
-## 4. Keep host defaults separate from per-transfer congestion experiments
+## 4. Try congestion control per transfer before changing the host default
 
-Inspect what the kernel supports and currently uses:
+TCP congestion control decides how a sender reacts when a path fills or drops
+packets. Linux normally uses CUBIC, which treats packet loss as a congestion
+signal. BBR instead models the path's delivery rate and round-trip time and
+paces traffic to match them. That difference can make BBR much faster on a
+long-distance path with occasional loss, while a clean LAN or an already
+saturated disk may show no useful difference.
+
+This does not make BBR a universally better system default. CUBIC is a
+standardized, widely deployed algorithm designed to coexist with traditional
+TCP traffic. The `bbr` in ordinary mainline Linux is the older BBRv1; the
+current BBRv3 work is a separate, experimental implementation. BBRv1 can share
+a bottleneck unevenly with CUBIC or with BBR flows that have different
+round-trip times, depending on the path and its buffers. Because syq may use
+several flows, that fairness cost matters on a shared link even when the syq
+transfer itself is fast. BBR also relies on suitable packet pacing and fair
+queueing. These are good reasons for Linux to keep a conservative default for
+every application, but not reasons to avoid a scoped BBR test for a bulk copy.
+
+See the [CUBIC standard][cubic-rfc], the [BBR project and version
+notes][bbr-project], the current [experimental BBR specification][bbr-draft],
+and an [experimental analysis of BBRv1 RTT fairness][bbr-fairness] for the
+details behind those trade-offs.
+
+First inspect what each Linux endpoint supports and currently uses:
 
 ```sh
 sysctl net.ipv4.tcp_available_congestion_control
@@ -158,32 +181,45 @@ sysctl net.core.default_qdisc
 tc qdisc show
 ```
 
-BBR with fair queueing can help some long-distance or lossy paths, but it is
-not an syq requirement and is not automatically faster on a clean LAN. Changing
-`net.ipv4.tcp_congestion_control` affects new TCP connections from every
-application. If both endpoints already default to the wanted algorithm, syq's
-new direct TCP sockets inherit it and no application option is needed.
-
 For a scoped comparison on Linux, `syq rsync --tcp-congestion ALGO` selects an
 algorithm only for syq's direct TCP data sockets, on both the connecting and
 listening hosts. It does not change the host default. Both kernels must have
 the algorithm registered, and an unprivileged syq process may choose only an
 entry in `net.ipv4.tcp_allowed_congestion_control`. A rejected explicit request
-stops the transfer rather than silently changing the experiment. Use a fixed
-connection count such as `-j 1` when comparing algorithms, repeat and alternate
-the runs, and inspect the effective algorithms and loss/window telemetry with
-`--stats`.
+stops the transfer rather than silently changing the experiment. Without the
+option, each socket inherits its host's default.
 
-Congestion control is sender-side: the server setting governs bulk downloads,
-while the uploading client setting governs bulk uploads. The per-socket option
-does not attach or replace a queueing discipline. Changing
+Compare algorithms with a fixed connection count so syq's worker tuning does
+not hide their effect:
+
+```sh
+syq rsync -a -j 1 --tcp-congestion cubic --stats SOURCE HOST:DESTINATION
+syq rsync -a -j 1 --tcp-congestion bbr   --stats SOURCE HOST:DESTINATION
+```
+
+Repeat and alternate the two commands, then test the other transfer direction:
+congestion control is sender-side, so a path can behave very differently in
+reverse. `--stats` reports the effective algorithm, retransmitted packets and
+bytes, round-trip time, congestion window, and delivery rate. If BBR wins
+repeatedly, pass `--tcp-congestion bbr` for that workload and rerun once without
+`-j 1` to measure normal automatic worker tuning. Prefer this per-transfer
+choice to a global sysctl change.
+
+The server setting governs bulk downloads, while the uploading client setting
+governs bulk uploads. The per-socket option does not attach or replace a
+queueing discipline. Changing
 `net.core.default_qdisc` alone may not replace qdiscs already attached to live
 interfaces, and virtual or multiqueue devices can have different behavior.
+Changing `net.ipv4.tcp_congestion_control` affects new connections from every
+application. If both endpoints already default to the wanted algorithm, syq's
+new direct TCP sockets inherit it and no application option is needed.
 
 Only test these settings when network measurements point to congestion, loss,
 or queueing rather than CPU or storage. Confirm kernel support, follow the
 operating system or network provider's guidance, record the prior algorithm and
-qdisc, and have an out-of-band recovery path before changing a remote host.
+qdisc, consider other users of the path, and have an out-of-band recovery path
+before changing a remote host. Use `--bwlimit` when sharing capacity matters
+more than finishing as quickly as possible.
 
 ## 5. Leave MTU, RDMA, and interface addressing to the network owner
 
@@ -228,3 +264,7 @@ measured decision from an inherited assumption:
 
 [ip-sysctl]: https://docs.kernel.org/networking/ip-sysctl.html#tcp-variables
 [maxstartups]: https://man.openbsd.org/sshd_config#MaxStartups
+[bbr-draft]: https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/
+[bbr-fairness]: https://arxiv.org/abs/1706.09115
+[bbr-project]: https://github.com/google/bbr
+[cubic-rfc]: https://www.rfc-editor.org/rfc/rfc9438.html
