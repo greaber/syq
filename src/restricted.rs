@@ -4883,6 +4883,44 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_deletion_keeps_the_unfiltered_scan_but_refuses_removals() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority_with_policy(
+            &root,
+            DeletionPolicyV1::Forbid,
+            16,
+            0,
+            FilterPolicyV3 {
+                ignore: vec!["ignored/".into()],
+                destination_roots: Vec::new(),
+                delete_excluded: true,
+            },
+            PublicationPolicyV1::AtomicStaged,
+        );
+        let target = root.join("target").as_os_str().as_bytes().to_vec();
+        let mut unfiltered_scan = Request::Scan {
+            root: target,
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: true,
+            guard: None,
+        };
+        authority.authorize(&mut unfiltered_scan, false).unwrap();
+        let ignored = root
+            .join("target/ignored/file")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        let mut delete = Request::Apply {
+            ops: vec![Op::Unlink { path: ignored }],
+            guard: None,
+        };
+        assert!(authority.authorize(&mut delete, false).is_err());
+    }
+
+    #[test]
     fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
         let parse = |options: &[&str]| {
             let mut argv = vec!["syq rsync", "-r"];

@@ -373,14 +373,12 @@ impl FilterPolicyV3 {
                 bail!("signed filter roots must be sorted and unique");
             }
         }
-        if self.delete_excluded {
-            let GrantOperationV1::Copy(copy) = &grant.operation;
-            if copy.policy.deletion == DeletionPolicyV1::Forbid {
-                bail!(
-                    "signed filter policy cannot delete excluded paths when deletion is forbidden"
-                );
-            }
-        }
+        // `delete_excluded` is also a scan policy: with it, the orchestrator
+        // inspects the destination unfiltered, and the receiver requires
+        // exactly that. It therefore stays meaningful when deletion is
+        // forbidden (a dry run, or a zero deletion budget); the receiver's
+        // deletion policy still refuses every actual removal.
+        let _ = grant;
         Ok(())
     }
 }
@@ -2440,6 +2438,21 @@ mod tests {
             RootExistenceV4::Existing,
         )
         .is_err());
+    }
+
+    #[test]
+    fn delete_excluded_filters_remain_valid_when_deletion_is_forbidden() {
+        let grant = fixture_grant(50);
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicyV1::Forbid);
+        let filters = FilterPolicyV3 {
+            ignore: vec!["*.tmp".into()],
+            destination_roots: vec![b"/srv/archive/project".to_vec()],
+            delete_excluded: true,
+        };
+        // The unfiltered-scan policy still matters for a dry run or a zero
+        // deletion budget; the receiver's deletion policy refuses removals.
+        filters.validate(&grant).unwrap();
     }
 
     #[test]
