@@ -79,6 +79,10 @@ pub struct Args {
     /// `syq map` never contacts a destination.
     #[arg(skip)]
     pub native_map_target: Option<Vec<u8>>,
+    /// NDJSON mapping manifest consumed by native cp instead of selectors
+    /// (`-` reads stdin, streamed).
+    #[arg(skip)]
+    pub native_mapping: Option<Vec<u8>>,
 
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
@@ -653,6 +657,11 @@ struct NativeCopyFields {
         allow_hyphen_values = true
     )]
     as_existing: Option<OsString>,
+    /// Copy the entries of an NDJSON mapping manifest (`-` reads stdin)
+    /// instead of selecting sources; entry src paths are relative to -C and
+    /// dst paths are relative to the --into container
+    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
+    mapping: Option<OsString>,
     #[command(flatten)]
     operational: NativeOperationalArgs,
 }
@@ -752,7 +761,36 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     } else {
         None
     };
-    let mut locations = lower_native_selection(&parsed.selection, &matches)?;
+    let mapping = parsed.mapping.take();
+    if mapping.is_some() && interface != Interface::NativeCp {
+        bail!("--mapping is only available on syq cp");
+    }
+    let mut locations = if mapping.is_some() {
+        let has_selectors = !(parsed.selection.src.is_empty()
+            && parsed.selection.src_src.is_empty()
+            && parsed.selection.srcs.is_empty()
+            && parsed.selection.src_srcs.is_empty()
+            && parsed.selection.sources.is_empty());
+        if has_selectors {
+            bail!("--mapping replaces source selectors; do not combine them");
+        }
+        let endpoint = parse_native_endpoint(parsed.selection.from.as_deref())?;
+        let base = trim_native_trailing_slashes(
+            parsed
+                .selection
+                .cwd
+                .clone()
+                .map(OsStringExt::into_vec)
+                .unwrap_or_else(|| b".".to_vec()),
+        );
+        if base.is_empty() {
+            bail!("source base may not be empty");
+        }
+        // The manifest is the selection; its entries resolve against this root.
+        vec![Location::native(endpoint, base, SourceSelection::Contents)]
+    } else {
+        lower_native_selection(&parsed.selection, &matches)?
+    };
     if interface == Interface::NativeMap {
         if parsed.selection.from.is_some() {
             bail!("syq map with a remote source (--from) is not yet supported");
@@ -799,6 +837,9 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             command_label(interface)
         ),
     };
+    if placement == Placement::As && mapping.is_some() {
+        bail!("--as conflicts with --mapping: each entry's dst is its own --as");
+    }
     if placement == Placement::As
         && (locations.len() != 1
             || !matches!(
@@ -869,6 +910,17 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.max_delete = max_delete;
     args.native_map_cwd = map_cwd;
     args.native_map_target = native_map_target;
+    args.native_mapping = mapping.map(OsStringExt::into_vec);
+    if args.native_mapping.is_some() {
+        // The manifest is read on this machine and its entries are stat'ed
+        // through the source connection; a direct remote-to-remote copy has
+        // no way to carry either.
+        let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
+        let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
+        if src_remote && dst_remote {
+            bail!("--mapping with a remote-to-remote copy is not supported; one end must be local");
+        }
+    }
     apply_native_operational(&mut args, parsed.operational);
     apply_internal_native_direct(&mut args)?;
     Ok(args)

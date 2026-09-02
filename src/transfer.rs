@@ -1518,6 +1518,8 @@ pub fn run(args: Args) -> Result<i32> {
         } else {
             None
         },
+        src_overrides: std::collections::HashMap::new(),
+        implicit_dirs: std::collections::HashSet::new(),
         create_root: if create_root && multiple_distinct_sources {
             Some((dst_root.clone(), root_create_condition))
         } else {
@@ -1525,7 +1527,7 @@ pub fn run(args: Args) -> Result<i32> {
         },
         destination_anchor: &destination_anchor,
         use_operator_anchor,
-        keep_dirs: args.files_from.is_some(),
+        keep_dirs: args.files_from.is_some() || args.native_mapping.is_some(),
         delete_roots: Vec::new(),
         deletes: Deletes::default(),
         dry_run_changes: {
@@ -1539,7 +1541,28 @@ pub fn run(args: Args) -> Result<i32> {
 
     let mut scan_err = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
-    if args.files_from.is_some() {
+    if let Some(mapping) = args.native_mapping.as_deref() {
+        let src = &srcs[0];
+        let open = || -> Result<Box<dyn std::io::BufRead>> {
+            if mapping == b"-" {
+                return Ok(Box::new(std::io::stdin().lock()));
+            }
+            let path = std::path::PathBuf::from(OsStr::from_bytes(mapping).to_os_string());
+            Ok(Box::new(std::io::BufReader::new(
+                std::fs::File::open(&path)
+                    .map_err(|e| anyhow::anyhow!("--mapping {}: {e}", path.display()))?,
+            )))
+        };
+        match open().and_then(|mut reader| {
+            st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, &mut *reader)
+        }) {
+            Ok(()) => dry_run_mappings.push(DryRunMapping {
+                target: dst_root.clone(),
+                semantics: "entries selected by --mapping",
+            }),
+            Err(e) => scan_err = Some(e),
+        }
+    } else if args.files_from.is_some() {
         let src = &srcs[0];
         match st.scan_files_from(
             &mut *src_ctl,
@@ -1555,7 +1578,10 @@ pub fn run(args: Args) -> Result<i32> {
             Err(e) => scan_err = Some(e),
         }
     }
-    for src in srcs.iter().filter(|_| args.files_from.is_none()) {
+    for src in srcs
+        .iter()
+        .filter(|_| args.files_from.is_none() && args.native_mapping.is_none())
+    {
         let src_root = src.path.clone();
         let contents = src.copies_contents();
         let follow_root = src.follows_root();
@@ -2617,6 +2643,13 @@ struct Planner<'a> {
     /// Several sources: mapped batches waiting for all scans to finish
     /// (see `Mapped`). None with a single source, where batches stream.
     buffer: Option<Vec<Mapped>>,
+    /// --mapping: per-destination source override. A manifest entry's `path`
+    /// carries the destination-relative path so claims, ordering, and job
+    /// naming work unchanged; the read side looks the actual source up here.
+    src_overrides: std::collections::HashMap<PathBytes, PathBytes>,
+    /// --mapping: full destination paths of implicit ancestor directories no
+    /// entry names, created with default metadata (no deferred stamping).
+    implicit_dirs: std::collections::HashSet<PathBytes>,
     /// Placement root and receiver-enforced conditions for native operations.
     root_path: PathBytes,
     exact_condition: TargetCondition,
@@ -3009,6 +3042,156 @@ impl Planner<'_> {
         Ok(())
     }
 
+    /// Consume an NDJSON mapping manifest: each entry claims exactly one
+    /// source object (relative to `src_root`) at an explicit destination
+    /// (relative to `dst_root`). Entries stream: chunks are planned and
+    /// applied before the manifest ends, so `--mapping -` starts work long
+    /// before stdin closes. Destination ancestors no entry names are
+    /// synthesized as implicit directories with default metadata.
+    fn scan_mapping(
+        &mut self,
+        src: &mut dyn Conn,
+        src_root: &[u8],
+        dst_root: &[u8],
+        reader: &mut dyn std::io::BufRead,
+    ) -> Result<()> {
+        use std::collections::{HashMap, HashSet};
+        match stat_one(src, src_root, true)? {
+            Some(e) if e.kind == Kind::Dir => {}
+            Some(_) => bail!(
+                "--mapping: source base {} is not a directory",
+                display(src_root)
+            ),
+            None => bail!(
+                "--mapping: source base {} does not exist",
+                display(src_root)
+            ),
+        }
+        self.progress.scanned.fetch_add(1, Relaxed);
+
+        // Explicit destinations seen (duplicates are hard errors), what the
+        // planner was given for each destination path, and which of those
+        // were synthesized ancestors an explicit entry may still upgrade.
+        let mut manifest_dsts: HashSet<PathBytes> = HashSet::new();
+        let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
+        let mut synthesized: HashSet<PathBytes> = HashSet::new();
+        let mut line_number = 0u64;
+        let mut done = false;
+        while !done {
+            let mut chunk: Vec<(u64, ManifestEntry)> = Vec::new();
+            while chunk.len() < crate::scan::BATCH {
+                let mut line = String::new();
+                let n = reader
+                    .read_line(&mut line)
+                    .map_err(|e| anyhow::anyhow!("--mapping: read: {e}"))?;
+                if n == 0 {
+                    done = true;
+                    break;
+                }
+                line_number += 1;
+                let text = line.trim_end_matches('\n').trim_end_matches('\r');
+                if text.is_empty() {
+                    continue;
+                }
+                let entry = parse_manifest_entry(text)
+                    .map_err(|e| anyhow::anyhow!("--mapping line {line_number}: {e}"))?;
+                if !manifest_dsts.insert(entry.dst.clone()) {
+                    bail!(
+                        "--mapping line {line_number}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)",
+                        display(&entry.dst)
+                    );
+                }
+                chunk.push((line_number, entry));
+            }
+            if chunk.is_empty() {
+                continue;
+            }
+            let stats = stat_many(
+                src,
+                chunk.iter().map(|(_, m)| join(src_root, &m.src)).collect(),
+                false,
+            )?;
+            let mut batch: Vec<Entry> = Vec::new();
+            for ((line_number, m), st) in chunk.into_iter().zip(stats) {
+                let Some(e) = st else {
+                    self.progress.error(&format!(
+                        "syq: --mapping line {line_number}: source {} does not exist",
+                        display(&m.src)
+                    ));
+                    continue;
+                };
+                if let Some(declared) = m.kind {
+                    if !declared.matches(e.kind) {
+                        self.progress.error(&format!(
+                            "syq: --mapping line {line_number}: source {} is {}, not the declared {}",
+                            display(&m.src),
+                            kind_label(e.kind),
+                            declared.label(),
+                        ));
+                        continue;
+                    }
+                }
+                // Destination ancestors: consistent with what earlier entries
+                // established, with missing ones synthesized parent-first.
+                let mut conflict = false;
+                let mut chain: Vec<PathBytes> = Vec::new();
+                for (i, &byte) in m.dst.iter().enumerate() {
+                    if byte != b'/' {
+                        continue;
+                    }
+                    let anc = &m.dst[..i];
+                    match emitted.get(anc) {
+                        Some(Kind::Dir) => {}
+                        Some(_) => {
+                            self.progress.error(&format!(
+                                "syq: --mapping line {line_number}: destination ancestor {} was mapped as a non-directory",
+                                display(anc)
+                            ));
+                            conflict = true;
+                            break;
+                        }
+                        None => chain.push(anc.to_vec()),
+                    }
+                }
+                if conflict {
+                    continue;
+                }
+                match emitted.get(&m.dst) {
+                    None => {}
+                    Some(Kind::Dir) if e.kind == Kind::Dir && synthesized.remove(&m.dst) => {
+                        // An explicit directory entry for a path an earlier
+                        // entry implied: upgrade it from default metadata to
+                        // this entry's metadata.
+                        self.implicit_dirs.remove(&join(dst_root, &m.dst));
+                    }
+                    Some(_) => {
+                        self.progress.error(&format!(
+                            "syq: --mapping line {line_number}: destination {} was already used as a directory",
+                            display(&m.dst)
+                        ));
+                        continue;
+                    }
+                }
+                for anc in chain {
+                    self.implicit_dirs.insert(join(dst_root, &anc));
+                    emitted.insert(anc.clone(), Kind::Dir);
+                    synthesized.insert(anc.clone());
+                    batch.push(implicit_dir_entry(anc));
+                }
+                emitted.insert(m.dst.clone(), e.kind);
+                if m.src != m.dst {
+                    self.src_overrides.insert(m.dst.clone(), m.src);
+                }
+                let mut e = e;
+                e.path = m.dst;
+                batch.push(e);
+            }
+            self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+            self.handle_batch(batch, src_root, b"", dst_root)?;
+        }
+        Ok(())
+    }
+
     /// Walk `src_root/rel` and plan its entries under the same relative prefix.
     fn scan_subtree(
         &mut self,
@@ -3150,7 +3333,10 @@ impl Planner<'_> {
             let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
                 continue;
             };
-            let src = join(src_root, &e.path);
+            let src = match self.src_overrides.get(&e.path) {
+                Some(actual) => join(src_root, actual),
+                None => join(src_root, &e.path),
+            };
             match claim {
                 Claim::Dir => dirs.push((dst, dst_rel, e)),
                 Claim::Weak if e.kind == Kind::Other => {
@@ -3385,7 +3571,10 @@ impl Planner<'_> {
                                 ));
                             }
                         }
-                        Some(d) if metadata_differs(e, d, meta_flags) => {
+                        Some(d)
+                            if metadata_differs(e, d, meta_flags)
+                                && !self.implicit_dirs.contains(p) =>
+                        {
                             self.dry_run_changes.metadata_directories.insert(p.clone());
                             if opts.verbose > 0 {
                                 self.progress.println(&format!(
@@ -3484,6 +3673,12 @@ impl Planner<'_> {
                     flags &= !flags::MODE;
                 }
                 for (p, _, e, s) in &planned {
+                    // Implicit --mapping ancestors keep the metadata their
+                    // creation gave them; only named entries stamp source
+                    // metadata.
+                    if self.implicit_dirs.contains(p) {
+                        continue;
+                    }
                     let depth = p.iter().filter(|&&c| c == b'/').count();
                     let mut meta = e.meta();
                     let mut flags = flags;
@@ -5960,5 +6155,145 @@ mod tests {
         assert!(output.contains("current average 1.00 ms, minimum unavailable"));
         assert!(output.contains("receive unavailable, send-buffer unavailable"));
         assert!(output.contains("tcp ECN CE deliveries: unavailable"));
+    }
+}
+
+/// One parsed `--mapping` manifest entry.
+struct ManifestEntry {
+    src: PathBytes,
+    dst: PathBytes,
+    kind: Option<DeclaredKind>,
+}
+
+/// The manifest's `kind` field: disambiguation of the request, not a
+/// precondition. A mismatch fails that entry the way a missing source does.
+#[derive(Clone, Copy)]
+enum DeclaredKind {
+    File,
+    Dir,
+    Symlink,
+    Special,
+}
+
+impl DeclaredKind {
+    fn matches(self, kind: Kind) -> bool {
+        match self {
+            DeclaredKind::File => kind == Kind::File,
+            DeclaredKind::Dir => kind == Kind::Dir,
+            DeclaredKind::Symlink => kind == Kind::Symlink,
+            DeclaredKind::Special => matches!(
+                kind,
+                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
+            ),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DeclaredKind::File => "file",
+            DeclaredKind::Dir => "dir",
+            DeclaredKind::Symlink => "symlink",
+            DeclaredKind::Special => "special",
+        }
+    }
+}
+
+fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
+    use base64::Engine as _;
+    // Unknown keys are rejected so a typo cannot be silently dropped; the
+    // known informational fields (`size`, `mtime`, a tagged path's `display`)
+    // are accepted and ignored so `syq map` output and future automation
+    // records round-trip.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WirePath {
+        encoding: String,
+        value: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        display: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireEntry {
+        src: WirePath,
+        dst: WirePath,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        size: Option<u64>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        mtime: Option<i64>,
+    }
+    let entry: WireEntry = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let decode = |path: WirePath, which: &str| -> Result<PathBytes> {
+        let bytes = match path.encoding.as_str() {
+            "utf-8" => path.value.into_bytes(),
+            "base64" => base64::engine::general_purpose::STANDARD
+                .decode(path.value.as_bytes())
+                .map_err(|e| anyhow::anyhow!("{which}: invalid base64 path: {e}"))?,
+            other => bail!("{which}: unknown path encoding {other:?}"),
+        };
+        validate_manifest_path(&bytes, which)?;
+        Ok(bytes)
+    };
+    let src = decode(entry.src, "src")?;
+    let dst = decode(entry.dst, "dst")?;
+    let kind = match entry.kind.as_deref() {
+        None => None,
+        Some("file") => Some(DeclaredKind::File),
+        Some("dir") => Some(DeclaredKind::Dir),
+        Some("symlink") => Some(DeclaredKind::Symlink),
+        Some("special") => Some(DeclaredKind::Special),
+        Some(other) => bail!("unknown kind {other:?}"),
+    };
+    Ok(ManifestEntry { src, dst, kind })
+}
+
+fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
+    if path.is_empty() {
+        bail!("{which} path is empty");
+    }
+    if path[0] == b'/' {
+        bail!(
+            "{which} path {:?} is absolute; mapping entries are root-relative",
+            String::from_utf8_lossy(path)
+        );
+    }
+    if path.contains(&0) {
+        bail!("{which} path contains NUL");
+    }
+    for component in path.split(|&byte| byte == b'/') {
+        if component.is_empty() || component == b"." || component == b".." {
+            bail!(
+                "{which} path {:?} contains an empty, `.`, or `..` component",
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A destination ancestor directory no manifest entry names: created with
+/// default metadata (mode through the umask, natural mtime; see
+/// `Planner::implicit_dirs`).
+fn implicit_dir_entry(path: PathBytes) -> Entry {
+    Entry {
+        path,
+        kind: Kind::Dir,
+        size: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        dev: 0,
+        ino: 0,
+        ctime: 0,
+        ctime_nsec: 0,
+        link: None,
     }
 }

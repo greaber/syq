@@ -7994,3 +7994,212 @@ fn native_map_refuses_non_utf8_names() {
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(stderr.contains("UTF-8"), "stderr: {stderr}");
 }
+
+// ---- syq cp --mapping ----
+
+fn syq_cp_in(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
+    cmd.arg("cp").args(args).current_dir(dir);
+    match stdin {
+        None => cmd.run().expect("run syq cp"),
+        Some(data) => {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().expect("spawn syq cp");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(data)
+                .expect("write manifest");
+            child.wait_with_output().expect("wait syq cp")
+        }
+    }
+}
+
+fn entry_line(src: &str, dst: &str, kind: Option<&str>) -> String {
+    let kind = kind.map_or(String::new(), |k| format!(",\"kind\":\"{k}\""));
+    format!(
+        "{{\"src\":{{\"encoding\":\"utf-8\",\"value\":\"{src}\"}},\"dst\":{{\"encoding\":\"utf-8\",\"value\":\"{dst}\"}}{kind}}}\n"
+    )
+}
+
+#[test]
+fn native_cp_mapping_renames_creates_ancestors_and_streams_stdin() {
+    let t = Tmp::new();
+    write(&t.path("src/Berlin/IMG.JPG"), b"img");
+    write(&t.path("src/Notes.TXT"), b"hello");
+    write(&t.path("dst/unrelated.txt"), b"keep");
+    let manifest = format!(
+        "{}{}{}",
+        entry_line("Berlin", "berlin", Some("dir")),
+        entry_line("Berlin/IMG.JPG", "berlin/2024/07/img.jpg", Some("file")),
+        entry_line("Notes.TXT", "notes.txt", None),
+    );
+    // Dry run writes nothing.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-n", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.path("dst/berlin").exists());
+    // Real run from stdin: renames, implicit 2024/07 ancestors, keeps extras.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "cp failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("dst/berlin/2024/07/img.jpg")), b"img");
+    assert_eq!(read(&t.path("dst/notes.txt")), b"hello");
+    assert_eq!(read(&t.path("dst/unrelated.txt")), b"keep");
+    // Rerun converges cleanly.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert!(out.status.success());
+}
+
+#[test]
+fn native_cp_mapping_file_manifest_and_base64_src() {
+    let t = Tmp::new();
+    let bad = t
+        .path("src")
+        .join(std::ffi::OsString::from_vec(b"caf\xe9.txt".to_vec()));
+    write(&bad, b"latin1 name");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"caf\xe9.txt");
+    let manifest = format!(
+        "{{\"src\":{{\"encoding\":\"base64\",\"value\":\"{b64}\"}},\"dst\":{{\"encoding\":\"utf-8\",\"value\":\"cafe.txt\"}}}}\n"
+    );
+    write(&t.path("m.ndjson"), manifest.as_bytes());
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "m.ndjson", "-C", "src", "--into", "out", "-q"],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "cp failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("out/cafe.txt")), b"latin1 name");
+}
+
+#[test]
+fn native_cp_mapping_entry_failures_are_partial_not_fatal() {
+    let t = Tmp::new();
+    write(&t.path("src/real.txt"), b"real");
+    fs::create_dir_all(t.path("src/adir")).unwrap();
+    let manifest = format!(
+        "{}{}{}",
+        entry_line("missing.txt", "a.txt", None),
+        entry_line("adir", "b.txt", Some("file")),
+        entry_line("real.txt", "c.txt", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(stderr.contains("not the declared file"), "{stderr}");
+    assert_eq!(read(&t.path("dst/c.txt")), b"real");
+    assert!(!t.path("dst/a.txt").exists());
+    assert!(!t.path("dst/b.txt").exists());
+}
+
+#[test]
+fn native_cp_mapping_hard_refusals() {
+    let t = Tmp::new();
+    write(&t.path("src/x.txt"), b"x");
+    let refuse = |manifest: &str, needle: &str| {
+        let out = syq_cp_in(
+            &t.path(""),
+            &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+            Some(manifest.as_bytes()),
+        );
+        assert!(!out.status.success(), "expected refusal for {manifest:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(stderr.contains(needle), "wanted {needle:?} in: {stderr}");
+    };
+    let dup = format!(
+        "{}{}",
+        entry_line("x.txt", "same", None),
+        entry_line("x.txt", "same", None)
+    );
+    refuse(&dup, "duplicate destination");
+    refuse(
+        "{\"src\":{\"encoding\":\"utf-8\",\"value\":\"x.txt\"},\"dst\":{\"encoding\":\"utf-8\",\"value\":\"../out\"}}\n",
+        "component",
+    );
+    refuse(
+        "{\"src\":{\"encoding\":\"utf-8\",\"value\":\"/etc/passwd\"},\"dst\":{\"encoding\":\"utf-8\",\"value\":\"y\"}}\n",
+        "absolute",
+    );
+    refuse(
+        "{\"src\":{\"encoding\":\"utf-8\",\"value\":\"x.txt\"},\"dst\":{\"encoding\":\"utf-8\",\"value\":\"y\"},\"knd\":\"file\"}\n",
+        "unknown field",
+    );
+    // Parse-level grammar refusals.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "src/x.txt", "--into", "dst"],
+        Some(b""),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("replaces source selectors"));
+    let out = syq_cp_in(&t.path(""), &["--mapping", "-", "--as", "exact"], Some(b""));
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--as conflicts with --mapping"));
+}
+
+#[test]
+fn native_cp_mapping_end_to_end_map_pipeline() {
+    let t = Tmp::new();
+    write(&t.path("src/Berlin/IMG.JPG"), b"img");
+    write(&t.path("src/Notes.TXT"), b"hello");
+    // syq map | (lowercase transform) | syq cp --mapping -
+    let map_out = syq_map_in(&t.path(""), &["--src-src", "src"]);
+    assert!(map_out.status.success());
+    let transformed: String = String::from_utf8(map_out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let lower = v["dst"]["value"].as_str().unwrap().to_lowercase();
+            v["dst"]["value"] = serde_json::Value::String(lower);
+            format!("{v}\n")
+        })
+        .collect();
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "pub", "-q"],
+        Some(transformed.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("pub/berlin/img.jpg")), b"img");
+    assert_eq!(read(&t.path("pub/notes.txt")), b"hello");
+}
