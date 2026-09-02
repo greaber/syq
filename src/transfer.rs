@@ -2038,6 +2038,24 @@ pub fn run(args: Args) -> Result<i32> {
     let created_counts = (st.dirs_created, st.links_created, st.specials_created);
     drop(st);
 
+    // With a command-restricted receiver, ask for its signed receipt now that
+    // every mutation is settled, and hand it to the invoking machine as one
+    // marked line. That machine verifies it; this orchestrator's own report
+    // is not trusted for what landed.
+    if args.restricted_grant.is_some() {
+        use base64::Engine as _;
+        match dst_ctl.call(Request::Receipt) {
+            Ok(Response::Receipt(envelope)) => println!(
+                "{}{}",
+                crate::receipt::RECEIPT_LINE_PREFIX,
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode(envelope)
+            ),
+            Ok(Response::Err(error)) => progress.error(&format!("syq: receipt: {error}")),
+            Ok(other) => progress.error(&format!("syq: receipt: unexpected response {other:?}")),
+            Err(error) => progress.error(&format!("syq: receipt: {error:#}")),
+        }
+    }
+
     progress.stop();
     if let Some(t) = ticker {
         let _ = t.join();

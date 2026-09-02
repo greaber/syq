@@ -100,7 +100,7 @@ struct LocalEnrollment {
     canonical_root: String,
     receiver_path: String,
     /// Absent for enrollments installed before receivers had receipt keys;
-    /// rerunning `syq enroll` refreshes them.
+    /// rerunning `syq enrollment add` refreshes them.
     #[serde(default)]
     receipt_public_key: Option<String>,
 }
@@ -122,10 +122,8 @@ pub(crate) struct PreparedTransfer {
     pub(crate) grant: String,
     pub(crate) enrollment_id: EnrollmentId,
     /// The nonce the grant was signed with; the receipt must name it.
-    #[allow(dead_code)]
     pub(crate) request_id: RequestId,
     /// Verifier for the receipt hostB will issue.
-    #[allow(dead_code)]
     pub(crate) receipt_public_key: String,
 }
 
@@ -315,7 +313,7 @@ impl RestrictedAuthority {
         } = extensions;
         if receipt_policy.required && receipt_key.is_none() {
             bail!(
-                "the grant requires a receipt but this receiver has no receipt key; rerun `syq enroll` to refresh the enrollment"
+                "the grant requires a receipt but this receiver has no receipt key; rerun `syq enrollment add` to refresh the enrollment"
             );
         }
         let enrollment_id = grant.enrollment_id;
@@ -406,7 +404,7 @@ impl RestrictedAuthority {
     /// Sign hostB's account of this grant and close it to further mutation.
     pub(crate) fn issue_receipt(&self) -> Result<Vec<u8>> {
         let key = self.receipt_key.as_ref().context(
-            "this receiver has no receipt key; rerun `syq enroll` to refresh the enrollment",
+            "this receiver has no receipt key; rerun `syq enrollment add` to refresh the enrollment",
         )?;
         // Close the grant first, then wait for every request already
         // authorized on any connection to execute and settle, so the receipt
@@ -3203,7 +3201,7 @@ pub(crate) fn prepare_transfer(
         None => {
             if !allow_enrollment {
                 bail!(
-                    "read-only operations will not install a receiver enrollment; pre-enroll this destination with `syq enroll` or explicitly use --agent-broker-only"
+                    "read-only operations will not install a receiver enrollment; pre-enroll this destination with `syq enrollment add` or explicitly use --agent-broker-only"
                 );
             }
             let jump = endpoint(
@@ -3224,7 +3222,7 @@ pub(crate) fn prepare_transfer(
     let private_key = load_private_key(&directory)?;
     let receipt_public_key = metadata.receipt_public_key.clone().with_context(|| {
         format!(
-            "enrollment {} predates receipts and cannot verify one; rerun `syq enroll {}:{}` to refresh it",
+            "enrollment {} predates receipts and cannot verify one; rerun `syq enrollment add {}:{}` to refresh it",
             metadata.id, host, requested
         )
     })?;
@@ -3351,62 +3349,74 @@ fn management_via(arguments: &[OsString]) -> Result<Option<SshEndpoint>> {
     )?))
 }
 
+const ENROLLMENT_USAGE: &str = "Usage: syq enrollment <COMMAND>\n\nManage command-restricted receiver enrollments.\n\nCommands:\n  add     Enroll a remote destination, or refresh an existing enrollment\n  list    List local enrollments\n  revoke  Remove an enrollment from both machines\n\nRun `syq enrollment <COMMAND> --help` for command-specific help.";
+
+/// `syq enrollment add|list|revoke`: the receiver enrollment system is one
+/// subcommand with its verbs beneath it. `argv[1]` is `enrollment`.
 pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
-    let command = argv.get(1)?.to_str()?;
+    if argv.get(1)?.to_str()? != "enrollment" {
+        return None;
+    }
+    let Some(command) = argv.get(2).and_then(|argument| argument.to_str()) else {
+        eprintln!("{ENROLLMENT_USAGE}");
+        return Some(Ok(2));
+    };
     match command {
-        "enrollments" => {
-            Some((|| {
-                if argv.get(2).is_some_and(|argument| argument == "--help") {
-                    println!("Usage: syq enrollments\n\nList local command-restricted receiver enrollments.");
-                    return Ok(0);
-                }
-                if argv.len() != 2 {
-                    bail!("usage: syq enrollments");
-                }
-                let active = load_local_enrollments()?;
-                let active_ids = active
-                    .iter()
-                    .map(|(metadata, _)| metadata.id)
-                    .collect::<HashSet<_>>();
-                for (metadata, _) in active {
-                    let target = endpoint(&metadata.target_login, &metadata.host, metadata.port)?;
+        "--help" | "-h" => {
+            println!("{ENROLLMENT_USAGE}");
+            Some(Ok(0))
+        }
+        "list" => Some((|| {
+            if argv.get(3).is_some_and(|argument| argument == "--help") {
+                println!("Usage: syq enrollment list\n\nList local command-restricted receiver enrollments.");
+                return Ok(0);
+            }
+            if argv.len() != 3 {
+                bail!("usage: syq enrollment list");
+            }
+            let active = load_local_enrollments()?;
+            let active_ids = active
+                .iter()
+                .map(|(metadata, _)| metadata.id)
+                .collect::<HashSet<_>>();
+            for (metadata, _) in active {
+                let target = endpoint(&metadata.target_login, &metadata.host, metadata.port)?;
+                println!(
+                    "{}\tactive\t{}\t{}\t{}",
+                    metadata.id,
+                    target.label(),
+                    metadata.canonical_root,
+                    if metadata.receipt_public_key.is_some() {
+                        "receipt-key"
+                    } else {
+                        "no-receipt-key"
+                    }
+                );
+            }
+            for (pending, _) in load_pending_enrollments()? {
+                if !active_ids.contains(&pending.id) {
+                    let target = endpoint(&pending.target_login, &pending.host, pending.port)?;
                     println!(
-                        "{}\tactive\t{}\t{}\t{}",
-                        metadata.id,
+                        "{}\tpending\t{}\t{}",
+                        pending.id,
                         target.label(),
-                        metadata.canonical_root,
-                        if metadata.receipt_public_key.is_some() {
-                            "receipt-key"
-                        } else {
-                            "no-receipt-key"
-                        }
+                        pending.requested_destination
                     );
                 }
-                for (pending, _) in load_pending_enrollments()? {
-                    if !active_ids.contains(&pending.id) {
-                        let target = endpoint(&pending.target_login, &pending.host, pending.port)?;
-                        println!(
-                            "{}\tpending\t{}\t{}",
-                            pending.id,
-                            target.label(),
-                            pending.requested_destination
-                        );
-                    }
-                }
-                Ok(0)
-            })())
-        }
-        "enroll" => Some((|| {
-            if argv.get(2).is_some_and(|argument| argument == "--help") {
+            }
+            Ok(0)
+        })()),
+        "add" => Some((|| {
+            if argv.get(3).is_some_and(|argument| argument == "--help") {
                 println!(
-                    "Usage: syq enroll [USER@]HOST:DESTINATION [--via [USER@]HOST]\n\nPre-enroll a command-restricted receiver for DESTINATION's existing parent."
+                    "Usage: syq enrollment add [USER@]HOST:DESTINATION [--via [USER@]HOST]\n\nEnroll a command-restricted receiver for DESTINATION's existing parent, or refresh an existing enrollment's receiver."
                 );
                 return Ok(0);
             }
-            if argv.len() < 3 {
-                bail!("usage: syq enroll [USER@]HOST:DESTINATION [--via [USER@]HOST]");
+            if argv.len() < 4 {
+                bail!("usage: syq enrollment add [USER@]HOST:DESTINATION [--via [USER@]HOST]");
             }
-            let target = argv[2].to_str().context("enrollment target is not UTF-8")?;
+            let target = argv[3].to_str().context("enrollment target is not UTF-8")?;
             let location = Location::parse(target)?;
             let host = location
                 .host
@@ -3414,7 +3424,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                 .context("enrollment target must be remote")?;
             let requested = std::str::from_utf8(&location.path)
                 .context("enrollment destination is not UTF-8")?;
-            let via = management_via(&argv[3..])?;
+            let via = management_via(&argv[4..])?;
             let policy = crate::agent_broker::resolve_host_policy(
                 "ssh",
                 location.user.as_deref(),
@@ -3438,17 +3448,17 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             Ok(0)
         })()),
         "revoke" => Some((|| {
-            if argv.get(2).is_some_and(|argument| argument == "--help") {
+            if argv.get(3).is_some_and(|argument| argument == "--help") {
                 println!(
-                    "Usage: syq revoke ENROLLMENT-ID [--via [USER@]HOST]\n\nRemove the forced key and per-enrollment state from both machines."
+                    "Usage: syq enrollment revoke ENROLLMENT-ID [--via [USER@]HOST]\n\nRemove the forced key and per-enrollment state from both machines."
                 );
                 return Ok(0);
             }
-            if argv.len() < 3 {
-                bail!("usage: syq revoke ENROLLMENT-ID [--via [USER@]HOST]");
+            if argv.len() < 4 {
+                bail!("usage: syq enrollment revoke ENROLLMENT-ID [--via [USER@]HOST]");
             }
-            let id = EnrollmentId::parse(argv[2].to_str().context("enrollment ID is not UTF-8")?)?;
-            let via = management_via(&argv[3..])?;
+            let id = EnrollmentId::parse(argv[3].to_str().context("enrollment ID is not UTF-8")?)?;
+            let via = management_via(&argv[4..])?;
             let active = load_local_enrollments()?
                 .into_iter()
                 .find(|(metadata, _)| metadata.id == id);
@@ -3509,7 +3519,9 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             println!("revoked {id} from {}", target.label());
             Ok(0)
         })()),
-        _ => None,
+        other => Some(Err(anyhow::anyhow!(
+            "unknown enrollment command {other:?}\n{ENROLLMENT_USAGE}"
+        ))),
     }
 }
 

@@ -1081,6 +1081,45 @@ fn native_cp_with_prune_removes_only_target_extras_after_copy() {
 }
 
 #[test]
+fn enrollment_is_one_subcommand_with_its_verbs_beneath_it() {
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .run()
+            .unwrap()
+    };
+    let help = run(&["enrollment", "--help"]);
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    for verb in ["add", "list", "revoke"] {
+        assert!(text.contains(verb), "{text}");
+    }
+    let bare = run(&["enrollment"]);
+    assert_eq!(bare.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("Usage: syq enrollment"));
+    let bogus = run(&["enrollment", "rotate"]);
+    assert!(!bogus.status.success());
+    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown enrollment command"));
+    for verb in ["add", "list", "revoke"] {
+        let verb_help = run(&["enrollment", verb, "--help"]);
+        assert!(verb_help.status.success(), "{verb}");
+        assert!(
+            String::from_utf8_lossy(&verb_help.stdout).contains(&format!("syq enrollment {verb}")),
+            "{verb}"
+        );
+    }
+    // The old top-level spellings are gone.
+    for old in [
+        &["enroll", "host:dst"][..],
+        &["enrollments"],
+        &["revoke", "id"],
+    ] {
+        let out = run(old);
+        assert!(!out.status.success(), "{old:?}");
+    }
+}
+
+#[test]
 fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"data");
