@@ -15,22 +15,12 @@ pub fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-pub fn release() -> String {
-    format!("v{}", env!("CARGO_PKG_VERSION"))
-}
-
-/// Kept so updaters through 0.1.1 can validate newer binaries. It is no longer a
-/// protocol identity and deliberately has a fixed numeric suffix.
-pub fn legacy_helper_id() -> String {
-    format!("{}-p0", release())
-}
-
 pub fn require_release_build() -> Result<()> {
     if is_release_build() {
         return Ok(());
     }
     bail!(
-        "managed remote bootstrap is only available from an official syq release build (this build is {}); install this build on the remote and pass --syq-path, or use an official release",
+        "managed remote bootstrap is only available from an official syq release build (this build is {}); use an official release",
         build()
     )
 }
@@ -53,13 +43,9 @@ mod tests {
     #[test]
     fn development_builds_do_not_claim_the_release_identity() {
         if env!("SYQ_IS_RELEASE_BUILD") == "0" {
-            assert!(build().starts_with(&format!("{}+dev.", release())));
-            assert_ne!(build(), release());
+            let release = format!("v{}", env!("CARGO_PKG_VERSION"));
+            assert!(build().starts_with(&format!("{release}+dev.")));
+            assert_ne!(build(), release);
         }
-    }
-
-    #[test]
-    fn legacy_identity_is_not_a_protocol_version() {
-        assert_eq!(legacy_helper_id(), format!("{}-p0", release()));
     }
 }

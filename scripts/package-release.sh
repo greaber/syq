@@ -62,9 +62,8 @@ jq -n --sort-keys \
   --arg repository 'https://github.com/greaber/syq' \
   --arg version "$version" \
   --arg tag "$tag" \
-  --arg helper_id "$tag-p0" \
   --argjson artifacts "$artifacts" \
-  '{schema:1,repository:$repository,version:$version,tag:$tag,helper_id:$helper_id,artifacts:$artifacts}' \
+  '{schema:1,repository:$repository,version:$version,tag:$tag,artifacts:$artifacts}' \
   > "$manifest_core"
 
 "$script_dir/generate-installer.sh" "$manifest_core" "$dist/install.sh"

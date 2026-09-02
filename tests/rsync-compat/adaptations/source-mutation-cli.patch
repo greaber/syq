@@ -17,7 +17,7 @@ index 572e512..4d5c746 100644
 
  proc = subprocess.run(
 -    rsync_argv('-a', '--no-inc-recursive', '--bwlimit=1500', f'{src}/', f'{dst}/'),
-+    rsync_argv('-a', '-j', '1', '--bwlimit=1500', f'{src}/', f'{dst}/'),
++    rsync_argv('-a', '--syq-connections', '1', '--bwlimit=1500', f'{src}/', f'{dst}/'),
      capture_output=True, text=True)
 
  t.join()
@@ -30,7 +30,7 @@ index 3f2735b..5760e97 100644
      t.start()
      proc = subprocess.run(
 -        rsync_argv(*extra_rsync, '--no-inc-recursive', f'--bwlimit={bwlimit}',
-+        rsync_argv(*extra_rsync, '-j', '1', f'--bwlimit={bwlimit}',
++        rsync_argv(*extra_rsync, '--syq-connections', '1', f'--bwlimit={bwlimit}',
                     f'{src}/', f'{dst}/'),
          capture_output=True, text=True)
      t.join()

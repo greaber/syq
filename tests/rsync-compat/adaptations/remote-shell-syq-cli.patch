@@ -22,7 +22,7 @@ index 89b2814..4f712b6 100644
 +shell = rsh_cmd(None, '--no-cd')
 +dest = f"localhost:{base}/dest\ntouch {sentinel}\n#"
 +subprocess.run(
-+    rsync_argv('-a', '-e', shell, f'--syq-path={rsync_path_arg()}',
++    rsync_argv('-a', '-e', shell, f'--rsync-path={rsync_path_arg()}',
 +               f'{src}/', dest),
 +    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
 +)

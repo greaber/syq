@@ -1030,7 +1030,7 @@ impl RemoteSpec {
 
     /// A shell command that runs syq with `args` on this host.  Automatic mode
     /// addresses the exact release/build-identified helper; explicit mode preserves the
-    /// administrator-provided path; --no-bootstrap uses normal PATH lookup.
+    /// administrator-provided path; disabling bootstrap uses normal PATH lookup.
     pub fn program_command(&self, args: &[String]) -> String {
         if let Some(p) = &self.syq_path {
             return format!("{} {}", shell_words::quote(p), shell_words::join(args));
@@ -1039,13 +1039,6 @@ impl RemoteSpec {
             return remote_helper::launcher(args);
         }
         format!("syq {}", shell_words::join(args))
-    }
-
-    /// Connect, retrying a few times: sshd's MaxStartups (default 10) drops
-    /// connections at random when many are being set up at once, so we also
-    /// limit how many connects are in flight.
-    pub fn connect(&self, compress: bool) -> Result<RemoteConn> {
-        self.connect_with_request(compress, true, None)
     }
 
     /// `limited`: take a connect slot (data connections). The control
@@ -1675,7 +1668,7 @@ impl RemoteSpec {
         }
         self.bootstrap_helper(bootstrap).with_context(|| {
             format!(
-                "could not install the authorized {} helper on {} ({}); install a compatible syq and pass --syq-path",
+                "could not install the authorized {} helper on {} ({})",
                 remote_helper::helper_identity(),
                 self.label(),
                 target.key
@@ -1712,7 +1705,7 @@ impl RemoteSpec {
             .ok_or_else(|| anyhow!("{}: malformed platform response {value:?}", self.label()))?;
         let target = Target::from_uname(os, arch).ok_or_else(|| {
             anyhow!(
-                "{}: automatic remote helpers do not support {os} {arch}; install syq there and pass --syq-path",
+                "{}: automatic remote helpers do not support {os} {arch}",
                 self.label()
             )
         })?;
