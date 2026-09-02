@@ -460,7 +460,8 @@ The command-restricted path requires atomic staged publication and encrypted
 TCP data connections. `--inplace`, `--no-tcp`, `--tcp-plain`,
 `--tcp-congestion`, `--update`, `--existing`, `--ignore-existing`, native
 `--*-new`/`--*-existing`,
-`--ignore`/`--ignore-from`, `--files-from`, `--min-size`, a nonzero
+`--ignore`/`--ignore-from`, `--files-from`, `--mapping`, `--min-size`, a
+nonzero
 `--bwlimit`, `--syq-path`, and `--no-bootstrap` currently fail closed because
 the receiver cannot enforce those semantics independently of hostA.
 `--max-size` is enforced as a signed per-file limit, but is refused together
