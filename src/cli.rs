@@ -8,7 +8,6 @@ pub enum Interface {
     #[default]
     Rsync,
     NativeCp,
-    NativeCpPrune,
     NativeRm,
     NativeMap,
 }
@@ -386,7 +385,6 @@ impl Args {
         match command {
             "rsync" => Self::parse_rsync(&argv[1..]),
             "cp" => parse_native(&argv[1..], Interface::NativeCp),
-            "cp-prune" => parse_native(&argv[1..], Interface::NativeCpPrune),
             "rm" => parse_native(&argv[1..], Interface::NativeRm),
             "map" => parse_native(&argv[1..], Interface::NativeMap),
             "--help" | "-h" => {
@@ -401,7 +399,7 @@ impl Args {
             // remain top-level. Internal helper switches are handled in main.
             "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv),
             _ => bail!(
-                "expected a command (`cp`, `cp-prune`, `rm`, `map`, or `rsync`); rsync-shaped syntax now starts with `syq rsync`"
+                "expected a command (`cp`, `rm`, `map`, or `rsync`); rsync-shaped syntax now starts with `syq rsync`"
             ),
         }
     }
@@ -542,7 +540,7 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects without removing target-only objects\n  cp-prune     Copy, then remove target-only objects in the mapped scope\n  rm           Remove explicitly selected object trees\n  map          Print a copy's resolved selection and placement as NDJSON\n  rsync        Use the retained rsync-shaped command surface\n  enroll       Pre-enroll a command-restricted remote destination\n  enrollments  List local command-restricted enrollments\n  revoke       Revoke a command-restricted enrollment\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a copy's resolved selection and placement as NDJSON\n  rsync        Use the retained rsync-shaped command surface\n  enroll       Pre-enroll a command-restricted remote destination\n  enrollments  List local command-restricted enrollments\n  revoke       Revoke a command-restricted enrollment\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -782,10 +780,10 @@ struct NativeCopyFields {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeSizeSelectionArgs {
-    /// Skip regular source files larger than SIZE; cp-prune protects their destination paths
+    /// Skip regular source files larger than SIZE; --prune protects their destination paths
     #[arg(long, value_name = "SIZE")]
     max_size: Option<String>,
-    /// Skip regular source files smaller than SIZE; cp-prune protects their destination paths
+    /// Skip regular source files smaller than SIZE; --prune protects their destination paths
     #[arg(long, value_name = "SIZE")]
     min_size: Option<String>,
 }
@@ -795,7 +793,7 @@ struct NativeSizeSelectionArgs {
     name = "syq cp",
     version,
     about = "Copy selected objects with explicit endpoint and placement syntax",
-    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files.",
+    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths.",
     override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyCommand {
@@ -803,23 +801,12 @@ struct NativeCopyCommand {
     copy: NativeCopyFields,
     #[command(flatten)]
     size_selection: NativeSizeSelectionArgs,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "syq cp-prune",
-    version,
-    about = "Copy selected objects, then remove target-only objects in mapped scopes",
-    long_about = "Copy selected objects, then remove target-only objects in mapped scopes.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. Removal uses the current post-transfer deletion scopes and guards; ignored paths remain protected.",
-    override_usage = "syq cp-prune [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
-)]
-struct NativeCopyPruneCommand {
-    #[command(flatten)]
-    copy: NativeCopyFields,
-    #[command(flatten)]
-    size_selection: NativeSizeSelectionArgs,
-    /// Refuse all removals if more than N are planned
-    #[arg(long, value_name = "N")]
+    /// After copying, remove target-only objects in mapped directory scopes;
+    /// ignored and size-excluded source paths remain protected
+    #[arg(long, conflicts_with_all = ["mapping", "results"])]
+    prune: bool,
+    /// With --prune, refuse all removals if more than N are planned
+    #[arg(long, value_name = "N", requires = "prune")]
     max_delete: Option<u64>,
 }
 
@@ -852,9 +839,7 @@ struct NativeRmCommand {
 
 fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
     match interface {
-        Interface::NativeCp | Interface::NativeCpPrune | Interface::NativeMap => {
-            parse_native_copy(argv, interface)
-        }
+        Interface::NativeCp | Interface::NativeMap => parse_native_copy(argv, interface),
         Interface::NativeRm => parse_native_rm(argv),
         Interface::Rsync => unreachable!(),
     }
@@ -863,36 +848,32 @@ fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
 fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     let mut full_argv = vec![OsString::from(command_label(interface))];
     full_argv.extend_from_slice(argv);
-    let (mut parsed, matches, max_delete, size_selection) = if interface == Interface::NativeCpPrune
-    {
-        let matches = NativeCopyPruneCommand::command()
-            .try_get_matches_from(full_argv)
-            .unwrap_or_else(|error| error.exit());
-        let parsed = NativeCopyPruneCommand::from_arg_matches(&matches)?;
-        (
-            parsed.copy,
-            matches,
-            parsed.max_delete,
-            parsed.size_selection,
-        )
-    } else if interface == Interface::NativeMap {
-        let matches = NativeMapCommand::command()
-            .try_get_matches_from(full_argv)
-            .unwrap_or_else(|error| error.exit());
-        let parsed = NativeMapCommand::from_arg_matches(&matches)?;
-        (
-            parsed.copy,
-            matches,
-            None,
-            NativeSizeSelectionArgs::default(),
-        )
-    } else {
-        let matches = NativeCopyCommand::command()
-            .try_get_matches_from(full_argv)
-            .unwrap_or_else(|error| error.exit());
-        let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
-        (parsed.copy, matches, None, parsed.size_selection)
-    };
+    let (mut parsed, matches, prune, max_delete, size_selection) =
+        if interface == Interface::NativeMap {
+            let matches = NativeMapCommand::command()
+                .try_get_matches_from(full_argv)
+                .unwrap_or_else(|error| error.exit());
+            let parsed = NativeMapCommand::from_arg_matches(&matches)?;
+            (
+                parsed.copy,
+                matches,
+                false,
+                None,
+                NativeSizeSelectionArgs::default(),
+            )
+        } else {
+            let matches = NativeCopyCommand::command()
+                .try_get_matches_from(full_argv)
+                .unwrap_or_else(|error| error.exit());
+            let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
+            (
+                parsed.copy,
+                matches,
+                parsed.prune,
+                parsed.max_delete,
+                parsed.size_selection,
+            )
+        };
     // `syq map` keeps `-C` out of selector paths so emitted `src` values stay
     // relative to it; the walk joins it back.
     let map_cwd = if interface == Interface::NativeMap {
@@ -909,7 +890,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         bail!("--results is only available on syq cp");
     }
     if parsed.reuse_connection && interface == Interface::NativeMap {
-        bail!("--reuse-connection is only available on syq cp and cp-prune");
+        bail!("--reuse-connection is only available on syq cp");
     }
     if results.is_some() && parsed.operational.common.dry_run {
         // Dry-run trace output is a deliberately deferred automation
@@ -1071,7 +1052,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.placement = placement;
     args.target_existence = existence;
     args.locations = locations;
-    args.delete = interface == Interface::NativeCpPrune;
+    args.delete = prune;
     args.max_delete = max_delete;
     args.max_size = size_selection.max_size;
     args.min_size = size_selection.min_size;
@@ -1345,7 +1326,6 @@ fn command_label(interface: Interface) -> &'static str {
     match interface {
         Interface::Rsync => "syq rsync",
         Interface::NativeCp => "syq cp",
-        Interface::NativeCpPrune => "syq cp-prune",
         Interface::NativeRm => "syq rm",
         Interface::NativeMap => "syq map",
     }
@@ -1797,6 +1777,21 @@ mod tests {
         assert!(args.inplace);
         assert_eq!(args.min_size.as_deref(), Some("1K"));
         assert_eq!(args.max_size.as_deref(), Some("1M"));
+    }
+
+    #[test]
+    fn native_prune_lowers_to_shared_deletion_policy() {
+        let argv = [
+            "--prune",
+            "--max-delete=3",
+            "source",
+            "--into",
+            "destination",
+        ]
+        .map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        assert!(args.delete);
+        assert_eq!(args.max_delete, Some(3));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! End-to-end enrollment and signed restricted-transfer integration.
 
-use crate::cli::{Args, Existence, Interface, Location, Placement};
+use crate::cli::{Args, Existence, Location, Placement};
 use crate::delegation::{
     self, CopyLimitsV1, CopyOperationV1, CopyOptionsV1, CopyPolicyV1, DeletionPolicyV1,
     DestinationPlacementV1, ExistingDestinationPolicyV1, FilterPolicyV3, GrantExtensions,
@@ -2554,11 +2554,7 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
             "--inplace cannot be combined with --ignore-existing, --existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
-    if !args.dry_run
-        && !args.verify_only
-        && (args.delete || args.interface == Interface::NativeCpPrune)
-        && args.max_delete.is_none()
-    {
+    if !args.dry_run && !args.verify_only && args.delete && args.max_delete.is_none() {
         // The signed deletion count is the only bound on what a compromised
         // hostA can remove inside the scope, so make it an explicit choice
         // instead of a silent hundred-million default.
@@ -2615,11 +2611,7 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
             "--reuse-connection is not available with the command-restricted receiver: its host-bound authentication is verified per fresh connection"
         );
     }
-    if !args.dry_run
-        && !args.verify_only
-        && (args.delete || args.interface == Interface::NativeCpPrune)
-        && args.max_size.is_some()
-    {
+    if !args.dry_run && !args.verify_only && args.delete && args.max_size.is_some() {
         bail!(
             "--max-size with deletion is not yet independently enforceable by the command-restricted receiver"
         );
@@ -2649,10 +2641,7 @@ fn grant_for(
     let read_only = args.dry_run || args.verify_only;
     // `--max-delete 0` means nothing may be deleted, which the grant states
     // directly as a forbidding policy rather than a zero budget.
-    let deletion = if !read_only
-        && (args.delete || args.interface == Interface::NativeCpPrune)
-        && args.max_delete != Some(0)
-    {
+    let deletion = if !read_only && args.delete && args.max_delete != Some(0) {
         DeletionPolicyV1::DeleteDestinationOnly
     } else {
         DeletionPolicyV1::Forbid
