@@ -55,13 +55,15 @@ const WIRE_MAGIC: &[u8; 8] = b"SYQGRNT\0";
 // V1's typed GrantV1 body is frozen. V2 wraps that body with a signed
 // receiver-side file-data rate ceiling. V3 additionally binds source-selection
 // filters and their deletion policy so a remote source coordinator cannot
-// mutate a path the invoking machine excluded. Receivers retain V1/V2 decoding.
-// The SSHSIG namespace remains stable because the signed wire version already
-// separates the payloads and existing enrollment policies authorize this
-// protocol family by that namespace.
+// mutate a path the invoking machine excluded. V4 adds the placement root's
+// signed existence precondition (`--into-new`, `--as-existing`, and friends).
+// Receivers retain V1/V2/V3 decoding. The SSHSIG namespace remains stable
+// because the signed wire version already separates the payloads and existing
+// enrollment policies authorize this protocol family by that namespace.
 const WIRE_VERSION_V1: u16 = 1;
 const WIRE_VERSION_V2: u16 = 2;
-const WIRE_VERSION: u16 = 3;
+const WIRE_VERSION_V3: u16 = 3;
+const WIRE_VERSION: u16 = 4;
 const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 2 + 4 + 4;
 const MAX_GRANT_BYTES: usize = 32 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
@@ -390,11 +392,35 @@ struct GrantBodyV3 {
     filters: FilterPolicyV3,
 }
 
+/// Signed precondition on the placement root itself. The receiver checks it
+/// once against the enrolled root when the grant is claimed, and `New`
+/// additionally forces no-replace creation of that root, so a remote source
+/// coordinator cannot turn `--into-new` into an update of an existing tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RootExistenceV4 {
+    #[default]
+    Any,
+    /// The signed destination must not exist when the grant is claimed.
+    New,
+    /// The signed destination must already exist when the grant is claimed;
+    /// a directory placement additionally requires a directory.
+    Existing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct GrantBodyV4 {
+    grant: GrantV1,
+    max_file_data_bytes_per_second: u64,
+    filters: FilterPolicyV3,
+    root_existence: RootExistenceV4,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SignedGrantEnvelope {
     pub grant: GrantV1,
     pub max_file_data_bytes_per_second: u64,
     pub filters: FilterPolicyV3,
+    pub root_existence: RootExistenceV4,
     /// Canonical OpenSSH armored SSHSIG bytes.
     pub signature: Vec<u8>,
     wire_version: u16,
@@ -407,6 +433,7 @@ impl SignedGrantEnvelope {
             grant,
             max_file_data_bytes_per_second,
             filters: FilterPolicyV3::default(),
+            root_existence: RootExistenceV4::Any,
             signature,
             wire_version: WIRE_VERSION,
         }
@@ -420,6 +447,7 @@ impl SignedGrantEnvelope {
             &self.grant,
             self.max_file_data_bytes_per_second,
             &self.filters,
+            self.root_existence,
         )?;
         if body.len() > MAX_GRANT_BYTES {
             bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
@@ -445,7 +473,10 @@ impl SignedGrantEnvelope {
             bail!("not a SYQ signed grant envelope");
         }
         let version = u16::from_be_bytes(bytes[8..10].try_into().expect("fixed header"));
-        if !matches!(version, WIRE_VERSION_V1 | WIRE_VERSION_V2 | WIRE_VERSION) {
+        if !matches!(
+            version,
+            WIRE_VERSION_V1 | WIRE_VERSION_V2 | WIRE_VERSION_V3 | WIRE_VERSION
+        ) {
             bail!("unsupported signed grant envelope version {version}");
         }
         let grant_len =
@@ -466,11 +497,11 @@ impl SignedGrantEnvelope {
             bail!("signed grant envelope length is noncanonical");
         }
         let body_bytes = &bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + grant_len];
-        let (grant, max_file_data_bytes_per_second, filters) = match version {
+        let (grant, max_file_data_bytes_per_second, filters, root_existence) = match version {
             WIRE_VERSION_V1 => {
                 let grant: GrantV1 =
                     postcard::from_bytes(body_bytes).context("decode signed grant")?;
-                (grant, 0, FilterPolicyV3::default())
+                (grant, 0, FilterPolicyV3::default(), RootExistenceV4::Any)
             }
             WIRE_VERSION_V2 => {
                 let body: GrantBodyV2 =
@@ -479,21 +510,38 @@ impl SignedGrantEnvelope {
                     body.grant,
                     body.max_file_data_bytes_per_second,
                     FilterPolicyV3::default(),
+                    RootExistenceV4::Any,
                 )
             }
-            WIRE_VERSION => {
+            WIRE_VERSION_V3 => {
                 let body: GrantBodyV3 =
                     postcard::from_bytes(body_bytes).context("decode signed grant")?;
                 (
                     body.grant,
                     body.max_file_data_bytes_per_second,
                     body.filters,
+                    RootExistenceV4::Any,
+                )
+            }
+            WIRE_VERSION => {
+                let body: GrantBodyV4 =
+                    postcard::from_bytes(body_bytes).context("decode signed grant")?;
+                (
+                    body.grant,
+                    body.max_file_data_bytes_per_second,
+                    body.filters,
+                    body.root_existence,
                 )
             }
             _ => unreachable!(),
         };
-        if canonical_body_bytes(version, &grant, max_file_data_bytes_per_second, &filters)?
-            != body_bytes
+        if canonical_body_bytes(
+            version,
+            &grant,
+            max_file_data_bytes_per_second,
+            &filters,
+            root_existence,
+        )? != body_bytes
         {
             bail!("signed grant uses a noncanonical encoding");
         }
@@ -505,6 +553,7 @@ impl SignedGrantEnvelope {
             grant,
             max_file_data_bytes_per_second,
             filters,
+            root_existence,
             signature,
             wire_version: version,
         })
@@ -516,6 +565,7 @@ impl SignedGrantEnvelope {
             &self.grant,
             self.max_file_data_bytes_per_second,
             &self.filters,
+            self.root_existence,
         )
     }
 }
@@ -524,6 +574,7 @@ pub(crate) fn sign_grant(
     grant: GrantV1,
     max_file_data_bytes_per_second: u64,
     mut filters: FilterPolicyV3,
+    root_existence: RootExistenceV4,
     private_key: &PrivateKey,
 ) -> Result<Vec<u8>> {
     if private_key.is_encrypted() {
@@ -541,8 +592,10 @@ pub(crate) fn sign_grant(
     filters.validate(&grant)?;
     // Keep emitting the oldest form capable of representing the request so
     // ordinary transfers remain usable with existing receiver enrollments.
-    let wire_version = if filters.is_active() {
+    let wire_version = if root_existence != RootExistenceV4::Any {
         WIRE_VERSION
+    } else if filters.is_active() {
+        WIRE_VERSION_V3
     } else if max_file_data_bytes_per_second == 0 {
         WIRE_VERSION_V1
     } else {
@@ -553,6 +606,7 @@ pub(crate) fn sign_grant(
         &grant,
         max_file_data_bytes_per_second,
         &filters,
+        root_existence,
     )?;
     let signature = private_key
         .sign(SSHSIG_NAMESPACE, HashAlg::Sha256, &payload)
@@ -564,6 +618,7 @@ pub(crate) fn sign_grant(
         grant,
         max_file_data_bytes_per_second,
         filters,
+        root_existence,
         signature,
         wire_version,
     }
@@ -577,6 +632,7 @@ fn signing_payload(grant: &GrantV1, max_file_data_bytes_per_second: u64) -> Resu
         grant,
         max_file_data_bytes_per_second,
         &FilterPolicyV3::default(),
+        RootExistenceV4::Any,
     )
 }
 
@@ -585,10 +641,17 @@ fn signing_payload_for_version(
     grant: &GrantV1,
     max_file_data_bytes_per_second: u64,
     filters: &FilterPolicyV3,
+    root_existence: RootExistenceV4,
 ) -> Result<Vec<u8>> {
     grant.validate_static()?;
     filters.validate(grant)?;
-    let body = canonical_body_bytes(wire_version, grant, max_file_data_bytes_per_second, filters)?;
+    let body = canonical_body_bytes(
+        wire_version,
+        grant,
+        max_file_data_bytes_per_second,
+        filters,
+        root_existence,
+    )?;
     if body.len() > MAX_GRANT_BYTES {
         bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
     }
@@ -605,17 +668,19 @@ fn canonical_body_bytes(
     grant: &GrantV1,
     max_file_data_bytes_per_second: u64,
     filters: &FilterPolicyV3,
+    root_existence: RootExistenceV4,
 ) -> Result<Vec<u8>> {
+    let root_constrained = root_existence != RootExistenceV4::Any;
     match wire_version {
         WIRE_VERSION_V1 => {
-            if max_file_data_bytes_per_second != 0 || filters.is_active() {
+            if max_file_data_bytes_per_second != 0 || filters.is_active() || root_constrained {
                 bail!("version-one grants cannot carry signed extensions");
             }
             canonical_grant_bytes(grant)
         }
         WIRE_VERSION_V2 => {
-            if filters.is_active() {
-                bail!("version-two grants cannot carry filter policy");
+            if filters.is_active() || root_constrained {
+                bail!("version-two grants cannot carry filter or root-existence policy");
             }
             postcard::to_stdvec(&GrantBodyV2 {
                 grant: grant.clone(),
@@ -623,10 +688,22 @@ fn canonical_body_bytes(
             })
             .context("encode canonical signed grant")
         }
-        WIRE_VERSION => postcard::to_stdvec(&GrantBodyV3 {
+        WIRE_VERSION_V3 => {
+            if root_constrained {
+                bail!("version-three grants cannot carry root-existence policy");
+            }
+            postcard::to_stdvec(&GrantBodyV3 {
+                grant: grant.clone(),
+                max_file_data_bytes_per_second,
+                filters: filters.clone(),
+            })
+            .context("encode canonical signed grant")
+        }
+        WIRE_VERSION => postcard::to_stdvec(&GrantBodyV4 {
             grant: grant.clone(),
             max_file_data_bytes_per_second,
             filters: filters.clone(),
+            root_existence,
         })
         .context("encode canonical signed grant"),
         _ => bail!("unsupported signed grant envelope version {wire_version}"),
@@ -1045,7 +1122,15 @@ pub(crate) struct VerifiedGrant {
     grant: GrantV1,
     max_file_data_bytes_per_second: u64,
     filters: FilterPolicyV3,
+    root_existence: RootExistenceV4,
     execution_deadline: Instant,
+}
+
+/// The signed extensions a verified grant carries beyond its frozen V1 body.
+pub(crate) struct GrantExtensions {
+    pub max_file_data_bytes_per_second: u64,
+    pub filters: FilterPolicyV3,
+    pub root_existence: RootExistenceV4,
 }
 
 impl VerifiedGrant {
@@ -1054,11 +1139,14 @@ impl VerifiedGrant {
         self.execution_deadline
     }
 
-    pub(crate) fn into_parts(self) -> (GrantV1, u64, FilterPolicyV3, Instant) {
+    pub(crate) fn into_parts(self) -> (GrantV1, GrantExtensions, Instant) {
         (
             self.grant,
-            self.max_file_data_bytes_per_second,
-            self.filters,
+            GrantExtensions {
+                max_file_data_bytes_per_second: self.max_file_data_bytes_per_second,
+                filters: self.filters,
+                root_existence: self.root_existence,
+            },
             self.execution_deadline,
         )
     }
@@ -1096,6 +1184,7 @@ pub(crate) fn verify_and_claim(
         grant: envelope.grant,
         max_file_data_bytes_per_second: envelope.max_file_data_bytes_per_second,
         filters: envelope.filters,
+        root_existence: envelope.root_existence,
         execution_deadline,
     })
 }
@@ -2157,6 +2246,7 @@ mod tests {
             grant,
             max_file_data_bytes_per_second,
             &FilterPolicyV3::default(),
+            RootExistenceV4::Any,
         )
         .expect("encode test grant");
         let mut out = Vec::new();
@@ -2183,6 +2273,7 @@ mod tests {
             &legacy_grant,
             0,
             &FilterPolicyV3::default(),
+            RootExistenceV4::Any,
         )
         .expect("make legacy signing payload");
         let legacy_signature = sign(&legacy_payload, &fixture.key, SSHSIG_NAMESPACE, None);
@@ -2190,6 +2281,7 @@ mod tests {
             grant: legacy_grant.clone(),
             max_file_data_bytes_per_second: 0,
             filters: FilterPolicyV3::default(),
+            root_existence: RootExistenceV4::Any,
             signature: legacy_signature,
             wire_version: WIRE_VERSION_V1,
         }
@@ -2206,7 +2298,7 @@ mod tests {
             &fixture.replay("version-one-compatibility-replay"),
         )
         .expect("verify version-one grant");
-        assert_eq!(verified.into_parts().1, 0);
+        assert_eq!(verified.into_parts().1.max_file_data_bytes_per_second, 0);
 
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -2240,8 +2332,14 @@ mod tests {
         let public = private.public_key().to_openssh().unwrap();
         fs::write(&fixture.allowed_signers, format!("{SIGNER} {public}\n")).unwrap();
         let replay = fixture.replay("in-process-signature-replay");
-        let encoded =
-            sign_grant(fixture_grant(44), 0, FilterPolicyV3::default(), &private).unwrap();
+        let encoded = sign_grant(
+            fixture_grant(44),
+            0,
+            FilterPolicyV3::default(),
+            RootExistenceV4::Any,
+            &private,
+        )
+        .unwrap();
         assert_eq!(
             SignedGrantEnvelope::decode(&encoded).unwrap().wire_version,
             WIRE_VERSION_V1
@@ -2254,8 +2352,14 @@ mod tests {
         )
         .expect("OpenSSH must accept the in-process SSHSIG");
 
-        let rate_limited =
-            sign_grant(fixture_grant(45), 4096, FilterPolicyV3::default(), &private).unwrap();
+        let rate_limited = sign_grant(
+            fixture_grant(45),
+            4096,
+            FilterPolicyV3::default(),
+            RootExistenceV4::Any,
+            &private,
+        )
+        .unwrap();
         let decoded = SignedGrantEnvelope::decode(&rate_limited).unwrap();
         assert_eq!(decoded.wire_version, WIRE_VERSION_V2);
         assert_eq!(decoded.max_file_data_bytes_per_second, 4096);
@@ -2272,10 +2376,18 @@ mod tests {
             destination_roots: vec![b"/srv/archive/project".to_vec()],
             delete_excluded: false,
         };
-        let filtered = sign_grant(fixture_grant(46), 0, filters.clone(), &private).unwrap();
+        let filtered = sign_grant(
+            fixture_grant(46),
+            0,
+            filters.clone(),
+            RootExistenceV4::Any,
+            &private,
+        )
+        .unwrap();
         let decoded = SignedGrantEnvelope::decode(&filtered).unwrap();
-        assert_eq!(decoded.wire_version, WIRE_VERSION);
+        assert_eq!(decoded.wire_version, WIRE_VERSION_V3);
         assert_eq!(decoded.filters, filters);
+        assert_eq!(decoded.root_existence, RootExistenceV4::Any);
         let verified = verify_and_claim(
             &filtered,
             &context(SIGNER, TARGET, NOW, 0),
@@ -2283,14 +2395,51 @@ mod tests {
             &fixture.replay("in-process-filter-signature-replay"),
         )
         .expect("OpenSSH must accept the signed filter extension");
-        assert_eq!(verified.into_parts().2, filters);
+        assert_eq!(verified.into_parts().1.filters, filters);
 
         let outside = FilterPolicyV3 {
             ignore: vec!["*.tmp".into()],
             destination_roots: vec![b"/srv/outside".to_vec()],
             delete_excluded: false,
         };
-        assert!(sign_grant(fixture_grant(47), 0, outside, &private).is_err());
+        assert!(sign_grant(
+            fixture_grant(47),
+            0,
+            outside,
+            RootExistenceV4::Any,
+            &private
+        )
+        .is_err());
+
+        // A root-existence precondition needs the V4 body, even without the
+        // other extensions, and survives verification unchanged.
+        let rooted = sign_grant(
+            fixture_grant(48),
+            0,
+            FilterPolicyV3::default(),
+            RootExistenceV4::New,
+            &private,
+        )
+        .unwrap();
+        let decoded = SignedGrantEnvelope::decode(&rooted).unwrap();
+        assert_eq!(decoded.wire_version, WIRE_VERSION);
+        assert_eq!(decoded.root_existence, RootExistenceV4::New);
+        let verified = verify_and_claim(
+            &rooted,
+            &context(SIGNER, TARGET, NOW, 0),
+            &fixture.policy(),
+            &fixture.replay("in-process-root-existence-signature-replay"),
+        )
+        .expect("OpenSSH must accept the signed root-existence extension");
+        assert_eq!(verified.into_parts().1.root_existence, RootExistenceV4::New);
+        assert!(canonical_body_bytes(
+            WIRE_VERSION_V3,
+            &fixture_grant(49),
+            0,
+            &FilterPolicyV3::default(),
+            RootExistenceV4::Existing,
+        )
+        .is_err());
     }
 
     #[test]
@@ -2331,9 +2480,14 @@ mod tests {
             transcript.extend_from_slice(&(label.len() as u32).to_be_bytes());
             transcript.extend_from_slice(label.as_bytes());
             transcript.push(operation_tag);
-            let payload =
-                signing_payload_for_version(WIRE_VERSION_V1, grant, 0, &FilterPolicyV3::default())
-                    .expect("encode version-one signing payload");
+            let payload = signing_payload_for_version(
+                WIRE_VERSION_V1,
+                grant,
+                0,
+                &FilterPolicyV3::default(),
+                RootExistenceV4::Any,
+            )
+            .expect("encode version-one signing payload");
             transcript.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             transcript.extend_from_slice(&payload);
         }

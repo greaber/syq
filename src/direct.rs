@@ -263,13 +263,10 @@ pub fn run(
             destination_policy.port(),
             &destination_policy.host_key_algorithms(),
         ));
-        // Native new/existing forms are deliberately only ordinary initial
-        // pathname checks. The command-restricted receiver cannot currently
-        // represent that lightweight policy, so retain the live constrained
-        // broker without preparing a receiver grant for those forms.
-        let receiver_grant_allowed =
-            args.interface == Interface::Rsync || args.target_existence == Existence::Any;
-        let prepared = (!args.agent_broker_only && receiver_grant_allowed)
+        // Native new/existing placement forms travel in the signed grant as the
+        // root-existence precondition, so they use the receiver like any other
+        // form instead of silently keeping only the constrained broker.
+        let prepared = (!args.agent_broker_only)
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,

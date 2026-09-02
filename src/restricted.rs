@@ -3,8 +3,8 @@
 use crate::cli::{Args, Existence, Interface, Location, Placement};
 use crate::delegation::{
     self, CopyLimitsV1, CopyOperationV1, CopyOptionsV1, CopyPolicyV1, DeletionPolicyV1,
-    DestinationPlacementV1, ExistingDestinationPolicyV1, FilterPolicyV3, GrantOperationV1, GrantV1,
-    MutationScopeV1, PublicationPolicyV1, RequestId,
+    DestinationPlacementV1, ExistingDestinationPolicyV1, FilterPolicyV3, GrantExtensions,
+    GrantOperationV1, GrantV1, MutationScopeV1, PublicationPolicyV1, RequestId, RootExistenceV4,
 };
 use crate::enrollment::{
     self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentRoute, SshEndpoint,
@@ -114,6 +114,14 @@ pub(crate) struct PreparedTransfer {
 struct AuthorityState {
     paths: HashSet<Vec<u8>>,
     receiver_modes: HashMap<Vec<u8>, ReceiverModeState>,
+    /// Objects this grant created and the executor confirmed. The
+    /// existing-object policy is about what existed before the transfer, so
+    /// later operations on these are the transfer's own business.
+    created: HashSet<Vec<u8>>,
+    /// Creations authorized but not yet confirmed or rolled back. They never
+    /// grant the shortcut above: a second creation of the same path races at
+    /// the kernel instead of trusting an outcome that has not happened yet.
+    provisional: HashSet<Vec<u8>>,
     transferred_bytes: u64,
     deletions: u64,
     live_connections: u16,
@@ -243,6 +251,7 @@ pub(crate) struct RestrictedAuthority {
     filters: FilterPolicyV3,
     filter_matcher: Option<ignore::gitignore::Gitignore>,
     filter_roots: Vec<Vec<u8>>,
+    root_existence: RootExistenceV4,
     file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
     receiver_umask: u32,
     deadline: Instant,
@@ -254,11 +263,30 @@ impl RestrictedAuthority {
     fn new(
         config: &ReceiverEnrollment,
         grant: GrantV1,
-        max_file_data_bytes_per_second: u64,
-        filters: FilterPolicyV3,
+        extensions: GrantExtensions,
         deadline: Instant,
     ) -> Result<Self> {
+        let GrantExtensions {
+            max_file_data_bytes_per_second,
+            filters,
+            root_existence,
+        } = extensions;
         let GrantOperationV1::Copy(copy) = grant.operation;
+        if copy.policy.existing == ExistingDestinationPolicyV1::UpdateIfOlder {
+            // The comparison depends on a source mtime only the remote
+            // coordinator reports, so the receiver cannot enforce it.
+            bail!("update-if-older existing-object policy is not enforceable by the receiver");
+        }
+        if copy.policy.publication == PublicationPolicyV1::InPlace
+            && (copy.policy.existing != ExistingDestinationPolicyV1::Replace
+                || (root_existence == RootExistenceV4::New
+                    && copy.policy.placement == DestinationPlacementV1::ExactPath))
+        {
+            // In-place preparation opens, creates, or replaces the final
+            // pathname with no condition to attach, so it can neither retain
+            // a pre-existing object nor be pinned to one.
+            bail!("in-place publication cannot honor a signed existing-object policy");
+        }
         let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
         let filter_roots = filters.destination_roots.clone();
         let root_path = Path::new(&config.root);
@@ -284,7 +312,7 @@ impl RestrictedAuthority {
         let receiver_umask = read_process_umask();
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
-        Ok(Self {
+        let authority = Self {
             guard: ContainerGuard {
                 root: config.root.as_bytes().to_vec(),
                 dev: config.root_dev,
@@ -295,6 +323,7 @@ impl RestrictedAuthority {
             filters,
             filter_matcher,
             filter_roots,
+            root_existence,
             file_data_limit,
             receiver_umask,
             deadline,
@@ -302,12 +331,43 @@ impl RestrictedAuthority {
             state: Mutex::new(AuthorityState {
                 paths: HashSet::new(),
                 receiver_modes: HashMap::new(),
+                created: HashSet::new(),
+                provisional: HashSet::new(),
                 transferred_bytes: 0,
                 deletions: 0,
                 live_connections: 0,
                 tcp_listener_started: false,
             }),
-        })
+        };
+        authority.check_root_existence()?;
+        Ok(authority)
+    }
+
+    /// Check the signed placement-root precondition once, against the
+    /// enrolled root, before any request is served. `New` is then kept true
+    /// by `constrain_creation`, which forces no-replace creation of the root.
+    fn check_root_existence(&self) -> Result<()> {
+        let observed = self.rooted_metadata(&self.destination)?;
+        let destination = String::from_utf8_lossy(&self.destination);
+        match (self.root_existence, observed) {
+            (RootExistenceV4::Any, _) => Ok(()),
+            (RootExistenceV4::New, Some(_)) => bail!(
+                "signed destination {destination} already exists, but the grant requires a new path"
+            ),
+            (RootExistenceV4::New, None) => Ok(()),
+            (RootExistenceV4::Existing, None) => bail!(
+                "signed destination {destination} does not exist, but the grant requires an existing path"
+            ),
+            (RootExistenceV4::Existing, Some(metadata))
+                if self.copy.policy.placement != DestinationPlacementV1::ExactPath
+                    && !metadata.is_dir() =>
+            {
+                bail!(
+                    "signed destination {destination} is not a directory, but the grant places names inside it"
+                )
+            }
+            (RootExistenceV4::Existing, Some(_)) => Ok(()),
+        }
     }
 
     pub(crate) fn validate_hello(&self, compressed: bool) -> Result<()> {
@@ -452,6 +512,256 @@ impl RestrictedAuthority {
             bail!("receiver mutation targets a path excluded by the signed filter policy");
         }
         self.record_path(path)
+    }
+
+    fn created_by_this_grant(&self, path: &[u8]) -> bool {
+        self.state.lock().unwrap().created.contains(path)
+    }
+
+    /// Confirm or forget the provisional creations of an executed request.
+    /// Only a confirmed creation becomes this grant's own; a failed one is
+    /// dropped so the path cannot later be replaced as if it were.
+    /// `response` is the executor's answer to the authorized request.
+    pub(crate) fn settle(&self, settlement: Settlement, response: &proto::Response) {
+        if settlement.0.is_empty() {
+            return;
+        }
+        let failed = |index: usize| match response {
+            proto::Response::Err(_) => true,
+            proto::Response::Applied(results) => results.get(index).is_some_and(Option::is_some),
+            _ => false,
+        };
+        let mut state = self.state.lock().unwrap();
+        for creation in settlement.0 {
+            state.provisional.remove(&creation.path);
+            if creation.persist && !failed(creation.index) {
+                state.created.insert(creation.path);
+            }
+        }
+    }
+
+    fn forget_provisional(&self, pending: &[PendingCreation]) {
+        let mut state = self.state.lock().unwrap();
+        for creation in pending {
+            state.provisional.remove(&creation.path);
+        }
+    }
+
+    /// Bind an operation that creates or replaces the object at `path` to the
+    /// signed existing-object policy. `Skip` retains whatever existed before
+    /// the transfer, so creation is forced to be no-replace; `MustExist`
+    /// creates nothing, so something must already be there and the mutation
+    /// is pinned to that object's identity. `directory` marks a directory
+    /// creation, which may reuse an existing directory under `Skip` exactly
+    /// as the ordinary engine keeps recursing into it. A root the grant
+    /// requires to be new is forced to no-replace creation under every
+    /// policy, as a directory whenever the placement puts names inside it.
+    /// A creation this call records is provisional until `settle` sees the
+    /// executor succeed; `index` and `pending` carry that bookkeeping.
+    fn constrain_creation(
+        &self,
+        path: &[u8],
+        condition: &mut proto::TargetCondition,
+        directory: bool,
+        index: usize,
+        pending: &mut Vec<PendingCreation>,
+    ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        let policy = self.copy.policy.existing;
+        let root_must_be_new =
+            self.root_existence == RootExistenceV4::New && path == self.destination;
+        let label = String::from_utf8_lossy(path);
+        if root_must_be_new
+            && !directory
+            && self.copy.policy.placement != DestinationPlacementV1::ExactPath
+        {
+            bail!(
+                "signed placement puts names inside {label}, so it must be created as a directory"
+            );
+        }
+        if self.created_by_this_grant(path)
+            || (policy == ExistingDestinationPolicyV1::Replace && !root_must_be_new)
+        {
+            return Ok(());
+        }
+        let observed = self.rooted_metadata(path)?;
+        match policy {
+            ExistingDestinationPolicyV1::MustExist => {
+                let metadata = match observed {
+                    Some(metadata) if !directory || metadata.is_dir() => metadata,
+                    Some(_) => {
+                        bail!("signed grant creates nothing: {label} exists but is not a directory")
+                    }
+                    None => bail!("signed grant creates nothing: {label} does not exist"),
+                };
+                // Pin the mutation to what was observed: a signed deletion on
+                // another connection could otherwise empty the path between
+                // this check and execution, turning an update into a creation.
+                // A caller-supplied identity is accepted only when it names
+                // the observed object, never on its own authority.
+                match *condition {
+                    Any => {
+                        *condition = Matches {
+                            dev: metadata.dev,
+                            ino: metadata.ino,
+                        }
+                    }
+                    Absent => bail!(
+                        "no-replace creation of {label} contradicts the signed existing-object policy"
+                    ),
+                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
+                    MatchesFingerprint {
+                        dev,
+                        ino,
+                        ctime,
+                        ctime_nsec,
+                    } if (dev, ino, ctime, ctime_nsec)
+                        == (
+                            metadata.dev,
+                            metadata.ino,
+                            metadata.ctime,
+                            metadata.ctime_nsec,
+                        ) => {}
+                    Matches { .. } | MatchesFingerprint { .. } => bail!(
+                        "requested identity for {label} does not match the object the receiver observed"
+                    ),
+                }
+                if !directory {
+                    // Metadata later in this same batch lands on the new
+                    // inode, not the one it replaces, so it must not be
+                    // pinned to the old identity. The replacement is never
+                    // remembered beyond this request: a later request must
+                    // again observe and pin whatever is there, or a chain of
+                    // replacements could change the object's type.
+                    pending.push(PendingCreation {
+                        index,
+                        path: path.to_vec(),
+                        persist: false,
+                    });
+                }
+                Ok(())
+            }
+            ExistingDestinationPolicyV1::Skip | ExistingDestinationPolicyV1::Replace => {
+                match observed {
+                    Some(metadata)
+                        if directory
+                            && metadata.is_dir()
+                            && policy == ExistingDestinationPolicyV1::Skip =>
+                    {
+                        return Ok(());
+                    }
+                    Some(_) => {
+                        bail!("signed grant retains existing objects: {label} already exists")
+                    }
+                    None => {}
+                }
+                match *condition {
+                    Any | Absent => *condition = Absent,
+                    Matches { .. } | MatchesFingerprint { .. } => bail!(
+                        "replacement of {label} contradicts the signed existing-object policy"
+                    ),
+                }
+                self.state.lock().unwrap().provisional.insert(path.to_vec());
+                pending.push(PendingCreation {
+                    index,
+                    path: path.to_vec(),
+                    persist: true,
+                });
+                Ok(())
+            }
+            ExistingDestinationPolicyV1::UpdateIfOlder => {
+                bail!("update-if-older existing-object policy is not enforceable by the receiver")
+            }
+        }
+    }
+
+    /// Bind an operation that modifies an existing non-directory object at
+    /// `path` (metadata, replacement bases, in-place content) to the signed
+    /// existing-object policy. Only `Skip` forbids these, and only for objects
+    /// that predate the transfer; directories are kept and may still receive
+    /// metadata, as in the ordinary engine.
+    fn constrain_update(
+        &self,
+        path: &[u8],
+        is_dir: bool,
+        condition: Option<&mut proto::TargetCondition>,
+        pending: &[PendingCreation],
+    ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        let label = String::from_utf8_lossy(path);
+        // A creation earlier in this same request (a symlink followed by its
+        // metadata, say) counts: the batch executes in order, so the
+        // metadata only ever lands on this request's own creation.
+        let own = self.created_by_this_grant(path)
+            || pending.iter().any(|creation| creation.path == path);
+        match self.copy.policy.existing {
+            ExistingDestinationPolicyV1::Skip if is_dir || own => Ok(()),
+            ExistingDestinationPolicyV1::Skip => {
+                bail!("signed grant retains existing objects: {label} may not be modified")
+            }
+            ExistingDestinationPolicyV1::MustExist if own => Ok(()),
+            ExistingDestinationPolicyV1::MustExist => {
+                // Updates are pinned to the observed object, like
+                // publications: nothing hostA supplies names an inode on its
+                // own authority.
+                let Some(metadata) = self.rooted_metadata(path)? else {
+                    bail!("signed grant creates nothing: {label} does not exist")
+                };
+                let Some(condition) = condition else {
+                    return Ok(());
+                };
+                match *condition {
+                    Any => {
+                        *condition = Matches {
+                            dev: metadata.dev,
+                            ino: metadata.ino,
+                        }
+                    }
+                    Absent => bail!(
+                        "no-replace update of {label} contradicts the signed existing-object policy"
+                    ),
+                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
+                    MatchesFingerprint {
+                        dev,
+                        ino,
+                        ctime,
+                        ctime_nsec,
+                    } if (dev, ino, ctime, ctime_nsec)
+                        == (
+                            metadata.dev,
+                            metadata.ino,
+                            metadata.ctime,
+                            metadata.ctime_nsec,
+                        ) => {}
+                    Matches { .. } | MatchesFingerprint { .. } => bail!(
+                        "requested identity for {label} does not match the object the receiver observed"
+                    ),
+                }
+                Ok(())
+            }
+            ExistingDestinationPolicyV1::Replace => Ok(()),
+            ExistingDestinationPolicyV1::UpdateIfOlder => {
+                bail!("update-if-older existing-object policy is not enforceable by the receiver")
+            }
+        }
+    }
+
+    /// Refuse staging work whose eventual publication the existing-object
+    /// policy would reject, so the transfer fails before moving bytes.
+    fn constrain_prepare(&self, path: &[u8]) -> Result<()> {
+        if self.created_by_this_grant(path) {
+            return Ok(());
+        }
+        let label = String::from_utf8_lossy(path);
+        match self.copy.policy.existing {
+            ExistingDestinationPolicyV1::Skip if self.rooted_metadata(path)?.is_some() => {
+                bail!("signed grant retains existing objects: {label} already exists")
+            }
+            ExistingDestinationPolicyV1::MustExist if self.rooted_metadata(path)?.is_none() => {
+                bail!("signed grant creates nothing: {label} does not exist")
+            }
+            _ => Ok(()),
+        }
     }
 
     fn check_flags(&self, flags: u8) -> Result<()> {
@@ -810,7 +1120,12 @@ impl RestrictedAuthority {
         Ok(())
     }
 
-    fn authorize_op(&self, operation: &mut Op) -> Result<()> {
+    fn authorize_op(
+        &self,
+        operation: &mut Op,
+        index: usize,
+        pending: &mut Vec<PendingCreation>,
+    ) -> Result<()> {
         let path = match &*operation {
             Op::Mkdir { path, .. }
             | Op::SetMeta { path, .. }
@@ -850,14 +1165,28 @@ impl RestrictedAuthority {
         };
         self.check_mutation_path(path, is_dir)?;
         match operation {
-            Op::Mkdir { path, mode, .. } => {
+            Op::Mkdir {
+                path,
+                mode,
+                condition,
+            } => {
+                self.constrain_creation(path, condition, true, index, pending)?;
                 if !self.copy.options.preserve_permissions {
                     self.remember_receiver_creation(path, true)?;
                     *mode = 0o700;
                 }
                 Ok(())
             }
-            Op::Mknod { path, mode, .. } => {
+            Op::Symlink {
+                path, condition, ..
+            } => self.constrain_creation(path, condition, false, index, pending),
+            Op::Mknod {
+                path,
+                mode,
+                condition,
+                ..
+            } => {
+                self.constrain_creation(path, condition, false, index, pending)?;
                 if !self.copy.options.preserve_permissions {
                     self.remember_receiver_creation(path, false)?;
                     #[cfg(target_os = "linux")]
@@ -873,30 +1202,57 @@ impl RestrictedAuthority {
                 meta,
                 flags,
                 condition,
-            } => self.constrain_receiver_mode(
-                path,
-                meta,
-                flags,
-                condition,
-                ReceiverModeTarget::AnyExisting,
-            ),
+            } => {
+                self.constrain_update(path, is_dir, Some(&mut *condition), pending)?;
+                self.constrain_receiver_mode(
+                    path,
+                    meta,
+                    flags,
+                    condition,
+                    ReceiverModeTarget::AnyExisting,
+                )
+            }
             Op::SetFileMetaIfSame {
                 path,
                 meta,
                 flags,
                 condition,
-            } => self.constrain_receiver_mode(
-                path,
-                meta,
-                flags,
-                condition,
-                ReceiverModeTarget::RegularFile,
-            ),
-            _ => Ok(()),
+            } => {
+                self.constrain_update(path, false, Some(&mut *condition), pending)?;
+                self.constrain_receiver_mode(
+                    path,
+                    meta,
+                    flags,
+                    condition,
+                    ReceiverModeTarget::RegularFile,
+                )
+            }
+            Op::Remove { .. } | Op::Rmdir { .. } | Op::Unlink { .. } => Ok(()),
         }
     }
 
-    pub(crate) fn authorize(&self, request: &mut Request, over_ssh: bool) -> Result<()> {
+    /// Check and rewrite one request against the signed grant. The returned
+    /// settlement must be handed back to `settle` with the executor's
+    /// response so provisional creations are forgotten when execution fails.
+    pub(crate) fn authorize(&self, request: &mut Request, over_ssh: bool) -> Result<Settlement> {
+        let mut pending = Vec::new();
+        match self.authorize_inner(request, over_ssh, &mut pending) {
+            Ok(()) => Ok(Settlement(pending)),
+            Err(error) => {
+                // Nothing of a refused request executes, including the
+                // entries authorized before the refusing one.
+                self.forget_provisional(&pending);
+                Err(error)
+            }
+        }
+    }
+
+    fn authorize_inner(
+        &self,
+        request: &mut Request,
+        over_ssh: bool,
+        pending: &mut Vec<PendingCreation>,
+    ) -> Result<()> {
         self.check_deadline()?;
         match request {
             Request::TcpListen {
@@ -989,8 +1345,8 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::Apply { ops, guard } => {
-                for operation in ops {
-                    self.authorize_op(operation)?;
+                for (index, operation) in ops.iter_mut().enumerate() {
+                    self.authorize_op(operation, index, pending)?;
                 }
                 *guard = Some(self.guard.clone());
             }
@@ -1032,6 +1388,7 @@ impl RestrictedAuthority {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
+                self.constrain_update(path, false, None, pending)?;
                 *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
@@ -1043,6 +1400,7 @@ impl RestrictedAuthority {
                 ..
             } => {
                 self.check_mutation_path(path, false)?;
+                self.constrain_update(path, false, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -1066,6 +1424,7 @@ impl RestrictedAuthority {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
+                self.constrain_prepare(path)?;
                 *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
@@ -1095,6 +1454,7 @@ impl RestrictedAuthority {
                     bail!("file finalization does not match the signed publication policy");
                 }
                 self.check_mutation_path(path, false)?;
+                self.constrain_creation(path, condition, false, 0, pending)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -1118,8 +1478,9 @@ impl RestrictedAuthority {
                         bail!("small-file batch exceeds the signed file-data rate-limit burst");
                     }
                 }
-                for put in puts {
+                for (index, put) in puts.iter_mut().enumerate() {
                     self.charge_bytes(&put.path, 0, put.data.len())?;
+                    self.constrain_creation(&put.path, &mut put.condition, false, index, pending)?;
                     self.constrain_receiver_mode(
                         &put.path,
                         &mut put.meta,
@@ -1146,6 +1507,21 @@ impl RestrictedAuthority {
         }
         Ok(())
     }
+}
+
+/// Creations an authorized request recorded provisionally, keyed by the
+/// operation or small-put index the executor reports on.
+#[derive(Debug, Default)]
+pub(crate) struct Settlement(Vec<PendingCreation>);
+
+/// One object a request creates or replaces. Only creations that `persist`
+/// become the grant's own once confirmed; a `MustExist` replacement counts
+/// only for the rest of its own request.
+#[derive(Debug)]
+pub(crate) struct PendingCreation {
+    index: usize,
+    path: Vec<u8>,
+    persist: bool,
 }
 
 fn current_account() -> Result<(String, PathBuf)> {
@@ -1997,6 +2373,14 @@ fn now() -> Result<i64> {
         .context("current time exceeds signed grant range")
 }
 
+fn root_existence_for(existence: Existence) -> RootExistenceV4 {
+    match existence {
+        Existence::Any => RootExistenceV4::Any,
+        Existence::New => RootExistenceV4::New,
+        Existence::Existing => RootExistenceV4::Existing,
+    }
+}
+
 fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.no_tcp || args.tcp_plain {
         bail!("command-restricted transfers require encrypted TCP data connections");
@@ -2004,13 +2388,18 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.tcp_congestion.is_some() {
         bail!("--tcp-congestion is not yet represented in the signed receiver grant");
     }
-    if args.update
-        || args.ignore_existing
-        || args.existing
-        || args.target_existence != Existence::Any
+    if args.update {
+        bail!(
+            "--update compares against source modification times that only hostA reports, so the command-restricted receiver cannot enforce it"
+        );
+    }
+    if args.inplace
+        && (args.ignore_existing
+            || args.existing
+            || (args.target_existence == Existence::New && args.placement == Placement::As))
     {
         bail!(
-            "--update, --ignore-existing, --existing, and destination-existence constraints are not yet enforceable by the command-restricted receiver"
+            "--inplace cannot be combined with --ignore-existing, --existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
     if !args.files_from_lines.is_empty()
@@ -2104,11 +2493,15 @@ fn grant_for(
     };
     mutation_scopes.sort_by(|left, right| left.path.cmp(&right.path));
     mutation_scopes.dedup_by(|left, right| left.path == right.path);
+    // Per-object policy only. The placement root's own precondition
+    // (`--into-existing` and friends) is the separate signed root-existence
+    // field; folding it in here would forbid creating files inside an
+    // existing directory.
     let existing = if args.ignore_existing {
         ExistingDestinationPolicyV1::Skip
     } else if args.update {
         ExistingDestinationPolicyV1::UpdateIfOlder
-    } else if args.existing || args.target_existence == Existence::Existing {
+    } else if args.existing {
         ExistingDestinationPolicyV1::MustExist
     } else {
         ExistingDestinationPolicyV1::Replace
@@ -2259,6 +2652,7 @@ pub(crate) fn prepare_transfer(
             )?,
             delete_excluded: args.delete_excluded,
         },
+        root_existence_for(args.target_existence),
         &private_key,
     )?;
     Ok(PreparedTransfer {
@@ -2310,13 +2704,9 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         revocation_file: None,
     };
     let verified = delegation::verify_and_claim(&envelope, &context, &policy, &replay)?;
-    let (grant, max_file_data_bytes_per_second, filters, deadline) = verified.into_parts();
+    let (grant, extensions, deadline) = verified.into_parts();
     let authority = std::sync::Arc::new(RestrictedAuthority::new(
-        &config,
-        grant,
-        max_file_data_bytes_per_second,
-        filters,
-        deadline,
+        &config, grant, extensions, deadline,
     )?);
     crate::server::run_restricted(authority)
 }
@@ -2531,9 +2921,35 @@ mod tests {
         deletion: DeletionPolicyV1,
         maximum_bytes: u64,
         max_file_data_bytes_per_second: u64,
-        mut filters: FilterPolicyV3,
+        filters: FilterPolicyV3,
         publication: PublicationPolicyV1,
     ) -> RestrictedAuthority {
+        test_authority_with_existence(
+            root,
+            deletion,
+            maximum_bytes,
+            max_file_data_bytes_per_second,
+            filters,
+            publication,
+            ExistingDestinationPolicyV1::Replace,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_authority_with_existence(
+        root: &Path,
+        deletion: DeletionPolicyV1,
+        maximum_bytes: u64,
+        max_file_data_bytes_per_second: u64,
+        mut filters: FilterPolicyV3,
+        publication: PublicationPolicyV1,
+        existing: ExistingDestinationPolicyV1,
+        placement: DestinationPlacementV1,
+        root_existence: RootExistenceV4,
+    ) -> Result<RestrictedAuthority> {
         let opened = Root::open(root).unwrap();
         let identity = opened.identity();
         let id = EnrollmentId::random();
@@ -2567,8 +2983,8 @@ mod tests {
                     descendants: true,
                 }],
                 policy: CopyPolicyV1 {
-                    placement: DestinationPlacementV1::ExactPath,
-                    existing: ExistingDestinationPolicyV1::Replace,
+                    placement,
+                    existing,
                     deletion,
                     publication,
                 },
@@ -2602,11 +3018,13 @@ mod tests {
         RestrictedAuthority::new(
             &config,
             grant,
-            max_file_data_bytes_per_second,
-            filters,
+            GrantExtensions {
+                max_file_data_bytes_per_second,
+                filters,
+                root_existence,
+            },
             Instant::now() + std::time::Duration::from_secs(60),
         )
-        .unwrap()
     }
 
     #[test]
@@ -2960,6 +3378,827 @@ mod tests {
         authority.authorize(&mut inplace, false).unwrap();
         let mut staged = prepare(false);
         assert!(authority.authorize(&mut staged, false).is_err());
+    }
+
+    fn existence_authority(
+        root: &Path,
+        existing: ExistingDestinationPolicyV1,
+        placement: DestinationPlacementV1,
+        root_existence: RootExistenceV4,
+    ) -> Result<RestrictedAuthority> {
+        test_authority_with_existence(
+            root,
+            DeletionPolicyV1::DeleteDestinationOnly,
+            1024,
+            0,
+            FilterPolicyV3::default(),
+            PublicationPolicyV1::AtomicStaged,
+            existing,
+            placement,
+            root_existence,
+        )
+    }
+
+    fn path_bytes(path: &Path) -> Vec<u8> {
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    fn plain_meta() -> proto::Meta {
+        proto::Meta {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        }
+    }
+
+    fn prepare_request(path: &Path) -> Request {
+        Request::Prepare {
+            path: path_bytes(path),
+            size: 4,
+            inplace: false,
+            partial_id: [1; 16],
+            mode: 0o600,
+            guard: None,
+        }
+    }
+
+    fn finalize_request(path: &Path, condition: proto::TargetCondition) -> Request {
+        Request::Finalize {
+            path: path_bytes(path),
+            inplace: false,
+            partial_id: [1; 16],
+            meta: plain_meta(),
+            flags: 0,
+            condition,
+            guard: None,
+        }
+    }
+
+    fn finalize_condition(request: &Request) -> proto::TargetCondition {
+        let Request::Finalize { condition, .. } = request else {
+            unreachable!()
+        };
+        *condition
+    }
+
+    fn small_put(path: &Path) -> Request {
+        Request::PutSmallBatch(vec![proto::SmallPut {
+            path: path_bytes(path),
+            partial_id: [1; 16],
+            data: b"new".to_vec(),
+            hash: crate::fsops::content_digest(b"new"),
+            meta: plain_meta(),
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        }])
+    }
+
+    fn small_put_condition(request: &Request) -> proto::TargetCondition {
+        let Request::PutSmallBatch(puts) = request else {
+            unreachable!()
+        };
+        puts[0].condition
+    }
+
+    fn apply(op: Op) -> Request {
+        Request::Apply {
+            ops: vec![op],
+            guard: None,
+        }
+    }
+
+    fn op_condition(request: &Request) -> proto::TargetCondition {
+        let Request::Apply { ops, .. } = request else {
+            unreachable!()
+        };
+        match &ops[0] {
+            Op::Mkdir { condition, .. }
+            | Op::Symlink { condition, .. }
+            | Op::Mknod { condition, .. }
+            | Op::SetMeta { condition, .. }
+            | Op::SetFileMetaIfSame { condition, .. } => *condition,
+            Op::Remove { .. } | Op::Rmdir { .. } | Op::Unlink { .. } => unreachable!(),
+        }
+    }
+
+    fn mkdir(path: &Path) -> Op {
+        Op::Mkdir {
+            path: path_bytes(path),
+            mode: 0o755,
+            condition: proto::TargetCondition::Any,
+        }
+    }
+
+    fn symlink_op(path: &Path) -> Op {
+        Op::Symlink {
+            path: path_bytes(path),
+            target: b"elsewhere".to_vec(),
+            condition: proto::TargetCondition::Any,
+        }
+    }
+
+    fn set_meta(path: &Path) -> Op {
+        Op::SetMeta {
+            path: path_bytes(path),
+            meta: plain_meta(),
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+        }
+    }
+
+    #[test]
+    fn signed_skip_policy_retains_preexisting_objects() {
+        use proto::TargetCondition::{Absent, Any, Matches};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let dir = target.join("dir");
+        let kept = target.join("kept");
+        let fresh = target.join("fresh");
+        let small = target.join("small");
+        let new_dir = target.join("new-dir");
+        let link = target.join("link");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&kept, b"old").unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::Skip,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap();
+
+        // New files are staged and published without replacing anything;
+        // staging for a pre-existing object fails before bytes move.
+        let mut prepare_fresh = prepare_request(&fresh);
+        authority.authorize(&mut prepare_fresh, false).unwrap();
+        let mut prepare_kept = prepare_request(&kept);
+        assert!(authority.authorize(&mut prepare_kept, false).is_err());
+        let mut publish_fresh = finalize_request(&fresh, Any);
+        let settlement = authority.authorize(&mut publish_fresh, false).unwrap();
+        assert_eq!(finalize_condition(&publish_fresh), Absent);
+        authority.settle(settlement, &proto::Response::Ok);
+        let mut publish_kept = finalize_request(&kept, Any);
+        assert!(authority.authorize(&mut publish_kept, false).is_err());
+        // What this grant created, and the executor confirmed, is its own to
+        // republish.
+        let mut republish_fresh = finalize_request(&fresh, Matches { dev: 1, ino: 1 });
+        authority.authorize(&mut republish_fresh, false).unwrap();
+        assert_eq!(
+            finalize_condition(&republish_fresh),
+            Matches { dev: 1, ino: 1 }
+        );
+        let mut small_kept = small_put(&kept);
+        assert!(authority.authorize(&mut small_kept, false).is_err());
+        let mut small_new = small_put(&small);
+        authority.authorize(&mut small_new, false).unwrap();
+        assert_eq!(small_put_condition(&small_new), Absent);
+
+        // Existing directories are kept and reused; nothing existing becomes
+        // a directory, and new directories are created without replacement.
+        let mut reuse_dir = apply(mkdir(&dir));
+        authority.authorize(&mut reuse_dir, false).unwrap();
+        assert_eq!(op_condition(&reuse_dir), Any);
+        let mut dir_over_file = apply(mkdir(&kept));
+        assert!(authority.authorize(&mut dir_over_file, false).is_err());
+        let mut create_dir = apply(mkdir(&new_dir));
+        authority.authorize(&mut create_dir, false).unwrap();
+        assert_eq!(op_condition(&create_dir), Absent);
+
+        // Symlinks follow the same rule, and metadata may follow only this
+        // grant's own creations or directories.
+        let mut link_over_file = apply(symlink_op(&kept));
+        assert!(authority.authorize(&mut link_over_file, false).is_err());
+        let mut create_link = apply(symlink_op(&link));
+        let settlement = authority.authorize(&mut create_link, false).unwrap();
+        assert_eq!(op_condition(&create_link), Absent);
+        authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        let mut meta_link = apply(set_meta(&link));
+        authority.authorize(&mut meta_link, false).unwrap();
+        let mut meta_dir = apply(set_meta(&dir));
+        authority.authorize(&mut meta_dir, false).unwrap();
+        let mut meta_kept = apply(set_meta(&kept));
+        assert!(authority.authorize(&mut meta_kept, false).is_err());
+        let mut same_kept = apply(Op::SetFileMetaIfSame {
+            path: path_bytes(&kept),
+            condition: Any,
+            meta: plain_meta(),
+            flags: 0,
+        });
+        assert!(authority.authorize(&mut same_kept, false).is_err());
+
+        // Content repair of a pre-existing file is refused; deletion remains
+        // governed by the separately signed deletion policy.
+        let mut finish = Request::FinishBasis {
+            path: path_bytes(&kept),
+            partial_id: [1; 16],
+            meta: plain_meta(),
+            flags: 0,
+            condition: Any,
+            guard: None,
+        };
+        assert!(authority.authorize(&mut finish, false).is_err());
+        let mut seed = Request::SeedBasis {
+            path: path_bytes(&kept),
+            partial_id: [1; 16],
+            len: 3,
+            guard: None,
+        };
+        assert!(authority.authorize(&mut seed, false).is_err());
+        let mut delete = apply(Op::Unlink {
+            path: path_bytes(&kept),
+        });
+        authority.authorize(&mut delete, false).unwrap();
+    }
+
+    #[test]
+    fn signed_must_exist_policy_creates_nothing() {
+        use proto::TargetCondition::{Absent, Any, Matches};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let dir = target.join("dir");
+        let present = target.join("present");
+        let link = target.join("link");
+        let missing = target.join("missing");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&present, b"old").unwrap();
+        std::os::unix::fs::symlink("present", &link).unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::MustExist,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap();
+
+        let mut prepare_present = prepare_request(&present);
+        authority.authorize(&mut prepare_present, false).unwrap();
+        let mut prepare_missing = prepare_request(&missing);
+        assert!(authority.authorize(&mut prepare_missing, false).is_err());
+        let mut update_present = finalize_request(&present, Any);
+        authority.authorize(&mut update_present, false).unwrap();
+        let present_identity = fs::symlink_metadata(&present).unwrap();
+        assert_eq!(
+            finalize_condition(&update_present),
+            Matches {
+                dev: present_identity.dev(),
+                ino: present_identity.ino(),
+            }
+        );
+        let mut create_present = finalize_request(&present, Absent);
+        assert!(authority.authorize(&mut create_present, false).is_err());
+        let mut publish_missing = finalize_request(&missing, Any);
+        assert!(authority.authorize(&mut publish_missing, false).is_err());
+        let mut small_missing = small_put(&missing);
+        assert!(authority.authorize(&mut small_missing, false).is_err());
+        let mut small_present = small_put(&present);
+        authority.authorize(&mut small_present, false).unwrap();
+
+        let mut reuse_dir = apply(mkdir(&dir));
+        authority.authorize(&mut reuse_dir, false).unwrap();
+        let mut create_dir = apply(mkdir(&missing));
+        assert!(authority.authorize(&mut create_dir, false).is_err());
+        let mut dir_over_file = apply(mkdir(&present));
+        assert!(authority.authorize(&mut dir_over_file, false).is_err());
+        let mut replace_link = apply(symlink_op(&link));
+        authority.authorize(&mut replace_link, false).unwrap();
+        let link_identity = fs::symlink_metadata(&link).unwrap();
+        assert_eq!(
+            op_condition(&replace_link),
+            Matches {
+                dev: link_identity.dev(),
+                ino: link_identity.ino(),
+            }
+        );
+        let mut create_link = apply(symlink_op(&missing));
+        assert!(authority.authorize(&mut create_link, false).is_err());
+
+        let mut finish = Request::FinishBasis {
+            path: path_bytes(&present),
+            partial_id: [1; 16],
+            meta: plain_meta(),
+            flags: 0,
+            condition: Any,
+            guard: None,
+        };
+        authority.authorize(&mut finish, false).unwrap();
+        let mut meta_present = apply(set_meta(&present));
+        authority.authorize(&mut meta_present, false).unwrap();
+    }
+
+    #[test]
+    fn provisional_creations_are_forgotten_when_execution_fails() {
+        use proto::TargetCondition::{Absent, Any, Matches};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::Skip,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap();
+        let fresh = target.join("fresh");
+        let kept = target.join("kept");
+        let dir_a = target.join("dir-a");
+        let dir_b = target.join("dir-b");
+
+        // A failed no-replace publication leaves nothing behind, so a foreign
+        // object that appears afterwards is retained like any other.
+        let mut publish = finalize_request(&fresh, Any);
+        let settlement = authority.authorize(&mut publish, false).unwrap();
+        authority.settle(settlement, &proto::Response::Err("raced".into()));
+        fs::write(&fresh, b"foreign").unwrap();
+        let mut republish = finalize_request(&fresh, Any);
+        assert!(authority.authorize(&mut republish, false).is_err());
+
+        // A successful one stays this grant's own.
+        let mut publish = small_put(&kept);
+        let settlement = authority.authorize(&mut publish, false).unwrap();
+        authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        let mut republish = finalize_request(&kept, Matches { dev: 1, ino: 1 });
+        authority.authorize(&mut republish, false).unwrap();
+
+        // Per-operation results settle a batch operation by operation.
+        let mut batch = Request::Apply {
+            ops: vec![mkdir(&dir_a), mkdir(&dir_b)],
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut batch, false).unwrap();
+        authority.settle(
+            settlement,
+            &proto::Response::Applied(vec![None, Some("raced".into())]),
+        );
+        let mut again_a = apply(mkdir(&dir_a));
+        authority.authorize(&mut again_a, false).unwrap();
+        assert_eq!(op_condition(&again_a), Any);
+        let mut again_b = apply(mkdir(&dir_b));
+        authority.authorize(&mut again_b, false).unwrap();
+        assert_eq!(op_condition(&again_b), Absent);
+    }
+
+    #[test]
+    fn a_refused_request_leaves_no_provisional_creations_behind() {
+        use proto::TargetCondition::{Absent, Any};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let kept = target.join("kept");
+        let fresh = target.join("fresh");
+        let link = target.join("link");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&kept, b"old").unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::Skip,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap();
+
+        // The first entry is authorized before the second is refused; nothing
+        // of the batch runs, so the first must not count as created.
+        let mut batch = Request::Apply {
+            ops: vec![mkdir(&fresh), symlink_op(&kept)],
+            guard: None,
+        };
+        assert!(authority.authorize(&mut batch, false).is_err());
+        let mut again = apply(mkdir(&fresh));
+        authority.authorize(&mut again, false).unwrap();
+        assert_eq!(op_condition(&again), Absent);
+
+        // Until the executor confirms a creation, a second creation of the
+        // same path is not this grant's own either: it races at the kernel.
+        let mut concurrent = apply(mkdir(&fresh));
+        authority.authorize(&mut concurrent, false).unwrap();
+        assert_eq!(op_condition(&concurrent), Absent);
+
+        // Metadata may follow a creation within the same request.
+        let mut create_and_touch = Request::Apply {
+            ops: vec![symlink_op(&link), set_meta(&link)],
+            guard: None,
+        };
+        authority.authorize(&mut create_and_touch, false).unwrap();
+        let Request::Apply { ops, .. } = &create_and_touch else {
+            unreachable!()
+        };
+        assert!(matches!(ops[1], Op::SetMeta { condition: Any, .. }));
+    }
+
+    #[test]
+    fn must_exist_accepts_only_the_observed_identity() {
+        use proto::TargetCondition::{Matches, MatchesFingerprint};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let present = target.join("present");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&present, b"old").unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::MustExist,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap();
+        let identity = fs::symlink_metadata(&present).unwrap();
+        let mut bogus = finalize_request(&present, Matches { dev: 1, ino: 1 });
+        assert!(authority.authorize(&mut bogus, false).is_err());
+        let mut stale = finalize_request(
+            &present,
+            MatchesFingerprint {
+                dev: identity.dev(),
+                ino: identity.ino(),
+                ctime: identity.ctime() + 1,
+                ctime_nsec: identity.ctime_nsec() as u32,
+            },
+        );
+        assert!(authority.authorize(&mut stale, false).is_err());
+        let mut exact = finalize_request(
+            &present,
+            Matches {
+                dev: identity.dev(),
+                ino: identity.ino(),
+            },
+        );
+        authority.authorize(&mut exact, false).unwrap();
+    }
+
+    #[test]
+    fn must_exist_pins_update_only_operations() {
+        use proto::TargetCondition::{Any, Matches};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let present = target.join("present");
+        let missing = target.join("missing");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&present, b"old").unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::MustExist,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap();
+        let identity = fs::symlink_metadata(&present).unwrap();
+        let expected = Matches {
+            dev: identity.dev(),
+            ino: identity.ino(),
+        };
+
+        let mut meta = apply(set_meta(&present));
+        authority.authorize(&mut meta, false).unwrap();
+        assert_eq!(op_condition(&meta), expected);
+        let mut same = apply(Op::SetFileMetaIfSame {
+            path: path_bytes(&present),
+            condition: Any,
+            meta: plain_meta(),
+            flags: 0,
+        });
+        authority.authorize(&mut same, false).unwrap();
+        assert_eq!(op_condition(&same), expected);
+        let mut finish = Request::FinishBasis {
+            path: path_bytes(&present),
+            partial_id: [1; 16],
+            meta: plain_meta(),
+            flags: 0,
+            condition: Any,
+            guard: None,
+        };
+        authority.authorize(&mut finish, false).unwrap();
+        let Request::FinishBasis { condition, .. } = &finish else {
+            unreachable!()
+        };
+        assert_eq!(*condition, expected);
+
+        let mut bogus = apply(Op::SetMeta {
+            path: path_bytes(&present),
+            meta: plain_meta(),
+            flags: 0,
+            condition: Matches { dev: 1, ino: 1 },
+        });
+        assert!(authority.authorize(&mut bogus, false).is_err());
+        let mut absent = apply(set_meta(&missing));
+        assert!(authority.authorize(&mut absent, false).is_err());
+    }
+
+    #[test]
+    fn must_exist_replacement_and_metadata_execute_as_one_batch() {
+        use proto::TargetCondition::{Any, Matches};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let link = target.join("link");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink("old-target", &link).unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::MustExist,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .unwrap();
+        let before = fs::symlink_metadata(&link).unwrap();
+
+        // A changed symlink is replaced and then given its metadata in one
+        // ordinary batch. The replacement is pinned to the old inode; the
+        // metadata must land on the new one.
+        let mut batch = Request::Apply {
+            ops: vec![symlink_op(&link), set_meta(&link)],
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut batch, false).unwrap();
+        let Request::Apply {
+            ops,
+            guard: Some(guard),
+        } = &batch
+        else {
+            unreachable!()
+        };
+        assert!(matches!(
+            ops[0],
+            Op::Symlink { condition: Matches { dev, ino }, .. }
+                if (dev, ino) == (before.dev(), before.ino())
+        ));
+        assert!(matches!(ops[1], Op::SetMeta { condition: Any, .. }));
+        let results = crate::fsops::FsOps::new().apply(ops, Some(guard));
+        assert!(results.iter().all(Option::is_none), "{results:?}");
+        authority.settle(settlement, &proto::Response::Applied(results));
+        assert_eq!(
+            fs::read_link(&link).unwrap().as_os_str().as_bytes(),
+            b"elsewhere"
+        );
+        let after = fs::symlink_metadata(&link).unwrap();
+        assert_ne!(after.ino(), before.ino());
+
+        // A later request must observe and pin the replacement afresh; it
+        // is not a creation the grant may now treat as its own, so neither a
+        // type change nor an unpinned publication is possible.
+        let mut touch = apply(set_meta(&link));
+        authority.authorize(&mut touch, false).unwrap();
+        assert_eq!(
+            op_condition(&touch),
+            Matches {
+                dev: after.dev(),
+                ino: after.ino(),
+            }
+        );
+        let mut as_directory = apply(mkdir(&link));
+        assert!(authority.authorize(&mut as_directory, false).is_err());
+        let mut publish = finalize_request(&link, Any);
+        authority.authorize(&mut publish, false).unwrap();
+        assert_eq!(
+            finalize_condition(&publish),
+            Matches {
+                dev: after.dev(),
+                ino: after.ino(),
+            }
+        );
+    }
+
+    #[test]
+    fn guarded_executor_honors_creation_conditions() {
+        use proto::TargetCondition::{Absent, Any, Matches};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let file = target.join("file");
+        let dir = target.join("dir");
+        let link = target.join("link");
+        let fresh = target.join("fresh");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&file, b"keep").unwrap();
+        std::os::unix::fs::symlink("file", &link).unwrap();
+        let root_identity = fs::metadata(&root).unwrap();
+        let guard = ContainerGuard {
+            root: path_bytes(&root),
+            dev: root_identity.dev(),
+            ino: root_identity.ino(),
+        };
+        let identity = |path: &Path| {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }
+        };
+        let run = |op: Op| crate::fsops::FsOps::new().apply(&[op], Some(&guard))[0].clone();
+        let with = |op: Op, condition| match op {
+            Op::Mkdir { path, mode, .. } => Op::Mkdir {
+                path,
+                mode,
+                condition,
+            },
+            Op::Symlink { path, target, .. } => Op::Symlink {
+                path,
+                target,
+                condition,
+            },
+            other => other,
+        };
+
+        // No-replace creation never removes what is there.
+        assert!(run(with(mkdir(&file), Absent)).is_some());
+        assert!(run(with(symlink_op(&file), Absent)).is_some());
+        assert!(run(with(mkdir(&dir), Absent)).is_some());
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
+        assert!(run(with(mkdir(&fresh), Absent)).is_none());
+        assert!(fresh.is_dir());
+
+        // Matched replacement requires the observed object and its type.
+        assert!(run(with(symlink_op(&link), Matches { dev: 1, ino: 1 })).is_some());
+        assert!(run(with(symlink_op(&file), identity(&file))).is_some());
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
+        assert!(run(with(symlink_op(&link), identity(&link))).is_none());
+        assert!(run(with(mkdir(&file), identity(&file))).is_some());
+        assert!(run(with(mkdir(&dir), identity(&dir))).is_none());
+
+        // The unconditioned form keeps the ordinary replace behavior.
+        assert!(run(with(symlink_op(&file), Any)).is_none());
+        assert!(file.is_symlink());
+    }
+
+    #[test]
+    fn new_directory_placement_root_must_be_created_as_a_directory() {
+        use proto::TargetCondition::{Absent, Any};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let target = root.join("target");
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::Replace,
+            DestinationPlacementV1::DirectoryAsChild,
+            RootExistenceV4::New,
+        )
+        .unwrap();
+        let mut as_file = finalize_request(&target, Any);
+        assert!(authority.authorize(&mut as_file, false).is_err());
+        let mut as_small_file = small_put(&target);
+        assert!(authority.authorize(&mut as_small_file, false).is_err());
+        let mut as_link = apply(symlink_op(&target));
+        assert!(authority.authorize(&mut as_link, false).is_err());
+        let mut as_directory = apply(mkdir(&target));
+        authority.authorize(&mut as_directory, false).unwrap();
+        assert_eq!(op_condition(&as_directory), Absent);
+    }
+
+    #[test]
+    fn inplace_publication_cannot_honor_no_replace_policies() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let inplace = |existing, placement, root_existence| {
+            test_authority_with_existence(
+                &root,
+                DeletionPolicyV1::Forbid,
+                1024,
+                0,
+                FilterPolicyV3::default(),
+                PublicationPolicyV1::InPlace,
+                existing,
+                placement,
+                root_existence,
+            )
+        };
+        assert!(inplace(
+            ExistingDestinationPolicyV1::Skip,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .is_err());
+        assert!(inplace(
+            ExistingDestinationPolicyV1::Replace,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::New,
+        )
+        .is_err());
+        // In-place preparation cannot be pinned to an observed object either,
+        // so MustExist is refused as well; only Replace remains, and a new
+        // directory root is fine because mkdir creates it.
+        assert!(inplace(
+            ExistingDestinationPolicyV1::MustExist,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .is_err());
+        inplace(
+            ExistingDestinationPolicyV1::Replace,
+            DestinationPlacementV1::DirectoryContents,
+            RootExistenceV4::New,
+        )
+        .unwrap();
+
+        // The orchestrator refuses the same combination before signing. The
+        // rsync-shaped parser already makes --inplace and --ignore-existing
+        // conflict, so the reachable case is the native --as-new placement.
+        let mut args = Args::try_parse_from([
+            "syq rsync",
+            "-r",
+            "--inplace",
+            "host-a:source",
+            "host-b:/backup",
+        ])
+        .unwrap();
+        args.normalize();
+        validate_restricted_args(&args).unwrap();
+        args.placement = Placement::As;
+        args.target_existence = Existence::New;
+        assert!(validate_restricted_args(&args).is_err());
+        args.placement = Placement::Into;
+        validate_restricted_args(&args).unwrap();
+    }
+
+    #[test]
+    fn signed_root_existence_is_checked_at_claim_and_forced_on_creation() {
+        use proto::TargetCondition::{Absent, Any};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let target = root.join("target");
+        let replace = ExistingDestinationPolicyV1::Replace;
+
+        // A root that must be new is refused when present, and otherwise may
+        // only be created without replacement; afterwards it is this grant's.
+        fs::create_dir(&target).unwrap();
+        assert!(existence_authority(
+            &root,
+            replace,
+            DestinationPlacementV1::DirectoryContents,
+            RootExistenceV4::New,
+        )
+        .is_err());
+        fs::remove_dir(&target).unwrap();
+        let authority = existence_authority(
+            &root,
+            replace,
+            DestinationPlacementV1::DirectoryContents,
+            RootExistenceV4::New,
+        )
+        .unwrap();
+        let mut create_root = apply(mkdir(&target));
+        let settlement = authority.authorize(&mut create_root, false).unwrap();
+        assert_eq!(op_condition(&create_root), Absent);
+        fs::create_dir(&target).unwrap();
+        authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        let mut revisit_root = apply(mkdir(&target));
+        authority.authorize(&mut revisit_root, false).unwrap();
+        assert_eq!(op_condition(&revisit_root), Any);
+        let mut child = finalize_request(&target.join("child"), Any);
+        authority.authorize(&mut child, false).unwrap();
+        assert_eq!(finalize_condition(&child), Any);
+
+        // A root that must exist needs the object, and a directory whenever
+        // the placement puts names inside it.
+        fs::remove_dir(&target).unwrap();
+        assert!(existence_authority(
+            &root,
+            replace,
+            DestinationPlacementV1::DirectoryContents,
+            RootExistenceV4::Existing,
+        )
+        .is_err());
+        fs::write(&target, b"file").unwrap();
+        assert!(existence_authority(
+            &root,
+            replace,
+            DestinationPlacementV1::DirectoryContents,
+            RootExistenceV4::Existing,
+        )
+        .is_err());
+        existence_authority(
+            &root,
+            replace,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Existing,
+        )
+        .unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::create_dir(&target).unwrap();
+        existence_authority(
+            &root,
+            replace,
+            DestinationPlacementV1::DirectoryAsChild,
+            RootExistenceV4::Existing,
+        )
+        .unwrap();
+
+        // The one existing-object policy the receiver cannot enforce is
+        // refused when the grant is claimed rather than trusted.
+        assert!(existence_authority(
+            &root,
+            ExistingDestinationPolicyV1::UpdateIfOlder,
+            DestinationPlacementV1::ExactPath,
+            RootExistenceV4::Any,
+        )
+        .is_err());
     }
 
     #[test]

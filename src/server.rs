@@ -163,12 +163,16 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Err(_) => break,
         };
         t[0] += t0.elapsed().as_secs_f64();
-        if let Some(authority) = &authority {
-            if let Err(error) = authority.authorize(&mut req, over_ssh) {
-                w.write_msg(&Response::Err(format!("{error:#}")))?;
-                continue;
-            }
-        }
+        let settlement = match &authority {
+            Some(authority) => match authority.authorize(&mut req, over_ssh) {
+                Ok(settlement) => Some(settlement),
+                Err(error) => {
+                    w.write_msg(&Response::Err(format!("{error:#}")))?;
+                    continue;
+                }
+            },
+            None => None,
+        };
         match &req {
             Request::WriteRange { data, .. } => {
                 blocks += 1;
@@ -321,6 +325,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
             other => {
                 let t0 = std::time::Instant::now();
                 let resp = ops.handle(&other);
+                if let (Some(authority), Some(settlement)) = (&authority, settlement) {
+                    authority.settle(settlement, &resp);
+                }
                 t[1] += t0.elapsed().as_secs_f64();
                 if drop_after_handling_for_test(&other) {
                     return Ok(());

@@ -1584,12 +1584,65 @@ fn relative_under(root: &Path, target: &Path) -> Result<RelativePath> {
     RelativePath::new(relative.as_os_str().as_bytes())
 }
 
+/// Observe the object at a guarded path and hold it to the planner's
+/// condition. `Absent` requires nothing there (the following `*at` creation
+/// then fails atomically if something appears); the matching conditions
+/// require the observed identity. `Any` accepts whatever is found.
+fn observe_rooted_condition(
+    target: &GuardedTarget,
+    condition: TargetCondition,
+) -> Result<Option<crate::rooted::RootMetadata>> {
+    let observed = target.root.metadata_optional(&target.relative)?;
+    let label = &target.label;
+    match (condition, observed) {
+        (TargetCondition::Any, observed) => Ok(observed),
+        (TargetCondition::Absent, None) => Ok(None),
+        (TargetCondition::Absent, Some(_)) => {
+            bail!(
+                "target {} appeared before no-replace creation",
+                label.display()
+            )
+        }
+        (TargetCondition::Matches { dev, ino }, Some(metadata))
+            if metadata.dev == dev && metadata.ino == ino =>
+        {
+            Ok(Some(metadata))
+        }
+        (
+            TargetCondition::MatchesFingerprint {
+                dev,
+                ino,
+                ctime,
+                ctime_nsec,
+            },
+            Some(metadata),
+        ) if metadata.dev == dev
+            && metadata.ino == ino
+            && metadata.ctime == ctime
+            && metadata.ctime_nsec == ctime_nsec =>
+        {
+            Ok(Some(metadata))
+        }
+        (TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }, _) => {
+            bail!(
+                "target {} changed before it could be replaced",
+                label.display()
+            )
+        }
+    }
+}
+
 fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
-        Op::Mkdir { mode, .. } => {
+        Op::Mkdir {
+            mode, condition, ..
+        } => {
             if path.is_empty() {
+                if *condition == TargetCondition::Absent {
+                    bail!("guarded root {} already exists", target.label.display());
+                }
                 let directory = root.open_directory(path)?;
                 let metadata = directory.metadata()?;
                 if metadata.mode() & 0o700 != 0o700 {
@@ -1598,7 +1651,7 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
                 }
                 return Ok(());
             }
-            match root.metadata_optional(path)? {
+            match observe_rooted_condition(target, *condition)? {
                 Some(metadata) if metadata.is_dir() => {
                     if metadata.mode & 0o700 != 0o700 {
                         let directory = root.open_metadata(path)?;
@@ -1607,6 +1660,10 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
                     }
                     Ok(())
                 }
+                Some(_) if *condition != TargetCondition::Any => bail!(
+                    "target {} cannot change type under a matched condition",
+                    target.label.display()
+                ),
                 Some(_) => {
                     root.unlink(path)?;
                     root.create_directory(path, (*mode & 0o7777) | 0o700)
@@ -1614,26 +1671,58 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
                 None => root.create_directory(path, (*mode & 0o7777) | 0o700),
             }
         }
-        Op::Symlink { target: link, .. } => {
-            if let Some(metadata) = root.metadata_optional(path)? {
+        Op::Symlink {
+            target: link,
+            condition,
+            ..
+        } => match observe_rooted_condition(target, *condition)? {
+            // A matched replacement swaps the new leaf in atomically, so a
+            // concurrent replacement of the observed object is refused
+            // rather than deleted.
+            Some(metadata) if *condition != TargetCondition::Any => {
+                if !metadata.is_symlink() {
+                    bail!(
+                        "target {} cannot change type under a matched condition",
+                        target.label.display()
+                    );
+                }
+                root.replace_symlink_if_same(path, link, metadata.dev, metadata.ino)
+            }
+            Some(metadata) => {
                 if metadata.is_dir() {
                     root.remove_directory(path)?;
                 } else {
                     root.unlink(path)?;
                 }
+                root.create_symlink(path, link)
             }
-            root.create_symlink(path, link)
-        }
-        Op::Mknod { mode, rdev, .. } => {
-            if let Some(metadata) = root.metadata_optional(path)? {
+            None => root.create_symlink(path, link),
+        },
+        Op::Mknod {
+            mode,
+            rdev,
+            condition,
+            ..
+        } => match observe_rooted_condition(target, *condition)? {
+            Some(metadata) if *condition != TargetCondition::Any => {
+                if file_type_bits(metadata.mode) != file_type_bits(*mode) {
+                    bail!(
+                        "target {} cannot change type under a matched condition",
+                        target.label.display()
+                    );
+                }
+                root.replace_node_if_same(path, *mode, *rdev, metadata.dev, metadata.ino)
+            }
+            Some(metadata) => {
                 if metadata.is_dir() {
                     root.remove_directory(path)?;
                 } else {
                     root.unlink(path)?;
                 }
+                root.create_node(path, *mode, *rdev)
             }
-            root.create_node(path, *mode, *rdev)
-        }
+            None => root.create_node(path, *mode, *rdev),
+        },
         Op::SetMeta {
             meta,
             flags,
