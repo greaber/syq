@@ -3,7 +3,7 @@
 use crate::cli::{Args, Existence, Interface, Location, Placement};
 use crate::delegation::{
     self, CopyLimitsV1, CopyOperationV1, CopyOptionsV1, CopyPolicyV1, DeletionPolicyV1,
-    DestinationPlacementV1, ExistingDestinationPolicyV1, GrantOperationV1, GrantV1,
+    DestinationPlacementV1, ExistingDestinationPolicyV1, FilterPolicyV3, GrantOperationV1, GrantV1,
     MutationScopeV1, PublicationPolicyV1, RequestId,
 };
 use crate::enrollment::{
@@ -240,6 +240,9 @@ pub(crate) struct RestrictedAuthority {
     guard: ContainerGuard,
     destination: Vec<u8>,
     copy: CopyOperationV1,
+    filters: FilterPolicyV3,
+    filter_matcher: Option<ignore::gitignore::Gitignore>,
+    filter_roots: Vec<Vec<u8>>,
     file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
     receiver_umask: u32,
     deadline: Instant,
@@ -252,9 +255,12 @@ impl RestrictedAuthority {
         config: &ReceiverEnrollment,
         grant: GrantV1,
         max_file_data_bytes_per_second: u64,
+        filters: FilterPolicyV3,
         deadline: Instant,
     ) -> Result<Self> {
         let GrantOperationV1::Copy(copy) = grant.operation;
+        let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
+        let filter_roots = filters.destination_roots.clone();
         let root_path = Path::new(&config.root);
         let destination = Path::new(std::ffi::OsStr::from_bytes(&copy.destination));
         let relative = destination.strip_prefix(root_path).with_context(|| {
@@ -286,6 +292,9 @@ impl RestrictedAuthority {
             },
             destination: copy.destination.clone(),
             copy,
+            filters,
+            filter_matcher,
+            filter_roots,
             file_data_limit,
             receiver_umask,
             deadline,
@@ -363,6 +372,40 @@ impl RestrictedAuthority {
                 && path.get(scope.path.len()) == Some(&b'/'))
     }
 
+    fn filter_applies(&self, path: &[u8]) -> bool {
+        self.filter_roots.iter().any(|root| {
+            path == root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/'))
+        })
+    }
+
+    /// A mapped source root itself is never ignored. A destination path that
+    /// can be supplied by several overlapping roots remains allowed when any
+    /// one of those source-relative spellings is included.
+    fn path_is_ignored(&self, path: &[u8], is_dir: bool) -> bool {
+        let Some(matcher) = &self.filter_matcher else {
+            return false;
+        };
+        let mut under_root = false;
+        for root in &self.filter_roots {
+            if path == root {
+                return false;
+            }
+            if !path.starts_with(root) || path.get(root.len()) != Some(&b'/') {
+                continue;
+            }
+            under_root = true;
+            let relative = &path[root.len() + 1..];
+            let relative = Path::new(OsStr::from_bytes(relative));
+            let pruned_by_ancestor = relative.ancestors().skip(1).any(|ancestor| {
+                !ancestor.as_os_str().is_empty() && matcher.matched(ancestor, true).is_ignore()
+            });
+            if !pruned_by_ancestor && !matcher.matched(relative, is_dir).is_ignore() {
+                return false;
+            }
+        }
+        under_root
+    }
+
     fn record_path(&self, path: &[u8]) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         if state.paths.insert(path.to_vec())
@@ -387,7 +430,7 @@ impl RestrictedAuthority {
         self.record_path(path)
     }
 
-    fn check_mutation_path(&self, path: &[u8]) -> Result<()> {
+    fn check_mutation_authority(&self, path: &[u8]) -> Result<()> {
         if self.copy.options.dry_run || self.copy.options.verify_only {
             bail!("signed read-only transfer forbids destination mutations");
         }
@@ -399,6 +442,14 @@ impl RestrictedAuthority {
             .any(|scope| Self::scope_allows(scope, path))
         {
             bail!("receiver mutation is outside the signed destination scopes");
+        }
+        Ok(())
+    }
+
+    fn check_mutation_path(&self, path: &[u8], is_dir: bool) -> Result<()> {
+        self.check_mutation_authority(path)?;
+        if self.path_is_ignored(path, is_dir) {
+            bail!("receiver mutation targets a path excluded by the signed filter policy");
         }
         self.record_path(path)
     }
@@ -709,7 +760,7 @@ impl RestrictedAuthority {
     }
 
     fn charge_bytes(&self, path: &[u8], offset: u64, bytes: usize) -> Result<()> {
-        self.check_mutation_path(path)?;
+        self.check_mutation_path(path, false)?;
         let bytes = u64::try_from(bytes).context("request byte count overflow")?;
         if self
             .file_data_limit
@@ -738,11 +789,16 @@ impl RestrictedAuthority {
         Ok(())
     }
 
-    fn charge_deletion(&self, path: &[u8]) -> Result<()> {
+    fn charge_deletion(&self, path: &[u8], is_dir: bool) -> Result<()> {
         if path == self.destination {
             bail!("the signed destination root itself may not be deleted");
         }
-        self.check_mutation_path(path)?;
+        if self.filters.delete_excluded {
+            self.check_mutation_authority(path)?;
+            self.record_path(path)?;
+        } else {
+            self.check_mutation_path(path, is_dir)?;
+        }
         if self.copy.policy.deletion == DeletionPolicyV1::Forbid {
             bail!("deletion is not authorized by the signed grant");
         }
@@ -774,13 +830,25 @@ impl RestrictedAuthority {
             Op::Remove { .. } => {
                 bail!("recursive remove is not supported by the root-confined receiver")
             }
-            Op::Rmdir { path } | Op::Unlink { path } => {
-                self.charge_deletion(path)?;
+            Op::Rmdir { path } => {
+                self.charge_deletion(path, true)?;
+                self.state.lock().unwrap().receiver_modes.remove(path);
+                return Ok(());
+            }
+            Op::Unlink { path } => {
+                self.charge_deletion(path, false)?;
                 self.state.lock().unwrap().receiver_modes.remove(path);
                 return Ok(());
             }
         };
-        self.check_mutation_path(path)?;
+        let is_dir = match operation {
+            Op::Mkdir { .. } => true,
+            Op::SetMeta { .. } => self
+                .rooted_metadata(path)?
+                .is_some_and(|metadata| metadata.is_dir()),
+            _ => false,
+        };
+        self.check_mutation_path(path, is_dir)?;
         match operation {
             Op::Mkdir { path, mode, .. } => {
                 if !self.copy.options.preserve_permissions {
@@ -865,6 +933,7 @@ impl RestrictedAuthority {
             Request::Scan {
                 root,
                 follow_root,
+                ignore,
                 guard,
                 ..
             } => {
@@ -872,6 +941,16 @@ impl RestrictedAuthority {
                     bail!("signed destination scans cannot follow a root symlink");
                 }
                 self.check_observation_path(root)?;
+                if self.filter_applies(root) {
+                    let expected = if self.filters.delete_excluded {
+                        &[][..]
+                    } else {
+                        self.filters.ignore.as_slice()
+                    };
+                    if ignore.as_slice() != expected {
+                        bail!("destination scan filters do not match the signed filter policy");
+                    }
+                }
                 *guard = Some(self.guard.clone());
             }
             Request::StatMany {
@@ -946,10 +1025,13 @@ impl RestrictedAuthority {
             Request::SeedBasis {
                 path, len, guard, ..
             } => {
+                if self.copy.policy.publication != PublicationPolicyV1::AtomicStaged {
+                    bail!("in-place signed receiver forbids staged basis creation");
+                }
                 if *len > self.copy.limits.max_file_bytes {
                     bail!("signed grant per-file byte limit exceeded");
                 }
-                self.check_mutation_path(path)?;
+                self.check_mutation_path(path, false)?;
                 *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
@@ -960,7 +1042,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                self.check_mutation_path(path)?;
+                self.check_mutation_path(path, false)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -977,13 +1059,13 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                if *inplace || self.copy.policy.publication != PublicationPolicyV1::AtomicStaged {
-                    bail!("signed receiver requires atomic staged publication");
+                if *inplace != (self.copy.policy.publication == PublicationPolicyV1::InPlace) {
+                    bail!("file preparation does not match the signed publication policy");
                 }
                 if *size > self.copy.limits.max_file_bytes {
                     bail!("signed grant per-file byte limit exceeded");
                 }
-                self.check_mutation_path(path)?;
+                self.check_mutation_path(path, false)?;
                 *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
@@ -994,8 +1076,8 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                if *inplace {
-                    bail!("signed receiver requires atomic staged publication");
+                if *inplace != (self.copy.policy.publication == PublicationPolicyV1::InPlace) {
+                    bail!("file write does not match the signed publication policy");
                 }
                 self.charge_bytes(path, *off, data.len())?;
                 *guard = Some(self.guard.clone());
@@ -1009,10 +1091,10 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                if *inplace {
-                    bail!("signed receiver requires atomic staged publication");
+                if *inplace != (self.copy.policy.publication == PublicationPolicyV1::InPlace) {
+                    bail!("file finalization does not match the signed publication policy");
                 }
-                self.check_mutation_path(path)?;
+                self.check_mutation_path(path, false)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -1023,6 +1105,9 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::PutSmallBatch(puts) => {
+                if self.copy.policy.publication != PublicationPolicyV1::AtomicStaged {
+                    bail!("in-place signed receiver forbids staged small-file publication");
+                }
                 if let Some(limit) = &self.file_data_limit {
                     let bytes = puts.iter().try_fold(0u64, |total, put| {
                         total
@@ -1916,9 +2001,6 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.no_tcp || args.tcp_plain {
         bail!("command-restricted transfers require encrypted TCP data connections");
     }
-    if args.inplace {
-        bail!("command-restricted transfers currently require atomic staged publication");
-    }
     if args.tcp_congestion.is_some() {
         bail!("--tcp-congestion is not yet represented in the signed receiver grant");
     }
@@ -1931,14 +2013,13 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
             "--update, --ignore-existing, --existing, and destination-existence constraints are not yet enforceable by the command-restricted receiver"
         );
     }
-    if !args.ignore_lines.is_empty()
-        || !args.files_from_lines.is_empty()
+    if !args.files_from_lines.is_empty()
         || args.files_from.is_some()
         || args.native_mapping.is_some()
         || args.min_size.is_some()
     {
         bail!(
-            "--ignore/--ignore-from, --files-from, --mapping, and --min-size are not yet independently enforceable by the command-restricted receiver"
+            "--files-from, --mapping, and --min-size are not yet independently enforceable by the command-restricted receiver"
         );
     }
     if args.syq_path.is_some() || args.no_bootstrap {
@@ -2098,6 +2179,28 @@ fn grant_for(
     Ok(grant)
 }
 
+fn filter_destination_roots(
+    args: &Args,
+    sources: &[Location],
+    destination: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    let mut roots = Vec::with_capacity(sources.len());
+    for source in sources {
+        if args.placement == Placement::As || source.copies_contents() {
+            roots.push(destination.to_vec());
+        } else {
+            let basename = source.basename();
+            if basename.is_empty() {
+                bail!("named source has no destination basename for signed filters");
+            }
+            roots.push(crate::fsops::join(destination, &basename));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 pub(crate) fn prepare_transfer(
     args: &Args,
     sources: &[Location],
@@ -2147,6 +2250,15 @@ pub(crate) fn prepare_transfer(
             &canonical_destination,
         )?,
         args.bwlimit_bytes,
+        FilterPolicyV3 {
+            ignore: args.ignore_lines.clone(),
+            destination_roots: filter_destination_roots(
+                args,
+                sources,
+                canonical_destination.as_bytes(),
+            )?,
+            delete_excluded: args.delete_excluded,
+        },
         &private_key,
     )?;
     Ok(PreparedTransfer {
@@ -2198,11 +2310,12 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         revocation_file: None,
     };
     let verified = delegation::verify_and_claim(&envelope, &context, &policy, &replay)?;
-    let (grant, max_file_data_bytes_per_second, deadline) = verified.into_parts();
+    let (grant, max_file_data_bytes_per_second, filters, deadline) = verified.into_parts();
     let authority = std::sync::Arc::new(RestrictedAuthority::new(
         &config,
         grant,
         max_file_data_bytes_per_second,
+        filters,
         deadline,
     )?);
     crate::server::run_restricted(authority)
@@ -2403,6 +2516,24 @@ mod tests {
         maximum_bytes: u64,
         max_file_data_bytes_per_second: u64,
     ) -> RestrictedAuthority {
+        test_authority_with_policy(
+            root,
+            deletion,
+            maximum_bytes,
+            max_file_data_bytes_per_second,
+            FilterPolicyV3::default(),
+            PublicationPolicyV1::AtomicStaged,
+        )
+    }
+
+    fn test_authority_with_policy(
+        root: &Path,
+        deletion: DeletionPolicyV1,
+        maximum_bytes: u64,
+        max_file_data_bytes_per_second: u64,
+        mut filters: FilterPolicyV3,
+        publication: PublicationPolicyV1,
+    ) -> RestrictedAuthority {
         let opened = Root::open(root).unwrap();
         let identity = opened.identity();
         let id = EnrollmentId::random();
@@ -2418,6 +2549,9 @@ mod tests {
             receiver_path: "/usr/bin/syq".into(),
         };
         let destination = root.join("target");
+        if !filters.ignore.is_empty() && filters.destination_roots.is_empty() {
+            filters.destination_roots = vec![destination.as_os_str().as_bytes().to_vec()];
+        }
         let grant = GrantV1 {
             enrollment_id: id,
             target_login: "receiver".into(),
@@ -2436,7 +2570,7 @@ mod tests {
                     placement: DestinationPlacementV1::ExactPath,
                     existing: ExistingDestinationPolicyV1::Replace,
                     deletion,
-                    publication: PublicationPolicyV1::AtomicStaged,
+                    publication,
                 },
                 options: CopyOptionsV1 {
                     recursive: true,
@@ -2469,6 +2603,7 @@ mod tests {
             &config,
             grant,
             max_file_data_bytes_per_second,
+            filters,
             Instant::now() + std::time::Duration::from_secs(60),
         )
         .unwrap()
@@ -2668,6 +2803,163 @@ mod tests {
             guard: None,
         };
         assert!(authority.authorize(&mut write, false).is_err());
+    }
+
+    #[test]
+    fn signed_filters_bind_scans_mutations_and_prune_protection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let policy = FilterPolicyV3 {
+            ignore: vec!["ignored/".into(), "!ignored/file".into()],
+            destination_roots: Vec::new(),
+            delete_excluded: false,
+        };
+        let authority = test_authority_with_policy(
+            &root,
+            DeletionPolicyV1::DeleteDestinationOnly,
+            16,
+            0,
+            policy.clone(),
+            PublicationPolicyV1::AtomicStaged,
+        );
+        let target = root.join("target").as_os_str().as_bytes().to_vec();
+        let ignored = root
+            .join("target/ignored/file")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        let included = root.join("target/included").as_os_str().as_bytes().to_vec();
+
+        let scan = |ignore: Vec<String>| Request::Scan {
+            root: target.clone(),
+            follow_root: false,
+            ignore,
+            report_ignored: true,
+            guard: None,
+        };
+        let mut matching_scan = scan(policy.ignore.clone());
+        authority.authorize(&mut matching_scan, false).unwrap();
+        let mut altered_scan = scan(Vec::new());
+        assert!(authority.authorize(&mut altered_scan, false).is_err());
+
+        let prepare = |path| Request::Prepare {
+            path,
+            size: 4,
+            inplace: false,
+            partial_id: [1; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        let mut included_prepare = prepare(included);
+        authority.authorize(&mut included_prepare, false).unwrap();
+        let mut ignored_prepare = prepare(ignored.clone());
+        assert!(authority.authorize(&mut ignored_prepare, false).is_err());
+        let mut protected_delete = Request::Apply {
+            ops: vec![Op::Unlink {
+                path: ignored.clone(),
+            }],
+            guard: None,
+        };
+        assert!(authority.authorize(&mut protected_delete, false).is_err());
+
+        let delete_excluded = test_authority_with_policy(
+            &root,
+            DeletionPolicyV1::DeleteDestinationOnly,
+            16,
+            0,
+            FilterPolicyV3 {
+                ignore: policy.ignore,
+                destination_roots: Vec::new(),
+                delete_excluded: true,
+            },
+            PublicationPolicyV1::AtomicStaged,
+        );
+        let mut permitted_delete = Request::Apply {
+            ops: vec![Op::Unlink { path: ignored }],
+            guard: None,
+        };
+        delete_excluded
+            .authorize(&mut permitted_delete, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let destination = root.join("target").as_os_str().as_bytes().to_vec();
+        let mut args = Args::try_parse_from([
+            "syq rsync",
+            "-r",
+            "host-a:tree/",
+            "host-a:cache",
+            "host-b:/target",
+        ])
+        .unwrap();
+        args.normalize();
+        args.placement = Placement::Into;
+        let sources = [
+            Location::parse("host-a:tree/").unwrap(),
+            Location::parse("host-a:cache").unwrap(),
+        ];
+        let destination_roots = filter_destination_roots(&args, &sources, &destination).unwrap();
+        let cache = root.join("target/cache").as_os_str().as_bytes().to_vec();
+        assert_eq!(destination_roots, vec![destination, cache.clone()]);
+
+        let authority = test_authority_with_policy(
+            &root,
+            DeletionPolicyV1::Forbid,
+            16,
+            0,
+            FilterPolicyV3 {
+                ignore: vec!["cache/".into()],
+                destination_roots,
+                delete_excluded: false,
+            },
+            PublicationPolicyV1::AtomicStaged,
+        );
+        let prepare = |path| Request::Prepare {
+            path,
+            size: 4,
+            inplace: false,
+            partial_id: [2; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        let mut cache_root = prepare(cache.clone());
+        authority.authorize(&mut cache_root, false).unwrap();
+        let mut cache_child = prepare(crate::fsops::join(&cache, b"file"));
+        authority.authorize(&mut cache_child, false).unwrap();
+    }
+
+    #[test]
+    fn signed_inplace_policy_requires_inplace_file_mutations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority_with_policy(
+            &root,
+            DeletionPolicyV1::Forbid,
+            16,
+            0,
+            FilterPolicyV3::default(),
+            PublicationPolicyV1::InPlace,
+        );
+        let target = root.join("target/file").as_os_str().as_bytes().to_vec();
+        let prepare = |inplace| Request::Prepare {
+            path: target.clone(),
+            size: 4,
+            inplace,
+            partial_id: [1; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        let mut inplace = prepare(true);
+        authority.authorize(&mut inplace, false).unwrap();
+        let mut staged = prepare(false);
+        assert!(authority.authorize(&mut staged, false).is_err());
     }
 
     #[test]

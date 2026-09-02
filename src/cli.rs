@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use clap::{CommandFactory, FromArgMatches, Parser};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
@@ -470,29 +470,7 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
         .map(crate::bwlimit::parse_rate)
         .transpose()?
         .unwrap_or(0);
-    let mut items: Vec<(usize, bool, String)> = Vec::new();
-    if let Some(idx) = matches.indices_of("ignore") {
-        for (i, v) in idx.zip(&args.ignore) {
-            items.push((i, false, v.clone()));
-        }
-    }
-    if let Some(idx) = matches.indices_of("ignore_from") {
-        for (i, v) in idx.zip(&args.ignore_from) {
-            items.push((i, true, v.clone()));
-        }
-    }
-    items.sort_by_key(|(i, _, _)| *i);
-    for (_, from_file, v) in items {
-        if from_file {
-            let text = std::fs::read_to_string(&v)
-                .map_err(|e| anyhow::anyhow!("--ignore-from {v}: {e}"))?;
-            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-            args.ignore_lines
-                .extend(text.lines().map(|l| l.trim_end_matches('\r').to_string()));
-        } else {
-            args.ignore_lines.push(v);
-        }
-    }
+    args.ignore_lines = ordered_ignore_lines(&args.ignore, &args.ignore_from, matches)?;
     if let Some(f) = &args.files_from {
         // Check this before reading the list (it may be stdin) and before
         // anything connects: the list lives on this machine, but a direct
@@ -513,6 +491,45 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
         args.files_from_lines = read_files_from(f, args.from0)?;
     }
     Ok(args)
+}
+
+fn ordered_ignore_lines(
+    ignore: &[String],
+    ignore_from: &[String],
+    matches: &clap::ArgMatches,
+) -> Result<Vec<String>> {
+    let mut items: Vec<(usize, bool, String)> = Vec::new();
+    if let Some(indices) = matches.indices_of("ignore") {
+        items.extend(
+            indices
+                .zip(ignore)
+                .map(|(index, value)| (index, false, value.clone())),
+        );
+    }
+    if let Some(indices) = matches.indices_of("ignore_from") {
+        items.extend(
+            indices
+                .zip(ignore_from)
+                .map(|(index, value)| (index, true, value.clone())),
+        );
+    }
+    items.sort_by_key(|(index, _, _)| *index);
+
+    let mut lines = Vec::new();
+    for (_, from_file, value) in items {
+        if from_file {
+            let text = std::fs::read_to_string(&value)
+                .map_err(|error| anyhow::anyhow!("--ignore-from {value}: {error}"))?;
+            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            lines.extend(
+                text.lines()
+                    .map(|line| line.trim_end_matches('\r').to_string()),
+            );
+        } else {
+            lines.push(value);
+        }
+    }
+    Ok(lines)
 }
 
 fn print_root_help() {
@@ -648,6 +665,25 @@ struct NativeCopyOperationalArgs {
     /// Print transfer statistics at the end
     #[arg(long)]
     stats: bool,
+    /// Skip paths matching a gitignore-style pattern (repeatable)
+    #[arg(long = "ignore", value_name = "PATTERN", allow_hyphen_values = true)]
+    ignore: Vec<String>,
+    /// Read gitignore-style patterns from FILE (repeatable; stacks in command-line order)
+    #[arg(long, value_name = "FILE")]
+    ignore_from: Vec<String>,
+    /// Preserve additional metadata (permissions, ownership, or specials; repeatable/comma-separated)
+    #[arg(long, value_name = "ATTRIBUTE", value_delimiter = ',')]
+    preserve: Vec<NativePreserve>,
+    /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
+    #[arg(long)]
+    inplace: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum NativePreserve {
+    Permissions,
+    Ownership,
+    Specials,
 }
 
 #[derive(clap::Args, Debug)]
@@ -724,7 +760,7 @@ struct NativeCopyFields {
     name = "syq cp",
     version,
     about = "Copy selected objects with explicit endpoint and placement syntax",
-    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies use fixed rsync -rlt behavior: recursive traversal, symlinks copied as symlinks, and modification times preserved. Permissions, owner, group, devices, and special files are not preserved.",
+    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files.",
     override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyCommand {
@@ -737,7 +773,7 @@ struct NativeCopyCommand {
     name = "syq cp-prune",
     version,
     about = "Copy selected objects, then remove target-only objects in mapped scopes",
-    long_about = "Copy selected objects, then remove target-only objects in mapped scopes.\n\nCopying uses fixed rsync -rlt behavior: recursive traversal, symlinks copied as symlinks, and modification times preserved. Permissions, owner, group, devices, and special files are not preserved. Removal uses the current post-transfer deletion scopes and guards.",
+    long_about = "Copy selected objects, then remove target-only objects in mapped scopes.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. Removal uses the current post-transfer deletion scopes and guards; ignored paths remain protected.",
     override_usage = "syq cp-prune [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyPruneCommand {
@@ -998,7 +1034,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             bail!("--mapping with a remote-to-remote copy is not supported; one end must be local");
         }
     }
-    apply_native_copy_operational(&mut args, parsed.operational)?;
+    apply_native_copy_operational(&mut args, parsed.operational, &matches)?;
     apply_internal_native_direct(&mut args)?;
     Ok(args)
 }
@@ -1153,6 +1189,7 @@ fn apply_native_operational(args: &mut Args, operational: NativeOperationalArgs)
 fn apply_native_copy_operational(
     args: &mut Args,
     operational: NativeCopyOperationalArgs,
+    matches: &clap::ArgMatches,
 ) -> Result<()> {
     let NativeCopyOperationalArgs {
         common,
@@ -1160,6 +1197,10 @@ fn apply_native_copy_operational(
         no_compress,
         bwlimit,
         stats,
+        ignore,
+        ignore_from,
+        preserve,
+        inplace,
     } = operational;
     args.checksum = hash;
     args.no_compress = no_compress;
@@ -1173,6 +1214,20 @@ fn apply_native_copy_operational(
         .unwrap_or(0);
     args.bwlimit = bwlimit;
     args.stats = stats;
+    args.ignore_lines = ordered_ignore_lines(&ignore, &ignore_from, matches)?;
+    args.ignore = ignore;
+    args.ignore_from = ignore_from;
+    args.inplace = inplace;
+    for attribute in preserve {
+        match attribute {
+            NativePreserve::Permissions => args.perms = true,
+            NativePreserve::Ownership => {
+                args.owner = true;
+                args.group = true;
+            }
+            NativePreserve::Specials => args.devices = true,
+        }
+    }
     apply_native_operational(args, common);
     Ok(())
 }
@@ -1594,6 +1649,29 @@ mod tests {
         let argv = ["--hash", "source", "--into", "destination"].map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
         assert!(args.checksum);
+    }
+
+    #[test]
+    fn native_copy_policies_lower_to_the_shared_engine() {
+        let argv = [
+            "--ignore",
+            "*.tmp",
+            "--ignore",
+            "!keep.tmp",
+            "--preserve=permissions,ownership,specials",
+            "--inplace",
+            "source",
+            "--into",
+            "destination",
+        ]
+        .map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        assert_eq!(args.ignore_lines, ["*.tmp", "!keep.tmp"]);
+        assert!(args.perms);
+        assert!(args.owner);
+        assert!(args.group);
+        assert!(args.devices);
+        assert!(args.inplace);
     }
 
     #[test]

@@ -2391,7 +2391,44 @@ impl FsOps {
         let p = resolve(path);
         if let Some(guard) = guard {
             if inplace {
-                bail!("guarded destination cannot be prepared in place");
+                self.uncache(&p);
+                let target = guarded_target(path, guard)?;
+                for _ in 0..8 {
+                    match target.root.metadata_optional(&target.relative)? {
+                        Some(metadata) if metadata.is_file() => {
+                            let file = target.root.open_regular_write(&target.relative, false)?;
+                            require_rooted_metadata(&file, metadata, &target.label)?;
+                            file.set_len(size).with_context(|| {
+                                format!("resize confined file {}", target.label.display())
+                            })?;
+                            return Ok(());
+                        }
+                        Some(metadata) if metadata.is_dir() => {
+                            bail!("destination {} is a directory", target.label.display())
+                        }
+                        Some(_) => target.root.unlink(&target.relative)?,
+                        None => match target.root.create_file(&target.relative, mode) {
+                            Ok(file) => {
+                                file.set_len(size).with_context(|| {
+                                    format!("resize confined file {}", target.label.display())
+                                })?;
+                                return Ok(());
+                            }
+                            Err(error)
+                                if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                                    error.kind() == io::ErrorKind::AlreadyExists
+                                }) =>
+                            {
+                                continue
+                            }
+                            Err(error) => return Err(error),
+                        },
+                    }
+                }
+                bail!(
+                    "destination {} changed repeatedly while opening it",
+                    target.label.display()
+                );
             }
             let target = guarded_target(path, guard)?;
             let pp = partial_path(&p, partial_id)?;
@@ -2637,12 +2674,15 @@ impl FsOps {
             && !destination_fs.synchronous;
         let mut userspace_fallback = false;
         #[cfg(debug_assertions)]
-        if !inplace && std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
+        if std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
             if use_sequential_nfs_fallback {
                 userspace_fallback = true;
             } else {
                 drop(d);
-                fs::remove_file(&target).with_context(|| format!("remove {}", target.display()))?;
+                if !inplace {
+                    fs::remove_file(&target)
+                        .with_context(|| format!("remove {}", target.display()))?;
+                }
                 bail!("EXDEV");
             }
         }
@@ -2673,14 +2713,11 @@ impl FsOps {
                         userspace_fallback = true;
                         continue;
                     }
-                    if inplace {
-                        drop(d);
-                        let _ = fs::remove_file(&target);
-                    } else {
+                    drop(d);
+                    if !inplace {
                         // The planner probed before this empty sidecar existed.
                         // A content-identical fallback completes through its
                         // retained basis fd and would otherwise orphan it.
-                        drop(d);
                         fs::remove_file(&target)
                             .with_context(|| format!("remove {}", target.display()))?;
                     }
@@ -2884,11 +2921,19 @@ impl FsOps {
         };
         let f = if let Some(guard) = target.guard {
             if inplace {
-                bail!("guarded destination cannot be written in place");
+                let final_target = guarded_target(target.path, guard)?;
+                self.cached_rooted(
+                    &p,
+                    &final_target.root,
+                    &final_target.relative,
+                    attempt,
+                    false,
+                )?
+            } else {
+                let final_target = guarded_target(target.path, guard)?;
+                let relative = relative_under(&final_target.root_path, &p)?;
+                self.cached_rooted(&p, &final_target.root, &relative, attempt, true)?
             }
-            let final_target = guarded_target(target.path, guard)?;
-            let relative = relative_under(&final_target.root_path, &p)?;
-            self.cached_rooted(&p, &final_target.root, &relative, attempt, true)?
         } else {
             self.cached(&p, true, attempt, !inplace)?
         };
@@ -2991,10 +3036,17 @@ impl FsOps {
         else {
             unreachable!("rooted finalization requires a container guard")
         };
-        if inplace {
-            bail!("guarded destination cannot be finalized in place");
-        }
         let target = guarded_target(path, guard)?;
+        if inplace {
+            let file = self
+                .uncache(&target.label)
+                .map(Ok)
+                .unwrap_or_else(|| target.root.open_regular_write(&target.relative, false))?;
+            set_meta_file(&file, meta, flags)
+                .with_context(|| format!("set metadata {}", target.label.display()))?;
+            require_rooted_named_identity(&target, &file, condition)?;
+            return Ok(());
+        }
         let src = partial_path(&target.label, partial_id)?;
         let src_relative = relative_under(&target.root_path, &src)?;
         let file = self
@@ -3665,6 +3717,84 @@ mod tests {
 
         assert!(regular_opened);
         assert!(link_rejected);
+    }
+
+    #[test]
+    fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
+        let dir = test_dir();
+        let root_path = dir.join("root");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&root_path).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let target = root_path.join("file");
+        let sentinel = outside.join("sentinel");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&sentinel, b"outside").unwrap();
+        symlink(&outside, root_path.join("escape")).unwrap();
+
+        let root = Root::open(&root_path).unwrap();
+        let identity = root.identity();
+        let guard = ContainerGuard {
+            root: root_path.as_os_str().as_bytes().to_vec(),
+            dev: identity.dev,
+            ino: identity.ino,
+        };
+        let target_bytes = target.as_os_str().as_bytes();
+        let partial_id = [7; 16];
+        let inode = fs::metadata(&target).unwrap().ino();
+        let mut operations = FsOps::new();
+        operations
+            .prepare(target_bytes, 3, true, &partial_id, 0o600, Some(&guard))
+            .unwrap();
+        operations
+            .write_range(
+                PartialTarget {
+                    path: target_bytes,
+                    id: &partial_id,
+                    guard: Some(&guard),
+                },
+                true,
+                0,
+                0,
+                content_digest(b"new"),
+                b"new",
+            )
+            .unwrap();
+        operations
+            .finalize(
+                target_bytes,
+                true,
+                &partial_id,
+                &Meta {
+                    mode: 0o600,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                },
+                0,
+                TargetMutation {
+                    condition: TargetCondition::Any,
+                    guard: Some(&guard),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(fs::metadata(&target).unwrap().ino(), inode);
+        let escaped = root_path.join("escape/sentinel");
+        assert!(operations
+            .prepare(
+                escaped.as_os_str().as_bytes(),
+                1,
+                true,
+                &partial_id,
+                0o600,
+                Some(&guard),
+            )
+            .is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

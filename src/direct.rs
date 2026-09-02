@@ -175,11 +175,15 @@ fn automatic_enrollment_allowed(dry_run: bool, verify_only: bool) -> bool {
     !(dry_run || verify_only)
 }
 
-fn utf8_path(path: &[u8], role: &str) -> Result<String> {
+fn utf8_path(path: &[u8], role: &str, interface: Interface) -> Result<String> {
     String::from_utf8(path.to_vec()).map_err(|_| {
-        anyhow::anyhow!(
-            "direct remote-to-remote {role} is not valid UTF-8; use --relay so raw path bytes travel in the protocol"
-        )
+        if interface == Interface::Rsync {
+            anyhow::anyhow!(
+                "direct remote-to-remote {role} is not valid UTF-8; use --relay so raw path bytes travel in the protocol"
+            )
+        } else {
+            anyhow::anyhow!("native direct remote-to-remote {role} must be valid UTF-8")
+        }
     })
 }
 
@@ -373,6 +377,23 @@ pub fn run(
     if args.interface != Interface::Rsync && args.checksum {
         remote.push("--hash".into());
     }
+    if args.inplace {
+        remote.push("--inplace".into());
+    }
+    for line in &args.ignore_lines {
+        remote.push(format!("--ignore={line}"));
+    }
+    if args.interface != Interface::Rsync {
+        if args.perms {
+            remote.push("--preserve=permissions".into());
+        }
+        if args.owner || args.group {
+            remote.push("--preserve=ownership".into());
+        }
+        if args.devices {
+            remote.push("--preserve=specials".into());
+        }
+    }
     if let Some(j) = args.connections_opt {
         remote.push("-j".into());
         remote.push(j.to_string());
@@ -382,9 +403,6 @@ pub fn run(
         remote.push(format!("--min-split={}", args.min_split));
         if args.verify_only {
             remote.push("--verify-only".into());
-        }
-        if args.inplace {
-            remote.push("--inplace".into());
         }
         if args.insecure_links {
             remote.push("--insecure-links".into());
@@ -412,9 +430,6 @@ pub fn run(
         }
         if let Some(path) = &args.checkpoint {
             remote.push(format!("--checkpoint={path}"));
-        }
-        for line in &args.ignore_lines {
-            remote.push(format!("--ignore={line}"));
         }
     }
     if let Some(rate) = &args.bwlimit {
@@ -478,11 +493,13 @@ pub fn run(
     if args.interface == Interface::Rsync {
         remote.push("--".into());
         for source in srcs {
-            remote.push(utf8_path(&source.path, "source path")?);
+            remote.push(utf8_path(&source.path, "source path", args.interface)?);
         }
-        let dst_path = restricted_destination_path
-            .clone()
-            .unwrap_or(utf8_path(&dst.path, "target path")?);
+        let dst_path = restricted_destination_path.clone().unwrap_or(utf8_path(
+            &dst.path,
+            "target path",
+            args.interface,
+        )?);
         let dst_arg = if srcs[0].same_host(dst) {
             if dst.path.starts_with(b"/")
                 || dst.path == b"~"
@@ -522,7 +539,7 @@ pub fn run(
                 }
                 .into(),
             );
-            remote.push(utf8_path(&source.path, "source path")?);
+            remote.push(utf8_path(&source.path, "source path", args.interface)?);
         }
         if !srcs[0].same_host(dst) {
             remote.push("--to".into());
@@ -533,11 +550,11 @@ pub fn run(
             ));
         }
         remote.push(native_placement_arg(args)?.into());
-        remote.push(
-            restricted_destination_path
-                .clone()
-                .unwrap_or(utf8_path(&dst.path, "target path")?),
-        );
+        remote.push(restricted_destination_path.clone().unwrap_or(utf8_path(
+            &dst.path,
+            "target path",
+            args.interface,
+        )?));
     }
 
     if args.detach {
@@ -671,7 +688,11 @@ pub fn run(
         return Ok(0);
     }
     if !args.quiet {
-        eprintln!("syq: remote-to-remote: running on {src_host} (use --relay to route data through this machine)");
+        if args.interface == Interface::Rsync {
+            eprintln!("syq: remote-to-remote: running on {src_host} (use --relay to route data through this machine)");
+        } else {
+            eprintln!("syq: remote-to-remote: running on {src_host}");
+        }
     }
     let run = || {
         let mut cmd = make_command();
@@ -706,9 +727,15 @@ pub fn run(
                 && !args.unrestricted_agent_forwarding
                 && !same_host
             {
-                bail!("remote-to-remote transfer on {src_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Retry with --relay, use --no-forward-agent with source-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", destination_login_user.as_deref().unwrap_or("the destination user"), dst.host.as_deref().unwrap_or("the destination"))
+                if args.interface == Interface::Rsync {
+                    bail!("remote-to-remote transfer on {src_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Retry with --relay, use --no-forward-agent with source-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", destination_login_user.as_deref().unwrap_or("the destination user"), dst.host.as_deref().unwrap_or("the destination"))
+                }
+                bail!("remote-to-remote transfer on {src_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --no-forward-agent with source-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", destination_login_user.as_deref().unwrap_or("the destination user"), dst.host.as_deref().unwrap_or("the destination"))
             }
-            bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
+            if args.interface == Interface::Rsync {
+                bail!("remote-to-remote transfer on {src_host} failed (exit {c}); if {src_host} cannot reach the destination, retry with --relay")
+            }
+            bail!("remote-to-remote transfer on {src_host} failed (exit {c}); {src_host} may not be able to reach the destination")
         }
         None => bail!("remote syq on {src_host} killed by signal"),
     }
@@ -734,7 +761,7 @@ pub fn follow(args: &Args) -> Result<i32> {
     let (Some(host), log) = (&loc.host, &loc.path) else {
         bail!("usage: syq rsync --follow HOST:LOGFILE")
     };
-    let log = utf8_path(log, "log path")?;
+    let log = utf8_path(log, "log path", Interface::Rsync)?;
     let rsh = parse_rsh(&args.rsh)?;
     let mut cmd = Command::new(&rsh[0]);
     cmd.args(&rsh[1..]);
