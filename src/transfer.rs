@@ -2,7 +2,7 @@
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{
-    parse_rsh, parse_size, Args, Existence, Interface, Location, Placement, SourceSelection,
+    parse_rsh, parse_size, Args, Existence, Interface, Location, Placement, RunAt, SourceSelection,
 };
 use crate::conn::{
     ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
@@ -16,6 +16,7 @@ use crate::tune::{self, Gate};
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -97,12 +98,18 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
         None => Endpoint::Local,
         Some(h) => {
             let rsh = parse_rsh(&args.rsh)?;
+            if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
+                bail!(
+                    "an explicit endpoint SSH port requires the default ssh or an --rsh command whose executable is ssh"
+                );
+            }
             let ssh_multiplexer = if args.rsh.is_some() {
                 None
             } else if args.reuse_connection && args.restricted_grant.is_none() {
                 Some(Arc::new(SshMultiplexer::persistent(
                     loc.user.as_deref(),
                     h,
+                    loc.port,
                 )?))
             } else {
                 Some(Arc::new(SshMultiplexer::new()?))
@@ -111,6 +118,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 local_process: false,
                 user: loc.user.clone(),
                 host: h.clone(),
+                port: loc.port,
                 rsh,
                 syq_path: args.syq_path.clone(),
                 auto_helper: args.restricted_grant.is_none()
@@ -667,6 +675,22 @@ fn handle_tcp_setup_error(
     Ok(())
 }
 
+fn announce_detached_ready() -> Result<()> {
+    let Some(path) = std::env::var_os("SYQ_INTERNAL_DETACH_READY") else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("create detached-readiness marker {}", path.display()))?;
+    use std::io::Write as _;
+    file.write_all(b"ready\n")?;
+    Ok(())
+}
+
 pub fn run(args: Args) -> Result<i32> {
     let mut args = args;
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
@@ -696,6 +720,17 @@ pub fn run(args: Args) -> Result<i32> {
         .map(|(_, sources)| sources)
         .unwrap_or(&[]);
     let (dst, original_srcs) = locs.split_last().unwrap();
+    let direct_remote_to_remote = original_srcs[0].is_remote()
+        && dst.is_remote()
+        && !original_srcs[0].same_host(dst)
+        && !args.relay
+        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local);
+    if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
+    {
+        bail!(
+            "--detach, --no-forward-agent, and --agent-broker-only apply only to a direct copy between two different remote endpoints"
+        );
+    }
     if args.restricted_grant.is_some()
         && (args.no_tcp
             || args.tcp_plain
@@ -712,12 +747,7 @@ pub fn run(args: Args) -> Result<i32> {
             bail!("all sources must be on the same host");
         }
     }
-    if args.unrestricted_agent_forwarding
-        && (!original_srcs[0].is_remote()
-            || !dst.is_remote()
-            || original_srcs[0].same_host(dst)
-            || args.relay)
-    {
+    if args.unrestricted_agent_forwarding && !direct_remote_to_remote {
         bail!(
             "--unrestricted-agent-forwarding is only valid for a live direct transfer between two different remote hosts"
         );
@@ -801,6 +831,12 @@ pub fn run(args: Args) -> Result<i32> {
         };
     }
     if src_ep.is_remote() && dst_ep.is_remote() {
+        if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
+            args.relay = true;
+        }
+        if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
+            return crate::direct::run_at_target(&args, srcs, dst, source_operand_count);
+        }
         if !args.relay {
             // The direct orchestrator runs on the source host and rebuilds
             // the command; no direct leg holds a reusable local master, so
@@ -815,7 +851,10 @@ pub fn run(args: Args) -> Result<i32> {
                 .iter()
                 .chain(std::iter::once(dst))
                 .all(|location| std::str::from_utf8(&location.path).is_ok());
-            if args.interface == Interface::Rsync || direct_paths_are_utf8 {
+            if args.interface == Interface::Rsync
+                || direct_paths_are_utf8
+                || args.run_at == RunAt::Source
+            {
                 // Let the remote orchestrator observe the original source count so
                 // repeated file sources keep multi-source destination semantics.
                 return crate::direct::run(&args, srcs, dst, source_operand_count);
@@ -829,6 +868,8 @@ pub fn run(args: Args) -> Result<i32> {
         if args.relay && !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
+    } else if args.interface != Interface::Rsync && args.run_at != RunAt::Auto {
+        bail!("--run-at currently applies only to copies between two remote endpoints");
     }
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {
@@ -1546,6 +1587,7 @@ pub fn run(args: Args) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
+    announce_detached_ready()?;
     let all_remote_endpoints_use_tcp = use_tcp
         && [&src_ep, &dst_ep]
             .into_iter()

@@ -150,8 +150,29 @@ pub fn resolve_host_policy(
     host: &str,
     load_user_certificates: bool,
 ) -> Result<HostPolicy> {
-    let inspection = inspect_ssh_configuration(ssh_program, explicit_user, host, false)?;
-    let defaults = inspect_ssh_configuration(ssh_program, explicit_user, host, true)?;
+    resolve_host_policy_at(
+        ssh_program,
+        explicit_user,
+        host,
+        None,
+        load_user_certificates,
+    )
+}
+
+/// Resolve host policy after applying an explicit endpoint port. Keeping the
+/// port in the OpenSSH query makes the actual connection, known-host lookup,
+/// broker binding, and enrollment route describe the same endpoint.
+pub fn resolve_host_policy_at(
+    ssh_program: &str,
+    explicit_user: Option<&str>,
+    host: &str,
+    explicit_port: Option<u16>,
+    load_user_certificates: bool,
+) -> Result<HostPolicy> {
+    let inspection =
+        inspect_ssh_configuration_at(ssh_program, explicit_user, host, explicit_port, false)?;
+    let defaults =
+        inspect_ssh_configuration_at(ssh_program, explicit_user, host, explicit_port, true)?;
     let defaults = KnownHostsDefaults::from_openssh(&defaults.output)?;
     let config = parse_ssh_config_with_defaults(
         &inspection.output,
@@ -196,10 +217,27 @@ struct SshConfigurationInspection {
     known_hosts_configured: KnownHostsConfigured,
 }
 
+#[cfg(test)]
 fn inspect_ssh_configuration(
     ssh_program: &str,
     explicit_user: Option<&str>,
     host: &str,
+    compiled_defaults_only: bool,
+) -> Result<SshConfigurationInspection> {
+    inspect_ssh_configuration_at(
+        ssh_program,
+        explicit_user,
+        host,
+        None,
+        compiled_defaults_only,
+    )
+}
+
+fn inspect_ssh_configuration_at(
+    ssh_program: &str,
+    explicit_user: Option<&str>,
+    host: &str,
+    explicit_port: Option<u16>,
     compiled_defaults_only: bool,
 ) -> Result<SshConfigurationInspection> {
     let mut command = Command::new(ssh_program);
@@ -209,6 +247,9 @@ fn inspect_ssh_configuration(
     }
     if let Some(user) = explicit_user {
         command.args(["-l", user]);
+    }
+    if let Some(port) = explicit_port {
+        command.args(["-p", &port.to_string()]);
     }
     command.args(["--", host]).env("LC_ALL", "C");
     let output = command
@@ -2839,6 +2880,12 @@ mod tests {
         assert_eq!(resolved.known_hosts_name, "stable-vault");
         assert_eq!(resolved.host_keys, [host_key]);
         assert!(resolved.user_certificates.is_empty());
+
+        let overridden =
+            resolve_host_policy_at(ssh.to_str().unwrap(), None, "vault", Some(2200), false)
+                .unwrap();
+        assert_eq!(overridden.port(), 2200);
+        assert_eq!(overridden.known_hosts_name, "stable-vault");
     }
 
     #[test]

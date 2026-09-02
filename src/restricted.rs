@@ -88,6 +88,8 @@ struct LocalEnrollment {
     version: u16,
     id: EnrollmentId,
     host: String,
+    #[serde(default)]
+    port: Option<u16>,
     target_login: String,
     remote_home: String,
     requested_parent: String,
@@ -100,6 +102,8 @@ struct PendingEnrollment {
     version: u16,
     id: EnrollmentId,
     host: String,
+    #[serde(default)]
+    port: Option<u16>,
     target_login: String,
     requested_destination: String,
 }
@@ -2351,12 +2355,13 @@ fn install_over_route(
     Ok(response)
 }
 
-fn endpoint(login: &str, host: &str) -> Result<SshEndpoint> {
-    SshEndpoint::parse(&format!("{login}@{host}"))
+fn endpoint(login: &str, host: &str, port: Option<u16>) -> Result<SshEndpoint> {
+    SshEndpoint::from_parts(login, host, port)
 }
 
 fn enroll(
     host: &str,
+    port: Option<u16>,
     login: &str,
     requested_destination: &str,
     jump: Option<&SshEndpoint>,
@@ -2368,7 +2373,7 @@ fn enroll(
 
     let mut active = None;
     for (metadata, directory) in load_local_enrollments()? {
-        if metadata.host == host && metadata.target_login == login {
+        if metadata.host == host && metadata.port == port && metadata.target_login == login {
             if let Some(canonical_destination) = destination_for(&metadata, requested_destination)?
             {
                 active = Some((metadata, directory, canonical_destination));
@@ -2392,6 +2397,7 @@ fn enroll(
             .into_iter()
             .find(|(pending, _)| {
                 pending.host == host
+                    && pending.port == port
                     && pending.target_login == login
                     && pending.requested_destination == requested_destination
             })
@@ -2405,6 +2411,7 @@ fn enroll(
                 version: CONFIG_VERSION,
                 id: metadata.id,
                 host: metadata.host,
+                port: metadata.port,
                 target_login: metadata.target_login,
                 requested_destination: requested_destination.to_owned(),
             };
@@ -2421,6 +2428,7 @@ fn enroll(
                 version: CONFIG_VERSION,
                 id,
                 host: host.to_owned(),
+                port,
                 target_login: login.to_owned(),
                 requested_destination: requested_destination.to_owned(),
             };
@@ -2436,7 +2444,7 @@ fn enroll(
         requested_destination: requested_destination.to_owned(),
         public_key,
     };
-    let target = endpoint(login, host)?;
+    let target = endpoint(login, host, port)?;
     let direct = install_over_route(&target, EnrollmentRoute::Direct, &request);
     let response = match (direct, jump) {
         (Ok(response), _) => response,
@@ -2457,6 +2465,7 @@ fn enroll(
         version: CONFIG_VERSION,
         id: pending.id,
         host: host.to_owned(),
+        port,
         target_login: login.to_owned(),
         remote_home: response.remote_home,
         requested_parent: response.requested_parent,
@@ -2786,7 +2795,10 @@ pub(crate) fn prepare_transfer(
         .context("restricted destination path is not UTF-8")?;
     let mut selected = None;
     for (metadata, directory) in load_local_enrollments()? {
-        if metadata.host == host && metadata.target_login == destination_login {
+        if metadata.host == host
+            && metadata.port == destination.port
+            && metadata.target_login == destination_login
+        {
             if let Some(canonical_destination) = destination_for(&metadata, requested)? {
                 selected = Some((metadata, directory, canonical_destination));
                 break;
@@ -2804,8 +2816,16 @@ pub(crate) fn prepare_transfer(
             let jump = endpoint(
                 source_login,
                 sources[0].host.as_deref().context("source host missing")?,
+                sources[0].port,
             )?;
-            enroll(host, destination_login, requested, Some(&jump), false)?
+            enroll(
+                host,
+                destination.port,
+                destination_login,
+                requested,
+                Some(&jump),
+                false,
+            )?
         }
     };
     let private_key = load_private_key(&directory)?;
@@ -2935,18 +2955,21 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                     .map(|(metadata, _)| metadata.id)
                     .collect::<HashSet<_>>();
                 for (metadata, _) in active {
+                    let target = endpoint(&metadata.target_login, &metadata.host, metadata.port)?;
                     println!(
-                        "{}\tactive\t{}@{}\t{}",
-                        metadata.id, metadata.target_login, metadata.host, metadata.canonical_root
+                        "{}\tactive\t{}\t{}",
+                        metadata.id,
+                        target.label(),
+                        metadata.canonical_root
                     );
                 }
                 for (pending, _) in load_pending_enrollments()? {
                     if !active_ids.contains(&pending.id) {
+                        let target = endpoint(&pending.target_login, &pending.host, pending.port)?;
                         println!(
-                            "{}\tpending\t{}@{}\t{}",
+                            "{}\tpending\t{}\t{}",
                             pending.id,
-                            pending.target_login,
-                            pending.host,
+                            target.label(),
                             pending.requested_destination
                         );
                     }
@@ -2979,11 +3002,19 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                 host,
                 true,
             )?;
-            let (metadata, _, destination) =
-                enroll(host, &policy.login_user, requested, via.as_ref(), true)?;
+            let (metadata, _, destination) = enroll(
+                host,
+                None,
+                &policy.login_user,
+                requested,
+                via.as_ref(),
+                true,
+            )?;
             println!(
-                "enrolled {} for {}@{}:{}",
-                metadata.id, metadata.target_login, metadata.host, destination
+                "enrolled {} for {}:{}",
+                metadata.id,
+                endpoint(&metadata.target_login, &metadata.host, metadata.port)?.label(),
+                destination
             );
             Ok(0)
         })()),
@@ -3002,7 +3033,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             let active = load_local_enrollments()?
                 .into_iter()
                 .find(|(metadata, _)| metadata.id == id);
-            let (target_login, host, remote_command, directory) = match active {
+            let (target_login, host, port, remote_command, directory) = match active {
                 Some((metadata, directory)) => {
                     let command = enrollment::EnrollmentRemoteCommand::new(
                         Path::new(&metadata.receiver_path),
@@ -3011,6 +3042,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                     (
                         metadata.target_login,
                         metadata.host,
+                        metadata.port,
                         command.as_str().to_owned(),
                         directory,
                     )
@@ -3023,6 +3055,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                     (
                         pending.target_login,
                         pending.host,
+                        pending.port,
                         "exec \"$HOME/.local/libexec/syq-receiver\" --restricted-revoke".to_owned(),
                         directory,
                     )
@@ -3035,7 +3068,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                 target_login: target_login.clone(),
                 public_key: private_key.public_key().to_openssh()?,
             };
-            let target = endpoint(&target_login, &host)?;
+            let target = endpoint(&target_login, &host, port)?;
             let encoded = serde_json::to_vec(&request)?;
             let direct = run_ssh(&target, EnrollmentRoute::Direct, &remote_command, &encoded);
             match (direct, via.as_ref()) {
@@ -3054,7 +3087,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             delegation::validate_private_directory_path(&directory)?;
             fs::remove_dir_all(&directory)
                 .with_context(|| format!("remove local enrollment {}", directory.display()))?;
-            println!("revoked {id} from {target_login}@{host}");
+            println!("revoked {id} from {}", target.label());
             Ok(0)
         })()),
         _ => None,
@@ -3252,6 +3285,7 @@ mod tests {
             version: CONFIG_VERSION,
             id,
             host: "host-b".into(),
+            port: None,
             target_login: "backup".into(),
             requested_destination: "/archive/item".into(),
         };
@@ -3275,6 +3309,7 @@ mod tests {
             version: CONFIG_VERSION,
             id,
             host: pending.host,
+            port: pending.port,
             target_login: pending.target_login,
             remote_home: "/home/backup".into(),
             requested_parent: "/archive".into(),
