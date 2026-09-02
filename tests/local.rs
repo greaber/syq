@@ -376,6 +376,130 @@ fn native_copy_uses_explicit_endpoints_cwd_and_option_safe_selectors() {
 }
 
 #[test]
+fn native_copy_typed_selectors_are_source_preconditions() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"file");
+    write(&t.path("src/dir/child"), b"child");
+    symlink("dir", t.path("src/link")).unwrap();
+
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("src"),
+        "--src-file",
+        "file",
+        "--src-dir",
+        "dir",
+        "--src-file",
+        "link",
+        "--into-new",
+        &t.s("copied"),
+    ]);
+    assert_eq!(read(&t.path("copied/file")), b"file");
+    assert_eq!(read(&t.path("copied/dir/child")), b"child");
+    assert_eq!(
+        fs::read_link(t.path("copied/link")).unwrap(),
+        Path::new("dir")
+    );
+
+    run_native_ok(&[
+        "cp",
+        "--src-file",
+        &t.s("src/file"),
+        "--as-new",
+        &t.s("exact"),
+    ]);
+    assert_eq!(read(&t.path("exact")), b"file");
+
+    let wrong_directory = native_syq(&[
+        "cp",
+        "--src-dir",
+        &t.s("src/file"),
+        "--into-new",
+        &t.s("wrong-directory"),
+    ]);
+    assert!(!wrong_directory.status.success());
+    assert!(stderr_of(&wrong_directory).contains("--src-dir selector"));
+    assert!(!t.path("wrong-directory").exists());
+
+    let followed_link = native_syq(&[
+        "cp",
+        "--src-dir",
+        &t.s("src/link"),
+        "--into-new",
+        &t.s("followed-link"),
+    ]);
+    assert!(!followed_link.status.success());
+    assert!(stderr_of(&followed_link).contains("--src-dir selector"));
+    assert!(!t.path("followed-link").exists());
+}
+
+#[test]
+fn native_cp_prune_checks_all_typed_sources_before_mutation() {
+    let t = Tmp::new();
+    write(&t.path("src/good"), b"new");
+    write(&t.path("src/not-a-file/child"), b"child");
+    write(&t.path("dst/good"), b"old");
+    write(&t.path("dst/extra"), b"keep");
+
+    let output = native_syq(&[
+        "cp-prune",
+        "--src-file",
+        &t.s("src/good"),
+        "--src-file",
+        &t.s("src/not-a-file"),
+        "--into-existing",
+        &t.s("dst"),
+    ]);
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("--src-file selector"));
+    assert_eq!(read(&t.path("dst/good")), b"old");
+    assert_eq!(read(&t.path("dst/extra")), b"keep");
+}
+
+#[test]
+fn native_copy_accepts_copy_only_operational_controls() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-file",
+            &t.s("src/file"),
+            "--as-new",
+            &t.s("copied"),
+            "--bwlimit",
+            "1G",
+            "--stats",
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("copied")), b"payload");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("scanned entries:"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let invalid = native_syq(&[
+        "cp",
+        &t.s("src/file"),
+        "--as-new",
+        &t.s("invalid"),
+        "--bwlimit",
+        "fast",
+    ]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(stderr_of(&invalid).contains("bad --bwlimit"));
+    assert!(!t.path("invalid").exists());
+}
+
+#[test]
 fn native_copy_named_selector_preserves_a_root_symlink() {
     use std::os::unix::fs::symlink;
 
@@ -768,6 +892,30 @@ fn native_rm_typed_selectors_check_every_type_before_mutation() {
     ]);
     assert!(!t.path("file").exists());
     assert!(!t.path("directory").exists());
+}
+
+#[test]
+fn native_rm_accepts_bulk_typed_selectors() {
+    let t = Tmp::new();
+    write(&t.path("base/file-a"), b"a");
+    write(&t.path("base/file-b"), b"b");
+    write(&t.path("base/dir-a/child"), b"a");
+    write(&t.path("base/dir-b/child"), b"b");
+
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s("base"),
+        "--src-files",
+        "file-a",
+        "file-b",
+        "--src-dirs",
+        "dir-a",
+        "dir-b",
+        "--progress-json",
+        "--no-progress",
+    ]);
+    assert!(listing(&t.path("base")).is_empty());
 }
 
 #[test]
@@ -3823,6 +3971,10 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
     write(&t.path("sources/a"), b"a");
     write(&t.path("sources/tree/f"), b"tree");
     write(&t.path("sources/contents/b"), b"b");
+    write(&t.path("sources/file-a"), b"file-a");
+    write(&t.path("sources/file-b"), b"file-b");
+    write(&t.path("sources/dir-a/c"), b"dir-a");
+    write(&t.path("sources/dir-b/d"), b"dir-b");
     write(&t.path("sources/z"), b"z");
 
     run_native_ok(&[
@@ -3832,6 +3984,12 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         "tree",
         "--src-srcs",
         "contents",
+        "--src-files",
+        "file-a",
+        "file-b",
+        "--src-dirs",
+        "dir-a",
+        "dir-b",
         "--src",
         "z",
         "--cwd",
@@ -3842,7 +4000,13 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         &t.s("dest"),
     ]);
 
-    assert_eq!(listing(&t.path("dest")), ["a", "b", "tree", "tree/f", "z"]);
+    assert_eq!(
+        listing(&t.path("dest")),
+        [
+            "a", "b", "dir-a", "dir-a/c", "dir-b", "dir-b/d", "file-a", "file-b", "tree", "tree/f",
+            "z",
+        ]
+    );
 }
 
 #[test]
@@ -3866,6 +4030,8 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
         ["cp", "-a", "source", "--into", "dest"].as_slice(),
         ["cp", "--delete", "source", "--into", "dest"].as_slice(),
         ["rm", "--no-tcp", "source", "", ""].as_slice(),
+        ["rm", "--bwlimit", "1M", "source", ""].as_slice(),
+        ["rm", "--stats", "source", "", ""].as_slice(),
     ] {
         let args: Vec<_> = args.iter().copied().filter(|arg| !arg.is_empty()).collect();
         let out = native_syq(&args);

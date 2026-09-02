@@ -150,6 +150,8 @@ target placement in separate arguments:
 syq cp project --to server --into /backup       # named object → /backup/project
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
+syq cp --src-file report --src-dir assets --into /backup
+syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
 syq cp report --to server --as-new /reports/final
 syq cp-prune --src-src build --to server --into-existing /srv/app
 syq rm cache old-output
@@ -169,12 +171,17 @@ any `.` or `..` component.
 Bare paths and repeatable `--src PATH` select named objects. A named directory
 keeps its basename at the target; a named symlink is copied as a symlink. A
 trailing slash is ordinary path spelling and has no semantic effect.
+`--src-file PATH` adds the precondition that the named object is not a
+directory, while `--src-dir DIR` requires a directory; on a match they copy
+exactly like `--src`, including copying a selected symlink rather than following
+it. These typed selectors are available to `cp`, `cp-prune`, and `rm`.
 `--src-src DIR` selects a directory's contents and merges them directly into
-the target container. `--srcs PATH...` and `--src-srcs DIR...` are bulk
-conveniences for those two canonical selectors. Symlinks found while traversing
-a directory are copied as symlinks and are never followed. Singular selector
-options consume their next argument even when it begins with `-`, so every Unix
-filename is expressible without losing raw path bytes.
+the target container. `--srcs PATH...`, `--src-srcs DIR...`, `--src-files
+PATH...`, and `--src-dirs DIR...` are bulk conveniences for the corresponding
+singular selectors. Symlinks found while traversing a directory are copied as
+symlinks and are never followed. Singular selector options consume their next
+argument even when it begins with `-`, so every Unix filename is expressible
+without losing raw path bytes.
 
 Placement is always explicit in this initial native surface:
 
@@ -225,7 +232,7 @@ would leave it, even if later components would re-enter. `--cwd` is not a
 containment boundary when `--follow` is used.
 
 For removal, `--src PATH` and bare paths accept either a terminal file or
-directory and remove that object, recursively for a directory.
+directory and remove that object, recursively for a directory. As with copy,
 `--src-file PATH` requires a non-directory terminal object, while
 `--src-dir DIR` requires a directory and removes its entire tree.
 `--src-src DIR` requires a directory, removes its contents, and retains the
@@ -246,16 +253,20 @@ hard links, ACLs, xattrs, filtering, comparison policy, and the automation API
 are intentionally not frozen by this first grammar. Use `syq rsync` when the
 current compatibility options for those capabilities are needed.
 
-The native commands accept only `-n`/`--dry-run`, `-v`/`--verbose`,
-`-q`/`--quiet`, and `-j`/`--connections` in addition to the endpoint,
-selector, cwd, and placement options above. `cp-prune` additionally accepts
-`--max-delete`; `rm` additionally accepts `--root` and `--follow` plus its
-typed selectors. Preservation policies, filters, comparison controls, progress
-interfaces, and SSH/transport configuration remain available only through
-`syq rsync`; sharing the transfer engine does not expose those options in
-native mode. Remote-to-remote copies still use the ordinary automatic
-transport. Native raw path bytes are relayed through syq's protocol when they
-cannot be represented in a direct remote shell command.
+All native commands accept `-n`/`--dry-run`, `-v`/`--verbose`, `-q`/`--quiet`,
+`-j`/`--connections`, `--progress`/`--no-progress`, and `--progress-json` in
+addition to their endpoint and selector options. `cp` and `cp-prune` also
+accept `--bwlimit RATE` and `--stats`; the bandwidth limit applies only to file
+data, not scanning, hashing, metadata, or pruning. `cp-prune` additionally
+accepts `--max-delete`; `rm` additionally accepts `--root` and `--follow` plus
+its endpoint-side removal semantics.
+
+Preservation policies, filters, comparison controls, low-level transfer tuning,
+and SSH/transport configuration remain available only through `syq rsync`;
+sharing the transfer engine does not expose those options in native mode.
+Remote-to-remote copies still use the ordinary automatic transport. Native raw
+path bytes are relayed through syq's protocol when they cannot be represented
+in a direct remote shell command.
 
 ## Rsync compatibility
 
