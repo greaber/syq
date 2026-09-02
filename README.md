@@ -10,10 +10,8 @@ that idle workers steal from each other, so a single huge file at the end of
 a transfer still uses every connection. Throughput is typically several times
 that of a single ssh stream. It also has a progress meter that separates
 transferred bytes from unchanged ones and automatically resumes interrupted
-transfers from partial files without retransmitting their finished blocks. An
-optional checkpoint can avoid repeated destination lookups for exceptionally
-large or failure-prone jobs; it is not required for normal resumption. SYQ can
-also verify that a copy is complete.
+transfers from partial files without retransmitting their finished blocks. SYQ
+can also verify that a copy is complete.
 
 ## Install
 
@@ -358,7 +356,6 @@ explicitly say otherwise.
 | `-c`, `--checksum` | Compare every file with BLAKE3 instead of size+mtime; repair mismatches (native spelling: `--hash`) |
 | `--verify-only` | Hash every file in the run's scope on both sides and report differences; write nothing |
 | `--inplace` | Write directly into destination files (no partial + rename) |
-| `--checkpoint FILE` | Avoid completed-file destination lookups on later runs; normal resume does not need it |
 | `-e CMD`, `--rsh CMD` | Remote shell command; bypasses automatic broker, receiver, and enrollment setup and controls agent forwarding itself (default `ssh`) |
 | `--syq-path PATH` | Use this exact remote `syq` instead of the managed helper |
 | `--no-bootstrap` | Require `syq` on the remote `PATH`; do not install a managed helper |
@@ -658,10 +655,6 @@ progress to a log on hostA. HostA needs its own hostB credential because a
 temporary local broker cannot survive detachment. An explicit `--rsh` may
 provide another persistent authentication policy. Reattach with
 `syq --follow hostA:LOG` to stream that progress.
-An explicit `--checkpoint` path belongs to the machine running the
-orchestrator: normally the invoking machine, but hostA for a direct or detached
-remote-to-remote copy (`--relay` keeps it local).
-
 ## Path semantics
 
 Identical to rsync:
@@ -823,11 +816,11 @@ contents and an interruption leaves the final file unfinished.
 Local → local runs the same machinery in-process with N threads, which helps
 on NFS and NVMe.
 
-### Resume and checkpoints
+### Resume
 
 With the default staged write path, Ctrl-C is safe: kill it and rerun the same
-command. `--inplace` deliberately gives up that guarantee. No checkpoint is
-needed for this normal resumption. Resume works at two levels.
+command. `--inplace` deliberately gives up that guarantee. Resume works at two
+levels.
 
 **Within a file.** There is no per-file state file — the partial *is* the state:
 
@@ -871,52 +864,9 @@ does not recognize or resume that legacy form: remove any such destination
 sidecars manually after an interrupted old-version transfer. A legacy-named
 file in a source tree is copied as ordinary payload without a special warning.
 
-**Across the whole job.** Ordinary copies keep no transfer history, but their
-source and destination scans still skip files already complete. Deleting or
-changing a destination file affects the next run just as it does with rsync.
-
-Only when repeated destination metadata lookups are themselves too expensive
-should you opt in to a checkpoint:
-
-```sh
-syq rsync -a --checkpoint ./copy.state huge-tree/ host:huge-tree/
-# after an interruption, run the identical command again
-```
-
-The mode-0600 JSONL checkpoint identifies the canonical source, destination,
-and copy semantics. It records regular files only after SYQ established that
-the destination was complete and, for transferred files, rechecked the source.
-On retry, a record whose source fingerprint still matches (size, nanosecond
-mtime, and requested mode/owner/group metadata) skips that destination lookup.
-Everything else follows the normal quick check, partial hashing, and transfer
-path. Unfinished individual files are never checkpoint-complete; their actual
-`.syq-part.<job-id>` contents remain the resume state.
-
-The checkpoint is flushed about once a second and persists after both failed
-and successful runs until you remove or stop passing it. Losing its last
-buffered records only causes repeated work; if recording stops mid-run the
-copy continues and a warning names the I/O error — printed even under `-q`,
-while the exit code keeps describing the copy itself. Invalidation records are
-flushed before a checkpoint-covered destination is removed or changes type,
-but the checkpoint is not `fsync`ed and does not promise recovery across power
-loss. If an existing checkpoint has completed records but an expected
-destination root is missing, SYQ fails and asks you to remove the checkpoint to
-restart. The checkpoint must be a regular file with exactly one hard link and
-must be outside local source and destination trees; a hardlinked checkpoint is
-refused because appending or changing its permissions would also affect its
-other names. `-n` reads and validates existing state but never creates or
-changes it. `-c`, `--verify-only`, and `--rm` conflict with `--checkpoint`. One
-checkpoint file may be used by only one running copy at a time. Its filesystem
-must support advisory file locking; SYQ fails rather than write checkpoint
-state without single-writer exclusion.
-
-A checkpoint is an explicit trust decision: SYQ does not inspect a destination
-file covered by a matching record. If another process deleted, replaced, or
-modified that destination after it was recorded, a checkpointed retry will not
-notice. Do not use a checkpoint when the destination may be independently
-modified; omit the option and SYQ remains history-independent. `--delete`
-records what it removes in an active checkpoint, so a file the source drops
-and later brings back is transferred again rather than assumed complete.
+**Across the whole job.** Copies keep no transfer history. Their source and
+destination scans skip files already complete, and deleting or changing a
+destination file affects the next run just as it does with rsync.
 
 Like rsync, ordinary SYQ runs do not coordinate with each other. Different
 logical commands use different partial names, so concurrent copies into one

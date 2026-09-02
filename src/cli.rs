@@ -209,15 +209,6 @@ pub struct Args {
     /// in-place write leaves a newer-looking final file those filters would then skip forever
     #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
-    /// Avoid completed-file destination lookups on later runs. Normal reruns and partial-file
-    /// resume do not need this. The file persists and must be outside local source/destination trees.
-    #[arg(
-        long,
-        value_name = "FILE",
-        conflicts_with_all = ["checksum", "verify_only", "rm"]
-    )]
-    pub checkpoint: Option<String>,
-
     /// Remote shell command (default: ssh); controls agent forwarding when set
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
@@ -1454,7 +1445,6 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         "--min-size",
         "--files-from",
         "--max-delete",
-        "--checkpoint",
         "--tcp-ports",
         "--tcp-congestion",
         "--syq-path",

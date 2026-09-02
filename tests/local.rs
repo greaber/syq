@@ -5475,34 +5475,6 @@ fn existing_updates_through_a_destination_root_symlink_to_a_dir() {
     assert!(t.path("dst").symlink_metadata().unwrap().is_symlink());
 }
 
-// Resume: a successful transfer leaves no marker behind, and the retained
-// journal is authoritative — a completed file is skipped on a plain rerun even
-// if the destination was externally deleted, while -c bypasses the journal.
-#[test]
-fn checkpoint_conflicts_are_rejected() {
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"data");
-    for conflicting in ["-c", "--verify-only"] {
-        let out = syq(&[
-            "-a",
-            conflicting,
-            "--checkpoint",
-            &t.s("state"),
-            &t.s("src/"),
-            &t.s("dst/"),
-        ]);
-        assert!(!out.status.success(), "{conflicting}");
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("cannot be used with"), "{conflicting}: {err}");
-    }
-    let out = syq(&["--rm", "--checkpoint", &t.s("state"), &t.s("src")]);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("cannot be used with"), "{err}");
-    assert!(t.path("src/f").is_file());
-    assert!(!t.path("state").exists());
-}
-
 #[test]
 fn no_forward_agent_conflicts_with_explicit_rsh() {
     let t = Tmp::new();
@@ -5585,7 +5557,7 @@ fn ordinary_copy_needs_no_writable_history_directory() {
     let t = Tmp::new();
     write(&t.path("src/f"), b"data");
     // A regular file cannot contain an application state directory. Ordinary
-    // copies must ignore both locations because history is opt-in.
+    // copies must ignore both locations because they keep no history.
     write(&t.path("not-a-directory"), b"occupied");
     let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
@@ -5599,238 +5571,6 @@ fn ordinary_copy_needs_no_writable_history_directory() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(read(&t.path("dst/f")), b"data");
-}
-
-// An explicitly requested checkpoint is retained after a copy error and is
-// authoritative on retry. A source metadata change invalidates its record.
-#[cfg(debug_assertions)]
-#[test]
-fn checkpoint_is_explicit_retained_and_source_sensitive() {
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"data");
-    write(&t.path("src/fail/other"), b"other");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    let checkpoint = t.s("copy.checkpoint");
-    let out = compat_command()
-        .args([
-            "-a",
-            "--no-progress",
-            "--checkpoint",
-            &checkpoint,
-            &t.s("src/"),
-            &t.s("dest/"),
-        ])
-        .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .run()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(23));
-    assert!(t.path("copy.checkpoint").is_file());
-
-    // Changing mode under -a makes the source fingerprint differ, so this file
-    // is checked and restored rather than checkpoint-skipped.
-    fs::set_permissions(t.path("src/f"), fs::Permissions::from_mode(0o600)).unwrap();
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    fs::remove_file(t.path("dest/f")).unwrap();
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dest/"),
-    ]);
-    assert_eq!(read(&t.path("dest/f")), b"data");
-    assert_eq!(
-        fs::metadata(t.path("dest/f")).unwrap().mode() & 0o777,
-        0o600
-    );
-    assert!(
-        t.path("copy.checkpoint").is_file(),
-        "an explicit checkpoint persists after a clean retry"
-    );
-}
-
-// A completed checkpoint deliberately trusts destination history, but an
-// ordinary source fingerprint change invalidates the corresponding record.
-#[test]
-fn completed_checkpoint_trusts_destination_and_tracks_source() {
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"original");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    let checkpoint = t.s("copy.checkpoint");
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert!(t.path("copy.checkpoint").is_file());
-
-    write(&t.path("dst/f"), b"damaged independently");
-    let stdout = run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert_eq!(transferred(&stdout), 0);
-    assert_eq!(
-        read(&t.path("dst/f")),
-        b"damaged independently",
-        "a matching record intentionally bypasses destination inspection"
-    );
-
-    write(&t.path("src/f"), b"updated source");
-    set_mtime(&t.path("src/f"), 1_600_000_001);
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert_eq!(read(&t.path("dst/f")), b"updated source");
-    assert!(t.path("copy.checkpoint").is_file());
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn checkpoint_tombstone_precedes_destination_deletion() {
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"same source fingerprint");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    let checkpoint = t.s("copy.checkpoint");
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-
-    fs::remove_file(t.path("src/f")).unwrap();
-    let mut child = compat_command()
-        .args([
-            "-a",
-            "--delete",
-            "--no-progress",
-            "--checkpoint",
-            &checkpoint,
-            &t.s("src/"),
-            &t.s("dst/"),
-        ])
-        .env("SYQ_TEST_HOLD_AFTER_DELETE_MS", "10000")
-        .start()
-        .unwrap();
-    for _ in 0..300 {
-        if !t.path("dst/f").exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let deletion_observed = !t.path("dst/f").exists();
-    let kill_result = child.kill();
-    let wait_result = child.wait();
-    assert!(
-        deletion_observed,
-        "delete attempt did not reach the interruption window"
-    );
-    kill_result.unwrap();
-    wait_result.unwrap();
-
-    // Recreate precisely the fingerprint stored by the first run. Without a
-    // durable pre-delete tombstone, the checkpoint would skip this file while
-    // leaving its destination missing.
-    write(&t.path("src/f"), b"same source fingerprint");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    let stdout = run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert_eq!(transferred(&stdout), 1, "{stdout}");
-    assert_eq!(read(&t.path("dst/f")), b"same source fingerprint");
-}
-
-#[test]
-fn checkpoint_inside_local_source_is_rejected() {
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"data");
-    let out = syq(&[
-        "-a",
-        "--checkpoint",
-        &t.s("src/state"),
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("must not be inside local source"), "{err}");
-    assert!(!t.path("src/state").exists());
-    assert!(!t.path("dst").exists());
-}
-
-#[test]
-fn checkpoint_inside_local_destination_is_rejected() {
-    let t = Tmp::new();
-    write(&t.path("src/state"), b"payload");
-    let out = syq(&[
-        "-a",
-        "--checkpoint",
-        &t.s("dst/state"),
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("must not be inside local destination"),
-        "{err}"
-    );
-    assert!(!t.path("dst").exists());
-}
-
-// A checkpoint-complete file is still a claimed destination: a second source that
-// later maps onto the same path is a collision, not a silent overwrite.
-#[cfg(debug_assertions)]
-#[test]
-fn checkpoint_skip_still_detects_collision() {
-    let t = Tmp::new();
-    write(&t.path("A/x"), b"from A");
-    write(&t.path("A/fail/y"), b"failure trigger");
-    fs::create_dir_all(t.path("B")).unwrap();
-    let checkpoint = t.s("copy.checkpoint");
-    let out = compat_command()
-        .args([
-            "-a",
-            "--no-progress",
-            "--checkpoint",
-            &checkpoint,
-            &t.s("A/"),
-            &t.s("B/"),
-            &t.s("dest/"),
-        ])
-        .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .run()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(23));
-    assert_eq!(read(&t.path("dest/x")), b"from A");
-    write(&t.path("B/x"), b"from B");
-    let out = syq(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("A/"),
-        &t.s("B/"),
-        &t.s("dest/"),
-    ]);
-    assert!(!out.status.success(), "ambiguous mapping must be reported");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("same destination"), "stderr: {err}");
-    assert_eq!(read(&t.path("dest/x")), b"from A", "must not be clobbered");
 }
 
 // A read-only source root: the copy succeeds, the root ends up 0555, and a
@@ -6096,234 +5836,23 @@ fn root_meta_failure_is_visible() {
     assert_eq!(read(&t.path("dst/f")), b"data");
 }
 
-// A quick-check-identical file whose metadata repair fails is not checkpointed
-// as complete, so the next run repairs it instead of skipping it.
-#[cfg(debug_assertions)]
-#[test]
-fn checkpoint_records_quick_check_only_after_meta_repair() {
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"data");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    let before = fs::metadata(t.path("dst/f")).unwrap().mode() & 0o777;
-    assert_ne!(before, 0o600);
-    fs::set_permissions(t.path("src/f"), fs::Permissions::from_mode(0o600)).unwrap();
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    let checkpoint = t.s("copy.checkpoint");
-    let out = compat_command()
-        .args([
-            "-a",
-            "--no-progress",
-            "--checkpoint",
-            &checkpoint,
-            &t.s("src/"),
-            &t.s("dst/"),
-        ])
-        .env("SYQ_TEST_FAIL_SETMETA", "f")
-        .run()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(23));
-    assert_eq!(
-        fs::metadata(t.path("dst/f")).unwrap().mode() & 0o777,
-        before
-    );
-    assert!(t.path("copy.checkpoint").is_file());
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert_eq!(
-        fs::metadata(t.path("dst/f")).unwrap().mode() & 0o777,
-        0o600,
-        "the failed repair must not have been checkpointed as complete"
-    );
-    assert!(t.path("copy.checkpoint").is_file());
-}
-
 // The read-only modes create nothing, not even the destination directory.
 #[test]
 fn readonly_modes_create_nothing() {
     let t = Tmp::new();
     write(&t.path("src/f"), b"data");
-    let checkpoint = t.s("dry-run.checkpoint");
     let out = syq(&["-a", "--verify-only", &t.s("src/"), &t.s("dst/")]);
     assert!(
         !t.path("dst").exists(),
         "--verify-only must not create the destination"
     );
     assert!(!out.status.success(), "everything is missing");
-    let out = syq(&[
-        "-a",
-        "-n",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
+    let out = syq(&["-a", "-n", &t.s("src/"), &t.s("dst/")]);
     assert!(out.status.success());
     assert!(
         !t.path("dst").exists(),
         "--dry-run must not create the destination"
     );
-    assert!(
-        !t.path("dry-run.checkpoint").exists(),
-        "--dry-run must not create a checkpoint"
-    );
-}
-
-#[test]
-fn dry_run_validates_checkpoint_identity_with_missing_destination() {
-    let t = Tmp::new();
-    write(&t.path("first/f"), b"first");
-    write(&t.path("second/f"), b"second");
-    let checkpoint = t.s("copy.checkpoint");
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("first/"),
-        &t.s("first-dst/"),
-    ]);
-    let out = syq(&[
-        "-an",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("second/"),
-        &t.s("missing/"),
-    ]);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("describes a different copy"), "{err}");
-    assert!(!t.path("missing").exists());
-}
-
-// Different spellings of the same local path are one job.
-#[cfg(debug_assertions)]
-#[test]
-fn checkpoint_identity_is_spelling_independent() {
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"data");
-    write(&t.path("src/fail/y"), b"trigger");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    let dotted = format!("{}/./src/", t.s(""));
-    let checkpoint = t.s("copy.checkpoint");
-    let out = compat_command()
-        .args([
-            "-a",
-            "--no-progress",
-            "--checkpoint",
-            &checkpoint,
-            &dotted,
-            &t.s("dst/"),
-        ])
-        .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .run()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(23));
-    fs::remove_file(t.path("dst/f")).unwrap();
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert!(
-        !t.path("dst/f").exists(),
-        "same checkpoint identity, so the explicitly trusted file is skipped"
-    );
-}
-
-// Existing completion records are never reset automatically. A missing
-// destination is suspicious and requires the user to remove the checkpoint.
-#[cfg(debug_assertions)]
-#[test]
-fn existing_checkpoint_with_missing_destination_fails() {
-    let t = Tmp::new();
-    write(&t.path("src/a"), b"aaaa");
-    write(&t.path("src/fail/secret"), b"secret");
-    let checkpoint = t.s("copy.checkpoint");
-    let out = compat_command()
-        .args([
-            "-a",
-            "--no-progress",
-            "--checkpoint",
-            &checkpoint,
-            &t.s("src/"),
-            &t.s("dest/"),
-        ])
-        .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .run()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(23));
-    assert!(t.path("copy.checkpoint").is_file());
-    fs::remove_dir_all(t.path("dest")).unwrap();
-    assert!(!t.path("dest").exists());
-    let out = syq(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dest/"),
-    ]);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("destination") && err.contains("missing"),
-        "{err}"
-    );
-    assert!(!t.path("dest").exists());
-    assert!(t.path("copy.checkpoint").is_file());
-}
-
-#[test]
-fn existing_checkpoint_with_missing_mapped_source_target_fails() {
-    let t = Tmp::new();
-    write(&t.path("bigdir/f"), b"data");
-    let checkpoint = t.s("copy.checkpoint");
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("bigdir"),
-        &t.s("backups"),
-    ]);
-    fs::remove_dir_all(t.path("backups/bigdir")).unwrap();
-    let out = syq(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("bigdir"),
-        &t.s("backups"),
-    ]);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("destination target") && err.contains("missing"),
-        "{err}"
-    );
-    assert!(!t.path("backups/bigdir").exists());
-}
-
-#[test]
-fn missing_destination_does_not_replace_an_unrelated_checkpoint_path() {
-    let t = Tmp::new();
-    write(&t.path("src/a"), b"data");
-    write(&t.path("important"), b"not a checkpoint");
-    let out = syq(&[
-        "-a",
-        "--checkpoint",
-        &t.s("important"),
-        &t.s("src/"),
-        &t.s("dest/"),
-    ]);
-    assert!(!out.status.success());
-    assert_eq!(read(&t.path("important")), b"not a checkpoint");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("not a SYQ checkpoint"), "stderr: {err}");
 }
 
 // Two ordinary copies into one tree behave like rsync: the union lands, and a
@@ -7240,49 +6769,6 @@ fn self_copy_guard_sees_through_symlinks() {
     assert!(!t.path("src/out").exists());
 }
 
-// Metadata-only reconciliation is a valid checkpoint completion. The explicit
-// checkpoint then trusts it on retry, just like a transferred completion.
-#[cfg(debug_assertions)]
-#[test]
-fn checkpoint_records_metadata_only_reconcile() {
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"");
-    write(&t.path("src/fail/y"), b"trigger");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    set_mtime(&t.path("src/f"), 1_600_000_001);
-    let checkpoint = t.s("copy.checkpoint");
-    let out = compat_command()
-        .args([
-            "-a",
-            "--no-progress",
-            "--checkpoint",
-            &checkpoint,
-            &t.s("src/"),
-            &t.s("dst/"),
-        ])
-        .env("SYQ_TEST_FAIL_SETMETA", "fail")
-        .run()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(23));
-    assert_eq!(
-        fs::metadata(t.path("dst/f")).unwrap().mtime(),
-        1_600_000_001
-    );
-    fs::remove_file(t.path("dst/f")).unwrap();
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &checkpoint,
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert!(
-        !t.path("dst/f").exists(),
-        "the metadata-only reconcile must have been checkpointed"
-    );
-}
-
 // Unsupported rsync flags get a helpful, specific error (not clap's generic
 // "unexpected argument"), and the filter family points at --ignore.
 #[test]
@@ -7338,6 +6824,21 @@ fn removed_fsync_option_is_rejected() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unexpected argument '--fsync'"), "{stderr}");
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn removed_checkpoint_option_is_rejected_without_creating_state() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    let output = syq(&["--checkpoint", &t.s("state"), &t.s("src"), &t.s("dst")]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument '--checkpoint'"),
+        "{stderr}"
+    );
+    assert!(!t.path("state").exists());
     assert!(!t.path("dst").exists());
 }
 
@@ -7925,102 +7426,6 @@ fn size_arguments_reject_negative_nan_and_overflow() {
     assert_eq!(transferred(&so), 1);
 }
 
-#[test]
-fn delete_records_checkpoint_intent_before_unlinking() {
-    // A file the checkpoint recorded as complete leaves the source; --delete
-    // tries to remove it but the unlink fails (read-only extra directory —
-    // claimed directories get opened up, extras don't). The Deleted intent
-    // must already be durable in the checkpoint — written before the unlink —
-    // so a later restore with the same fingerprint is rechecked, not assumed.
-    let t = Tmp::new();
-    write(&t.path("src/sub/f"), b"data");
-    set_mtime(&t.path("src/sub/f"), 1_600_000_000);
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &t.s("state"),
-        &t.s("src/"),
-        &t.s("dst"),
-    ]);
-    fs::remove_dir_all(t.path("src/sub")).unwrap();
-    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o555)).unwrap();
-    let out = syq(&[
-        "-a",
-        "--checkpoint",
-        &t.s("state"),
-        "--delete",
-        &t.s("src/"),
-        &t.s("dst"),
-    ]);
-    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
-    assert!(t.path("dst/sub/f").exists(), "unlink really failed");
-    let state = String::from_utf8_lossy(&read(&t.path("state"))).into_owned();
-    assert!(
-        state.contains("\"deleted\""),
-        "intent must precede the unlink: {state}"
-    );
-}
-
-#[test]
-fn delete_halts_when_checkpoint_intents_cannot_be_persisted() {
-    // RLIMIT_FSIZE pins the checkpoint at its current size, so the Deleted
-    // intent cannot be appended. Deletion must then not happen at all:
-    // unlinking would leave a durable Complete record for a missing file.
-    use std::os::unix::process::CommandExt;
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"data");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &t.s("state"),
-        &t.s("src/"),
-        &t.s("dst"),
-    ]);
-    fs::remove_file(t.path("src/f")).unwrap();
-    let limit = fs::metadata(t.path("state")).unwrap().len();
-    let mut cmd = compat_command();
-    cmd.args([
-        "-a",
-        "--checkpoint",
-        &t.s("state"),
-        "--delete",
-        &t.s("src/"),
-        &t.s("dst"),
-        "--no-progress",
-    ]);
-    unsafe {
-        cmd.pre_exec(move || {
-            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-            let rl = libc::rlimit {
-                rlim_cur: limit,
-                rlim_max: limit,
-            };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &rl) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let out = cmd.run().unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(23),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("could not persist deletion intents"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        t.path("dst/f").exists(),
-        "nothing may be deleted without a durable intent"
-    );
-}
-
 // ----------------------------------------------------------- review round 11
 
 #[test]
@@ -8037,56 +7442,6 @@ fn inplace_conflicts_with_receiver_state_filters() {
         );
     }
     assert!(!t.path("dst").exists());
-}
-
-#[test]
-fn checkpoint_invalidated_on_type_change_and_directory_removal() {
-    // f completes as a file; the source turns f into a directory (type-change
-    // invalidation), then drops it (--delete rmdir), then restores the
-    // original file with an identical fingerprint. The checkpointed run must
-    // transfer it — a stale Complete record would report "unchanged" while
-    // the destination has nothing.
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"data");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &t.s("state"),
-        &t.s("src/"),
-        &t.s("dst"),
-    ]);
-    fs::remove_file(t.path("src/f")).unwrap();
-    write(&t.path("src/f/child"), b"c");
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &t.s("state"),
-        &t.s("src/"),
-        &t.s("dst"),
-    ]);
-    assert!(t.path("dst/f").is_dir());
-    fs::remove_dir_all(t.path("src/f")).unwrap();
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &t.s("state"),
-        "--delete",
-        &t.s("src/"),
-        &t.s("dst"),
-    ]);
-    assert!(!t.path("dst/f").exists());
-    write(&t.path("src/f"), b"data");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    let so = run_ok(&[
-        "-a",
-        "--checkpoint",
-        &t.s("state"),
-        &t.s("src/"),
-        &t.s("dst"),
-    ]);
-    assert_eq!(read(&t.path("dst/f")), b"data", "{so}");
-    assert_eq!(transferred(&so), 1, "{so}");
 }
 
 #[test]
@@ -8142,39 +7497,6 @@ fn destination_walk_errors_disable_deletion() {
     fs::set_permissions(t.path("dst/dark"), fs::Permissions::from_mode(0o755)).unwrap();
     assert!(t.path("dst/gone").exists(), "nothing may be deleted");
     assert!(t.path("dst/dark/inside").exists());
-}
-
-#[test]
-fn checkpoint_invalidation_survives_trailing_slash_destination() {
-    // Same type-change sequence as above, but the destination is spelled
-    // `dst/` and the file has a one-character name: join() adds no extra
-    // separator for a trailing slash, so slicing the full path used to drop
-    // the first byte of the key (or produce an empty one).
-    let t = Tmp::new();
-    write(&t.path("src/f"), b"data");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    let dst = format!("{}/", t.s("dst"));
-    run_ok(&["-a", "--checkpoint", &t.s("state"), &t.s("src/"), &dst]);
-    fs::remove_file(t.path("src/f")).unwrap();
-    write(&t.path("src/f/child"), b"c");
-    run_ok(&["-a", "--checkpoint", &t.s("state"), &t.s("src/"), &dst]);
-    assert!(t.path("dst/f").is_dir());
-    fs::remove_dir_all(t.path("src/f")).unwrap();
-    run_ok(&[
-        "-a",
-        "--checkpoint",
-        &t.s("state"),
-        "--delete",
-        &t.s("src/"),
-        &dst,
-    ]);
-    assert!(!t.path("dst/f").exists());
-    write(&t.path("src/f"), b"data");
-    set_mtime(&t.path("src/f"), 1_600_000_000);
-    let so = run_ok(&["-a", "--checkpoint", &t.s("state"), &t.s("src/"), &dst]);
-    assert!(t.path("dst/f").is_file(), "{so}");
-    assert_eq!(read(&t.path("dst/f")), b"data");
-    assert_eq!(transferred(&so), 1, "{so}");
 }
 
 #[cfg(debug_assertions)]

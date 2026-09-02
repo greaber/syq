@@ -10,7 +10,7 @@
 //! [`SSHSIG_NAMESPACE`], verified by OpenSSH against an explicit allowed-signers
 //! policy. A fresh random [`RequestId`] is a replay nonce; durable claiming gives
 //! at-most-once redemption, not exactly-once execution across a receiver crash.
-//! The ID is a separate type and size from the stable copy/checkpoint IDs in
+//! The ID is a separate type and size from the stable copy IDs in
 //! `proto`.
 //! Redeemed IDs are rejected from the pinned claim store before invoking the
 //! verifier. Each verifier runs in an isolated process group with a 30-second
