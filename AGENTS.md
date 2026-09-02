@@ -108,6 +108,25 @@ outlive its premise and steer later work in the wrong direction.
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
 
+## Release tag lifecycle
+
+- Treat a release tag as provisional until its release workflow connects it to
+  permanent published state. If an attempt is abandoned before that boundary,
+  remove the failed tag locally and remotely instead of reserving a version
+  that was never released. Never force-update or silently move the tag.
+- A release tag becomes permanent as soon as any associated version or artifact
+  reaches an immutable or append-only destination, including an immutable
+  GitHub release, a package registry, a module proxy, the Homebrew tap, or a
+  durable artifact attestation. Never move or delete a permanent tag. Repair or
+  rerun the remaining publication steps from that exact tag when safe, or cut a
+  new version when they cannot be completed consistently.
+- Before deleting a provisional tag, stop or wait for its active workflows and
+  audit every release destination with read-only checks. Resolve the exact tag
+  object and target commit; verify that no permanent publication exists; and
+  inspect and clean any recoverable draft state. Delete only the explicitly
+  audited local and remote refs, then verify their absence and report what was
+  removed and whether it can be recovered.
+
 ## Always report the commit you are talking about
 
 - Any status report about branch or PR work states the short SHA it refers

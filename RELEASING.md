@@ -191,6 +191,25 @@ formula to the tap job. The same rerun packages the source crate again and
 requires its SHA-256 to match the immutable crates.io version; a missing
 version is published, while a divergent version fails closed.
 
+### Failed tag cleanup and the permanence boundary
+
+A pushed tag is provisional until the release reaches permanent published
+state. If an attempt is abandoned before then, do not burn the version merely
+because the tag existed: verify that no GitHub release, package-registry
+version, Homebrew update, module-proxy entry, or durable attestation exists,
+clean any recoverable draft, and delete the exact local and remote tag refs.
+Never force-update the tag. Once the cause is fixed, a maintainer may create a
+new signed tag for the still-unpublished version from a fully checked `master`
+commit.
+
+Once any permanent destination accepts the version, the tag is immutable even
+if later publication steps fail. Do not delete or move it. Rerun the idempotent
+steps from the same tag when their checks permit it; otherwise repair the
+remaining channel without changing published bytes or advance to a new
+version. Record the exact tag object, target commit, failed workflow, and every
+destination checked whenever deciding which side of this boundary an attempt
+is on.
+
 The release workflow sets `SYQ_RELEASE_BUILD=1`, which makes each platform
 binary report the tag (for example `v0.2.0`) as its build identity. Ordinary
 source builds instead include their Git revision and cannot populate the

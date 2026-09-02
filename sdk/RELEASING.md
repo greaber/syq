@@ -1,7 +1,11 @@
 # Releasing the language SDKs
 
 SDK releases use independent versions and tags. Published versions are
-immutable: never move a release tag or attempt to replace an uploaded package.
+immutable: never move or delete their release tags or attempt to replace an
+uploaded package. A tag whose publication is abandoned before any permanent
+release or registry state exists remains provisional; audit all destinations,
+clean any recoverable draft, and delete that tag rather than burning an
+unpublished SDK version.
 
 ## One-time setup
 
