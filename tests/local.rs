@@ -1074,6 +1074,52 @@ exec /bin/sh -c "$1"
     path
 }
 
+/// An ssh-shaped remote shell that accepts the control session, rejects every
+/// multiplexed worker like an sshd with `MaxSessions 1`, and accepts workers
+/// that disable `ControlPath`.
+fn fake_ssh_rejecting_multiplexed_workers(t: &Tmp) -> PathBuf {
+    let path = t.path("bin/ssh");
+    executable(
+        &path,
+        br#"#!/bin/sh
+control_master=unset
+control_path=unset
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o)
+            option=$2
+            shift 2
+            case "$option" in
+                ControlMaster=*) control_master=${option#ControlMaster=} ;;
+                ControlPath=*) control_path=${option#ControlPath=} ;;
+            esac
+            ;;
+        -l)
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            exit 98
+            ;;
+    esac
+done
+shift
+printf '%s|%s\n' "$control_master" "$control_path" >> "$FAKE_RSH_LOG"
+if [ "$control_master" = no ] && [ "$control_path" != none ]; then
+    exit 255
+fi
+HOME="$FAKE_REMOTE_HOME"
+PATH=/usr/bin:/bin
+export HOME PATH
+exec /bin/sh -c "$1"
+"#,
+    );
+    path
+}
+
 fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
     let mut cmd = compat_command();
     cmd.args(["-e", rsh.to_str().unwrap(), "--no-tcp", "-j", "1"])
@@ -1963,6 +2009,76 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     assert!(
         stderr.contains("concurrency: starting with 16 connections (auto-tuned)"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"in-place over reachable TCP");
+    let remote = format!("127.0.0.1:{}", t.s("dst"));
+
+    let out = compat_command()
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--tcp-plain", "--inplace", "-a", "-j", "1"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .run()
+        .expect("run in-place copy over reachable TCP");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"in-place over reachable TCP");
+}
+
+#[test]
+fn multiplexed_worker_refusal_falls_back_to_independent_ssh() {
+    let t = Tmp::new();
+    fake_ssh_rejecting_multiplexed_workers(&t);
+    write(&t.path("src"), b"independent SSH fallback");
+    let remote = format!("fake:{}", t.s("dst"));
+
+    let out = compat_command()
+        .arg("--syq-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--no-tcp", "-a", "-j", "1"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .run()
+        .expect("run copy when the SSH server rejects multiplexed workers");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"independent SSH fallback");
+    let invocations = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        invocations
+            .lines()
+            .any(|line| line.starts_with("yes|") && !line.ends_with("|none")),
+        "control connection did not enable its private socket:\n{invocations}"
+    );
+    assert!(
+        invocations
+            .lines()
+            .any(|line| line.starts_with("no|") && !line.ends_with("|none")),
+        "no multiplexed worker was attempted:\n{invocations}"
+    );
+    assert!(
+        invocations.lines().any(|line| line == "no|none"),
+        "no independent worker fallback was attempted:\n{invocations}"
     );
 }
 

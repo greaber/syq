@@ -1629,6 +1629,7 @@ pub fn run(args: Args) -> Result<i32> {
     if all_remote_endpoints_use_tcp
         && destination_tree_known_missing
         && !opts.dry_run
+        && !opts.inplace
         && !opts.verify_only
         && (!destination_anchor_required || destination_anchor.get().is_some())
     {

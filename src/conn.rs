@@ -121,6 +121,26 @@ pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<WorkerInitializationError>())
 }
 
+/// OpenSSH accepted the control connection but rejected a multiplexed worker
+/// session. Independent SSH connections may still be permitted (for example,
+/// with `MaxSessions 1`), so callers can safely disable reuse and retry.
+#[derive(Debug)]
+struct MultiplexedSshSessionError(String);
+
+impl std::fmt::Display for MultiplexedSshSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MultiplexedSshSessionError {}
+
+fn is_multiplexed_ssh_session_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<MultiplexedSshSessionError>())
+}
+
 fn worker_initialization_response(response: Response) -> Result<()> {
     match response {
         Response::Ok => Ok(()),
@@ -431,6 +451,7 @@ pub struct RemoteConn {
     dead: bool,
     peer: Option<PeerInfo>,
     tcp_socket: Option<TcpStream>,
+    multiplexed_ssh: bool,
 }
 
 const READ_AHEAD: usize = 4;
@@ -523,6 +544,13 @@ impl RemoteConn {
         if let Some(child) = &mut self.child {
             for _ in 0..20 {
                 if let Ok(Some(status)) = child.try_wait() {
+                    if self.multiplexed_ssh && status.code() == Some(255) {
+                        return MultiplexedSshSessionError(format!(
+                            "{}: multiplexed SSH session was rejected ({status})",
+                            self.label
+                        ))
+                        .into();
+                    }
                     return anyhow!("{}: remote syq exited ({status})", self.label);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -782,7 +810,7 @@ impl SshMultiplexer {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SshConnection {
     Independent,
     Control,
@@ -885,9 +913,7 @@ impl RemoteSpec {
         if self.rsh[0].ends_with("ssh") {
             let multiplex = match (connection, &self.ssh_multiplexer) {
                 (SshConnection::Control, Some(multiplexer)) => Some((multiplexer, true)),
-                (SshConnection::Worker, Some(multiplexer)) if multiplexer.reuse_for_workers() => {
-                    Some((multiplexer, false))
-                }
+                (SshConnection::Worker, Some(multiplexer)) => Some((multiplexer, false)),
                 _ => None,
             };
             if let Some((multiplexer, master)) = multiplex {
@@ -926,6 +952,20 @@ impl RemoteSpec {
         }
         cmd.arg(&self.host);
         cmd
+    }
+
+    fn ssh_connection(&self, limited: bool) -> SshConnection {
+        if !limited {
+            SshConnection::Control
+        } else if self
+            .ssh_multiplexer
+            .as_ref()
+            .is_some_and(|multiplexer| multiplexer.reuse_for_workers())
+        {
+            SshConnection::Worker
+        } else {
+            SshConnection::Independent
+        }
     }
 
     /// A shell command that runs syq with `args` on this host.  Automatic mode
@@ -991,20 +1031,39 @@ impl RemoteSpec {
         let mut last = None;
         for attempt in 0..6 {
             let _slot = limited.then(connect_slot);
-            match self.connect_once(compress, limited, initial_request.clone()) {
+            let ssh_connection = self.ssh_connection(limited);
+            match self.connect_once(compress, ssh_connection, initial_request.clone()) {
                 Ok(c) => return Ok(c),
+                Err(e)
+                    if ssh_connection == SshConnection::Worker
+                        && is_multiplexed_ssh_session_error(&e) =>
+                {
+                    // MaxSessions can reject a new channel on an otherwise
+                    // healthy control connection while still allowing a new
+                    // independently authenticated SSH connection. Disable
+                    // reuse for every later worker and retry immediately.
+                    self.set_ssh_multiplexing(false);
+                    if crate::transfer::debug() {
+                        eprintln!(
+                            "syq: {}: multiplexed SSH worker rejected; using independent SSH connections",
+                            self.label()
+                        );
+                    }
+                    last = Some(e);
+                    continue;
+                }
                 // Don't retry what won't change: a missing binary (127) or a
                 // build identity mismatch.
                 Err(e)
                     if attempt == 5
-                        || e.to_string().contains("build identity mismatch")
+                        || format!("{e:#}").contains("build identity mismatch")
                         || is_worker_initialization_error(&e)
-                        || e.to_string().contains("exit status: 127")
-                        || e.to_string().contains(&format!(
+                        || format!("{e:#}").contains("exit status: 127")
+                        || format!("{e:#}").contains(&format!(
                             "exit status: {}",
                             remote_helper::HELPER_MISSING_EXIT
                         ))
-                        || e.to_string().contains(&format!(
+                        || format!("{e:#}").contains(&format!(
                             "exit status: {}",
                             remote_helper::HELPER_NOT_EXECUTABLE_EXIT
                         )) =>
@@ -1039,7 +1098,7 @@ impl RemoteSpec {
     fn connect_once(
         &self,
         compress: bool,
-        limited: bool,
+        ssh_connection: SshConnection,
         initial_request: Option<Request>,
     ) -> Result<RemoteConn> {
         let mut server_args = vec!["--server".into()];
@@ -1051,11 +1110,7 @@ impl RemoteSpec {
             command.args(&server_args);
             command
         } else {
-            let mut command = self.ssh_command(if limited {
-                SshConnection::Worker
-            } else {
-                SshConnection::Control
-            });
+            let mut command = self.ssh_command(ssh_connection);
             let remote_command = if self.restricted_grant.is_some() {
                 // This text is inspected by the forced receiver through
                 // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
@@ -1088,6 +1143,7 @@ impl RemoteSpec {
             dead: false,
             peer: None,
             tcp_socket: None,
+            multiplexed_ssh: ssh_connection == SshConnection::Worker,
         };
         let conn = hello(conn, compress, Vec::new(), initial_request)?;
         self.record_peer(&conn);
@@ -1374,6 +1430,7 @@ impl RemoteSpec {
                 dead: false,
                 peer: None,
                 tcp_socket: Some(tcp_socket),
+                multiplexed_ssh: false,
             };
             let conn = hello(conn, compress, info.token.clone(), initial_request.clone())?;
             self.record_peer(&conn);
@@ -1384,7 +1441,7 @@ impl RemoteSpec {
 }
 
 fn helper_needs_install(e: &anyhow::Error) -> bool {
-    let message = e.to_string();
+    let message = format!("{e:#}");
     message.contains(&format!(
         "exit status: {}",
         remote_helper::HELPER_MISSING_EXIT
@@ -1519,7 +1576,10 @@ fn hello(
         }
         Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
         Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
-        Err(e) => bail!("{e}\ncould not start the remote syq on {}", conn.label),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("could not start the remote syq on {}", conn.label))
+        }
     }
     if initial_request.is_some() {
         worker_initialization_response(conn.recv()?)?;
@@ -2201,6 +2261,7 @@ mod tests {
             dead: false,
             peer: None,
             tcp_socket: None,
+            multiplexed_ssh: false,
         };
         let conn = hello(
             conn,
@@ -2263,6 +2324,7 @@ mod tests {
                 dead: false,
                 peer: None,
                 tcp_socket: Some(tcp_socket),
+                multiplexed_ssh: false,
             };
             let timeout = std::time::Duration::from_millis(5);
             let start = std::time::Instant::now();
@@ -2435,12 +2497,12 @@ mod tests {
         assert!(control.iter().any(|arg| arg == &control_path));
         assert!(control.iter().any(|arg| arg == "ControlPersist=no"));
 
-        let worker = args(SshConnection::Worker);
+        let worker = args(spec.ssh_connection(true));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
 
         spec.set_ssh_multiplexing(true);
-        let worker = args(SshConnection::Worker);
+        let worker = args(spec.ssh_connection(true));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == &control_path));
         assert!(!worker.iter().any(|arg| arg == "ControlPath=none"));
