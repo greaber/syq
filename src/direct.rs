@@ -422,15 +422,15 @@ pub fn run(
         if args.existing {
             remote.push("--existing".into());
         }
-        if let Some(m) = &args.max_size {
-            remote.push(format!("--max-size={m}"));
-        }
-        if let Some(m) = &args.min_size {
-            remote.push(format!("--min-size={m}"));
-        }
         if let Some(path) = &args.checkpoint {
             remote.push(format!("--checkpoint={path}"));
         }
+    }
+    if let Some(maximum) = &args.max_size {
+        remote.push(format!("--max-size={maximum}"));
+    }
+    if let Some(minimum) = &args.min_size {
+        remote.push(format!("--min-size={minimum}"));
     }
     if let Some(rate) = &args.bwlimit {
         remote.push(format!("--bwlimit={rate}"));
