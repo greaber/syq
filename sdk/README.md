@@ -33,6 +33,7 @@ The current mapping is:
 |---|---|
 | `0.0.1` | `0.1.5` |
 | `0.0.2` | `0.1.7` |
+| `0.0.3` | `0.1.8` |
 
 The two version numbers do not need to match, but the mapping is immutable for
 a published SDK release. Multiple SDK releases may pin the same syq release.
