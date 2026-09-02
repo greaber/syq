@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
@@ -168,20 +168,44 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
-/// Resolve the command's effective persistence context. An explicit scope is
-/// validated even for a local-only command, while the durable policy supplies
-/// the global scope only when enabled.
-pub(crate) fn resolve_for_command(args: &mut Args) -> Result<()> {
+/// Remember whether the command explicitly selected a scope without touching
+/// configuration or runtime state. Commands that never construct an eligible
+/// implicit SSH endpoint must not depend on either location being accessible.
+pub(crate) fn mark_explicit_scope(args: &mut Args) {
     args.pscope_explicit = args.pscope.is_some();
-    args.pscope = match args.pscope.as_deref() {
+}
+
+/// Resolve persistence only for an implicit local SSH edge. Explicit scopes
+/// are validated here, and the durable policy is read here, so local commands,
+/// custom remote shells, remote coordinators, and restricted receivers do not
+/// acquire an unrelated filesystem dependency.
+pub(crate) fn scope_for_implicit_ssh(explicit_scope: Option<&Path>) -> Result<Option<PathBuf>> {
+    match explicit_scope {
         Some(scope) => {
             validate_scope(scope)?;
-            Some(scope.to_path_buf())
+            Ok(Some(scope.to_path_buf()))
         }
-        None if global_enabled()? => Some(ensure_global_scope()?),
-        None => None,
-    };
-    Ok(())
+        None if global_enabled()? => Ok(Some(ensure_global_scope()?)),
+        None => Ok(None),
+    }
+}
+
+/// OpenSSH expands percent tokens in control paths, including paths supplied
+/// through `-S`. Double each percent byte so that expansion yields the literal,
+/// byte-exact filesystem path. Keeping the path in an `OsString` also avoids
+/// lossy UTF-8 conversion and makes whitespace one argv value rather than SSH
+/// configuration syntax.
+pub(crate) fn openssh_control_path(path: &Path) -> OsString {
+    let bytes = path.as_os_str().as_bytes();
+    let mut escaped =
+        Vec::with_capacity(bytes.len() + bytes.iter().filter(|&&b| b == b'%').count());
+    for &byte in bytes {
+        if byte == b'%' {
+            escaped.push(b'%');
+        }
+        escaped.push(byte);
+    }
+    OsString::from_vec(escaped)
 }
 
 /// Return the stable socket path for one endpoint and record enough metadata
@@ -646,7 +670,10 @@ fn close_master(socket: &Path, record: &EndpointRecord) -> Result<()> {
 
 fn master_exit_command(socket: &Path, record: &EndpointRecord) -> Command {
     let mut command = Command::new("ssh");
-    command.arg("-S").arg(socket).args(["-O", "exit"]);
+    command
+        .arg("-S")
+        .arg(openssh_control_path(socket))
+        .args(["-O", "exit"]);
     if let Some(user) = &record.user {
         command.args(["-l", user]);
     }
@@ -736,6 +763,20 @@ mod tests {
                 "--",
                 "example"
             ]
+        );
+    }
+
+    #[test]
+    fn master_exit_preserves_path_bytes_and_escapes_openssh_percent_tokens() {
+        let path = PathBuf::from(OsString::from_vec(
+            b"/tmp/scope with space/%h/non-utf8-\xff/socket".to_vec(),
+        ));
+        let command = master_exit_command(&path, &EndpointRecord::new(None, "example", None));
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args[0], OsStr::new("-S"));
+        assert_eq!(
+            args[1].as_bytes(),
+            b"/tmp/scope with space/%%h/non-utf8-\xff/socket"
         );
     }
 }

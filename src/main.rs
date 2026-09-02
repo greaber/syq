@@ -184,10 +184,7 @@ fn main() {
         }
         return;
     }
-    if let Err(error) = persistence::resolve_for_command(&mut args) {
-        eprintln!("syq: {error:#}");
-        std::process::exit(1);
-    }
+    persistence::mark_explicit_scope(&mut args);
     let quiet = args.quiet;
     let result = if args.follow {
         direct::follow(&args)

@@ -105,15 +105,17 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             }
             let ssh_multiplexer = if args.rsh.is_some() {
                 None
+            } else if args.restricted_grant.is_some() {
+                Some(Arc::new(SshMultiplexer::new()?))
             } else {
-                match (args.pscope.as_deref(), args.restricted_grant.is_none()) {
-                    (Some(scope), true) => Some(Arc::new(SshMultiplexer::persistent(
-                        scope,
+                match crate::persistence::scope_for_implicit_ssh(args.pscope.as_deref())? {
+                    Some(scope) => Some(Arc::new(SshMultiplexer::persistent(
+                        &scope,
                         loc.user.as_deref(),
                         h,
                         loc.port,
                     )?)),
-                    _ => Some(Arc::new(SshMultiplexer::new()?)),
+                    None => Some(Arc::new(SshMultiplexer::new()?)),
                 }
             };
             Endpoint::Remote(RemoteSpec {
@@ -808,12 +810,6 @@ pub fn run(args: Args) -> Result<i32> {
         bail!(
             "--pscope is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
         );
-    }
-    if coordinator_is_remote {
-        // A durable local preference is a capability, not a demand that every
-        // topology support persistence. The remote coordinator owns its SSH
-        // edges, so do not create misleading local endpoint records for them.
-        args.pscope = None;
     }
     if args.detach && args.native_results.is_some() {
         bail!(

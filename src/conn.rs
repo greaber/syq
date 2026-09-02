@@ -967,8 +967,8 @@ impl RemoteSpec {
                     // skips the handshake.
                     cmd.arg("-o")
                         .arg("ControlMaster=auto")
-                        .arg("-o")
-                        .arg(format!("ControlPath={}", multiplexer.path.display()))
+                        .arg("-S")
+                        .arg(crate::persistence::openssh_control_path(&multiplexer.path))
                         .arg("-o")
                         .arg(format!("ControlPersist={REUSE_PERSIST_SECONDS}"));
                 } else {
@@ -984,8 +984,8 @@ impl RemoteSpec {
                             "ControlMaster={}",
                             if master { "yes" } else { "no" }
                         ))
-                        .arg("-o")
-                        .arg(format!("ControlPath={}", multiplexer.path.display()))
+                        .arg("-S")
+                        .arg(crate::persistence::openssh_control_path(&multiplexer.path))
                         .arg("-o")
                         .arg("ControlPersist=no");
                 }
@@ -2537,7 +2537,7 @@ mod tests {
     #[test]
     fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
         let multiplexer = std::sync::Arc::new(SshMultiplexer::new().unwrap());
-        let control_path = format!("ControlPath={}", multiplexer.path.display());
+        let control_path = multiplexer.path.to_string_lossy().into_owned();
         let spec = RemoteSpec {
             local_process: false,
             user: None,
@@ -2562,7 +2562,9 @@ mod tests {
 
         let control = args(SshConnection::Control);
         assert!(control.iter().any(|arg| arg == "ControlMaster=yes"));
-        assert!(control.iter().any(|arg| arg == &control_path));
+        assert!(control
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path));
         assert!(control.iter().any(|arg| arg == "ControlPersist=no"));
 
         let worker = args(spec.ssh_connection(true));
@@ -2572,7 +2574,9 @@ mod tests {
         spec.set_ssh_multiplexing(true);
         let worker = args(spec.ssh_connection(true));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
-        assert!(worker.iter().any(|arg| arg == &control_path));
+        assert!(worker
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path));
         assert!(!worker.iter().any(|arg| arg == "ControlPath=none"));
 
         let independent = args(SshConnection::Independent);
@@ -2599,7 +2603,7 @@ mod tests {
             std::fs::metadata(&base).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        let control_path = format!("ControlPath={}", multiplexer.path.display());
+        let control_path = multiplexer.path.to_string_lossy().into_owned();
         let spec = RemoteSpec {
             local_process: false,
             user: Some("u".into()),
@@ -2623,7 +2627,9 @@ mod tests {
         };
         let control = args(SshConnection::Control);
         assert!(control.iter().any(|arg| arg == "ControlMaster=auto"));
-        assert!(control.iter().any(|arg| arg == &control_path));
+        assert!(control
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path));
         assert!(control
             .iter()
             .any(|arg| arg == &format!("ControlPersist={REUSE_PERSIST_SECONDS}")));
@@ -2633,5 +2639,46 @@ mod tests {
         let worker = args(spec.ssh_connection(true));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
+    }
+
+    #[test]
+    fn persistent_control_path_is_one_byte_exact_openssh_argument() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/scope with space/%h/non-utf8-\xff/socket".to_vec(),
+        ));
+        let multiplexer = SshMultiplexer {
+            _directory: None,
+            path,
+            persistent: true,
+            reuse_for_workers: AtomicBool::new(false),
+        };
+        let spec = RemoteSpec {
+            local_process: false,
+            user: None,
+            host: "example".into(),
+            port: None,
+            rsh: vec!["ssh".into()],
+            syq_path: None,
+            auto_helper: false,
+            restricted_grant: None,
+            helper_install: Default::default(),
+            ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
+            quiet: false,
+            tcp: Default::default(),
+            diagnostics: Default::default(),
+        };
+
+        let command = spec.ssh_command(SshConnection::Control);
+        let args: Vec<_> = command.get_args().collect();
+        let control_index = args
+            .iter()
+            .position(|arg| *arg == OsStr::new("-S"))
+            .unwrap();
+        assert_eq!(
+            args[control_index + 1].as_bytes(),
+            b"/tmp/scope with space/%%h/non-utf8-\xff/socket"
+        );
     }
 }

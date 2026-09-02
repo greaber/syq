@@ -1679,7 +1679,7 @@ fn fake_ssh(t: &Tmp) -> PathBuf {
 printf '%s\n' "$*" >> "$FAKE_RSH_LOG"
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        -o|-l|-p) shift 2 ;;
+        -o|-l|-p|-S) shift 2 ;;
         -a|-A|-x|-k|-T) shift ;;
         --) shift; break ;;
         -*) shift ;;
@@ -1717,6 +1717,10 @@ while [ "$#" -gt 0 ]; do
             esac
             ;;
         -l)
+            shift 2
+            ;;
+        -S)
+            control_path=$2
             shift 2
             ;;
         --)
@@ -6006,6 +6010,22 @@ fn ordinary_copy_needs_no_writable_history_directory() {
     assert_eq!(read(&t.path("dst/f")), b"data");
 }
 
+#[test]
+fn local_copy_does_not_read_the_global_persistence_configuration() {
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    // An eligible implicit SSH endpoint would report this malformed policy,
+    // but a local copy has no persistence decision to make.
+    write(&t.path("config/syq/persistence-v1.json"), b"not valid JSON");
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/f")), b"data");
+}
+
 // A read-only source root: the copy succeeds, the root ends up 0555, and a
 // rerun into the now read-only destination works too.
 #[test]
@@ -9858,10 +9878,7 @@ fn durable_and_ephemeral_policies_reach_implicit_ssh_connections() {
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     assert!(log.contains("ControlMaster=auto"), "{log}");
     assert!(log.contains("ControlPersist=300"), "{log}");
-    assert!(
-        log.contains(&format!("ControlPath={global_scope}/cm-")),
-        "{log}"
-    );
+    assert!(log.contains(&format!("-S {global_scope}/cm-")), "{log}");
     let status = persistence_command(&t, &["status"]).run().unwrap();
     assert_output_ok(&status);
     assert!(String::from_utf8_lossy(&status.stdout).contains("backup.example:2222"));
@@ -9930,7 +9947,7 @@ exit 0
     assert_output_ok(&output);
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     assert!(
-        log.contains(&format!("ControlPath={}/cm-", scope.display())),
+        log.contains(&format!("-S {}/cm-", scope.display())),
         "{log}"
     );
     assert_output_ok(
@@ -9992,7 +10009,15 @@ fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
     let refused = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--pscope"])
         .arg(&attack)
-        .args(["--src", &t.s("src/a"), "--as", &t.s("no-copy"), "-q"])
+        .args([
+            "--src",
+            &t.s("src/a"),
+            "--to",
+            "backup.example",
+            "--as",
+            &t.s("no-copy"),
+            "-q",
+        ])
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_RUNTIME_DIR", t.path("runtime"))
         .run()
