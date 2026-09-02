@@ -284,6 +284,56 @@ def _append_text(argv: list[Argument], option: str, value: object | None) -> Non
         argv.extend((option, str(value)))
 
 
+def _append_remote_arguments(
+    argv: list[Argument],
+    *,
+    run_at: str | None,
+    rsh: str | None,
+    syq_path: str | os.PathLike[str] | None,
+    no_bootstrap: bool,
+    tcp_plain: bool,
+    no_tcp: bool,
+    tcp_ports: str | None,
+    tcp_congestion: str | None,
+    no_forward_agent: bool,
+    unrestricted_agent_forwarding: bool,
+    agent_broker_only: bool,
+) -> None:
+    if run_at is not None:
+        if run_at not in {"auto", "local", "source", "target"}:
+            raise SyqInvocationError(
+                "--run-at must be auto, local, source, or target"
+            )
+        argv.extend(("--run-at", run_at))
+    if rsh is not None:
+        argv.extend(("--rsh", _text_arg(rsh, label="rsh")))
+    if syq_path is not None:
+        argv.extend(("--syq-path", _text_arg(syq_path, label="syq_path")))
+    for enabled, option in (
+        (no_bootstrap, "--no-bootstrap"),
+        (tcp_plain, "--tcp-plain"),
+        (no_tcp, "--no-tcp"),
+    ):
+        if enabled:
+            argv.append(option)
+    if tcp_ports is not None:
+        argv.extend(("--tcp-ports", _text_arg(tcp_ports, label="tcp_ports")))
+    if tcp_congestion is not None:
+        argv.extend(
+            (
+                "--tcp-congestion",
+                _text_arg(tcp_congestion, label="tcp_congestion"),
+            )
+        )
+    for enabled, option in (
+        (no_forward_agent, "--no-forward-agent"),
+        (unrestricted_agent_forwarding, "--unrestricted-agent-forwarding"),
+        (agent_broker_only, "--agent-broker-only"),
+    ):
+        if enabled:
+            argv.append(option)
+
+
 def _nonnegative_integer(value: int | None, *, option: str) -> int | None:
     if value is None:
         return None
@@ -604,6 +654,17 @@ class Client:
         bwlimit: str | int | None = None,
         connections: int | None = None,
         reuse_connection: bool = False,
+        run_at: str | None = None,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        no_bootstrap: bool = False,
+        tcp_plain: bool = False,
+        no_tcp: bool = False,
+        tcp_ports: str | None = None,
+        tcp_congestion: str | None = None,
+        no_forward_agent: bool = False,
+        unrestricted_agent_forwarding: bool = False,
+        agent_broker_only: bool = False,
         max_entries: int | None = None,
         max_total_bytes: str | int | None = None,
         max_runtime: str | int | None = None,
@@ -652,6 +713,20 @@ class Client:
             max_size=max_size,
             min_size=min_size,
             max_delete=max_delete,
+        )
+        _append_remote_arguments(
+            argv,
+            run_at=run_at,
+            rsh=rsh,
+            syq_path=syq_path,
+            no_bootstrap=no_bootstrap,
+            tcp_plain=tcp_plain,
+            no_tcp=no_tcp,
+            tcp_ports=tcp_ports,
+            tcp_congestion=tcp_congestion,
+            no_forward_agent=no_forward_agent,
+            unrestricted_agent_forwarding=unrestricted_agent_forwarding,
+            agent_broker_only=agent_broker_only,
         )
         if mapping is not None and prune:
             raise SyqInvocationError("--mapping conflicts with --prune")

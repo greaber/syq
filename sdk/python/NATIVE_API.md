@@ -209,6 +209,17 @@ syq.cp(
     bwlimit=None,
     connections=None,
     reuse_connection=False,
+    run_at=None,
+    rsh=None,
+    syq_path=None,
+    no_bootstrap=False,
+    tcp_plain=False,
+    no_tcp=False,
+    tcp_ports=None,
+    tcp_congestion=None,
+    no_forward_agent=False,
+    unrestricted_agent_forwarding=False,
+    agent_broker_only=False,
     max_entries=None,
     max_total_bytes=None,
     max_runtime=None,
@@ -263,6 +274,13 @@ Python API does not replace them with differently defined unit types.
 same native constraints and five-minute reuse window; the library does not
 maintain a separate connection pool.
 
+Native remote controls keep their command names mechanically: `run_at`, `rsh`,
+`syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
+`tcp_congestion`, `no_forward_agent`, `unrestricted_agent_forwarding`, and
+`agent_broker_only`. Endpoint strings passed through `from_` and `to` include
+the native optional port syntax. The executable remains authoritative for
+topology, transport, platform, enrollment, and credential-policy constraints.
+
 Human presentation options such as `verbose`, `quiet`, `stats`, `progress`,
 `no_progress`, and `progress_json` are initially omitted from typed methods.
 Typed methods consume structured results and applications render their own
@@ -273,6 +291,9 @@ under its native name rather than under a Python synonym.
 `results` is also not a typed `cp` parameter: it is the transport the library
 uses internally to obtain `CpResult`. Callers that need direct control of
 `--results FILE` use `run`. The parameter is reserved rather than repurposed.
+For the same reason, `detach` remains available through raw `run`: native
+`--detach` deliberately rejects the attached result stream required by typed
+`cp`.
 
 ## Mapping, transformation, and copy
 

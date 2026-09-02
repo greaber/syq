@@ -204,6 +204,51 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(operation.disposition, syq.Disposition.SUCCEEDED)
         self.assertEqual(operation.kind, syq.EntryKind.FILE)
 
+    def test_cp_forwards_native_remote_controls(self) -> None:
+        self.client.cp(
+            "source",
+            from_="source:2222",
+            to="target:2200",
+            into="out",
+            run_at="local",
+            rsh="ssh -F config",
+            syq_path="/opt/syq",
+            no_bootstrap=True,
+            tcp_plain=True,
+            tcp_ports="49000-49010",
+            tcp_congestion="bbr",
+        )
+        argv = self.argv()
+        for expected in (
+            "--run-at",
+            "--rsh",
+            "--syq-path",
+            "--no-bootstrap",
+            "--tcp-plain",
+            "--tcp-ports",
+            "--tcp-congestion",
+        ):
+            self.assertIn(expected, argv)
+
+        for parameter, option in (
+            ({"no_tcp": True}, "--no-tcp"),
+            ({"no_forward_agent": True}, "--no-forward-agent"),
+            (
+                {"unrestricted_agent_forwarding": True},
+                "--unrestricted-agent-forwarding",
+            ),
+            ({"agent_broker_only": True}, "--agent-broker-only"),
+        ):
+            with self.subTest(option=option):
+                self.client.cp(
+                    "source",
+                    from_="source",
+                    to="target",
+                    into="out",
+                    **parameter,
+                )
+                self.assertIn(option, self.argv())
+
     def test_non_success_result_raises_or_can_be_returned(self) -> None:
         env = {**self.env, "SYQ_FAKE_STATUS": "partial"}
         client = syq.Client(executable=self.executable, env=env)
@@ -306,6 +351,8 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("a", "b", as_="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "ordinary source"):
             self.client.map(src_src="source", as_="target")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "--run-at"):
+            self.client.cp("source", into="target", run_at="elsewhere")
         with self.assertRaisesRegex(ValueError, "relative"):
             syq.RelativePath("/absolute")
         with self.assertRaisesRegex(ValueError, "NUL"):

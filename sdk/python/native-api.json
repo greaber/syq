@@ -7,7 +7,10 @@
         "from", "cwd", "follow", "src", "src-src", "src-file", "src-dir", "to",
         "into", "into-new", "into-existing", "as", "as-new", "as-existing",
         "mapping", "prune", "max-delete", "dry-run", "connections",
-        "reuse-connection", "max-entries", "max-total-bytes", "max-runtime",
+        "reuse-connection", "run-at", "rsh", "syq-path", "no-bootstrap",
+        "tcp-plain", "no-tcp", "tcp-ports", "tcp-congestion",
+        "no-forward-agent", "unrestricted-agent-forwarding",
+        "agent-broker-only", "max-entries", "max-total-bytes", "max-runtime",
         "hash", "no-compress", "bwlimit", "ignore", "ignore-from", "preserve",
         "inplace", "max-size", "min-size"
       ],
@@ -18,7 +21,10 @@
         "src-files": "src-file",
         "src-dirs": "src-dir"
       },
-      "raw_only": ["verbose", "quiet", "progress", "no-progress", "progress-json", "stats"],
+      "raw_only": [
+        "verbose", "quiet", "progress", "no-progress", "progress-json",
+        "stats", "detach"
+      ],
       "follow_up": []
     },
     "rm": {
