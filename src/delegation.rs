@@ -96,11 +96,16 @@ pub(crate) struct RequestId([u8; 32]);
 
 impl RequestId {
     /// A fresh nonce whose first 8 bytes are the big-endian issue time, so
-    /// hex claim filenames sort chronologically and expired claims can one
-    /// day be pruned by name. The remaining 24 random bytes carry
-    /// uniqueness; the timestamp is organizational only — it is not
-    /// validated by verifiers, which must rely on the envelope signature
-    /// and the claim store, never on this prefix.
+    /// hex claim filenames sort chronologically for inspection. The
+    /// remaining 24 random bytes carry uniqueness; the timestamp is
+    /// organizational only — verifiers rely on the envelope signature and
+    /// the claim store, never on this prefix. IMPORTANT: claims created
+    /// before this layout carry fully random IDs that are indistinguishable
+    /// from timestamped ones by name, so any future expiry or pruning
+    /// decision MUST read `claimed_at` from inside the claim record (see
+    /// `validate_claim_record`), never interpret the filename; a
+    /// filename-based pruner could misread a legacy random prefix as an
+    /// ancient timestamp and delete a live claim, re-enabling its grant.
     pub(crate) fn fresh(issued_at: i64) -> Result<Self> {
         let mut bytes = [0u8; 32];
         let seconds = u64::try_from(issued_at).context("request ID issue time before epoch")?;
