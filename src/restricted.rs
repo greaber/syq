@@ -122,6 +122,13 @@ struct AuthorityState {
     /// grant the shortcut above: a second creation of the same path races at
     /// the kernel instead of trusting an outcome that has not happened yet.
     provisional: HashSet<Vec<u8>>,
+    /// Bytes each staged or in-place file may occupy on disk, keyed by the
+    /// destination path and the partial this grant declared for it:
+    /// preallocation and basis seeding are charged against the aggregate
+    /// ceiling here, once per file at its largest declared size, and every
+    /// write or publication must name a declared partial.
+    reserved: HashMap<(Vec<u8>, proto::PartialId), u64>,
+    reserved_bytes: u64,
     transferred_bytes: u64,
     deletions: u64,
     live_connections: u16,
@@ -333,6 +340,8 @@ impl RestrictedAuthority {
                 receiver_modes: HashMap::new(),
                 created: HashSet::new(),
                 provisional: HashSet::new(),
+                reserved: HashMap::new(),
+                reserved_bytes: 0,
                 transferred_bytes: 0,
                 deletions: 0,
                 live_connections: 0,
@@ -466,13 +475,103 @@ impl RestrictedAuthority {
         under_root
     }
 
+    /// Charge the on-disk size a prepared or seeded file will occupy against
+    /// the signed aggregate byte ceiling. A path is charged once, at the
+    /// largest size declared for it, so retries and resumes do not double
+    /// count while many distinct preparations cannot exceed the ceiling.
+    fn reserve_bytes(&self, path: &[u8], partial_id: proto::PartialId, size: u64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let key = (path.to_vec(), partial_id);
+        // An existing declaration only grows; a new one is registered even
+        // at zero length, so an empty file can still be published.
+        let previous = state.reserved.get(&key).copied();
+        if previous.is_some_and(|previous| size <= previous) {
+            return Ok(());
+        }
+        let total = state
+            .reserved_bytes
+            .checked_add(size - previous.unwrap_or(0))
+            .context("signed reservation byte counter overflow")?;
+        if total > self.copy.limits.max_total_bytes {
+            bail!("signed grant total-byte limit exceeded by file preparation");
+        }
+        state.reserved_bytes = total;
+        state.reserved.insert(key, size);
+        Ok(())
+    }
+
+    /// The size this grant declared for a partial, which bounds what may be
+    /// written into it and what may be published from it. A partial left by
+    /// an earlier grant has no declaration here and cannot be used.
+    fn declared_size(&self, path: &[u8], partial_id: proto::PartialId) -> Result<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .reserved
+            .get(&(path.to_vec(), partial_id))
+            .copied()
+            .with_context(|| {
+                format!(
+                    "staged file {} was not declared under this grant",
+                    String::from_utf8_lossy(path)
+                )
+            })
+    }
+
+    /// Refuse to publish a staged or in-place file that is larger than the
+    /// size this grant declared for it.
+    fn check_published_length(
+        &self,
+        path: &[u8],
+        partial_id: proto::PartialId,
+        inplace: bool,
+    ) -> Result<()> {
+        let declared = self.declared_size(path, partial_id)?;
+        let staged = if inplace {
+            path.to_vec()
+        } else {
+            crate::fsops::partial_path(Path::new(OsStr::from_bytes(path)), &partial_id)?
+                .into_os_string()
+                .into_vec()
+        };
+        if let Some(metadata) = self.rooted_metadata(&staged)? {
+            if metadata.len > declared {
+                bail!(
+                    "staged file {} exceeds its declared size",
+                    String::from_utf8_lossy(path)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Charge every entry a destination scan returns against the signed entry
+    /// ceiling, so enumeration is bounded like every other observation.
+    pub(crate) fn record_scanned<'a>(
+        &self,
+        root: &[u8],
+        entries: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<()> {
+        for relative in entries {
+            if relative.is_empty() {
+                continue;
+            }
+            self.record_path(&crate::fsops::join(root, relative))?;
+        }
+        Ok(())
+    }
+
     fn record_path(&self, path: &[u8]) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        if state.paths.insert(path.to_vec())
-            && state.paths.len() as u64 > self.copy.limits.max_entries
-        {
+        if state.paths.contains(path) {
+            return Ok(());
+        }
+        // Check before inserting: a path rejected at the ceiling must not be
+        // remembered, or resubmitting it would pass as already counted.
+        if state.paths.len() as u64 >= self.copy.limits.max_entries {
             bail!("signed grant entry limit exceeded");
         }
+        state.paths.insert(path.to_vec());
         Ok(())
     }
 
@@ -1379,7 +1478,11 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::SeedBasis {
-                path, len, guard, ..
+                path,
+                partial_id,
+                len,
+                guard,
+                ..
             } => {
                 if self.copy.policy.publication != PublicationPolicyV1::AtomicStaged {
                     bail!("in-place signed receiver forbids staged basis creation");
@@ -1389,6 +1492,7 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, false, None, pending)?;
+                self.reserve_bytes(path, *partial_id, *len)?;
                 *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
@@ -1414,6 +1518,7 @@ impl RestrictedAuthority {
                 path,
                 size,
                 inplace,
+                partial_id,
                 guard,
                 ..
             } => {
@@ -1425,11 +1530,13 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_prepare(path)?;
+                self.reserve_bytes(path, *partial_id, *size)?;
                 *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
                 path,
                 inplace,
+                partial_id,
                 off,
                 data,
                 guard,
@@ -1438,12 +1545,20 @@ impl RestrictedAuthority {
                 if *inplace != (self.copy.policy.publication == PublicationPolicyV1::InPlace) {
                     bail!("file write does not match the signed publication policy");
                 }
+                let declared = self.declared_size(path, *partial_id)?;
+                if off
+                    .checked_add(data.len() as u64)
+                    .is_none_or(|end| end > declared)
+                {
+                    bail!("file write extends past the size declared for it");
+                }
                 self.charge_bytes(path, *off, data.len())?;
                 *guard = Some(self.guard.clone());
             }
             Request::Finalize {
                 path,
                 inplace,
+                partial_id,
                 meta,
                 flags,
                 condition,
@@ -1454,6 +1569,7 @@ impl RestrictedAuthority {
                     bail!("file finalization does not match the signed publication policy");
                 }
                 self.check_mutation_path(path, false)?;
+                self.check_published_length(path, *partial_id, *inplace)?;
                 self.constrain_creation(path, condition, false, 0, pending)?;
                 self.constrain_receiver_mode(
                     path,
@@ -2402,6 +2518,48 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
             "--inplace cannot be combined with --ignore-existing, --existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
+    if !args.dry_run
+        && !args.verify_only
+        && (args.delete || args.interface == Interface::NativeCpPrune)
+        && args.max_delete.is_none()
+    {
+        // The signed deletion count is the only bound on what a compromised
+        // hostA can remove inside the scope, so make it an explicit choice
+        // instead of a silent hundred-million default.
+        bail!(
+            "deletion through the command-restricted receiver needs an explicit --max-delete ceiling"
+        );
+    }
+    // Range-check every ceiling here, before automatic enrollment can touch
+    // hostB, rather than leaving it to grant validation after the fact.
+    if let Some(runtime) = args.max_runtime_secs {
+        if runtime > DEFAULT_RUNTIME_SECONDS {
+            bail!(
+                "--max-runtime exceeds the {}-hour signed grant ceiling",
+                DEFAULT_RUNTIME_SECONDS / 3600
+            );
+        }
+    }
+    if args
+        .max_entries
+        .is_some_and(|entries| entries == 0 || entries > delegation::MAX_ENTRIES)
+    {
+        bail!(
+            "--max-entries must be between 1 and {}",
+            delegation::MAX_ENTRIES
+        );
+    }
+    if args
+        .max_total_bytes
+        .is_some_and(|bytes| bytes == 0 || bytes > delegation::MAX_COPY_BYTES)
+    {
+        bail!("--max-total-bytes must be at least 1 byte");
+    }
+    if let Some(maximum) = args.max_size.as_deref() {
+        if crate::cli::parse_size(maximum)? == 0 {
+            bail!("--max-size must be at least 1 byte on the command-restricted path");
+        }
+    }
     if !args.files_from_lines.is_empty()
         || args.files_from.is_some()
         || args.native_mapping.is_some()
@@ -2448,14 +2606,45 @@ fn grant_for(
     validate_restricted_args(args)?;
     let issued_at = now()?;
     let read_only = args.dry_run || args.verify_only;
-    let deletion = if !read_only && (args.delete || args.interface == Interface::NativeCpPrune) {
+    // `--max-delete 0` means nothing may be deleted, which the grant states
+    // directly as a forbidding policy rather than a zero budget.
+    let deletion = if !read_only
+        && (args.delete || args.interface == Interface::NativeCpPrune)
+        && args.max_delete != Some(0)
+    {
         DeletionPolicyV1::DeleteDestinationOnly
     } else {
         DeletionPolicyV1::Forbid
     };
+    let max_entries = args.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
+    let max_total_bytes = args.max_total_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    let max_file_bytes = args
+        .max_size
+        .as_deref()
+        .map(crate::cli::parse_size)
+        .transpose()?
+        .unwrap_or(DEFAULT_MAX_BYTES)
+        .min(max_total_bytes);
     let max_deletions = match deletion {
         DeletionPolicyV1::Forbid => 0,
-        DeletionPolicyV1::DeleteDestinationOnly => args.max_delete.unwrap_or(DEFAULT_MAX_ENTRIES),
+        DeletionPolicyV1::DeleteDestinationOnly => args
+            .max_delete
+            .context("deletion through the command-restricted receiver needs --max-delete")?
+            .min(max_entries),
+    };
+    let (not_after, max_runtime_seconds) = match args.max_runtime_secs {
+        None => (
+            issued_at
+                .checked_add(GRANT_VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
+                .context("signed grant expiration overflow")?,
+            DEFAULT_RUNTIME_SECONDS,
+        ),
+        Some(runtime) => (
+            issued_at
+                .checked_add(i64::from(runtime))
+                .context("signed grant expiration overflow")?,
+            runtime,
+        ),
     };
     let copies_contents = sources.iter().any(Location::copies_contents);
     let placement = match args.placement {
@@ -2514,9 +2703,7 @@ fn grant_for(
         request_id: RequestId::random()?,
         issued_at,
         not_before: issued_at.saturating_sub(CLOCK_SKEW_SECONDS),
-        not_after: issued_at
-            .checked_add(GRANT_VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
-            .context("signed grant expiration overflow")?,
+        not_after,
         operation: GrantOperationV1::Copy(CopyOperationV1 {
             destination: destination_bytes,
             mutation_scopes,
@@ -2547,15 +2734,9 @@ fn grant_for(
                 tcp_port_hi,
             },
             limits: CopyLimitsV1 {
-                max_entries: DEFAULT_MAX_ENTRIES,
-                max_total_bytes: DEFAULT_MAX_BYTES,
-                max_file_bytes: args
-                    .max_size
-                    .as_deref()
-                    .map(crate::cli::parse_size)
-                    .transpose()?
-                    .unwrap_or(DEFAULT_MAX_BYTES)
-                    .min(DEFAULT_MAX_BYTES),
+                max_entries,
+                max_total_bytes,
+                max_file_bytes,
                 hash_block_bytes: crate::cli::parse_size(&args.block_size)?
                     .clamp(proto::MIN_HASH_BLOCK_BYTES, proto::MAX_HASH_BLOCK_BYTES),
                 max_connections: u16::try_from(if args.connections_opt.is_some() {
@@ -2565,7 +2746,7 @@ fn grant_for(
                 })
                 .context("connection maximum exceeds grant representation")?,
                 max_deletions,
-                max_runtime_seconds: DEFAULT_RUNTIME_SECONDS,
+                max_runtime_seconds,
             },
         }),
     };
@@ -3711,6 +3892,9 @@ mod tests {
 
         // A failed no-replace publication leaves nothing behind, so a foreign
         // object that appears afterwards is retained like any other.
+        authority
+            .authorize(&mut prepare_request(&fresh), false)
+            .unwrap();
         let mut publish = finalize_request(&fresh, Any);
         let settlement = authority.authorize(&mut publish, false).unwrap();
         authority.settle(settlement, &proto::Response::Err("raced".into()));
@@ -3722,6 +3906,9 @@ mod tests {
         let mut publish = small_put(&kept);
         let settlement = authority.authorize(&mut publish, false).unwrap();
         authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        authority
+            .authorize(&mut prepare_request(&kept), false)
+            .unwrap();
         let mut republish = finalize_request(&kept, Matches { dev: 1, ino: 1 });
         authority.authorize(&mut republish, false).unwrap();
 
@@ -3820,6 +4007,9 @@ mod tests {
             },
         );
         assert!(authority.authorize(&mut stale, false).is_err());
+        authority
+            .authorize(&mut prepare_request(&present), false)
+            .unwrap();
         let mut exact = finalize_request(
             &present,
             Matches {
@@ -3952,6 +4142,9 @@ mod tests {
         );
         let mut as_directory = apply(mkdir(&link));
         assert!(authority.authorize(&mut as_directory, false).is_err());
+        authority
+            .authorize(&mut prepare_request(&link), false)
+            .unwrap();
         let mut publish = finalize_request(&link, Any);
         authority.authorize(&mut publish, false).unwrap();
         assert_eq!(
@@ -4151,6 +4344,9 @@ mod tests {
         let mut revisit_root = apply(mkdir(&target));
         authority.authorize(&mut revisit_root, false).unwrap();
         assert_eq!(op_condition(&revisit_root), Any);
+        authority
+            .authorize(&mut prepare_request(&target.join("child")), false)
+            .unwrap();
         let mut child = finalize_request(&target.join("child"), Any);
         authority.authorize(&mut child, false).unwrap();
         assert_eq!(finalize_condition(&child), Any);
@@ -4607,6 +4803,18 @@ mod tests {
             guard: None,
         };
 
+        // Writes must land in a partial this grant declared.
+        assert!(authority.authorize(&mut request(0), false).is_err());
+        let mut prepare = Request::Prepare {
+            path: target.clone(),
+            size: 1024,
+            inplace: false,
+            partial_id: [0; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        authority.authorize(&mut prepare, false).unwrap();
+
         let started = Instant::now();
         authority.authorize(&mut request(0), false).unwrap();
         authority.authorize(&mut request(256), false).unwrap();
@@ -4615,7 +4823,7 @@ mod tests {
             "signed aggregate rate limit did not pace consecutive writes"
         );
 
-        let mut oversized = request(512);
+        let mut oversized = request(0);
         if let Request::WriteRange { data, .. } = &mut oversized {
             data.resize(513, 0);
         }
@@ -4776,6 +4984,334 @@ mod tests {
             guard: None,
         };
         authority.authorize(&mut observe_container, false).unwrap();
+    }
+
+    #[test]
+    fn entry_ceiling_survives_resubmission_of_a_rejected_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        // The helper grant allows eight entries.
+        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let stat = |name: String| Request::StatMany {
+            paths: vec![root
+                .join("target")
+                .join(name)
+                .as_os_str()
+                .as_bytes()
+                .to_vec()],
+            follow: false,
+            guard: None,
+        };
+        for index in 0..8 {
+            authority
+                .authorize(&mut stat(format!("entry-{index}")), false)
+                .unwrap();
+        }
+        assert!(authority
+            .authorize(&mut stat("entry-8".into()), false)
+            .is_err());
+        // Resubmitting the rejected path must not slip through as counted.
+        assert!(authority
+            .authorize(&mut stat("entry-8".into()), false)
+            .is_err());
+        // Paths already inside the ceiling remain usable.
+        authority
+            .authorize(&mut stat("entry-0".into()), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn forbidden_deletion_keeps_the_unfiltered_scan_but_refuses_removals() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority_with_policy(
+            &root,
+            DeletionPolicyV1::Forbid,
+            16,
+            0,
+            FilterPolicyV3 {
+                ignore: vec!["ignored/".into()],
+                destination_roots: Vec::new(),
+                delete_excluded: true,
+            },
+            PublicationPolicyV1::AtomicStaged,
+        );
+        let target = root.join("target").as_os_str().as_bytes().to_vec();
+        let mut unfiltered_scan = Request::Scan {
+            root: target,
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: true,
+            guard: None,
+        };
+        authority.authorize(&mut unfiltered_scan, false).unwrap();
+        let ignored = root
+            .join("target/ignored/file")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        let mut delete = Request::Apply {
+            ops: vec![Op::Unlink { path: ignored }],
+            guard: None,
+        };
+        assert!(authority.authorize(&mut delete, false).is_err());
+    }
+
+    #[test]
+    fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir_all(root.join("target")).unwrap();
+        // The helper grant allows 16 bytes in total and per file.
+        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 16);
+        let prepare = |name: &str, size| Request::Prepare {
+            path: root
+                .join("target")
+                .join(name)
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+            size,
+            inplace: false,
+            partial_id: [1; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        authority.authorize(&mut prepare("a", 10), false).unwrap();
+        // A second file would take the aggregate past the ceiling.
+        assert!(authority.authorize(&mut prepare("b", 10), false).is_err());
+        // Re-preparing the same file at the same or a larger size charges only
+        // the difference; a retry never double counts.
+        authority.authorize(&mut prepare("a", 10), false).unwrap();
+        authority.authorize(&mut prepare("a", 14), false).unwrap();
+        assert!(authority.authorize(&mut prepare("b", 3), false).is_err());
+        authority.authorize(&mut prepare("b", 2), false).unwrap();
+        let mut seed = Request::SeedBasis {
+            path: root.join("target/b").as_os_str().as_bytes().to_vec(),
+            partial_id: [1; 16],
+            len: 3,
+            guard: None,
+        };
+        assert!(authority.authorize(&mut seed, false).is_err());
+
+        // An empty file is declared at zero length and can be published.
+        authority
+            .authorize(&mut prepare("empty", 0), false)
+            .unwrap();
+        let mut publish_empty = Request::Finalize {
+            path: root.join("target/empty").as_os_str().as_bytes().to_vec(),
+            inplace: false,
+            partial_id: [1; 16],
+            meta: proto::Meta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        authority.authorize(&mut publish_empty, false).unwrap();
+        // A file never declared under this grant cannot be published.
+        let mut publish_foreign = Request::Finalize {
+            path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
+            inplace: false,
+            partial_id: [9; 16],
+            meta: proto::Meta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        assert!(authority.authorize(&mut publish_foreign, false).is_err());
+    }
+
+    #[test]
+    fn scanned_entries_count_against_the_entry_ceiling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        // The helper grant allows eight entries.
+        let authority = test_authority(&root, DeletionPolicyV1::Forbid, 1024);
+        let target = root.join("target").as_os_str().as_bytes().to_vec();
+        let mut scan = Request::Scan {
+            root: target.clone(),
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: false,
+            guard: None,
+        };
+        authority.authorize(&mut scan, false).unwrap();
+        let names: Vec<Vec<u8>> = (0..7)
+            .map(|index| format!("entry-{index}").into_bytes())
+            .collect();
+        let mut batch: Vec<&[u8]> = vec![b""];
+        batch.extend(names.iter().map(Vec::as_slice));
+        // Root plus seven descendants fills the ceiling exactly.
+        authority.record_scanned(&target, batch).unwrap();
+        assert!(authority
+            .record_scanned(&target, [b"entry-7".as_slice()])
+            .is_err());
+        // Already counted entries may be listed again.
+        authority
+            .record_scanned(&target, [b"entry-0".as_slice()])
+            .unwrap();
+    }
+
+    #[test]
+    fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
+        let parse = |options: &[&str]| {
+            let mut argv = vec!["syq rsync", "-r"];
+            argv.extend_from_slice(options);
+            argv.extend_from_slice(&["host-a:source", "host-b:/backup"]);
+            let mut args = Args::try_parse_from(argv).unwrap();
+            args.normalize();
+            args
+        };
+        // validate_restricted_args runs first in prepare_transfer, before
+        // the enrollment lookup or installation.
+        let mut args = parse(&[]);
+        validate_restricted_args(&args).unwrap();
+        args.max_runtime_secs = Some(DEFAULT_RUNTIME_SECONDS + 1);
+        assert!(validate_restricted_args(&args).is_err());
+        let mut args = parse(&[]);
+        args.max_entries = Some(0);
+        assert!(validate_restricted_args(&args).is_err());
+        args.max_entries = Some(delegation::MAX_ENTRIES + 1);
+        assert!(validate_restricted_args(&args).is_err());
+        let mut args = parse(&[]);
+        args.max_total_bytes = Some(0);
+        assert!(validate_restricted_args(&args).is_err());
+        assert!(validate_restricted_args(&parse(&["--max-size", "0"])).is_err());
+        assert!(validate_restricted_args(&parse(&["--delete"])).is_err());
+        validate_restricted_args(&parse(&["--delete", "--max-delete", "0"])).unwrap();
+
+        // A zero deletion budget signs a grant that forbids deletion outright.
+        let id = EnrollmentId::random();
+        let source = Location::parse("host-a:source").unwrap();
+        let grant = grant_for(
+            &parse(&["--delete", "--max-delete", "0"]),
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup",
+        )
+        .unwrap();
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicyV1::Forbid);
+        assert_eq!(copy.limits.max_deletions, 0);
+    }
+
+    #[test]
+    fn explicit_ceilings_are_signed_and_deletion_needs_a_stated_budget() {
+        let id = EnrollmentId::random();
+        let source = Location::parse("host-a:source").unwrap();
+        let parse = |options: &[&str]| {
+            let mut argv = vec!["syq rsync", "-r"];
+            argv.extend_from_slice(options);
+            argv.extend_from_slice(&["host-a:source", "host-b:/backup"]);
+            let mut args = Args::try_parse_from(argv).unwrap();
+            args.normalize();
+            args
+        };
+
+        // Defaults are the wide built-in ceilings and the 24-hour validity.
+        let default_args = parse(&[]);
+        let default_grant = grant_for(
+            &default_args,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup",
+        )
+        .unwrap();
+        let GrantOperationV1::Copy(default_copy) = &default_grant.operation;
+        assert_eq!(default_copy.limits.max_entries, DEFAULT_MAX_ENTRIES);
+        assert_eq!(default_copy.limits.max_total_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(default_copy.limits.max_file_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(
+            default_copy.limits.max_runtime_seconds,
+            DEFAULT_RUNTIME_SECONDS
+        );
+        assert_eq!(
+            default_grant.not_after - default_grant.not_before,
+            GRANT_VALIDITY_SECONDS
+        );
+
+        // Explicit ceilings land in the signed limits; the per-file bound
+        // never exceeds the total, and the validity shrinks to the runtime.
+        let mut ceilings = parse(&["--max-size", "3M"]);
+        ceilings.max_entries = Some(12);
+        ceilings.max_total_bytes = Some(2 << 20);
+        ceilings.max_runtime_secs = Some(1800);
+        let grant = grant_for(
+            &ceilings,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup",
+        )
+        .unwrap();
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(copy.limits.max_entries, 12);
+        assert_eq!(copy.limits.max_total_bytes, 2 << 20);
+        assert_eq!(copy.limits.max_file_bytes, 2 << 20);
+        assert_eq!(copy.limits.max_runtime_seconds, 1800);
+        assert_eq!(grant.not_after - grant.issued_at, 1800);
+        assert_eq!(grant.issued_at - grant.not_before, CLOCK_SKEW_SECONDS);
+
+        let mut too_long = parse(&[]);
+        too_long.max_runtime_secs = Some(DEFAULT_RUNTIME_SECONDS + 1);
+        assert!(grant_for(
+            &too_long,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup"
+        )
+        .is_err());
+
+        // Deletion authority must be stated; it is then capped by the entry
+        // ceiling so the grant stays self-consistent.
+        let unbounded = parse(&["--delete"]);
+        assert!(grant_for(
+            &unbounded,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup"
+        )
+        .is_err());
+        let mut bounded = parse(&["--delete", "--max-delete", "40"]);
+        bounded.max_entries = Some(30);
+        let grant = grant_for(
+            &bounded,
+            std::slice::from_ref(&source),
+            id,
+            "backup",
+            "/backup",
+        )
+        .unwrap();
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(
+            copy.policy.deletion,
+            DeletionPolicyV1::DeleteDestinationOnly
+        );
+        assert_eq!(copy.limits.max_deletions, 30);
+        // A read-only run plans no deletion, so it needs no budget.
+        let preview = parse(&["--delete", "--dry-run"]);
+        let grant = grant_for(&preview, &[source], id, "backup", "/backup").unwrap();
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicyV1::Forbid);
     }
 
     #[test]

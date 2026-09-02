@@ -78,9 +78,9 @@ const MAX_SIGNER_BYTES: usize = 512;
 const MAX_GRANT_VALIDITY_SECS: i64 = 24 * 60 * 60;
 const MAX_CLOCK_SKEW_SECS: i64 = 5 * 60;
 const MAX_UNIX_TIMESTAMP: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
-const MAX_ENTRIES: u64 = 1_000_000_000_000;
+pub(crate) const MAX_ENTRIES: u64 = 1_000_000_000_000;
 // Keep later accounting representable in both signed and unsigned counters.
-const MAX_COPY_BYTES: u64 = i64::MAX as u64;
+pub(crate) const MAX_COPY_BYTES: u64 = i64::MAX as u64;
 const MAX_CONNECTIONS: u16 = 64;
 const MAX_FILTER_RULES: usize = 4096;
 const MAX_FILTER_RULE_BYTES: usize = 4096;
@@ -373,14 +373,12 @@ impl FilterPolicyV3 {
                 bail!("signed filter roots must be sorted and unique");
             }
         }
-        if self.delete_excluded {
-            let GrantOperationV1::Copy(copy) = &grant.operation;
-            if copy.policy.deletion == DeletionPolicyV1::Forbid {
-                bail!(
-                    "signed filter policy cannot delete excluded paths when deletion is forbidden"
-                );
-            }
-        }
+        // `delete_excluded` is also a scan policy: with it, the orchestrator
+        // inspects the destination unfiltered, and the receiver requires
+        // exactly that. It therefore stays meaningful when deletion is
+        // forbidden (a dry run, or a zero deletion budget); the receiver's
+        // deletion policy still refuses every actual removal.
+        let _ = grant;
         Ok(())
     }
 }
@@ -2440,6 +2438,21 @@ mod tests {
             RootExistenceV4::Existing,
         )
         .is_err());
+    }
+
+    #[test]
+    fn delete_excluded_filters_remain_valid_when_deletion_is_forbidden() {
+        let grant = fixture_grant(50);
+        let GrantOperationV1::Copy(copy) = &grant.operation;
+        assert_eq!(copy.policy.deletion, DeletionPolicyV1::Forbid);
+        let filters = FilterPolicyV3 {
+            ignore: vec!["*.tmp".into()],
+            destination_roots: vec![b"/srv/archive/project".to_vec()],
+            delete_excluded: true,
+        };
+        // The unfiltered-scan policy still matters for a dry run or a zero
+        // deletion budget; the receiver's deletion policy refuses removals.
+        filters.validate(&grant).unwrap();
     }
 
     #[test]

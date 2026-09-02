@@ -311,6 +311,13 @@ pub struct Args {
     /// With --delete, refuse to delete anything if more than N deletions are planned (exit 25)
     #[arg(long, value_name = "N", requires = "delete")]
     pub max_delete: Option<u64>,
+    /// Native-only command-restricted receiver ceilings, signed into the grant.
+    #[arg(skip)]
+    pub max_entries: Option<u64>,
+    #[arg(skip)]
+    pub max_total_bytes: Option<u64>,
+    #[arg(skip)]
+    pub max_runtime_secs: Option<u32>,
     /// Skip regular files that are newer on the destination (directories,
     /// symlinks and specials are unaffected)
     #[arg(short = 'u', long)]
@@ -676,6 +683,15 @@ struct NativeCopyOperationalArgs {
     /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
     #[arg(long)]
     inplace: bool,
+    /// Command-restricted receiver ceiling: refuse to touch more than N destination entries (direct remote-to-remote only)
+    #[arg(long, value_name = "N")]
+    max_entries: Option<u64>,
+    /// Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total (direct remote-to-remote only)
+    #[arg(long, value_name = "SIZE")]
+    max_total_bytes: Option<String>,
+    /// Command-restricted receiver ceiling: the signed grant expires DURATION after it is issued, e.g. 30m or 2h (direct remote-to-remote only; at most 23h)
+    #[arg(long, value_name = "DURATION")]
+    max_runtime: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1062,6 +1078,21 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         }
     }
     apply_native_copy_operational(&mut args, parsed.operational, &matches)?;
+    if args.max_entries.is_some()
+        || args.max_total_bytes.is_some()
+        || args.max_runtime_secs.is_some()
+    {
+        // These are assertions for hostB's enrolled receiver to enforce; with
+        // no such receiver in the topology, nothing would enforce them, so
+        // refuse rather than let them read as local limits.
+        let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
+        let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
+        if !(src_remote && dst_remote) {
+            bail!(
+                "--max-entries, --max-total-bytes, and --max-runtime are command-restricted receiver ceilings; they apply only to direct remote-to-remote copies"
+            );
+        }
+    }
     apply_internal_native_direct(&mut args)?;
     Ok(args)
 }
@@ -1228,7 +1259,16 @@ fn apply_native_copy_operational(
         ignore_from,
         preserve,
         inplace,
+        max_entries,
+        max_total_bytes,
+        max_runtime,
     } = operational;
+    args.max_entries = max_entries;
+    args.max_total_bytes = max_total_bytes.as_deref().map(parse_size).transpose()?;
+    args.max_runtime_secs = max_runtime
+        .as_deref()
+        .map(parse_duration_secs)
+        .transpose()?;
     args.checksum = hash;
     args.no_compress = no_compress;
     if no_compress {
@@ -1556,6 +1596,34 @@ fn message_for_short(c: char) -> Option<&'static str> {
     })
 }
 
+/// Parse a whole-number duration with an optional `s`, `m`, or `h` suffix
+/// (seconds when unsuffixed) into seconds. Zero is rejected.
+pub fn parse_duration_secs(s: &str) -> Result<u32> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => {
+            let m: u32 = match c.to_ascii_lowercase() {
+                's' => 1,
+                'm' => 60,
+                'h' => 60 * 60,
+                _ => bail!("bad duration suffix in {s:?}; use s, m, or h"),
+            };
+            (&s[..s.len() - 1], m)
+        }
+        _ => (s, 1),
+    };
+    let n: u32 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad duration {s:?}"))?;
+    let seconds = n
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("bad duration {s:?}: value is too large"))?;
+    if seconds == 0 {
+        bail!("duration {s:?} must be at least one second");
+    }
+    Ok(seconds)
+}
+
 pub fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {
@@ -1596,10 +1664,21 @@ pub fn parse_size(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_size, Args,
-        Interface, Placement, SourceSelection,
+        native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
+        parse_size, Args, Interface, Placement, SourceSelection,
     };
     use clap::Parser;
+
+    #[test]
+    fn durations_take_seconds_minutes_or_hours_and_reject_zero() {
+        assert_eq!(parse_duration_secs("45").unwrap(), 45);
+        assert_eq!(parse_duration_secs("90s").unwrap(), 90);
+        assert_eq!(parse_duration_secs("30m").unwrap(), 1800);
+        assert_eq!(parse_duration_secs("2H").unwrap(), 7200);
+        for bad in ["0", "0m", "", "5d", "1.5h", "-3", "4294967295h"] {
+            assert!(parse_duration_secs(bad).is_err(), "{bad:?}");
+        }
+    }
 
     fn args(options: &[&str]) -> Args {
         let mut argv = vec!["syq"];
