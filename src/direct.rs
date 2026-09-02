@@ -24,36 +24,96 @@ const MAX_RECEIPT_LINE_BYTES: usize = 96 * 1024 * 1024;
 /// receipt line to ourselves. Used only when a receipt is expected; other
 /// transfers inherit stdout untouched. Returns the last receipt payload.
 fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<Vec<u8>>> {
+    relay_stdout_bounded(stdout, MAX_RECEIPT_LINE_BYTES)
+}
+
+/// Streams every ordinary line straight through without holding more than
+/// one buffer of it, so a hostile orchestrator cannot make this machine
+/// buffer an arbitrarily long line; only a receipt line is collected, up to
+/// `limit` bytes.
+fn relay_stdout_bounded(stdout: impl std::io::Read, limit: usize) -> Result<Option<Vec<u8>>> {
     use std::io::Write;
     let prefix = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes();
-    let mut reader = std::io::BufReader::new(stdout);
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
     let mut out = std::io::stdout().lock();
-    let mut line = Vec::new();
     let mut receipt = None;
+    // The first bytes of the current line, held only until the prefix
+    // decision; then either the receipt payload being collected or nothing.
+    let mut head: Vec<u8> = Vec::with_capacity(prefix.len());
+    let mut decided = false;
+    let mut capturing: Option<Vec<u8>> = None;
+    let finish_capture = |payload: &mut Vec<u8>| {
+        while payload
+            .last()
+            .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            payload.pop();
+        }
+        std::mem::take(payload)
+    };
     loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
+        let buffer = reader
+            .fill_buf()
             .context("read remote orchestrator output")?;
-        if read == 0 {
+        if buffer.is_empty() {
             break;
         }
-        if let Some(payload) = line.strip_prefix(prefix) {
-            if payload.len() > MAX_RECEIPT_LINE_BYTES {
-                bail!("the relayed receipt line exceeds {MAX_RECEIPT_LINE_BYTES} bytes");
+        let mut consumed = 0;
+        while consumed < buffer.len() {
+            let chunk = &buffer[consumed..];
+            let (segment, ends_line) = match chunk.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (&chunk[..=index], true),
+                None => (chunk, false),
+            };
+            consumed += segment.len();
+            if !decided {
+                head.extend_from_slice(segment);
+                if head.len() >= prefix.len() || ends_line {
+                    decided = true;
+                    if head.starts_with(prefix) {
+                        capturing = Some(head[prefix.len()..].to_vec());
+                    } else {
+                        out.write_all(&head)
+                            .context("relay remote orchestrator output")?;
+                    }
+                    head.clear();
+                }
+            } else if let Some(payload) = capturing.as_mut() {
+                payload.extend_from_slice(segment);
+            } else {
+                out.write_all(segment)
+                    .context("relay remote orchestrator output")?;
             }
-            let payload = payload
-                .strip_suffix(b"\n")
-                .unwrap_or(payload)
-                .strip_suffix(b"\r")
-                .unwrap_or(payload);
-            receipt = Some(payload.to_vec());
-            continue;
+            if let Some(payload) = capturing.as_mut() {
+                if payload.len() > limit {
+                    bail!("the relayed receipt line exceeds {limit} bytes");
+                }
+            }
+            if ends_line {
+                if let Some(payload) = capturing.as_mut() {
+                    receipt = Some(finish_capture(payload));
+                    capturing = None;
+                } else {
+                    out.flush().context("relay remote orchestrator output")?;
+                }
+                decided = false;
+            }
         }
-        out.write_all(&line)
-            .and_then(|()| out.flush())
-            .context("relay remote orchestrator output")?;
+        reader.consume(consumed);
     }
+    // Output that ended without a newline.
+    if !head.is_empty() {
+        if head.starts_with(prefix) {
+            capturing = Some(head[prefix.len()..].to_vec());
+        } else {
+            out.write_all(&head)
+                .context("relay remote orchestrator output")?;
+        }
+    }
+    if let Some(payload) = capturing.as_mut() {
+        receipt = Some(finish_capture(payload));
+    }
+    out.flush().context("relay remote orchestrator output")?;
     Ok(receipt)
 }
 
@@ -1332,6 +1392,24 @@ mod tests {
             Some(good.as_bytes())
         );
         assert_eq!(relay_stdout(b"plain\n".as_slice()).unwrap(), None);
+
+        // Ordinary lines stream through however long they are, a receipt
+        // line without a trailing newline still counts, and an oversized
+        // receipt line is refused instead of buffered.
+        let mut long = vec![b'x'; 300 * 1024];
+        long.push(b'\n');
+        long.extend_from_slice(crate::receipt::RECEIPT_LINE_PREFIX.as_bytes());
+        long.extend_from_slice(good.as_bytes());
+        assert_eq!(
+            relay_stdout_bounded(long.as_slice(), 4096)
+                .unwrap()
+                .as_deref(),
+            Some(good.as_bytes())
+        );
+        let mut oversized = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
+        oversized.extend(std::iter::repeat_n(b'A', 5000));
+        oversized.push(b'\n');
+        assert!(relay_stdout_bounded(oversized.as_slice(), 4096).is_err());
     }
 
     #[test]
