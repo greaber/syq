@@ -8968,3 +8968,168 @@ fn native_mapping_and_map_respect_typed_selectors() {
     let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
     assert_eq!(dsts, ["d", "f.txt"]);
 }
+
+// ---- MAPPINGS.md example verification ----
+//
+// Each documented jq transform lives here as a constant. Tests assert the
+// constant appears in MAPPINGS.md (whitespace-normalized, so formatting can
+// change but semantics cannot drift silently), then execute the real
+// pipeline with jq against a local tree. Endpoints are adapted from the
+// documented `--to nas --into /...` to local directories.
+
+const DOC_JQ_LOWERCASE: &str = ".dst.value |= ascii_downcase";
+const DOC_JQ_DATE_PARTITION: &str = r#"select(.kind == "file")
+        | .dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value"#;
+const DOC_JQ_MIN_SIZE: &str = r#"select(.kind != "file" or .size >= 1048576)"#;
+const DOC_JQ_RETRY_GATE: &str = r#"if (.[-1].type? // "") != "result"
+        then "incomplete results stream (no terminal record)" | halt_error
+        elif (.[-1].status != "success" and .[-1].status != "partial")
+        then "run stopped early (status \(.[-1].status)); rerun it instead of retrying" | halt_error
+        else .[] | select(.type == "operation_result"
+                          and .disposition == "failed"
+                          and .retryable != "no")
+             | {src, dst, kind} end"#;
+
+fn assert_documented(program: &str) {
+    let doc = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/MAPPINGS.md")).unwrap();
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        squash(&doc).contains(&squash(program)),
+        "MAPPINGS.md no longer contains this documented jq program; update the doc and this test together:\n{program}"
+    );
+}
+
+fn jq(program: &str, args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new("jq")
+        .arg("-c")
+        .args(args)
+        .arg(program)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("jq must be installed to verify the documented examples");
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn run_doc_pipeline(t: &Tmp, program: &str, jq_args: &[&str], src: &str, dst: &str) {
+    assert_documented(program);
+    let map_out = syq_map_in(&t.path(""), &["--src-src", src]);
+    assert!(map_out.status.success());
+    let jq_out = jq(program, jq_args, &map_out.stdout);
+    assert!(
+        jq_out.status.success(),
+        "documented jq program failed: {}",
+        String::from_utf8_lossy(&jq_out.stderr)
+    );
+    let cp = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", src, "--into", dst, "-q"],
+        Some(&jq_out.stdout),
+    );
+    assert!(
+        cp.status.success(),
+        "cp failed: {}",
+        String::from_utf8_lossy(&cp.stderr)
+    );
+}
+
+#[test]
+fn mappings_md_lowercase_example_works_verbatim() {
+    let t = Tmp::new();
+    write(&t.path("src/Berlin/IMG_1234.JPG"), b"img");
+    write(&t.path("src/Notes.TXT"), b"hello");
+    run_doc_pipeline(&t, DOC_JQ_LOWERCASE, &[], "src", "pub");
+    assert_eq!(read(&t.path("pub/berlin/img_1234.jpg")), b"img");
+    assert_eq!(read(&t.path("pub/notes.txt")), b"hello");
+}
+
+#[test]
+fn mappings_md_date_partition_example_works_verbatim() {
+    let t = Tmp::new();
+    write(&t.path("photos/IMG_1234.JPG"), b"july");
+    write(&t.path("photos/IMG_8812.JPG"), b"november");
+    write(&t.path("photos/clip.mp4"), b"january");
+    set_mtime(&t.path("photos/IMG_1234.JPG"), 1721900000); // 2024-07
+    set_mtime(&t.path("photos/IMG_8812.JPG"), 1730500000); // 2024-11
+    set_mtime(&t.path("photos/clip.mp4"), 1736000000); // 2025-01
+    run_doc_pipeline(&t, DOC_JQ_DATE_PARTITION, &[], "photos", "archive");
+    assert_eq!(read(&t.path("archive/2024/07/IMG_1234.JPG")), b"july");
+    assert_eq!(read(&t.path("archive/2024/11/IMG_8812.JPG")), b"november");
+    assert_eq!(read(&t.path("archive/2025/01/clip.mp4")), b"january");
+}
+
+#[test]
+fn mappings_md_min_size_example_works_verbatim() {
+    let t = Tmp::new();
+    write(&t.path("data/big.bin"), &vec![7u8; 1048576]);
+    write(&t.path("data/small.txt"), b"tiny");
+    write(&t.path("data/sub/also-small.txt"), b"tiny");
+    run_doc_pipeline(&t, DOC_JQ_MIN_SIZE, &[], "data", "big");
+    assert_eq!(read(&t.path("big/big.bin")).len(), 1048576);
+    assert!(!t.path("big/small.txt").exists());
+    assert!(
+        t.path("big/sub").is_dir(),
+        "non-file entries pass the filter"
+    );
+    assert!(!t.path("big/sub/also-small.txt").exists());
+}
+
+#[test]
+fn mappings_md_retry_gate_example_works_verbatim() {
+    let t = Tmp::new();
+    write(&t.path("src/ok.txt"), b"ok");
+    let manifest = format!(
+        "{}{}",
+        entry_line("gone.txt", "g.txt", None),
+        entry_line("ok.txt", "ok.txt", None),
+    );
+    let cp = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(cp.status.code(), Some(23));
+    let results = read(&t.path("r.ndjson"));
+    assert_documented(DOC_JQ_RETRY_GATE);
+    // Complete partial stream: the gate passes and emits the retry entry.
+    let out = jq(DOC_JQ_RETRY_GATE, &["-s"], &results);
+    assert!(out.status.success());
+    let retry: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one retry entry");
+    assert_eq!(retry["dst"]["value"], "g.txt");
+    // The emitted entry executes as a mapping after the source appears.
+    write(&t.path("src/gone.txt"), b"late");
+    let cp = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(&out.stdout),
+    );
+    assert!(cp.status.success());
+    assert_eq!(read(&t.path("dst/g.txt")), b"late");
+    // Truncated stream: refused.
+    let truncated: Vec<u8> = results
+        .split(|&b| b == b'\n')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(&b'\n');
+    let out = jq(DOC_JQ_RETRY_GATE, &["-s"], &truncated);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("incomplete results stream"));
+    // Aborted terminal record: refused with advice to rerun.
+    let mut aborted = truncated.clone();
+    aborted.extend_from_slice(b"\n{\"type\":\"result\",\"status\":\"aborted\"}\n");
+    let out = jq(DOC_JQ_RETRY_GATE, &["-s"], &aborted);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("run stopped early (status aborted)"));
+}
