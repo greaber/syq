@@ -2272,7 +2272,7 @@ mod tests {
                 expected_dev: 1,
                 expected_ino: 2,
                 request_prefix: b"destination".to_vec(),
-                insecure_links: false,
+                symlink_policy: OperatorSymlinkPolicy::TrustedOwner,
             }),
         )
         .unwrap();

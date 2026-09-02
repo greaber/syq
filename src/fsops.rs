@@ -199,13 +199,12 @@ impl OperatorDirectorySelection {
     }
 }
 
-/// Resolve an operator-selected directory with rsync's ownership rule:
-/// symlinks at any component are followed only when owned by uid 0 or by this
-/// process's effective uid. The descriptor remains in the returned selection.
+/// Resolve an operator-selected directory under the requested symlink policy.
+/// The descriptor remains in the returned selection.
 fn select_operator_directory(
     path: &[u8],
     allow_missing: bool,
-    insecure_links: bool,
+    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<(OperatorDirectorySelection, Option<DirectoryAnchor>)> {
     let path = resolve(path);
     let path = if path.is_absolute() {
@@ -251,13 +250,22 @@ fn select_operator_directory(
         };
         if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
             let euid = unsafe { libc::geteuid() };
-            if !insecure_links && !operator_symlink_owner_is_trusted(metadata.st_uid, euid) {
-                bail!(
-                    "refusing symlink component {:?} owned by uid {}; expected uid 0 or receiver uid {}",
-                    OsStr::from_bytes(&component),
-                    metadata.st_uid,
-                    euid
-                );
+            match symlink_policy {
+                OperatorSymlinkPolicy::Refuse => bail!(
+                    "refusing symlink component {:?}; pass --follow to resolve symlinks",
+                    OsStr::from_bytes(&component)
+                ),
+                OperatorSymlinkPolicy::TrustedOwner
+                    if !operator_symlink_owner_is_trusted(metadata.st_uid, euid) =>
+                {
+                    bail!(
+                        "refusing symlink component {:?} owned by uid {}; expected uid 0 or receiver uid {}",
+                        OsStr::from_bytes(&component),
+                        metadata.st_uid,
+                        euid
+                    );
+                }
+                OperatorSymlinkPolicy::TrustedOwner | OperatorSymlinkPolicy::FollowAll => {}
             }
             symlink_hops += 1;
             if symlink_hops > 40 {
@@ -290,6 +298,73 @@ fn select_operator_directory(
     };
     let anchor = selection.anchor()?;
     Ok((selection, Some(anchor)))
+}
+
+/// Check the current spelling of an operator-supplied local path without
+/// traversing a symlink. This is semantic preflight for orchestrator-local
+/// control files; retaining their opened identity belongs to the broader
+/// descriptor-root migration.
+pub(crate) fn check_operator_path_no_symlinks(
+    path: &[u8],
+    allow_final_symlink: bool,
+    allow_missing_final: bool,
+) -> Result<()> {
+    let path = resolve(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let raw = path.as_os_str().as_bytes();
+    if raw.contains(&0) {
+        bail!("operator path contains NUL");
+    }
+
+    let mut directory = open_operator_directory_start(raw.starts_with(b"/"))?;
+    let mut remaining: VecDeque<Vec<u8>> = raw
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    while let Some(component) = remaining.pop_front() {
+        if component == b"." {
+            continue;
+        }
+        if component == b".." {
+            directory = open_operator_directory_at(&directory, b"..")?;
+            continue;
+        }
+
+        let final_component = remaining.is_empty();
+        let metadata = match operator_lstat_at(&directory, &component) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if final_component
+                    && allow_missing_final
+                    && error.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            if final_component && allow_final_symlink {
+                return Ok(());
+            }
+            bail!(
+                "operator path encounters symlink component {:?}; pass --follow to resolve symlinks",
+                OsStr::from_bytes(&component)
+            );
+        }
+        if final_component {
+            return Ok(());
+        }
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
+        }
+        directory = open_operator_directory_at(&directory, &component)?;
+    }
+    Ok(())
 }
 
 fn operator_symlink_owner_is_trusted(owner: u32, euid: u32) -> bool {
@@ -816,9 +891,9 @@ impl FsOps {
         &mut self,
         path: &[u8],
         allow_missing: bool,
-        insecure_links: bool,
+        symlink_policy: OperatorSymlinkPolicy,
     ) -> Result<Option<DirectoryAnchor>> {
-        let (selection, anchor) = select_operator_directory(path, allow_missing, insecure_links)?;
+        let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
         self.operator_selection = Some(selection);
         Ok(anchor)
     }
@@ -840,10 +915,10 @@ impl FsOps {
         expected_dev: u64,
         expected_ino: u64,
         request_prefix: &[u8],
-        insecure_links: bool,
+        symlink_policy: OperatorSymlinkPolicy,
     ) -> Result<()> {
         let selection = if let Some(path) = path {
-            match select_operator_directory(path, false, insecure_links) {
+            match select_operator_directory(path, false, symlink_policy) {
                 Ok((selection, Some(anchor)))
                     if (anchor.dev, anchor.ino) == (expected_dev, expected_ino) =>
                 {
@@ -3128,15 +3203,10 @@ impl FsOps {
             Request::CheckOperatorDirectory {
                 path,
                 allow_missing,
-                insecure_links,
+                symlink_policy,
             } => self
-                .check_operator_directory(path, *allow_missing, *insecure_links)
-                .with_context(|| {
-                    format!(
-                        "resolve operator destination directory {}",
-                        resolve(path).display()
-                    )
-                })
+                .check_operator_directory(path, *allow_missing, *symlink_policy)
+                .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
                 .map(Response::DirectorySelection),
             Request::CreateOperatorDirectory {
                 mode,
@@ -3149,14 +3219,14 @@ impl FsOps {
                 expected_dev,
                 expected_ino,
                 request_prefix,
-                insecure_links,
+                symlink_policy,
             } => self
                 .anchor_destination(
                     path.as_deref(),
                     *expected_dev,
                     *expected_ino,
                     request_prefix,
-                    *insecure_links,
+                    *symlink_policy,
                 )
                 .map(|_| Response::Ok),
             Request::PartialPaths {
@@ -3810,8 +3880,12 @@ mod tests {
             dir.join("relative-link/nested"),
             dir.join("absolute-link/nested"),
         ] {
-            let (_, anchor) =
-                select_operator_directory(selected.as_os_str().as_bytes(), false, false).unwrap();
+            let (_, anchor) = select_operator_directory(
+                selected.as_os_str().as_bytes(),
+                false,
+                OperatorSymlinkPolicy::TrustedOwner,
+            )
+            .unwrap();
             let anchor = anchor.unwrap();
             assert_eq!((anchor.dev, anchor.ino), (expected.dev(), expected.ino()));
         }
@@ -3820,7 +3894,7 @@ mod tests {
                 .as_os_str()
                 .as_bytes(),
             true,
-            false,
+            OperatorSymlinkPolicy::TrustedOwner,
         )
         .unwrap()
         .1
@@ -3828,10 +3902,35 @@ mod tests {
         assert!(select_operator_directory(
             dir.join("relative-link/missing").as_os_str().as_bytes(),
             false,
-            false,
+            OperatorSymlinkPolicy::TrustedOwner,
         )
         .is_err());
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn operator_directory_walk_can_refuse_every_symlink() {
+        let dir = test_dir();
+        fs::create_dir_all(dir.join("real")).unwrap();
+        symlink("real", dir.join("link")).unwrap();
+
+        let error = select_operator_directory(
+            dir.join("link").as_os_str().as_bytes(),
+            false,
+            OperatorSymlinkPolicy::Refuse,
+        )
+        .err()
+        .expect("no-follow policy must refuse an owned symlink");
+        assert!(error.to_string().contains("pass --follow"), "{error:#}");
+
+        let (_, anchor) = select_operator_directory(
+            dir.join("link").as_os_str().as_bytes(),
+            false,
+            OperatorSymlinkPolicy::FollowAll,
+        )
+        .unwrap();
+        assert!(anchor.is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3843,7 +3942,7 @@ mod tests {
         let (mut selection, anchor) = select_operator_directory(
             dir.join("parent/missing/deeper").as_os_str().as_bytes(),
             true,
-            false,
+            OperatorSymlinkPolicy::TrustedOwner,
         )
         .unwrap();
         assert!(anchor.is_none());
@@ -3862,10 +3961,18 @@ mod tests {
         let dir = test_dir();
         fs::create_dir_all(dir.join("parent")).unwrap();
         let selected = dir.join("parent/missing/deeper");
-        let (mut first, first_anchor) =
-            select_operator_directory(selected.as_os_str().as_bytes(), true, false).unwrap();
-        let (mut second, second_anchor) =
-            select_operator_directory(selected.as_os_str().as_bytes(), true, false).unwrap();
+        let (mut first, first_anchor) = select_operator_directory(
+            selected.as_os_str().as_bytes(),
+            true,
+            OperatorSymlinkPolicy::TrustedOwner,
+        )
+        .unwrap();
+        let (mut second, second_anchor) = select_operator_directory(
+            selected.as_os_str().as_bytes(),
+            true,
+            OperatorSymlinkPolicy::TrustedOwner,
+        )
+        .unwrap();
         assert!(first_anchor.is_none());
         assert!(second_anchor.is_none());
 
@@ -3884,8 +3991,12 @@ mod tests {
         let dir = test_dir();
         fs::create_dir_all(dir.join("parent")).unwrap();
         let selected = dir.join("parent/new");
-        let (mut selection, anchor) =
-            select_operator_directory(selected.as_os_str().as_bytes(), true, false).unwrap();
+        let (mut selection, anchor) = select_operator_directory(
+            selected.as_os_str().as_bytes(),
+            true,
+            OperatorSymlinkPolicy::TrustedOwner,
+        )
+        .unwrap();
         assert!(anchor.is_none());
 
         fs::create_dir(&selected).unwrap();

@@ -377,6 +377,9 @@ pub fn run(
     if args.interface != Interface::Rsync && args.checksum {
         remote.push("--hash".into());
     }
+    if args.interface != Interface::Rsync && args.native_follow {
+        remote.push("--follow".into());
+    }
     if args.inplace {
         remote.push("--inplace".into());
     }
