@@ -21,7 +21,7 @@ tag=$1
 }
 version=${tag#v}
 
-for command in git gh jq curl openssl ssh-keygen; do
+for command in git gh jq curl openssl ssh-keygen python3; do
   command -v "$command" >/dev/null || die "release preflight needs $command"
 done
 
@@ -30,6 +30,7 @@ cd "$root"
 [ "$(git symbolic-ref --short HEAD 2>/dev/null)" = master ] \
   || die 'release preflight must run on the master branch'
 [ -z "$(git status --porcelain)" ] || die 'working tree is not clean'
+python3 scripts/check-python-api-sync.py
 
 origin_url=$(git config --get remote.origin.url 2>/dev/null || true)
 origin_url=${origin_url%.git}

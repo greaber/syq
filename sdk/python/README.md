@@ -1,8 +1,9 @@
 # syq for Python
 
-`syq` is the official preview Python adapter for the
+`syq` is the official Python client for the
 [syq parallel file copier](https://github.com/greaber/syq). It invokes syq with
-an argument array and never constructs a shell command.
+an argument array and never constructs a shell command. The typed API mirrors
+the native commands: `cp`, `cp_prune`, `rm`, and `map`.
 
 ```sh
 python -m pip install syq
@@ -19,17 +20,56 @@ print(syq.__version__)           # Python package version
 print(syq.PINNED_SYQ_VERSION)    # tested executable version
 print(syq.managed_executable())  # downloads once, then returns the cached path
 
-plan = syq.run([
-    "cp",
-    "project",
-    "--to",
-    "server",
-    "--into",
-    "/backup",
-    "--dry-run",
-])
-print(plan.stdout.decode())
+plan = syq.cp("project", to="server", into="/backup", dry_run=True)
+print(plan.files_planned, plan.bytes_planned)
 ```
+
+The typed API validates syq's complete automation-v1 stream and its agreement
+with the process status. Dry and live calls return the same result types;
+completed mutation counts are zero for a dry run:
+
+```python
+client = syq.Client(process_cwd="/srv/jobs")
+
+preview = client.cp_prune(
+    src_src="build",
+    to="server",
+    into_existing="/srv/app",
+    max_delete=100,
+    dry_run=True,
+)
+```
+
+`on_event` receives typed records as syq produces them without keeping a
+potentially enormous operation ledger in memory:
+
+```python
+def observe(event: syq.AutomationEvent) -> None:
+    if isinstance(event, syq.OperationResult):
+        print(event.action, event.dst, event.disposition)
+
+result = syq.cp("data", into="backup", on_event=observe)
+```
+
+Mapping output is streaming and context-managed. Passing Python mapping
+entries to `cp` first materializes the complete iterable on disk, so a failed
+transform cannot launch a copy with only a valid prefix:
+
+```python
+from dataclasses import replace
+
+with syq.map(src_src="photos") as mapping:
+    entries = (
+        replace(entry, dst=syq.RelativePath("archive") / entry.dst)
+        for entry in mapping
+    )
+    result = syq.cp(mapping=entries, cwd=mapping.cwd, into="published")
+```
+
+The source tree may contain typed support ahead of the latest released syq
+pin. During that development interval, use `Client(executable=...)` with the
+candidate binary; the next SDK release updates the immutable pin only after
+candidate conformance tests pass.
 
 The managed executable is stored below
 `$XDG_CACHE_HOME/syq/sdk/python/v0.1.8/` or, when `XDG_CACHE_HOME` is not an
@@ -62,9 +102,7 @@ The package targets Python 3.10 or newer on Linux and macOS and has no runtime
 Python dependencies. See the [SDK compatibility policy](../README.md) for the
 release mapping.
 
-## Proposed native API
+## Native API reference
 
-The next typed layer is being designed in
-[Proposed Python native API](NATIVE_API.md). That document is a specification
-for review, not an implemented usage guide. The process adapter described above
-remains the current public API.
+See [Python native API](NATIVE_API.md) for command signatures, mappings,
+failure behavior, resource ownership, and the CLI/SDK synchronization policy.

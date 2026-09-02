@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "commands": {
+    "cp": {
+      "sdk": "python",
+      "python": [
+        "from", "cwd", "follow", "src", "src-src", "src-file", "src-dir", "to",
+        "into", "into-new", "into-existing", "as", "as-new", "as-existing",
+        "mapping", "dry-run", "connections", "reuse-connection", "max-entries", "max-total-bytes",
+        "max-runtime", "hash", "no-compress", "bwlimit",
+        "ignore", "ignore-from", "preserve", "inplace", "max-size", "min-size"
+      ],
+      "internal": ["quiet", "results"],
+      "aliases": {
+        "srcs": "src",
+        "src-srcs": "src-src",
+        "src-files": "src-file",
+        "src-dirs": "src-dir"
+      },
+      "raw_only": ["verbose", "progress", "no-progress", "progress-json", "stats"],
+      "follow_up": []
+    },
+    "cp-prune": {
+      "sdk": "python",
+      "python": [
+        "from", "cwd", "follow", "src", "src-src", "src-file", "src-dir", "to",
+        "into", "into-new", "into-existing", "as", "as-new", "as-existing",
+        "dry-run", "connections", "reuse-connection", "max-entries", "max-total-bytes",
+        "max-runtime", "hash", "no-compress", "bwlimit", "ignore",
+        "ignore-from", "preserve", "inplace", "max-size", "min-size", "max-delete"
+      ],
+      "internal": ["quiet", "results"],
+      "aliases": {
+        "srcs": "src",
+        "src-srcs": "src-src",
+        "src-files": "src-file",
+        "src-dirs": "src-dir"
+      },
+      "raw_only": ["mapping", "verbose", "progress", "no-progress", "progress-json", "stats"],
+      "follow_up": []
+    },
+    "rm": {
+      "sdk": "python",
+      "python": ["from", "cwd", "root", "follow", "src", "src-src", "src-file", "src-dir", "dry-run", "connections"],
+      "internal": ["quiet", "results"],
+      "aliases": {
+        "srcs": "src",
+        "src-srcs": "src-src",
+        "src-files": "src-file",
+        "src-dirs": "src-dir"
+      },
+      "raw_only": ["verbose", "progress", "no-progress", "progress-json"],
+      "follow_up": []
+    },
+    "map": {
+      "sdk": "python",
+      "python": ["cwd", "follow", "src", "src-src", "src-file", "src-dir", "to", "into", "as"],
+      "internal": ["quiet"],
+      "aliases": {
+        "srcs": "src",
+        "src-srcs": "src-src",
+        "src-files": "src-file",
+        "src-dirs": "src-dir"
+      },
+      "raw_only": [
+        "from", "into-new", "into-existing", "as-new", "as-existing", "mapping",
+        "dry-run", "verbose", "connections", "progress", "no-progress",
+        "progress-json", "results", "hash", "no-compress", "bwlimit", "stats", "reuse-connection",
+        "max-entries", "max-total-bytes", "max-runtime",
+        "ignore", "ignore-from", "preserve", "inplace"
+      ],
+      "follow_up": []
+    }
+  }
+}

@@ -1,13 +1,12 @@
-# Proposed Python native API
+# Python native API
 
-Status: design specification for review. The API in this document is not
-implemented. The current public package remains the process adapter documented
-in [README.md](README.md).
+Status: implemented for the upcoming automation-v1 syq version. Until a syq
+release containing v1 exists, source-tree users must select the candidate
+binary explicitly; the next Python SDK release updates its managed pin after
+conformance tests pass.
 
-This document describes the first useful Python interface to syq's native
-filesystem commands. Examples are intended to be executable once the proposal
-is implemented; during design review they are specifications, not current
-usage examples.
+This document describes the Python interface to syq's native filesystem
+commands.
 
 ## Positioning
 
@@ -107,7 +106,7 @@ result = syq.cp(
     into="/backup",
 )
 
-print(result.files_transferred, result.bytes_transferred)
+print(result.files_completed, result.bytes_completed)
 ```
 
 The corresponding native command is:
@@ -192,6 +191,7 @@ syq.cp(
     src_dir=None,
     from_=None,
     cwd=None,
+    follow=False,
     to=None,
     into=None,
     into_new=None,
@@ -205,6 +205,16 @@ syq.cp(
     no_compress=False,
     bwlimit=None,
     connections=None,
+    reuse_connection=False,
+    max_entries=None,
+    max_total_bytes=None,
+    max_runtime=None,
+    ignore=None,
+    ignore_from=None,
+    preserve=None,
+    inplace=False,
+    max_size=None,
+    min_size=None,
     on_event=None,
     timeout=None,
     check=True,
@@ -239,9 +249,16 @@ rejects absolute selectors and explicit `.` or `..` components. Input paths
 accept text and byte path-like objects on supported Unix systems; byte paths
 are not decoded merely to build argv.
 
-`hash`, `no_compress`, `bwlimit`, `connections`, and `dry_run` retain the exact
-native meanings. In particular, `bwlimit` accepts the native rate spelling;
-the Python API does not replace it with a differently defined unit type.
+`follow`, `hash`, `no_compress`, `bwlimit`, `connections`, `reuse_connection`, `ignore`,
+`ignore_from`, `preserve`, `inplace`, `max_size`, `min_size`, and `dry_run`
+retain the exact native meanings. `max_entries`, `max_total_bytes`, and
+`max_runtime` expose the native command-restricted receiver ceilings and are
+therefore accepted only for a direct remote-to-remote copy using an enrolled
+receiver. Rate, size, and duration values accept the native spellings; the
+Python API does not replace them with differently defined unit types.
+`reuse_connection` keeps the implicit SSH control connection alive under the
+same native constraints and five-minute reuse window; the library does not
+maintain a separate connection pool.
 
 Human presentation options such as `verbose`, `quiet`, `stats`, `progress`,
 `no_progress`, and `progress_json` are initially omitted from typed methods.
@@ -313,7 +330,8 @@ reaps the owned process. A parse error, nonzero producer status, timeout, or
 interruption raises instead of presenting the yielded prefix as a complete
 mapping.
 
-The method retains `syq map`'s native limits for the pinned binary. Initially,
+The method retains `syq map`'s native limits for the pinned binary, including
+`follow=True` for resolving explicitly selected symlink paths. Initially,
 mapping emission is local and read-only, and the accepted selector and
 placement combinations are the ones documented for the executable. The
 client may reject a known-invalid combination before launch, but it does not
@@ -424,19 +442,19 @@ events describe planned work instead of completed work.
 
 A dry run describes what syq observed and would have done. It is not an
 executable transaction, authorization token, or promise that the filesystem
-will remain unchanged before a later operation. Typed dry-run results cannot
-ship until automation v1 defines the corresponding execution trace and
-terminal result.
+will remain unchanged before a later operation. Automation v1 supplies the
+shared execution trace and terminal result.
 
 ## Events and terminal results
 
 Typed operations consume the stable automation stream. `on_event` receives
 frozen dataclasses corresponding to the schema's records, including run-start
-information, operation results, warnings, structured errors, progress samples,
-dry-run trace items, and the terminal result.
+information, operation results, warnings, structured errors, and the terminal
+result.
 
-The schema, not this document, owns their exact fields and enum members. The
-Python types expose every stable schema field without parsing display text.
+The schema in [AUTOMATION.md](../../AUTOMATION.md), not this document, owns
+their exact fields and enum members. The Python types expose every stable
+schema field without parsing display text.
 
 The client validates at least these stream invariants:
 
@@ -469,7 +487,8 @@ The exception families have distinct meanings:
 | `SyqProtocolError` | Machine output was malformed, unsupported, inconsistent, or incomplete |
 | `SyqOperationError` | A valid terminal result reports a non-successful operation |
 
-`SyqOperationError.result` contains the typed terminal result.
+`SyqOperationError.result` contains the typed terminal result and its `stderr`
+attribute retains up to the final 8 KiB of diagnostic output.
 `SyqProtocolError` retains the raw process status and bounded diagnostic
 context needed to investigate without storing an unbounded stream in the
 exception. Process spawn failures and timeouts retain the existing standard
@@ -519,12 +538,12 @@ result = client.run(
 ```
 
 `Client.run` and `syq.run` accept only arguments after the executable name and
-never construct a shell command. The proposed process-layer additions are:
+never construct a shell command. The process layer also supports:
 
 - `input=` for bounded bytes;
 - text and byte path-like argv entries on Unix; and
-- a context-managed streaming primitive for callers that deliberately need
-  raw stdout/stderr.
+- complete byte stdout and stderr capture for callers that deliberately need
+  the raw process output.
 
 Raw execution returns raw bytes and a process status. It does not parse human
 output, infer native objects from argv, or claim the structured completion
@@ -532,10 +551,9 @@ guarantees of typed methods.
 
 ## Synchrony and resource ownership
 
-The first API is synchronous. `on_event` provides live observation without
-requiring every caller to manage threads and pipes. Applications can place a
-synchronous call in a worker thread when integrating with `asyncio`; a native
-async API should wait for demonstrated demand.
+`Client` is synchronous. `on_event` provides live observation without
+requiring every caller to manage threads and pipes. `AsyncClient` is developed
+as a follow-up layer over the same value objects and protocol contract.
 
 Every object that owns a subprocess is a context manager. Normal method calls
 reap before returning. Early context exit, timeout, interruption, callback
@@ -553,9 +571,8 @@ schema major versions rather than guessing compatibility from the executable's
 marketing version. Additive fields and enum values follow the automation
 schema's compatibility policy.
 
-Mapping entries also need an explicit compatibility decision before this API
-is stable: either the manifest gains its own schema version, or public
-`MappingEntry` support is documented as exact-binary-pair only.
+Mapping entries are supported at the exact SDK/binary pairing. A separately
+versioned mapping schema can broaden that compatibility boundary later.
 
 Python API changes follow Python package semantic versioning. Adding support
 for a new syq release does not by itself justify a breaking Python API change.
@@ -581,39 +598,20 @@ The initial typed API does not provide:
 - implicit selection of a newer syq from `PATH`; or
 - API promises for human stdout, stderr, or progress formatting.
 
-## Product dependencies and implementation order
+## Product readiness
 
-| Proposed layer | Product dependency | Current readiness |
+| Layer | Product dependency | Current readiness |
 |---|---|---|
-| Managed executable and raw `run` | Released binary manifest | Already shipped |
-| Raw stdin and safe streaming | Process behavior only | Can be implemented now |
-| `RelativePath` and mapping codecs | Mapping format compatibility decision | Exact pinned version is usable now |
-| `map` and safe `cp(mapping=...)` input | `syq map` and `cp --mapping` | Native support shipped; Python design pending |
-| Typed `cp` results | Stable automation result stream | Blocked on automation v1; schema 0 is preview |
-| Typed `cp_prune` and `rm` | Stable command-specific events/results | Not yet present in native output |
-| Typed `dry_run=True` | Stable execution-trace records | Not yet present in native output |
+| Managed executable and raw `run` | Released binary manifest | Implemented |
+| Raw stdin and safe streaming | Process behavior only | Implemented |
+| `RelativePath` and mapping codecs | Exact binary pairing | Implemented |
+| `map` and safe `cp(mapping=...)` input | Native mapping commands | Implemented |
+| Typed `cp`, `cp_prune`, and `rm` | Automation v1 | Implemented |
+| Typed `dry_run=True` | Automation-v1 planned operations | Implemented |
 
-The implementation should proceed in that order. A preview namespace may
-experiment with schema-0 result decoding, but it must not silently become the
-stable types specified here.
-
-## Review questions
-
-The command and option naming rule is a decision in this draft, not an open
-question. The remaining choices to review before implementation are:
-
-1. Is a small `RelativePath` value worth the API surface, or should mapping
-   entries expose `str | bytes` directly?
-2. Should `MappingEntry` wait for a separately versioned mapping schema, or is
-   the exact executable pin a sufficient compatibility boundary?
-3. Should repeated selector keywords accept a scalar or iterable, as proposed,
-   or require sequences consistently?
-4. Are matching module functions and `Client` methods worth the duplicated
-   public surface?
-5. Is pre-materializing every Python mapping the correct safe default despite
-   its temporary-disk cost?
-6. Should the first typed release include every mutating native command, or
-   ship `map` and `cp` as soon as their contracts are stable?
-7. Should any native presentation flags be exposed on typed methods, and if
-   so, how should their output be delivered without competing with structured
-   events?
+The source inventory `native-api.json` records the disposition of every native
+option. Rust tests require new options to appear there. A feature PR may put an
+option in `follow_up` instead of implementing Python immediately, but the syq
+release workflow rejects any remaining follow-up. A post-merge workflow keeps
+one GitHub tracking issue open while follow-ups exist. Python signature tests
+and candidate execution tests verify the other side of the contract.

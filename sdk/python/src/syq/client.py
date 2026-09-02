@@ -1,36 +1,53 @@
-"""Minimal process adapter for syq's command-line interface."""
+"""Synchronous process and native-command clients for syq."""
 
 from __future__ import annotations
 
+import json
 import os
+import selectors
 import signal
 import subprocess
-from collections.abc import Mapping, Sequence
+import tempfile
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO
 
 from .bootstrap import managed_executable
+from .errors import (
+    SyqInvocationError,
+    SyqOperationError,
+    SyqOutputError,
+    SyqProcessError,
+    SyqProtocolError,
+)
+from .models import (
+    AutomationEvent,
+    CpPruneResult,
+    CpResult,
+    MappingEntry,
+    OperationStatus,
+    OperationSummary,
+    RmResult,
+    _mapping_json,
+)
+from .protocol import AutomationDecoder, parse_mapping_line
+
+
+PathArgument = str | bytes | os.PathLike[str] | os.PathLike[bytes]
+Argument = str | bytes
+Selector = PathArgument | Iterable[PathArgument]
 
 
 @dataclass(frozen=True, slots=True)
 class Result:
-    """The complete result of one syq process."""
+    """The complete result of one raw syq process."""
 
-    argv: tuple[str, ...]
+    argv: tuple[Argument, ...]
     returncode: int
     stdout: bytes
     stderr: bytes
-
-
-class SyqProcessError(RuntimeError):
-    """A syq process completed with a nonzero status."""
-
-    def __init__(self, result: Result) -> None:
-        self.result = result
-        super().__init__(f"syq exited with status {result.returncode}")
-
-
-class SyqOutputError(ValueError):
-    """syq returned output that the requested operation cannot interpret."""
 
 
 def _text_arg(value: str | os.PathLike[str], *, label: str) -> str:
@@ -40,23 +57,29 @@ def _text_arg(value: str | os.PathLike[str], *, label: str) -> str:
     return result
 
 
+def _argument(value: PathArgument, *, label: str) -> Argument:
+    result = os.fspath(value)
+    if not isinstance(result, (str, bytes)):
+        raise TypeError(f"{label} must resolve to str or bytes")
+    if isinstance(result, bytes) and os.name != "posix":
+        raise TypeError(f"{label} may resolve to bytes only on POSIX")
+    contains_nul = b"\0" in result if isinstance(result, bytes) else "\0" in result
+    if contains_nul:
+        raise ValueError(f"{label} may not contain NUL")
+    return result
+
+
 def run(
-    args: Sequence[str | os.PathLike[str]],
+    args: Sequence[PathArgument],
     *,
     executable: str | os.PathLike[str] | None = None,
     check: bool = True,
-    cwd: str | os.PathLike[str] | None = None,
+    cwd: PathArgument | None = None,
     env: Mapping[str, str] | None = None,
     timeout: float | None = None,
+    input: bytes | None = None,
 ) -> Result:
-    """Run syq without a shell and capture its complete byte output.
-
-    ``args`` contains only arguments after the executable name. By default the
-    SDK downloads and uses its pinned syq release. Passing ``executable`` opts
-    into an untested custom binary. A missing custom executable, timeout, or
-    other spawn failure is reported by ``subprocess``. A completed nonzero
-    process raises :class:`SyqProcessError` unless ``check`` is false.
-    """
+    """Run syq without a shell and capture its complete byte output."""
 
     if isinstance(args, (str, bytes, os.PathLike)):
         raise TypeError("args must be a sequence of individual arguments")
@@ -65,28 +88,25 @@ def run(
         if executable is None
         else _text_arg(executable, label="executable")
     )
-    argument_text = tuple(
-        _text_arg(argument, label=f"args[{index}]")
+    argument_values = tuple(
+        _argument(argument, label=f"args[{index}]")
         for index, argument in enumerate(args)
     )
-    argv = (executable_text, *argument_text)
+    argv: tuple[Argument, ...] = (executable_text, *argument_values)
     process = subprocess.Popen(
         argv,
         cwd=cwd,
         env=env,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         shell=False,
         start_new_session=True,
     )
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(input=input, timeout=timeout)
     except BaseException:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        _kill_process_group(process)
         process.communicate()
         raise
     result = Result(
@@ -112,3 +132,740 @@ def version(*, executable: str | os.PathLike[str] | None = None) -> str:
     if not output.startswith(prefix) or len(output) == len(prefix):
         raise SyqOutputError(f"unexpected syq --version output: {output!r}")
     return output[len(prefix) :]
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _remaining(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+class _LineProcess:
+    """An owned process whose stdout is consumed as bounded NDJSON lines."""
+
+    def __init__(
+        self,
+        argv: tuple[Argument, ...],
+        *,
+        cwd: PathArgument | None,
+        env: Mapping[str, str] | None,
+        timeout: float | None,
+    ) -> None:
+        self.argv = argv
+        self.timeout = timeout
+        self._deadline = None if timeout is None else time.monotonic() + timeout
+        self._stderr_file: BinaryIO = tempfile.TemporaryFile()
+        self._process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr_file,
+            shell=False,
+            start_new_session=True,
+        )
+        assert self._process.stdout is not None
+        self._stdout = self._process.stdout
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._stdout, selectors.EVENT_READ)
+        self._buffer = bytearray()
+        self._eof = False
+        self.returncode: int | None = None
+        self.stderr = b""
+        self._closed = False
+
+    def next_line(self) -> bytes | None:
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(self._buffer[:newline])
+                del self._buffer[: newline + 1]
+                return line
+            if self._eof:
+                if self._buffer:
+                    line = bytes(self._buffer)
+                    self._buffer.clear()
+                    return line
+                return None
+            wait = _remaining(self._deadline)
+            if wait == 0 or not self._selector.select(wait):
+                raise subprocess.TimeoutExpired(self.argv, self.timeout)
+            chunk = os.read(self._stdout.fileno(), 64 * 1024)
+            if chunk:
+                self._buffer.extend(chunk)
+            else:
+                self._eof = True
+
+    def finish(self) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            self.returncode = self._process.wait(timeout=_remaining(self._deadline))
+        except subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(self.argv, self.timeout) from None
+        self._capture_stderr()
+        self._close_files()
+        return self.returncode
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        # Kill the owned group even if the leader just exited: a malformed
+        # producer or callback failure must not leave an SSH/helper descendant.
+        _kill_process_group(self._process)
+        self.returncode = self._process.wait()
+        self._capture_stderr()
+        self._close_files()
+
+    def _capture_stderr(self) -> None:
+        self._stderr_file.flush()
+        end = self._stderr_file.seek(0, os.SEEK_END)
+        self._stderr_file.seek(max(0, end - 8192))
+        self.stderr = self._stderr_file.read()
+
+    def _close_files(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._selector.close()
+        self._stdout.close()
+        self._stderr_file.close()
+
+
+def _values(value: Selector | None, *, label: str) -> tuple[Argument, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes, os.PathLike)):
+        return (_argument(value, label=label),)
+    try:
+        return tuple(
+            _argument(item, label=f"{label}[{index}]")
+            for index, item in enumerate(value)
+        )
+    except TypeError as error:
+        raise TypeError(f"{label} must be a path or iterable of paths") from error
+
+
+def _append_paths(
+    argv: list[Argument], option: str, value: Selector | None
+) -> int:
+    values = _values(value, label=option)
+    for item in values:
+        argv.extend((option, item))
+    return len(values)
+
+
+def _append_text(argv: list[Argument], option: str, value: object | None) -> None:
+    if value is not None:
+        if not isinstance(value, (str, int)) or isinstance(value, bool):
+            raise SyqInvocationError(f"{option} must be text or an integer")
+        argv.extend((option, str(value)))
+
+
+def _nonnegative_integer(value: int | None, *, option: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise SyqInvocationError(f"{option} must be a non-negative integer")
+    return value
+
+
+def _positive_integer(value: int | None, *, option: str) -> int | None:
+    value = _nonnegative_integer(value, option=option)
+    if value == 0:
+        raise SyqInvocationError(f"{option} must be positive")
+    return value
+
+
+def _copy_arguments(
+    command: str,
+    sources: tuple[PathArgument, ...],
+    *,
+    src: Selector | None,
+    src_src: Selector | None,
+    src_file: Selector | None,
+    src_dir: Selector | None,
+    from_: str | None,
+    cwd: PathArgument | None,
+    follow: bool,
+    to: str | None,
+    into: PathArgument | None,
+    into_new: PathArgument | None,
+    into_existing: PathArgument | None,
+    as_: PathArgument | None,
+    as_new: PathArgument | None,
+    as_existing: PathArgument | None,
+    dry_run: bool,
+    hash: bool,
+    no_compress: bool,
+    bwlimit: str | int | None,
+    connections: int | None,
+    reuse_connection: bool,
+    max_entries: int | None,
+    max_total_bytes: str | int | None,
+    max_runtime: str | int | None,
+    ignore: str | Iterable[str] | None,
+    ignore_from: Selector | None,
+    preserve: str | Iterable[str] | None,
+    inplace: bool,
+    max_size: str | int | None,
+    min_size: str | int | None,
+    max_delete: int | None,
+) -> tuple[list[Argument], int]:
+    argv: list[Argument] = [command]
+    source_count = 0
+    contents_count = 0
+    for index, source in enumerate(sources):
+        argv.append(_argument(source, label=f"sources[{index}]"))
+        source_count += 1
+    for option, value in (
+        ("--src", src),
+        ("--src-src", src_src),
+        ("--src-file", src_file),
+        ("--src-dir", src_dir),
+    ):
+        appended = _append_paths(argv, option, value)
+        source_count += appended
+        if option == "--src-src":
+            contents_count += appended
+    if from_ is not None:
+        argv.extend(("--from", _text_arg(from_, label="from_")))
+    if cwd is not None:
+        argv.extend(("--cwd", _argument(cwd, label="cwd")))
+    if follow:
+        argv.append("--follow")
+    if to is not None:
+        argv.extend(("--to", _text_arg(to, label="to")))
+    placements = [
+        ("--into", into),
+        ("--into-new", into_new),
+        ("--into-existing", into_existing),
+        ("--as", as_),
+        ("--as-new", as_new),
+        ("--as-existing", as_existing),
+    ]
+    selected_placements = [
+        (name, value) for name, value in placements if value is not None
+    ]
+    if command != "map" and len(selected_placements) != 1:
+        raise SyqInvocationError(
+            "exactly one of --into, --into-new, --into-existing, --as, "
+            "--as-new, or --as-existing is required"
+        )
+    if command == "map" and len(selected_placements) > 1:
+        raise SyqInvocationError("mapping placement options conflict")
+    for option, value in selected_placements:
+        assert value is not None
+        argv.extend((option, _argument(value, label=option)))
+        if option.startswith("--as") and source_count and (
+            source_count != 1 or contents_count
+        ):
+            raise SyqInvocationError(
+                "--as, --as-new, and --as-existing require exactly one "
+                "ordinary source object"
+            )
+    if dry_run:
+        argv.append("--dry-run")
+    if hash:
+        argv.append("--hash")
+    if no_compress:
+        argv.append("--no-compress")
+    _append_text(argv, "--bwlimit", bwlimit)
+    connections = _positive_integer(connections, option="--connections")
+    if connections is not None:
+        argv.extend(("--connections", str(connections)))
+    if reuse_connection:
+        argv.append("--reuse-connection")
+    max_entries = _nonnegative_integer(max_entries, option="--max-entries")
+    if max_entries is not None:
+        argv.extend(("--max-entries", str(max_entries)))
+    _append_text(argv, "--max-total-bytes", max_total_bytes)
+    _append_text(argv, "--max-runtime", max_runtime)
+    if ignore is not None:
+        patterns = (ignore,) if isinstance(ignore, str) else tuple(ignore)
+        for pattern in patterns:
+            if not isinstance(pattern, str):
+                raise SyqInvocationError("--ignore patterns must be text")
+            argv.extend(("--ignore", pattern))
+    _append_paths(argv, "--ignore-from", ignore_from)
+    if preserve is not None:
+        attributes = (preserve,) if isinstance(preserve, str) else tuple(preserve)
+        for attribute in attributes:
+            if attribute not in {"permissions", "ownership", "specials"}:
+                raise SyqInvocationError(
+                    "--preserve must contain permissions, ownership, or specials"
+                )
+            argv.extend(("--preserve", attribute))
+    if inplace:
+        argv.append("--inplace")
+    _append_text(argv, "--max-size", max_size)
+    _append_text(argv, "--min-size", min_size)
+    max_delete = _nonnegative_integer(max_delete, option="--max-delete")
+    if max_delete is not None:
+        argv.extend(("--max-delete", str(max_delete)))
+    return argv, source_count
+
+
+class MapStream(Iterable[MappingEntry]):
+    """A context-managed, streaming ``syq map`` result."""
+
+    def __init__(self, process: _LineProcess, cwd: PathArgument) -> None:
+        self._process = process
+        self.cwd = cwd
+        self._complete = False
+
+    def __iter__(self) -> MapStream:
+        return self
+
+    def __next__(self) -> MappingEntry:
+        if self._complete:
+            raise StopIteration
+        try:
+            line = self._process.next_line()
+            if line is None:
+                returncode = self._process.finish()
+                self._complete = True
+                if returncode != 0:
+                    raise SyqProtocolError(
+                        f"syq map exited with status {returncode}",
+                        returncode=returncode,
+                        stderr=self._process.stderr,
+                    )
+                raise StopIteration
+            return parse_mapping_line(line)
+        except StopIteration:
+            raise
+        except BaseException as error:
+            self._process.abort()
+            self._complete = True
+            if isinstance(error, SyqProtocolError):
+                error.returncode = self._process.returncode
+                error.stderr = self._process.stderr
+            raise
+
+    def close(self) -> None:
+        if not self._complete:
+            self._process.abort()
+            self._complete = True
+
+    def __enter__(self) -> MapStream:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class Client:
+    """A configured synchronous client for syq's native command surface."""
+
+    def __init__(
+        self,
+        *,
+        executable: str | os.PathLike[str] | None = None,
+        cache_dir: str | os.PathLike[str] | None = None,
+        process_cwd: PathArgument | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        self._executable = (
+            None if executable is None else _text_arg(executable, label="executable")
+        )
+        self._cache_dir = cache_dir
+        self.process_cwd = process_cwd
+        self.env = env
+        self.timeout = timeout
+
+    def _executable_value(self) -> str:
+        if self._executable is not None:
+            return self._executable
+        if self._cache_dir is None:
+            return os.fspath(managed_executable())
+        return os.fspath(managed_executable(cache_dir=self._cache_dir))
+
+    def run(
+        self,
+        args: Sequence[PathArgument],
+        *,
+        check: bool = True,
+        cwd: PathArgument | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        input: bytes | None = None,
+    ) -> Result:
+        return run(
+            args,
+            executable=self._executable_value(),
+            check=check,
+            cwd=self.process_cwd if cwd is None else cwd,
+            env=self.env if env is None else env,
+            timeout=self.timeout if timeout is None else timeout,
+            input=input,
+        )
+
+    def _typed(
+        self,
+        argv: list[Argument],
+        *,
+        mode: str,
+        on_event: Callable[[AutomationEvent], object] | None,
+        timeout: float | None,
+        check: bool,
+    ) -> OperationSummary:
+        argv.extend(("--results=-", "--quiet"))
+        command = (self._executable_value(), *argv)
+        process = _LineProcess(
+            command,
+            cwd=self.process_cwd,
+            env=self.env,
+            timeout=self.timeout if timeout is None else timeout,
+        )
+        decoder = AutomationDecoder(mode)
+        try:
+            while True:
+                line = process.next_line()
+                if line is None:
+                    break
+                event = decoder.feed(line)
+                if on_event is not None:
+                    on_event(event)
+            returncode = process.finish()
+            result = decoder.finish(returncode)
+        except BaseException as error:
+            process.abort()
+            if isinstance(error, SyqProtocolError):
+                error.returncode = process.returncode
+                error.stderr = process.stderr
+            raise
+        if check and result.status is not OperationStatus.SUCCESS:
+            raise SyqOperationError(result, stderr=process.stderr)
+        return result
+
+    def cp(
+        self,
+        *sources: PathArgument,
+        src: Selector | None = None,
+        src_src: Selector | None = None,
+        src_file: Selector | None = None,
+        src_dir: Selector | None = None,
+        from_: str | None = None,
+        cwd: PathArgument | None = None,
+        follow: bool = False,
+        to: str | None = None,
+        into: PathArgument | None = None,
+        into_new: PathArgument | None = None,
+        into_existing: PathArgument | None = None,
+        as_: PathArgument | None = None,
+        as_new: PathArgument | None = None,
+        as_existing: PathArgument | None = None,
+        mapping: PathArgument | Iterable[MappingEntry] | None = None,
+        dry_run: bool = False,
+        hash: bool = False,
+        no_compress: bool = False,
+        bwlimit: str | int | None = None,
+        connections: int | None = None,
+        reuse_connection: bool = False,
+        max_entries: int | None = None,
+        max_total_bytes: str | int | None = None,
+        max_runtime: str | int | None = None,
+        ignore: str | Iterable[str] | None = None,
+        ignore_from: Selector | None = None,
+        preserve: str | Iterable[str] | None = None,
+        inplace: bool = False,
+        max_size: str | int | None = None,
+        min_size: str | int | None = None,
+        on_event: Callable[[AutomationEvent], object] | None = None,
+        timeout: float | None = None,
+        check: bool = True,
+    ) -> CpResult:
+        argv, source_count = _copy_arguments(
+            "cp",
+            sources,
+            src=src,
+            src_src=src_src,
+            src_file=src_file,
+            src_dir=src_dir,
+            from_=from_,
+            cwd=cwd,
+            follow=follow,
+            to=to,
+            into=into,
+            into_new=into_new,
+            into_existing=into_existing,
+            as_=as_,
+            as_new=as_new,
+            as_existing=as_existing,
+            dry_run=dry_run,
+            hash=hash,
+            no_compress=no_compress,
+            bwlimit=bwlimit,
+            connections=connections,
+            reuse_connection=reuse_connection,
+            max_entries=max_entries,
+            max_total_bytes=max_total_bytes,
+            max_runtime=max_runtime,
+            ignore=ignore,
+            ignore_from=ignore_from,
+            preserve=preserve,
+            inplace=inplace,
+            max_size=max_size,
+            min_size=min_size,
+            max_delete=None,
+        )
+        if mapping is None:
+            if source_count == 0:
+                raise SyqInvocationError("syq cp needs a source selector or mapping")
+            return self._typed(
+                argv, mode="cp", on_event=on_event, timeout=timeout, check=check
+            )
+        if source_count:
+            raise SyqInvocationError("--mapping replaces source selectors")
+        if any(value is not None for value in (as_, as_new, as_existing)):
+            raise SyqInvocationError("--mapping conflicts with --as")
+        if isinstance(mapping, (str, bytes, os.PathLike)):
+            argv.extend(("--mapping", _argument(mapping, label="mapping")))
+            return self._typed(
+                argv, mode="cp", on_event=on_event, timeout=timeout, check=check
+            )
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix="syq-python-mapping-", suffix=".ndjson"
+        ) as manifest:
+            for index, entry in enumerate(mapping):
+                if not isinstance(entry, MappingEntry):
+                    raise TypeError(f"mapping[{index}] must be a MappingEntry")
+                manifest.write(
+                    json.dumps(
+                        _mapping_json(entry),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            manifest.flush()
+            argv.extend(("--mapping", manifest.name))
+            return self._typed(
+                argv, mode="cp", on_event=on_event, timeout=timeout, check=check
+            )
+
+    def cp_prune(
+        self,
+        *sources: PathArgument,
+        src: Selector | None = None,
+        src_src: Selector | None = None,
+        src_file: Selector | None = None,
+        src_dir: Selector | None = None,
+        from_: str | None = None,
+        cwd: PathArgument | None = None,
+        follow: bool = False,
+        to: str | None = None,
+        into: PathArgument | None = None,
+        into_new: PathArgument | None = None,
+        into_existing: PathArgument | None = None,
+        as_: PathArgument | None = None,
+        as_new: PathArgument | None = None,
+        as_existing: PathArgument | None = None,
+        dry_run: bool = False,
+        hash: bool = False,
+        no_compress: bool = False,
+        bwlimit: str | int | None = None,
+        connections: int | None = None,
+        reuse_connection: bool = False,
+        max_entries: int | None = None,
+        max_total_bytes: str | int | None = None,
+        max_runtime: str | int | None = None,
+        ignore: str | Iterable[str] | None = None,
+        ignore_from: Selector | None = None,
+        preserve: str | Iterable[str] | None = None,
+        inplace: bool = False,
+        max_size: str | int | None = None,
+        min_size: str | int | None = None,
+        max_delete: int | None = None,
+        on_event: Callable[[AutomationEvent], object] | None = None,
+        timeout: float | None = None,
+        check: bool = True,
+    ) -> CpPruneResult:
+        argv, source_count = _copy_arguments(
+            "cp-prune",
+            sources,
+            src=src,
+            src_src=src_src,
+            src_file=src_file,
+            src_dir=src_dir,
+            from_=from_,
+            cwd=cwd,
+            follow=follow,
+            to=to,
+            into=into,
+            into_new=into_new,
+            into_existing=into_existing,
+            as_=as_,
+            as_new=as_new,
+            as_existing=as_existing,
+            dry_run=dry_run,
+            hash=hash,
+            no_compress=no_compress,
+            bwlimit=bwlimit,
+            connections=connections,
+            reuse_connection=reuse_connection,
+            max_entries=max_entries,
+            max_total_bytes=max_total_bytes,
+            max_runtime=max_runtime,
+            ignore=ignore,
+            ignore_from=ignore_from,
+            preserve=preserve,
+            inplace=inplace,
+            max_size=max_size,
+            min_size=min_size,
+            max_delete=max_delete,
+        )
+        if source_count == 0:
+            raise SyqInvocationError("syq cp-prune needs a source selector")
+        return self._typed(
+            argv, mode="cp-prune", on_event=on_event, timeout=timeout, check=check
+        )
+
+    def rm(
+        self,
+        *sources: PathArgument,
+        src: Selector | None = None,
+        src_src: Selector | None = None,
+        src_file: Selector | None = None,
+        src_dir: Selector | None = None,
+        from_: str | None = None,
+        cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
+        follow: bool = False,
+        dry_run: bool = False,
+        connections: int | None = None,
+        on_event: Callable[[AutomationEvent], object] | None = None,
+        timeout: float | None = None,
+        check: bool = True,
+    ) -> RmResult:
+        if cwd is not None and root is not None:
+            raise SyqInvocationError("--cwd conflicts with --root")
+        argv: list[Argument] = ["rm"]
+        count = 0
+        for index, source in enumerate(sources):
+            argv.append(_argument(source, label=f"sources[{index}]"))
+            count += 1
+        for option, value in (
+            ("--src", src),
+            ("--src-src", src_src),
+            ("--src-file", src_file),
+            ("--src-dir", src_dir),
+        ):
+            count += _append_paths(argv, option, value)
+        if not count:
+            raise SyqInvocationError("syq rm needs a source selector")
+        if from_ is not None:
+            argv.extend(("--from", _text_arg(from_, label="from_")))
+        if cwd is not None:
+            argv.extend(("--cwd", _argument(cwd, label="cwd")))
+        if root is not None:
+            argv.extend(("--root", _argument(root, label="root")))
+        if follow:
+            argv.append("--follow")
+        if dry_run:
+            argv.append("--dry-run")
+        connections = _positive_integer(connections, option="--connections")
+        if connections is not None:
+            argv.extend(("--connections", str(connections)))
+        return self._typed(
+            argv, mode="rm", on_event=on_event, timeout=timeout, check=check
+        )
+
+    def map(
+        self,
+        *sources: PathArgument,
+        src: Selector | None = None,
+        src_src: Selector | None = None,
+        src_file: Selector | None = None,
+        src_dir: Selector | None = None,
+        cwd: PathArgument | None = None,
+        follow: bool = False,
+        to: str | None = None,
+        into: PathArgument | None = None,
+        as_: PathArgument | None = None,
+        timeout: float | None = None,
+    ) -> MapStream:
+        # Materialize selectors once so generators are not consumed separately
+        # while deriving the source base carried by MapStream.cwd.
+        src_values = _values(src, label="--src")
+        src_src_values = _values(src_src, label="--src-src")
+        src_file_values = _values(src_file, label="--src-file")
+        src_dir_values = _values(src_dir, label="--src-dir")
+        argv, source_count = _copy_arguments(
+            "map",
+            sources,
+            src=src_values,
+            src_src=src_src_values,
+            src_file=src_file_values,
+            src_dir=src_dir_values,
+            from_=None,
+            cwd=cwd,
+            follow=follow,
+            to=to,
+            into=into,
+            into_new=None,
+            into_existing=None,
+            as_=as_,
+            as_new=None,
+            as_existing=None,
+            dry_run=False,
+            hash=False,
+            no_compress=False,
+            bwlimit=None,
+            connections=None,
+            reuse_connection=False,
+            max_entries=None,
+            max_total_bytes=None,
+            max_runtime=None,
+            ignore=None,
+            ignore_from=None,
+            preserve=None,
+            inplace=False,
+            max_size=None,
+            min_size=None,
+            max_delete=None,
+        )
+        if source_count == 0:
+            raise SyqInvocationError("syq map needs a source selector")
+        argv.append("--quiet")
+        command = (self._executable_value(), *argv)
+        process_base = Path(
+            os.fsdecode(
+                os.fspath(self.process_cwd)
+                if self.process_cwd is not None
+                else os.getcwd()
+            )
+        )
+        native_base = Path(os.fsdecode(os.fspath(cwd))) if cwd is not None else Path()
+        effective_cwd = (process_base / native_base).resolve()
+        if src_src_values:
+            if len(src_src_values) != 1 or source_count != 1:
+                raise SyqInvocationError(
+                    "syq map takes --src-src as its only selector"
+                )
+            effective_cwd /= os.fsdecode(src_src_values[0])
+        return MapStream(
+            _LineProcess(
+                command,
+                cwd=self.process_cwd,
+                env=self.env,
+                timeout=self.timeout if timeout is None else timeout,
+            ),
+            effective_cwd,
+        )
