@@ -771,19 +771,10 @@ pub fn run(args: Args) -> Result<i32> {
                 "--results cannot be used with --detach because the remote result stream would not remain attached"
             );
         }
-        let coordinator_is_remote = args.locations.len() >= 2 && {
-            let source = &args.locations[0];
-            let dst = args.locations.last().expect("locations checked above");
-            let direct_paths_are_utf8 = args
-                .locations
-                .iter()
-                .all(|location| std::str::from_utf8(&location.path).is_ok());
-            source.is_remote()
-                && dst.is_remote()
-                && !args.relay
-                && args.run_at != RunAt::Local
-                && (args.run_at != RunAt::Auto || direct_paths_are_utf8)
-        };
+        let coordinator_is_remote = args
+            .locations
+            .split_last()
+            .is_some_and(|(dst, sources)| uses_remote_coordinator(&args, sources, dst));
         // The machine owns stdout either way: suppress every human stdout
         // line so the stream stays parseable.
         progress.suppress_stdout();
@@ -879,6 +870,23 @@ fn run_endpoints(locations: &[Location]) -> Vec<crate::results::EndpointRecord> 
     endpoints
 }
 
+fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &Location) -> bool {
+    let Some(source) = sources.first() else {
+        return false;
+    };
+    let direct_paths_are_utf8 = sources
+        .iter()
+        .chain(std::iter::once(dst))
+        .all(|location| std::str::from_utf8(&location.path).is_ok());
+    source.is_remote()
+        && dst.is_remote()
+        && !args.relay
+        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
+        && (args.interface == Interface::Rsync
+            || args.run_at != RunAt::Auto
+            || direct_paths_are_utf8)
+}
+
 fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
     let io = error
         .chain()
@@ -929,13 +937,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .iter()
         .chain(std::iter::once(dst))
         .all(|location| std::str::from_utf8(&location.path).is_ok());
-    let coordinator_is_remote = original_srcs[0].is_remote()
-        && dst.is_remote()
-        && !args.relay
-        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
-        && (args.interface == Interface::Rsync
-            || args.run_at != RunAt::Auto
-            || direct_paths_are_utf8);
+    let coordinator_is_remote = uses_remote_coordinator(&args, original_srcs, dst);
     let direct_remote_to_remote = original_srcs[0].is_remote()
         && dst.is_remote()
         && !original_srcs[0].same_host(dst)

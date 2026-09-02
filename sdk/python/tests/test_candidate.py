@@ -167,6 +167,55 @@ class CandidateCompatibilityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(result.stderr)
 
+    def test_candidate_remote_coordinator_returns_one_valid_stream(self) -> None:
+        assert EXECUTABLE is not None
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"remote coordinator")
+            remote_home = root / "remote-home"
+            remote_home.mkdir()
+            rsh_log = root / "rsh.log"
+            rsh = root / "fake-rsh"
+            rsh.write_text(
+                """#!/bin/sh
+shift
+HOME="$FAKE_REMOTE_HOME"
+PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
+export HOME PATH
+printf '%s\\n' "$1" >> "$FAKE_RSH_LOG"
+exec /bin/sh -c "$1"
+""",
+                encoding="utf-8",
+            )
+            rsh.chmod(0o755)
+            client = syq.Client(
+                executable=EXECUTABLE,
+                process_cwd=root,
+                env={
+                    **os.environ,
+                    "FAKE_REMOTE_HOME": os.fspath(remote_home),
+                    "FAKE_REMOTE_BIN": os.fspath(root / "remote-bin"),
+                    "FAKE_RSH_LOG": os.fspath(rsh_log),
+                },
+            )
+
+            result = client.cp(
+                src=source,
+                from_="hostA",
+                to="hostB",
+                run_at="target",
+                as_=destination,
+                rsh=os.fspath(rsh),
+                syq_path=EXECUTABLE,
+                no_tcp=True,
+                connections=1,
+            )
+
+            self.assertEqual(result.status, syq.OperationStatus.SUCCESS)
+            self.assertEqual(destination.read_bytes(), b"remote coordinator")
+
 
 if __name__ == "__main__":
     unittest.main()
