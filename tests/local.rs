@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -541,6 +541,99 @@ fn native_hash_repairs_equal_metadata_content_mismatches() {
             assert!(!t.path(&format!("{destination}/extra")).exists());
         }
     }
+}
+
+#[test]
+fn native_filters_apply_to_copy_and_protect_pruned_paths() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"keep");
+    write(&t.path("src/discard.tmp"), b"new-discard");
+    write(&t.path("src/important.tmp"), b"important");
+
+    run_native_ok(&[
+        "cp",
+        "--ignore",
+        "*.tmp",
+        "--src-src",
+        &t.s("src"),
+        "--into",
+        &t.s("copied"),
+    ]);
+    assert_eq!(listing(&t.path("copied")), ["keep"]);
+
+    write(&t.path("patterns"), b"*.tmp\n");
+    write(&t.path("pruned/discard.tmp"), b"protected-old-copy");
+    write(&t.path("pruned/extra"), b"remove");
+    run_native_ok(&[
+        "cp-prune",
+        "--ignore-from",
+        &t.s("patterns"),
+        "--ignore",
+        "!important.tmp",
+        "--src-src",
+        &t.s("src"),
+        "--into-existing",
+        &t.s("pruned"),
+    ]);
+    assert_eq!(read(&t.path("pruned/keep")), b"keep");
+    assert_eq!(read(&t.path("pruned/important.tmp")), b"important");
+    assert_eq!(read(&t.path("pruned/discard.tmp")), b"protected-old-copy");
+    assert!(!t.path("pruned/extra").exists());
+}
+
+#[test]
+fn native_preserve_policy_controls_permissions_and_special_files() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"new");
+    fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o751)).unwrap();
+    mkfifo(&t.path("src/fifo"));
+    write(&t.path("dst/file"), b"old");
+    fs::set_permissions(t.path("dst/file"), fs::Permissions::from_mode(0o600)).unwrap();
+    set_mtime(&t.path("src/file"), 1_700_000_000);
+    set_mtime(&t.path("dst/file"), 1_600_000_000);
+
+    run_native_ok(&[
+        "cp",
+        "--preserve=permissions,specials",
+        "--src-src",
+        &t.s("src"),
+        "--into-existing",
+        &t.s("dst"),
+    ]);
+
+    assert_eq!(read(&t.path("dst/file")), b"new");
+    assert_eq!(
+        fs::metadata(t.path("dst/file")).unwrap().mode() & 0o777,
+        0o751
+    );
+    assert!(fs::symlink_metadata(t.path("dst/fifo"))
+        .unwrap()
+        .file_type()
+        .is_fifo());
+}
+
+#[test]
+fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
+    let t = Tmp::new();
+    let expected = vec![b'n'; 5 * 1024 * 1024];
+    write(&t.path("src/file"), &expected);
+    write(&t.path("dst/file"), &vec![b'o'; expected.len()]);
+    set_mtime(&t.path("src/file"), 1_700_000_000);
+    set_mtime(&t.path("dst/file"), 1_600_000_000);
+    let inode = fs::metadata(t.path("dst/file")).unwrap().ino();
+
+    run_native_ok(&[
+        "cp",
+        "--inplace",
+        "--src-src",
+        &t.s("src"),
+        "--into-existing",
+        &t.s("dst"),
+    ]);
+
+    assert_eq!(read(&t.path("dst/file")), expected);
+    assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
+    assert!(partial_files(&t.path("dst")).is_empty());
 }
 
 #[test]
@@ -8199,6 +8292,63 @@ fn direct_remote_to_remote_forwards_receiver_policy_opt_outs() {
         log.contains("--insecure-links"),
         "the source-side orchestrator silently changed destination-link policy"
     );
+}
+
+#[test]
+fn native_direct_remote_to_remote_forwards_copy_policies() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let helper = cached_remote_helper(&t);
+    fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), &helper).unwrap();
+
+    let contents = vec![7u8; 5 << 20];
+    write(&t.path("src/keep"), &contents);
+    write(&t.path("src/skip.tmp"), b"excluded");
+    fs::set_permissions(t.path("src/keep"), fs::Permissions::from_mode(0o640)).unwrap();
+    write(&t.path("dst/keep"), b"old");
+    let original_inode = fs::metadata(t.path("dst/keep")).unwrap().ino();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--from",
+            "fake",
+            "--src-src",
+            &t.s("src"),
+            "--to",
+            "fake",
+            "--ignore=*.tmp",
+            "--preserve=permissions",
+            "--inplace",
+            "--into-existing",
+            &t.s("dst"),
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", rsh)
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("run native direct transfer through fake remote shell");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/keep")), contents);
+    let metadata = fs::metadata(t.path("dst/keep")).unwrap();
+    assert_eq!(
+        metadata.ino(),
+        original_inode,
+        "--inplace was not forwarded"
+    );
+    assert_eq!(metadata.mode() & 0o777, 0o640);
+    assert!(!t.path("dst/skip.tmp").exists());
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    for option in ["--ignore=*.tmp", "--preserve=permissions", "--inplace"] {
+        assert!(
+            log.contains(option),
+            "source command omitted {option}: {log}"
+        );
+    }
 }
 
 // ----------------------------------------------------------- review round 13

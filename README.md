@@ -155,6 +155,9 @@ syq cp --src-file report --src-dir assets --into /backup
 syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
 syq cp report --to server --as-new /reports/final
 syq cp --hash report --to server --as-existing /reports/final
+syq cp --ignore '*.tmp' --src-src project --to server --into /app
+syq cp --preserve=permissions,ownership project --to server --into /backup
+syq cp --inplace disk.img --to server --as-existing /images/disk.img
 syq cp-prune --src-src build --to server --into-existing /srv/app
 syq rm cache old-output
 syq rm --from server --cwd /srv --src old-output
@@ -248,35 +251,40 @@ detected write failure cancels queued work and stops directory scans from
 scheduling more removals; operations already completed or inside a filesystem
 call are not rolled back. Native `rm` has no detached mode.
 
-The first native fidelity default is exactly `-rlt`: it recurses through
-directories, copies symlinks as symlinks, and retains mtimes. Owner, group,
-modes, special files,
-hard links, ACLs, xattrs, filtering, other copy policies, and the automation API
-are intentionally not frozen by this first grammar. Use `syq rsync` when the
-current compatibility options for those capabilities are needed.
+Native copy fidelity defaults to `-rlt`: recurse through directories, copy
+symlinks as symlinks, and retain mtimes. `--preserve=permissions` additionally
+copies modes, `--preserve=ownership` requests numeric owner and group, and
+`--preserve=specials` copies device, FIFO, and socket nodes. The option is
+repeatable and accepts comma-separated values. Ownership follows the same
+receiver-side rules as archive mode: owner is set only when the receiver runs
+as root, while group changes that fail with `EPERM` are skipped. Hard links,
+ACLs, and xattrs are not preserved.
 
 All native commands accept `-n`/`--dry-run`, `-v`/`--verbose`, `-q`/`--quiet`,
 `-j`/`--connections`, `--progress`/`--no-progress`, and `--progress-json` in
 addition to their endpoint and selector options. `cp` and `cp-prune` also
-accept `--hash`, `--no-compress`, `--bwlimit RATE`, and `--stats`. `--hash`
+accept `--hash`, `--no-compress`, `--bwlimit RATE`, `--stats`, repeatable
+`--ignore PATTERN`/`--ignore-from FILE`, `--preserve`, and `--inplace`. Filters
+use the gitignore semantics described below and apply at every source root;
+`cp-prune` protects excluded destination paths from pruning. `--hash`
 compares existing regular-file contents with full BLAKE3 digests instead of
 trusting equal size and modification time; it does not add a second
 post-transfer verification pass. The bandwidth limit applies only to file
 data, not scanning, hashing, metadata, or pruning. A
 command-restricted remote-to-remote receiver independently enforces the signed
-aggregate limit. A receiver installed by an older syq rejects that V2 grant
-safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment to the
-current binary. `cp` additionally accepts `--mapping` and `--results` (see
-[MAPPINGS.md](MAPPINGS.md)). `cp-prune` additionally
+aggregate limit, signed filters, and the selected staged or in-place publication
+policy. A receiver installed by an older syq rejects an extension or unsupported
+policy safely; rerun `syq enroll HOST:DEST` to refresh an existing enrollment
+to the current binary. `cp` additionally accepts `--mapping` and `--results`
+(see [MAPPINGS.md](MAPPINGS.md)). `cp-prune` additionally
 accepts `--max-delete`; `rm` additionally accepts `--root` and `--follow` plus
 its endpoint-side removal semantics.
 
-Preservation policies, filters, other comparison and write controls, block and
-split sizing, and SSH/transport configuration remain available only through `syq rsync`;
-sharing the transfer engine does not expose those options in native mode.
-Remote-to-remote copies still use the ordinary automatic transport. Native raw
-path bytes are relayed through syq's protocol when they cannot be represented
-in a direct remote shell command.
+Other comparison and selection controls, block and split sizing, and
+SSH/transport configuration remain available only through `syq rsync`.
+Remote-to-remote native copies always use the automatic topology and do not
+expose `--relay`; raw path bytes are relayed internally through syq's protocol
+when they cannot be represented in a direct remote shell command.
 
 ## Mappings
 
@@ -457,8 +465,8 @@ cannot supply special bits or turn this path into chmod authority over existing
 objects. A new directory does retain a setgid bit inherited from its destination
 parent by hostB's kernel; that bit is read from the newly created inode and is
 not accepted from HostA's mode proposal. Preserved modes are bound to the
-receiver-observed inode fingerprint; atomic publication fails if that object
-changes instead of carrying its mode onto a replacement. Hash requests must use
+receiver-observed inode fingerprint; publication fails if that object changes
+instead of carrying its mode onto a replacement. Hash requests must use
 the signed block size, and the receiver rejects any request whose hash vector
 could exceed the protocol frame
 limit.
@@ -478,13 +486,16 @@ source metadata, or stop the transfer. It still cannot escape the signed
 destination scopes or independently authenticate to hostB with the enrollment
 key.
 
-The command-restricted path requires atomic staged publication and encrypted
-TCP data connections. `--inplace`, `--no-tcp`, `--tcp-plain`,
-`--tcp-congestion`, `--update`, `--existing`, `--ignore-existing`, native
-`--*-new`/`--*-existing`,
-`--ignore`/`--ignore-from`, `--files-from`, `--mapping`, `--min-size`,
-`--syq-path`, and
-`--no-bootstrap` currently fail closed because
+The command-restricted path requires encrypted TCP data connections. Ordered
+filter rules and `--delete-excluded` are included in a V3 signed grant: the
+receiver requires destination scans to use the exact policy and rejects
+mutations of excluded paths unless their deletion was explicitly authorized.
+The signed publication policy distinguishes atomic staged writes from
+`--inplace`; in-place requests use descriptor-relative opens and writes beneath
+the enrolled root and cannot silently switch back to staged publication.
+`--no-tcp`, `--tcp-plain`, `--tcp-congestion`, `--update`, `--existing`,
+`--ignore-existing`, native `--*-new`/`--*-existing`, `--files-from`, `--mapping`,
+`--min-size`, `--syq-path`, and `--no-bootstrap` currently fail closed because
 the receiver cannot enforce those semantics independently of hostA.
 `--max-size` is enforced as a signed per-file limit, but is refused together
 with deletion because filtered source files could otherwise make hostA's
@@ -1181,6 +1192,8 @@ syq rsync -a --ignore '*.o' --ignore /build src/ host:dst/      # glob; leading 
 syq rsync -a --ignore 'logs/*' --ignore '!logs/keep/' src/ dst/ # everything in logs/ except keep/
 syq rsync -a --ignore-from .gitignore --ignore '!dist/' repo/ host:repo/
 syq rsync -a --ignore '*' --ignore '!*/' --ignore '!*.jpg' photos/ bak/ # copy only *.jpg
+syq cp --ignore-from .gitignore --src-src repo --to host --into repo
+syq cp-prune --ignore cache/ --src-src build --into-existing deploy
 ```
 
 Rules of thumb (they're git's): `foo` matches a file or directory named `foo`
@@ -1190,8 +1203,9 @@ it is transferred or even scanned — which is why "only `*.jpg`" needs the
 `!*/` line to keep descending. Empty directories are copied like any other
 (this is a filter on the walk, not git's notion of what's tracked). The source
 root itself is never ignored; with several sources each is filtered from its
-own root. `-n` previews the selected scope and intended changes. `--rm` does not
-take filters (it always removes the whole tree), so `--ignore` conflicts with it.
+own root. `-n` previews the selected scope and intended changes. The same rules
+are available on native `cp` and `cp-prune`. Neither native `rm` nor compatibility
+`--rm` takes filters: removal always selects the whole explicit tree.
 
 As in git, a `!` rule cannot re-include something whose parent directory is
 ignored: `logs/**` prunes `logs/keep` itself, so `!logs/keep/**` after it has
