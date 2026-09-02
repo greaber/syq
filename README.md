@@ -289,7 +289,7 @@ reshape a transfer:
 ```bash
 set -o pipefail
 syq map --src-src photos \
-  | jq '.dst.value |= ascii_downcase' \
+  | jq -c '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C photos --to nas --into /pub
 ```
 

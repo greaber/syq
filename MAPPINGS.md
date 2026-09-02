@@ -11,7 +11,7 @@ before a single byte moves.
 ```bash
 set -o pipefail
 syq map --src-src photos \
-  | jq '.dst.value |= ascii_downcase' \
+  | jq -c '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C photos --to nas --into /pub
 ```
 
@@ -92,7 +92,7 @@ manifest instead:
 
 ```bash
 set -o pipefail
-syq map --src-src src | jq '.dst.value |= ascii_downcase' > m.ndjson \
+syq map --src-src src | jq -c '.dst.value |= ascii_downcase' > m.ndjson \
   && syq cp --mapping m.ndjson -C src --to nas --into /pub
 ```
 
@@ -103,7 +103,7 @@ A migration to a case-insensitive filesystem:
 ```bash
 set -o pipefail
 syq map --src-src src \
-  | jq '.dst.value |= ascii_downcase' \
+  | jq -c '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C src --to nas --into /pub
 ```
 
@@ -151,7 +151,7 @@ up around every run.
 ```bash
 set -o pipefail
 syq map --src-src photos \
-  | jq 'select(.kind == "file")
+  | jq -c 'select(.kind == "file")
         | .dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value' \
   | syq cp --mapping - -C photos --to nas --into /archive
 ```
@@ -178,7 +178,7 @@ lifecycle (rebuild after changes, clean up after runs).
 ```bash
 set -o pipefail
 syq map --src-src data \
-  | jq 'select(.kind != "file" or .size >= 1048576)' \
+  | jq -c 'select(.kind != "file" or .size >= 1048576)' \
   | syq cp --mapping - -C data --to nas --into /big
 ```
 
