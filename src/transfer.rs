@@ -722,11 +722,8 @@ pub fn run(args: Args) -> Result<i32> {
         writer.emit_run(&crate::results::RunRecord {
             run_id: &run_id,
             started_at,
-            mode: if args.interface == Interface::NativeCpPrune {
-                "cp-prune"
-            } else {
-                "cp"
-            },
+            mode: "cp",
+            prune: args.delete,
             mapping: args.native_mapping.is_some(),
             dry_run: args.dry_run,
             endpoints: run_endpoints(&args.locations),

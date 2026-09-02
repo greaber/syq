@@ -47,6 +47,7 @@ pub struct RunRecord<'a> {
     pub run_id: &'a str,
     pub started_at: i64,
     pub mode: &'static str,
+    pub prune: bool,
     pub mapping: bool,
     pub dry_run: bool,
     pub endpoints: Vec<EndpointRecord>,
@@ -94,7 +95,7 @@ pub struct ResultRecord {
     pub bytes_transferred: u64,
     pub bytes_unchanged: u64,
     pub elapsed_ms: u64,
-    /// cp-prune only; None keeps the fields out of the record.
+    /// `--prune` runs only; None keeps the fields out of the record.
     pub deletions_planned: Option<u64>,
     pub deletions_completed: Option<u64>,
     pub deletions_blocked: Option<u64>,
@@ -134,6 +135,7 @@ impl ResultsWriter {
             "started_at": run.started_at,
             "syq_version": env!("CARGO_PKG_VERSION"),
             "mode": run.mode,
+            "prune": run.prune,
             "mapping": run.mapping,
             "dry_run": run.dry_run,
             "endpoints": endpoints,

@@ -343,7 +343,6 @@ pub fn run(
     let mut remote: Vec<String> = vec![match args.interface {
         Interface::Rsync => "rsync",
         Interface::NativeCp => "cp",
-        Interface::NativeCpPrune => "cp-prune",
         Interface::NativeRm => bail!("native rm cannot be a remote-to-remote transfer"),
         Interface::NativeMap => bail!("syq map runs locally and is never remoted"),
     }
@@ -385,6 +384,9 @@ pub fn run(
     }
     if args.interface != Interface::Rsync && args.native_follow {
         remote.push("--follow".into());
+    }
+    if args.interface == Interface::NativeCp && args.delete {
+        remote.push("--prune".into());
     }
     if args.inplace {
         remote.push("--inplace".into());

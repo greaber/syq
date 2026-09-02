@@ -255,8 +255,8 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   a policy exclusion like `--min-size`: the run still succeeds and the
   entry appears only in the excluded aggregate. Filter with
   `jq -c 'select(.kind != "special")'` to drop such entries up front.
-- Mappings define no deletion region, so `--mapping` is not available
-  on `cp-prune`.
+- Mappings define no deletion region, so `--mapping` cannot be combined
+  with `--prune`.
 - Duplicate lines are errors, even identical ones: a duplicate almost
   always means a generator bug. Deduplicate in your generator if you
   union overlapping fragments.
@@ -273,7 +273,7 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
 
 ## Machine-readable results (preview)
 
-`syq cp --results FILE` and `syq cp-prune --results FILE` write an
+`syq cp --results FILE` (with or without `--prune`) writes an
 NDJSON outcome stream beside the ordinary human output; with `-` the
 machine owns stdout and syq suppresses its own human stdout. The
 stream carries `schema_version: 1`: a `run` record (run id, mode,
