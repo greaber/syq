@@ -788,7 +788,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
 }
 
 #[test]
-fn native_copy_placement_links_use_the_same_follow_policy() {
+fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
@@ -811,19 +811,33 @@ fn native_copy_placement_links_use_the_same_follow_policy() {
         "--as-existing",
         &t.s("exact-link"),
     ]);
-    assert_eq!(read(&t.path("referent")), b"new");
-    assert!(t.path("exact-link").is_symlink());
+    assert_eq!(read(&t.path("exact-link")), b"new");
+    assert_eq!(read(&t.path("referent")), b"old-again");
+    assert!(!t.path("exact-link").is_symlink());
 
-    symlink("created-referent", t.path("dangling-link")).unwrap();
+    symlink("never-created", t.path("dangling-existing-link")).unwrap();
     run_native_ok(&[
         "cp",
         "--follow",
         &t.s("source"),
-        "--as-new",
-        &t.s("dangling-link"),
+        "--as-existing",
+        &t.s("dangling-existing-link"),
     ]);
-    assert_eq!(read(&t.path("created-referent")), b"new");
-    assert!(t.path("dangling-link").is_symlink());
+    assert_eq!(read(&t.path("dangling-existing-link")), b"new");
+    assert!(!t.path("never-created").exists());
+
+    symlink("also-never-created", t.path("dangling-new-link")).unwrap();
+    let refused = native_syq(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as-new",
+        &t.s("dangling-new-link"),
+    ]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("already exists"));
+    assert!(t.path("dangling-new-link").is_symlink());
+    assert!(!t.path("also-never-created").exists());
 
     fs::create_dir_all(t.path("links")).unwrap();
     write(&t.path("elsewhere/relative-referent"), b"old-relative");
@@ -839,8 +853,12 @@ fn native_copy_placement_links_use_the_same_follow_policy() {
         "--as-existing",
         &t.s("links/relative-link"),
     ]);
-    assert_eq!(read(&t.path("elsewhere/relative-referent")), b"new");
-    assert!(t.path("links/relative-link").is_symlink());
+    assert_eq!(read(&t.path("links/relative-link")), b"new");
+    assert_eq!(
+        read(&t.path("elsewhere/relative-referent")),
+        b"old-relative"
+    );
+    assert!(!t.path("links/relative-link").is_symlink());
 
     let absolute_referent = t.path("elsewhere/absolute-referent");
     write(&absolute_referent, b"old-absolute");
@@ -852,23 +870,54 @@ fn native_copy_placement_links_use_the_same_follow_policy() {
         "--as-existing",
         &t.s("links/absolute-link"),
     ]);
-    assert_eq!(read(&absolute_referent), b"new");
-    assert!(t.path("links/absolute-link").is_symlink());
+    assert_eq!(read(&t.path("links/absolute-link")), b"new");
+    assert_eq!(read(&absolute_referent), b"old-absolute");
+    assert!(!t.path("links/absolute-link").is_symlink());
 
     symlink(
-        "../elsewhere/created-external-referent",
+        "../elsewhere/never-created-external-referent",
         t.path("links/dangling-external-link"),
     )
     .unwrap();
-    run_native_ok(&[
+    let refused = native_syq(&[
         "cp",
         "--follow",
         &t.s("source"),
         "--as-new",
         &t.s("links/dangling-external-link"),
     ]);
-    assert_eq!(read(&t.path("elsewhere/created-external-referent")), b"new");
+    assert!(!refused.status.success());
     assert!(t.path("links/dangling-external-link").is_symlink());
+    assert!(!t.path("elsewhere/never-created-external-referent").exists());
+
+    fs::create_dir(t.path("real-parent")).unwrap();
+    symlink("real-parent", t.path("parent-link")).unwrap();
+    let refused = native_syq(&["cp", &t.s("source"), "--as", &t.s("parent-link/exact-name")]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(!t.path("real-parent/exact-name").exists());
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        &t.s("source"),
+        "--as",
+        &t.s("parent-link/exact-name"),
+    ]);
+    assert_eq!(read(&t.path("real-parent/exact-name")), b"new");
+
+    write(&t.path("source-tree/file"), b"tree");
+    symlink("source-tree", t.path("source-tree-link")).unwrap();
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--src-dir",
+        &t.s("source-tree"),
+        "--as-existing",
+        &t.s("source-tree-link"),
+    ]);
+    assert!(!t.path("source-tree-link").is_symlink());
+    assert_eq!(read(&t.path("source-tree-link/file")), b"tree");
+    assert_eq!(read(&t.path("source-tree/file")), b"tree");
 
     fs::create_dir(t.path("real-container")).unwrap();
     symlink("real-container", t.path("container-link")).unwrap();
