@@ -97,12 +97,16 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
         None => Endpoint::Local,
         Some(h) => {
             let rsh = parse_rsh(&args.rsh)?;
-            let ssh_multiplexer = args
-                .rsh
-                .is_none()
-                .then(SshMultiplexer::new)
-                .transpose()?
-                .map(Arc::new);
+            let ssh_multiplexer = if args.rsh.is_some() {
+                None
+            } else if args.reuse_connection && args.restricted_grant.is_none() {
+                Some(Arc::new(SshMultiplexer::persistent(
+                    loc.user.as_deref(),
+                    h,
+                )?))
+            } else {
+                Some(Arc::new(SshMultiplexer::new()?))
+            };
             Endpoint::Remote(RemoteSpec {
                 local_process: false,
                 user: loc.user.clone(),

@@ -9401,3 +9401,46 @@ fn mappings_md_drop_specials_example_works_verbatim() {
     assert_eq!(read(&t.path("dst/a.txt")), b"ok");
     assert!(!t.path("dst/pipe").exists());
 }
+
+#[test]
+fn reuse_connection_flag_surface() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    // Conflicts with an explicit remote shell on the rsync surface.
+    let out = syq(&[
+        "-a",
+        "--reuse-connection",
+        "-e",
+        "ssh -p 2222",
+        &t.s("src/"),
+        &t.s("dst"),
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("--rsh"), "{stderr}");
+    // syq map never connects; the flag is refused there.
+    let out = syq_map_in(&t.path(""), &["--src-src", "src", "--reuse-connection"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only available on syq cp"));
+    // Local copies accept it as a no-op on both surfaces.
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "out",
+            "--reuse-connection",
+            "-q",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("out/a.txt")), b"a");
+    let out = syq(&["-a", "--reuse-connection", &t.s("src/"), &t.s("out2")]);
+    assert!(out.status.success());
+}
