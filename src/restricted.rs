@@ -3205,19 +3205,6 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
     crate::server::run_restricted(authority)
 }
 
-/// The receipt signing key an install left in the state directory, if any;
-/// enrollments installed before receipts existed have none.
-fn load_receipt_key(state: &Path) -> Result<Option<PrivateKey>> {
-    let path = state.join(RECEIPT_KEY_FILE);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let encoded = delegation::read_secure_regular(&path, "receipt signing key", 128 * 1024)?;
-    PrivateKey::from_openssh(&encoded)
-        .context("parse receipt signing key")
-        .map(Some)
-}
-
 fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
     if original.len() > 128 * 1024 {
         bail!("restricted receiver command exceeds size limit");
