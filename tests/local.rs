@@ -11378,10 +11378,10 @@ fn native_mapping_and_map_respect_typed_selectors() {
     assert_eq!(dsts, ["d", "f.txt"]);
 }
 
-// ---- MAPPINGS.md example verification ----
+// ---- docs/mappings.md example verification ----
 //
 // Each documented jq transform lives here as a constant. Tests assert the
-// constant appears in MAPPINGS.md (whitespace-normalized, so formatting can
+// constant appears in docs/mappings.md (whitespace-normalized, so formatting can
 // change but semantics cannot drift silently), then execute the real
 // pipeline with jq against a local tree. Endpoints are adapted from the
 // documented `--to nas --into /...` to local directories.
@@ -11403,12 +11403,12 @@ const DOC_JQ_RETRY_GATE: &str = r#"if (.[-1].type? // "") != "result"
 /// the test executes, so an undocumented flag can never make a broken
 /// example pass.
 fn assert_documented(flags: &[&str], program: &str) {
-    let doc = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/MAPPINGS.md")).unwrap();
+    let doc = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/mappings.md")).unwrap();
     let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let invocation = format!("jq {} '{program}'", flags.join(" "));
     assert!(
         squash(&doc).contains(&squash(&invocation)),
-        "MAPPINGS.md no longer contains this documented jq invocation; update the doc and this test together:\n{invocation}"
+        "docs/mappings.md no longer contains this documented jq invocation; update the doc and this test together:\n{invocation}"
     );
 }
 

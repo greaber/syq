@@ -68,10 +68,3 @@ This suite is intentionally outside `cargo test` and CI. Run it after changing
 SSH, remote-helper, enrollment, restricted-receiver, transport, or remote
 topology behavior, and before cutting a release. A failure retains public logs
 under `target/real-ssh.*`; the ephemeral private key is always removed.
-
-## Known findings from bringing up the suite
-
-- A restricted copy to a missing directory with `--preserve=permissions` is
-  currently rejected because root creation requests a receiver-managed mode
-  that the grant does not authorize. The passing restricted case pre-creates
-  its root and uses `--into-existing`; descendant modes are still compared.

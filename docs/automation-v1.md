@@ -4,11 +4,11 @@
 operation outcomes. This document is the contract for that stream:
 what each record means, which fields a consumer may rely on, and how
 exit codes correspond to terminal statuses. The machine-checkable
-counterpart is [`schemas/automation-v1.schema.json`](../schemas/automation-v1.schema.json);
+counterpart is [`schemas/automation-v1.schema.json`](https://github.com/greaber/syq/blob/master/schemas/automation-v1.schema.json);
 example streams live in
-[`tests/fixtures/automation-v1/`](../tests/fixtures/automation-v1/).
+[`tests/fixtures/automation-v1/`](https://github.com/greaber/syq/tree/master/tests/fixtures/automation-v1).
 For the mapping manifest *input* format, see
-[`MAPPINGS.md`](../MAPPINGS.md) — `syq map` output is a manifest, not
+[Mappings](mappings.md) — `syq map` output is a manifest, not
 this stream, and the two formats never mix.
 
 ## The channel
@@ -56,7 +56,7 @@ narration is discarded), so the numbers a person reads and a machine
 parses come from the same verified record. `--dry-run` with
 `--results` needs a local coordinator today: traces and planned
 totals exist only on the coordinator, and a receipt cannot attest a
-plan (relaying the coordinator's own stream is a recorded follow-up). `--results` is not available on
+plan, and the coordinator's own stream is not relayed. `--results` is not available on
 `syq map` (its stdout is the manifest format) or, yet, on other
 commands, and cannot be combined with `--detach`. `--dry-run`
 composes; see below. `--results` cannot be combined with `--detach`, because
@@ -234,7 +234,7 @@ trouble exactly as a real run would.
   treat the absence of errors as success.
 - Build retry manifests from the stream only when the terminal status
   is `success` or `partial`. Any other status means entries may be
-  unsettled — rerun instead. (The retry recipe in `MAPPINGS.md`
+  unsettled — rerun instead. (The retry recipe in [the mappings guide](mappings.md)
   enforces both checks.)
 - Ignore record types and optional fields you do not recognize;
   additions within schema version 1 are not breaking.
@@ -252,5 +252,5 @@ integration tests validate every line syq emits against it, so any
 shape change fails a test and is reviewed as an API change. The
 committed fixtures under `tests/fixtures/automation-v1/` are examples
 of real streams (regenerate with
-`scripts/regen-automation-fixtures.sh`); SDKs develop against them
-without running syq.
+`scripts/regen-automation-fixtures.sh`); client libraries can develop against
+them without running syq.
