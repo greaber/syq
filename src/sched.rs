@@ -3,8 +3,9 @@
 use crate::proto::{ContainerGuard, Entry, PathBytes};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct FileJob {
@@ -69,6 +70,10 @@ struct Inner {
 pub struct Sched {
     inner: Mutex<Inner>,
     cv: Condvar,
+    direct_fallback_workers: AtomicUsize,
+    tune_request: AtomicUsize,
+    tune_wait: Mutex<()>,
+    tune_cv: Condvar,
     pub jobs: Mutex<Vec<FileJob>>,
     pub block: u64,
     pub min_split: u64,
@@ -92,6 +97,10 @@ impl Sched {
                 abort: false,
             }),
             cv: Condvar::new(),
+            direct_fallback_workers: AtomicUsize::new(0),
+            tune_request: AtomicUsize::new(0),
+            tune_wait: Mutex::new(()),
+            tune_cv: Condvar::new(),
             jobs: Mutex::new(Vec::new()),
             block,
             min_split: min_split.max(2 * block),
@@ -108,6 +117,54 @@ impl Sched {
         self.inner.lock().unwrap().files.push((size, Reverse(idx)));
         self.cv.notify_one();
         idx
+    }
+
+    /// File jobs and queues are index-addressed while workers are active. Once
+    /// every worker and the tuner have joined, release their retained capacity
+    /// before deletion, deferred metadata, and receipt settlement continue.
+    pub fn clear_finished_work(&self) {
+        *self.jobs.lock().unwrap() = Vec::new();
+        let mut inner = self.inner.lock().unwrap();
+        inner.files = BinaryHeap::new();
+        inner.ranges = Vec::new();
+        inner.finishes = Vec::new();
+        inner.inflight = Vec::new();
+        inner.outstanding = HashMap::new();
+        inner.failed = HashSet::new();
+    }
+
+    /// Wake the tuner when a speculative direct local copy discovers that it
+    /// needs the ordinary parallel userspace path after all.
+    pub fn request_worker_count(&self, workers: usize) {
+        let _guard = self.tune_wait.lock().unwrap();
+        self.tune_request.fetch_max(workers, Relaxed);
+        self.tune_cv.notify_one();
+    }
+
+    pub fn arm_direct_fallback(&self, workers: usize) {
+        self.direct_fallback_workers.store(workers, Relaxed);
+    }
+
+    pub fn request_direct_fallback(&self) {
+        let workers = self.direct_fallback_workers.load(Relaxed);
+        if workers > 0 {
+            self.request_worker_count(workers);
+        }
+    }
+
+    pub fn take_worker_count_request(&self) -> usize {
+        self.tune_request.swap(0, Relaxed)
+    }
+
+    pub fn wait_for_tuning(&self, timeout: Duration) {
+        let guard = self.tune_wait.lock().unwrap();
+        if self.tune_request.load(Relaxed) == 0 {
+            drop(
+                self.tune_cv
+                    .wait_timeout_while(guard, timeout, |_| self.tune_request.load(Relaxed) == 0)
+                    .unwrap(),
+            );
+        }
     }
 
     /// Let speculative TCP workers warm while the planner performs remote

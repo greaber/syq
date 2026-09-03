@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) const SSHSIG_NAMESPACE: &str = "syq-grant@greaber.github";
 const WIRE_MAGIC: &[u8; 8] = b"SYQGRNT\0";
-const WIRE_VERSION: u16 = 2;
+const WIRE_VERSION: u16 = 3;
 const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 2 + 4 + 4;
 const MAX_GRANT_BYTES: usize = 32 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
@@ -387,12 +387,23 @@ pub(crate) enum RootExistence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantBodyV2 {
+struct GrantBody {
     grant: Grant,
     max_file_data_bytes_per_second: u64,
     filters: FilterPolicy,
     root_existence: RootExistence,
     receipt_v2: crate::receipt_v2::ReceiptPolicyV2,
+}
+
+#[cfg(test)]
+fn test_receipt_policy() -> crate::receipt_v2::ReceiptPolicyV2 {
+    crate::receipt_v2::ReceiptPolicyV2 {
+        required: true,
+        hashed: false,
+        max_records: crate::receipt_v2::DEFAULT_MAX_RECORDS,
+        max_plaintext_bytes: crate::receipt_v2::DEFAULT_MAX_PLAINTEXT_BYTES,
+        delivery: crate::receipt_v2::ReceiptDeliveryV2::DetachedSignedPlaintext,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -414,7 +425,7 @@ impl SignedGrantEnvelope {
             max_file_data_bytes_per_second,
             filters: FilterPolicy::default(),
             root_existence: RootExistence::Any,
-            receipt_v2: crate::receipt_v2::ReceiptPolicyV2::minimal_for_tests(),
+            receipt_v2: test_receipt_policy(),
             signature,
         }
     }
@@ -474,14 +485,14 @@ impl SignedGrantEnvelope {
             bail!("signed grant envelope length is noncanonical");
         }
         let body_bytes = &bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + grant_len];
-        let body: GrantBodyV2 = postcard::from_bytes(body_bytes).context("decode signed grant")?;
-        let (grant, max_file_data_bytes_per_second, filters, root_existence, receipt_v2) = (
-            body.grant,
-            body.max_file_data_bytes_per_second,
-            body.filters,
-            body.root_existence,
-            body.receipt_v2,
-        );
+        let body: GrantBody = postcard::from_bytes(body_bytes).context("decode signed grant")?;
+        let GrantBody {
+            grant,
+            max_file_data_bytes_per_second,
+            filters,
+            root_existence,
+            receipt_v2,
+        } = body;
         if canonical_body_bytes(
             &grant,
             max_file_data_bytes_per_second,
@@ -572,7 +583,7 @@ fn signing_payload_default(grant: &Grant, max_file_data_bytes_per_second: u64) -
         max_file_data_bytes_per_second,
         &FilterPolicy::default(),
         RootExistence::Any,
-        &crate::receipt_v2::ReceiptPolicyV2::minimal_for_tests(),
+        &test_receipt_policy(),
     )
 }
 
@@ -611,7 +622,7 @@ fn canonical_body_bytes(
     receipt_v2: &crate::receipt_v2::ReceiptPolicyV2,
 ) -> Result<Vec<u8>> {
     receipt_v2.validate()?;
-    postcard::to_stdvec(&GrantBodyV2 {
+    postcard::to_stdvec(&GrantBody {
         grant: grant.clone(),
         max_file_data_bytes_per_second,
         filters: filters.clone(),
@@ -1047,11 +1058,11 @@ pub(crate) struct GrantConstraints {
 #[cfg(test)]
 impl Default for GrantConstraints {
     fn default() -> Self {
-        GrantConstraints {
+        Self {
             max_file_data_bytes_per_second: 0,
             filters: FilterPolicy::default(),
             root_existence: RootExistence::Any,
-            receipt_v2: crate::receipt_v2::ReceiptPolicyV2::minimal_for_tests(),
+            receipt_v2: test_receipt_policy(),
         }
     }
 }
@@ -2187,7 +2198,7 @@ mod tests {
             max_file_data_bytes_per_second,
             &FilterPolicy::default(),
             RootExistence::Any,
-            &crate::receipt_v2::ReceiptPolicyV2::minimal_for_tests(),
+            &test_receipt_policy(),
         )
         .expect("encode test grant");
         let mut out = Vec::new();
@@ -2210,6 +2221,11 @@ mod tests {
         let mut unsupported = encoded.clone();
         unsupported[8..10].copy_from_slice(&(WIRE_VERSION + 1).to_be_bytes());
         assert!(SignedGrantEnvelope::decode(&unsupported).is_err());
+        let mut legacy = encoded.clone();
+        legacy[8..10].copy_from_slice(&1u16.to_be_bytes());
+        assert!(SignedGrantEnvelope::decode(&legacy).is_err());
+        legacy[8..10].copy_from_slice(&2u16.to_be_bytes());
+        assert!(SignedGrantEnvelope::decode(&legacy).is_err());
 
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -2334,7 +2350,7 @@ mod tests {
         .expect("OpenSSH must accept the signed root-existence extension");
         assert_eq!(verified.into_parts().1.root_existence, RootExistence::New);
 
-        // Grant v2 binds the complete receipt delivery policy, including the
+        // The grant binds the complete receipt delivery policy, including the
         // per-transfer HPKE recipient key, into the signed grant transcript.
         let policy_v2 = crate::receipt_v2::ReceiptPolicyV2 {
             required: true,

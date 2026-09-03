@@ -4,7 +4,7 @@
 use crate::proto::*;
 use crate::rooted::{
     OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root, RootIdentity,
-    RootMetadata,
+    RootMetadata, OPERATOR_SYMLINK_FOLLOW_ADVICE,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -284,7 +284,7 @@ pub(crate) fn check_operator_path_no_symlinks(
         PinnedPath::Directory(_) => Ok(()),
         PinnedPath::Leaf(leaf) if !leaf.metadata().is_symlink() || allow_final_symlink => Ok(()),
         PinnedPath::Leaf(_) => bail!(
-            "operator path encounters a last-component symlink; pass --follow to resolve symlinks"
+            "operator path encounters a last-component symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}"
         ),
         PinnedPath::Missing(missing) => {
             let (_, components) = missing.into_parts();

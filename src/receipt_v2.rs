@@ -67,19 +67,6 @@ pub(crate) struct ReceiptPolicyV2 {
 }
 
 impl ReceiptPolicyV2 {
-    /// A minimal valid policy for tests that need a grant but do not
-    /// exercise receipts.
-    #[cfg(test)]
-    pub(crate) fn minimal_for_tests() -> Self {
-        ReceiptPolicyV2 {
-            required: true,
-            hashed: false,
-            max_records: 1024,
-            max_plaintext_bytes: 1024 * 1024,
-            delivery: ReceiptDeliveryV2::DetachedSignedPlaintext,
-        }
-    }
-
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.required {
             bail!("receipt v2 policy must require a receipt");
@@ -293,6 +280,7 @@ pub(crate) struct TerminalReceiptV2 {
 pub(crate) struct StreamWriterV2 {
     file: File,
     hasher: blake3::Hasher,
+    record_buffer: Vec<u8>,
     record_count: u64,
     plaintext_bytes: u64,
     summary: ReceiptSummaryV2,
@@ -330,6 +318,7 @@ impl StreamWriterV2 {
         Ok(Self {
             file: tempfile::tempfile().context("create receiver receipt spool")?,
             hasher: blake3::Hasher::new(),
+            record_buffer: Vec::new(),
             record_count: 0,
             plaintext_bytes: 0,
             summary: ReceiptSummaryV2::default(),
@@ -360,7 +349,9 @@ impl StreamWriterV2 {
             self.recording_failure = Some(RecordingFailureV2::StorageFailed);
             return;
         }
-        let body = match postcard::to_stdvec(record) {
+        let mut body = std::mem::take(&mut self.record_buffer);
+        body.clear();
+        let body = match postcard::to_extend(record, body) {
             Ok(body) => body,
             Err(_) => {
                 self.recording_failure = Some(RecordingFailureV2::StorageFailed);
@@ -370,6 +361,7 @@ impl StreamWriterV2 {
         let framed_len = match STREAM_RECORD_HEADER_BYTES.checked_add(body.len()) {
             Some(length) => length,
             None => {
+                self.record_buffer = body;
                 self.recording_failure = Some(RecordingFailureV2::LimitExceeded);
                 return;
             }
@@ -377,17 +369,20 @@ impl StreamWriterV2 {
         let new_bytes = match self.plaintext_bytes.checked_add(framed_len as u64) {
             Some(bytes) => bytes,
             None => {
+                self.record_buffer = body;
                 self.recording_failure = Some(RecordingFailureV2::LimitExceeded);
                 return;
             }
         };
         if self.record_count >= self.max_records || new_bytes > self.max_plaintext_bytes {
+            self.record_buffer = body;
             self.recording_failure = Some(RecordingFailureV2::LimitExceeded);
             return;
         }
         let length = match u32::try_from(body.len()) {
             Ok(length) => length.to_be_bytes(),
             Err(_) => {
+                self.record_buffer = body;
                 self.recording_failure = Some(RecordingFailureV2::LimitExceeded);
                 return;
             }
@@ -398,6 +393,7 @@ impl StreamWriterV2 {
             .and_then(|()| self.file.write_all(&body))
             .is_err()
         {
+            self.record_buffer = body;
             self.recording_failure = Some(RecordingFailureV2::StorageFailed);
             return;
         }
@@ -406,6 +402,7 @@ impl StreamWriterV2 {
         self.record_count += 1;
         self.plaintext_bytes = new_bytes;
         summarize(record, &mut self.summary);
+        self.record_buffer = body;
     }
 
     pub(crate) fn finish(mut self, closure: ReceiptClosureV2<'_>) -> Result<IssuedReceiptV2> {
@@ -555,6 +552,45 @@ pub(crate) enum TransportFrameV2 {
     },
 }
 
+#[derive(Serialize)]
+enum BorrowedTransportFrameV2<'a> {
+    Start {
+        mode: TransportModeV2,
+        encapsulated_key: &'a [u8],
+    },
+    Chunk {
+        sequence: u64,
+        payload: &'a [u8],
+    },
+    End {
+        sequence: u64,
+        payload: &'a [u8],
+    },
+}
+
+#[cfg(test)]
+impl TransportFrameV2 {
+    fn as_borrowed(&self) -> BorrowedTransportFrameV2<'_> {
+        match self {
+            Self::Start {
+                mode,
+                encapsulated_key,
+            } => BorrowedTransportFrameV2::Start {
+                mode: *mode,
+                encapsulated_key,
+            },
+            Self::Chunk { sequence, payload } => BorrowedTransportFrameV2::Chunk {
+                sequence: *sequence,
+                payload,
+            },
+            Self::End { sequence, payload } => BorrowedTransportFrameV2::End {
+                sequence: *sequence,
+                payload,
+            },
+        }
+    }
+}
+
 pub(crate) fn emit_transport_frames(
     mut issued: IssuedReceiptV2,
     mut emit: impl FnMut(Vec<u8>) -> Result<()>,
@@ -570,10 +606,13 @@ pub(crate) fn emit_transport_frames(
             let (encapsulated, mut sender) =
                 setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &public, &info)
                     .map_err(|_| anyhow!("set up HPKE receipt sender"))?;
-            emit(encode_transport_frame(&TransportFrameV2::Start {
-                mode: TransportModeV2::AttachedEncrypted,
-                encapsulated_key: encapsulated.to_bytes().as_slice().to_vec(),
-            })?)?;
+            let encapsulated = encapsulated.to_bytes();
+            emit(encode_borrowed_transport_frame(
+                &BorrowedTransportFrameV2::Start {
+                    mode: TransportModeV2::AttachedEncrypted,
+                    encapsulated_key: encapsulated.as_slice(),
+                },
+            )?)?;
             let mut sequence = 0u64;
             let mut buffer = vec![0u8; PLAINTEXT_CHUNK_BYTES];
             let mut remaining = issued.stream_len;
@@ -587,26 +626,32 @@ pub(crate) fn emit_transport_frames(
                 let payload = sender
                     .seal(&buffer[..wanted], &frame_aad(sequence, false))
                     .map_err(|_| anyhow!("encrypt receipt stream frame"))?;
-                emit(encode_transport_frame(&TransportFrameV2::Chunk {
-                    sequence,
-                    payload,
-                })?)?;
+                emit(encode_borrowed_transport_frame(
+                    &BorrowedTransportFrameV2::Chunk {
+                        sequence,
+                        payload: &payload,
+                    },
+                )?)?;
                 sequence += 1;
                 remaining -= wanted as u64;
             }
             let payload = sender
                 .seal(&issued.signed_terminal, &frame_aad(sequence, true))
                 .map_err(|_| anyhow!("encrypt receipt terminal frame"))?;
-            emit(encode_transport_frame(&TransportFrameV2::End {
-                sequence,
-                payload,
-            })?)?;
+            emit(encode_borrowed_transport_frame(
+                &BorrowedTransportFrameV2::End {
+                    sequence,
+                    payload: &payload,
+                },
+            )?)?;
         }
         ReceiptDeliveryV2::DetachedSignedPlaintext => {
-            emit(encode_transport_frame(&TransportFrameV2::Start {
-                mode: TransportModeV2::DetachedSignedPlaintext,
-                encapsulated_key: Vec::new(),
-            })?)?;
+            emit(encode_borrowed_transport_frame(
+                &BorrowedTransportFrameV2::Start {
+                    mode: TransportModeV2::DetachedSignedPlaintext,
+                    encapsulated_key: &[],
+                },
+            )?)?;
             let mut sequence = 0u64;
             let mut buffer = vec![0u8; PLAINTEXT_CHUNK_BYTES];
             let mut remaining = issued.stream_len;
@@ -617,32 +662,56 @@ pub(crate) fn emit_transport_frames(
                     .stream
                     .read_exact(&mut buffer[..wanted])
                     .context("read receiver receipt spool")?;
-                emit(encode_transport_frame(&TransportFrameV2::Chunk {
-                    sequence,
-                    payload: buffer[..wanted].to_vec(),
-                })?)?;
+                emit(encode_borrowed_transport_frame(
+                    &BorrowedTransportFrameV2::Chunk {
+                        sequence,
+                        payload: &buffer[..wanted],
+                    },
+                )?)?;
                 sequence += 1;
                 remaining -= wanted as u64;
             }
-            emit(encode_transport_frame(&TransportFrameV2::End {
-                sequence,
-                payload: issued.signed_terminal,
-            })?)?;
+            emit(encode_borrowed_transport_frame(
+                &BorrowedTransportFrameV2::End {
+                    sequence,
+                    payload: &issued.signed_terminal,
+                },
+            )?)?;
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn encode_transport_frame(frame: &TransportFrameV2) -> Result<Vec<u8>> {
-    let body = postcard::to_stdvec(frame).context("encode receipt transport frame")?;
-    if body.len() > MAX_FRAME_BODY_BYTES {
+    encode_borrowed_transport_frame(&frame.as_borrowed())
+}
+
+fn encode_borrowed_transport_frame(frame: &BorrowedTransportFrameV2<'_>) -> Result<Vec<u8>> {
+    let payload_len = match frame {
+        BorrowedTransportFrameV2::Start {
+            encapsulated_key, ..
+        } => encapsulated_key.len(),
+        BorrowedTransportFrameV2::Chunk { payload, .. }
+        | BorrowedTransportFrameV2::End { payload, .. } => payload.len(),
+    };
+    // Postcard adds only enum tags and variable-length integer fields around
+    // the byte payload. Leave modest headroom so normal frames need one
+    // allocation without walking the payload once just to measure it.
+    let capacity = HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(32))
+        .context("receipt transport frame length overflow")?;
+    let mut encoded = Vec::with_capacity(capacity);
+    encoded.resize(HEADER_LEN, 0);
+    encoded = postcard::to_extend(frame, encoded).context("encode receipt transport frame")?;
+    let body_len = encoded.len() - HEADER_LEN;
+    if body_len == 0 || body_len > MAX_FRAME_BODY_BYTES {
         bail!("receipt transport frame exceeds size limit");
     }
-    let mut encoded = Vec::with_capacity(HEADER_LEN + body.len());
-    encoded.extend_from_slice(FRAME_MAGIC);
-    encoded.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-    encoded.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    encoded.extend_from_slice(&body);
+    encoded[..8].copy_from_slice(FRAME_MAGIC);
+    encoded[8..10].copy_from_slice(&FRAME_VERSION.to_be_bytes());
+    encoded[10..HEADER_LEN].copy_from_slice(&(body_len as u32).to_be_bytes());
     Ok(encoded)
 }
 
@@ -1324,13 +1393,27 @@ fn sign_terminal(receipt: &TerminalReceiptV2, private_key: &PrivateKey) -> Resul
     if private_key.is_encrypted() {
         bail!("cannot sign a receipt with an encrypted key");
     }
-    let body = postcard::to_stdvec(receipt).context("encode receipt terminal")?;
-    if body.len() > MAX_TERMINAL_BYTES {
+    let measured_body_len =
+        postcard::experimental::serialized_size(receipt).context("measure receipt terminal")?;
+    if measured_body_len > MAX_TERMINAL_BYTES {
         bail!("receipt terminal exceeds size limit");
     }
-    let payload = terminal_signing_payload(&body);
+    let signed_header_len = TERMINAL_HEADER_LEN - std::mem::size_of::<u32>();
+    let mut encoded =
+        Vec::with_capacity(TERMINAL_HEADER_LEN + measured_body_len + MAX_SIGNATURE_BYTES);
+    encoded.extend_from_slice(TERMINAL_MAGIC);
+    encoded.extend_from_slice(&TERMINAL_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&[0; std::mem::size_of::<u32>()]);
+    encoded = postcard::to_extend(receipt, encoded).context("encode receipt terminal")?;
+    let body_len = encoded.len() - signed_header_len;
+    debug_assert_eq!(body_len, measured_body_len);
+    if body_len > MAX_TERMINAL_BYTES {
+        bail!("receipt terminal exceeds size limit");
+    }
+    encoded[10..signed_header_len].copy_from_slice(&(body_len as u32).to_be_bytes());
+    let payload_len = encoded.len();
     let signature = private_key
-        .sign(RECEIPT_NAMESPACE, HashAlg::Sha256, &payload)
+        .sign(RECEIPT_NAMESPACE, HashAlg::Sha256, &encoded)
         .context("sign receipt terminal")?
         .to_pem(LineEnding::LF)
         .context("encode receipt terminal signature")?
@@ -1338,13 +1421,11 @@ fn sign_terminal(receipt: &TerminalReceiptV2, private_key: &PrivateKey) -> Resul
     if signature.len() > MAX_SIGNATURE_BYTES {
         bail!("receipt terminal signature exceeds size limit");
     }
-    let mut encoded = Vec::with_capacity(TERMINAL_HEADER_LEN + body.len() + signature.len());
-    encoded.extend_from_slice(TERMINAL_MAGIC);
-    encoded.extend_from_slice(&TERMINAL_VERSION.to_be_bytes());
-    encoded.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    encoded.extend_from_slice(&(signature.len() as u32).to_be_bytes());
-    encoded.extend_from_slice(&body);
-    encoded.extend_from_slice(&signature);
+    encoded.resize(TERMINAL_HEADER_LEN + body_len + signature.len(), 0);
+    encoded.copy_within(signed_header_len..payload_len, TERMINAL_HEADER_LEN);
+    encoded[signed_header_len..TERMINAL_HEADER_LEN]
+        .copy_from_slice(&(signature.len() as u32).to_be_bytes());
+    encoded[TERMINAL_HEADER_LEN + body_len..].copy_from_slice(&signature);
     Ok(encoded)
 }
 
@@ -1615,6 +1696,33 @@ mod tests {
         assert_eq!(result["receipt_status"], "incomplete");
         assert_eq!(result["exit_code"], 1);
         assert_eq!(result["errors"], 3);
+    }
+
+    #[test]
+    fn borrowed_transport_frames_preserve_wire_encoding() {
+        let frames = [
+            TransportFrameV2::Start {
+                mode: TransportModeV2::AttachedEncrypted,
+                encapsulated_key: vec![3; 32],
+            },
+            TransportFrameV2::Chunk {
+                sequence: u64::MAX,
+                payload: vec![5; PLAINTEXT_CHUNK_BYTES],
+            },
+            TransportFrameV2::End {
+                sequence: 17,
+                payload: vec![7; 257],
+            },
+        ];
+        for frame in frames {
+            let owned = postcard::to_stdvec(&frame).unwrap();
+            let borrowed = postcard::to_stdvec(&frame.as_borrowed()).unwrap();
+            assert_eq!(borrowed, owned);
+
+            let encoded = encode_transport_frame(&frame).unwrap();
+            assert_eq!(&encoded[HEADER_LEN..], owned);
+            assert_eq!(decode_transport_frame(&encoded).unwrap(), frame);
+        }
     }
 
     #[test]

@@ -36,6 +36,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dest for destination paths, or --follow for all directly supplied filesystem paths";
+
 #[cfg(target_os = "linux")]
 const MODE_TYPE_MASK: u32 = libc::S_IFMT;
 #[cfg(not(target_os = "linux"))]
@@ -413,8 +415,8 @@ impl OperatorResolver {
         let euid = unsafe { libc::geteuid() };
         match self.symlink_policy {
             OperatorSymlinkPolicy::Refuse => bail!(
-                "refusing symlink component {:?} in operator path; pass --follow to resolve symlinks",
-                String::from_utf8_lossy(component)
+                "refusing symlink component {:?} in operator path; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
+                String::from_utf8_lossy(component),
             ),
             OperatorSymlinkPolicy::TrustedOwner
                 if !operator_symlink_owner_is_trusted(metadata.uid, euid) =>

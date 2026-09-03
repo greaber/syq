@@ -74,14 +74,14 @@ fn receipt_settlement_outcome(
 const MAX_RECEIPT_V2_LINE_BYTES: usize = 192 * 1024;
 const MAX_RECEIPT_V2_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
 
-struct CapturedReceiptV2 {
+struct CapturedReceipt {
     file: std::fs::File,
     frames: u64,
     bytes: u64,
     ended: bool,
 }
 
-impl CapturedReceiptV2 {
+impl CapturedReceipt {
     fn new() -> Result<Self> {
         Ok(Self {
             file: tempfile::tempfile().context("create encrypted receipt spool")?,
@@ -145,27 +145,18 @@ impl Iterator for CapturedFrames<'_> {
     }
 }
 
-/// Pass the orchestrator's stdout through byte for byte, keeping only the
+/// Pass the coordinator's stdout through byte for byte, keeping only the
 /// receipt marker lines to ourselves. Used only when a receipt is expected;
-/// other transfers inherit stdout untouched. V2 frames are decoded one line
+/// other transfers inherit stdout untouched. Frames are decoded one line
 /// at a time and spooled rather than accumulated in memory.
-fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceiptV2>> {
-    relay_stdout_bounded(stdout)
-}
-
-/// Streams every ordinary line straight through without holding more than
-/// one buffer of it, so a hostile orchestrator cannot make this machine
-/// buffer an arbitrarily long line; only a receipt line is collected, up to
-/// its protocol-specific limit.
-fn relay_stdout_bounded(stdout: impl std::io::Read) -> Result<Option<CapturedReceiptV2>> {
-    let v2_prefix = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes();
-    let decision_len = v2_prefix.len();
+fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
+    let prefix = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes();
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
     let mut out = std::io::stdout().lock();
     let mut receipt = None;
     // The first bytes of the current line, held only until the prefix
     // decision; then either the receipt payload being collected or nothing.
-    let mut head: Vec<u8> = Vec::with_capacity(decision_len);
+    let mut head: Vec<u8> = Vec::with_capacity(prefix.len());
     let mut decided = false;
     let mut capturing: Option<Vec<u8>> = None;
     let finish_capture = |payload: &mut Vec<u8>| {
@@ -194,10 +185,10 @@ fn relay_stdout_bounded(stdout: impl std::io::Read) -> Result<Option<CapturedRec
             consumed += segment.len();
             if !decided {
                 head.extend_from_slice(segment);
-                if head.len() >= decision_len || ends_line {
+                if head.len() >= prefix.len() || ends_line {
                     decided = true;
-                    if head.starts_with(v2_prefix) {
-                        capturing = Some(head[v2_prefix.len()..].to_vec());
+                    if head.starts_with(prefix) {
+                        capturing = Some(head[prefix.len()..].to_vec());
                     } else {
                         out.write_all(&head)
                             .context("relay remote orchestrator output")?;
@@ -228,8 +219,8 @@ fn relay_stdout_bounded(stdout: impl std::io::Read) -> Result<Option<CapturedRec
     }
     // Output that ended without a newline.
     if !head.is_empty() {
-        if head.starts_with(v2_prefix) {
-            capturing = Some(head[v2_prefix.len()..].to_vec());
+        if head.starts_with(prefix) {
+            capturing = Some(head[prefix.len()..].to_vec());
         } else {
             out.write_all(&head)
                 .context("relay remote orchestrator output")?;
@@ -242,13 +233,13 @@ fn relay_stdout_bounded(stdout: impl std::io::Read) -> Result<Option<CapturedRec
     Ok(receipt)
 }
 
-fn store_receipt_line(captured: &mut Option<CapturedReceiptV2>, payload: Vec<u8>) -> Result<()> {
+fn store_receipt_line(captured: &mut Option<CapturedReceipt>, payload: Vec<u8>) -> Result<()> {
     let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(payload.trim_ascii())
         .context("decode a receipt v2 frame relayed from the source host")?;
     let receipt = match captured {
         Some(receipt) => receipt,
-        None => captured.insert(CapturedReceiptV2::new()?),
+        None => captured.insert(CapturedReceipt::new()?),
     };
     receipt.push(&encoded)
 }
@@ -271,7 +262,7 @@ struct ReceiptSettlement<'a> {
 /// can never disagree.
 fn settle_receipt(
     expectation: &ReceiptExpectation,
-    captured: Option<&mut CapturedReceiptV2>,
+    captured: Option<&mut CapturedReceipt>,
     settlement: ReceiptSettlement<'_>,
 ) -> Result<i32> {
     let Some(captured) = captured else {
@@ -286,7 +277,7 @@ fn settle_receipt(
 
 fn settle_receipt_v2(
     expectation: &ReceiptExpectation,
-    captured: &mut CapturedReceiptV2,
+    captured: &mut CapturedReceipt,
     settlement: ReceiptSettlement<'_>,
 ) -> Result<i32> {
     let ReceiptSettlement {
@@ -708,7 +699,7 @@ pub fn run(
     run_remote(args, srcs, dst, false, results)
 }
 
-pub fn coordinate_at_target(
+pub fn coordinate_at_dest(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
@@ -897,6 +888,13 @@ fn run_remote(
     }
     if args.native_follow {
         remote.push("--follow".into());
+    } else {
+        if args.native_follow_src {
+            remote.push("--follow-src".into());
+        }
+        if args.native_follow_dest {
+            remote.push("--follow-dest".into());
+        }
     }
     if args.delete {
         remote.push("--prune".into());

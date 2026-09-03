@@ -144,10 +144,20 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     })
 }
 
-fn operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+fn source_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
     if args.interface == Interface::Rsync {
         OperatorSymlinkPolicy::TrustedOwner
-    } else if args.native_follow {
+    } else if args.follows_native_source_paths() {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    }
+}
+
+fn destination_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+    if args.interface == Interface::Rsync {
+        OperatorSymlinkPolicy::TrustedOwner
+    } else if args.follows_native_destination_paths() {
         OperatorSymlinkPolicy::FollowAll
     } else {
         OperatorSymlinkPolicy::Refuse
@@ -636,7 +646,7 @@ pub(crate) fn validate_native_source_type(
 ) -> Result<()> {
     match selection {
         SourceSelection::Contents | SourceSelection::Directory if kind == Kind::Symlink => bail!(
-            "selector {} is a symlink; pass --follow to resolve symlinks",
+            "selector {} is a symlink; pass --follow-src (or --follow) to resolve source symlinks",
             display(path)
         ),
         SourceSelection::Contents if kind != Kind::Dir => {
@@ -1095,7 +1105,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_SSH;
         }
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dest {
-            return crate::direct::coordinate_at_target(
+            return crate::direct::coordinate_at_dest(
                 &args,
                 srcs,
                 dst,
@@ -1143,7 +1153,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         args.connections = if src_ep.is_remote() || dst_ep.is_remote() {
             tune::START_SSH
         } else {
-            tune::START_LOCAL
+            tune::start_local()
         };
     }
     #[cfg(not(target_os = "linux"))]
@@ -1180,7 +1190,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         update: args.update,
         ignore_existing: args.ignore_existing,
         existing: args.existing,
-        operator_symlink_policy: operator_symlink_policy(&args),
+        operator_symlink_policy: destination_operator_symlink_policy(&args),
         max_size,
         min_size,
     });
@@ -1474,20 +1484,23 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     // Rsync retains its destination-directory compatibility rule. Native
     // container placement keeps the named symlink by default or resolves its
-    // complete chain under --follow. Exact native placement always selects
-    // the final directory entry; --follow applies only to its parent path.
+    // complete chain under the destination follow policy. Exact native
+    // placement always selects the final directory entry; destination
+    // following applies only to its parent path.
     let (dst_root, mut dst_root_entry) = match args.interface {
         Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?,
         _ if expand_exact_home => (
             dst_canonical.as_os_str().as_bytes().to_vec(),
             dst_root_entry,
         ),
-        _ if args.native_follow && args.placement == Placement::Into => follow_container_symlink(
-            &mut *dst_ctl,
-            &operator_dst_root,
-            dst_root_entry,
-            args.target_existence != Existence::Existing,
-        )?,
+        _ if args.follows_native_destination_paths() && args.placement == Placement::Into => {
+            follow_container_symlink(
+                &mut *dst_ctl,
+                &operator_dst_root,
+                dst_root_entry,
+                args.target_existence != Existence::Existing,
+            )?
+        }
         _ => (operator_dst_root.clone(), dst_root_entry),
     };
     if debug() {
@@ -1516,13 +1529,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let dst_is_dir = match args.placement {
         Placement::Into => {
             if args.interface != Interface::Rsync
-                && !args.native_follow
+                && !args.follows_native_destination_paths()
                 && dst_root_entry
                     .as_ref()
                     .is_some_and(|entry| entry.kind == Kind::Symlink)
             {
                 bail!(
-                    "--into target {} is a symlink; pass --follow to resolve symlinks",
+                    "--into destination {} is a symlink; pass --follow-dest (or --follow) to resolve destination symlinks",
                     display(&dst_root)
                 );
             }
@@ -1572,17 +1585,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 &mut *src_ctl,
                 &parent_path(&source.path),
                 false,
-                operator_symlink_policy(&args),
+                source_operator_symlink_policy(&args),
             )?;
         }
         // Native selectors are structural: validate every selected root before
         // a missing --into target can be created. Contents selectors require
-        // a directory and resolve a selected link only under --follow.
+        // a directory and resolve a selected link only under the source
+        // follow policy.
         for source in srcs {
             match stat_one(
                 &mut *src_ctl,
                 &source.path,
-                source.follows_root(args.native_follow),
+                source.follows_root(args.follows_native_source_paths()),
             )? {
                 Some(entry) => {
                     validate_native_source_type(&source.path, source.selection, entry.kind)?
@@ -1607,8 +1621,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         operator_dst_root.clone()
     } else {
         // Exact placement always retains the parent of the command-line leaf.
-        // Under --follow that walk may traverse parent symlinks, but it never
-        // changes which final directory entry the command addresses.
+        // Under destination following that walk may traverse parent symlinks,
+        // but it never changes which final directory entry the command addresses.
         parent_path(&operator_dst_root)
     };
     let request_prefix = if expand_exact_home || dst_is_dir {
@@ -1690,7 +1704,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             // Only a directory source can trigger the recurse-into-itself trap.
             // Judge the source the way the scan will, including the interface's
             // explicit selected-root link policy.
-            let follow_root = args.files_from.is_some() || s.follows_root(args.native_follow);
+            let follow_root =
+                args.files_from.is_some() || s.follows_root(args.follows_native_source_paths());
             let src_is_dir = matches!(stat_one(&mut *src_ctl, &s.path, follow_root)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
@@ -2017,7 +2032,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     {
         let src_root = src.path.clone();
         let contents = src.copies_contents();
-        let follow_root = src.follows_root(args.native_follow);
+        let follow_root = src.follows_root(args.follows_native_source_paths());
         // A bare directory source goes to dest/basename even when dest doesn't
         // exist yet; a non-directory source only does so when dest is a directory
         // (decided once the root entry is seen).
@@ -2106,6 +2121,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     }
                 }
                 if !workers_started {
+                    // A same-machine file normally completes wholly inside one
+                    // small-file or receiver-side copy request (copy_file_range,
+                    // or the sequential NFS fallback). Starting 32 loopback
+                    // connections cannot help that request. If a larger file
+                    // instead discovers a partial or an unsupported offload,
+                    // the first worker wakes the tuner to restore the ordinary
+                    // local starting count immediately.
+                    let single_direct_candidate = autotune
+                        && opts.same_host
+                        && !opts.checksum
+                        && !opts.verify_only
+                        && bwlimit.is_none()
+                        && {
+                            let jobs = sched.jobs.lock().unwrap();
+                            matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
+                        };
+                    if single_direct_candidate {
+                        sched.arm_direct_fallback(args.connections);
+                        args.connections = 1;
+                        gate.set_active(1);
+                    }
                     spawn_workers(args.connections);
                 }
             }
@@ -2163,6 +2199,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if opts.dry_run {
         st.flush_dry_directory_traces();
     }
+    sched.clear_finished_work();
     let mut deleted = 0u64;
     let mut delete_plan = if opts.delete {
         DeletePlan::Skipped("the copy plan did not complete")
@@ -2850,7 +2887,7 @@ fn follow_dir_symlink(
 }
 
 /// Resolve a symlink used as a directly supplied native container. Explicit
-/// `--follow` selects the referent regardless of its type; the caller then
+/// Destination following selects the referent regardless of its type; the caller then
 /// requires the result to be a directory. Placement forms that allow a
 /// missing target may create the referent of a dangling chain.
 fn follow_container_symlink(
@@ -3917,10 +3954,30 @@ impl Planner<'_> {
         let deferred = std::mem::take(&mut self.deferred_payloads);
         if let Some(buf) = &mut self.buffer {
             buf.extend(deferred);
-            return self.replay_buffered();
+            self.replay_buffered()?;
+        } else {
+            for m in deferred {
+                self.apply_mapped(m)?;
+            }
         }
-        for m in deferred {
-            self.apply_mapped(m)?;
+
+        // These sets exist only to validate and apply mapped scan entries.
+        // Jobs already own the source spelling needed by workers. Deletion
+        // alone still needs the destination claims and live sidecar names.
+        self.missing_dirs = std::collections::HashSet::new();
+        self.dry_run_replaced_dirs = std::collections::HashSet::new();
+        self.unusable_files = std::collections::HashSet::new();
+        // Dry-run directory traces are intentionally deferred until after
+        // planning, when a later explicit directory can have upgraded an
+        // implicit ancestor. They still need these two source-mapping sets.
+        if !self.opts.dry_run {
+            self.src_overrides = std::collections::HashMap::new();
+            self.implicit_dirs = std::collections::HashSet::new();
+        }
+        if !self.opts.delete {
+            self.dst_seen = std::collections::HashMap::new();
+            self.live_sidecars = Vec::new();
+            self.delete_roots = Vec::new();
         }
         Ok(())
     }
@@ -6221,6 +6278,9 @@ impl Worker {
                 }
             }
         };
+        if partial_size.is_some() {
+            self.sched.request_direct_fallback();
+        }
         // Same-machine copy: let the receiver move the bytes directly (kernel
         // offload, or one sequential writer for cross-mount NFS) instead of
         // framing, hashing and scheduling them through the transport.
@@ -6238,7 +6298,12 @@ impl Worker {
                     self.sched.ranges_ready(idx, vec![]);
                     return Ok(());
                 }
-                Ok(false) => {} // not offloadable — fall through to streaming
+                Ok(false) => {
+                    // The one-worker automatic start was only a cheap direct
+                    // copy probe. Restore the normal local worker count before
+                    // exposing userspace ranges for an unsupported offload.
+                    self.sched.request_direct_fallback();
+                }
                 Err(e) => {
                     self.sched.ranges_ready(idx, vec![]);
                     if self.transport_dead() {
@@ -6618,6 +6683,16 @@ impl Worker {
             }),
         );
         let block = self.transfer_block();
+        let read_window = if self.src.supports_request_pipelining() {
+            WINDOW
+        } else {
+            1
+        };
+        let write_window = if self.dst.supports_request_pipelining() {
+            WINDOW
+        } else {
+            1
+        };
         let inplace = job.inplace;
         let mut reads_out = 0usize;
         let mut writes_out = 0usize;
@@ -6627,7 +6702,7 @@ impl Worker {
                 // worker picks it up; what's already requested still completes.
                 self.sched.release_rest(h);
             }
-            while reads_out < WINDOW {
+            while reads_out < read_window {
                 let (off, n) = {
                     let mut g = h.lock().unwrap();
                     if g.pos >= g.end {
@@ -6671,7 +6746,7 @@ impl Worker {
             })?;
             self.t[1] += t0.elapsed().as_secs_f64();
             writes_out += 1;
-            if writes_out >= WINDOW {
+            if writes_out >= write_window {
                 let t0 = std::time::Instant::now();
                 ok(self.dst.recv()?, "write")?;
                 self.t[2] += t0.elapsed().as_secs_f64();

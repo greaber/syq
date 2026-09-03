@@ -404,6 +404,8 @@ def _copy_arguments(
     from_: str | None,
     cwd: PathArgument | None,
     follow: bool,
+    follow_src: bool,
+    follow_dest: bool,
     to: str | None,
     into: PathArgument | None,
     into_new: PathArgument | None,
@@ -450,6 +452,10 @@ def _copy_arguments(
         argv.extend(("--cwd", _argument(cwd, label="cwd")))
     if follow:
         argv.append("--follow")
+    if follow_src:
+        argv.append("--follow-src")
+    if follow_dest:
+        argv.append("--follow-dest")
     if to is not None:
         argv.extend(("--to", _text_arg(to, label="to")))
     placements = [
@@ -708,6 +714,8 @@ class Client:
         from_: str | None = None,
         cwd: PathArgument | None = None,
         follow: bool = False,
+        follow_src: bool = False,
+        follow_dest: bool = False,
         to: str | None = None,
         into: PathArgument | None = None,
         into_new: PathArgument | None = None,
@@ -769,6 +777,8 @@ class Client:
             from_=from_,
             cwd=cwd,
             follow=follow,
+            follow_src=follow_src,
+            follow_dest=follow_dest,
             to=to,
             into=into,
             into_new=into_new,
@@ -860,6 +870,7 @@ class Client:
         src_dir: Selector | None = None,
         cwd: PathArgument | None = None,
         follow: bool = False,
+        follow_src: bool = False,
         as_: PathArgument | None = None,
         timeout: float | None = None,
     ) -> MapStream:
@@ -879,6 +890,8 @@ class Client:
             from_=None,
             cwd=cwd,
             follow=follow,
+            follow_src=follow_src,
+            follow_dest=False,
             to=None,
             into=None,
             into_new=None,

@@ -103,6 +103,14 @@ fn run_ok(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn expected_local_start() -> usize {
+    if std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() <= 2) {
+        16
+    } else {
+        32
+    }
+}
+
 /// Parse "syq: transferred N files" from the summary line.
 fn transferred(stdout: &str) -> u64 {
     let line = stdout
@@ -783,8 +791,93 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
         &t.s("never-created"),
     ]);
     assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
+    let stderr = stderr_of(&refused);
+    assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
+    assert!(
+        stderr.contains("--follow-dest for destination paths"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--follow for all directly supplied filesystem paths"),
+        "{stderr}"
+    );
     assert!(!t.path("never-created").exists());
+}
+
+#[test]
+fn native_directional_follow_keeps_source_destination_and_control_authority_separate() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real-source/file"), b"data");
+    symlink("real-source", t.path("source-link")).unwrap();
+    fs::create_dir(t.path("real-destination")).unwrap();
+    symlink("real-destination", t.path("destination-link")).unwrap();
+
+    run_native_ok(&[
+        "cp",
+        "--follow-src",
+        "--src-src",
+        &t.s("source-link"),
+        "--into",
+        &t.s("source-followed"),
+    ]);
+    assert_eq!(read(&t.path("source-followed/file")), b"data");
+
+    let destination_refused = native_syq(&[
+        "cp",
+        "--follow-src",
+        "--src-src",
+        &t.s("real-source"),
+        "--into-existing",
+        &t.s("destination-link"),
+    ]);
+    assert!(!destination_refused.status.success());
+    assert!(stderr_of(&destination_refused).contains("--follow-dest"));
+    assert!(!t.path("real-destination/file").exists());
+
+    let source_refused = native_syq(&[
+        "cp",
+        "--follow-dest",
+        "--src-src",
+        &t.s("source-link"),
+        "--into",
+        &t.s("source-refused"),
+    ]);
+    assert!(!source_refused.status.success());
+    assert!(stderr_of(&source_refused).contains("--follow-src"));
+    assert!(!t.path("source-refused").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--follow-dest",
+        "--src-src",
+        &t.s("real-source"),
+        "--into-existing",
+        &t.s("destination-link"),
+    ]);
+    assert_eq!(read(&t.path("real-destination/file")), b"data");
+
+    write(&t.path("rules"), b"*.tmp\n");
+    symlink("rules", t.path("rules-link")).unwrap();
+    let control_refused = native_syq(&[
+        "cp",
+        "--follow-src",
+        "--follow-dest",
+        "--ignore-from",
+        &t.s("rules-link"),
+        "--src-src",
+        &t.s("real-source"),
+        "--into",
+        &t.s("control-refused"),
+    ]);
+    assert!(!control_refused.status.success());
+    let stderr = stderr_of(&control_refused);
+    assert!(
+        stderr.contains("--follow for all directly supplied filesystem paths"),
+        "{stderr}"
+    );
+    assert!(!t.path("control-refused").exists());
 }
 
 #[test]
@@ -894,11 +987,15 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     symlink("real-parent", t.path("parent-link")).unwrap();
     let refused = native_syq(&["cp", &t.s("source"), "--as", &t.s("parent-link/exact-name")]);
     assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("--follow-dest for destination paths"),
+        "{stderr}"
+    );
     assert!(!t.path("real-parent/exact-name").exists());
     run_native_ok(&[
         "cp",
-        "--follow",
+        "--follow-dest",
         &t.s("source"),
         "--as",
         &t.s("parent-link/exact-name"),
@@ -1179,7 +1276,8 @@ fn native_rm_refuses_an_intermediate_symlink_before_mutating_any_selector() {
         "link/file",
     ]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("pass --follow"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
     assert_eq!(read(&t.path("victim")), b"keep");
     assert_eq!(read(&t.path("real/file")), b"keep");
     assert!(t.path("link").is_symlink());
@@ -1248,7 +1346,7 @@ fn native_rm_follow_removes_the_referent_and_leaves_the_link() {
     write(&t.path("real/file"), b"remove");
     symlink("real", t.path("link")).unwrap();
 
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--src-dir", "link"]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow-src", "--src-dir", "link"]);
 
     assert!(t.path("link").is_symlink());
     assert!(!t.path("real").exists());
@@ -3191,7 +3289,11 @@ fn single_file_to_new_name() {
     let t = Tmp::new();
     write(&t.path("src/f.txt"), b"data");
     set_mtime(&t.path("src/f.txt"), 1_600_000_000);
-    run_ok(&["-a", &t.s("src/f.txt"), &t.s("out.txt")]);
+    let output = run_ok(&["-a", "--stats", &t.s("src/f.txt"), &t.s("out.txt")]);
+    assert!(
+        output.contains("connections: auto: settled at 1 (path 1, peak 1)"),
+        "{output}"
+    );
     assert_eq!(read(&t.path("out.txt")), b"data");
     assert_same_tree(&t.path("src/f.txt"), &t.path("out.txt"));
 }
@@ -3203,11 +3305,15 @@ fn archive_copies_mode_zero_empty_file_without_opening_source() {
     write(&src, b"");
     fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
 
-    run_ok(&["-a", &t.s("src/empty"), &t.s("dst/empty")]);
+    let output = run_ok(&["-a", "--stats", &t.s("src/empty"), &t.s("dst/empty")]);
 
     let dst = fs::metadata(t.path("dst/empty")).unwrap();
     assert_eq!(dst.len(), 0);
     assert_eq!(dst.mode() & 0o777, 0);
+    assert!(
+        output.contains("connections: auto: settled at 1 (path 1, peak 1)"),
+        "{output}"
+    );
 }
 
 #[test]
@@ -3624,7 +3730,10 @@ fn dry_run_reports_typed_preflight_summary() {
         "{out}"
     );
     assert!(
-        out.contains("route: local filesystem; 32 initial workers (auto-tuned)"),
+        out.contains(&format!(
+            "route: local filesystem; {} initial workers (auto-tuned)",
+            expected_local_start()
+        )),
         "{out}"
     );
     assert!(t.path("dst/extra").exists());
@@ -6484,6 +6593,30 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
+fn copy_local_exdev_auto_fallback_restores_parallel_workers() {
+    let t = Tmp::new();
+    let contents = vec![b'x'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+
+    let out = compat_command()
+        .args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), contents);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "connections: auto: settled at {0} (path {0}, peak {0})",
+            expected_local_start()
+        )),
+        "{stdout}"
+    );
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
 fn native_inplace_exdev_fallback_preserves_hardlink_aliases() {
     let t = Tmp::new();
     let contents = vec![b'n'; 8 * 1024 * 1024];
@@ -7140,10 +7273,13 @@ fn stats_report_connection_tuning_mode() {
         std::fs::write(t.path(&format!("src/f{i}")), vec![b'x'; 1000]).unwrap();
     }
     // Without -j the count is auto-tuned; a short local copy never leaves the
-    // local starting count of 32.
+    // CPU-sensitive local starting count.
     let out = run_ok(&["-a", "--stats", &t.s("src/"), &t.s("auto/")]);
     assert!(
-        out.contains("connections: auto: settled at 32 (path 32, peak 32)"),
+        out.contains(&format!(
+            "connections: auto: settled at {0} (path {0}, peak {0})",
+            expected_local_start()
+        )),
         "{out}"
     );
     // An explicit -j is used as given, with no tuning.
@@ -7760,7 +7896,8 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         .args([
             "--from",
             "fake",
-            "--follow",
+            "--follow-src",
+            "--follow-dest",
             "--src-src",
             &t.s("src"),
             "--to",
@@ -7793,7 +7930,8 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     assert!(!t.path("dst/extra").exists());
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     for option in [
-        "--follow",
+        "--follow-src",
+        "--follow-dest",
         "--ignore=*.tmp",
         "--preserve=permissions",
         "--inplace",
@@ -7808,7 +7946,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
 }
 
 #[test]
-fn native_coordinate_at_target_reverses_the_remote_ssh_edge() {
+fn native_coordinate_at_dest_reverses_the_remote_ssh_edge() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src/file"), b"pulled");
@@ -7985,7 +8123,7 @@ fn native_coordinate_at_local_relays_between_remote_endpoints() {
 }
 
 #[test]
-fn native_coordinate_at_target_fails_closed_without_read_enrollment_support() {
+fn native_coordinate_at_dest_fails_closed_without_read_enrollment_support() {
     let t = Tmp::new();
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -8299,9 +8437,17 @@ fn native_map_uses_the_common_source_follow_policy() {
 
     let refused = syq_map_in(&t.path(""), &["--src-src", "link"]);
     assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(stderr_of(&refused).contains("--follow-src"));
 
-    let lines = map_lines(&syq_map_in(&t.path(""), &["--follow", "--src-src", "link"]));
+    let intermediate = syq_map_in(&t.path(""), &["--src", "link/file"]);
+    assert!(!intermediate.status.success());
+    let stderr = stderr_of(&intermediate);
+    assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
+
+    let lines = map_lines(&syq_map_in(
+        &t.path(""),
+        &["--follow-src", "--src-src", "link"],
+    ));
     assert_eq!(lines.len(), 1);
     assert_eq!(map_path(&lines[0], "src"), "file");
     assert_eq!(lines[0]["kind"], "file");

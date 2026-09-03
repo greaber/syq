@@ -87,6 +87,12 @@ pub struct Args {
     /// Permit symlinks that must be traversed in directly supplied native paths.
     #[arg(skip)]
     pub native_follow: bool,
+    /// Permit symlinks that must be traversed in directly supplied source paths.
+    #[arg(skip)]
+    pub native_follow_src: bool,
+    /// Permit symlinks that must be traversed in directly supplied destination paths.
+    #[arg(skip)]
+    pub native_follow_dest: bool,
     /// Source-side base for `syq map` selectors, joined at walk time so the
     /// emitted `src` values stay relative to it.
     #[arg(skip)]
@@ -195,8 +201,9 @@ pub struct Args {
 
     /// Parallel connections/workers. Default for copies: auto-tuned — starts at
     /// the last settled count remembered for this host path and transport, or 16
-    /// over TCP, 8 over ssh, or 32 when local. It probes from 1 to 64 while the
-    /// copy has enough work to measure. Give a number to fix it.
+    /// over TCP, 8 over ssh, or 16 when local with at most two available CPUs
+    /// (otherwise 32). It probes from 1 to 64 while the copy has enough work to
+    /// measure. Give a number to fix it.
     #[arg(long = "syq-connections", value_name = "N")]
     pub connections_opt: Option<usize>,
     #[arg(skip)]
@@ -391,6 +398,14 @@ pub struct Args {
 }
 
 impl Args {
+    pub(crate) fn follows_native_source_paths(&self) -> bool {
+        self.native_follow || self.native_follow_src
+    }
+
+    pub(crate) fn follows_native_destination_paths(&self) -> bool {
+        self.native_follow || self.native_follow_dest
+    }
+
     /// Parse the command line and read ignore files, keeping command-line and
     /// file patterns in the order they were given (later lines win, as in
     /// a .gitignore file).
@@ -591,9 +606,12 @@ struct NativeSourceArgs {
     /// Resolve relative source selectors from DIR
     #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
     cwd: Option<OsString>,
-    /// Follow symlinks that must be traversed in directly supplied endpoint paths
+    /// Follow symlinks in all directly supplied filesystem paths
     #[arg(long)]
     follow: bool,
+    /// Follow symlinks in directly supplied source paths
+    #[arg(long)]
+    follow_src: bool,
     /// Select a named source object (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src: Vec<OsString>,
@@ -649,9 +667,12 @@ struct NativeRmSelectionArgs {
     /// Confine resolution and removal beneath DIR
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     root: Option<OsString>,
-    /// Follow symlinks that must be traversed in directly supplied endpoint paths
+    /// Follow symlinks in all directly supplied filesystem paths
     #[arg(long)]
     follow: bool,
+    /// Follow symlinks in directly supplied source paths
+    #[arg(long)]
+    follow_src: bool,
     /// Select an object without constraining the selected object's type (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src: Vec<OsString>,
@@ -828,6 +849,9 @@ struct NativeCopyFields {
     /// Target endpoint ([USER@]HOST[:PORT]); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
+    /// Follow symlinks in directly supplied destination paths
+    #[arg(long)]
+    follow_dest: bool,
     /// Put selected names inside DIR, creating it if necessary
     #[arg(
         long,
@@ -1145,6 +1169,8 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.suppress_summary = copy.suppress_summary;
     args.pscope = pscope;
     args.native_follow = copy.selection.source.follow;
+    args.native_follow_src = copy.selection.source.follow_src;
+    args.native_follow_dest = copy.follow_dest;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
         // through the source connection; a direct remote-to-remote copy has
@@ -1283,6 +1309,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     args.native_map_cwd = map_cwd;
     args.native_map_target = target;
     args.native_follow = parsed.source.follow;
+    args.native_follow_src = parsed.source.follow_src;
     Ok(args)
 }
 
@@ -1364,6 +1391,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     args.native_rm_cwd = parsed.selection.cwd.map(OsStringExt::into_vec);
     args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
     args.native_follow = parsed.selection.follow;
+    args.native_follow_src = parsed.selection.follow_src;
     args.pscope = parsed.pscope;
     args.rm = true;
     apply_native_operational(&mut args, parsed.operational);
@@ -1755,22 +1783,45 @@ pub(crate) fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<NativeE
 /// `/`, `a//b`) are removed; `..` components and entries naming the root itself
 /// are rejected.
 fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
-    use std::io::Read;
-    let mut raw = Vec::new();
+    use std::io::BufReader;
     if file == "-" {
-        std::io::stdin().read_to_end(&mut raw)?;
+        read_files_from_reader(BufReader::new(std::io::stdin()), nul)
     } else {
-        raw = std::fs::read(file).map_err(|e| anyhow::anyhow!("--files-from {file}: {e}"))?;
+        let input = std::fs::File::open(file)
+            .map_err(|error| anyhow::anyhow!("--files-from {file}: {error}"))?;
+        read_files_from_reader_named(BufReader::new(input), nul, Some(file))
     }
+}
+
+fn read_files_from_reader(input: impl std::io::BufRead, nul: bool) -> Result<Vec<Vec<u8>>> {
+    read_files_from_reader_named(input, nul, None)
+}
+
+fn read_files_from_reader_named(
+    mut input: impl std::io::BufRead,
+    nul: bool,
+    file: Option<&str>,
+) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
-    let items: Vec<&[u8]> = if nul {
-        raw.split(|&b| b == 0).collect()
-    } else {
-        raw.split(|&b| b == b'\n')
-            .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
-            .collect()
-    };
-    for item in items {
+    let mut item = Vec::new();
+    let separator = if nul { 0 } else { b'\n' };
+    loop {
+        item.clear();
+        let read = input
+            .read_until(separator, &mut item)
+            .map_err(|error| match file {
+                Some(file) => anyhow::anyhow!("--files-from {file}: {error}"),
+                None => anyhow::anyhow!(error),
+            })?;
+        if read == 0 {
+            break;
+        }
+        if item.last() == Some(&separator) {
+            item.pop();
+        }
+        if !nul && item.last() == Some(&b'\r') {
+            item.pop();
+        }
         // rsync treats these prefixes as comments in both line and NUL modes.
         // A literal name remains selectable by spelling it as `./#name` or
         // `./;name`.
@@ -1780,29 +1831,34 @@ fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
         if item.contains(&0) {
             bail!(
                 "--files-from: {:?} contains a NUL byte (is this a --from0 list?)",
-                String::from_utf8_lossy(item)
-            );
-        }
-        let p = item;
-        if p.split(|&b| b == b'/').any(|c| c == b"..") {
-            bail!(
-                "--files-from: {:?} contains a `..` component",
-                String::from_utf8_lossy(item)
+                String::from_utf8_lossy(&item)
             );
         }
         // Drop `.` and empty components (`a/./b`, `a//b` -> `a/b`) so one path
         // has one spelling and the planner never schedules a file twice.
-        let parts: Vec<&[u8]> = p
-            .split(|&b| b == b'/')
-            .filter(|c| *c != b"." && !c.is_empty())
-            .collect();
-        if parts.is_empty() {
+        let mut normalized = Vec::with_capacity(item.len());
+        for component in item.split(|&byte| byte == b'/') {
+            if component == b".." {
+                bail!(
+                    "--files-from: {:?} contains a `..` component",
+                    String::from_utf8_lossy(&item)
+                );
+            }
+            if component.is_empty() || component == b"." {
+                continue;
+            }
+            if !normalized.is_empty() {
+                normalized.push(b'/');
+            }
+            normalized.extend_from_slice(component);
+        }
+        if normalized.is_empty() {
             bail!(
                 "--files-from: {:?} names the source root itself",
-                String::from_utf8_lossy(item)
+                String::from_utf8_lossy(&item)
             );
         }
-        out.push(parts.join(&b'/'));
+        out.push(normalized);
     }
     Ok(out)
 }
@@ -2005,9 +2061,84 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
-        parse_size, Args, Placement, SourceSelection,
+        parse_size, read_files_from_reader, Args, Placement, SourceSelection,
     };
+    use anyhow::{bail, Result};
     use clap::Parser;
+
+    fn read_files_from_buffered_reference(raw: &[u8], nul: bool) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let items: Vec<&[u8]> = if nul {
+            raw.split(|&byte| byte == 0).collect()
+        } else {
+            raw.split(|&byte| byte == b'\n')
+                .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+                .collect()
+        };
+        for item in items {
+            if item.is_empty() || matches!(item.first(), Some(b'#' | b';')) {
+                continue;
+            }
+            if item.contains(&0) {
+                bail!("entry contains a NUL byte");
+            }
+            if item.split(|&byte| byte == b'/').any(|part| part == b"..") {
+                bail!("entry contains a `..` component");
+            }
+            let parts: Vec<&[u8]> = item
+                .split(|&byte| byte == b'/')
+                .filter(|part| *part != b"." && !part.is_empty())
+                .collect();
+            if parts.is_empty() {
+                bail!("entry names the source root itself");
+            }
+            out.push(parts.join(&b'/'));
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn files_from_is_parsed_record_by_record() {
+        let lines = b"a//b\r\ncomment\0inside\n./#literal\n; ignored\n";
+        assert!(read_files_from_reader(&lines[..], false).is_err());
+        assert_eq!(
+            read_files_from_reader(&b"a//b\r\n./#literal\n; ignored\n"[..], false).unwrap(),
+            [b"a/b".to_vec(), b"#literal".to_vec()]
+        );
+        assert_eq!(
+            read_files_from_reader(&b"a/./b\0./;literal\0"[..], true).unwrap(),
+            [b"a/b".to_vec(), b";literal".to_vec()]
+        );
+    }
+
+    #[test]
+    fn incremental_files_from_keeps_buffered_parser_validation() {
+        const ALPHABET: &[u8] = b"a./\r\n\0#;";
+        for nul in [false, true] {
+            for length in 0usize..=5 {
+                let cases = ALPHABET.len().pow(length as u32);
+                for mut encoded in 0..cases {
+                    let mut raw = vec![0; length];
+                    for byte in &mut raw {
+                        *byte = ALPHABET[encoded % ALPHABET.len()];
+                        encoded /= ALPHABET.len();
+                    }
+                    let expected = read_files_from_buffered_reference(&raw, nul);
+                    let actual = read_files_from_reader(&raw[..], nul);
+                    assert_eq!(
+                        actual.as_ref().ok(),
+                        expected.as_ref().ok(),
+                        "input {raw:?}, nul={nul}; actual={actual:?}, expected={expected:?}"
+                    );
+                    assert_eq!(
+                        actual.is_err(),
+                        expected.is_err(),
+                        "input {raw:?}, nul={nul}; actual={actual:?}, expected={expected:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn durations_take_seconds_minutes_or_hours_and_reject_zero() {
@@ -2124,6 +2255,32 @@ mod tests {
         assert!(args.inplace);
         assert_eq!(args.min_size.as_deref(), Some("1K"));
         assert_eq!(args.max_size.as_deref(), Some("1M"));
+    }
+
+    #[test]
+    fn native_directional_follow_is_distinct_from_the_umbrella() {
+        let argv = [
+            "--follow-src",
+            "source",
+            "--follow-dest",
+            "--into",
+            "destination",
+        ]
+        .map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv).unwrap();
+        assert!(!args.native_follow);
+        assert!(args.native_follow_src);
+        assert!(args.native_follow_dest);
+        assert!(args.follows_native_source_paths());
+        assert!(args.follows_native_destination_paths());
+
+        let argv = ["--follow", "source", "--into", "destination"].map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv).unwrap();
+        assert!(args.native_follow);
+        assert!(!args.native_follow_src);
+        assert!(!args.native_follow_dest);
+        assert!(args.follows_native_source_paths());
+        assert!(args.follows_native_destination_paths());
     }
 
     #[test]
