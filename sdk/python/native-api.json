@@ -21,6 +21,7 @@
         "as-new",
         "as-existing",
         "mapping",
+        "results",
         "prune",
         "max-delete",
         "dry-run",
@@ -51,7 +52,6 @@
       ],
       "internal": [
         "delegated-operands-b64",
-        "results",
         "results-fd",
         "suppress-summary"
       ],

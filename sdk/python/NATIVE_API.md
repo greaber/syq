@@ -70,6 +70,9 @@ every caller translate between two APIs.
 SDK-only controls have Python names because they have no native spelling. The
 initial ones are `on_event`, `timeout`, and `check`; their documentation must
 identify them as process- or library-level behavior rather than syq options.
+The typed `results=` parameter keeps the native concept and spelling, but
+accepts a Python binary file-like object instead of a path so applications can
+choose files, in-memory buffers, and their own stream adapters naturally.
 
 Not every command-line parsing convenience needs another Python parameter.
 The plural options `--srcs`, `--src-srcs`, `--src-files`, and `--src-dirs`
@@ -206,6 +209,7 @@ syq.cp(
     as_new=None,
     as_existing=None,
     mapping=None,
+    results=None,
     prune=False,
     dry_run=False,
     hash=False,
@@ -315,12 +319,34 @@ presentation. Callers that specifically want native human output use `run`.
 If a presentation option is later useful on a typed method, it must appear
 under its native name rather than under a Python synonym.
 
-`results` is also not a typed `cp` parameter: it is the transport the library
-uses internally to obtain `CpResult`. Callers that need direct control of
-`--results FILE` use `run`. The parameter is reserved rather than repurposed.
-For the same reason, `detach` remains available through raw `run`: native
-`--detach` deliberately rejects the attached result stream required by typed
-`cp`.
+Typed `cp` always consumes the automation stream to produce its `CpResult`.
+Passing `results=` also copies the validated NDJSON records to a caller-owned
+binary file-like object:
+
+```python
+with open("run.ndjson", "wb") as records:
+    result = syq.cp("source", into="destination", results=records)
+```
+
+The object must provide `write(bytes)` and may provide `flush()`. The SDK
+flushes it after a complete stream but never closes it. A valid `partial` or
+`refused` terminal record is written before `SyqOperationError` is raised, so
+the saved stream and the exception's result agree. The terminal record is
+withheld if the stream, process exit, or callback does not complete
+consistently. Sink failures abort the operation rather than making an
+incomplete saved stream look successful.
+
+Internally, typed `cp` creates a dedicated pipe and passes its write end using
+native `--results-fd`. It never asks syq to put machine output on stdout and
+never parses stdout as automation data. `--results-fd` is an implementation
+detail rather than a caller parameter. Callers that specifically need native
+`--results FILE` path behavior use `run`. Native and Python typed results both
+remain attached operations, so `detach` remains available only through raw
+`run`. A live direct remote-to-remote copy may coordinate remotely: the
+receiver's verified receipt returns as receiver-attested records in the same
+local stream. A remote-to-remote dry run has no such receipt stream and must
+use `coordinate_at="local"`. The SDK mirrors that refusal rather than silently
+opting into a local relay.
 
 ## Mapping, transformation, and copy
 
@@ -594,11 +620,12 @@ guarantees of typed methods.
 
 ## Synchrony, asyncio, and resource ownership
 
-`Client` is synchronous. `AsyncClient` exposes `run`, `version`, typed `cp`
-(including `prune=True`), and `map` using native asyncio subprocesses rather
-than a thread wrapper. Its command parameters, result objects, validation, and
-failure types are shared with `Client`; commands such as `rm` remain available
-through `await client.run(["rm", ...])`.
+`Client` and `AsyncClient` both expose `run`, `version`, typed `cp` (including
+`prune=True`), and `map`. Their public method names, parameter names, defaults,
+result objects, validation, and failure types match. `AsyncClient` uses native
+asyncio subprocesses rather than wrapping the synchronous client in a thread;
+commands such as `rm` remain available through
+`await client.run(["rm", ...])`.
 
 ```python
 client = syq.AsyncClient(process_cwd="/srv/jobs")
@@ -614,6 +641,12 @@ before `async with`. Its `on_event` accepts either an ordinary callback or an
 awaitable callback. Awaitable callbacks run in record order and count toward
 the operation timeout. An ordinary callback runs on the event-loop thread and
 should return quickly.
+
+The deliberately asynchronous additions are support for async mapping
+iterables, awaitable event callbacks, and async iteration/context management.
+Writes to a synchronous `results=` object are buffered to a bounded size and
+performed off the event-loop thread. Both clients preserve record order and
+leave the object open.
 
 Normal method calls reap before returning. Early mapping-context exit,
 timeout, cancellation, callback failure, or decoder failure kills and reaps
