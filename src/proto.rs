@@ -637,8 +637,8 @@ pub enum Request {
     },
     /// Receiver-side copy of a same-machine file (copy_file_range when
     /// possible, optionally a sequential userspace fallback for a local
-    /// source and asynchronous NFS destination). Err("EXDEV") tells the
-    /// caller to use the normal streaming path.
+    /// source and asynchronous NFS destination). `CopyLocalUnsupported`
+    /// tells the caller to use the normal streaming path.
     CopyLocal {
         source: RegisteredPath,
         dst: PathBytes,
@@ -799,6 +799,10 @@ pub enum Response {
     Receipt(#[serde(with = "serde_bytes")] Vec<u8>),
     Ok,
     Err(String),
+    /// `CopyLocal` could not use the receiver-side direct-copy path. This is
+    /// deliberately distinct from `Err`: filenames and other diagnostics are
+    /// untrusted text and must never select a recovery path.
+    CopyLocalUnsupported,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1071,5 +1075,19 @@ mod tests {
             let encoded = postcard::to_allocvec(&invalid).unwrap();
             assert!(postcard::from_bytes::<RegisteredPath>(&encoded).is_err());
         }
+    }
+
+    #[test]
+    fn copy_local_fallback_has_a_structured_wire_response() {
+        let mut frame = Vec::new();
+        FrameWriter::new(&mut frame, false)
+            .write_msg(&Response::CopyLocalUnsupported)
+            .unwrap();
+        assert!(matches!(
+            FrameReader::new(frame.as_slice())
+                .read_msg::<Response>()
+                .unwrap(),
+            Response::CopyLocalUnsupported
+        ));
     }
 }
