@@ -6557,7 +6557,10 @@ fn copy_local_exdev_auto_fallback_restores_parallel_workers() {
     assert_eq!(read(&t.path("dst")), contents);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("connections: auto: settled at 32 (path 32, peak 32)"),
+        stdout.contains(&format!(
+            "connections: auto: settled at {0} (path {0}, peak {0})",
+            expected_local_start()
+        )),
         "{stdout}"
     );
 }
