@@ -8,9 +8,21 @@ priority = "critical"
 impact = "security"
 status = "covered"
 claim = "Peer-selected source and destination paths must not be redirected outside their transfer roots by raced parent symlinks."
-compat_tests = ["sender-scan-dir-escape", "symlink-race-source", "symlink-race-dest", "symlink-race-relative-dest"]
+compat_tests = ["sender-scan-dir-escape", "symlink-race-source", "symlink-race-dest", "symlink-race-relative-dest", "receiver-rename-symlink-race"]
 local_tests = ["destination_root_replacement_after_selection_cannot_redirect_worker", "destination_file_write_refuses_descendant_symlink_swap", "destination_prune_scan_refuses_descendant_symlink_swap", "self_copy_guard_sees_through_symlinks", "files_from_self_copy_through_symlinked_root_is_rejected"]
 note = "Default source discovery and reads plus destination scanning, mutation, file transfer, and publication use retained capabilities and refuse raced descendant symlinks. Rsync-mode --insecure-links is the documented explicit source-authority expansion, not a pathname fallback within the confined policy."
+
+[[regressions]]
+id = "rsync-53802"
+source = "https://github.com/RsyncProject/rsync/security/advisories/GHSA-4mfr-8jrv-49x4"
+title = "Operator-supplied input paths followed attacker-planted symlinks"
+priority = "critical"
+impact = "security"
+status = "covered"
+claim = "A privileged copy must not read a control file through a foreign-owned leaf or parent symlink; an explicitly insecure invocation may opt out."
+compat_tests = ["operator-path-files-from"]
+local_tests = ["control_input_replacement_symlinks_cannot_redirect_reads", "trusted_control_symlink_target_is_read_from_the_opened_link"]
+note = "The unmodified upstream matrix covers absolute and relative --files-from paths, symlinks at the leaf and in a parent, and both the trusted-owner policy and --insecure-links opt-out. SYQ's deterministic local regressions additionally replace a link after it has been selected and cover --syq-ignore-from."
 
 [[regressions]]
 id = "rsync-359"

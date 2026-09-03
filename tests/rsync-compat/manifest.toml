@@ -104,6 +104,17 @@ requirements = ["Unix-domain sockets"]
 note = "Archive mode handles a nested socket without losing ordinary files."
 
 [[tests]]
+name = "operator-path-files-from"
+classification = "conformance"
+area = "security"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "security", "operator-path", "files-from", "symlinks"]
+requirements = ["symlinks"]
+note = "Apply rsync's trusted-owner policy to leaf and parent symlinks in absolute and relative --files-from paths, with --insecure-links as the explicit opt-out."
+
+[[tests]]
 name = "search-only-destination"
 classification = "conformance"
 area = "permissions"
@@ -483,6 +494,20 @@ platforms = ["linux"]
 tags = ["remote", "ssh", "security", "argument-quoting"]
 requirements = ["rsync lsh test helper"]
 note = "A newline-bearing remote destination cannot split SYQ's quoted remote command and execute an injected shell command."
+
+[[tests]]
+name = "receiver-rename-symlink-race"
+upstream_test = "rename-fullpath-symlink-race"
+classification = "adapted"
+adaptation = "rename-destination-symlink-race"
+adaptation_kind = "subset"
+area = "security"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "security", "destination-race", "publication"]
+requirements = ["symlinks"]
+note = "Race a destination parent between a directory and an out-of-tree symlink during normal staged publication; the adaptation removes upstream's unsupported absolute --temp-dir trigger but preserves its flipper, positive control, and outside-write oracle."
 
 [[tests]]
 name = "unsafe-links"

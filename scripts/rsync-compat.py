@@ -477,11 +477,17 @@ def running_as() -> str:
     return "root" if hasattr(os, "geteuid") and os.geteuid() == 0 else "non-root"
 
 
-def select_tests(manifest: dict) -> tuple[list[dict], list[dict]]:
+def select_tests(
+    manifest: dict, selected_areas: set[str] | None = None
+) -> tuple[list[dict], list[dict], list[dict]]:
     selected: list[dict] = []
     environment_excluded: list[dict] = []
+    selection_excluded: list[dict] = []
     current_platform = platform_name()
     for test in manifest.get("tests", []):
+        if selected_areas and test["area"] not in selected_areas:
+            selection_excluded.append(test)
+            continue
         platforms = test.get("platforms", [])
         if platforms and current_platform not in platforms:
             environment_excluded.append(test)
@@ -491,7 +497,7 @@ def select_tests(manifest: dict) -> tuple[list[dict], list[dict]]:
             environment_excluded.append(test)
             continue
         selected.append(test)
-    return selected, environment_excluded
+    return selected, environment_excluded, selection_excluded
 
 
 def markdown_cell(value: object) -> str:
@@ -770,6 +776,9 @@ def assess_harness(
 
 def markdown_report(report: dict) -> str:
     command = command_text(["syq", *report["target_args"]])
+    area_selection = ""
+    if report.get("selected_areas"):
+        area_selection = " · areas: `" + ", ".join(report["selected_areas"]) + "`"
     if report["harness_ok"]:
         harness_status = (
             "Harness execution: **complete** — runner exit code "
@@ -783,7 +792,8 @@ def markdown_report(report: dict) -> str:
         "",
         f"Pinned upstream: `{report['upstream_commit']}` · target: `{report['target_name']}` "
         f"via `{command}` "
-        f"· platform: `{report['platform']}` · run as: `{report['run_as']}`",
+        f"· platform: `{report['platform']}` · run as: `{report['run_as']}`"
+        f"{area_selection}",
         "",
         harness_status,
         "",
@@ -807,6 +817,22 @@ def markdown_report(report: dict) -> str:
             "",
         ]
     )
+    if report.get("selection_excluded"):
+        lines.extend(
+            [
+                f"Area selection omitted {len(report['selection_excluded'])} other "
+                "runnable scenario(s).",
+                "",
+            ]
+        )
+    if report.get("environment_excluded"):
+        lines.extend(
+            [
+                f"Platform or user circumstances excluded "
+                f"{len(report['environment_excluded'])} selected scenario(s).",
+                "",
+            ]
+        )
     if report["tests"]:
         lines.extend(
             [
@@ -869,6 +895,9 @@ def markdown_report(report: dict) -> str:
 
 def html_report(report: dict) -> str:
     command = command_text(["syq", *report["target_args"]])
+    area_selection = ""
+    if report.get("selected_areas"):
+        area_selection = " · areas: " + escape(", ".join(report["selected_areas"]))
     cards = "".join(
         '<div class="card"><strong>'
         + str(report["position_counts"].get(position, 0))
@@ -927,6 +956,17 @@ def html_report(report: dict) -> str:
         if report["harness_ok"]
         else "Harness execution failed; results may be incomplete."
     )
+    selection_notes = ""
+    if report.get("selection_excluded"):
+        selection_notes += (
+            f"<p>Area selection omitted {len(report['selection_excluded'])} other "
+            "runnable scenario(s).</p>"
+        )
+    if report.get("environment_excluded"):
+        selection_notes += (
+            f"<p>Platform or user circumstances excluded "
+            f"{len(report['environment_excluded'])} selected scenario(s).</p>"
+        )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>SYQ rsync behavioral matrix</title><style>
@@ -953,8 +993,8 @@ dt {{ font-weight: 700; margin-top: .5rem; }} dd {{ margin-left: 1.25rem; }}
 <h1>SYQ rsync behavioral compatibility matrix</h1>
 <p class="meta">Pinned rsync <code>{escape(report['upstream_commit'])}</code> · target
 <code>{escape(report['target_name'])}</code> via <code>{escape(command)}</code> ·
-{escape(report['platform'])} · {escape(report['run_as'])}</p>
-<p class="status {harness_class}">{escape(harness_text)}</p>
+{escape(report['platform'])} · {escape(report['run_as'])}{area_selection}</p>
+<p class="status {harness_class}">{escape(harness_text)}</p>{selection_notes}
 <div class="cards">{cards}</div>{harness_errors}{change_notice}
 <h2>Observed tests</h2><table><thead><tr><th>Area</th><th>Test</th><th>Observed</th>
 <th>Product position</th><th>Provenance</th><th>Circumstances</th><th>Note</th></tr></thead>
@@ -994,6 +1034,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ledger-only", action="store_true")
     parser.add_argument("--update-ledger", action="store_true")
     parser.add_argument(
+        "--area",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="run only manifest tests in this behavioral area (repeatable)",
+    )
+    parser.add_argument(
         "--require-tests",
         action="store_true",
         help="fail after writing reports if no tests apply (used by CI)",
@@ -1024,6 +1071,16 @@ def main() -> int:
     inventory = load_inventory()
     regressions = load_regressions()
     target = manifest["target"]
+    selected_areas = set(args.area)
+    available_areas = {test["area"] for test in manifest.get("tests", [])}
+    unknown_areas = sorted(selected_areas - available_areas)
+    if unknown_areas:
+        raise CompatError(
+            "unknown --area value(s): "
+            + ", ".join(unknown_areas)
+            + "; available areas: "
+            + ", ".join(sorted(available_areas))
+        )
 
     cache = args.cache_dir.resolve()
     cache.mkdir(parents=True, exist_ok=True)
@@ -1040,7 +1097,9 @@ def main() -> int:
     if args.ledger_only:
         return 0
 
-    selected, environment_excluded = select_tests(manifest)
+    selected, environment_excluded, selection_excluded = select_tests(
+        manifest, selected_areas
+    )
     adaptation_ids = sorted(
         {test["adaptation"] for test in selected if test.get("adaptation")}
     )
@@ -1170,11 +1229,13 @@ def main() -> int:
         "target_description": target.get("description", ""),
         "platform": platform_name(),
         "run_as": running_as(),
+        "selected_areas": sorted(selected_areas),
         "applicable": applicable,
         "observed_counts": dict(sorted(observed_counts.items())),
         "position_counts": dict(sorted(position_counts.items())),
         "adapted": sum(test["classification"] == "adapted" for test in test_results),
         "environment_excluded": [test["name"] for test in environment_excluded],
+        "selection_excluded": [test["name"] for test in selection_excluded],
         "unsupported_features": unsupported_features,
         "ledger": {key: ledger_counts[key] for key in sorted(VALID_CLASSES)},
         "tests": test_results,

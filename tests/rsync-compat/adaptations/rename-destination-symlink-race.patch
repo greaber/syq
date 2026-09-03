@@ -1,0 +1,105 @@
+diff --git a/testsuite/receiver-rename-symlink-race_test.py b/testsuite/receiver-rename-symlink-race_test.py
+new file mode 100755
+index 0000000..f78034a
+--- /dev/null
++++ b/testsuite/receiver-rename-symlink-race_test.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++"""Normal staged-publication rename stays beneath the destination root.
++
++This is the supported-path subset of rename-fullpath-symlink-race.  The
++upstream test uses an absolute --temp-dir to expose a mixed absolute/relative
++bug in rsync's rename wrapper.  SYQ has no --temp-dir, so this scenario keeps
++the same real parent-directory flipper and outside-write oracle while staging
++through the target's ordinary temporary-file path.
++"""
++
++import os
++import subprocess
++import time
++
++from rsyncfns import SCRATCHDIR, race_budget, rmtree, rsync_argv, test_fail
++
++
++base = SCRATCHDIR / f'receiver-rename-{os.getpid()}'
++src = base / 'src'
++dest = base / 'dest'
++outside = base / 'outside'
++rmtree(base)
++(src / 'sub').mkdir(parents=True)
++for i in range(40):
++    (src / 'sub' / f'f{i}').write_text('payload-' + 'x' * 20000 + '\n')
++dest.mkdir()
++outside.mkdir()
++
++sub = dest / 'sub'
++link = dest / '.sublink'
++link.symlink_to(outside)
++
++
++def push():
++    return subprocess.run(
++        rsync_argv('-a', f'{src}/', f'{dest}/'),
++        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
++    )
++
++
++# A clean run must traverse the same staged write and final-rename path.  This
++# prevents a target that simply rejects the invocation from passing the race.
++sub.mkdir()
++control = push()
++if control.returncode != 0 or not (sub / 'f0').is_file():
++    test_fail(
++        "positive control: an ordinary staged copy did not create dest/sub/f0 "
++        f"(rc={control.returncode}); the rename-race test would be vacuous"
++    )
++for entry in outside.iterdir():
++    if entry.is_file() or entry.is_symlink():
++        entry.unlink()
++
++# Keep dest/sub alternating between the real directory and a symlink to the
++# outside sentinel directory while repeated transfers stage and publish files.
++# The child terminates with this test process and has a hard backstop so an
++# interrupted suite cannot leave a namespace-mutating process behind.
++flip_code = (
++    "import os, sys, time\n"
++    "sub, link = sys.argv[1], sys.argv[2]\n"
++    "scratch = sub + '.flip'\n"
++    "parent = os.getppid()\n"
++    "deadline = time.monotonic() + 120\n"
++    "while time.monotonic() < deadline and os.getppid() == parent:\n"
++    "    try:\n"
++    "        os.makedirs(sub, exist_ok=True)\n"
++    "        os.rename(sub, scratch); os.rename(link, sub); os.rename(scratch, link)\n"
++    "        os.rename(sub, scratch); os.rename(link, sub); os.rename(scratch, link)\n"
++    "    except OSError:\n"
++    "        pass\n"
++)
++flip = subprocess.Popen(['python3', '-c', flip_code, str(sub), str(link)])
++try:
++    deadline = time.monotonic() + race_budget(10.0)
++    while time.monotonic() < deadline:
++        rmtree(sub)
++        try:
++            sub.unlink()
++        except OSError:
++            pass
++        push()
++        escaped = sorted(
++            entry.name for entry in outside.iterdir()
++            if entry.is_file() and not entry.is_symlink()
++        )
++        if escaped:
++            test_fail(
++                "receiver publication followed a raced destination parent "
++                f"symlink and wrote outside the selected tree: {escaped}"
++            )
++finally:
++    flip.terminate()
++    try:
++        flip.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        flip.kill()
++        flip.wait()
++
++print("receiver-rename-symlink-race: publication stayed beneath destination root")
