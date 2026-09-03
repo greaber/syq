@@ -53,10 +53,10 @@ cargo install --locked --path . # or: put it on your PATH
 
 Managed remote bootstrap is available only from official release builds.
 For Cargo and checkout builds, install a compatible `syq` on the remote and
-select it explicitly. Native `syq cp` uses `--syq-path PATH`, or
-`--no-bootstrap` when the binary is on the remote `PATH`; `syq rsync` uses the
-rsync-compatible `--rsync-path PATH`, or `--syq-no-bootstrap` for the same
-`PATH` lookup.
+select it explicitly. Native `syq cp` and remote `syq rm` use `--syq-path
+PATH`, or `--no-bootstrap` when the binary is on the remote `PATH`; `syq
+rsync` uses the rsync-compatible `--rsync-path PATH`, or
+`--syq-no-bootstrap` for the same `PATH` lookup.
 
 ## Update checks and self-update
 
@@ -82,8 +82,8 @@ notarization in addition to this terminal-first path.
 
 ## Remote helper bootstrap
 
-The remote side runs `syq --server`, but it does not need to be installed or
-configured first. An official syq uses its exact release helper under
+An ordinary remote side runs `syq --server`, but it does not need to be
+installed or configured first. An official syq uses its exact release helper under
 `~/.cache/syq/helpers/`. On first use of a version it detects the remote
 platform and checks for a downloader, SHA-256 implementation, and `gzip`. When
 that complete toolchain is available, the remote downloads the matching
@@ -108,10 +108,10 @@ discarded and produces an integrity warning even if the verified upload then
 succeeds.
 
 The managed cache accepts only a verified release binary. To opt out of
-managed bootstrap, install a compatible binary yourself. Native `syq cp` uses
-`--syq-path /path/to/syq`, or `--no-bootstrap` when the binary is on the
-non-interactive remote `PATH`; `syq rsync` uses `--rsync-path /path/to/syq` or
-`--syq-no-bootstrap`.
+managed bootstrap, install a compatible binary yourself. Native `syq cp` and
+remote `syq rm` use `--syq-path /path/to/syq`, or `--no-bootstrap` when the
+binary is on the non-interactive remote `PATH`; `syq rsync` uses `--rsync-path
+/path/to/syq` or `--syq-no-bootstrap`.
 
 The local client verifies the manifest's embedded Ed25519 signature over its
 RFC 8785 canonical JSON. Direct remote download uses `curl` or `wget`, `gzip`,

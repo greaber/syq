@@ -20,12 +20,15 @@ syq cp --from hostA --src-src big --to hostB --into big
 syq cp --prune --from hostA --src-src tree --to hostB --into-existing tree
 ```
 
-For paths representable in a remote command, syq starts the coordinator on
-hostA and pushes directly to hostB, so file data does not traverse the invoking
-machine. Matching helpers are installed automatically on both hosts and output
-is streamed back. Raw path bytes that cannot be represented safely in the
-remote command require an explicit `--coordinate-at local` relay. When both
-endpoints name the same host and user, syq runs a local copy on that host.
+syq starts the orchestrator on hostA and pushes directly to hostB, so file
+data does not traverse the invoking machine; path operands travel encoded in
+the delegated command, so any filename works. Matching helpers are installed
+automatically on both hosts and output is streamed back. When both endpoints
+name the same host and user, syq runs a local copy on that host.
+For a source build, `--syq-path` or `--no-bootstrap` selects the ordinary hostA
+coordinator, including on the command-restricted path. It is not forwarded as
+authority to choose hostB's receiver: that executable is the separately
+enrolled forced command and is refreshed by enrollment.
 
 ## The default path: enrolled receiver plus constrained broker
 
@@ -41,10 +44,22 @@ under `~/.local/share/syq/restricted/`; the receipt key's public half is
 returned to the local machine and recorded with the enrollment. Before
 publishing the forced key, syq verifies that the installed receiver is a
 regular executable and that it and every path ancestor are trusted-owner- or
-root-owned, non-writable by other users, and free of non-owner ACL grants.
+root-owned and non-writable by other users. On Linux, access ACLs are evaluated
+by their effective permissions: named entries are accepted when they are
+read-only or identify root, the target user, or its verified user-private
+group. A default ACL does not make its existing directory writable, and every
+new directory or file syq creates is validated before use. Group-write from the
+conventional umask 002 is accepted only when account and group database lookups
+prove that the group is user-private (same name and no other member or non-root
+primary-group user). Otherwise group-write still fails closed. Private
+enrollment directories and secret files remain exactly 0700 and 0600. A
+failure names the machine and reports every unsafe component of the path that
+syq could securely inspect.
 
-Enrollment first tries local→hostB directly. If that network path is
-unavailable, it retries through hostA with OpenSSH `ProxyJump`; hostA gets only
+Enrollment first tries local→hostB directly. If SSH reports a transport
+failure, it retries through hostA with OpenSSH `ProxyJump`; a remote validation
+or installation error is reported against hostB without repeating it through
+the proxy. HostA gets only
 `ssh -W` byte forwarding and cannot see the encrypted hostB session, an agent
 socket, or the enrollment key. The destination parent must already exist.
 Enrollment is durable, is reused for later destination leaves sharing that
@@ -234,8 +249,15 @@ also refreshes the installed
 receiver to the exact local syq binary; the receipt key is kept for the life
 of the enrollment, so a refresh, or a retry after a lost reply, never leaves
 the two sides holding different keys. To rotate it, revoke and enroll again.
-Revocation leaves that shared binary because other enrollments may use it. It
-prevents new receiver sessions. A
+Revocation keeps the shared receiver while another enrollment or managed
+forced-key entry may use it. The final revoke removes the shared receiver and
+empty `syq/restricted` state namespace on hostB. General account directories
+such as `.local`, `share`, and `libexec` are preserved even when empty because
+syq does not assume it created them. Each installer or revoker uploads and runs
+its temporary management helper within one SSH session whose cleanup trap owns
+the stage. Install and revoke serialize the shared receiver lifecycle, so a
+concurrent enrollment recreates the receiver before publishing its forced key.
+Revocation prevents new receiver sessions. A
 session that already claimed its signed request can finish an operation already
 in progress; later protocol requests are rejected once the signed execution
 deadline expires rather than forcibly interrupting a filesystem syscall.

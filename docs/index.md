@@ -56,8 +56,8 @@ Today its biggest strengths are speed and secure remote-to-remote transfers.
 Its composability story is still developing but is arguably already ahead of
 rsync's. On filesystem hardening, rsync, and especially [its security
 design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md), has
-been a great teacher; the student has not surpassed the master, and the gaps
-are documented rather than hidden.
+been a great teacher; native `cp` and `rm` now follow the same design, and the
+remaining differences are documented rather than hidden.
 
 ## Speed
 
@@ -166,11 +166,12 @@ or a pre-planted temporary file. Rsync 3.5 is the state of the art here. Syq
 already validates every peer-supplied path, follows an operator-named
 destination symlink only when root or the receiving user owns it, opens leaves
 without following links, never recursively deletes an object that changed
-type, and runs native `rm` and the restricted receiver entirely on
-descriptor-relative operations. It has not reached parity: ordinary copies
-still address descendants by pathname, so a parent directory swapped for a
-symlink mid-transfer is a known gap, and syq's always-on resume files assume
-their directory is not writable by untrusted users.
+type, and pins every selected source and destination as an open descriptor
+before anything changes, so every worker reads and writes relative to those
+descriptors and a directory swapped for a symlink mid-transfer cannot redirect
+it. Two things remain weaker than rsync: syq's always-on resume files assume
+their directory is not writable by untrusted users, and the peer protocol has
+not been fuzzed the way rsync's has.
 
 **Least privilege for remote transfers.** For a remote-to-remote copy, the
 default gives hostA neither your agent nor a credential. A temporary local

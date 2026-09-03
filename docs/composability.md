@@ -46,6 +46,11 @@ Several guarantees make the plan more than a printout:
   `syq rsync`) runs only after the copy, only after a complete and error-free
   scan of both sides, and `--max-delete N` deletes nothing at all when more
   than N deletions are planned.
+- **Capacity is checked up front.** When the destination is missing or an
+  empty directory, the plan compares the copy's logical size and object count
+  with the space and inodes available to the receiving user, prints the result
+  as a `capacity` line, and a real run refuses to start if they do not fit. It
+  is a sanity check, not a reservation.
 - **`--dry-run` and `--syq-verify-only` are read-only by construction.** Under the
   command-restricted remote-to-remote path, the signed grant marks them
   read-only and the receiver rejects every mutation even if the sending host
@@ -112,7 +117,13 @@ or a stream can express too:
   `trace` records instead of results under `--dry-run`, an `error` record per
   counted error, and exactly one terminal `result` whose numbers also render
   the human summary. It is schema version 1, with a stated compatibility
-  policy; [Automation results](automation-v1.md) is the contract. Failed
+  policy; [Automation results](automation-v1.md) is the contract. The stream
+  is always written on the machine you invoke syq from. For a remote-to-remote
+  copy through an enrolled receiver it is *receiver-attested*: built from
+  hostB's verified receipt (each record marked
+  `"provenance": "receiver_attested"`) while the data flows directly between
+  the hosts; without an enrollment, the run fails unless `--coordinate-at
+  local` explicitly routes the data through your machine. Failed
   operation records carry `src`, `dst`, and `kind`, so once the terminal
   record says the run settled, a retry manifest is one filter away. The
   [mappings guide](mappings.md#machine-readable-results) has that filter,

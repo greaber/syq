@@ -285,8 +285,9 @@ data connections across all of them (multipath) — it keeps only paths within
 2x of the fastest, so it never drags a fast transfer down by mixing in a slow
 link. Every candidate still gets its complete bounded probe window, but those
 independent probes run while the control connection prepares the destination.
-Worker Hello and destination anchoring are likewise sent in one
-pipelined setup turn. Single-homed hosts and laptops use the one best path,
+An unrestricted destination worker claims its registered directory as part of
+its authenticated Hello, and the receiver acknowledges readiness only after
+that claim succeeds. Single-homed hosts and laptops use the one best path,
 unchanged. With ufw:
 
 ```sh
@@ -295,7 +296,7 @@ sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specif
 ```
 
 Use `-vv` to see the route planned for the real transfer. For each remote
-endpoint seen by the active coordinator it reports the authenticated helper
+endpoint seen by the active orchestrator it reports the authenticated helper
 identity and platform, every TCP address syq considered, reachability and
 advertised link speed, why a reachable address was or was not selected by the
 preflight, the resulting planned TCP/ssh transport, and the initial connection
@@ -310,9 +311,9 @@ or start transfer workers, and verbosity does not change dry-run's success or
 failure. The reported route is therefore a plan for a real transfer, not a
 claim that a worker data connection was completed.
 
-Native remote-to-remote copies work the same way: the coordinator on hostA
+Native remote-to-remote copies work the same way: the orchestrator on hostA
 connects to hostB's listener. Diagnostics are relative to that active
-coordinator. If both endpoints name hostA, `-vv` reports a local filesystem
+orchestrator. If both endpoints name hostA, `-vv` reports a local filesystem
 route there.
 
 No special server setup is required. For a measurement-first checklist of

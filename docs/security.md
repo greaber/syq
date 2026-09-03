@@ -41,17 +41,28 @@ yet been applied everywhere.
 
 ### Where syq stands
 
-Compared with rsync 3.5:
-
-**Matches or exceeds rsync.**
+Native `cp` and `rm` follow the same design as rsync 3.5, and in a few places
+go further:
 
 - Every path a remote peer sends is validated before it reaches the
   filesystem: absolute names, NUL, empty components, `.` and `..` are rejected.
-- The operator-named destination root is resolved with rsync's ownership rule
-  (a symlink component is followed only when root or the receiving user owns
-  it), then retained as an
-  opened directory whose device and inode every worker verifies, so changing
-  the external spelling afterward cannot redirect the copy.
+- Every selected source is resolved and registered as an open descriptor
+  before anything on the destination changes, and every worker claims those
+  exact descriptors when it starts. Directory walks, stats, content hashes, and
+  reads use that descriptor plus strict relative names; they never reopen the
+  operator's spelling and never follow a symlink found inside the tree. A
+  selected file authorizes only the exact object observed at registration, and
+  a symlink's target is read through the opened link object, not by name.
+- The destination directory is resolved once (a symlink component in the
+  operator's own path is followed only when root or the receiving user owns it),
+  registered, and handed to every worker as an open descriptor. Scanning, prune
+  planning, creation, metadata, deletion, file preparation, writes, and
+  publication all happen relative to it and never follow descendant symlinks.
+  Conditional updates verify the observed identity rather than a name.
+- The control files you pass (`--ignore-from`, `--files-from`, a named
+  `--mapping`) are read from the identity selected by the component walk, so
+  renaming them mid-run cannot redirect the read, and a named `--results` file
+  is created fresh beneath its retained parent; an existing entry is refused.
 - Regular files are opened with `O_NOFOLLOW` and the opened type is checked;
   sidecars must be singly linked regular files; special files are refused
   without blocking.
@@ -67,16 +78,12 @@ Compared with rsync 3.5:
   unless `--preserve` or the rsync-shaped flags ask for it, and ACLs and
   xattrs are not implemented at all. Several classes of rsync vulnerability
   are simply unreachable.
+- `--files-from` is stricter than rsync: a listed path whose parent is a
+  symlink on the source is refused before syq creates the implied destination
+  directory, where rsync creates it first and fails the content open afterward.
 
-**Where rsync is stronger.**
+What is different from rsync, or weaker:
 
-- **Descendant parents in ordinary copies.** The destination root is retained,
-  but many operations on descendants still use pathnames relative to it. An
-  attacker who can replace an intermediate directory with a symlink between
-  syq's plan and its write can redirect that write. Rsync holds the parent
-  descriptor for every leaf.
-- **Ordinary source enumeration** is not uniformly rooted either, so the same
-  caveat applies to a source tree that an attacker can modify during the copy.
 - **Resume files.** Syq always keeps partials, at deterministic names
   (`.name.syq-part.<job-id>`) so a rerun finds its state without a state file.
   Rsync's equivalent, `--partial-dir`, is opt-in and its manual warns that the
@@ -86,6 +93,13 @@ Compared with rsync 3.5:
   creation and the singly-linked-regular-file check limit what that buys, but
   they cannot prove who created a predictable pathname. Do not run a
   privileged copy into a directory writable by untrusted users.
+- **The rsync-mode escape hatch.** `syq rsync --insecure-links` restores the
+  unconfined, name-based source traversal, including through symlinked
+  `--files-from` parents. It exists for compatibility and is never selected
+  automatically.
+- **Older macOS.** The descriptor-bound symlink read that source registration
+  relies on needs macOS 13 or newer; older releases fail registration instead
+  of falling back to a name-based read.
 - **Protocol robustness.** Frames are length-bounded and several requests have
   specific limits, but the peer protocol has not been fuzzed the way rsync's
   has.
@@ -96,10 +110,11 @@ Compared with rsync 3.5:
   or device preservation; it cannot be asked to create a setuid file.
 - Treat every destination directory as a trust boundary for resume state, as
   you would rsync's `--partial-dir`. This matters most when syq runs as root.
+- In rsync mode, leave `--insecure-links` off unless a symlinked parent in a
+  file list is exactly what you mean.
 - For an untrusted or semi-trusted source host in a remote-to-remote copy, use
   the default restricted path described below; it protects the destination
-  from a compromised source even though the ordinary engine on the source side
-  is not what enforces it.
+  from a compromised source, and the receipt tells you what actually landed.
 - When another process may modify a destination file in place during a
   transfer, no file tool can promise a consistent result; use a snapshot.
 
@@ -164,8 +179,10 @@ exact running syq to hostB as a receiver, and appends one managed
 that key never leaves the local machine. HostA never sees it; the broker signs
 with it only along the verified path above. Before publishing the forced key,
 syq checks that the installed receiver and every path ancestor are owned by
-the trusted user or root, are not writable by others, and carry no foreign ACL
-grants, so the account cannot broaden its own authority. Enrollment can also
+the trusted user or root and are not writable by anyone else (Linux access
+ACLs are judged by their effective permissions, and group-write is accepted
+only for a proven user-private group), so the account cannot broaden its own
+authority. Enrollment can also
 run through hostA as an ssh `ProxyJump`, in which case hostA carries encrypted
 bytes and sees no agent, key, or session.
 
