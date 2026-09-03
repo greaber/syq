@@ -1963,6 +1963,8 @@ fn unsupported_message(tok: &str) -> Option<String> {
 const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The SYQ extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See \"Ignoring paths\" in docs/reference.md.";
 const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. --syq-verify-only can compare contents without mutation, but it does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
+const SOURCE_LINK_TRAVERSAL_MSG: &str = "syq does not implement rsync's source descendant-link traversal (-L/--copy-links, --copy-unsafe-links, or -k/--copy-dirlinks); -l copies symlinks as symlinks, and --insecure-links does not enable these modes.";
+const DESTINATION_LINK_TRAVERSAL_MSG: &str = "syq does not implement -K/--keep-dirlinks because it follows existing destination directory symlinks; syq replaces destination symlink conflicts instead.";
 
 fn message_for_long(base: &str) -> Option<&'static str> {
     Some(match base {
@@ -1979,8 +1981,13 @@ fn message_for_long(base: &str) -> Option<&'static str> {
         "hard-links" => "syq does not preserve hard links (-H/--hard-links).",
         "acls" => "syq does not preserve ACLs (-A/--acls).",
         "xattrs" => "syq does not preserve extended attributes (-X/--xattrs).",
-        "copy-links" | "copy-unsafe-links" | "copy-dirlinks" => {
-            "syq does not implement -L/--copy-links; it copies symlinks as symlinks (-l)."
+        "copy-links" | "copy-unsafe-links" | "copy-dirlinks" => SOURCE_LINK_TRAVERSAL_MSG,
+        "keep-dirlinks" => DESTINATION_LINK_TRAVERSAL_MSG,
+        "safe-links" => {
+            "syq does not implement --safe-links; selected symlinks are preserved without classifying whether their targets leave the transfer tree."
+        }
+        "munge-links" => {
+            "syq does not implement --munge-links; selected symlink target bytes are preserved unchanged."
         }
         "link-dest" | "compare-dest" | "copy-dest" => {
             "syq does not implement --link-dest/--compare-dest/--copy-dest."
@@ -1997,6 +2004,8 @@ fn message_for_short(c: char) -> Option<&'static str> {
         'S' => "sparse",
         'x' => "one-file-system",
         'L' => "copy-links",
+        'k' => "copy-dirlinks",
+        'K' => "keep-dirlinks",
         'i' => "itemize-changes",
         _ => return None,
     })
