@@ -266,6 +266,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 Request::TcpListen { .. }
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
+                    | Request::CheckOperatorDirectoryAncestry { .. }
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }

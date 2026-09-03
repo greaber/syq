@@ -21,8 +21,8 @@ impact = "data-loss"
 status = "partial"
 claim = "A copy whose effective source and destination are the same inode or tree must never truncate or overwrite its only good copy."
 compat_tests = []
-local_tests = ["inplace_self_copy_preserves_source", "file_onto_itself_is_allowed_noop", "copy_onto_itself_among_sources_is_order_independent"]
-note = "SYQ's supported ordinary and --inplace self-copy paths are guarded. Rsync's destructive --remove-source-files mode is not implemented, so the exact historical command is not applicable yet."
+local_tests = ["inplace_self_copy_preserves_source", "file_onto_itself_is_allowed_noop", "copy_onto_itself_among_sources_is_order_independent", "self_copy_guard_does_not_reject_a_destination_outside_the_moved_source", "self_copy_guard_rejects_a_destination_inside_the_moved_source"]
+note = "SYQ's supported ordinary and --inplace self-copy paths are guarded using retained source and destination directory capabilities, including across operator-path renames. Rsync's destructive --remove-source-files mode is not implemented, so the exact historical command is not applicable yet."
 
 [[regressions]]
 id = "rsync-ghsa-phxh-hjqv-39c9"

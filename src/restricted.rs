@@ -1935,6 +1935,7 @@ impl RestrictedAuthority {
                 bail!("request is not valid on a command-restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
+            | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. } => {

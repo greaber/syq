@@ -260,6 +260,124 @@ impl OperatorDirectorySelection {
         }
         self.anchor()
     }
+
+    /// Compare an effective directory beneath this retained operator
+    /// selection with an exact opened source directory. Existing components
+    /// are opened without following symlinks. Once a missing or non-directory
+    /// component is reached, the remaining virtual suffix is interpreted
+    /// component by component so `.` and `..` retain kernel path semantics.
+    fn relation_to_source(&self, source: &File, suffix: &[u8]) -> Result<DirectoryRelation> {
+        if suffix.starts_with(b"/") {
+            bail!("destination ancestry suffix must be relative");
+        }
+        if suffix.contains(&0) {
+            bail!("destination ancestry suffix contains NUL");
+        }
+
+        let source_metadata = source
+            .metadata()
+            .context("inspect source directory capability")?;
+        if !source_metadata.is_dir() {
+            bail!("destination ancestry source capability is not a directory");
+        }
+
+        let mut directory = self
+            .directory
+            .try_clone()
+            .context("duplicate retained destination directory")?;
+        let mut components = self.missing.clone();
+        components.extend(
+            suffix
+                .split(|byte| *byte == b'/')
+                .filter(|component| !component.is_empty())
+                .map(<[u8]>::to_vec),
+        );
+        let mut virtual_components: Vec<Vec<u8>> = Vec::new();
+
+        while let Some(component) = components.pop_front() {
+            if component == b"." {
+                continue;
+            }
+            if component == b".." {
+                if virtual_components.pop().is_none() {
+                    directory = open_operator_directory_at(&directory, b"..")
+                        .context("open retained destination parent")?;
+                }
+                continue;
+            }
+            if !virtual_components.is_empty() {
+                virtual_components.push(component);
+                continue;
+            }
+            match open_operator_directory_at(&directory, &component) {
+                Ok(child) => directory = child,
+                Err(error) if absent_or_nondirectory(&error) => {
+                    // A missing entry, regular file, or symlink will either be
+                    // replaced as a directory beneath this parent or make the
+                    // copy fail. It must never be followed for this decision.
+                    virtual_components.push(component);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "inspect effective destination component {:?}",
+                            OsStr::from_bytes(&component)
+                        )
+                    })
+                }
+            }
+        }
+
+        opened_directory_relation(
+            directory,
+            source_metadata.dev(),
+            source_metadata.ino(),
+            !virtual_components.is_empty(),
+        )
+    }
+}
+
+fn absent_or_nondirectory(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            .is_some_and(|errno| matches!(errno, libc::ENOENT | libc::ENOTDIR | libc::ELOOP))
+    })
+}
+
+/// Walk parents from an already-open destination directory. The source
+/// descriptor stays open for the whole query, so device/inode reuse cannot
+/// turn the comparison into pathname authority.
+fn opened_directory_relation(
+    mut directory: File,
+    source_dev: u64,
+    source_ino: u64,
+    virtual_descendant: bool,
+) -> Result<DirectoryRelation> {
+    let mut below_candidate = virtual_descendant;
+    loop {
+        let metadata = directory
+            .metadata()
+            .context("inspect effective destination directory")?;
+        if (metadata.dev(), metadata.ino()) == (source_dev, source_ino) {
+            return Ok(if below_candidate {
+                DirectoryRelation::Descendant
+            } else {
+                DirectoryRelation::Same
+            });
+        }
+        let parent = open_operator_directory_at(&directory, b"..")
+            .context("walk effective destination ancestry")?;
+        let parent_metadata = parent
+            .metadata()
+            .context("inspect effective destination parent")?;
+        if (parent_metadata.dev(), parent_metadata.ino()) == (metadata.dev(), metadata.ino()) {
+            return Ok(DirectoryRelation::Separate);
+        }
+        directory = parent;
+        below_candidate = true;
+    }
 }
 
 /// Resolve an operator-selected directory under the requested symlink policy.
@@ -362,7 +480,11 @@ fn operator_directory_flags() -> libc::c_int {
     {
         libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        libc::O_SEARCH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
     }
@@ -1116,6 +1238,37 @@ impl FsOps {
         Ok(anchor)
     }
 
+    fn check_operator_directory_ancestry(
+        &self,
+        checks: &[DirectoryAncestryCheck],
+    ) -> Result<Vec<Vec<DirectoryRelation>>> {
+        if checks.len() > DEFAULT_MAX_ROOTS {
+            bail!(
+                "destination ancestry source count ({}) exceeds the endpoint-session limit ({DEFAULT_MAX_ROOTS})",
+                checks.len()
+            );
+        }
+        let selection = self
+            .operator_selection
+            .as_ref()
+            .context("destination directory was not checked on this connection")?;
+        checks
+            .iter()
+            .map(|check| {
+                if !check.source_root.is_directory() {
+                    bail!("destination ancestry requires a source directory ticket");
+                }
+                let source = claim_descriptor(&check.source_root)
+                    .context("claim exact source directory for destination ancestry")?;
+                check
+                    .suffixes
+                    .iter()
+                    .map(|suffix| selection.relation_to_source(&source, suffix))
+                    .collect()
+            })
+            .collect()
+    }
+
     fn create_operator_directory(
         &mut self,
         mode: u32,
@@ -1709,6 +1862,7 @@ impl FsOps {
             | Request::TcpListen { .. }
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
+            | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }
@@ -4232,6 +4386,9 @@ impl FsOps {
                 .check_operator_directory(path, *allow_missing, *symlink_policy)
                 .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
                 .map(Response::DirectorySelection),
+            Request::CheckOperatorDirectoryAncestry { checks } => self
+                .check_operator_directory_ancestry(checks)
+                .map(Response::DirectoryRelations),
             Request::RegisterSourceRoots {
                 selections,
                 symlink_policy,
@@ -5021,6 +5178,61 @@ mod tests {
         )
         .unwrap();
         assert!(anchor.is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retained_operator_directory_reports_source_ancestry_without_following_suffix_links() {
+        let dir = test_dir();
+        let source = dir.join("source");
+        let child = source.join("child");
+        let sibling = dir.join("sibling");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        symlink(&source, sibling.join("link-to-source")).unwrap();
+        let source = File::open(&source).unwrap();
+
+        let select = |path: &Path, allow_missing| {
+            select_operator_directory(
+                path.as_os_str().as_bytes(),
+                allow_missing,
+                OperatorSymlinkPolicy::Refuse,
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(
+            select(&dir.join("source"), false)
+                .relation_to_source(&source, b"")
+                .unwrap(),
+            DirectoryRelation::Same
+        );
+        assert_eq!(
+            select(&child, false)
+                .relation_to_source(&source, b"")
+                .unwrap(),
+            DirectoryRelation::Descendant
+        );
+        assert_eq!(
+            select(&dir.join("source/missing/deeper"), true)
+                .relation_to_source(&source, b"")
+                .unwrap(),
+            DirectoryRelation::Descendant
+        );
+        assert_eq!(
+            select(&sibling, false)
+                .relation_to_source(&source, b"link-to-source")
+                .unwrap(),
+            DirectoryRelation::Separate,
+            "a generated destination suffix must not follow a symlink"
+        );
+        assert_eq!(
+            select(&child, false)
+                .relation_to_source(&source, b"..")
+                .unwrap(),
+            DirectoryRelation::Same
+        );
+
         fs::remove_dir_all(&dir).unwrap();
     }
 
