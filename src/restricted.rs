@@ -962,9 +962,10 @@ impl RestrictedAuthority {
         let outcome_error = |index: usize| -> Option<&str> {
             match response {
                 proto::Response::Err(error) => Some(error.as_str()),
-                proto::Response::Applied(results) => {
-                    results.get(index).and_then(|error| error.as_deref())
-                }
+                proto::Response::EndpointError(error) => Some(error.as_str()),
+                proto::Response::Applied(results) => results
+                    .get(index)
+                    .and_then(|error| error.as_ref().map(proto::WireError::as_str)),
                 _ => None,
             }
         };
@@ -1980,6 +1981,9 @@ impl RestrictedAuthority {
                     self.check_observation_path(path)?;
                 }
                 *guard = Some(self.guard.clone());
+            }
+            Request::DestinationFilesystemInfo { .. } => {
+                bail!("destination filesystem inspection is not authorized by the signed grant")
             }
             Request::PartialPaths { paths, guard, .. } => {
                 for path in paths {
@@ -6475,7 +6479,7 @@ mod tests {
             len: 1,
             guard: Some(guard),
         });
-        assert!(matches!(response, proto::Response::Err(_)));
+        assert!(matches!(response, proto::Response::EndpointError(_)));
         assert_eq!(fs::metadata(outside.join("secret")).unwrap().len(), 6);
     }
 }

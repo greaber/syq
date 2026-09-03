@@ -335,6 +335,14 @@ pub enum Request {
         request_prefix: PathBytes,
         symlink_policy: OperatorSymlinkPolicy,
     },
+    /// Inspect the filesystem containing the receiver's retained destination
+    /// directory. Before anchoring this is the exact selected directory, or
+    /// the nearest existing ancestor of a missing destination.
+    DestinationFilesystemInfo {
+        /// Only meaningful for an existing selected destination directory.
+        /// Failure to prove emptiness is reported as None, not as an error.
+        check_empty: bool,
+    },
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {
         paths: Vec<PathBytes>,
@@ -502,6 +510,7 @@ pub enum Response {
     /// Absolute operator spelling plus device/inode of the securely opened
     /// directory, or None when an allowed missing suffix was reached.
     DirectorySelection(Option<DirectoryAnchor>),
+    DestinationFilesystemInfo(DestinationFilesystemInfo),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
     BatchPlan {
         partial_paths: Vec<std::result::Result<PathBytes, String>>,
@@ -510,7 +519,7 @@ pub enum Response {
         /// caller must apply directory changes before inspecting leaves.
         others: Option<Vec<Option<Entry>>>,
     },
-    Applied(Vec<Option<String>>),
+    Applied(Vec<Option<WireError>>),
     PartialSize(Option<u64>),
     Hashes(Vec<ContentDigest>),
     HeldHashes {
@@ -534,7 +543,53 @@ pub enum Response {
     /// inside the canonical frame encoding.
     ReceiptV2(#[serde(with = "serde_bytes")] Vec<u8>),
     Ok,
+    /// An endpoint operation failed with a preserved OS error number. Server
+    /// and authorization protocol failures continue to use Err(String).
+    EndpointError(WireError),
     Err(String),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct DestinationFilesystemInfo {
+    pub device: u64,
+    pub available_bytes: u64,
+    /// Filesystems that do not expose a meaningful inode population report
+    /// None rather than a misleading zero.
+    pub available_inodes: Option<u64>,
+    pub empty: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct WireError {
+    pub message: String,
+    pub raw_os_error: Option<i32>,
+}
+
+impl WireError {
+    pub fn as_str(&self) -> &str {
+        &self.message
+    }
+}
+
+impl From<String> for WireError {
+    fn from(message: String) -> Self {
+        WireError {
+            message,
+            raw_os_error: None,
+        }
+    }
+}
+
+impl From<&str> for WireError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]

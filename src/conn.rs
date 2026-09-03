@@ -151,6 +151,7 @@ fn worker_initialization_response(response: Response) -> Result<()> {
     match response {
         Response::Ok => Ok(()),
         Response::Err(error) => Err(WorkerInitializationError(error).into()),
+        Response::EndpointError(error) => Err(WorkerInitializationError(error.message).into()),
         other => Err(WorkerInitializationError(format!(
             "unexpected worker initialization response {other:?}"
         ))
@@ -371,7 +372,17 @@ pub(crate) fn tcp_socket_stats(_stream: &TcpStream) -> Option<TcpSocketStats> {
 pub fn ok(resp: Response, what: &str) -> Result<Response> {
     match resp {
         Response::Err(e) => Err(anyhow!("{what}: {e}")),
+        Response::EndpointError(error) => Err(endpoint_error(error)).context(what.to_owned()),
         r => Ok(r),
+    }
+}
+
+pub fn endpoint_error(error: WireError) -> anyhow::Error {
+    match error.raw_os_error {
+        Some(raw) => {
+            anyhow::Error::new(std::io::Error::from_raw_os_error(raw)).context(error.message)
+        }
+        None => anyhow!(error.message),
     }
 }
 
