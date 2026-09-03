@@ -1155,11 +1155,20 @@ pub fn run(args: Args) -> Result<i32> {
                     let conns = src_ep
                         .connect_with_sources(compress, initial_sources.clone())
                         .and_then(|src| {
+                            let copy_sources = if cfg!(target_os = "linux")
+                                && opts.same_host
+                                && !opts.insecure_links
+                            {
+                                initial_sources.clone()
+                            } else {
+                                Vec::new()
+                            };
                             Ok((
                                 src,
-                                dst_ep.connect_with_destination(
+                                dst_ep.connect_with_copy_capabilities(
                                     compress,
                                     initial_destination.clone(),
+                                    copy_sources,
                                 )?,
                             ))
                         });
@@ -1333,6 +1342,19 @@ pub fn run(args: Args) -> Result<i32> {
         Endpoint::Local { .. } => 0,
         Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
     };
+    // On Linux, each same-machine destination worker also claims the exact
+    // source capabilities from the source endpoint's broker before reporting
+    // ready. These are foreign-session claims even when both logical endpoints
+    // are local to the coordinator process.
+    let copy_local_claim_workers =
+        if cfg!(target_os = "linux") && opts.same_host && !opts.insecure_links {
+            maximum_workers
+        } else {
+            0
+        };
+    let source_independent_claim_workers = source_independent_claim_workers
+        .checked_add(copy_local_claim_workers)
+        .context("source worker count overflow")?;
     let registered_sources = register_source_roots(
         &mut *src_ctl,
         srcs,
@@ -5943,6 +5965,7 @@ impl Worker {
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
         if self.opts.same_host
+            && !self.opts.insecure_links
             && !self.opts.checksum
             && self.bwlimit.is_none()
             && job.entry.size > 0
@@ -6142,7 +6165,7 @@ impl Worker {
         self.set_inplace(idx, inplace);
         let mode = self.create_mode(job);
         let resp = self.dst.call(Request::CopyLocal {
-            src: job.src.clone(),
+            source: job.source.clone(),
             dst: job.dst.clone(),
             inplace,
             allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
@@ -6170,7 +6193,7 @@ impl Worker {
                 }
                 Ok(true)
             }
-            Response::Err(e) if e.contains("EXDEV") => Ok(false),
+            Response::CopyLocalUnsupported => Ok(false),
             Response::Err(e) => bail!("{e}"),
             other => bail!("unexpected response {other:?}"),
         }

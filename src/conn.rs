@@ -2179,12 +2179,19 @@ impl Endpoint {
         self.connect_with_role(compress, ConnectionRole::SourceWorker { roots })
     }
 
-    pub(crate) fn connect_with_destination(
+    pub(crate) fn connect_with_copy_capabilities(
         &self,
         compress: bool,
         destination: Option<DestinationRoot>,
+        copy_sources: Vec<RegisteredSourceRoot>,
     ) -> Result<Box<dyn Conn>> {
-        self.connect_with_role(compress, ConnectionRole::DestinationWorker { destination })
+        self.connect_with_role(
+            compress,
+            ConnectionRole::DestinationWorker {
+                destination,
+                copy_sources,
+            },
+        )
     }
 
     fn connect_with_role(&self, compress: bool, role: ConnectionRole) -> Result<Box<dyn Conn>> {
@@ -2200,15 +2207,28 @@ impl Endpoint {
                 match role {
                     ConnectionRole::DestinationWorker {
                         destination: Some(destination),
-                    } => conn
-                        .ops
-                        .initialize_destination(&destination)
-                        .map_err(|error| {
-                            WorkerInitializationError(format!(
-                                "initialize local destination worker: {error:#}"
-                            ))
-                        })?,
-                    ConnectionRole::DestinationWorker { destination: None } => {
+                        copy_sources,
+                    } => {
+                        conn.ops
+                            .initialize_destination(&destination)
+                            .map_err(|error| {
+                                WorkerInitializationError(format!(
+                                    "initialize local destination worker: {error:#}"
+                                ))
+                            })?;
+                        if !copy_sources.is_empty() {
+                            conn.ops
+                                .initialize_copy_sources(&copy_sources)
+                                .map_err(|error| {
+                                    WorkerInitializationError(format!(
+                                        "initialize local copy sources: {error:#}"
+                                    ))
+                                })?;
+                        }
+                    }
+                    ConnectionRole::DestinationWorker {
+                        destination: None, ..
+                    } => {
                         return Err(WorkerInitializationError(
                             "local destination worker requires a registered root".into(),
                         )
@@ -2393,7 +2413,10 @@ mod tests {
 
         // Match the remote server's non-control gate for destination workers
         // too; this direct trait method must not be a role bypass.
-        let role = ConnectionRole::DestinationWorker { destination: None };
+        let role = ConnectionRole::DestinationWorker {
+            destination: None,
+            copy_sources: Vec::new(),
+        };
         let mut destination = LocalConn::new(&role, Default::default());
         let error = destination
             .native_remove(
@@ -2570,12 +2593,14 @@ mod tests {
                 role:
                     ConnectionRole::DestinationWorker {
                         destination: Some(destination),
+                        copy_sources,
                     },
                 ..
             } = hello
             else {
                 panic!("destination initialization was not carried in Hello");
             };
+            assert!(copy_sources.is_empty());
             assert_eq!(destination.request_prefix, b"destination");
 
             let mut writer = FrameWriter::new(socket, false);
@@ -2606,6 +2631,7 @@ mod tests {
             Vec::new(),
             ConnectionRole::DestinationWorker {
                 destination: Some(destination),
+                copy_sources: Vec::new(),
             },
         )
         .unwrap();

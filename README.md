@@ -254,15 +254,17 @@ its mutable directory name. Replacing an exact selected leaf is an error, while
 changed-source retry remains available for entries beneath a selected
 directory. On macOS this descriptor-bound symlink operation requires macOS 13
 or newer; older releases fail source registration rather than fall back to a
-name-based read. Same-machine `CopyLocal` source opens and the canonical-path
-self-copy check still use legacy pathnames and are the remaining
-source-confinement work. This is therefore not yet a complete hostile-namespace
-guarantee for copies that take the local-copy optimization. Copy also gives
-every destination worker the selected directory descriptor; destination
-observation, directory and special-file creation, metadata changes, and
-planned non-recursive deletion are relative to that descriptor. Destination
-scanning, including the walk that plans `--delete`, is relative to it too and
-never follows descendant symlinks.
+name-based read. On Linux, the same-machine `CopyLocal` optimization gives its
+destination worker both endpoints' exact capabilities during authenticated
+startup, then opens the source and destination relative to those descriptors.
+Rsync-mode `--insecure-links` skips that optimization because its explicitly
+unconfined source names cannot be represented by the capability-only request.
+The canonical-path directory self-copy preflight remains source-confinement
+work. Copy also gives every destination worker the selected directory
+descriptor; destination observation, directory and special-file creation,
+metadata changes, and planned non-recursive deletion are relative to that
+descriptor. Destination scanning, including the walk that plans `--delete`, is
+relative to it too and never follows descendant symlinks.
 Rsync-mode `--insecure-links` is the explicit compatibility opt-out: that
 session uses the legacy unconfined pathname discovery and content-read paths,
 including traversal through symlinked `--files-from` ancestors. Native
@@ -272,9 +274,10 @@ Registration also budgets the process's currently open descriptors, one
 retained parent descriptor per source root and one object descriptor per exact
 leaf for the registry, control connection, and every worker that may share its
 process, plus conservative per-worker file-cache, transport, and concurrent
-independent-worker broker-claim overhead. If the endpoint's open-file limit
-cannot hold that set, the copy fails before destination mutation with guidance
-to reduce selectors or `--connections`.
+independent-worker broker-claim overhead. Same-machine Linux copies include
+the destination workers' cross-session claims in that admission check. If the
+endpoint's open-file limit cannot hold that set, the copy fails before
+destination mutation with guidance to reduce selectors or `--connections`.
 Regular-file destination transfer state has not all moved to
 descriptor-relative access yet either. The default therefore rejects
 links present during preflight, while the remaining containment work must also
