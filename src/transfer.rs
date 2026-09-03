@@ -2244,14 +2244,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             loop {
                 match dst_ctl.recv() {
-                    Ok(Response::Receipt(envelope)) => {
-                        println!(
-                            "{}{}",
-                            crate::receipt::RECEIPT_LINE_PREFIX,
-                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(envelope)
-                        );
-                        break;
-                    }
                     Ok(Response::ReceiptV2(frame)) => {
                         let terminal = match crate::receipt_v2::transport_frame_is_end(&frame) {
                             Ok(terminal) => terminal,

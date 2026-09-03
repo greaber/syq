@@ -67,6 +67,19 @@ pub(crate) struct ReceiptPolicyV2 {
 }
 
 impl ReceiptPolicyV2 {
+    /// A minimal valid policy for tests that need a grant but do not
+    /// exercise receipts.
+    #[cfg(test)]
+    pub(crate) fn minimal_for_tests() -> Self {
+        ReceiptPolicyV2 {
+            required: true,
+            hashed: false,
+            max_records: 1024,
+            max_plaintext_bytes: 1024 * 1024,
+            delivery: ReceiptDeliveryV2::DetachedSignedPlaintext,
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.required {
             bail!("receipt v2 policy must require a receipt");

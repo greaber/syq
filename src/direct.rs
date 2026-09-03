@@ -16,7 +16,7 @@ struct ReceiptExpectation {
     enrollment_id: EnrollmentId,
     request_id: RequestId,
     recipient_secret: Option<crate::receipt_v2::RecipientSecret>,
-    policy: Option<crate::receipt_v2::ReceiptPolicyV2>,
+    policy: crate::receipt_v2::ReceiptPolicyV2,
     grant_digest: Option<[u8; 32]>,
 }
 
@@ -59,15 +59,8 @@ fn receipt_settlement_outcome(
     }
 }
 
-/// The receipt envelope is bounded at 64 MiB; allow for base64 and slack.
-const MAX_RECEIPT_LINE_BYTES: usize = 96 * 1024 * 1024;
 const MAX_RECEIPT_V2_LINE_BYTES: usize = 192 * 1024;
 const MAX_RECEIPT_V2_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
-
-enum CapturedReceipt {
-    V1(Vec<u8>),
-    V2(CapturedReceiptV2),
-}
 
 struct CapturedReceiptV2 {
     file: std::fs::File,
@@ -140,31 +133,21 @@ impl Iterator for CapturedFrames<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ReceiptLineKind {
-    V1,
-    V2,
-}
-
 /// Pass the orchestrator's stdout through byte for byte, keeping only the
 /// receipt marker lines to ourselves. Used only when a receipt is expected;
 /// other transfers inherit stdout untouched. V2 frames are decoded one line
 /// at a time and spooled rather than accumulated in memory.
-fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
-    relay_stdout_bounded(stdout, MAX_RECEIPT_LINE_BYTES)
+fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceiptV2>> {
+    relay_stdout_bounded(stdout)
 }
 
 /// Streams every ordinary line straight through without holding more than
 /// one buffer of it, so a hostile orchestrator cannot make this machine
 /// buffer an arbitrarily long line; only a receipt line is collected, up to
 /// its protocol-specific limit.
-fn relay_stdout_bounded(
-    stdout: impl std::io::Read,
-    legacy_limit: usize,
-) -> Result<Option<CapturedReceipt>> {
-    let v1_prefix = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes();
+fn relay_stdout_bounded(stdout: impl std::io::Read) -> Result<Option<CapturedReceiptV2>> {
     let v2_prefix = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes();
-    let decision_len = v1_prefix.len().max(v2_prefix.len());
+    let decision_len = v2_prefix.len();
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
     let mut out = std::io::stdout().lock();
     let mut receipt = None;
@@ -172,7 +155,7 @@ fn relay_stdout_bounded(
     // decision; then either the receipt payload being collected or nothing.
     let mut head: Vec<u8> = Vec::with_capacity(decision_len);
     let mut decided = false;
-    let mut capturing: Option<(ReceiptLineKind, Vec<u8>)> = None;
+    let mut capturing: Option<Vec<u8>> = None;
     let finish_capture = |payload: &mut Vec<u8>| {
         while payload
             .last()
@@ -202,33 +185,27 @@ fn relay_stdout_bounded(
                 if head.len() >= decision_len || ends_line {
                     decided = true;
                     if head.starts_with(v2_prefix) {
-                        capturing = Some((ReceiptLineKind::V2, head[v2_prefix.len()..].to_vec()));
-                    } else if head.starts_with(v1_prefix) {
-                        capturing = Some((ReceiptLineKind::V1, head[v1_prefix.len()..].to_vec()));
+                        capturing = Some(head[v2_prefix.len()..].to_vec());
                     } else {
                         out.write_all(&head)
                             .context("relay remote orchestrator output")?;
                     }
                     head.clear();
                 }
-            } else if let Some((_, payload)) = capturing.as_mut() {
+            } else if let Some(payload) = capturing.as_mut() {
                 payload.extend_from_slice(segment);
             } else {
                 out.write_all(segment)
                     .context("relay remote orchestrator output")?;
             }
-            if let Some((kind, payload)) = capturing.as_mut() {
-                let limit = match kind {
-                    ReceiptLineKind::V1 => legacy_limit,
-                    ReceiptLineKind::V2 => MAX_RECEIPT_V2_LINE_BYTES,
-                };
-                if payload.len() > limit {
-                    bail!("the relayed receipt line exceeds {limit} bytes");
+            if let Some(payload) = capturing.as_mut() {
+                if payload.len() > MAX_RECEIPT_V2_LINE_BYTES {
+                    bail!("the relayed receipt line exceeds {MAX_RECEIPT_V2_LINE_BYTES} bytes");
                 }
             }
             if ends_line {
-                if let Some((kind, mut payload)) = capturing.take() {
-                    store_receipt_line(&mut receipt, kind, finish_capture(&mut payload))?;
+                if let Some(mut payload) = capturing.take() {
+                    store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
                 } else {
                     out.flush().context("relay remote orchestrator output")?;
                 }
@@ -240,47 +217,28 @@ fn relay_stdout_bounded(
     // Output that ended without a newline.
     if !head.is_empty() {
         if head.starts_with(v2_prefix) {
-            capturing = Some((ReceiptLineKind::V2, head[v2_prefix.len()..].to_vec()));
-        } else if head.starts_with(v1_prefix) {
-            capturing = Some((ReceiptLineKind::V1, head[v1_prefix.len()..].to_vec()));
+            capturing = Some(head[v2_prefix.len()..].to_vec());
         } else {
             out.write_all(&head)
                 .context("relay remote orchestrator output")?;
         }
     }
-    if let Some((kind, mut payload)) = capturing.take() {
-        store_receipt_line(&mut receipt, kind, finish_capture(&mut payload))?;
+    if let Some(mut payload) = capturing.take() {
+        store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
     }
     out.flush().context("relay remote orchestrator output")?;
     Ok(receipt)
 }
 
-fn store_receipt_line(
-    captured: &mut Option<CapturedReceipt>,
-    kind: ReceiptLineKind,
-    payload: Vec<u8>,
-) -> Result<()> {
-    match kind {
-        ReceiptLineKind::V1 => {
-            if captured.is_some() {
-                bail!("the remote orchestrator relayed more than one legacy receipt line");
-            }
-            *captured = Some(CapturedReceipt::V1(payload));
-        }
-        ReceiptLineKind::V2 => {
-            let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
-                .decode(payload.trim_ascii())
-                .context("decode a receipt v2 frame relayed from the source host")?;
-            if captured.is_none() {
-                *captured = Some(CapturedReceipt::V2(CapturedReceiptV2::new()?));
-            }
-            let Some(CapturedReceipt::V2(receipt)) = captured.as_mut() else {
-                bail!("the remote orchestrator mixed receipt protocol versions");
-            };
-            receipt.push(&encoded)?;
-        }
-    }
-    Ok(())
+fn store_receipt_line(captured: &mut Option<CapturedReceiptV2>, payload: Vec<u8>) -> Result<()> {
+    let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(payload.trim_ascii())
+        .context("decode a receipt v2 frame relayed from the source host")?;
+    let receipt = match captured {
+        Some(receipt) => receipt,
+        None => captured.insert(CapturedReceiptV2::new()?),
+    };
+    receipt.push(&encoded)
 }
 
 /// Verify hostB's receipt against the grant this machine signed. A missing,
@@ -288,7 +246,7 @@ fn store_receipt_line(
 /// what the source-side orchestrator reported.
 fn settle_receipt(
     expectation: &ReceiptExpectation,
-    captured: Option<&mut CapturedReceipt>,
+    captured: Option<&mut CapturedReceiptV2>,
     src_host: &str,
     dst_host: &str,
     orchestrator_exit_code: i32,
@@ -300,78 +258,26 @@ fn settle_receipt(
             "the command-restricted receiver on {dst_host} issued no receipt through {src_host}; what landed cannot be verified"
         );
     };
-    if expectation.policy.is_some() {
-        return settle_receipt_v2(
-            expectation,
-            captured,
-            src_host,
-            dst_host,
-            orchestrator_exit_code,
-            emit_results,
-            verbose,
-        );
-    }
-    let CapturedReceipt::V1(payload) = captured else {
-        bail!("the receiver on {dst_host} returned a receipt protocol version that does not match the signed grant");
-    };
-    let envelope = base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(payload.trim_ascii())
-        .context("decode the receipt relayed from the source host")?;
-    let receipt = crate::receipt::verify(&envelope, &expectation.public_key)
-        .with_context(|| format!("verify the receipt from {dst_host}"))?;
-    if receipt.enrollment_id != expectation.enrollment_id
-        || receipt.request_id != expectation.request_id
-    {
-        bail!(
-            "the receipt from {dst_host} names a different grant than the one this transfer signed"
-        );
-    }
-    if receipt.refused > 0 {
-        bail!(
-            "the receiver on {dst_host} refused {} request(s) from {src_host}; first: {}",
-            receipt.refused,
-            receipt
-                .refusal_samples
-                .first()
-                .map(String::as_str)
-                .unwrap_or("(no message recorded)")
-        );
-    }
-    if receipt.incomplete_count > 0 {
-        let message = format!(
-            "{} in-place file(s) on {dst_host} were written but never completed",
-            receipt.incomplete_count
-        );
-        if orchestrator_exit_code == 0 {
-            bail!("{message}, yet {src_host} reported success");
-        }
-        eprintln!("syq: warning: {message}");
-    }
-    if verbose {
-        eprintln!(
-            "syq: receipt from {dst_host} verified: {} files published ({}), {} deleted, {} hashed, {} entries touched",
-            receipt.published_count,
-            crate::progress::human(receipt.published_bytes),
-            receipt.deleted_count,
-            receipt.observed_count,
-            receipt.entries
-        );
-    }
-    Ok(())
+    settle_receipt_v2(
+        expectation,
+        captured,
+        src_host,
+        dst_host,
+        orchestrator_exit_code,
+        emit_results,
+        verbose,
+    )
 }
 
 fn settle_receipt_v2(
     expectation: &ReceiptExpectation,
-    captured: &mut CapturedReceipt,
+    captured: &mut CapturedReceiptV2,
     src_host: &str,
     dst_host: &str,
     orchestrator_exit_code: i32,
     emit_results: bool,
     verbose: bool,
 ) -> Result<()> {
-    let CapturedReceipt::V2(captured) = captured else {
-        bail!("the receiver on {dst_host} returned a legacy receipt for a v2 grant");
-    };
     if !captured.ended {
         bail!("the receipt relayed through {src_host} has no terminal frame");
     }
@@ -379,10 +285,7 @@ fn settle_receipt_v2(
         .recipient_secret
         .as_ref()
         .context("the local HPKE receipt key is unavailable")?;
-    let policy = expectation
-        .policy
-        .as_ref()
-        .context("the signed receipt policy is unavailable")?;
+    let policy = &expectation.policy;
     if !matches!(
         policy.delivery,
         crate::receipt_v2::ReceiptDeliveryV2::AttachedEncrypted { .. }
@@ -858,7 +761,7 @@ fn run_remote(
                 enrollment_id: prepared.enrollment_id,
                 request_id: prepared.request_id,
                 recipient_secret: prepared.receipt_recipient_secret,
-                policy: Some(prepared.receipt_policy),
+                policy: prepared.receipt_policy,
                 grant_digest: Some(prepared.grant_digest),
             });
             if !args.quiet {
@@ -1449,138 +1352,16 @@ mod tests {
     }
 
     #[test]
-    fn receipts_are_verified_against_the_signed_grant() {
-        let keypair = ssh_key::private::Ed25519Keypair::from_seed(&[5; 32]);
-        let key = ssh_key::PrivateKey::new(keypair.into(), "syq-receipt-test").unwrap();
-        let enrollment_id = EnrollmentId::random();
-        let request_id = RequestId::fresh(1_900_000_000).unwrap();
-        let expectation = ReceiptExpectation {
-            public_key: key.public_key().to_openssh().unwrap(),
-            enrollment_id,
-            request_id,
-            recipient_secret: None,
-            policy: None,
-            grant_digest: None,
-        };
-        let mut ledger = crate::receipt::Ledger::default();
-        ledger.published.insert(
-            b"/dst/a".to_vec(),
-            crate::receipt::Published {
-                size: 3,
-                digest: None,
-                complete: true,
-            },
-        );
-        let encode = |ledger: &crate::receipt::Ledger, request_id| {
-            let receipt = ledger
-                .receipt(enrollment_id, request_id, 1_900_000_000, 1, 3)
-                .unwrap();
-            base64::engine::general_purpose::STANDARD_NO_PAD
-                .encode(crate::receipt::sign(&receipt, &key).unwrap())
-        };
-        let settle = |expectation: &ReceiptExpectation, payload: Option<&str>| {
-            let mut captured =
-                payload.map(|payload| CapturedReceipt::V1(payload.as_bytes().to_vec()));
-            settle_receipt(
-                expectation,
-                captured.as_mut(),
-                "host-a",
-                "host-b",
-                0,
-                false,
-                false,
-            )
-        };
-
-        let good = encode(&ledger, request_id);
-        settle(&expectation, Some(&good)).unwrap();
-        assert!(settle(&expectation, None).is_err());
-        assert!(settle(&expectation, Some("not a receipt")).is_err());
-
-        // The receipt must name the grant this machine signed.
-        let other = encode(&ledger, RequestId::fresh(1_900_000_001).unwrap());
-        assert!(settle(&expectation, Some(&other)).is_err());
-
-        // A refused request fails the transfer whatever hostA reported.
-        let mut refused = crate::receipt::Ledger::default();
-        refused.record_refusal("receiver mutation is outside the signed destination scopes");
-        let refused = encode(&refused, request_id);
-        assert!(settle(&expectation, Some(&refused)).is_err());
-
-        // An incomplete in-place file contradicts a successful orchestrator
-        // but is only a warning beside a failure it already reported.
-        let mut partial = crate::receipt::Ledger::default();
-        partial.published.insert(
-            b"/dst/image".to_vec(),
-            crate::receipt::Published {
-                size: 9,
-                digest: None,
-                complete: false,
-            },
-        );
-        let partial = encode(&partial, request_id);
-        assert!(settle(&expectation, Some(&partial)).is_err());
-        let mut captured = CapturedReceipt::V1(partial.as_bytes().to_vec());
-        settle_receipt(
-            &expectation,
-            Some(&mut captured),
-            "host-a",
-            "host-b",
-            23,
-            false,
-            false,
-        )
-        .unwrap();
-
-        // And it must verify against the enrollment's key.
-        let stranger = ssh_key::PrivateKey::new(
-            ssh_key::private::Ed25519Keypair::from_seed(&[6; 32]).into(),
-            "stranger",
-        )
-        .unwrap();
-        let mismatched = ReceiptExpectation {
-            public_key: stranger.public_key().to_openssh().unwrap(),
-            enrollment_id,
-            request_id,
-            recipient_secret: None,
-            policy: None,
-            grant_digest: None,
-        };
-        assert!(settle(&mismatched, Some(&good)).is_err());
-
-        // The relay keeps the receipt line, byte for byte, and passes
-        // everything else on, including bytes that are not UTF-8.
-        let mut output = b"syq: transferred 1 files\xff\r\n".to_vec();
-        output.extend_from_slice(crate::receipt::RECEIPT_LINE_PREFIX.as_bytes());
-        output.extend_from_slice(good.as_bytes());
-        output.extend_from_slice(b"\r\n");
-        let relayed = relay_stdout(output.as_slice()).unwrap().unwrap();
-        let CapturedReceipt::V1(relayed) = relayed else {
-            panic!("expected a legacy receipt");
-        };
-        assert_eq!(relayed, good.as_bytes());
+    fn relay_passes_output_through_and_spools_v2_frames() {
+        // Ordinary output streams through byte for byte, including bytes
+        // that are not UTF-8; a stream with no receipt lines captures
+        // nothing.
         assert!(relay_stdout(b"plain\n".as_slice()).unwrap().is_none());
-
-        // Ordinary lines stream through however long they are, a receipt
-        // line without a trailing newline still counts, and an oversized
-        // receipt line is refused instead of buffered.
-        let mut long = vec![b'x'; 300 * 1024];
-        long.push(b'\n');
-        long.extend_from_slice(crate::receipt::RECEIPT_LINE_PREFIX.as_bytes());
-        long.extend_from_slice(good.as_bytes());
-        let relayed = relay_stdout_bounded(long.as_slice(), 4096)
+        assert!(relay_stdout(b"syq: transferred 1 files\xff\r\n".as_slice())
             .unwrap()
-            .unwrap();
-        let CapturedReceipt::V1(relayed) = relayed else {
-            panic!("expected a legacy receipt");
-        };
-        assert_eq!(relayed, good.as_bytes());
-        let mut oversized = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
-        oversized.extend(std::iter::repeat_n(b'A', 5000));
-        oversized.push(b'\n');
-        assert!(relay_stdout_bounded(oversized.as_slice(), 4096).is_err());
+            .is_none());
 
-        // V2 marker lines are decoded and spooled as separate bounded frames,
+        // Marker lines are decoded and spooled as separate bounded frames,
         // not accumulated into one receipt allocation.
         let frames = [
             crate::receipt_v2::TransportFrameV2::Start {
@@ -1597,7 +1378,7 @@ mod tests {
             },
         ]
         .map(|frame| crate::receipt_v2::encode_transport_frame(&frame).unwrap());
-        let mut output = Vec::new();
+        let mut output = b"ordinary line\n".to_vec();
         for frame in &frames {
             output.extend_from_slice(crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes());
             output.extend_from_slice(
@@ -1607,11 +1388,17 @@ mod tests {
             );
             output.push(b'\n');
         }
-        let Some(CapturedReceipt::V2(mut captured)) = relay_stdout(&output[..]).unwrap() else {
-            panic!("expected captured receipt v2 frames");
-        };
+        let mut captured = relay_stdout(&output[..])
+            .unwrap()
+            .expect("captured receipt v2 frames");
         let captured: Vec<Vec<u8>> = captured.frames().unwrap().map(Result::unwrap).collect();
         assert_eq!(captured, frames);
+
+        // An oversized marker line is refused instead of buffered.
+        let mut oversized = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
+        oversized.extend(std::iter::repeat_n(b'A', MAX_RECEIPT_V2_LINE_BYTES + 1));
+        oversized.push(b'\n');
+        assert!(relay_stdout(oversized.as_slice()).is_err());
     }
 
     #[test]
