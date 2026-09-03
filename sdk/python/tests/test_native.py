@@ -469,6 +469,90 @@ if __name__ == "__main__":
 
 
 class ReceiverAttestedDecodingTests(unittest.TestCase):
+    @staticmethod
+    def _final_state_decoder():
+        from syq.protocol import AutomationDecoder
+
+        decoder = AutomationDecoder(prune=False, mapping=False, dry_run=False)
+        decoder.feed(
+            json.dumps(
+                {
+                    "schema": "syq.automation",
+                    "schema_version": 1,
+                    "seq": 0,
+                    "type": "run",
+                    "run_id": "attested",
+                    "started_at": 1,
+                    "syq_version": "0.0.0",
+                    "mode": "cp",
+                    "prune": False,
+                    "mapping": False,
+                    "dry_run": False,
+                    "endpoints": [
+                        {"role": "source", "kind": "ssh", "host": "a"},
+                        {"role": "destination", "kind": "ssh", "host": "b"},
+                    ],
+                }
+            ).encode()
+        )
+        return decoder
+
+    @staticmethod
+    def _final_state(metadata=None, digest=None):
+        record = {
+            "schema": "syq.automation",
+            "schema_version": 1,
+            "seq": 1,
+            "type": "final_state",
+            "provenance": "receiver_attested",
+            "scope": 0,
+            "dst": {"encoding": "utf-8", "value": "tree/file"},
+            "object": {
+                "state": "present",
+                "kind": "file",
+                "size": 3,
+                "metadata": metadata
+                or {
+                    "mode": 0o644,
+                    "uid": 0,
+                    "gid": 0,
+                    "mtime": 1,
+                    "mtime_nsec": 0,
+                    "rdev": 0,
+                },
+            },
+        }
+        if digest is not None:
+            record["object"]["digest"] = digest
+        return json.dumps(record).encode()
+
+    def test_signed_mtimes_decode_and_bad_digests_are_rejected(self) -> None:
+        # A pre-1970 mtime is schema-valid signed data.
+        decoder = self._final_state_decoder()
+        event = decoder.feed(
+            self._final_state(
+                metadata={
+                    "mode": 0o644,
+                    "uid": 0,
+                    "gid": 0,
+                    "mtime": -1,
+                    "mtime_nsec": 0,
+                    "rdev": 0,
+                }
+            )
+        )
+        assert event.metadata is not None
+        self.assertEqual(event.metadata.mtime, -1)
+
+        for digest in (
+            {"algorithm": "sha256", "value": "ab" * 32},
+            {"algorithm": "blake3", "value": "not-hex"},
+            {"algorithm": "blake3", "value": "AB" * 32},
+        ):
+            decoder = self._final_state_decoder()
+            with self.assertRaises(syq.SyqProtocolError):
+                decoder.feed(self._final_state(digest=digest))
+
     def test_attested_records_decode_with_the_receiver_vocabulary(self) -> None:
         from syq.protocol import AutomationDecoder
 

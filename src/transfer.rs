@@ -2443,14 +2443,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 }
             );
         }
-        if args.stats {
-            let (
-                files_label,
-                unchanged_files_label,
-                bytes_label,
-                unchanged_bytes_label,
-                bytes_work,
-            ) = if opts.dry_run {
+    }
+    // --stats is additional human output, not the summary line the local
+    // attested settlement re-renders; a delegated coordinator keeps it.
+    if !args.quiet && !aborted && args.stats {
+        let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
+            if opts.dry_run {
                 (
                     "files needing content work",
                     "files with unchanged content",
@@ -2467,11 +2465,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     done,
                 )
             };
-            let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
+        let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
                 matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
             });
-            let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-            println!(
+        let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
+        println!(
                 "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
@@ -2495,7 +2493,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 },
                 tcp_stats,
             );
-        }
     }
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);

@@ -548,96 +548,124 @@
           "$ref": "#/$defs/taggedPath"
         },
         "object": {
-          "type": "object",
-          "properties": {
-            "state": {
-              "enum": [
-                "present",
-                "absent",
-                "observation_failed"
-              ]
-            },
-            "kind": {
-              "enum": [
-                "dir",
-                "file",
-                "symlink",
-                "fifo",
-                "socket",
-                "character_device",
-                "block_device",
-                "other"
-              ]
-            },
-            "size": {
-              "$ref": "#/$defs/u64"
-            },
-            "metadata": {
+          "oneOf": [
+            {
               "type": "object",
               "properties": {
-                "mode": {
+                "state": {
+                  "const": "present"
+                },
+                "kind": {
+                  "enum": [
+                    "dir",
+                    "file",
+                    "symlink",
+                    "fifo",
+                    "socket",
+                    "character_device",
+                    "block_device",
+                    "other"
+                  ]
+                },
+                "size": {
                   "$ref": "#/$defs/u64"
                 },
-                "uid": {
-                  "$ref": "#/$defs/u64"
+                "metadata": {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "uid": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "gid": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "mtime": {
+                      "type": "integer"
+                    },
+                    "mtime_nsec": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "rdev": {
+                      "$ref": "#/$defs/u64"
+                    }
+                  },
+                  "required": [
+                    "mode",
+                    "uid",
+                    "gid",
+                    "mtime",
+                    "mtime_nsec",
+                    "rdev"
+                  ],
+                  "additionalProperties": false
                 },
-                "gid": {
-                  "$ref": "#/$defs/u64"
+                "digest": {
+                  "type": "object",
+                  "properties": {
+                    "algorithm": {
+                      "const": "blake3"
+                    },
+                    "value": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  },
+                  "required": [
+                    "algorithm",
+                    "value"
+                  ],
+                  "additionalProperties": false
                 },
-                "mtime": {
-                  "type": "integer"
+                "symlink_target": {
+                  "$ref": "#/$defs/taggedPath"
                 },
-                "mtime_nsec": {
-                  "$ref": "#/$defs/u64"
-                },
-                "rdev": {
-                  "$ref": "#/$defs/u64"
+                "observation_error": {
+                  "type": "string"
                 }
               },
               "required": [
-                "mode",
-                "uid",
-                "gid",
-                "mtime",
-                "mtime_nsec",
-                "rdev"
+                "state",
+                "kind",
+                "size",
+                "metadata"
               ],
               "additionalProperties": false
             },
-            "digest": {
+            {
               "type": "object",
               "properties": {
-                "algorithm": {
-                  "const": "blake3"
-                },
-                "value": {
-                  "type": "string",
-                  "pattern": "^[0-9a-f]{64}$"
+                "state": {
+                  "const": "absent"
                 }
               },
               "required": [
-                "algorithm",
-                "value"
+                "state"
               ],
               "additionalProperties": false
             },
-            "symlink_target": {
-              "$ref": "#/$defs/taggedPath"
-            },
-            "observation_error": {
-              "type": "string"
-            },
-            "code": {
-              "$ref": "#/$defs/receiptCode"
-            },
-            "message": {
-              "type": "string"
+            {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "const": "observation_failed"
+                },
+                "code": {
+                  "$ref": "#/$defs/receiptCode"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "state",
+                "code"
+              ],
+              "additionalProperties": false
             }
-          },
-          "required": [
-            "state"
-          ],
-          "additionalProperties": false
+          ]
         }
       },
       "required": [

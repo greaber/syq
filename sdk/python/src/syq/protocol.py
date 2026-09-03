@@ -41,6 +41,7 @@ from .models import (
 SCHEMA = "syq.automation"
 SCHEMA_VERSION = 1
 _MAX_U64 = (1 << 64) - 1
+_MAX_I64 = (1 << 63) - 1
 _EnumT = TypeVar("_EnumT")
 
 
@@ -65,11 +66,16 @@ def _integer(record: dict[str, Any], key: str, *, nonnegative: bool = True) -> i
     value = record.get(key)
     if not isinstance(value, int) or isinstance(value, bool):
         raise SyqProtocolError(f"automation field {key!r} must be an integer")
-    if nonnegative and value < 0:
-        raise SyqProtocolError(f"automation field {key!r} must not be negative")
-    if nonnegative and value > _MAX_U64:
+    if nonnegative:
+        if value < 0:
+            raise SyqProtocolError(f"automation field {key!r} must not be negative")
+        if value > _MAX_U64:
+            raise SyqProtocolError(
+                f"automation field {key!r} exceeds the unsigned 64-bit range"
+            )
+    elif not -_MAX_I64 - 1 <= value <= _MAX_I64:
         raise SyqProtocolError(
-            f"automation field {key!r} exceeds the unsigned 64-bit range"
+            f"automation field {key!r} exceeds the signed 64-bit range"
         )
     return value
 
@@ -314,10 +320,17 @@ class AutomationDecoder:
             if digest_record is not None:
                 if not isinstance(digest_record, dict):
                     raise SyqProtocolError("final_state digest is not an object")
-                digest = AttestedDigest(
-                    algorithm=_string(digest_record, "algorithm"),
-                    value=_string(digest_record, "value"),
-                )
+                algorithm = _string(digest_record, "algorithm")
+                if algorithm != "blake3":
+                    raise SyqProtocolError(
+                        "final_state digest algorithm is not blake3"
+                    )
+                value = _string(digest_record, "value")
+                if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                    raise SyqProtocolError(
+                        "final_state digest value is not 64 lowercase hex digits"
+                    )
+                digest = AttestedDigest(algorithm=algorithm, value=value)
             metadata_record = state.get("metadata")
             metadata = None
             if metadata_record is not None:
@@ -327,7 +340,7 @@ class AutomationDecoder:
                     mode=_integer(metadata_record, "mode"),
                     uid=_integer(metadata_record, "uid"),
                     gid=_integer(metadata_record, "gid"),
-                    mtime=_integer(metadata_record, "mtime"),
+                    mtime=_integer(metadata_record, "mtime", nonnegative=False),
                     mtime_nsec=_integer(metadata_record, "mtime_nsec"),
                     rdev=_integer(metadata_record, "rdev"),
                 )

@@ -196,8 +196,9 @@ individual `delete` record); `deletions_planned` and
 `deletions_blocked` never appear because planning and `--max-delete`
 blocking are coordinator concepts. Its `errors` count equals the
 receiver-attested `error` records emitted on the stream: one per
-failed or incomplete operation, per refusal, and per failed
-final-state observation.
+failed or incomplete operation, per refusal, and per failed or
+partial final-state observation (a present object whose hash or link
+target could not be read).
 
 The human summary is rendered from this same record, so the numbers a
 person reads and a machine parses cannot disagree.

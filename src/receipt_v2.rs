@@ -966,6 +966,21 @@ pub(crate) fn emit_automation_records(
                         if let Some(target) = symlink_target {
                             fields.insert("symlink_target".into(), tagged_path(&target));
                         }
+                        if let Some(error) = &observation_error {
+                            // The object landed but part of its final state
+                            // (hash or link target) could not be attested;
+                            // that failure counts like any other.
+                            writer.emit_value(serde_json::json!({
+                                "type": "error",
+                                "provenance": "receiver_attested",
+                                "class": "io",
+                                "message": format!(
+                                    "final state of {} was only partly observed: {error}",
+                                    String::from_utf8_lossy(&record.path)
+                                ),
+                            }));
+                            errors_emitted += 1;
+                        }
                         if let Some(error) = observation_error {
                             fields.insert("observation_error".into(), error.into());
                         }
@@ -1604,6 +1619,28 @@ mod tests {
                 diagnostic: None,
             },
         }));
+        // A present object whose closure hash could not be taken: the object
+        // is attested, but the partial observation still counts as an error.
+        stream.append(&RecordV2::FinalState(FinalStateRecordV2 {
+            sequence: stream.next_sequence(),
+            scope: 0,
+            path: b"partial".to_vec(),
+            object: FinalObjectV2::Present {
+                kind: Kind::File,
+                size: 4,
+                digest: None,
+                symlink_target: None,
+                metadata: ObjectMetadataV2 {
+                    mode: 0o100644,
+                    uid: 1000,
+                    gid: 1000,
+                    mtime: 5,
+                    mtime_nsec: 6,
+                    rdev: 0,
+                },
+                observation_error: Some("hash final file: boom".to_string()),
+            },
+        }));
         let issued = stream
             .finish(ReceiptClosureV2 {
                 enrollment_id,
@@ -1611,7 +1648,7 @@ mod tests {
                 grant_digest,
                 issued_at: 1_900_000_001,
                 policy: policy.clone(),
-                entries_touched: 1,
+                entries_touched: 2,
                 transferred_bytes: 0,
                 signing_key: &signing_key,
             })
@@ -1648,7 +1685,7 @@ mod tests {
         let sink = Sink::default();
         let writer = crate::results::ResultsWriter::new(Box::new(sink.clone()));
         let emitted = emit_automation_records(&mut verified, &writer, "aborted", 1, 3).unwrap();
-        assert_eq!(emitted.errors, 3);
+        assert_eq!(emitted.errors, 4);
         let automation = sink.0.lock().unwrap().clone();
         let records: Vec<serde_json::Value> = String::from_utf8(automation)
             .unwrap()
@@ -1679,6 +1716,8 @@ mod tests {
                 "error",
                 "error",
                 "final_state",
+                "error",
+                "final_state",
                 "result"
             ]
         );
@@ -1691,11 +1730,21 @@ mod tests {
         assert_eq!(records[3]["class"], "io");
         assert_eq!(records[3]["code"], "observation_failed");
         assert_eq!(records[4]["object"]["state"], "observation_failed");
+        assert_eq!(records[5]["class"], "io");
+        assert!(records[5]["message"]
+            .as_str()
+            .unwrap()
+            .contains("hash final file: boom"));
+        assert_eq!(records[6]["object"]["state"], "present");
+        assert_eq!(
+            records[6]["object"]["observation_error"],
+            "hash final file: boom"
+        );
         let result = records.last().unwrap();
         assert_eq!(result["status"], "aborted");
         assert_eq!(result["receipt_status"], "incomplete");
         assert_eq!(result["exit_code"], 1);
-        assert_eq!(result["errors"], 3);
+        assert_eq!(result["errors"], 4);
     }
 
     #[test]

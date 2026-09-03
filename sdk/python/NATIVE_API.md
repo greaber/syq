@@ -480,8 +480,9 @@ shared execution trace and terminal result.
 Typed operations consume the stable automation stream. `on_event` receives
 frozen dataclasses corresponding to its known records: `RunEvent`, sampled
 `ProgressEvent`, dry-run `TraceEvent` or live `OperationResult`, `ErrorEvent`,
-and the terminal `CpResult`. Additive unknown record types are validated for a
-well-formed envelope and sequence position, then ignored.
+receiver-attested `FinalStateEvent`, and the terminal `CpResult`. Additive
+unknown record types are validated for a well-formed envelope and sequence
+position, then ignored.
 
 The product's [automation-v1 contract](../../docs/automation-v1.md) and
 [JSON Schema](../../schemas/automation-v1.schema.json), not this document, own
@@ -506,8 +507,10 @@ operation succeeded or the process status is zero.
 Successful operation events are not retained by default. A copy may contain
 millions of entries; callers that need a ledger consume `on_event` and write
 one. Terminal aggregates are retained in the returned `CpResult`. Prune-only
-deletion totals are optional fields on that same type and are required exactly
-when the run has `prune=True`.
+deletion totals are optional fields on that same type. An ordinary terminal
+carries all three exactly when the run has `prune=True`; a receiver-attested
+terminal carries only `deletions_completed` (planning and `--max-delete`
+blocking are coordinator concepts a receipt cannot attest).
 
 ## Failure model
 
