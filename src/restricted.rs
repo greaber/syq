@@ -5608,6 +5608,8 @@ mod tests {
             inplace: true,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let settlement = authority.authorize(&mut prepare, false).unwrap();
@@ -5657,6 +5659,8 @@ mod tests {
             inplace: true,
             partial_id: [2; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let settlement = finished.authorize(&mut prepare, false).unwrap();
