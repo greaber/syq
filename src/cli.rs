@@ -166,7 +166,7 @@ pub struct Args {
     /// Copy symlinks as symlinks
     #[arg(short = 'l', long)]
     pub links: bool,
-    /// Permit unconfined traversal through symlinked source ancestors
+    /// Permit legacy traversal through symlinks in rsync operator paths and source descendants
     #[arg(long)]
     pub insecure_links: bool,
     /// Preserve permissions
@@ -525,18 +525,26 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
         .map(crate::bwlimit::parse_rate)
         .transpose()?
         .unwrap_or(0);
+    let symlink_policy = rsync_operator_symlink_policy(args.insecure_links);
     args.ignore_lines = ordered_ignore_lines(
         &args.ignore,
         &args.ignore_from,
         matches,
-        OperatorSymlinkPolicy::TrustedOwner,
+        symlink_policy,
         "--syq-ignore-from",
     )?;
     if let Some(f) = &args.files_from {
-        args.files_from_lines =
-            read_files_from(f, args.from0, OperatorSymlinkPolicy::TrustedOwner)?;
+        args.files_from_lines = read_files_from(f, args.from0, symlink_policy)?;
     }
     Ok(args)
+}
+
+pub(crate) fn rsync_operator_symlink_policy(insecure_links: bool) -> OperatorSymlinkPolicy {
+    if insecure_links {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::TrustedOwner
+    }
 }
 
 fn reject_remote_to_remote(args: &Args) -> Result<()> {
@@ -2091,8 +2099,10 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
-        parse_native_rm, parse_size, read_files_from_reader, Args, Placement, SourceSelection,
+        parse_native_rm, parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args,
+        Placement, SourceSelection,
     };
+    use crate::proto::OperatorSymlinkPolicy;
     use anyhow::{bail, Result};
     use clap::Parser;
 
@@ -2138,6 +2148,18 @@ mod tests {
         assert_eq!(
             read_files_from_reader(&b"a/./b\0./;literal\0"[..], true).unwrap(),
             [b"a/b".to_vec(), b";literal".to_vec()]
+        );
+    }
+
+    #[test]
+    fn insecure_links_is_the_rsync_operator_path_opt_out() {
+        assert_eq!(
+            rsync_operator_symlink_policy(false),
+            OperatorSymlinkPolicy::TrustedOwner
+        );
+        assert_eq!(
+            rsync_operator_symlink_policy(true),
+            OperatorSymlinkPolicy::FollowAll
         );
     }
 
