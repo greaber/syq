@@ -20,6 +20,45 @@ struct ReceiptExpectation {
     grant_digest: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReceiptSettlementOutcome {
+    results_status: &'static str,
+    exit_code: i32,
+    rejects_receipt: bool,
+}
+
+fn receipt_settlement_outcome(
+    receipt_status: crate::receipt_v2::ReceiptStatusV2,
+    refusals: u64,
+    orchestrator_exit_code: i32,
+) -> ReceiptSettlementOutcome {
+    let rejects_receipt = refusals > 0
+        || (receipt_status != crate::receipt_v2::ReceiptStatusV2::Clean
+            && orchestrator_exit_code == 0);
+    let exit_code = if rejects_receipt {
+        1
+    } else {
+        orchestrator_exit_code
+    };
+    let results_status = if receipt_status == crate::receipt_v2::ReceiptStatusV2::Incomplete {
+        // An incomplete receipt stream can omit operations. Never describe it
+        // as safe input for a per-entry retry, even when the coordinator also
+        // reported a conventional partial-transfer exit.
+        "aborted"
+    } else if refusals > 0 || orchestrator_exit_code == 25 {
+        "refused"
+    } else if exit_code == 0 {
+        "success"
+    } else {
+        "partial"
+    };
+    ReceiptSettlementOutcome {
+        results_status,
+        exit_code,
+        rejects_receipt,
+    }
+}
+
 /// The receipt envelope is bounded at 64 MiB; allow for base64 and slack.
 const MAX_RECEIPT_LINE_BYTES: usize = 96 * 1024 * 1024;
 const MAX_RECEIPT_V2_LINE_BYTES: usize = 192 * 1024;
@@ -420,20 +459,43 @@ fn settle_receipt_v2(
     })?;
 
     let terminal = receipt.terminal.clone();
+    let outcome = receipt_settlement_outcome(
+        terminal.status,
+        terminal.summary.refusals,
+        orchestrator_exit_code,
+    );
+    let settlement_error = if terminal.summary.refusals > 0 {
+        Some(format!(
+            "the receiver on {dst_host} refused {} request(s) from {src_host}; first: {}",
+            terminal.summary.refusals,
+            first_problem.as_deref().unwrap_or("(no detail recorded)")
+        ))
+    } else if terminal.status != crate::receipt_v2::ReceiptStatusV2::Clean
+        && orchestrator_exit_code == 0
+    {
+        Some(format!(
+            "the receiver on {dst_host} issued a {:?} receipt{}, yet {src_host} reported success",
+            terminal.status,
+            first_problem
+                .as_deref()
+                .map(|problem| format!("; first: {problem}"))
+                .unwrap_or_default()
+        ))
+    } else {
+        None
+    };
+    debug_assert_eq!(outcome.rejects_receipt, settlement_error.is_some());
     if emit_results {
         crate::receipt_v2::write_automation_results(
             &mut receipt,
             &mut std::io::stdout().lock(),
-            orchestrator_exit_code,
+            outcome.results_status,
+            outcome.exit_code,
         )
         .context("write receiver-attested --results stream")?;
     }
-    if terminal.summary.refusals > 0 {
-        bail!(
-            "the receiver on {dst_host} refused {} request(s) from {src_host}; first: {}",
-            terminal.summary.refusals,
-            first_problem.as_deref().unwrap_or("(no detail recorded)")
-        );
+    if let Some(message) = settlement_error {
+        bail!(message);
     }
     if terminal.status != crate::receipt_v2::ReceiptStatusV2::Clean {
         let message = format!(
@@ -444,9 +506,6 @@ fn settle_receipt_v2(
                 .map(|problem| format!("; first: {problem}"))
                 .unwrap_or_default()
         );
-        if orchestrator_exit_code == 0 {
-            bail!("{message}, yet {src_host} reported success");
-        }
         eprintln!("syq: warning: {message}");
     }
     if verbose {
@@ -1361,6 +1420,28 @@ mod tests {
         assert_eq!(broker_connection_limit(None, 8).unwrap(), 65);
         assert_eq!(broker_connection_limit(Some(128), 128).unwrap(), 129);
         assert!(broker_connection_limit(Some(usize::MAX), usize::MAX).is_err());
+    }
+
+    #[test]
+    fn receipt_settlement_preserves_terminal_outcomes() {
+        use crate::receipt_v2::ReceiptStatusV2::{Clean, Failed, Incomplete};
+
+        let cases = [
+            (Clean, 0, 0, "success", 0, false),
+            (Clean, 0, 23, "partial", 23, false),
+            (Clean, 0, 25, "refused", 25, false),
+            (Failed, 0, 0, "partial", 1, true),
+            (Failed, 1, 23, "refused", 1, true),
+            (Incomplete, 0, 0, "aborted", 1, true),
+            (Incomplete, 0, 23, "aborted", 23, false),
+            (Incomplete, 1, 23, "aborted", 1, true),
+        ];
+        for (receipt_status, refusals, coordinator, status, exit_code, rejects) in cases {
+            let outcome = receipt_settlement_outcome(receipt_status, refusals, coordinator);
+            assert_eq!(outcome.results_status, status);
+            assert_eq!(outcome.exit_code, exit_code);
+            assert_eq!(outcome.rejects_receipt, rejects);
+        }
     }
 
     #[test]

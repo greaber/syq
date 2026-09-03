@@ -317,9 +317,10 @@ jq -cs 'if (.[-1].type? // "") != "result"
 
 The jq program first checks the stream's terminal record: a results
 file without one is from a run that did not finish (a crash, a kill),
-and a terminal status other than `success` or `partial` (an aborted
-run, say) means queued entries were never settled — in both cases
-entries may have no records at all, so a retry manifest built from
+and a terminal status other than `success` or `partial` (an `aborted`
+incomplete receipt or a `refused` run) means queued entries were never
+settled or their receipt records may be missing. In both cases, entries
+may have no records at all, so a retry manifest built from
 what is there would look complete while it is not. With the
 terminal record present, the filter is what an exit code cannot
 express: which entries failed, and whether a retry could help.

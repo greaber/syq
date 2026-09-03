@@ -714,7 +714,8 @@ impl VerifiedReceiptV2 {
 pub(crate) fn write_automation_results(
     receipt: &mut VerifiedReceiptV2,
     out: &mut dyn Write,
-    orchestrator_exit_code: i32,
+    results_status: &'static str,
+    exit_code: i32,
 ) -> Result<()> {
     fn write_record(
         out: &mut dyn Write,
@@ -869,13 +870,6 @@ pub(crate) fn write_automation_results(
     })?;
 
     let terminal = &receipt.terminal;
-    let effective_exit_code = if terminal.status == ReceiptStatusV2::Clean {
-        orchestrator_exit_code
-    } else if orchestrator_exit_code == 0 {
-        1
-    } else {
-        orchestrator_exit_code
-    };
     let errors = terminal
         .summary
         .failed
@@ -888,9 +882,9 @@ pub(crate) fn write_automation_results(
         serde_json::json!({
             "type": "result",
             "provenance": "receiver_attested",
-            "status": if effective_exit_code == 0 { "success" } else { "partial" },
+            "status": results_status,
             "receipt_status": receipt_status_name(terminal.status),
-            "exit_code": effective_exit_code,
+            "exit_code": exit_code,
             "files_transferred": terminal.summary.published_files,
             "directories_ensured": directories_ensured,
             "symlinks_created": symlinks_created,
@@ -1509,7 +1503,7 @@ mod tests {
         assert_eq!(records.len(), 2);
 
         let mut automation = Vec::new();
-        write_automation_results(&mut verified, &mut automation, 0).unwrap();
+        write_automation_results(&mut verified, &mut automation, "refused", 25).unwrap();
         let records: Vec<serde_json::Value> = String::from_utf8(automation)
             .unwrap()
             .lines()
@@ -1522,7 +1516,10 @@ mod tests {
             records[2]["object"]["digest"]["value"],
             "0909090909090909090909090909090909090909090909090909090909090909"
         );
-        assert_eq!(records.last().unwrap()["receipt_status"], "clean");
+        let result = records.last().unwrap();
+        assert_eq!(result["status"], "refused");
+        assert_eq!(result["receipt_status"], "clean");
+        assert_eq!(result["exit_code"], 25);
 
         let mut missing = frames;
         missing.remove(1);
