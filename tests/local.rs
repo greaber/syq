@@ -7482,6 +7482,69 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn destination_file_write_refuses_descendant_symlink_swap() {
+    for no_tcp in [false, true] {
+        let t = Tmp::new();
+        let contents = vec![b'x'; 8 * 1024 * 1024];
+        write(&t.path("src/victim/file"), &contents);
+        fs::create_dir_all(t.path("dst/victim")).unwrap();
+        write(&t.path("outside/sentinel"), b"outside");
+
+        let mut command = compat_command();
+        command.args([
+            "-a",
+            "--bwlimit",
+            "1G",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
+        if no_tcp {
+            command.arg("--syq-no-tcp");
+        }
+        let mut child = command
+            .arg("--no-progress")
+            .env("SYQ_TEST_HOLD_PARTIAL_MS", "1000")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while partial_files(&t.path("dst/victim")).len() != 1
+            && std::time::Instant::now() < deadline
+        {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before preparing the destination sidecar"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            partial_files(&t.path("dst/victim")).len(),
+            1,
+            "destination sidecar was not prepared before timeout"
+        );
+
+        fs::rename(t.path("dst/victim"), t.path("displaced-victim")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("dst/victim")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+        assert_eq!(read(&t.path("outside/sentinel")), b"outside");
+        assert!(!t.path("outside/file").exists());
+        assert!(!t.path("displaced-victim/file").exists());
+        assert_eq!(partial_files(&t.path("displaced-victim")).len(), 1);
+        assert!(fs::symlink_metadata(t.path("dst/victim"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn destination_prune_scan_uses_retained_root_after_replacement() {
     for no_tcp in [false, true] {
         let t = Tmp::new();

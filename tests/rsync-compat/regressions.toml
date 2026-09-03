@@ -6,11 +6,11 @@ source = "https://github.com/RsyncProject/rsync/blob/7c20b077c980036a19587701cec
 title = "Parent-component symlink races can escape transfer roots"
 priority = "critical"
 impact = "security"
-status = "partial"
+status = "covered"
 claim = "Peer-selected source and destination paths must not be redirected outside their transfer roots by raced parent symlinks."
 compat_tests = ["sender-scan-dir-escape", "symlink-race-source", "symlink-race-dest", "symlink-race-relative-dest"]
-local_tests = ["destination_root_replacement_after_selection_cannot_redirect_worker", "self_copy_guard_sees_through_symlinks", "files_from_self_copy_through_symlinked_root_is_rejected"]
-note = "Source-side confinement and retained operator-named destination roots pass. Destination operations still resolve in-tree descendant components from relative pathnames, so descendant parent-component race confinement remains partial and highly visible."
+local_tests = ["destination_root_replacement_after_selection_cannot_redirect_worker", "destination_file_write_refuses_descendant_symlink_swap", "destination_prune_scan_refuses_descendant_symlink_swap", "self_copy_guard_sees_through_symlinks", "files_from_self_copy_through_symlinked_root_is_rejected"]
+note = "Default source discovery and reads plus destination scanning, mutation, file transfer, and publication use retained capabilities and refuse raced descendant symlinks. Rsync-mode --insecure-links is the documented explicit source-authority expansion, not a pathname fallback within the confined policy."
 
 [[regressions]]
 id = "rsync-359"
