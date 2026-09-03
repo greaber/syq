@@ -3742,6 +3742,359 @@ fn dry_run_creates_nothing() {
     assert!(out.contains("logical data:"), "{out}");
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_missing_destination_refuses_clear_byte_shortage_before_creation() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    let output = compat_command()
+        .args(["-a", &t.s("src/"), &t.s("dst"), "--no-progress"])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fresh destination capacity preflight failed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("7 B") && stderr.contains("1 B"), "{stderr}");
+    assert!(
+        !t.path("dst").exists(),
+        "the capacity preflight must precede destination creation"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_exact_destination_refuses_shortage_before_creating_missing_parents() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    let output = compat_command()
+        .args([
+            "-a",
+            &t.s("src/file"),
+            &t.s("missing/parent/file"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("fresh destination capacity preflight failed"));
+    assert!(
+        !t.path("missing").exists(),
+        "the capacity preflight must precede parent creation"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_existing_empty_destination_refuses_clear_byte_shortage_automatically() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+    fs::create_dir(t.path("dst")).unwrap();
+
+    let output = compat_command()
+        .args(["-a", &t.s("src/"), &t.s("dst"), "--no-progress"])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fresh destination capacity preflight failed"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_exact_existing_empty_directory_refuses_clear_byte_shortage() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+    fs::create_dir(t.path("dst")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", &t.s("src"), "--as-existing", &t.s("dst"), "-q"])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fresh destination capacity preflight failed"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nonempty_destination_skips_the_whole_copy_capacity_estimate() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+    write(&t.path("dst/existing"), b"keep");
+
+    let output = compat_command()
+        .args(["-a", &t.s("src/"), &t.s("dst"), "--no-progress"])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "0")
+        .env("SYQ_TEST_AVAILABLE_INODES", "0")
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/file")), b"payload");
+    assert_eq!(read(&t.path("dst/existing")), b"keep");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_destination_refuses_clear_inode_shortage() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    let output = compat_command()
+        .args(["-a", &t.s("src/"), &t.s("dst"), "--no-progress"])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "1048576")
+        .env("SYQ_TEST_AVAILABLE_INODES", "0")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("destination objects are required"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("0 inodes are available"), "{stderr}");
+    assert!(!t.path("dst").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_destination_dry_run_reports_capacity_sanity_check() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    let output = compat_command()
+        .args(["-an", &t.s("src/"), &t.s("dst"), "--no-progress"])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "1048576")
+        .env("SYQ_TEST_AVAILABLE_INODES", "10")
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("capacity: 7 B logical data required"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("10 inodes available"), "{stdout}");
+    assert!(stdout.contains("appears sufficient"), "{stdout}");
+    assert!(!t.path("dst").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_destination_dry_run_reports_insufficient_capacity() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    let output = compat_command()
+        .args(["-an", &t.s("src/"), &t.s("dst"), "--no-progress"])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("capacity: 7 B logical data required"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("(insufficient)"), "{stdout}");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("fresh destination capacity preflight failed"));
+    assert!(!t.path("dst").exists());
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn fallocate_no_space_is_fatal_and_stops_later_files() {
+    let t = Tmp::new();
+    write(&t.path("src/a-large"), &vec![b'x'; 256 * 1024]);
+    write(
+        &t.path("src/z-small"),
+        b"must not be copied after disk-full",
+    );
+    write(&t.path("dst/existing"), b"make this an update");
+
+    let output = compat_command()
+        .args([
+            "-a",
+            "--block-size",
+            "64K",
+            "--bwlimit",
+            "1G",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_FALLOCATE_ERRNO", "no_space")
+        .run()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "injected ENOSPC unexpectedly succeeded:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("preallocate destination file"), "{stderr}");
+    assert!(!t.path("dst/a-large").exists());
+    assert!(
+        !t.path("dst/z-small").exists(),
+        "disk-full must abort the transfer instead of continuing per-file"
+    );
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn fallocate_unsupported_filesystem_still_uses_sparse_fallback() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &vec![b'x'; 256 * 1024]);
+    write(&t.path("dst/existing"), b"make this an update");
+
+    let output = compat_command()
+        .args([
+            "-a",
+            "--block-size",
+            "64K",
+            "--bwlimit",
+            "1G",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_FALLOCATE_ERRNO", "unsupported")
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/file")), vec![b'x'; 256 * 1024]);
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn fallocate_quota_error_is_preserved_in_results() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
+    write(&t.path("dst/existing"), b"make this an update");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            "src",
+            "--into-existing",
+            "dst",
+            "--bwlimit",
+            "1G",
+            "--connections",
+            "1",
+            "--results",
+            "results.ndjson",
+            "-q",
+        ])
+        .current_dir(&t.0)
+        .env("SYQ_TEST_FALLOCATE_ERRNO", "quota")
+        .run()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        t.path("results.ndjson").exists(),
+        "results stream was not created:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["os_kind"] == "quota_exceeded"),
+        "quota classification missing from {records:#?}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn capacity_failure_reports_other_settled_apply_outcomes_before_aborting() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src")).unwrap();
+    std::os::unix::fs::symlink("good-target", t.path("src/a-good")).unwrap();
+    std::os::unix::fs::symlink("full-target", t.path("src/z-full")).unwrap();
+    write(&t.path("dst/existing"), b"make this an update");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            "src",
+            "--into-existing",
+            "dst",
+            "--results",
+            "results.ndjson",
+            "-q",
+        ])
+        .current_dir(&t.0)
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "z-full")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_link(t.path("dst/a-good")).unwrap(),
+        Path::new("good-target")
+    );
+    assert!(!t.path("dst/z-full").exists());
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let operation = |name: &str| {
+        records
+            .iter()
+            .find(|record| record["type"] == "operation_result" && record["dst"]["value"] == name)
+            .unwrap_or_else(|| panic!("missing operation result for {name}: {records:#?}"))
+    };
+    assert_eq!(operation("a-good")["disposition"], "succeeded");
+    assert_eq!(operation("z-full")["disposition"], "failed");
+    assert_eq!(operation("z-full")["os_kind"], "no_space");
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["status"], "aborted");
+    assert_eq!(terminal["symlinks_created"], 1);
+}
+
 #[test]
 fn dry_run_reports_typed_preflight_summary() {
     let t = Tmp::new();
@@ -9587,9 +9940,9 @@ fn native_cp_mapping_whole_manifest_preflight_writes_nothing() {
     );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate destination"));
-    // The --into container is created eagerly as with --files-from, but no
-    // entry may have been applied.
-    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+    // Fresh-target preflight defers the --into container too, so a manifest
+    // refusal leaves no destination namespace behind.
+    assert!(!t.path("dst").exists());
     // Declared-kind ancestor conflict is refused up front too.
     let conflict = format!(
         "{}{}",
@@ -9603,7 +9956,7 @@ fn native_cp_mapping_whole_manifest_preflight_writes_nothing() {
     );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not dir"));
-    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+    assert!(!t.path("dst").exists());
 }
 
 #[test]

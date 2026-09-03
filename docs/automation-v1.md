@@ -137,10 +137,12 @@ The seven classes each call for different consumer behavior: `io`
 retry), `conflict` (permanent for this entry as given), `integrity`
 (alarming — verification mismatch), `safety_limit` (a deliberate
 refusal, e.g. `--max-delete`), `usage`, `internal`. `os_kind`
-appears on local operations where the OS error is known: `not_found`,
+appears on endpoint operations where the OS error is known: `not_found`,
 `permission_denied`, `already_exists`, `invalid_input`, `no_space`,
-`read_only`, `other`. Remote errors currently arrive as strings and
-carry `class` only where the caller knows it.
+`quota_exceeded`, `read_only`, `other`. Filesystem errors preserve their OS
+error meaning across remote connections even when the endpoints use different
+numeric errno values. Errors without an OS classification cannot always be
+classified more narrowly than `other`.
 
 ### `result` — exactly one, always last, flushed
 
