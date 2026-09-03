@@ -58,6 +58,12 @@ struct CopyLocalPolicy {
     allow_sequential_nfs_fallback: bool,
 }
 
+#[derive(Clone, Copy)]
+enum CopyLocalOutcome {
+    Copied,
+    Unsupported,
+}
+
 #[cfg(target_os = "linux")]
 fn discard_rooted_copy_partial(
     root: &Root,
@@ -3544,7 +3550,8 @@ impl FsOps {
     /// Copy a whole same-machine file without routing its bytes through the
     /// transport. Prefer copy_file_range; when a cross-mount copy into NFS
     /// cannot be offloaded, use one sequential userspace writer instead. Other
-    /// unsupported filesystems return "EXDEV" for the parallel streaming path.
+    /// unsupported filesystems return `CopyLocalOutcome::Unsupported` for the
+    /// parallel streaming path.
     #[cfg(target_os = "linux")]
     fn copy_local(
         &mut self,
@@ -3554,7 +3561,7 @@ impl FsOps {
         partial_id: &PartialId,
         size: u64,
         mode: u32,
-    ) -> Result<()> {
+    ) -> Result<CopyLocalOutcome> {
         let CopyLocalPolicy {
             inplace,
             allow_sequential_nfs_fallback,
@@ -3713,7 +3720,7 @@ impl FsOps {
                         partial_metadata.ino(),
                     )?;
                 }
-                bail!("EXDEV");
+                return Ok(CopyLocalOutcome::Unsupported);
             }
         }
         let mut off: i64 = 0;
@@ -3757,7 +3764,7 @@ impl FsOps {
                             partial_metadata.ino(),
                         )?;
                     }
-                    bail!("EXDEV");
+                    return Ok(CopyLocalOutcome::Unsupported);
                 }
                 if raw == libc::EINTR {
                     continue;
@@ -3797,7 +3804,7 @@ impl FsOps {
             }
             d.set_len(size)?;
         }
-        Ok(())
+        Ok(CopyLocalOutcome::Copied)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -3809,8 +3816,8 @@ impl FsOps {
         _partial_id: &PartialId,
         _size: u64,
         _mode: u32,
-    ) -> Result<()> {
-        bail!("EXDEV")
+    ) -> Result<CopyLocalOutcome> {
+        Ok(CopyLocalOutcome::Unsupported)
     }
 
     /// Write a whole small file through its deterministic sidecar and atomically
@@ -4348,7 +4355,10 @@ impl FsOps {
                     *size,
                     *mode,
                 )
-                .map(|_| Response::Ok),
+                .map(|outcome| match outcome {
+                    CopyLocalOutcome::Copied => Response::Ok,
+                    CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
+                }),
             Request::PutSmallBatch(puts) => Ok(Response::Applied(
                 puts.iter()
                     .map(|put| {

@@ -6193,7 +6193,7 @@ impl Worker {
                 }
                 Ok(true)
             }
-            Response::Err(e) if e.contains("EXDEV") => Ok(false),
+            Response::CopyLocalUnsupported => Ok(false),
             Response::Err(e) => bail!("{e}"),
             other => bail!("unexpected response {other:?}"),
         }
