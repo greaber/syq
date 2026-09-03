@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a Python SDK patch release for one immutable syq manifest."""
+"""Prepare a matching Python SDK release for one immutable syq manifest."""
 
 from __future__ import annotations
 
@@ -109,14 +109,9 @@ def prepare(root: Path, manifest_path: Path) -> bool:
     packaged_manifest = root / "sdk/python/src/syq/syq-release-manifest.json"
     current_manifest = json.loads(packaged_manifest.read_bytes())
     current_syq_version = str(current_manifest["version"])
-    if version_tuple(new_syq_version, label="new syq release") <= version_tuple(
+    current_syq_version_tuple = version_tuple(
         current_syq_version, label="current syq release"
-    ):
-        print(
-            f"Python SDK already pins syq {current_syq_version}; "
-            f"not preparing {new_syq_version}"
-        )
-        return False
+    )
 
     pyproject_path = root / "sdk/python/pyproject.toml"
     pyproject = pyproject_path.read_text(encoding="utf-8")
@@ -124,10 +119,25 @@ def prepare(root: Path, manifest_path: Path) -> bool:
     if version_match is None:
         raise ValueError("could not find the Python package version")
     current_python_version = version_match.group(1)
-    major, minor, patch = version_tuple(
+    current_python_version_tuple = version_tuple(
         current_python_version, label="current Python SDK"
     )
-    new_python_version = f"{major}.{minor}.{patch + 1}"
+    if current_python_version_tuple != current_syq_version_tuple:
+        raise ValueError(
+            f"current Python SDK {current_python_version} does not match "
+            f"pinned syq {current_syq_version}"
+        )
+
+    if version_tuple(
+        new_syq_version, label="new syq release"
+    ) <= current_syq_version_tuple:
+        print(
+            f"Python SDK already pins syq {current_syq_version}; "
+            f"not preparing {new_syq_version}"
+        )
+        return False
+
+    new_python_version = new_syq_version
     pyproject = replace_once(
         pyproject,
         f'version = "{current_python_version}"',
@@ -139,10 +149,8 @@ def prepare(root: Path, manifest_path: Path) -> bool:
     python_readme = python_readme_path.read_text(encoding="utf-8")
     python_readme = replace_once(
         python_readme,
-        f"For Python package `{current_python_version}`, that release is syq "
-        f"`{current_syq_version}`.",
-        f"For Python package `{new_python_version}`, that release is syq "
-        f"`{new_syq_version}`.",
+        f"package `{current_python_version}`\nmanages syq `{current_syq_version}`.",
+        f"package `{new_python_version}`\nmanages syq `{new_syq_version}`.",
         label="Python README release mapping",
     )
     old_cache_path = f"syq/sdk/python/v{current_syq_version}/"
@@ -155,20 +163,8 @@ def prepare(root: Path, manifest_path: Path) -> bool:
     if old_cache_path in python_readme:
         raise ValueError("the Python README retained the old cache version")
 
-    sdk_readme_path = root / "sdk/README.md"
-    sdk_readme = sdk_readme_path.read_text(encoding="utf-8")
-    current_row = f"| `{current_python_version}` | `{current_syq_version}` |"
-    new_row = f"| `{new_python_version}` | `{new_syq_version}` |"
-    sdk_readme = replace_once(
-        sdk_readme,
-        current_row,
-        f"{current_row}\n{new_row}",
-        label="SDK mapping table row",
-    )
-
     pyproject_path.write_text(pyproject, encoding="utf-8")
     python_readme_path.write_text(python_readme, encoding="utf-8")
-    sdk_readme_path.write_text(sdk_readme, encoding="utf-8")
     packaged_manifest.write_bytes(raw_manifest)
     print(
         f"prepared Python SDK {new_python_version} for syq {new_syq_version}"

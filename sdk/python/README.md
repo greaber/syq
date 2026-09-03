@@ -10,11 +10,12 @@ python -m pip install syq
 ```
 
 Installing the package does not install syq itself. The first default call that
-needs syq downloads the syq release this package was tested with if it is not
+needs syq downloads the matching syq release if it is not
 already cached, checks it against the signed release manifest, and uses that
 managed binary for subsequent default calls.
-For Python package `0.0.3`, that release is syq `0.1.8`. syq always runs as a
-subprocess with an argument list, never through a shell.
+The Python package and its managed syq executable share one version: package `0.1.8`
+manages syq `0.1.8`.
+syq always runs as a subprocess with an argument list, never through a shell.
 
 ```python
 import syq

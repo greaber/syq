@@ -398,7 +398,7 @@ cat >"$status_bin/curl" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in
   *'crates.io/'*) printf '{"versions":[{"num":"0.1.8"}]}\n' ;;
-  *'pypi.org/'*) printf '{"info":{"version":"0.0.3"},"releases":{"0.0.3":[{}]}}\n' ;;
+  *'pypi.org/'*) printf '{"info":{"version":"0.1.8"},"releases":{"0.1.8":[{}]}}\n' ;;
   *) exit 2 ;;
 esac
 EOF
