@@ -7851,7 +7851,11 @@ mod tests {
         assert_eq!(fs::read(&external).unwrap(), b"sentinel");
         fs::remove_file(&partial).unwrap();
 
-        create_node_any(&partial, u32::from(libc::S_IFIFO) | 0o600, 0).unwrap();
+        #[cfg(target_os = "macos")]
+        let fifo_mode = u32::from(libc::S_IFIFO) | 0o600;
+        #[cfg(not(target_os = "macos"))]
+        let fifo_mode = libc::S_IFIFO | 0o600;
+        create_node_any(&partial, fifo_mode, 0).unwrap();
         let before = fs::symlink_metadata(&partial).unwrap();
         assert!(before.file_type().is_fifo());
         assert_eq!(observe(&mut operations), None);
