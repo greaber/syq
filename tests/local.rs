@@ -18,6 +18,12 @@ use std::sync::RwLock;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+// Successful host-native TCP tests must not share the product's fixed default
+// range across concurrent test binaries or repository worktrees. Port zero
+// asks the kernel to choose and reserve an available ephemeral port atomically.
+// The isolated real-SSH Compose suite still exercises the production default.
+const EPHEMERAL_TCP_PORTS: &str = "0-0";
+
 struct Tmp(PathBuf);
 
 impl Tmp {
@@ -3910,6 +3916,7 @@ fn double_verbose_dry_run_reports_tcp_without_extra_connection() {
         .arg(&rsh)
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args(["--dry-run", "-vv", "-a"])
         .arg(t.s("src"))
         .arg(&remote)
@@ -3978,6 +3985,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
         .arg(&rsh)
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args(["--dry-run", "-vv", "-a"])
         .arg(t.s("src"))
         .arg(&remote)
@@ -4059,6 +4067,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         .arg(&rsh)
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args(["--dry-run", "-a"])
         .arg(t.s("src"))
         .arg(&remote)
@@ -4082,6 +4091,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         .arg(&rsh)
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args(["--syq-tcp-plain", "--stats", "-avv"])
         .arg(t.s("src"))
         .arg(&remote)
@@ -4128,6 +4138,7 @@ fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
         .arg(&rsh)
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args([
             "--syq-tcp-plain",
             "--inplace",
@@ -4206,6 +4217,7 @@ fn tcp_congestion_override_is_applied_on_both_socket_ends_and_reported() {
         .arg(&rsh)
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args([
             "--syq-tcp-plain",
             "--syq-tcp-congestion=reno",
@@ -4253,6 +4265,7 @@ fn rejected_tcp_congestion_override_is_fatal_instead_of_falling_back() {
         .arg(&rsh)
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args([
             "--syq-tcp-congestion=syq_missing_cc",
             "-a",
@@ -10118,6 +10131,8 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         .args(["cp", "--rsh"])
         .arg(&rsh)
         .args([
+            "--tcp-ports",
+            EPHEMERAL_TCP_PORTS,
             "--from",
             "fake",
             "--follow-src",
