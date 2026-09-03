@@ -15,6 +15,33 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+const REMOTE_DIAGNOSTIC_LIMIT: usize = 1024 * 1024;
+const TRUNCATED_DIAGNOSTIC: &[u8] = b"\n[remote output truncated]\n";
+
+fn read_remote_diagnostic(mut input: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut limited = (&mut input).take(REMOTE_DIAGNOSTIC_LIMIT as u64 + 1);
+        let _ = limited.read_to_end(&mut bytes);
+    }
+    if bytes.len() > REMOTE_DIAGNOSTIC_LIMIT {
+        bytes.truncate(REMOTE_DIAGNOSTIC_LIMIT);
+        let _ = std::io::copy(&mut input, &mut std::io::sink());
+        bytes.extend_from_slice(TRUNCATED_DIAGNOSTIC);
+    }
+    bytes
+}
+
+fn diagnostic_reader(input: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || read_remote_diagnostic(input))
+}
+
+fn join_diagnostic(reader: std::thread::JoinHandle<Vec<u8>>, stream: &str) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow!("remote helper {stream} reader panicked"))
+}
+
 pub trait Conn: Send {
     fn send(&mut self, req: Request) -> Result<()>;
     fn recv(&mut self) -> Result<Response>;
@@ -25,6 +52,12 @@ pub trait Conn: Send {
     /// True once the transport has failed (remote process gone).
     fn is_dead(&self) -> bool {
         false
+    }
+    /// Whether sending several requests before receiving their responses can
+    /// overlap useful work. LocalConn executes requests synchronously, so
+    /// queueing several block responses there only retains their buffers.
+    fn supports_request_pipelining(&self) -> bool {
+        true
     }
     /// Current kernel RTT estimate for a direct TCP connection. This is a
     /// local socket query and never sends a protocol request.
@@ -393,6 +426,9 @@ impl Conn for LocalConn {
         self.pending
             .pop_front()
             .ok_or_else(|| anyhow!("no pending response"))
+    }
+    fn supports_request_pipelining(&self) -> bool {
+        false
     }
     fn scan(
         &mut self,
@@ -1684,18 +1720,35 @@ impl RemoteSpec {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let out = cmd
-            .output()
+        let mut child = cmd
+            .spawn()
             .with_context(|| format!("probe platform on {}", self.label()))?;
-        if !out.status.success() {
+        let stdout = diagnostic_reader(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("remote platform-probe stdout was not piped"))?,
+        );
+        let stderr = diagnostic_reader(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow!("remote platform-probe stderr was not piped"))?,
+        );
+        let status = child
+            .wait()
+            .with_context(|| format!("wait for platform probe on {}", self.label()))?;
+        let stdout = join_diagnostic(stdout, "stdout")?;
+        let stderr = join_diagnostic(stderr, "stderr")?;
+        if !status.success() {
             bail!(
                 "could not detect the platform on {} ({}){}",
                 self.label(),
-                out.status,
-                output_suffix(&out.stderr)
+                status,
+                output_suffix(&stderr)
             );
         }
-        let text = String::from_utf8_lossy(&out.stdout);
+        let text = String::from_utf8_lossy(&stdout);
         let value = text
             .lines()
             .find_map(|line| line.strip_prefix("syq-helper-target:"))
@@ -1784,15 +1837,11 @@ impl RemoteSpec {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("remote helper download stdout was not piped"))?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| anyhow!("remote helper download stderr was not piped"))?;
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            bytes
-        });
+        let stderr_reader = diagnostic_reader(stderr);
 
         let report = read_direct_report(&mut BufReader::new(stdout));
         let mut helper = None;
@@ -1846,9 +1895,7 @@ impl RemoteSpec {
         let status = child
             .wait()
             .with_context(|| format!("wait for helper download on {}", self.label()))?;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| anyhow!("remote helper stderr reader panicked"))?;
+        let stderr = join_diagnostic(stderr_reader, "stderr")?;
         let detail = output_message(&stderr);
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
@@ -1902,16 +1949,30 @@ impl RemoteSpec {
             .stdin
             .take()
             .ok_or_else(|| anyhow!("helper upload stdin was not piped"))?;
+        let stdout_reader = diagnostic_reader(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("helper upload stdout was not piped"))?,
+        );
+        let stderr_reader = diagnostic_reader(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow!("helper upload stderr was not piped"))?,
+        );
         let write_result = stdin.write_all(binary);
         drop(stdin);
-        let out = child
-            .wait_with_output()
+        let status = child
+            .wait()
             .with_context(|| format!("wait for helper upload to {}", self.label()))?;
-        if !out.status.success() {
+        let _stdout = join_diagnostic(stdout_reader, "stdout")?;
+        let stderr = join_diagnostic(stderr_reader, "stderr")?;
+        if !status.success() {
             bail!(
                 "remote helper upload exited {}{}",
-                out.status,
-                output_suffix(&out.stderr)
+                status,
+                output_suffix(&stderr)
             );
         }
         write_result.with_context(|| format!("upload helper to {}", self.label()))
@@ -2143,6 +2204,24 @@ impl Endpoint {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn remote_diagnostics_are_retained_with_a_fixed_ceiling() {
+        let bytes = vec![b'x'; REMOTE_DIAGNOSTIC_LIMIT + 4096];
+        let mut input = std::io::Cursor::new(&bytes);
+        let output = read_remote_diagnostic(&mut input);
+        assert_eq!(
+            &output[..REMOTE_DIAGNOSTIC_LIMIT],
+            &bytes[..REMOTE_DIAGNOSTIC_LIMIT]
+        );
+        assert!(output.ends_with(TRUNCATED_DIAGNOSTIC));
+        assert_eq!(
+            output.len(),
+            REMOTE_DIAGNOSTIC_LIMIT + TRUNCATED_DIAGNOSTIC.len()
+        );
+        assert_eq!(input.position(), bytes.len() as u64);
+        assert_eq!(read_remote_diagnostic(&b"brief"[..]), b"brief");
+    }
 
     struct ExitObserved<R> {
         inner: R,

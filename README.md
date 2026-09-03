@@ -1161,10 +1161,14 @@ Without an explicit connection count, syq tunes the number of workers while a
 copy runs instead of guessing. On a data path it has measured before, it starts at that path's last
 settled count; otherwise it starts with 16 when every remote endpoint has a
 reachable TCP data path, 8 over ssh, or 32 when both ends are local (threads
-are free, connections are not). Remembered results are keyed only by the
-directional endpoint path and transport (TCP and ssh learn separately), not by
-RTT, workload, filesystem or other volatile telemetry. A stale hint only costs
-the tuner a probe or two. The cache is
+are free, connections are not). A single same-machine file eligible for the
+whole-file or receiver-side direct-copy path starts with one worker because
+extra loopback connections cannot help; finding a partial or an unsupported
+kernel offload immediately restores the ordinary local starting count.
+Remembered results are keyed only by the directional endpoint path and
+transport (TCP and ssh learn separately), not by RTT, workload, filesystem or
+other volatile telemetry. A stale hint only costs the tuner a probe or two. The
+cache is
 `$XDG_CACHE_HOME/syq/tuning-v1.json` (normally
 `~/.cache/syq/tuning-v1.json`; set `SYQ_TUNING_CACHE` to override it or to an
 empty value to disable it). An explicit connection count, dry runs, verification, short runs

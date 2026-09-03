@@ -1691,22 +1691,31 @@ pub(crate) fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<NativeE
 /// `/`, `a//b`) are removed; `..` components and entries naming the root itself
 /// are rejected.
 fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
-    use std::io::Read;
-    let mut raw = Vec::new();
+    use std::io::BufReader;
     if file == "-" {
-        std::io::stdin().read_to_end(&mut raw)?;
+        read_files_from_reader(BufReader::new(std::io::stdin()), nul)
     } else {
-        raw = std::fs::read(file).map_err(|e| anyhow::anyhow!("--files-from {file}: {e}"))?;
+        let input = std::fs::File::open(file)
+            .map_err(|error| anyhow::anyhow!("--files-from {file}: {error}"))?;
+        read_files_from_reader(BufReader::new(input), nul)
     }
+}
+
+fn read_files_from_reader(mut input: impl std::io::BufRead, nul: bool) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
-    let items: Vec<&[u8]> = if nul {
-        raw.split(|&b| b == 0).collect()
-    } else {
-        raw.split(|&b| b == b'\n')
-            .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
-            .collect()
-    };
-    for item in items {
+    let mut item = Vec::new();
+    let separator = if nul { 0 } else { b'\n' };
+    loop {
+        item.clear();
+        if input.read_until(separator, &mut item)? == 0 {
+            break;
+        }
+        if item.last() == Some(&separator) {
+            item.pop();
+        }
+        if !nul && item.last() == Some(&b'\r') {
+            item.pop();
+        }
         // rsync treats these prefixes as comments in both line and NUL modes.
         // A literal name remains selectable by spelling it as `./#name` or
         // `./;name`.
@@ -1716,29 +1725,34 @@ fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
         if item.contains(&0) {
             bail!(
                 "--files-from: {:?} contains a NUL byte (is this a --from0 list?)",
-                String::from_utf8_lossy(item)
-            );
-        }
-        let p = item;
-        if p.split(|&b| b == b'/').any(|c| c == b"..") {
-            bail!(
-                "--files-from: {:?} contains a `..` component",
-                String::from_utf8_lossy(item)
+                String::from_utf8_lossy(&item)
             );
         }
         // Drop `.` and empty components (`a/./b`, `a//b` -> `a/b`) so one path
         // has one spelling and the planner never schedules a file twice.
-        let parts: Vec<&[u8]> = p
-            .split(|&b| b == b'/')
-            .filter(|c| *c != b"." && !c.is_empty())
-            .collect();
-        if parts.is_empty() {
+        let mut normalized = Vec::with_capacity(item.len());
+        for component in item.split(|&byte| byte == b'/') {
+            if component == b".." {
+                bail!(
+                    "--files-from: {:?} contains a `..` component",
+                    String::from_utf8_lossy(&item)
+                );
+            }
+            if component.is_empty() || component == b"." {
+                continue;
+            }
+            if !normalized.is_empty() {
+                normalized.push(b'/');
+            }
+            normalized.extend_from_slice(component);
+        }
+        if normalized.is_empty() {
             bail!(
                 "--files-from: {:?} names the source root itself",
-                String::from_utf8_lossy(item)
+                String::from_utf8_lossy(&item)
             );
         }
-        out.push(parts.join(&b'/'));
+        out.push(normalized);
     }
     Ok(out)
 }
@@ -1941,9 +1955,23 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
-        parse_size, Args, Placement, SourceSelection,
+        parse_size, read_files_from_reader, Args, Placement, SourceSelection,
     };
     use clap::Parser;
+
+    #[test]
+    fn files_from_is_parsed_record_by_record() {
+        let lines = b"a//b\r\ncomment\0inside\n./#literal\n; ignored\n";
+        assert!(read_files_from_reader(&lines[..], false).is_err());
+        assert_eq!(
+            read_files_from_reader(&b"a//b\r\n./#literal\n; ignored\n"[..], false).unwrap(),
+            [b"a/b".to_vec(), b"#literal".to_vec()]
+        );
+        assert_eq!(
+            read_files_from_reader(&b"a/./b\0./;literal\0"[..], true).unwrap(),
+            [b"a/b".to_vec(), b";literal".to_vec()]
+        );
+    }
 
     #[test]
     fn durations_take_seconds_minutes_or_hours_and_reject_zero() {

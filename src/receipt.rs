@@ -11,9 +11,11 @@
 use crate::delegation::RequestId;
 use crate::enrollment::EnrollmentId;
 use anyhow::{anyhow, bail, Context, Result};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufWriter, Write};
 
 pub(crate) const RECEIPT_NAMESPACE: &str = "syq-receipt-v1@greaber.github";
 /// The coordinator prints the base64 envelope after this prefix as one
@@ -103,6 +105,88 @@ pub(crate) struct Ledger {
     pub hash_failures: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct PublishedRef<'a> {
+    path: &'a [u8],
+    size: u64,
+    digest: Option<[u8; 32]>,
+    complete: bool,
+}
+
+struct PublishedList<'a>(&'a BTreeMap<Vec<u8>, Published>);
+
+impl Serialize for PublishedList<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (path, state) in self.0 {
+            sequence.serialize_element(&PublishedRef {
+                path,
+                size: state.size,
+                digest: state.digest,
+                complete: state.complete,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct DeletedList<'a>(&'a BTreeSet<Vec<u8>>);
+
+impl Serialize for DeletedList<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for path in self.0 {
+            sequence.serialize_element(path.as_slice())?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct ObservedRef<'a> {
+    path: &'a [u8],
+    size: u64,
+    digest: [u8; 32],
+}
+
+struct ObservedList<'a>(&'a BTreeMap<Vec<u8>, (u64, [u8; 32])>);
+
+impl Serialize for ObservedList<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (path, (size, digest)) in self.0 {
+            sequence.serialize_element(&ObservedRef {
+                path,
+                size: *size,
+                digest: *digest,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct DigestWriter<'a>(&'a mut blake3::Hasher);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Ledger {
     pub(crate) fn record_refusal(&mut self, message: &str) {
         self.refused += 1;
@@ -121,67 +205,116 @@ impl Ledger {
         entries: u64,
         transferred_bytes: u64,
     ) -> Result<ReceiptV1> {
-        let published: Vec<PublishedV1> = self
-            .published
-            .iter()
-            .map(|(path, state)| PublishedV1 {
-                path: path.clone(),
-                size: state.size,
-                digest: state.digest,
-                complete: state.complete,
-            })
-            .collect();
-        let incomplete_count = published.iter().filter(|item| !item.complete).count() as u64;
-        let deleted: Vec<Vec<u8>> = self.deleted.iter().cloned().collect();
-        let observed: Vec<ObservedV1> = self
-            .observed
-            .iter()
-            .map(|(path, (size, digest))| ObservedV1 {
-                path: path.clone(),
-                size: *size,
-                digest: *digest,
-            })
-            .collect();
-        let list_digest = list_digest(&published, &deleted, &observed)?;
-        let encoded_lists = postcard::to_stdvec(&published)?.len()
-            + postcard::to_stdvec(&deleted)?.len()
-            + postcard::to_stdvec(&observed)?.len();
-        let lists_truncated = published.len() > LIST_LIMIT
-            || deleted.len() > LIST_LIMIT
-            || observed.len() > LIST_LIMIT
+        let (published_bytes, incomplete_count) = self.published.values().try_fold(
+            (0u64, 0u64),
+            |(bytes, incomplete), state| -> Result<_> {
+                Ok((
+                    bytes
+                        .checked_add(state.size)
+                        .context("published byte total overflow")?,
+                    incomplete + u64::from(!state.complete),
+                ))
+            },
+        )?;
+        let published_list = PublishedList(&self.published);
+        let deleted_list = DeletedList(&self.deleted);
+        let observed_list = ObservedList(&self.observed);
+        let (list_digest, encoded_lists) =
+            serialized_list_digest(&published_list, &deleted_list, &observed_list)?;
+        let lists_truncated = self.published.len() > LIST_LIMIT
+            || self.deleted.len() > LIST_LIMIT
+            || self.observed.len() > LIST_LIMIT
             || encoded_lists > MAX_LIST_BYTES;
-        let published_bytes = published
-            .iter()
-            .try_fold(0u64, |total, item| total.checked_add(item.size))
-            .context("published byte total overflow")?;
+        let published = if lists_truncated {
+            Vec::new()
+        } else {
+            self.published
+                .iter()
+                .map(|(path, state)| PublishedV1 {
+                    path: path.clone(),
+                    size: state.size,
+                    digest: state.digest,
+                    complete: state.complete,
+                })
+                .collect()
+        };
+        let deleted = if lists_truncated {
+            Vec::new()
+        } else {
+            self.deleted.iter().cloned().collect()
+        };
+        let observed = if lists_truncated {
+            Vec::new()
+        } else {
+            self.observed
+                .iter()
+                .map(|(path, (size, digest))| ObservedV1 {
+                    path: path.clone(),
+                    size: *size,
+                    digest: *digest,
+                })
+                .collect()
+        };
         Ok(ReceiptV1 {
             enrollment_id,
             request_id,
             issued_at,
-            published_count: published.len() as u64,
+            published_count: self.published.len() as u64,
             published_bytes,
             incomplete_count,
-            deleted_count: deleted.len() as u64,
-            observed_count: observed.len() as u64,
+            deleted_count: self.deleted.len() as u64,
+            observed_count: self.observed.len() as u64,
             refused: self.refused,
             refusal_samples: self.refusal_samples.clone(),
             entries,
             transferred_bytes,
             list_digest,
             lists_truncated,
-            published: if lists_truncated {
-                Vec::new()
-            } else {
-                published
-            },
-            deleted: if lists_truncated { Vec::new() } else { deleted },
-            observed: if lists_truncated {
-                Vec::new()
-            } else {
-                observed
-            },
+            published,
+            deleted,
+            observed,
         })
     }
+}
+
+fn serialized_len(value: &(impl Serialize + ?Sized)) -> Result<usize> {
+    Ok(postcard::experimental::serialized_size(value)?)
+}
+
+fn digest_serialized(
+    hasher: &mut blake3::Hasher,
+    label: &str,
+    value: &(impl Serialize + ?Sized),
+    encoded_len: usize,
+) -> Result<()> {
+    hasher.update(&(label.len() as u32).to_be_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update(&(encoded_len as u64).to_be_bytes());
+    // Postcard emits many single-byte writes. Buffer those calls so hashing a
+    // large list stays CPU-efficient without materializing its whole encoding.
+    let mut writer = BufWriter::with_capacity(64 * 1024, DigestWriter(hasher));
+    postcard::to_io(value, &mut writer)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn serialized_list_digest(
+    published: &(impl Serialize + ?Sized),
+    deleted: &(impl Serialize + ?Sized),
+    observed: &(impl Serialize + ?Sized),
+) -> Result<([u8; 32], usize)> {
+    let published_len = serialized_len(published)?;
+    let deleted_len = serialized_len(deleted)?;
+    let observed_len = serialized_len(observed)?;
+    let encoded_len = published_len
+        .checked_add(deleted_len)
+        .and_then(|length| length.checked_add(observed_len))
+        .context("serialized receipt list length overflow")?;
+    let mut hasher = blake3::Hasher::new();
+    digest_serialized(&mut hasher, "published", published, published_len)?;
+    digest_serialized(&mut hasher, "deleted", deleted, deleted_len)?;
+    digest_serialized(&mut hasher, "observed", observed, observed_len)?;
+    Ok((*hasher.finalize().as_bytes(), encoded_len))
 }
 
 pub(crate) fn list_digest(
@@ -189,18 +322,7 @@ pub(crate) fn list_digest(
     deleted: &[Vec<u8>],
     observed: &[ObservedV1],
 ) -> Result<[u8; 32]> {
-    let mut hasher = blake3::Hasher::new();
-    for (label, bytes) in [
-        ("published", postcard::to_stdvec(published)?),
-        ("deleted", postcard::to_stdvec(deleted)?),
-        ("observed", postcard::to_stdvec(observed)?),
-    ] {
-        hasher.update(&(label.len() as u32).to_be_bytes());
-        hasher.update(label.as_bytes());
-        hasher.update(&(bytes.len() as u64).to_be_bytes());
-        hasher.update(&bytes);
-    }
-    Ok(*hasher.finalize().as_bytes())
+    Ok(serialized_list_digest(published, deleted, observed)?.0)
 }
 
 fn signing_payload(body: &[u8]) -> Vec<u8> {
@@ -217,12 +339,23 @@ pub(crate) fn sign(receipt: &ReceiptV1, private_key: &PrivateKey) -> Result<Vec<
     if private_key.is_encrypted() {
         bail!("cannot sign a receipt with an encrypted key");
     }
-    let body = postcard::to_stdvec(receipt).context("encode receipt")?;
-    if body.len() > MAX_BODY_BYTES {
+    let body_len = serialized_len(receipt).context("size receipt encoding")?;
+    if body_len > MAX_BODY_BYTES {
         bail!("receipt exceeds {MAX_BODY_BYTES} bytes");
     }
+    // Build the signed payload in the envelope's final allocation. Once it is
+    // signed, make room for the signature-length field in place. This avoids
+    // copying a potentially 16 MiB body into both a signing buffer and then a
+    // second envelope buffer.
+    let signed_header_len = WIRE_MAGIC.len() + 2 + 4;
+    let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len + MAX_SIGNATURE_BYTES);
+    out.extend_from_slice(WIRE_MAGIC);
+    out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+    out.extend_from_slice(&(body_len as u32).to_be_bytes());
+    out = postcard::to_extend(receipt, out).context("encode receipt")?;
+    debug_assert_eq!(out.len(), signed_header_len + body_len);
     let signature = private_key
-        .sign(RECEIPT_NAMESPACE, HashAlg::Sha256, &signing_payload(&body))
+        .sign(RECEIPT_NAMESPACE, HashAlg::Sha256, &out)
         .context("sign receipt")?
         .to_pem(LineEnding::LF)
         .context("encode receipt signature")?
@@ -230,12 +363,11 @@ pub(crate) fn sign(receipt: &ReceiptV1, private_key: &PrivateKey) -> Result<Vec<
     if signature.len() > MAX_SIGNATURE_BYTES {
         bail!("receipt signature exceeds {MAX_SIGNATURE_BYTES} bytes");
     }
-    let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body.len() + signature.len());
-    out.extend_from_slice(WIRE_MAGIC);
-    out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
-    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    out.extend_from_slice(&(signature.len() as u32).to_be_bytes());
-    out.extend_from_slice(&body);
+    let payload_len = out.len();
+    out.resize(payload_len + 4, 0);
+    out.copy_within(signed_header_len..payload_len, WIRE_HEADER_LEN);
+    out[signed_header_len..WIRE_HEADER_LEN]
+        .copy_from_slice(&(signature.len() as u32).to_be_bytes());
     out.extend_from_slice(&signature);
     Ok(out)
 }
@@ -327,6 +459,66 @@ mod tests {
             .insert(b"/srv/dst/kept".to_vec(), (3, [9; 32]));
         ledger.record_refusal("out of scope");
         ledger
+    }
+
+    #[test]
+    fn streaming_ledger_encoding_preserves_the_v1_digest() {
+        let ledger = ledger();
+        let published: Vec<PublishedV1> = ledger
+            .published
+            .iter()
+            .map(|(path, state)| PublishedV1 {
+                path: path.clone(),
+                size: state.size,
+                digest: state.digest,
+                complete: state.complete,
+            })
+            .collect();
+        let deleted: Vec<Vec<u8>> = ledger.deleted.iter().cloned().collect();
+        let observed: Vec<ObservedV1> = ledger
+            .observed
+            .iter()
+            .map(|(path, (size, digest))| ObservedV1 {
+                path: path.clone(),
+                size: *size,
+                digest: *digest,
+            })
+            .collect();
+
+        assert_eq!(
+            postcard::to_stdvec(&PublishedList(&ledger.published)).unwrap(),
+            postcard::to_stdvec(&published).unwrap()
+        );
+        assert_eq!(
+            postcard::to_stdvec(&DeletedList(&ledger.deleted)).unwrap(),
+            postcard::to_stdvec(&deleted).unwrap()
+        );
+        assert_eq!(
+            postcard::to_stdvec(&ObservedList(&ledger.observed)).unwrap(),
+            postcard::to_stdvec(&observed).unwrap()
+        );
+
+        let mut legacy = blake3::Hasher::new();
+        for (label, bytes) in [
+            ("published", postcard::to_stdvec(&published).unwrap()),
+            ("deleted", postcard::to_stdvec(&deleted).unwrap()),
+            ("observed", postcard::to_stdvec(&observed).unwrap()),
+        ] {
+            legacy.update(&(label.len() as u32).to_be_bytes());
+            legacy.update(label.as_bytes());
+            legacy.update(&(bytes.len() as u64).to_be_bytes());
+            legacy.update(&bytes);
+        }
+        assert_eq!(
+            serialized_list_digest(
+                &PublishedList(&ledger.published),
+                &DeletedList(&ledger.deleted),
+                &ObservedList(&ledger.observed)
+            )
+            .unwrap()
+            .0,
+            *legacy.finalize().as_bytes()
+        );
     }
 
     #[test]

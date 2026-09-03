@@ -855,9 +855,35 @@ pub fn run(
     let mut last_rate = None;
     meter.set_active(policy.n);
     loop {
-        std::thread::sleep(poll);
+        sched.wait_for_tuning(poll);
         if sched.is_aborted() || sched.finished() {
             break;
+        }
+
+        // A same-machine single-file copy starts with one cheap direct-copy
+        // probe. If the receiver reports a partial or unsupported kernel
+        // offload, skip the measurement ramp and restore the ordinary local
+        // starting count before userspace ranges become the bottleneck.
+        let requested = sched.take_worker_count_request().min(policy.max);
+        if requested > active {
+            let before = active;
+            policy = Policy::new(requested, policy.min, policy.max);
+            active = requested;
+            gate.set_retain(requested);
+            for id in gate.begin_warming(requested) {
+                spawn(id);
+            }
+            gate.set_active(requested);
+            meter.set_active(requested);
+            sampler.reset();
+            last = (meter.bytes(), meter.files());
+            sample_start = std::time::Instant::now();
+            if crate::transfer::debug() {
+                eprintln!(
+                    "syq: tune: {before} -> {requested} workers (direct copy needs userspace transfer)"
+                );
+            }
+            continue;
         }
 
         // Apply reductions immediately. An increase leaves the current set

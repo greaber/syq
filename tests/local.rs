@@ -3231,7 +3231,11 @@ fn single_file_to_new_name() {
     let t = Tmp::new();
     write(&t.path("src/f.txt"), b"data");
     set_mtime(&t.path("src/f.txt"), 1_600_000_000);
-    run_ok(&["-a", &t.s("src/f.txt"), &t.s("out.txt")]);
+    let output = run_ok(&["-a", "--stats", &t.s("src/f.txt"), &t.s("out.txt")]);
+    assert!(
+        output.contains("connections: auto: settled at 1 (path 1, peak 1)"),
+        "{output}"
+    );
     assert_eq!(read(&t.path("out.txt")), b"data");
     assert_same_tree(&t.path("src/f.txt"), &t.path("out.txt"));
 }
@@ -3243,11 +3247,15 @@ fn archive_copies_mode_zero_empty_file_without_opening_source() {
     write(&src, b"");
     fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
 
-    run_ok(&["-a", &t.s("src/empty"), &t.s("dst/empty")]);
+    let output = run_ok(&["-a", "--stats", &t.s("src/empty"), &t.s("dst/empty")]);
 
     let dst = fs::metadata(t.path("dst/empty")).unwrap();
     assert_eq!(dst.len(), 0);
     assert_eq!(dst.mode() & 0o777, 0);
+    assert!(
+        output.contains("connections: auto: settled at 1 (path 1, peak 1)"),
+        "{output}"
+    );
 }
 
 #[test]
@@ -6520,6 +6528,27 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), contents);
     assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_exdev_auto_fallback_restores_parallel_workers() {
+    let t = Tmp::new();
+    let contents = vec![b'x'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+
+    let out = compat_command()
+        .args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), contents);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("connections: auto: settled at 32 (path 32, peak 32)"),
+        "{stdout}"
+    );
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
