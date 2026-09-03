@@ -119,7 +119,7 @@ pub(crate) struct PinnedLeaf {
     name: CString,
     metadata: RootMetadata,
     object: Option<File>,
-    resolved_relative: Vec<u8>,
+    resolved_relative: Option<Vec<u8>>,
 }
 
 impl PinnedLeaf {
@@ -132,10 +132,9 @@ impl PinnedLeaf {
     }
 
     /// Canonical components from the resolver's initial directory to this
-    /// selection. Callers that expose the value must use a confined resolver,
-    /// so an unconfined `..` cannot make the spelling lose its original base.
-    pub(crate) fn resolved_relative(&self) -> &[u8] {
-        &self.resolved_relative
+    /// selection, or `None` while an unconfined walk is outside that base.
+    pub(crate) fn resolved_relative(&self) -> Option<&[u8]> {
+        self.resolved_relative.as_deref()
     }
 
     /// Open the selected identity for input without resolving its
@@ -206,7 +205,7 @@ pub(crate) struct PinnedDirectory {
     directory: File,
     entry: Option<PinnedLeaf>,
     metadata: RootMetadata,
-    resolved_relative: Vec<u8>,
+    resolved_relative: Option<Vec<u8>>,
 }
 
 impl PinnedDirectory {
@@ -219,10 +218,9 @@ impl PinnedDirectory {
     }
 
     /// Canonical components from the resolver's initial directory to this
-    /// selection. See `PinnedLeaf::resolved_relative` for the confinement
-    /// precondition on callers that expose the value.
-    pub(crate) fn resolved_relative(&self) -> &[u8] {
-        &self.resolved_relative
+    /// selection. See `PinnedLeaf::resolved_relative` for unconfined walks.
+    pub(crate) fn resolved_relative(&self) -> Option<&[u8]> {
+        self.resolved_relative.as_deref()
     }
 }
 
@@ -284,6 +282,9 @@ pub(crate) enum PinnedPath {
 struct OperatorCursor {
     directory: File,
     entry: Option<OperatorEntry>,
+    /// Canonical components beneath the resolver's original base. `None`
+    /// means an unconfined walk is currently outside that base.
+    resolved_relative: Option<Vec<u8>>,
 }
 
 /// How the cursor's directory was selected. Intermediate cursors deliberately
@@ -297,6 +298,8 @@ struct OperatorEntry {
 /// operator. Descendant transfer paths use `RelativePath` and `Root` instead.
 pub(crate) struct OperatorResolver {
     base: File,
+    base_identity: OperatorDirectoryIdentity,
+    base_is_process_root: bool,
     confined: bool,
     relative_input: bool,
     symlink_policy: OperatorSymlinkPolicy,
@@ -312,8 +315,13 @@ impl OperatorResolver {
         allow_missing: bool,
         hops: &mut Vec<OperatorSymlinkHop>,
     ) -> Result<PinnedPath> {
+        let base = open_operator_start(path.starts_with(b"/"))?;
+        let base_identity = operator_directory_identity(&base)?;
+        let base_is_process_root = operator_base_is_process_root(base_identity)?;
         Self {
-            base: open_operator_start(path.starts_with(b"/"))?,
+            base,
+            base_identity,
+            base_is_process_root,
             confined: false,
             relative_input: false,
             symlink_policy,
@@ -329,8 +337,13 @@ impl OperatorResolver {
         confined: bool,
         symlink_policy: OperatorSymlinkPolicy,
     ) -> Result<Self> {
+        let base = base.try_clone().context("duplicate operator path base")?;
+        let base_identity = operator_directory_identity(&base)?;
+        let base_is_process_root = operator_base_is_process_root(base_identity)?;
         Ok(Self {
-            base: base.try_clone().context("duplicate operator path base")?,
+            base,
+            base_identity,
+            base_is_process_root,
             confined,
             relative_input: true,
             symlink_policy,
@@ -357,6 +370,7 @@ impl OperatorResolver {
                 .try_clone()
                 .context("duplicate operator path base")?,
             entry: None,
+            resolved_relative: Some(Vec::new()),
         }];
         let mut symlink_count = 0usize;
 
@@ -364,7 +378,7 @@ impl OperatorResolver {
             let Some(component) = components.pop_front() else {
                 let current = stack.last().expect("operator resolver stack is nonempty");
                 let metadata = root_metadata_from_std(&current.directory.metadata()?)?;
-                let resolved_relative = operator_cursor_path(&stack, None);
+                let resolved_relative = current.resolved_relative.clone();
                 let entry = if let Some(entry) = &current.entry {
                     let parent = &stack
                         .iter()
@@ -402,11 +416,15 @@ impl OperatorResolver {
                 if stack.len() > 1 {
                     stack.pop();
                 } else if self.confined {
-                    bail!("operator path resolves outside its confined root");
+                    if !self.base_is_process_root {
+                        bail!("operator path resolves outside its confined root");
+                    }
                 } else {
+                    let directory = open_operator_directory_at(&stack[0].directory, b"..")
+                        .context("resolve operator path parent")?;
                     stack[0] = OperatorCursor {
-                        directory: open_operator_directory_at(&stack[0].directory, b"..")
-                            .context("resolve operator path parent")?,
+                        resolved_relative: self.relative_if_base(&directory)?,
+                        directory,
                         entry: None,
                     };
                 }
@@ -443,7 +461,8 @@ impl OperatorResolver {
 
             if metadata.is_symlink() {
                 if !follow_symlink {
-                    let resolved_relative = operator_cursor_path(&stack, Some(&component));
+                    let resolved_relative =
+                        append_operator_component(current.resolved_relative.as_deref(), &component);
                     let object = open_operator_symlink_at(current.directory.as_raw_fd(), &name)?;
                     if let Some(object) = &object {
                         require_operator_identity(
@@ -529,8 +548,10 @@ impl OperatorResolver {
                     if self.confined {
                         bail!("operator path has an absolute symlink target outside its root");
                     }
+                    let directory = open_operator_start(true)?;
                     stack = vec![OperatorCursor {
-                        directory: open_operator_start(true)?,
+                        resolved_relative: self.relative_if_base(&directory)?,
+                        directory,
                         entry: None,
                     }];
                 }
@@ -548,8 +569,14 @@ impl OperatorResolver {
                     root_metadata_from_std(&directory.metadata()?)?,
                     "operator directory",
                 )?;
+                let resolved_relative = if let Some(path) = current.resolved_relative.as_deref() {
+                    Some(join_operator_component(path, &component))
+                } else if self.directory_is_base(&directory)? {
+                    Some(Vec::new())
+                } else {
+                    None
+                };
                 if final_name {
-                    let resolved_relative = operator_cursor_path(&stack, Some(&component));
                     return Ok(PinnedPath::Directory(PinnedDirectory {
                         directory,
                         entry: Some(PinnedLeaf {
@@ -569,6 +596,7 @@ impl OperatorResolver {
                 stack.push(OperatorCursor {
                     directory,
                     entry: Some(OperatorEntry { name, metadata }),
+                    resolved_relative,
                 });
                 continue;
             }
@@ -591,9 +619,24 @@ impl OperatorResolver {
                 name,
                 metadata,
                 object: Some(object),
-                resolved_relative: operator_cursor_path(&stack, Some(&component)),
+                resolved_relative: append_operator_component(
+                    current.resolved_relative.as_deref(),
+                    &component,
+                ),
             }));
         }
+    }
+
+    fn relative_if_base(&self, directory: &File) -> Result<Option<Vec<u8>>> {
+        Ok(self.directory_is_base(directory)?.then(Vec::new))
+    }
+
+    fn directory_is_base(&self, directory: &File) -> Result<bool> {
+        let identity = operator_directory_identity(directory)?;
+        Ok(operator_directory_identities_match(
+            identity,
+            self.base_identity,
+        ))
     }
 
     fn authorize_symlink(&self, metadata: RootMetadata, component: &[u8]) -> Result<()> {
@@ -618,20 +661,86 @@ impl OperatorResolver {
     }
 }
 
-fn operator_cursor_path(stack: &[OperatorCursor], final_component: Option<&[u8]>) -> Vec<u8> {
-    let mut path = Vec::new();
-    for component in stack
-        .iter()
-        .filter_map(|cursor| cursor.entry.as_ref())
-        .map(|entry| entry.name.as_bytes())
-        .chain(final_component)
-    {
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(component);
+#[derive(Clone, Copy, Debug)]
+struct OperatorDirectoryIdentity {
+    dev: u64,
+    ino: u64,
+    #[cfg(target_os = "linux")]
+    mount_id: Option<u64>,
+}
+
+fn operator_directory_identity(directory: &File) -> Result<OperatorDirectoryIdentity> {
+    let metadata = root_metadata_from_std(&directory.metadata()?)?;
+    Ok(OperatorDirectoryIdentity {
+        dev: metadata.dev,
+        ino: metadata.ino,
+        #[cfg(target_os = "linux")]
+        mount_id: operator_mount_id(directory)?,
+    })
+}
+
+fn operator_directory_identities_match(
+    left: OperatorDirectoryIdentity,
+    right: OperatorDirectoryIdentity,
+) -> bool {
+    if left.dev != right.dev || left.ino != right.ino {
+        return false;
     }
-    path
+    #[cfg(target_os = "linux")]
+    {
+        matches!((left.mount_id, right.mount_id), (Some(left), Some(right)) if left == right)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn operator_mount_id(directory: &File) -> Result<Option<u64>> {
+    let mut status = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let result = unsafe {
+        libc::statx(
+            directory.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            status.as_mut_ptr(),
+        )
+    };
+    if result == 0 {
+        let status = unsafe { status.assume_init() };
+        return Ok(((status.stx_mask & libc::STATX_MNT_ID) != 0).then_some(status.stx_mnt_id));
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM)
+    ) {
+        return Ok(None);
+    }
+    Err(error).context("identify operator directory mount")
+}
+
+fn operator_base_is_process_root(identity: OperatorDirectoryIdentity) -> Result<bool> {
+    let root = open_operator_start(true)?;
+    Ok(operator_directory_identities_match(
+        operator_directory_identity(&root)?,
+        identity,
+    ))
+}
+
+fn append_operator_component(path: Option<&[u8]>, component: &[u8]) -> Option<Vec<u8>> {
+    path.map(|path| join_operator_component(path, component))
+}
+
+fn join_operator_component(path: &[u8], component: &[u8]) -> Vec<u8> {
+    let mut joined = path.to_vec();
+    if !joined.is_empty() {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(component);
+    joined
 }
 
 impl RootMetadata {
@@ -2544,6 +2653,69 @@ mod tests {
                 )
                 .is_err());
         }
+    }
+
+    #[test]
+    fn unconfined_operator_resolver_tracks_exit_and_reentry() {
+        let tree = TestDir::new("operator-unconfined-relative");
+        let base_path = tree.path().join("base");
+        let inside = base_path.join("inside");
+        let outside = tree.path().join("outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&inside, base_path.join("absolute-reentry")).unwrap();
+        let base = File::open(&base_path).unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, false, OperatorSymlinkPolicy::FollowAll).unwrap();
+
+        let select_directory = |path: &[u8]| {
+            let selected = resolver
+                .resolve(
+                    path,
+                    OperatorFinalComponent::Directory,
+                    false,
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            let PinnedPath::Directory(directory) = selected else {
+                panic!("directory was not selected");
+            };
+            directory.resolved_relative().map(<[u8]>::to_vec)
+        };
+
+        assert_eq!(select_directory(b"../outside"), None);
+        assert_eq!(
+            select_directory(b"../base/inside"),
+            Some(b"inside".to_vec())
+        );
+        assert_eq!(
+            select_directory(b"absolute-reentry"),
+            Some(b"inside".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn operator_directory_identity_does_not_conflate_mount_contexts() {
+        let identity = OperatorDirectoryIdentity {
+            dev: 7,
+            ino: 11,
+            mount_id: Some(13),
+        };
+        assert!(!operator_directory_identities_match(
+            identity,
+            OperatorDirectoryIdentity {
+                mount_id: Some(17),
+                ..identity
+            }
+        ));
+        assert!(!operator_directory_identities_match(
+            identity,
+            OperatorDirectoryIdentity {
+                mount_id: None,
+                ..identity
+            }
+        ));
     }
 
     #[test]

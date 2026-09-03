@@ -132,7 +132,10 @@ fn pin_selection(
     follow_src: bool,
     symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<MapSelection> {
-    let resolver = OperatorResolver::beneath(base, true, symlink_policy)?;
+    // `-C` is a resolution base, not a containment boundary. A followed
+    // selector may leave it; named selectors are checked separately below
+    // because their emitted `src` still has to be relative to this base.
+    let resolver = OperatorResolver::beneath(base, false, symlink_policy)?;
     let mut hops = Vec::new();
     let selection = resolver
         .resolve(
@@ -198,11 +201,17 @@ fn pin_selection(
 fn emitted_source(
     location: &crate::cli::Location,
     follow_src: bool,
-    resolved_relative: &[u8],
+    resolved_relative: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     if !follow_src || location.selection == SourceSelection::Contents {
         return Ok(location.path.clone());
     }
+    let resolved_relative = resolved_relative.with_context(|| {
+        format!(
+            "followed source {} resolves outside the mapping source base; choose a source base that contains it",
+            display(&location.path)
+        )
+    })?;
     if resolved_relative.is_empty() {
         bail!(
             "followed source {} resolves to the source base itself; select its contents instead",
