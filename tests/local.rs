@@ -5360,6 +5360,40 @@ fn capacity_failure_reports_other_settled_apply_outcomes_before_aborting() {
 }
 
 #[test]
+fn no_op_copy_does_not_mutate_directory_metadata() {
+    let t = Tmp::new();
+    write(&t.path("src/nested/file"), b"same");
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    let before: Vec<(i64, i64)> = [
+        t.path("dst"),
+        t.path("dst/nested"),
+        t.path("dst/nested/file"),
+    ]
+    .iter()
+    .map(|path| {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (metadata.ctime(), metadata.ctime_nsec())
+    })
+    .collect();
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    let after: Vec<(i64, i64)> = [
+        t.path("dst"),
+        t.path("dst/nested"),
+        t.path("dst/nested/file"),
+    ]
+    .iter()
+    .map(|path| {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (metadata.ctime(), metadata.ctime_nsec())
+    })
+    .collect();
+
+    assert_eq!(after, before);
+}
+
+#[test]
 fn dry_run_reports_typed_preflight_summary() {
     let t = Tmp::new();
     write(&t.path("src/send"), b"new");
@@ -5942,6 +5976,38 @@ fn small_files_atomic_no_partials() {
     ]);
     assert!(partial_files(&t.path("smd")).is_empty());
     assert_eq!(read(&t.path("smd/f7")), b"data-7");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn small_inplace_files_use_one_batched_worker() {
+    let t = Tmp::new();
+    for i in 0..3 {
+        write(
+            &t.path(&format!("src/f{i}")),
+            format!("contents-{i}").as_bytes(),
+        );
+    }
+    let output = compat_command()
+        .args([
+            "-a",
+            "--inplace",
+            "--syq-connections",
+            "32",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("small: 3 files in 1 batches"), "{stderr}");
+    assert!(stderr.contains("worker 0 connected"), "{stderr}");
+    assert!(!stderr.contains("worker 1 connected"), "{stderr}");
+    assert_eq!(read(&t.path("dst/f2")), b"contents-2");
+    assert!(partial_files(&t.path("dst")).is_empty());
 }
 
 #[cfg(debug_assertions)]
@@ -9349,17 +9415,14 @@ fn stats_report_connection_tuning_mode() {
     for i in 0..20 {
         std::fs::write(t.path(&format!("src/f{i}")), vec![b'x'; 1000]).unwrap();
     }
-    // Without -j the count is auto-tuned; a short local copy never leaves the
-    // CPU-sensitive local starting count.
+    // A tiny all-small-file job needs only one batch worker. Auto statistics
+    // report that settled count; fixed statistics continue to report the
+    // caller's configured ceiling.
     let out = run_ok(&["-a", "--stats", &t.s("src/"), &t.s("auto/")]);
     assert!(
-        out.contains(&format!(
-            "connections: auto: settled at {0} (path {0}, peak {0})",
-            expected_local_start()
-        )),
+        out.contains("connections: auto: settled at 1 (path 1, peak 1)"),
         "{out}"
     );
-    // An explicit -j is used as given, with no tuning.
     let out = run_ok(&[
         "-a",
         "--stats",

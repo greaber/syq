@@ -146,9 +146,12 @@ struct AuthorityState {
     /// destination path and the partial this grant declared for it:
     /// preallocation and basis seeding are charged against the aggregate
     /// ceiling here, once per file at its largest declared size, and every
-    /// write or publication must name a declared partial.
-    reserved: HashMap<(Vec<u8>, proto::PartialId), u64>,
+    /// write or publication must name a declared partial. Observation-only
+    /// preparations own separate provisional claims so an older absent
+    /// observation cannot roll back a newer preparation for the same key.
+    reserved: HashMap<(Vec<u8>, proto::PartialId), ByteReservation>,
     reserved_bytes: u64,
+    next_reservation_claim: u64,
     transferred_bytes: u64,
     deletions: u64,
     live_connections: u16,
@@ -186,6 +189,28 @@ enum ReceiverModeState {
     /// A new object's already-constrained mode. Pin it for the remainder of
     /// the grant so repeated requests cannot act as repeated chmod calls.
     Selected { mode: u32, kind: ReceiverModeKind },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ReservationClaimId(u64);
+
+#[derive(Debug, Default)]
+struct ByteReservation {
+    /// Capacity retained by a preparation that may have created, resized, or
+    /// reused the write target.
+    retained: Option<u64>,
+    /// Capacity provisionally claimed by observation-only preparations until
+    /// their individual outcomes are settled.
+    observations: HashMap<ReservationClaimId, u64>,
+}
+
+impl ByteReservation {
+    fn effective_size(&self) -> Option<u64> {
+        self.retained
+            .into_iter()
+            .chain(self.observations.values().copied())
+            .max()
+    }
 }
 
 impl ReceiverModeState {
@@ -394,6 +419,7 @@ impl RestrictedAuthority {
                 provisional: HashSet::new(),
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
+                next_reservation_claim: 0,
                 transferred_bytes: 0,
                 deletions: 0,
                 live_connections: 0,
@@ -724,25 +750,86 @@ impl RestrictedAuthority {
     /// the signed aggregate byte ceiling. A path is charged once, at the
     /// largest size declared for it, so retries and resumes do not double
     /// count while many distinct preparations cannot exceed the ceiling.
-    fn reserve_bytes(&self, path: &[u8], partial_id: proto::PartialId, size: u64) -> Result<()> {
+    fn reserve_bytes(
+        &self,
+        path: &[u8],
+        partial_id: proto::PartialId,
+        size: u64,
+        observation_only: bool,
+    ) -> Result<Option<ReservationClaimId>> {
         let mut state = self.state.lock().unwrap();
         let key = (path.to_vec(), partial_id);
-        // An existing declaration only grows; a new one is registered even
-        // at zero length, so an empty file can still be published.
-        let previous = state.reserved.get(&key).copied();
-        if previous.is_some_and(|previous| size <= previous) {
-            return Ok(());
-        }
+        let previous = state
+            .reserved
+            .get(&key)
+            .and_then(ByteReservation::effective_size);
+        // An existing declaration only grows; a new one is registered even at
+        // zero length, so an empty file can still be published.
+        let effective = previous.map_or(size, |previous| previous.max(size));
         let total = state
             .reserved_bytes
-            .checked_add(size - previous.unwrap_or(0))
+            .checked_add(effective - previous.unwrap_or(0))
             .context("signed reservation byte counter overflow")?;
         if total > self.copy.limits.max_total_bytes {
             bail!("signed grant total-byte limit exceeded by file preparation");
         }
+        let claim = if observation_only {
+            let claim = ReservationClaimId(state.next_reservation_claim);
+            state.next_reservation_claim = state
+                .next_reservation_claim
+                .checked_add(1)
+                .context("reservation claim counter overflow")?;
+            Some(claim)
+        } else {
+            None
+        };
+        let reservation = state.reserved.entry(key).or_default();
+        if let Some(claim) = claim {
+            reservation.observations.insert(claim, size);
+        } else {
+            reservation.retained = Some(
+                reservation
+                    .retained
+                    .map_or(size, |retained| retained.max(size)),
+            );
+        }
         state.reserved_bytes = total;
-        state.reserved.insert(key, size);
-        Ok(())
+        Ok(claim)
+    }
+
+    /// Settle one observation's provisional reservation without disturbing
+    /// claims installed by requests that ran before or after it.
+    fn settle_observation_reservation(
+        state: &mut AuthorityState,
+        key: &(Vec<u8>, proto::PartialId),
+        claim: ReservationClaimId,
+        retain: bool,
+    ) {
+        let Some(reservation) = state.reserved.get_mut(key) else {
+            return;
+        };
+        let before = reservation
+            .effective_size()
+            .expect("a stored reservation has at least one claim");
+        let Some(size) = reservation.observations.remove(&claim) else {
+            return;
+        };
+        if retain {
+            reservation.retained = Some(
+                reservation
+                    .retained
+                    .map_or(size, |retained| retained.max(size)),
+            );
+        }
+        let after = reservation.effective_size();
+        let released = before - after.unwrap_or(0);
+        state.reserved_bytes = state
+            .reserved_bytes
+            .checked_sub(released)
+            .expect("reservation settlement cannot underflow");
+        if after.is_none() {
+            state.reserved.remove(key);
+        }
     }
 
     /// The size this grant declared for a partial, which bounds what may be
@@ -754,7 +841,7 @@ impl RestrictedAuthority {
             .unwrap()
             .reserved
             .get(&(path.to_vec(), partial_id))
-            .copied()
+            .and_then(ByteReservation::effective_size)
             .with_context(|| {
                 format!(
                     "staged file {} was not declared under this grant",
@@ -1026,7 +1113,25 @@ impl RestrictedAuthority {
                     size,
                     inplace,
                     stage,
+                    skip_if_absent,
+                    observation_claim,
                 } => {
+                    // Observation-only Prepare replaces the old partial probe.
+                    // Settle only this request's provisional claim: concurrent
+                    // preparations for the same partial retain their own
+                    // capacity regardless of response ordering.
+                    let absent =
+                        skip_if_absent && matches!(response, proto::Response::PartialSize(None));
+                    if let Some(claim) = observation_claim {
+                        let key = (path.clone(), partial_id);
+                        Self::settle_observation_reservation(&mut state, &key, claim, !absent);
+                    }
+                    // If no sidecar existed, the observation performed no
+                    // file-lifecycle mutation and must not create an
+                    // incomplete receipt entry.
+                    if absent {
+                        continue;
+                    }
                     if state.ledger_v2.is_none() {
                         continue;
                     }
@@ -2075,7 +2180,7 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, false, None, pending)?;
-                self.reserve_bytes(path, *partial_id, *len)?;
+                self.reserve_bytes(path, *partial_id, *len, false)?;
                 outcomes.push(PendingOutcome::FileStageV2 {
                     index: 0,
                     path: path.clone(),
@@ -2083,6 +2188,8 @@ impl RestrictedAuthority {
                     size: *len,
                     inplace: false,
                     stage: FileStageV2::Prepare,
+                    skip_if_absent: false,
+                    observation_claim: None,
                 });
                 *guard = Some(self.guard.clone());
             }
@@ -2116,6 +2223,7 @@ impl RestrictedAuthority {
                 size,
                 inplace,
                 partial_id,
+                create_if_missing,
                 guard,
                 ..
             } => {
@@ -2127,7 +2235,8 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_prepare(path)?;
-                self.reserve_bytes(path, *partial_id, *size)?;
+                let observation_claim =
+                    self.reserve_bytes(path, *partial_id, *size, !*create_if_missing)?;
                 outcomes.push(PendingOutcome::FileStageV2 {
                     index: 0,
                     path: path.clone(),
@@ -2135,6 +2244,8 @@ impl RestrictedAuthority {
                     size: *size,
                     inplace: *inplace,
                     stage: FileStageV2::Prepare,
+                    skip_if_absent: !*create_if_missing,
+                    observation_claim,
                 });
                 if *inplace {
                     // In-place preparation resizes the final file itself:
@@ -2172,6 +2283,8 @@ impl RestrictedAuthority {
                     size: declared,
                     inplace: *inplace,
                     stage: FileStageV2::Write,
+                    skip_if_absent: false,
+                    observation_claim: None,
                 });
                 self.charge_bytes(path, *off, data.len())?;
                 *guard = Some(self.guard.clone());
@@ -2199,6 +2312,8 @@ impl RestrictedAuthority {
                     size: self.declared_size(path, *partial_id)?,
                     inplace: *inplace,
                     stage: FileStageV2::Finalize,
+                    skip_if_absent: false,
+                    observation_claim: None,
                 });
                 touched_v2.push(path.clone());
                 self.constrain_receiver_mode(
@@ -2211,8 +2326,10 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::PutSmallBatch(puts) => {
-                if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
-                    bail!("in-place signed receiver forbids staged small-file publication");
+                if self.copy.policy.publication != PublicationPolicy::AtomicStaged
+                    || puts.iter().any(|put| put.inplace)
+                {
+                    bail!("small-file publication does not match the signed publication policy");
                 }
                 if let Some(limit) = &self.file_data_limit {
                     let bytes = puts.iter().try_fold(0u64, |total, put| {
@@ -2338,6 +2455,13 @@ enum PendingOutcome {
         size: u64,
         inplace: bool,
         stage: FileStageV2,
+        /// Ignore a successful observation-only Prepare when it found no
+        /// resumable sidecar and therefore performed no lifecycle mutation.
+        skip_if_absent: bool,
+        /// This observation-only Prepare's provisional reservation. Settlement
+        /// releases or retains precisely this claim without affecting a
+        /// concurrent preparation for the same partial.
+        observation_claim: Option<ReservationClaimId>,
     },
 }
 
@@ -4796,6 +4920,7 @@ pub(crate) mod tests {
                 mtime_nsec: 0,
             },
             flags: proto::flags::RECEIVER_MODE,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: Some(ContainerGuard {
                 root: outside,
@@ -4897,6 +5022,8 @@ pub(crate) mod tests {
             inplace: false,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let mut included_prepare = prepare(included);
@@ -4974,6 +5101,8 @@ pub(crate) mod tests {
             inplace: false,
             partial_id: [2; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let mut cache_root = prepare(cache.clone());
@@ -5002,6 +5131,8 @@ pub(crate) mod tests {
             inplace,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let mut inplace = prepare(true);
@@ -5050,6 +5181,8 @@ pub(crate) mod tests {
             inplace: false,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         }
     }
@@ -5081,6 +5214,7 @@ pub(crate) mod tests {
             hash: crate::fsops::content_digest(b"new"),
             meta: plain_meta(),
             flags: 0,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: None,
         }])
@@ -5235,6 +5369,7 @@ pub(crate) mod tests {
             path: path_bytes(&kept),
             partial_id: [1; 16],
             len: 3,
+            attempt: 0,
             guard: None,
         };
         assert!(authority.authorize(&mut seed, false).is_err());
@@ -5834,6 +5969,117 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn observation_only_prepare_releases_absent_reservation_and_skips_lifecycle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let authority = test_authority_with_receipt(
+            &root,
+            DeletionPolicy::Forbid,
+            4,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((
+                generate_receipt_key(EnrollmentId::random()).unwrap(),
+                test_receipt_policy(),
+            )),
+        )
+        .unwrap();
+        let prepare = |path: &Path| {
+            let mut request = prepare_request(path);
+            let Request::Prepare {
+                create_if_missing, ..
+            } = &mut request
+            else {
+                unreachable!()
+            };
+            *create_if_missing = false;
+            request
+        };
+
+        let mut absent = prepare(&target.join("absent"));
+        let first = authority.authorize(&mut absent, false).unwrap();
+        let mut same_absent = prepare(&target.join("absent"));
+        let second = authority.authorize(&mut same_absent, false).unwrap();
+        authority.settle(first, &proto::Response::PartialSize(None));
+        assert_eq!(authority.state.lock().unwrap().reserved_bytes, 4);
+        authority.settle(second, &proto::Response::PartialSize(None));
+        {
+            let state = authority.state.lock().unwrap();
+            assert!(state.file_lifecycles_v2.is_empty());
+            assert!(state.reserved.is_empty());
+            assert_eq!(state.reserved_bytes, 0);
+        }
+
+        let present_path = target.join("present");
+        let mut present = prepare(&present_path);
+        let settlement = authority.authorize(&mut present, false).unwrap();
+        authority.settle(settlement, &proto::Response::PartialSize(Some(0)));
+        let state = authority.state.lock().unwrap();
+        assert!(state
+            .file_lifecycles_v2
+            .contains_key(&(path_bytes(&present_path), [1; 16])));
+        assert_eq!(state.reserved_bytes, 4);
+    }
+
+    #[test]
+    fn older_observation_does_not_release_newer_real_reservation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let authority = test_authority_with_receipt(
+            &root,
+            DeletionPolicy::Forbid,
+            4,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((
+                generate_receipt_key(EnrollmentId::random()).unwrap(),
+                test_receipt_policy(),
+            )),
+        )
+        .unwrap();
+        let path = target.join("shared");
+        let mut observation = prepare_request(&path);
+        let Request::Prepare {
+            create_if_missing, ..
+        } = &mut observation
+        else {
+            unreachable!()
+        };
+        *create_if_missing = false;
+
+        let older = authority.authorize(&mut observation, false).unwrap();
+        let mut real = prepare_request(&path);
+        let newer = authority.authorize(&mut real, false).unwrap();
+        authority.settle(older, &proto::Response::PartialSize(None));
+
+        {
+            let state = authority.state.lock().unwrap();
+            let reservation = state.reserved.get(&(path_bytes(&path), [1; 16])).unwrap();
+            assert_eq!(reservation.retained, Some(4));
+            assert!(reservation.observations.is_empty());
+            assert_eq!(state.reserved_bytes, 4);
+        }
+        let mut another = prepare_request(&target.join("another"));
+        let error = authority.authorize(&mut another, false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("signed grant total-byte limit exceeded"));
+        authority.settle(newer, &proto::Response::PartialSize(None));
+    }
+
+    #[test]
     fn receipt_v2_records_each_outcome_and_closure_state_then_encrypts_it() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
@@ -5879,6 +6125,7 @@ pub(crate) mod tests {
             hash: crate::fsops::content_digest(b"new"),
             meta: plain_meta(),
             flags: 0,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: None,
         };
@@ -5996,6 +6243,8 @@ pub(crate) mod tests {
             inplace: true,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let settlement = authority.authorize(&mut prepare, false).unwrap();
@@ -6045,6 +6294,8 @@ pub(crate) mod tests {
             inplace: true,
             partial_id: [2; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let settlement = finished.authorize(&mut prepare, false).unwrap();
@@ -6580,6 +6831,7 @@ pub(crate) mod tests {
                 mtime_nsec: 0,
             },
             flags: proto::flags::RECEIVER_MODE,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: None,
         };
@@ -6736,6 +6988,7 @@ pub(crate) mod tests {
             partial_id: [0; 16],
             block,
             len,
+            attempt: 0,
             guard: None,
         };
 
@@ -6787,6 +7040,8 @@ pub(crate) mod tests {
             inplace: false,
             partial_id: [0; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         authority.authorize(&mut prepare, false).unwrap();
@@ -6920,6 +7175,7 @@ pub(crate) mod tests {
                 mtime_nsec: 0,
             },
             flags: 0,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: None,
         }]);
@@ -7068,6 +7324,8 @@ pub(crate) mod tests {
             inplace: false,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         authority.authorize(&mut prepare("a", 10), false).unwrap();
@@ -7083,6 +7341,7 @@ pub(crate) mod tests {
             path: root.join("target/b").as_os_str().as_bytes().to_vec(),
             partial_id: [1; 16],
             len: 3,
+            attempt: 0,
             guard: None,
         };
         assert!(authority.authorize(&mut seed, false).is_err());
@@ -7415,6 +7674,7 @@ pub(crate) mod tests {
             partial_id: [0; 16],
             block: 4096,
             len: 1,
+            attempt: 0,
             guard: Some(guard),
         });
         assert!(matches!(response, proto::Response::EndpointError(_)));
@@ -7472,6 +7732,7 @@ pub(crate) mod tests {
                 partial_id: [0; 16],
                 block: proto::MIN_HASH_BLOCK_BYTES,
                 len: 1,
+                attempt: 0,
                 guard: None,
             },
         ] {
