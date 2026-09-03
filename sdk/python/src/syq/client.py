@@ -747,6 +747,18 @@ class Client:
         timeout: float | None = None,
         check: bool = True,
     ) -> CpResult:
+        if (
+            from_ is not None
+            and to is not None
+            and dry_run
+            and coordinate_at != "local"
+        ):
+            # Mirrors the CLI's usage-lane refusal: a dry run's traces exist
+            # only on the coordinator, which these placements move remote.
+            raise SyqInvocationError(
+                "a remote-to-remote dry run cannot produce the results "
+                "stream this surface relies on; pass coordinate_at='local'"
+            )
         argv, source_count = _copy_arguments(
             "cp",
             sources,

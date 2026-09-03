@@ -2357,7 +2357,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
-    if !args.quiet && !aborted {
+    if !args.quiet && !aborted && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
                 println!(

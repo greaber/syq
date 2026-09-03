@@ -18,8 +18,10 @@ from .models import (
     EntryKind,
     ErrorClass,
     ErrorEvent,
+    AttestedDigest,
     FinalObjectState,
     FinalStateEvent,
+    ObjectMetadata,
     MappingEntry,
     OperationAction,
     OperationResult,
@@ -307,9 +309,28 @@ class AutomationDecoder:
             state = record.get("object")
             if not isinstance(state, dict):
                 raise SyqProtocolError("final_state record has no object")
-            digest = state.get("digest")
-            if digest is not None and not isinstance(digest, dict):
-                raise SyqProtocolError("final_state digest is not an object")
+            digest_record = state.get("digest")
+            digest = None
+            if digest_record is not None:
+                if not isinstance(digest_record, dict):
+                    raise SyqProtocolError("final_state digest is not an object")
+                digest = AttestedDigest(
+                    algorithm=_string(digest_record, "algorithm"),
+                    value=_string(digest_record, "value"),
+                )
+            metadata_record = state.get("metadata")
+            metadata = None
+            if metadata_record is not None:
+                if not isinstance(metadata_record, dict):
+                    raise SyqProtocolError("final_state metadata is not an object")
+                metadata = ObjectMetadata(
+                    mode=_integer(metadata_record, "mode"),
+                    uid=_integer(metadata_record, "uid"),
+                    gid=_integer(metadata_record, "gid"),
+                    mtime=_integer(metadata_record, "mtime"),
+                    mtime_nsec=_integer(metadata_record, "mtime_nsec"),
+                    rdev=_integer(metadata_record, "rdev"),
+                )
             return FinalStateEvent(
                 **common,
                 provenance=_string(record, "provenance"),
@@ -318,7 +339,8 @@ class AutomationDecoder:
                 state=_enum(state, "state", FinalObjectState),
                 kind=_optional_string(state, "kind"),
                 size=_optional_integer(state, "size"),
-                digest=digest.get("value") if digest else None,
+                metadata=metadata,
+                digest=digest,
                 symlink_target=(
                     _tagged(state["symlink_target"], label="symlink_target")
                     if "symlink_target" in state
@@ -357,12 +379,12 @@ class AutomationDecoder:
             )
             attested = record.get("provenance") == "receiver_attested"
             if attested:
-                # A receipt attests settled deletions as individual delete
-                # records; it cannot vouch for planning or --max-delete
-                # blocking, so attested terminals carry no deletion totals.
-                if any(value is not None for value in deletion_values):
+                # A receipt attests settled deletions (deletions_completed);
+                # it cannot vouch for planning or --max-delete blocking, so
+                # the other two totals never appear.
+                if deletion_values[0] is not None or deletion_values[2] is not None:
                     raise SyqProtocolError(
-                        "a receiver-attested result may not contain deletion totals"
+                        "a receiver-attested result may only contain deletions_completed"
                     )
             elif self.run.prune and any(value is None for value in deletion_values):
                 raise SyqProtocolError(
@@ -394,6 +416,9 @@ class AutomationDecoder:
                 deletions_blocked=deletion_values[2],
                 provenance=_optional_string(record, "provenance"),
                 receipt_status=_optional_string(record, "receipt_status"),
+                operations=_optional_integer(record, "operations"),
+                final_states=_optional_integer(record, "final_states"),
+                receipt_records=_optional_integer(record, "receipt_records"),
             )
             self.result = result
             return result

@@ -106,6 +106,10 @@ pub struct Args {
     /// stream; validated and wrapped at startup.
     #[arg(skip)]
     pub native_results_fd: Option<i32>,
+    /// Internal delegated-run marker: skip the final human summary (the
+    /// invoking machine renders it from the verified attested terminal).
+    #[arg(skip)]
+    pub suppress_summary: bool,
     /// Native coordinator placement.
     #[arg(skip)]
     pub coordinate_at: CoordinateAt,
@@ -815,6 +819,10 @@ struct NativeCopyFields {
     /// bytes, so any filename survives the remote shell.
     #[arg(long, hide = true)]
     delegated_operands_b64: bool,
+    /// Internal: skip the final human summary — the invoking machine
+    /// renders it from the verified attested terminal instead.
+    #[arg(long, hide = true)]
+    suppress_summary: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
     /// Target endpoint ([USER@]HOST[:PORT]); omitted means local
@@ -1134,6 +1142,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
     args.native_results_fd = results_fd;
+    args.suppress_summary = copy.suppress_summary;
     args.pscope = pscope;
     args.native_follow = copy.selection.source.follow;
     if args.native_mapping.is_some() {

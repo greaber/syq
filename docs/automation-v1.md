@@ -190,9 +190,14 @@ terminal additionally carries `provenance`, the verified
 bookkeeping (`operations`, `final_states`, `receipt_records`); its
 aggregates cover receiver-visible work only — unchanged and excluded
 entries are orchestrator concepts a receipt cannot attest, and read
-as zero, and it carries no `deletions_*` totals even under `--prune`
-(settled deletions appear as individual `delete` records; planning
-and `--max-delete` blocking are coordinator concepts).
+as zero. Of the deletion totals it carries only `deletions_completed`,
+the settled deletions the receipt attests (each also appears as an
+individual `delete` record); `deletions_planned` and
+`deletions_blocked` never appear because planning and `--max-delete`
+blocking are coordinator concepts. Its `errors` count equals the
+receiver-attested `error` records emitted on the stream: one per
+failed or incomplete operation, per refusal, and per failed
+final-state observation.
 
 The human summary is rendered from this same record, so the numbers a
 person reads and a machine parses cannot disagree.

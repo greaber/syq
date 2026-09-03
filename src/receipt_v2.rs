@@ -729,16 +729,23 @@ impl VerifiedReceiptV2 {
 /// `error` record per refusal, a `final_state` record per closure-time
 /// observation, and the sealed terminal `result`. Every attested record
 /// carries `provenance: "receiver_attested"`.
+/// What the emission produced, for the human summary that renders from the
+/// same data.
+pub(crate) struct EmittedAutomationRecords {
+    pub errors: u64,
+}
+
 pub(crate) fn emit_automation_records(
     receipt: &mut VerifiedReceiptV2,
     writer: &crate::results::ResultsWriter,
     results_status: &'static str,
     exit_code: i32,
     elapsed_ms: u64,
-) -> Result<()> {
+) -> Result<EmittedAutomationRecords> {
     let mut directories_created = 0u64;
     let mut symlinks_created = 0u64;
     let mut specials_created = 0u64;
+    let mut errors_emitted = 0u64;
     receipt.for_each_record(|record| {
         let value = match record {
             RecordV2::Operation(record) => {
@@ -789,27 +796,73 @@ pub(crate) fn emit_automation_records(
                 if let Some(bytes) = bytes {
                     object.insert("bytes".into(), bytes.into());
                 }
-                if let Some(message) = record.diagnostic {
-                    object.insert("message".into(), message.into());
+                if let Some(message) = &record.diagnostic {
+                    object.insert("message".into(), message.as_str().into());
                 }
-                value
+                if matches!(
+                    record.disposition,
+                    OperationDispositionV2::Failed | OperationDispositionV2::Incomplete
+                ) {
+                    writer.emit_value(value);
+                    errors_emitted += 1;
+                    serde_json::json!({
+                        "type": "error",
+                        "provenance": "receiver_attested",
+                        "class": error_class_for(record.code),
+                        "code": outcome_name(record.code),
+                        "message": record.diagnostic.unwrap_or_else(|| {
+                            format!(
+                                "receiver operation on {} did not complete",
+                                String::from_utf8_lossy(&record.path)
+                            )
+                        }),
+                    })
+                } else {
+                    value
+                }
             }
-            RecordV2::Refusal(record) => serde_json::json!({
-                "type": "error",
-                "provenance": "receiver_attested",
-                // The receiver's guard deliberately refused the request.
-                "class": "safety_limit",
-                "code": outcome_name(record.code),
-                "message": record.diagnostic,
-            }),
+            RecordV2::Refusal(record) => {
+                errors_emitted += 1;
+                serde_json::json!({
+                    "type": "error",
+                    "provenance": "receiver_attested",
+                    // The receiver's guard deliberately refused the request.
+                    "class": "safety_limit",
+                    "code": outcome_name(record.code),
+                    "message": record
+                        .diagnostic
+                        .unwrap_or_else(|| "receiver refused the request".to_string()),
+                })
+            }
             RecordV2::FinalState(record) => {
                 let object = match record.object {
                     FinalObjectV2::Absent => serde_json::json!({"state": "absent"}),
-                    FinalObjectV2::ObservationFailed { code, diagnostic } => serde_json::json!({
-                        "state": "observation_failed",
-                        "code": outcome_name(code),
-                        "message": diagnostic,
-                    }),
+                    FinalObjectV2::ObservationFailed { code, diagnostic } => {
+                        writer.emit_value(serde_json::json!({
+                            "type": "error",
+                            "provenance": "receiver_attested",
+                            "class": "io",
+                            "code": outcome_name(code),
+                            "message": diagnostic.clone().unwrap_or_else(|| {
+                                format!(
+                                    "final state of {} could not be observed",
+                                    String::from_utf8_lossy(&record.path)
+                                )
+                            }),
+                        }));
+                        errors_emitted += 1;
+                        let mut object = serde_json::json!({
+                            "state": "observation_failed",
+                            "code": outcome_name(code),
+                        });
+                        if let Some(message) = diagnostic {
+                            object
+                                .as_object_mut()
+                                .expect("final object is an object")
+                                .insert("message".into(), message.into());
+                        }
+                        object
+                    }
                     FinalObjectV2::Present {
                         kind,
                         size,
@@ -864,12 +917,9 @@ pub(crate) fn emit_automation_records(
     })?;
 
     let terminal = &receipt.terminal;
-    let errors = terminal
-        .summary
-        .failed
-        .saturating_add(terminal.summary.incomplete)
-        .saturating_add(terminal.summary.refusals)
-        .saturating_add(terminal.summary.observation_failures);
+    // errors matches the error records actually emitted above — one per
+    // counted error, by construction.
+    let errors = errors_emitted;
     // Aggregates describe receiver-visible work only: unchanged and
     // excluded entries are orchestrator concepts a receipt cannot attest.
     writer.emit_terminal_value(serde_json::json!({
@@ -889,14 +939,17 @@ pub(crate) fn emit_automation_records(
         "bytes_transferred": terminal.summary.transferred_bytes,
         "bytes_unchanged": 0,
         "elapsed_ms": elapsed_ms,
-        // No deletions_* aggregates: a receipt attests settled deletions as
-        // individual delete records, but planning and --max-delete blocking
-        // are coordinator concepts it cannot vouch for.
+        // The one deletion fact a receipt can attest: settled deletions.
+        // Planning and --max-delete blocking are coordinator concepts, so
+        // deletions_planned and deletions_blocked never appear here.
+        "deletions_completed": terminal.summary.deletions,
         "operations": terminal.summary.operations,
         "final_states": terminal.summary.final_states,
         "receipt_records": terminal.record_count,
     }));
-    Ok(())
+    Ok(EmittedAutomationRecords {
+        errors: errors_emitted,
+    })
 }
 
 fn tagged_path(path: &[u8]) -> serde_json::Value {
@@ -940,6 +993,16 @@ fn outcome_name(code: OutcomeCodeV2) -> &'static str {
 
 pub(crate) fn receipt_status_label(status: ReceiptStatusV2) -> &'static str {
     receipt_status_name(status)
+}
+
+fn error_class_for(code: OutcomeCodeV2) -> &'static str {
+    match code {
+        OutcomeCodeV2::AuthorizationRefused => "safety_limit",
+        OutcomeCodeV2::FileLifecycleIncomplete => "integrity",
+        OutcomeCodeV2::ExecutionFailed | OutcomeCodeV2::ObservationFailed | OutcomeCodeV2::None => {
+            "io"
+        }
+    }
 }
 
 fn receipt_status_name(status: ReceiptStatusV2) -> &'static str {
@@ -1426,6 +1489,135 @@ mod tests {
     }
 
     #[test]
+    fn attested_failures_emit_matching_error_records() {
+        let (secret, public) = generate_recipient().unwrap();
+        let policy = policy(public);
+        let enrollment_id = EnrollmentId::random();
+        let request_id = RequestId::fresh(1_900_000_000).unwrap();
+        let grant_digest = [7; 32];
+        let signing_key = key(3);
+        let mut stream = StreamWriterV2::new(&policy).unwrap();
+        stream.append(&RecordV2::Operation(OperationRecordV2 {
+            sequence: stream.next_sequence(),
+            scope: 0,
+            path: b"artifact".to_vec(),
+            action: OperationActionV2::PublishFile {
+                size: 3,
+                inplace: false,
+            },
+            disposition: OperationDispositionV2::Failed,
+            code: OutcomeCodeV2::ExecutionFailed,
+            diagnostic: Some("short write".to_string()),
+        }));
+        stream.append(&RecordV2::Refusal(RefusalRecordV2 {
+            sequence: stream.next_sequence(),
+            code: OutcomeCodeV2::AuthorizationRefused,
+            diagnostic: None,
+        }));
+        stream.append(&RecordV2::FinalState(FinalStateRecordV2 {
+            sequence: stream.next_sequence(),
+            scope: 0,
+            path: b"artifact".to_vec(),
+            object: FinalObjectV2::ObservationFailed {
+                code: OutcomeCodeV2::ObservationFailed,
+                diagnostic: None,
+            },
+        }));
+        let issued = stream
+            .finish(ReceiptClosureV2 {
+                enrollment_id,
+                request_id,
+                grant_digest,
+                issued_at: 1_900_000_001,
+                policy: policy.clone(),
+                entries_touched: 1,
+                transferred_bytes: 0,
+                signing_key: &signing_key,
+            })
+            .unwrap();
+        let mut frames = Vec::new();
+        emit_transport_frames(issued, |frame| {
+            frames.push(frame);
+            Ok(())
+        })
+        .unwrap();
+        let mut verified = open_attached_frames(
+            frames.into_iter().map(Ok),
+            &secret,
+            &signing_key.public_key().to_openssh().unwrap(),
+            enrollment_id,
+            request_id,
+            grant_digest,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(verified.terminal.status, ReceiptStatusV2::Incomplete);
+
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = crate::results::ResultsWriter::new(Box::new(sink.clone()));
+        let emitted = emit_automation_records(&mut verified, &writer, "aborted", 1, 3).unwrap();
+        assert_eq!(emitted.errors, 3);
+        let automation = sink.0.lock().unwrap().clone();
+        let records: Vec<serde_json::Value> = String::from_utf8(automation)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schemas/automation-v1.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["seq"], index as u64);
+            if let Err(error) = validator.validate(record) {
+                panic!("line {}: {error}: {record}", index + 1);
+            }
+        }
+        // Each counted failure produces an error record: the failed
+        // operation, the refusal, and the failed observation, in stream
+        // order, with the failed operation's record preceding its error.
+        let types: Vec<&str> = records
+            .iter()
+            .map(|record| record["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "operation_result",
+                "error",
+                "error",
+                "error",
+                "final_state",
+                "result"
+            ]
+        );
+        assert_eq!(records[0]["disposition"], "failed");
+        assert_eq!(records[1]["class"], "io");
+        assert_eq!(records[1]["code"], "execution_failed");
+        assert_eq!(records[1]["message"], "short write");
+        assert_eq!(records[2]["class"], "safety_limit");
+        assert_eq!(records[2]["code"], "authorization_refused");
+        assert_eq!(records[3]["class"], "io");
+        assert_eq!(records[3]["code"], "observation_failed");
+        assert_eq!(records[4]["object"]["state"], "observation_failed");
+        let result = records.last().unwrap();
+        assert_eq!(result["status"], "aborted");
+        assert_eq!(result["receipt_status"], "incomplete");
+        assert_eq!(result["exit_code"], 1);
+        assert_eq!(result["errors"], 3);
+    }
+
+    #[test]
     fn encrypted_stream_round_trips_and_binds_all_frames() {
         let (secret, public) = generate_recipient().unwrap();
         let policy = policy(public);
@@ -1543,12 +1735,19 @@ mod tests {
             records[1]["object"]["digest"]["value"],
             "0909090909090909090909090909090909090909090909090909090909090909"
         );
+        assert_eq!(records[1]["object"]["metadata"]["mode"], 0o100644);
         let result = records.last().unwrap();
         assert_eq!(result["type"], "result");
         assert_eq!(result["status"], "refused");
         assert_eq!(result["receipt_status"], "clean");
         assert_eq!(result["exit_code"], 25);
         assert_eq!(result["elapsed_ms"], 7);
+        assert_eq!(result["errors"], 0);
+        assert_eq!(result["deletions_completed"], 0);
+        assert_eq!(result["operations"], 1);
+        assert_eq!(result["final_states"], 1);
+        assert!(result.get("deletions_planned").is_none());
+        assert!(result.get("deletions_blocked").is_none());
 
         let mut missing = frames;
         missing.remove(1);

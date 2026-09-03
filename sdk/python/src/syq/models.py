@@ -321,6 +321,26 @@ class ErrorEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ObjectMetadata:
+    """Filesystem metadata the receiver attested for a final object."""
+
+    mode: int
+    uid: int
+    gid: int
+    mtime: int
+    mtime_nsec: int
+    rdev: int
+
+
+@dataclass(frozen=True, slots=True)
+class AttestedDigest:
+    """A content digest from the receipt, algorithm included."""
+
+    algorithm: str
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
 class FinalStateEvent:
     """A receiver-attested closure-time observation of one touched path."""
 
@@ -333,7 +353,8 @@ class FinalStateEvent:
     state: FinalObjectState
     kind: str | None
     size: int | None
-    digest: str | None
+    metadata: ObjectMetadata | None
+    digest: AttestedDigest | None
     symlink_target: PathValue | None
     observation_error: str | None
     code: ReceiptCode | None
@@ -364,6 +385,9 @@ class OperationSummary:
     deletions_blocked: int | None
     provenance: str | None = None
     receipt_status: str | None = None
+    operations: int | None = None
+    final_states: int | None = None
+    receipt_records: int | None = None
     type: str = "result"
 
 

@@ -438,6 +438,8 @@ class NativeClientTests(unittest.TestCase):
             self.client.map(src_src="source", as_="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "--coordinate-at"):
             self.client.cp("source", into="target", coordinate_at="elsewhere")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "dry run"):
+            self.client.cp(from_="alpha:src", to="beta:dst", dry_run=True)
         with self.assertRaisesRegex(ValueError, "relative"):
             syq.RelativePath("/absolute")
         with self.assertRaisesRegex(ValueError, "NUL"):
@@ -549,6 +551,10 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
                 "bytes_transferred": 3,
                 "bytes_unchanged": 0,
                 "elapsed_ms": 5,
+                "deletions_completed": 0,
+                "operations": 3,
+                "final_states": 1,
+                "receipt_records": 4,
             },
         ]
         events = [
@@ -564,8 +570,17 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
         final = events[3]
         self.assertIsInstance(final, syq.FinalStateEvent)
         self.assertIs(final.state, syq.FinalObjectState.PRESENT)
-        self.assertEqual(final.digest, "ab" * 32)
+        assert final.digest is not None
+        self.assertEqual(final.digest.algorithm, "blake3")
+        self.assertEqual(final.digest.value, "ab" * 32)
+        assert final.metadata is not None
+        self.assertEqual(final.metadata.mode, 0o644)
         result = decoder.finish(0)
-        # Attested prune terminals carry no deletion totals.
+        # Attested terminals carry only the settled-deletion total.
         self.assertIsNone(result.deletions_planned)
+        self.assertIsNone(result.deletions_blocked)
+        self.assertEqual(result.deletions_completed, 0)
         self.assertEqual(result.receipt_status, "clean")
+        self.assertEqual(result.operations, 3)
+        self.assertEqual(result.final_states, 1)
+        self.assertEqual(result.receipt_records, 4)
