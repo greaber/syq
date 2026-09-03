@@ -671,14 +671,14 @@ pub fn run(
     run_remote(args, srcs, dst, false, results)
 }
 
-pub fn run_at_target(
+pub fn coordinate_at_target(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
     results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
 ) -> Result<i32> {
     if args.interface == Interface::Rsync {
-        bail!("--run-at target is available only through native copy syntax");
+        bail!("--coordinate-at dest is available only through native copy syntax");
     }
     if !srcs[0].same_host(dst)
         && args.rsh.is_none()
@@ -687,7 +687,7 @@ pub fn run_at_target(
         && !args.agent_broker_only
     {
         bail!(
-            "--run-at target requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with target-host credentials, or an explicit --rsh policy"
+            "--coordinate-at dest requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with target-host credentials, or an explicit --rsh policy"
         );
     }
     run_remote(args, srcs, dst, true, results)
@@ -898,7 +898,7 @@ fn run_remote(
         // coordinator; the wrapper turns this into a failed terminal
         // record, so the stream still settles.
         bail!(
-            "--results with a direct remote-to-remote copy needs a command-restricted receiver enrollment (its verified receipt is the stream) or --run-at local to route the transfer through this machine"
+            "--results with a direct remote-to-remote copy needs a command-restricted receiver enrollment (its verified receipt is the stream) or --coordinate-at local to route the transfer through this machine"
         );
     }
     if args.no_bootstrap {

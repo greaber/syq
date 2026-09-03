@@ -2,7 +2,8 @@
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{
-    parse_rsh, parse_size, Args, Existence, Interface, Location, Placement, RunAt, SourceSelection,
+    parse_rsh, parse_size, Args, CoordinateAt, Existence, Interface, Location, Placement,
+    SourceSelection,
 };
 use crate::conn::{
     ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
@@ -929,7 +930,7 @@ pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &L
     source.is_remote()
         && dst.is_remote()
         && !args.relay
-        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
+        && (args.interface == Interface::Rsync || args.coordinate_at != CoordinateAt::Local)
 }
 
 fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
@@ -996,7 +997,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && dst.is_remote()
         && !original_srcs[0].same_host(dst)
         && !args.relay
-        && args.run_at != RunAt::Local;
+        && args.coordinate_at != CoordinateAt::Local;
     if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
     {
         bail!(
@@ -1005,7 +1006,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     if args.pscope_explicit && coordinator_is_remote {
         bail!(
-            "--pscope is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
+            "--pscope is not supported with a remote transfer coordinator; use --coordinate-at local to keep the reusable connections on this machine"
         );
     }
     if args.restricted_grant.is_some()
@@ -1093,8 +1094,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if args.connections_default {
             args.connections = tune::START_SSH;
         }
-        if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
-            return crate::direct::run_at_target(
+        if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dest {
+            return crate::direct::coordinate_at_target(
                 &args,
                 srcs,
                 dst,
@@ -1104,18 +1105,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         return crate::direct::run(&args, srcs, dst, progress.results_writer().cloned());
     }
     if srcs[0].is_remote() && dst.is_remote() {
-        if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
+        if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Local {
             args.relay = true;
         }
         // Delegated operands are base64 in the remote argv, so every
         // non-relay remote-to-remote copy took the direct return above; the
-        // only way here is the operator's explicit --run-at local.
+        // only way here is the operator's explicit --coordinate-at local.
         debug_assert!(args.relay);
         if !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
-    } else if args.interface != Interface::Rsync && args.run_at != RunAt::Auto {
-        bail!("--run-at currently applies only to copies between two remote endpoints");
+    } else if args.interface != Interface::Rsync && args.coordinate_at != CoordinateAt::Auto {
+        bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let mut dst_ep = endpoint(dst, &args)?;

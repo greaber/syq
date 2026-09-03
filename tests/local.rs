@@ -7808,7 +7808,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
 }
 
 #[test]
-fn native_run_at_target_reverses_the_remote_ssh_edge() {
+fn native_coordinate_at_target_reverses_the_remote_ssh_edge() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src/file"), b"pulled");
@@ -7828,8 +7828,8 @@ fn native_run_at_target_reverses_the_remote_ssh_edge() {
             &t.s("src"),
             "--to",
             "hostB",
-            "--run-at",
-            "target",
+            "--coordinate-at",
+            "dest",
             "--into",
             &t.s("dst"),
             "-q",
@@ -7876,8 +7876,8 @@ fn native_target_dry_run_labels_the_real_endpoints_and_ports() {
             &t.s("src"),
             "--to",
             "hostB:2222",
-            "--run-at",
-            "target",
+            "--coordinate-at",
+            "dest",
             "--into",
             &t.s("dst"),
         ])
@@ -7943,7 +7943,7 @@ fn native_detach_rejects_an_unattached_results_stream() {
 }
 
 #[test]
-fn native_run_at_local_relays_between_remote_endpoints() {
+fn native_coordinate_at_local_relays_between_remote_endpoints() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src/file"), b"relayed");
@@ -7961,7 +7961,7 @@ fn native_run_at_local_relays_between_remote_endpoints() {
             &t.s("src"),
             "--to",
             "hostB",
-            "--run-at",
+            "--coordinate-at",
             "local",
             "--into",
             &t.s("dst"),
@@ -7985,7 +7985,7 @@ fn native_run_at_local_relays_between_remote_endpoints() {
 }
 
 #[test]
-fn native_run_at_target_fails_closed_without_read_enrollment_support() {
+fn native_coordinate_at_target_fails_closed_without_read_enrollment_support() {
     let t = Tmp::new();
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -7996,8 +7996,8 @@ fn native_run_at_target_fails_closed_without_read_enrollment_support() {
             &t.s("src"),
             "--to",
             "hostB",
-            "--run-at",
-            "target",
+            "--coordinate-at",
+            "dest",
             "--into",
             &t.s("dst"),
         ])
@@ -9989,8 +9989,8 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
             "src",
             "--to",
             "hostB",
-            "--run-at",
-            "target",
+            "--coordinate-at",
+            "dest",
             "--into",
             "dst",
             "-q",
@@ -10002,7 +10002,7 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
     assert!(!out.status.success());
     let stderr = stderr_of(&out);
     assert!(stderr.contains("remote transfer coordinator"), "{stderr}");
-    assert!(stderr.contains("--run-at local"), "{stderr}");
+    assert!(stderr.contains("--coordinate-at local"), "{stderr}");
 }
 
 #[test]
@@ -10569,8 +10569,8 @@ fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
         .args([
             "--to",
             "hostB",
-            "--run-at",
-            "target",
+            "--coordinate-at",
+            "dest",
             "--as",
             &t.s("dst-remote"),
         ])
@@ -10584,7 +10584,7 @@ fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = stderr_of(&out);
     assert!(stderr.contains("command-restricted receiver"), "{stderr}");
-    assert!(stderr.contains("--run-at local"), "{stderr}");
+    assert!(stderr.contains("--coordinate-at local"), "{stderr}");
     let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r-remote.ndjson")))
         .unwrap()
         .lines()

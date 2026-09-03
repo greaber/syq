@@ -144,7 +144,7 @@ syq cp project --to server --into /backup       # named object → /backup/proje
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
 syq cp --from server:2222 data --to backup:2200 --into /archive
-syq cp --from server data --to backup --run-at target --into /archive
+syq cp --from server data --to backup --coordinate-at dest --into /archive
 syq cp --src-file report --src-dir assets --into /backup
 syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
 syq cp report --to server --as-new /reports/final
@@ -357,7 +357,7 @@ the file fresh (an existing file is refused — one file, one run), and
 `--results-fd 3 3>run.ndjson` (see
 [docs/automation-v1.md](docs/automation-v1.md)). The stream is written
 by the transfer coordinator, so both forms require it to be local; a
-remote-to-remote copy is refused unless `--run-at local` is passed
+remote-to-remote copy is refused unless `--coordinate-at local` is passed
 explicitly — routing through this machine is never chosen implicitly
 on the stream's behalf — or through a command-restricted receiver
 enrollment, whose verified receipt becomes a receiver-attested stream
@@ -378,13 +378,13 @@ broker/receiver setup. A port in native endpoint syntax can be combined with
 the default SSH command or an explicit command whose executable is `ssh`; an
 arbitrary remote-shell wrapper must carry its own port option.
 
-For two remote endpoints, `--run-at auto` (the default) places the coordinator
+For two remote endpoints, `--coordinate-at auto` (the default) places the coordinator
 at the source. Path operands travel base64-encoded inside the delegated
 command line, so direct placement works for every filename and data is never
-routed through this machine implicitly. `--run-at source` explicitly selects a
-direct push, `--run-at target` selects a direct pull with the SSH edge
-reversed, and `--run-at local` explicitly selects a relay through this
-machine. `--run-at` is rejected for copies that do not have two remote
+routed through this machine implicitly. `--coordinate-at src` explicitly selects a
+direct push, `--coordinate-at dest` selects a direct pull with the SSH edge
+reversed, and `--coordinate-at local` explicitly selects a relay through this
+machine. `--coordinate-at` is rejected for copies that do not have two remote
 endpoints.
 
 The default push uses destination-bound agent authentication plus the
@@ -460,7 +460,7 @@ streams (or independent SSH processes under `--no-tcp`), so bulk throughput
 does not change. Persistence is not applied to an explicit `--rsh`, a remote
 transfer coordinator, or command-restricted receiver authentication. A global
 preference is simply ignored on those paths; an explicit `--pscope` is refused
-when the requested topology cannot honor it. Use `--run-at local` to keep a
+when the requested topology cannot honor it. Use `--coordinate-at local` to keep a
 native remote-to-remote copy's reusable connections on the invoking machine;
 `syq rsync` does not accept remote-to-remote copies.
 

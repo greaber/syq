@@ -206,7 +206,7 @@ exec /bin/sh -c "$1"
                 src=source,
                 from_="hostA",
                 to="hostB",
-                run_at="local",
+                coordinate_at="local",
                 as_=destination,
                 rsh=os.fspath(rsh),
                 syq_path=EXECUTABLE,

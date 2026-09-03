@@ -48,7 +48,7 @@ marked `"provenance": "receiver_attested"` — into the local file or
 descriptor. Data still flows directly between the remotes; only the
 verified account comes home. Without an enrollment there is no
 trusted channel, so the run fails (with a settled `failed` terminal
-record) unless `--run-at local` explicitly routes the transfer
+record) unless `--coordinate-at local` explicitly routes the transfer
 through this machine — the relay topology is never chosen implicitly
 on the stream's behalf. `--results` is not available on
 `syq map` (its stdout is the manifest format) or, yet, on other

@@ -573,7 +573,7 @@ class AsyncClient:
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
-        run_at: str | None = None,
+        coordinate_at: str | None = None,
         rsh: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
@@ -634,7 +634,7 @@ class AsyncClient:
         )
         _append_remote_arguments(
             argv,
-            run_at=run_at,
+            coordinate_at=coordinate_at,
             rsh=rsh,
             syq_path=syq_path,
             no_bootstrap=no_bootstrap,

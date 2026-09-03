@@ -208,7 +208,7 @@ syq.cp(
     no_compress=False,
     bwlimit=None,
     connections=None,
-    run_at=None,
+    coordinate_at=None,
     rsh=None,
     syq_path=None,
     no_bootstrap=False,
@@ -295,8 +295,8 @@ single ordered stream rather than a new filtering concept.
 Native remote controls keep their command names mechanically (a
 remote-to-remote copy needs either a command-restricted receiver
 enrollment — its verified receipt becomes the receiver-attested
-results stream — or an explicit `run_at="local"`; syq refuses the
-combination at runtime otherwise): `run_at`, `rsh`,
+results stream — or an explicit `coordinate_at="local"`; syq refuses the
+combination at runtime otherwise): `coordinate_at`, `rsh`,
 `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
 `tcp_congestion`, `no_forward_agent`, `unrestricted_agent_forwarding`, and
 `agent_broker_only`. Endpoint strings passed through `from_` and `to` include

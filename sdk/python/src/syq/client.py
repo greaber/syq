@@ -331,7 +331,7 @@ def _append_text(argv: list[Argument], option: str, value: object | None) -> Non
 def _append_remote_arguments(
     argv: list[Argument],
     *,
-    run_at: str | None,
+    coordinate_at: str | None,
     rsh: str | None,
     syq_path: str | os.PathLike[str] | None,
     no_bootstrap: bool,
@@ -343,12 +343,12 @@ def _append_remote_arguments(
     unrestricted_agent_forwarding: bool,
     agent_broker_only: bool,
 ) -> None:
-    if run_at is not None:
-        if run_at not in {"auto", "local", "source", "target"}:
+    if coordinate_at is not None:
+        if coordinate_at not in {"auto", "local", "src", "dest"}:
             raise SyqInvocationError(
-                "--run-at must be auto, local, source, or target"
+                "--coordinate-at must be auto, local, src, or dest"
             )
-        argv.extend(("--run-at", run_at))
+        argv.extend(("--coordinate-at", coordinate_at))
     if rsh is not None:
         argv.extend(("--rsh", _text_arg(rsh, label="rsh")))
     if syq_path is not None:
@@ -722,7 +722,7 @@ class Client:
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
-        run_at: str | None = None,
+        coordinate_at: str | None = None,
         rsh: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
@@ -783,7 +783,7 @@ class Client:
         )
         _append_remote_arguments(
             argv,
-            run_at=run_at,
+            coordinate_at=coordinate_at,
             rsh=rsh,
             syq_path=syq_path,
             no_bootstrap=no_bootstrap,

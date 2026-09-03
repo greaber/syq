@@ -1,6 +1,6 @@
 # Mappings: placement as data
 
-A mapping is a file (or stream) of explicit source→target claims that
+A mapping is a file (or stream) of explicit source→destination claims that
 `syq cp` can execute: a generalized `--as` covering many entries at
 once, or a `--files-from` whose entries can also *re-place* each file.
 You author selection and placement — with a script, or by transforming
@@ -32,7 +32,7 @@ One JSON object per line (NDJSON):
 ```
 
 - `src`, `dst` (required): paths relative to the source root (`-C DIR`,
-  default the working directory) and the target container (`--into
+  default the working directory) and the destination container (`--into
   DIR`). Absolute paths, empty paths, and any `.` or `..` component are
   rejected. Paths are tagged: `encoding` is `utf-8`, or `base64` for a
   name that is not valid UTF-8 (`value` is then standard base64 of the
@@ -229,7 +229,7 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   only; `syq rsync` is unchanged.
 - `syq map` accepts the local selector grammar, including the typed selectors
   `--src-file`/`--src-dir`, plus `--as PATH` (which emits the single selected
-  root under the target's basename). Those selectors are validated exactly as
+  root under the destination's basename). Those selectors are validated exactly as
   native `cp` validates them; see "Emitting a mapping" for the complete
   surface.
 - Fidelity is the native default (`-rlt`). There is no per-entry
@@ -248,7 +248,7 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   with `--follow`.
 - Symlinks selected by mapping entries are never resolved by mapping handling:
   a symlink maps as a symlink, and a destination path that would traverse a
-  symlink inside the target container fails that entry. Resolve links before
+  symlink inside the destination container fails that entry. Resolve links before
   emitting the manifest if you want targets instead.
 - `kind: "special"` asserts the source's type; it does not override the
   fixed `-rlt` fidelity, which copies no special files. Such an entry is
@@ -293,14 +293,14 @@ terminal record means the run did not finish; a terminal status other
 than `success` or `partial` means entries may be unsettled.
 
 The results writer lives with the transfer coordinator, so a stream
-requires a local coordinator (an explicit `--run-at local` for a
+requires a local coordinator (an explicit `--coordinate-at local` for a
 remote-to-remote copy). `--results` cannot be combined with `--detach`,
 because the caller would no longer be attached for the complete stream
 and its terminal record. Receiver-attested streams for attached direct
 copies through a command-restricted receiver — records verified and
 decrypted from hostB's receipt, marked `"provenance":"receiver_attested"`
 — exist in the engine and return once wired to the file/descriptor
-targets.
+outputs.
 
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:

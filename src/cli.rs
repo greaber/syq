@@ -42,16 +42,17 @@ pub enum SourceSelection {
 
 /// Endpoint that owns the transfer coordinator for a native copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-pub enum RunAt {
-    /// Run locally unless both endpoints are remote, then use the source when
-    /// possible and otherwise relay locally.
+pub enum CoordinateAt {
+    /// Run locally unless both endpoints are remote, then use the source
+    /// endpoint (delegated path operands travel encoded, so any filename
+    /// works).
     #[default]
     Auto,
     /// Run the coordinator at the source endpoint.
-    Source,
-    /// Run the coordinator at the target endpoint.
-    Target,
-    /// Keep the coordinator on the invoking machine.
+    Src,
+    /// Run the coordinator at the destination endpoint.
+    Dest,
+    /// Keep the coordinator on the invoking machine and relay the data there.
     Local,
 }
 
@@ -107,8 +108,8 @@ pub struct Args {
     pub native_results_fd: Option<i32>,
     /// Native coordinator placement.
     #[arg(skip)]
-    pub run_at: RunAt,
-    /// Native local-relay selection derived from `--run-at local`.
+    pub coordinate_at: CoordinateAt,
+    /// Native local-relay selection derived from `--coordinate-at local`.
     #[arg(skip)]
     pub relay: bool,
     /// Native detached remote coordinator.
@@ -752,8 +753,8 @@ enum ReceiptMode {
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
     /// Choose the endpoint that runs the coordinator
-    #[arg(long, value_enum, default_value_t = RunAt::Auto)]
-    run_at: RunAt,
+    #[arg(long, value_enum, default_value_t = CoordinateAt::Auto)]
+    coordinate_at: CoordinateAt,
     /// Remote shell command (default: ssh); the command owns SSH and agent policy when set
     #[arg(long = "rsh", value_name = "COMMAND")]
     rsh: Option<String>,
@@ -1562,7 +1563,7 @@ fn apply_native_copy_operational(
 }
 
 fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> {
-    args.run_at = remote.run_at;
+    args.coordinate_at = remote.coordinate_at;
     args.rsh = remote.rsh;
     args.syq_path = remote.syq_path;
     args.no_bootstrap = remote.no_bootstrap;
@@ -2123,7 +2124,7 @@ mod tests {
     #[test]
     fn native_remote_controls_lower_to_the_shared_engine() {
         let argv = [
-            "--run-at=target",
+            "--coordinate-at=dest",
             "--rsh=ssh -J jump",
             "--syq-path=/opt/syq",
             "--no-bootstrap",
@@ -2136,7 +2137,7 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv).unwrap();
-        assert_eq!(args.run_at, super::RunAt::Target);
+        assert_eq!(args.coordinate_at, super::CoordinateAt::Dest);
         assert_eq!(args.rsh.as_deref(), Some("ssh -J jump"));
         assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
         assert!(args.no_bootstrap);

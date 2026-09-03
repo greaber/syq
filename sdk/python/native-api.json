@@ -23,7 +23,7 @@
         "max-delete",
         "dry-run",
         "connections",
-        "run-at",
+        "coordinate-at",
         "rsh",
         "syq-path",
         "no-bootstrap",

@@ -463,7 +463,7 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Kernel TCP_INFO/TCP_CONNECTION_INFO for this end of a direct data
-    /// socket. SSH data transports report None at the orchestrator instead of
+    /// socket. SSH data transports report None at the coordinator instead of
     /// sending this request.
     TransportStats,
     /// Ask a command-restricted receiver for its signed receipt. Issuing it
@@ -487,7 +487,7 @@ pub enum Response {
     },
     /// The peer understood the requested per-socket override but its kernel
     /// could not honor it. Keep this distinct from ordinary TCP reachability
-    /// failures, for which the orchestrator may safely fall back to SSH.
+    /// failures, for which the coordinator may safely fall back to SSH.
     TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
