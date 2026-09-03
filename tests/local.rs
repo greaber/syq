@@ -130,6 +130,7 @@ fn source_fd_budget_handles_deep_tree_with_96_slots() {
         &t.s("source/"),
         &t.s("destination/"),
     ]);
+    command.env("SYQ_DEBUG", "1");
     set_child_nofile_limit(&mut command, 96);
     let output = command.run().unwrap();
     assert!(output.status.success(), "{}", stderr_of(&output));
@@ -150,6 +151,7 @@ fn source_fd_budget_handles_ten_exact_sources_with_128_slots() {
     command.args(["-a", "--syq-connections", "1", "--no-progress"]);
     command.args(&sources);
     command.arg(t.s("destination/"));
+    command.env("SYQ_DEBUG", "1");
     set_child_nofile_limit(&mut command, 128);
     let output = command.run().unwrap();
     assert!(output.status.success(), "{}", stderr_of(&output));
