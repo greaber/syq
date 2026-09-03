@@ -81,25 +81,27 @@ fn native_syq(args: &[&str]) -> Output {
 }
 
 fn set_child_nofile_limit(command: &mut Command, requested: libc::rlim_t) {
+    let mut inherited = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) } != 0 {
+        panic!(
+            "read inherited descriptor limit: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    assert!(
+        inherited.rlim_max >= requested,
+        "inherited hard descriptor limit {} is below the test limit {requested}",
+        inherited.rlim_max
+    );
+    let limit = libc::rlimit {
+        rlim_cur: requested,
+        rlim_max: requested,
+    };
     unsafe {
         command.pre_exec(move || {
-            let mut inherited = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if inherited.rlim_max < requested {
-                return Err(std::io::Error::other(format!(
-                    "inherited hard descriptor limit {} is below the test limit {requested}",
-                    inherited.rlim_max
-                )));
-            }
-            let limit = libc::rlimit {
-                rlim_cur: requested,
-                rlim_max: requested,
-            };
             if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
