@@ -18,6 +18,7 @@ mod private_broker;
 mod progress;
 mod proto;
 mod receipt;
+mod receipt_v2;
 mod remote_helper;
 mod restricted;
 mod results;

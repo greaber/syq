@@ -284,8 +284,14 @@ the terminal aggregates, and metadata-only updates are not yet
 reported per operation. A missing terminal record means the run did
 not finish.
 
-The results writer lives with the transfer coordinator. For a direct
-remote-to-remote copy, use `--results -` to stream its NDJSON back over the
+Normally the results writer lives with the transfer coordinator. For an
+attached direct remote-to-remote copy through a command-restricted receiver,
+however, `--results -` is written by the invoking machine only after it has
+verified and decrypted hostB's receipt. Those records have
+`"provenance":"receiver_attested"`, omit unauthenticated source claims, and
+add a `receiver_final_state` record for every path the transfer could have
+changed; `scope` identifies the signed mutation scope and `dst` is relative to
+it. Other direct remote coordinators stream their NDJSON back over the
 coordinator connection. A named results file is accepted only when the
 coordinator is local, including `--run-at local`; this avoids interpreting a
 local-looking pathname on a remote host. `--results` cannot be combined with
@@ -311,9 +317,10 @@ jq -cs 'if (.[-1].type? // "") != "result"
 
 The jq program first checks the stream's terminal record: a results
 file without one is from a run that did not finish (a crash, a kill),
-and a terminal status other than `success` or `partial` (an aborted
-run, say) means queued entries were never settled — in both cases
-entries may have no records at all, so a retry manifest built from
+and a terminal status other than `success` or `partial` (an `aborted`
+incomplete receipt or a `refused` run) means queued entries were never
+settled or their receipt records may be missing. In both cases, entries
+may have no records at all, so a retry manifest built from
 what is there would look complete while it is not. With the
 terminal record present, the filter is what an exit code cannot
 express: which entries failed, and whether a retry could help.

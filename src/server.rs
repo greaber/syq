@@ -336,7 +336,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
             }
             Request::Receipt => match &authority {
                 Some(authority) => match authority.issue_receipt() {
-                    Ok(envelope) => w.write_msg(&Response::Receipt(envelope))?,
+                    Ok(crate::restricted::IssuedReceipt::V1(envelope)) => {
+                        w.write_msg(&Response::Receipt(envelope))?
+                    }
+                    Ok(crate::restricted::IssuedReceipt::V2(receipt)) => {
+                        crate::receipt_v2::emit_transport_frames(receipt, |frame| {
+                            w.write_msg(&Response::ReceiptV2(frame))?;
+                            Ok(())
+                        })?;
+                    }
                     Err(error) => w.write_msg(&Response::Err(format!("{error:#}")))?,
                 },
                 None => w.write_msg(&Response::Err(
