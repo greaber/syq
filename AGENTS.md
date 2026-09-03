@@ -165,7 +165,14 @@ outlive its premise and steer later work in the wrong direction.
 
 ## Working on syq
 
-- `README.md` is the user-facing contract; the code is authoritative for
+- `README.md` and the documents under `docs/` are the user-facing contract;
+  `README.md` is a brief front door and `docs/` is the source of the
+  documentation site published with GitHub Pages (mdBook, configured by
+  `book.toml`; every page must be listed in `docs/SUMMARY.md`;
+  `scripts/check-doc-links.py` checks links). `docs/reference.md` carries the
+  detailed behavior. Write these documents directly and conversationally, in
+  plain words; a reader should not need project jargon such as "retained" or
+  "the ordinary engine" to follow them. The code is authoritative for
   everything else.
 - Distinguish explicit requirements from assumptions and design choices. If a
   supposed requirement creates substantial complexity, question the premise
@@ -173,7 +180,14 @@ outlive its premise and steer later work in the wrong direction.
   materially change the product.
 - Prefer one clear implementation. Add fallbacks or compatibility paths only
   for a concrete scenario or consumer that needs them.
-- Keep CLI behavior, help text, `README.md`, and integration tests in sync.
+- Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
+  sync. A behavior change lands in `docs/reference.md` (or the topical
+  document that owns it), not in a new README section.
+- `README.md` and `docs/` are written for users. They describe what the code
+  on `master` does. Plans, roadmap items, design directions, internal status,
+  unreleased or unvetted components, and notes to future maintainers do not
+  belong there; they go in `current-plans/` or a design note. State a
+  limitation as a fact about today's behavior, not as an intention.
 - Copy failures must be visible. Do not make an incomplete or truncated result
   look successful.
 - Exercise copy, resume, verification, and removal behavior in disposable
@@ -219,6 +233,17 @@ the built binary against temporary trees. Run `cargo test --all-targets` before
 handoff when a change is broad, crosses subsystem boundaries, changes shared
 test infrastructure, or leaves meaningful uncertainty about the affected
 surface. Do not run unrelated suites merely because they exist.
+
+Changes to SSH, remote helpers, enrollment, restricted receivers, transports,
+or remote coordinator placement should also run the local-only three-container
+OpenSSH suite:
+
+```bash
+scripts/test-real-ssh.sh
+```
+
+It is intentionally not part of ordinary CI or `cargo test`; see
+`tests/real-ssh/README.md` for its isolation and coverage.
 
 Pull-request CI intentionally mirrors this policy: it runs formatting, clippy,
 and native unit tests for Rust changes, plus a directly affected SDK, rsync, or

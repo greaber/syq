@@ -2036,6 +2036,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &dst_root,
             root_create_condition,
             opts.restricted_receiver,
+            opts.perms,
         )?;
         mutation_root_condition = target_identity(&created);
         if guard_containers {
@@ -2828,14 +2829,16 @@ fn mkdir_root(
     dst_root: &[u8],
     condition: TargetCondition,
     restricted_receiver: bool,
+    preserve_permissions: bool,
 ) -> Result<Entry> {
-    for ops in mkdir_root_batches(dst_root, condition, restricted_receiver) {
+    for ops in mkdir_root_batches(
+        dst_root,
+        condition,
+        restricted_receiver,
+        preserve_permissions,
+    ) {
         match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
-            Response::Applied(errs) => {
-                if let Some(e) = errs.into_iter().flatten().next() {
-                    bail!("{e}");
-                }
-            }
+            Response::Applied(errs) => mkdir_apply_result(errs)?,
             other => bail!("unexpected response {other:?}"),
         }
     }
@@ -2844,17 +2847,25 @@ fn mkdir_root(
         .with_context(|| format!("created target {} is not a directory", display(dst_root)))
 }
 
+fn mkdir_apply_result(errors: Vec<Option<WireError>>) -> Result<()> {
+    if let Some(error) = errors.into_iter().flatten().next() {
+        return Err(endpoint_error(error)).context("mkdir");
+    }
+    Ok(())
+}
+
 fn mkdir_root_batches(
     dst_root: &[u8],
     condition: TargetCondition,
     restricted_receiver: bool,
+    preserve_permissions: bool,
 ) -> Vec<Vec<Op>> {
     let mut batches = vec![vec![Op::Mkdir {
         path: dst_root.to_vec(),
         mode: 0o755,
         condition,
     }]];
-    if restricted_receiver {
+    if restricted_receiver && !preserve_permissions {
         // Keep this in a later receiver call. The restricted authority must
         // observe the directory after Mkdir so it can distinguish HostB's
         // kernel-inherited setgid bit from HostA's untrusted mode proposal.
@@ -4716,8 +4727,13 @@ impl Planner<'_> {
                     .expect("destination anchor set once");
             } else {
                 debug_assert!(is_destination_root);
-                let created =
-                    mkdir_root(self.dst, &root, condition, self.opts.restricted_receiver)?;
+                let created = mkdir_root(
+                    self.dst,
+                    &root,
+                    condition,
+                    self.opts.restricted_receiver,
+                    self.opts.perms,
+                )?;
                 self.mutation_root_condition = target_identity(&created);
                 if self.guard_containers {
                     self.container_guard = Some(target_container(&root, &created));
@@ -4793,7 +4809,7 @@ impl Planner<'_> {
                 // --ignore-existing never touches what exists either: an
                 // existing non-directory where a directory maps stays, and the
                 // mapped directory with its whole subtree is skipped, visibly
-                // (rsync would unlink the file; see RSYNC-COMPAT.md).
+                // (rsync would unlink the file; see docs/rsync-compat.md).
                 let conflict = opts.ignore_existing && !is_dir && st.is_some();
                 if conflict
                     || (opts.existing && !is_dir)
@@ -7671,6 +7687,18 @@ mod tests {
     }
 
     #[test]
+    fn mkdir_apply_error_preserves_endpoint_os_kind() {
+        let error = WireError {
+            message: "destination is full".into(),
+            io_kind: Some(WireIoKind::NoSpace),
+            raw_os_error: Some(libc::ENOSPC),
+        };
+        let error = mkdir_apply_result(vec![None, Some(error)]).unwrap_err();
+        assert_eq!(os_kind_of(&error), Some("no_space"));
+        assert_eq!(format!("{error:#}"), "mkdir: destination is full");
+    }
+
+    #[test]
     fn raw_path_identity_is_lossless_without_changing_utf8_identity() {
         use std::os::unix::ffi::OsStrExt as _;
 
@@ -7799,19 +7827,27 @@ mod tests {
     }
 
     #[test]
-    fn restricted_root_creation_includes_receiver_managed_final_mode() {
-        let ordinary = mkdir_root_batches(b"/destination", TargetCondition::Absent, false);
+    fn restricted_root_creation_uses_only_the_authorized_mode_policy() {
+        let ordinary = mkdir_root_batches(b"/destination", TargetCondition::Absent, false, false);
         assert_eq!(ordinary.len(), 1);
         assert!(matches!(ordinary[0].as_slice(), [Op::Mkdir { .. }]));
 
-        let restricted = mkdir_root_batches(b"/destination", TargetCondition::Absent, true);
-        assert_eq!(restricted.len(), 2);
+        let preserving = mkdir_root_batches(b"/destination", TargetCondition::Absent, true, true);
+        assert_eq!(preserving.len(), 1);
         assert!(matches!(
-            restricted[0].as_slice(),
+            preserving[0].as_slice(),
+            [Op::Mkdir { mode: 0o755, .. }]
+        ));
+
+        let receiver_managed =
+            mkdir_root_batches(b"/destination", TargetCondition::Absent, true, false);
+        assert_eq!(receiver_managed.len(), 2);
+        assert!(matches!(
+            receiver_managed[0].as_slice(),
             [Op::Mkdir { mode: 0o755, .. }]
         ));
         assert!(matches!(
-            restricted[1].as_slice(),
+            receiver_managed[1].as_slice(),
             [Op::SetMeta {
                 meta: Meta { mode: 0o755, .. },
                 flags: flags::RECEIVER_MODE,

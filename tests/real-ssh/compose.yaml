@@ -1,0 +1,60 @@
+x-node: &node
+  build:
+    context: ../..
+    dockerfile: tests/real-ssh/Dockerfile
+  image: ${SYQ_REAL_SSH_IMAGE:?set SYQ_REAL_SSH_IMAGE}
+  networks:
+    - lab
+
+services:
+  source:
+    <<: *node
+    hostname: source
+    command: ["endpoint"]
+    volumes:
+      - type: bind
+        source: ${SYQ_REAL_SSH_STATE:?set SYQ_REAL_SSH_STATE}/id_ed25519.pub
+        target: /run/lab/authorized_keys
+        read_only: true
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  destination:
+    <<: *node
+    hostname: destination
+    command: ["endpoint"]
+    cap_add:
+      - NET_ADMIN
+    environment:
+      SYQ_REAL_SSH_BLOCKED_TCP_PORT: "47800"
+    volumes:
+      - type: bind
+        source: ${SYQ_REAL_SSH_STATE:?set SYQ_REAL_SSH_STATE}/id_ed25519.pub
+        target: /run/lab/authorized_keys
+        read_only: true
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  runner:
+    <<: *node
+    hostname: runner
+    command: ["runner"]
+    environment:
+      SYQ_REAL_SSH_BLOCKED_TCP_PORT: "47800"
+    volumes:
+      - type: bind
+        source: ${SYQ_REAL_SSH_STATE:?set SYQ_REAL_SSH_STATE}/id_ed25519
+        target: /run/lab/id_ed25519
+        read_only: true
+
+networks:
+  lab:
+    internal: true

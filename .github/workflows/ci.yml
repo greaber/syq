@@ -140,7 +140,7 @@ jobs:
           needs.scope.outputs.tooling == 'true' ||
           (needs.scope.outputs.native == 'true' &&
            needs.scope.outputs.full_suite == 'true')
-        run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-ci.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/ci-scope.sh scripts/approve-generated-pr-runs.sh scripts/release-preflight.sh scripts/release-status.sh scripts/check-workflows.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-release-orchestration.sh scripts/test-homebrew-formula.sh scripts/test-python-sdk-release-tools.sh scripts/test-secret-tools.sh
+        run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-ci.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/ci-scope.sh scripts/approve-generated-pr-runs.sh scripts/release-preflight.sh scripts/release-status.sh scripts/check-workflows.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-release-orchestration.sh scripts/test-homebrew-formula.sh scripts/test-python-sdk-release-tools.sh scripts/test-secret-tools.sh scripts/test-real-ssh.sh tests/real-ssh/entrypoint.sh tests/real-ssh/scenarios.sh tests/real-ssh/ssh-wrapper.sh
 
   sdks:
     needs: scope

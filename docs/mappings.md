@@ -217,7 +217,7 @@ line:
 
 For the patterns people build today with hardlink or symlink staging
 farms so that plain rsync can mirror a restructured tree — and where
-those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md).
+those farms fall short — see [use-cases/link-farms.md](https://github.com/greaber/syq/blob/master/use-cases/link-farms.md).
 
 ## Semantics and limits
 
@@ -292,7 +292,7 @@ output; `--results-fd N` writes to a caller-opened descriptor instead
 (`--results-fd 3 3>r.ndjson`, or a pipe). The
 full contract — every record type and field, the exit-code table,
 the JSON Schema, and example streams — is
-[docs/automation-v1.md](docs/automation-v1.md). In brief: the
+[Automation results](automation-v1.md). In brief: the
 stream carries `schema_version: 1`: a `run` record (run id, mode,
 endpoints), sampled `progress` records, one `operation_result` per
 settled mutation and per failed mapping entry (with `retryable`, and
@@ -301,7 +301,7 @@ under `--dry-run` (each with the reason a mutation is planned), an
 `error` record per counted error, and exactly one flushed terminal
 `result` whose numbers also render the human summary. Unchanged and
 excluded entries appear only in the terminal aggregates, and
-metadata-only updates are not yet reported per operation. A missing
+metadata-only updates are not reported per operation. A missing
 terminal record means the run did not finish; a terminal status other
 than `success` or `partial` means entries may be unsettled.
 
