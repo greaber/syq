@@ -941,9 +941,10 @@ struct HeldBasis {
 struct SourceRootHandle {
     root: Arc<Root>,
     /// Each worker retains its own exact-object clone for the entire worker
-    /// lifetime. It is not used for content I/O; it prevents inode reuse while
-    /// the literal name is checked against `expected_leaf`.
-    _leaf_object: Option<File>,
+    /// lifetime. Content opens compare the opened name with both the serialized
+    /// identity and this retained object, preventing inode reuse while the
+    /// literal name is checked.
+    _leaf_object: Option<Arc<File>>,
     /// An empty selection authorizes the whole registered directory. A
     /// non-empty selection is one exact leaf beneath the registered parent.
     selection: PathBytes,
@@ -954,6 +955,7 @@ struct RegisteredSourceTarget {
     root: Arc<Root>,
     relative: RelativePath,
     expected_leaf: Option<SourceLeafIdentity>,
+    leaf_object: Option<Arc<File>>,
 }
 
 pub(crate) struct SourceScanRoot {
@@ -982,8 +984,30 @@ pub(crate) fn require_source_leaf_identity(
     Ok(())
 }
 
+/// Open one registered regular source without following any component. For an
+/// exact operator-selected leaf, validating the opened descriptor is the
+/// decisive check: once it matches, the descriptor itself pins that object for
+/// the whole read even if its name is replaced concurrently.
+fn open_registered_source(target: &RegisteredSourceTarget) -> Result<File> {
+    let file = target.root.open_regular_read(&target.relative)?;
+    match (&target.expected_leaf, &target.leaf_object) {
+        (Some(expected), Some(object)) => {
+            let opened = root_metadata_from_std(&file.metadata()?)?;
+            let retained = root_metadata_from_std(&object.metadata()?)?;
+            require_source_leaf_identity(expected, retained)?;
+            require_source_leaf_identity(expected, opened)?;
+        }
+        (None, None) => {}
+        _ => bail!("registered source leaf identity and retained object disagree"),
+    }
+    Ok(file)
+}
+
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct FdKey {
+    /// A registered source root is part of the cache identity. Parallel
+    /// legacy path spellings never alias a confined source descriptor.
+    source_root: Option<RegisteredRootId>,
     path: PathBuf,
     /// Source files and partials get a fresh cache entry after a source-change
     /// retry. An old descriptor may point at an inode that was renamed away.
@@ -995,6 +1019,12 @@ struct FdKey {
 struct PartialTarget<'a> {
     path: &'a [u8],
     id: &'a PartialId,
+    guard: Option<&'a ContainerGuard>,
+}
+
+struct HashTarget<'a> {
+    path: &'a [u8],
+    source: Option<&'a RegisteredPath>,
     guard: Option<&'a ContainerGuard>,
 }
 
@@ -1295,7 +1325,7 @@ impl FsOps {
                 id,
                 SourceRootHandle {
                     root: Arc::new(Root::from_directory(directory)?),
-                    _leaf_object: leaf_object,
+                    _leaf_object: leaf_object.map(Arc::new),
                     selection: source.selection.relative.clone(),
                     expected_leaf: source.expected_leaf.clone(),
                 },
@@ -1325,6 +1355,7 @@ impl FsOps {
             root: handle.root.clone(),
             relative: RelativePath::new(&source.relative)?,
             expected_leaf: handle.expected_leaf.clone(),
+            leaf_object: handle._leaf_object.clone(),
         })
     }
 
@@ -1383,6 +1414,29 @@ impl FsOps {
             bail!("an initialized source session rejects caller-supplied guards");
         }
         Ok(())
+    }
+
+    /// Resolve one source-content request. A destination worker must never
+    /// service source-only read families, and a confined source session never
+    /// treats an omitted registered reference as pathname authority.
+    fn source_content_target(
+        &self,
+        source: Option<&RegisteredPath>,
+    ) -> Result<Option<(RegisteredRootId, RegisteredSourceTarget)>> {
+        if self.destination_root.is_some() {
+            bail!("source content request is not valid on a destination worker");
+        }
+        if let Some(source) = source {
+            let target = self.registered_source_target(source)?;
+            return Ok(Some((source.root(), target)));
+        }
+        if self.source_roots.is_empty() {
+            return Ok(None);
+        }
+        if self.allow_unconfined_source_paths {
+            return Ok(None);
+        }
+        bail!("source content request omitted its registered source reference")
     }
 
     fn install_destination(&mut self, directory: File, request_prefix: &[u8]) -> Result<()> {
@@ -1633,6 +1687,7 @@ impl FsOps {
 
     fn cached(&mut self, p: &Path, write: bool, attempt: u32, private: bool) -> Result<&File> {
         let key = FdKey {
+            source_root: None,
             path: p.to_path_buf(),
             attempt,
             private,
@@ -1674,6 +1729,7 @@ impl FsOps {
         private: bool,
     ) -> Result<&File> {
         let key = FdKey {
+            source_root: None,
             path: label.to_path_buf(),
             attempt,
             private,
@@ -1693,6 +1749,31 @@ impl FsOps {
                 }
             }
             self.fds.insert(key.clone(), file);
+            self.fd_order.push(key.clone());
+        }
+        Ok(self.fds.get(&key).unwrap())
+    }
+
+    fn cached_source_read(
+        &mut self,
+        root_id: RegisteredRootId,
+        relative_bytes: &[u8],
+        target: &RegisteredSourceTarget,
+        attempt: u32,
+    ) -> Result<&File> {
+        let key = FdKey {
+            source_root: Some(root_id),
+            path: PathBuf::from(OsStr::from_bytes(relative_bytes)),
+            attempt,
+            private: false,
+        };
+        if !self.fds.contains_key(&key) {
+            if self.fds.len() >= FD_CACHE_MAX {
+                let victim = self.fd_order.remove(0);
+                self.fds.remove(&victim);
+            }
+            self.fds
+                .insert(key.clone(), open_registered_source(target)?);
             self.fd_order.push(key.clone());
         }
         Ok(self.fds.get(&key).unwrap())
@@ -3635,18 +3716,31 @@ impl FsOps {
         Ok(())
     }
 
-    pub fn hash_blocks(
+    fn hash_blocks(
         &mut self,
-        path: &[u8],
+        target: HashTarget<'_>,
         which: Which,
         partial_id: &PartialId,
         block: u64,
         len: u64,
-        guard: Option<&ContainerGuard>,
     ) -> Result<Vec<ContentDigest>> {
-        let p = resolve(path);
+        if target.source.is_some() || !self.source_roots.is_empty() {
+            if target.guard.is_some() {
+                bail!("source block hash cannot carry a destination guard");
+            }
+            if which != Which::Final {
+                bail!("source block hash is only valid for the final source file");
+            }
+            if let Some((_, source_target)) = self.source_content_target(target.source)? {
+                let mut file = open_registered_source(&source_target)?;
+                return hash_reader(&mut file, block, len);
+            }
+            // Only an explicitly unconfined rsync source session can reach
+            // this legacy branch after source roots have been initialized.
+        }
+        let p = resolve(target.path);
         let p = if which == Which::Partial {
-            if guard.is_some() {
+            if target.guard.is_some() {
                 partial_path(&p, partial_id)?
             } else {
                 self.partial_path(&p, partial_id)?
@@ -3654,11 +3748,11 @@ impl FsOps {
         } else {
             p
         };
-        if let Some(guard) = guard {
-            let target = guarded_target(path, guard)?;
-            let relative = relative_under(&target.root_path, &p)?;
-            let mut file = target.root.open_regular_read(&relative)?;
-            if which == Which::Partial && !is_safe_rooted_partial(target.root.metadata(&relative)?)
+        if let Some(guard) = target.guard {
+            let guarded = guarded_target(target.path, guard)?;
+            let relative = relative_under(&guarded.root_path, &p)?;
+            let mut file = guarded.root.open_regular_read(&relative)?;
+            if which == Which::Partial && !is_safe_rooted_partial(guarded.root.metadata(&relative)?)
             {
                 bail!(
                     "partial {} is not a singly-linked regular file",
@@ -3677,6 +3771,7 @@ impl FsOps {
     pub fn read_range(
         &mut self,
         path: &[u8],
+        source: Option<&RegisteredPath>,
         attempt: u32,
         off: u64,
         len: u32,
@@ -3685,8 +3780,18 @@ impl FsOps {
         if std::env::var_os("SYQ_TEST_FAIL_READ_RANGE").is_some() {
             bail!("test read-range failure");
         }
+        let target = self.source_content_target(source)?;
         let p = resolve(path);
-        let f = self.cached(&p, false, attempt, false)?;
+        let f = if let Some((root_id, target)) = target {
+            let relative_bytes = &source
+                .expect("rooted source target requires a registered reference")
+                .relative;
+            self.cached_source_read(root_id, relative_bytes, &target, attempt)?
+        } else {
+            // This is either a pre-registration test/control operation or the
+            // explicit rsync --insecure-links compatibility path.
+            self.cached(&p, false, attempt, false)?
+        };
         let mut data = vec![0u8; len as usize];
         f.read_exact_at(&mut data, off)
             .with_context(|| format!("read {} @{off}+{len}", p.display()))?;
@@ -3876,8 +3981,23 @@ impl FsOps {
         Ok(())
     }
 
-    pub fn file_hash(&mut self, path: &[u8], guard: Option<&ContainerGuard>) -> Result<Response> {
-        let mut f = if let Some(guard) = guard {
+    pub fn file_hash(
+        &mut self,
+        path: &[u8],
+        source: Option<&RegisteredPath>,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Response> {
+        let mut f = if source.is_some() || !self.source_roots.is_empty() {
+            if guard.is_some() {
+                bail!("source file hash cannot carry a destination guard");
+            }
+            if let Some((_, target)) = self.source_content_target(source)? {
+                open_registered_source(&target)?
+            } else {
+                // Explicit rsync --insecure-links compatibility path.
+                open_existing_regular(&resolve(path), false)?
+            }
+        } else if let Some(guard) = guard {
             let target = guarded_target(path, guard)?;
             target.root.open_regular_read(&target.relative)?
         } else if let Some(root) = &self.destination_root {
@@ -4083,6 +4203,7 @@ impl FsOps {
             )),
             Request::HashBlocks {
                 path,
+                source,
                 which,
                 partial_id,
                 block,
@@ -4090,25 +4211,42 @@ impl FsOps {
                 guard,
                 ..
             } => self
-                .hash_blocks(path, *which, partial_id, *block, *len, guard.as_ref())
+                .hash_blocks(
+                    HashTarget {
+                        path,
+                        source: source.as_ref(),
+                        guard: guard.as_ref(),
+                    },
+                    *which,
+                    partial_id,
+                    *block,
+                    *len,
+                )
                 .map(Response::Hashes),
             Request::ReadRange {
                 path,
+                source,
                 attempt,
                 off,
                 len,
                 ..
-            } => self.read_range(path, *attempt, *off, *len),
+            } => self.read_range(path, source.as_ref(), *attempt, *off, *len),
             Request::ReadSmallBatch(reads) => Ok(Response::SmallBlocks(
                 reads
                     .iter()
-                    .map(
-                        |read| match self.read_range(&read.path, read.attempt, 0, read.len) {
+                    .map(|read| {
+                        match self.read_range(
+                            &read.path,
+                            read.source.as_ref(),
+                            read.attempt,
+                            0,
+                            read.len,
+                        ) {
                             Ok(Response::Block { data, hash, .. }) => Ok(SmallBlock { data, hash }),
                             Ok(other) => Err(format!("unexpected response {other:?}")),
                             Err(error) => Err(errstr(&error)),
-                        },
-                    )
+                        }
+                    })
                     .collect(),
             )),
             Request::WriteRange {
@@ -4155,7 +4293,11 @@ impl FsOps {
                     },
                 )
                 .map(|_| Response::Ok),
-            Request::FileHash { path, guard, .. } => self.file_hash(path, guard.as_ref()),
+            Request::FileHash {
+                path,
+                source,
+                guard,
+            } => self.file_hash(path, source.as_ref(), guard.as_ref()),
             Request::Canonicalize { path, guard } => {
                 if let Some(guard) = guard {
                     guarded_target(path, guard)
@@ -4499,6 +4641,7 @@ fn apply_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::os::unix::fs::{symlink, FileTypeExt};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4509,6 +4652,36 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn registered_source_worker(
+        selections: &[&Path],
+        allow_unconfined_paths: bool,
+    ) -> (FsOps, Vec<RegisteredPath>, FsOps) {
+        let session = DescriptorSessionSlot::default();
+        let mut control = FsOps::with_descriptor_session(session.clone());
+        let response = control.handle(&Request::RegisterSourceRoots {
+            selections: selections
+                .iter()
+                .map(|path| SourceRootSelection {
+                    path: path.as_os_str().as_bytes().to_vec(),
+                    follow_root: false,
+                })
+                .collect(),
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths,
+            shared_workers: 0,
+            independent_claim_workers: 0,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        let selections = roots.iter().map(|root| root.selection.clone()).collect();
+        let mut worker = FsOps::with_descriptor_session(session);
+        worker.initialize_sources(&roots).unwrap();
+        // Return the control endpoint so tests retain the complete session
+        // lifecycle in addition to each worker's own root and leaf clones.
+        (worker, selections, control)
     }
 
     #[test]
@@ -4962,7 +5135,8 @@ mod tests {
 
         let stats = operations.stat_many(&[b"marker".to_vec()], false, None);
         assert_eq!(stats[0].as_ref().unwrap().size, 8);
-        let Response::FileHash { size, hash } = operations.file_hash(b"marker", None).unwrap()
+        let Response::FileHash { size, hash } =
+            operations.file_hash(b"marker", None, None).unwrap()
         else {
             panic!("unexpected hash response");
         };
@@ -4976,7 +5150,7 @@ mod tests {
             .unwrap()
             .starts_with(b"missing/deeper/.marker.syq-part."));
         assert!(operations.partial_paths(&[b"../outside".to_vec()], &[12; 16], None)[0].is_err());
-        assert!(operations.file_hash(b"../outside", None).is_err());
+        assert!(operations.file_hash(b"../outside", None, None).is_err());
         assert!(operations.stat_many(&[b"../outside".to_vec()], false, None)[0].is_none());
 
         fs::remove_dir_all(&dir).unwrap();
@@ -5749,6 +5923,352 @@ mod tests {
         });
         assert!(
             matches!(response, Response::Stats(stats) if stats.len() == 1 && stats[0].is_none())
+        );
+    }
+
+    #[test]
+    fn source_content_uses_registered_directory_after_name_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        let replacement = temporary.path().join("replacement");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(selected.join("marker"), b"original").unwrap();
+        fs::write(replacement.join("marker"), b"replacement").unwrap();
+        let raw_name = OsString::from_vec(b"raw-\xff".to_vec());
+        fs::write(selected.join(&raw_name), b"raw-original").unwrap();
+
+        let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+        let marker = selections[0].join(b"marker").unwrap();
+        let raw = selections[0].join(raw_name.as_bytes()).unwrap();
+        fs::rename(&selected, temporary.path().join("moved")).unwrap();
+        symlink(&replacement, &selected).unwrap();
+        let parallel_marker = selected.join("marker").as_os_str().as_bytes().to_vec();
+        assert_eq!(fs::read(selected.join("marker")).unwrap(), b"replacement");
+
+        let response = worker.handle(&Request::ReadRange {
+            path: parallel_marker.clone(),
+            source: Some(marker.clone()),
+            attempt: 0,
+            off: 0,
+            len: 8,
+        });
+        assert!(matches!(response, Response::Block { data, .. } if data == b"original"));
+
+        let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
+            path: parallel_marker.clone(),
+            source: Some(marker.clone()),
+            attempt: 0,
+            len: 8,
+        }]));
+        assert!(matches!(
+            response,
+            Response::SmallBlocks(blocks)
+                if matches!(&blocks[..], [Ok(SmallBlock { data, .. })] if data == b"original")
+        ));
+
+        let response = worker.handle(&Request::HashBlocks {
+            path: parallel_marker.clone(),
+            source: Some(marker.clone()),
+            which: Which::Final,
+            partial_id: [0; 16],
+            block: MIN_HASH_BLOCK_BYTES,
+            len: 8,
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::Hashes(hashes) if hashes == vec![content_digest(b"original")])
+        );
+
+        let response = worker.handle(&Request::FileHash {
+            path: parallel_marker,
+            source: Some(marker),
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::FileHash { size: 8, hash } if hash == content_digest(b"original"))
+        );
+
+        let response = worker.handle(&Request::ReadRange {
+            path: b"/parallel/path/is/not/authority".to_vec(),
+            source: Some(raw),
+            attempt: 0,
+            off: 0,
+            len: 12,
+        });
+        assert!(matches!(response, Response::Block { data, .. } if data == b"raw-original"));
+    }
+
+    #[test]
+    fn source_content_rejects_a_replaced_exact_leaf() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::write(&selected, b"original").unwrap();
+        let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+        fs::rename(&selected, temporary.path().join("selected-original")).unwrap();
+        fs::write(&selected, b"replaced").unwrap();
+
+        for response in [
+            worker.handle(&Request::ReadRange {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                source: Some(selections[0].clone()),
+                attempt: 0,
+                off: 0,
+                len: 8,
+            }),
+            worker.handle(&Request::HashBlocks {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                source: Some(selections[0].clone()),
+                which: Which::Final,
+                partial_id: [0; 16],
+                block: MIN_HASH_BLOCK_BYTES,
+                len: 8,
+                guard: None,
+            }),
+            worker.handle(&Request::FileHash {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                source: Some(selections[0].clone()),
+                guard: None,
+            }),
+        ] {
+            assert!(
+                matches!(response, Response::Err(error) if error.contains("registered source leaf changed identity"))
+            );
+        }
+        let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
+            path: selected.as_os_str().as_bytes().to_vec(),
+            source: Some(selections[0].clone()),
+            attempt: 0,
+            len: 8,
+        }]));
+        assert!(
+            matches!(response, Response::SmallBlocks(blocks) if matches!(&blocks[..], [Err(error)] if error.contains("registered source leaf changed identity")))
+        );
+    }
+
+    #[test]
+    fn source_content_refuses_symlink_intermediates() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret"), b"secret").unwrap();
+        symlink("../outside", selected.join("link")).unwrap();
+        let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+        let secret = selections[0].join(b"link/secret").unwrap();
+        let label = selected.join("link/secret").as_os_str().as_bytes().to_vec();
+
+        for response in [
+            worker.handle(&Request::ReadRange {
+                path: label.clone(),
+                source: Some(secret.clone()),
+                attempt: 0,
+                off: 0,
+                len: 6,
+            }),
+            worker.handle(&Request::HashBlocks {
+                path: label.clone(),
+                source: Some(secret.clone()),
+                which: Which::Final,
+                partial_id: [0; 16],
+                block: MIN_HASH_BLOCK_BYTES,
+                len: 6,
+                guard: None,
+            }),
+            worker.handle(&Request::FileHash {
+                path: label.clone(),
+                source: Some(secret.clone()),
+                guard: None,
+            }),
+        ] {
+            assert!(matches!(response, Response::Err(_)));
+        }
+        let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
+            path: label,
+            source: Some(secret),
+            attempt: 0,
+            len: 6,
+        }]));
+        assert!(
+            matches!(response, Response::SmallBlocks(blocks) if matches!(&blocks[..], [Err(_)]))
+        );
+        assert_eq!(fs::read(outside.join("secret")).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn source_read_cache_keys_root_and_attempt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(first.join("same"), b"first").unwrap();
+        fs::write(second.join("same"), b"other").unwrap();
+        let (mut worker, selections, _control) =
+            registered_source_worker(&[&first, &second], false);
+        let first_source = selections[0].join(b"same").unwrap();
+        let second_source = selections[1].join(b"same").unwrap();
+
+        for (source, expected) in [
+            (&first_source, &b"first"[..]),
+            (&second_source, &b"other"[..]),
+        ] {
+            let response = worker.handle(&Request::ReadRange {
+                path: b"same-parallel-label".to_vec(),
+                source: Some(source.clone()),
+                attempt: 0,
+                off: 0,
+                len: 5,
+            });
+            assert!(matches!(response, Response::Block { data, .. } if data == expected));
+        }
+
+        fs::rename(first.join("same"), first.join("old")).unwrap();
+        fs::write(first.join("same"), b"newer").unwrap();
+        let same_attempt = worker.handle(&Request::ReadRange {
+            path: Vec::new(),
+            source: Some(first_source.clone()),
+            attempt: 0,
+            off: 0,
+            len: 5,
+        });
+        assert!(matches!(same_attempt, Response::Block { data, .. } if data == b"first"));
+        let retry = worker.handle(&Request::ReadRange {
+            path: Vec::new(),
+            source: Some(first_source),
+            attempt: 1,
+            off: 0,
+            len: 5,
+        });
+        assert!(matches!(retry, Response::Block { data, .. } if data == b"newer"));
+    }
+
+    #[test]
+    fn confined_source_content_requires_exact_registered_references() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::write(&selected, b"selected").unwrap();
+        fs::write(temporary.path().join("sibling"), b"sibling!").unwrap();
+        let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+        let forged = RegisteredPath::new(selections[0].root(), b"sibling".to_vec()).unwrap();
+
+        for source in [None, Some(forged)] {
+            let response = worker.handle(&Request::ReadRange {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                source,
+                attempt: 0,
+                off: 0,
+                len: 8,
+            });
+            assert!(matches!(response, Response::Err(_)));
+        }
+
+        for response in [
+            worker.handle(&Request::HashBlocks {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                source: None,
+                which: Which::Final,
+                partial_id: [0; 16],
+                block: MIN_HASH_BLOCK_BYTES,
+                len: 8,
+                guard: None,
+            }),
+            worker.handle(&Request::FileHash {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                source: None,
+                guard: None,
+            }),
+        ] {
+            assert!(matches!(response, Response::Err(error) if error.contains("omitted")));
+        }
+        let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
+            path: selected.as_os_str().as_bytes().to_vec(),
+            source: None,
+            attempt: 0,
+            len: 8,
+        }]));
+        assert!(
+            matches!(response, Response::SmallBlocks(blocks) if matches!(&blocks[..], [Err(error)] if error.contains("omitted")))
+        );
+
+        let response = worker.handle(&Request::HashBlocks {
+            path: selected.as_os_str().as_bytes().to_vec(),
+            source: Some(selections[0].clone()),
+            which: Which::Partial,
+            partial_id: [0; 16],
+            block: MIN_HASH_BLOCK_BYTES,
+            len: 8,
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::Err(error) if error.contains("only valid for the final source"))
+        );
+    }
+
+    #[test]
+    fn unconfined_source_content_uses_only_the_explicit_legacy_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        let sibling = temporary.path().join("sibling");
+        fs::write(&selected, b"selected").unwrap();
+        fs::write(&sibling, b"legacy!!").unwrap();
+        let (mut worker, _, _control) = registered_source_worker(&[&selected], true);
+        let response = worker.handle(&Request::ReadRange {
+            path: sibling.as_os_str().as_bytes().to_vec(),
+            source: None,
+            attempt: 0,
+            off: 0,
+            len: 8,
+        });
+        assert!(matches!(response, Response::Block { data, .. } if data == b"legacy!!"));
+
+        let response = worker.handle(&Request::HashBlocks {
+            path: sibling.as_os_str().as_bytes().to_vec(),
+            source: None,
+            which: Which::Final,
+            partial_id: [0; 16],
+            block: MIN_HASH_BLOCK_BYTES,
+            len: 8,
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::Hashes(hashes) if hashes == vec![content_digest(b"legacy!!")])
+        );
+        let response = worker.handle(&Request::FileHash {
+            path: sibling.as_os_str().as_bytes().to_vec(),
+            source: None,
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::FileHash { size: 8, hash } if hash == content_digest(b"legacy!!"))
+        );
+    }
+
+    #[test]
+    fn destination_worker_rejects_source_only_content_requests() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("marker"), b"marker").unwrap();
+        let mut worker = FsOps::new();
+        worker.destination_root = Some(Arc::new(Root::open(temporary.path()).unwrap()));
+        worker.destination_prefix = Some(b".".to_vec());
+
+        let response = worker.handle(&Request::ReadRange {
+            path: b"marker".to_vec(),
+            source: None,
+            attempt: 0,
+            off: 0,
+            len: 6,
+        });
+        assert!(matches!(response, Response::Err(error) if error.contains("destination worker")));
+        let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
+            path: b"marker".to_vec(),
+            source: None,
+            attempt: 0,
+            len: 6,
+        }]));
+        assert!(
+            matches!(response, Response::SmallBlocks(blocks) if matches!(&blocks[..], [Err(error)] if error.contains("destination worker")))
         );
     }
 

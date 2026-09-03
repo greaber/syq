@@ -848,8 +848,9 @@ mod tests {
         let ticket = descriptor_session
             .register(std::fs::File::open(selected.path()).unwrap())
             .unwrap();
+        let selection = RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap();
         let source = RegisteredSourceRoot {
-            selection: RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap(),
+            selection: selection.clone(),
             ticket,
             leaf_ticket: None,
             expected_leaf: None,
@@ -940,6 +941,39 @@ mod tests {
         assert!(matches!(
             reader.read_msg::<Response>().unwrap(),
             Response::Err(error) if error.contains("source session rejects caller-supplied guards")
+        ));
+        writer
+            .write_msg(&Request::ReadRange {
+                // This contradictory spelling is diagnostic only; the
+                // registered source reference is the read authority.
+                path: b"/not/the/source/marker".to_vec(),
+                source: Some(selection.join(b"marker").unwrap()),
+                attempt: 0,
+                off: 0,
+                len: 6,
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Block { data, .. } if data == b"marker"
+        ));
+        writer
+            .write_msg(&Request::ReadRange {
+                path: selected
+                    .path()
+                    .join("marker")
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec(),
+                source: None,
+                attempt: 0,
+                off: 0,
+                len: 6,
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(error) if error.contains("omitted")
         ));
         writer
             .write_msg(&Request::RegisterSourceRoots {

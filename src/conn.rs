@@ -2343,7 +2343,20 @@ mod tests {
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
         };
+        let source_marker = roots[0].selection.join(b"marker").unwrap();
         let mut source = endpoint.connect_with_sources(false, roots).unwrap();
+
+        let response = source
+            .call(Request::ReadRange {
+                path: b"contradictory-path".to_vec(),
+                source: Some(source_marker),
+                attempt: 0,
+                off: 0,
+                len: 6,
+            })
+            .unwrap();
+        assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
+
         let response = source
             .call(Request::Apply {
                 ops: vec![Op::Unlink {

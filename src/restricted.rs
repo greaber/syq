@@ -1733,18 +1733,29 @@ impl RestrictedAuthority {
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
             }
-            Request::FileHash { path, guard, .. } => {
+            Request::FileHash {
+                path,
+                source,
+                guard,
+            } => {
+                if source.is_some() {
+                    bail!("source references are not valid on a command-restricted destination");
+                }
                 self.check_observation_path(path)?;
                 outcomes.push(PendingOutcome::Observe { path: path.clone() });
                 *guard = Some(self.guard.clone());
             }
             Request::HashBlocks {
                 path,
+                source,
                 block,
                 len,
                 guard,
                 ..
             } => {
+                if source.is_some() {
+                    bail!("source references are not valid on a command-restricted destination");
+                }
                 self.check_hash_request(*block, *len)?;
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
@@ -6316,9 +6327,10 @@ mod tests {
 
         let session = crate::descriptor_broker::DescriptorSessionSlot::default();
         let ticket = session.register(fs::File::open(&root).unwrap()).unwrap();
+        let source = proto::RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap();
         let mut scan = Request::Scan {
             root: root.as_os_str().as_bytes().to_vec(),
-            source: Some(proto::RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap()),
+            source: Some(source.clone()),
             follow_root: false,
             ignore: Vec::new(),
             report_ignored: false,
@@ -6328,5 +6340,27 @@ mod tests {
         assert!(error
             .to_string()
             .contains("source references are not valid"));
+
+        for mut request in [
+            Request::FileHash {
+                path: root.join("file").as_os_str().as_bytes().to_vec(),
+                source: Some(source.clone()),
+                guard: None,
+            },
+            Request::HashBlocks {
+                path: root.join("file").as_os_str().as_bytes().to_vec(),
+                source: Some(source),
+                which: proto::Which::Final,
+                partial_id: [0; 16],
+                block: proto::MIN_HASH_BLOCK_BYTES,
+                len: 1,
+                guard: None,
+            },
+        ] {
+            let error = authority.authorize(&mut request, true).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("source references are not valid"));
+        }
     }
 }

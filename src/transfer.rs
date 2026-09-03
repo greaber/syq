@@ -5444,6 +5444,13 @@ struct BlockDiff {
 }
 
 impl Worker {
+    /// Confined source sessions carry the registered capability on every
+    /// content request. Only rsync's explicit --insecure-links compatibility
+    /// mode intentionally asks the endpoint to use its legacy pathname.
+    fn source_reference(&self, job: &FileJob) -> Option<RegisteredPath> {
+        (!self.opts.insecure_links).then(|| job.source.clone())
+    }
+
     fn run(&mut self) -> Result<()> {
         let r = self.run_inner();
         if r.is_err() && !self.transport_dead() {
@@ -5651,7 +5658,7 @@ impl Worker {
             .filter(|job| job.entry.size > 0)
             .map(|job| SmallRead {
                 path: job.src.clone(),
-                source: Some(job.source.clone()),
+                source: self.source_reference(job),
                 attempt: job.attempts,
                 len: job.entry.size as u32,
             })
@@ -6251,7 +6258,7 @@ impl Worker {
         let size = job.entry.size;
         self.src.send(Request::HashBlocks {
             path: job.src.clone(),
-            source: Some(job.source.clone()),
+            source: self.source_reference(job),
             which: Which::Final,
             partial_id: self.partial_id(),
             block,
@@ -6352,7 +6359,7 @@ impl Worker {
                 self.limit(n);
                 self.src.send(Request::ReadRange {
                     path: job.src.clone(),
-                    source: Some(job.source.clone()),
+                    source: self.source_reference(&job),
                     attempt: job.attempts,
                     off,
                     len: n as u32,
@@ -6477,7 +6484,7 @@ impl Worker {
     fn contents_match(&mut self, job: &FileJob) -> Result<bool> {
         self.src.send(Request::FileHash {
             path: job.src.clone(),
-            source: Some(job.source.clone()),
+            source: self.source_reference(job),
             guard: None,
         })?;
         self.dst.send(Request::FileHash {
@@ -6597,7 +6604,7 @@ impl Worker {
         let r = (|| -> Result<bool> {
             self.src.send(Request::FileHash {
                 path: job.src.clone(),
-                source: Some(job.source.clone()),
+                source: self.source_reference(&job),
                 guard: None,
             })?;
             self.dst.send(Request::FileHash {

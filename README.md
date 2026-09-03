@@ -242,32 +242,32 @@ and selected identities through mutation. Copy resolves and registers every
 selected source before destination mutation, and every source worker claims
 those exact directory or parent descriptors during authenticated startup,
 before it reports readiness. Source discovery and metadata stats, including
-retry checks, use the resulting opaque root ID plus strict relative bytes as
-their authority. They do not reopen the operator spelling or follow descendant
-symlinks; a selected file authorizes only that exact leaf, not siblings beneath
-its retained parent. The endpoint registry and every initialized worker also
-keep that selected object open, so the pin remains valid even if the control
-connection exits first. Exact-symlink target bytes are snapshotted through the
-opened symlink object and never reread through its mutable directory name.
-Replacing an exact selected leaf is an error, while changed-source retry remains
-available for entries beneath a selected directory. On macOS this
-descriptor-bound symlink operation requires macOS 13 or newer; older releases
-fail source registration rather than fall back to a name-based read. Source
-content hashing, range/small reads, local-copy source opens, and the same-machine
-self-copy canonical-path check still use legacy pathnames and are the remaining
-source-confinement work.
-This is therefore not yet a complete hostile-namespace guarantee for source
-file contents. Copy also gives
+retry checks, source content hashes, and range/small reads use the resulting opaque
+root ID plus strict relative bytes as their authority. They do not reopen the
+operator spelling or follow descendant symlinks; a selected file authorizes
+only the exact leaf observed at registration, not siblings beneath its retained
+parent. The endpoint registry and every initialized worker also keep that
+selected object open, so the pin remains valid even if the control connection
+exits first, and every content open verifies its identity. Exact-symlink target
+bytes are snapshotted through the opened symlink object and never reread through
+its mutable directory name. Replacing an exact selected leaf is an error, while
+changed-source retry remains available for entries beneath a selected
+directory. On macOS this descriptor-bound symlink operation requires macOS 13
+or newer; older releases fail source registration rather than fall back to a
+name-based read. Same-machine `CopyLocal` source opens and the canonical-path
+self-copy check still use legacy pathnames and are the remaining
+source-confinement work. This is therefore not yet a complete hostile-namespace
+guarantee for copies that take the local-copy optimization. Copy also gives
 every destination worker the selected directory descriptor; destination
 observation, directory and special-file creation, metadata changes, and
 planned non-recursive deletion are relative to that descriptor. Destination
 scanning, including the walk that plans `--delete`, is relative to it too and
 never follows descendant symlinks.
 Rsync-mode `--insecure-links` is the explicit compatibility opt-out: that
-session uses the legacy unconfined pathname discovery path, including traversal
-through symlinked `--files-from` ancestors. Native mapping/generated names never
-inherit native `--follow`; they remain strict descendants of the registered
-source root.
+session uses the legacy unconfined pathname discovery and content-read paths,
+including traversal through symlinked `--files-from` ancestors. Native
+mapping/generated names never inherit native `--follow`; they remain strict
+descendants of the registered source root.
 Registration also budgets the process's currently open descriptors, one
 retained parent descriptor per source root and one object descriptor per exact
 leaf for the registry, control connection, and every worker that may share its

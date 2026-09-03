@@ -360,6 +360,58 @@ fn exact_symlink_source_replacement_is_rejected_after_registration() {
     assert!(!t.path("destination").exists());
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
+    let t = Tmp::new();
+    let original_large = vec![b'o'; 5 << 20];
+    write(&t.path("src/small"), b"original");
+    write(&t.path("src/large"), &original_large);
+    write(&t.path("outside/small"), b"replaced");
+    write(&t.path("outside/large"), &vec![b'r'; 5 << 20]);
+    let ready = t.path("source-content-ready");
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+            "--no-progress",
+        ])
+        // Keep the test on the ranged transport path instead of the excluded
+        // same-machine CopyLocal optimization.
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the source root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "source root was not registered before timeout"
+    );
+
+    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/small")), b"original");
+    assert_eq!(read(&t.path("dst/large")), original_large);
+}
+
 fn run_native_ok(args: &[&str]) -> String {
     let out = native_syq(args);
     assert!(

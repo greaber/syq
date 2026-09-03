@@ -219,8 +219,9 @@ pub struct ContainerGuard {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallRead {
     pub path: PathBytes,
-    /// Inert registered spelling for `path`; execution remains pathname-based
-    /// until the descriptor source-read cutover.
+    /// Authoritative source capability. `path` is only a diagnostic/legacy
+    /// spelling when this is present; omission is reserved for the explicit
+    /// rsync `--insecure-links` compatibility path.
     pub source: Option<RegisteredPath>,
     pub attempt: u32,
     pub len: u32,
@@ -434,8 +435,9 @@ pub enum ConnectionRole {
     /// start its TCP data listener.
     Control,
     /// A data connection reserved for reading a source endpoint. Discovery
-    /// and stat are confined to the registered roots; content reads are
-    /// migrated in a later protocol slice.
+    /// metadata, block/file hashes, and range/small reads are confined to the
+    /// registered roots unless the registration explicitly permits the rsync
+    /// `--insecure-links` compatibility path.
     SourceWorker {
         /// Every registered parent and exact-object descriptor is acquired
         /// before HelloOk. Local and same-process TCP workers clone in process;
@@ -620,8 +622,8 @@ pub enum Request {
     },
     HashBlocks {
         path: PathBytes,
-        /// Inert registered spelling; the descriptor hash cutover makes it
-        /// authoritative.
+        /// Authoritative for source hashing when present. Destination hashing
+        /// omits it; a confined source session rejects an omission.
         source: Option<RegisteredPath>,
         which: Which,
         partial_id: PartialId,
@@ -631,8 +633,8 @@ pub enum Request {
     },
     ReadRange {
         path: PathBytes,
-        /// Inert registered spelling; the descriptor read cutover makes it
-        /// authoritative.
+        /// Authoritative source capability. A confined source session rejects
+        /// an omission instead of falling back to `path`.
         source: Option<RegisteredPath>,
         attempt: u32,
         off: u64,
@@ -664,8 +666,8 @@ pub enum Request {
     PutSmallBatch(Vec<SmallPut>),
     FileHash {
         path: PathBytes,
-        /// Inert registered spelling; the descriptor hash cutover makes it
-        /// authoritative.
+        /// Authoritative for source hashing when present. Destination hashing
+        /// omits it; a confined source session rejects an omission.
         source: Option<RegisteredPath>,
         guard: Option<ContainerGuard>,
     },
