@@ -475,14 +475,32 @@ fn base32(bytes: &[u8]) -> String {
 }
 
 fn name_max(parent: &Path) -> usize {
+    static CACHE: OnceLock<Mutex<NameMaxCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(NameMaxCache::default()));
+    name_max_cached(parent, cache, |candidate| {
+        let Ok(path) = cstr(candidate) else {
+            return COMMON_NAME_MAX;
+        };
+        let limit = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_NAME_MAX) };
+        if limit > 0 {
+            limit as usize
+        } else {
+            COMMON_NAME_MAX
+        }
+    })
+}
+
+fn name_max_cached(
+    parent: &Path,
+    cache: &Mutex<NameMaxCache>,
+    query: impl Fn(&Path) -> usize,
+) -> usize {
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
     } else {
         parent
     };
     let key = lexical_absolute(parent);
-    static CACHE: OnceLock<Mutex<NameMaxCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(NameMaxCache::default()));
     let mut candidate = key.clone();
     loop {
         let cached_path = cache.lock().unwrap().paths.get(&candidate).copied();
@@ -493,21 +511,11 @@ fn name_max(parent: &Path) -> usize {
         // Preflight often runs before mapped destination subdirectories have
         // been created. Missing descendants inherit the nearest existing
         // ancestor's mount unless a concurrent mount change occurs.
-        if let Ok(metadata) = fs::metadata(&candidate) {
+        if let Ok(metadata) = fs::symlink_metadata(&candidate) {
             if metadata.is_dir() {
                 let dev = metadata.dev();
                 let cached = cache.lock().unwrap().devices.get(&dev).copied();
-                let limit = cached.unwrap_or_else(|| {
-                    let Ok(path) = cstr(&candidate) else {
-                        return COMMON_NAME_MAX;
-                    };
-                    let limit = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_NAME_MAX) };
-                    if limit > 0 {
-                        limit as usize
-                    } else {
-                        COMMON_NAME_MAX
-                    }
-                });
+                let limit = cached.unwrap_or_else(|| query(&candidate));
                 let mut cache = cache.lock().unwrap();
                 if cache.paths.len() >= NAME_MAX_CACHE_CAP {
                     cache.paths.clear();
@@ -544,26 +552,6 @@ fn lexical_absolute(path: &Path) -> PathBuf {
         }
     }
     normalized
-}
-
-#[cfg(test)]
-fn nearest_existing_directory(path: &Path) -> PathBuf {
-    let mut candidate = if path.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        path.to_path_buf()
-    };
-    loop {
-        // An in-tree symlink is replaced during planning, not traversed. Use
-        // lstat semantics here too so preflight and the eventual worker query
-        // the containing filesystem rather than the symlink target.
-        if fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.is_dir()) {
-            return candidate;
-        }
-        if !candidate.pop() || candidate.as_os_str().is_empty() {
-            return PathBuf::from(".");
-        }
-    }
 }
 
 fn safe_prefix_len(name: &[u8], requested: usize) -> usize {
@@ -2782,11 +2770,9 @@ impl FsOps {
                         }
                     }
                 }
+                Ok(_) if !create_if_missing => return Ok(None),
                 Ok(_) => {
                     fs::remove_file(pp).with_context(|| format!("replace {}", pp.display()))?;
-                    if !create_if_missing {
-                        return Ok(None);
-                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     if !create_if_missing {
@@ -2866,12 +2852,8 @@ impl FsOps {
                         Err(error) => return Err(error),
                     }
                 }
-                Some(_) => {
-                    root.unlink(relative)?;
-                    if !create_if_missing {
-                        return Ok(None);
-                    }
-                }
+                Some(_) if !create_if_missing => return Ok(None),
+                Some(_) => root.unlink(relative)?,
                 None if !create_if_missing => return Ok(None),
                 None => match root.create_file(relative, 0o600) {
                     Ok(file) => return Ok(Some((file, None))),
@@ -4973,18 +4955,23 @@ mod tests {
     }
 
     #[test]
-    fn name_limit_uses_nearest_existing_ancestor() {
+    fn name_limit_discovery_does_not_follow_in_tree_symlinks() {
         let dir = test_dir();
         fs::create_dir(&dir).unwrap();
-        let missing = dir.join("not-yet-created/deeper");
         let target = dir.join("symlink-target");
         let link = dir.join("in-tree-link");
         fs::create_dir(&target).unwrap();
         symlink(&target, &link).unwrap();
+        let cache = Mutex::new(NameMaxCache::default());
+        let queried = Mutex::new(Vec::new());
 
-        assert_eq!(nearest_existing_directory(&missing), dir);
-        assert_eq!(nearest_existing_directory(&link.join("deeper")), dir);
+        let limit = name_max_cached(&link.join("deeper"), &cache, |candidate| {
+            queried.lock().unwrap().push(candidate.to_path_buf());
+            143
+        });
 
+        assert_eq!(limit, 143);
+        assert_eq!(*queried.lock().unwrap(), vec![lexical_absolute(&dir)]);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5033,6 +5020,109 @@ mod tests {
             )
             .unwrap();
         assert!(partial.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn observation_only_prepare_preserves_unsafe_sidecars() {
+        let dir = test_dir();
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("file");
+        let partial_id = [12; 16];
+        let partial = partial_path(&target, &partial_id).unwrap();
+        let external = dir.join("external");
+        fs::write(&external, b"sentinel").unwrap();
+        let mut operations = FsOps::new();
+        let observe = |operations: &mut FsOps| {
+            operations
+                .prepare(
+                    PartialTarget {
+                        path: target.as_os_str().as_bytes(),
+                        id: &partial_id,
+                        guard: None,
+                    },
+                    PrepareOptions {
+                        size: 1024,
+                        inplace: false,
+                        mode: 0o600,
+                        attempt: 0,
+                        create_if_missing: false,
+                    },
+                )
+                .unwrap()
+        };
+
+        symlink(&external, &partial).unwrap();
+        let before = fs::symlink_metadata(&partial).unwrap();
+        assert_eq!(observe(&mut operations), None);
+        let after = fs::symlink_metadata(&partial).unwrap();
+        assert!(after.file_type().is_symlink());
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(fs::read_link(&partial).unwrap(), external);
+        fs::remove_file(&partial).unwrap();
+
+        fs::hard_link(&external, &partial).unwrap();
+        let before = fs::symlink_metadata(&partial).unwrap();
+        assert_eq!(before.nlink(), 2);
+        assert_eq!(observe(&mut operations), None);
+        let after = fs::symlink_metadata(&partial).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.nlink(), 2);
+        assert_eq!(fs::read(&external).unwrap(), b"sentinel");
+        fs::remove_file(&partial).unwrap();
+
+        create_node_any(&partial, libc::S_IFIFO | 0o600, 0).unwrap();
+        let before = fs::symlink_metadata(&partial).unwrap();
+        assert!(before.file_type().is_fifo());
+        assert_eq!(observe(&mut operations), None);
+        let after = fs::symlink_metadata(&partial).unwrap();
+        assert!(after.file_type().is_fifo());
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn observation_only_rooted_prepare_preserves_an_unsafe_sidecar() {
+        let dir = test_dir();
+        let root_path = dir.join("root");
+        fs::create_dir_all(&root_path).unwrap();
+        let root = Root::open(&root_path).unwrap();
+        let identity = root.identity();
+        let guard = ContainerGuard {
+            root: root_path.as_os_str().as_bytes().to_vec(),
+            dev: identity.dev,
+            ino: identity.ino,
+        };
+        let target = root_path.join("file");
+        let partial_id = [13; 16];
+        let partial = partial_path(&target, &partial_id).unwrap();
+        symlink("unsafe-target", &partial).unwrap();
+        let before = fs::symlink_metadata(&partial).unwrap();
+        let mut operations = FsOps::new();
+
+        let observed = operations
+            .prepare(
+                PartialTarget {
+                    path: target.as_os_str().as_bytes(),
+                    id: &partial_id,
+                    guard: Some(&guard),
+                },
+                PrepareOptions {
+                    size: 1024,
+                    inplace: false,
+                    mode: 0o600,
+                    attempt: 0,
+                    create_if_missing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(observed, None);
+        let after = fs::symlink_metadata(&partial).unwrap();
+        assert!(after.file_type().is_symlink());
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(fs::read_link(&partial).unwrap(), Path::new("unsafe-target"));
         fs::remove_dir_all(&dir).unwrap();
     }
 
