@@ -298,7 +298,7 @@ struct OperatorEntry {
 /// operator. Descendant transfer paths use `RelativePath` and `Root` instead.
 pub(crate) struct OperatorResolver {
     base: File,
-    base_identity: RootIdentity,
+    base_identity: OperatorDirectoryIdentity,
     base_is_process_root: bool,
     confined: bool,
     relative_input: bool,
@@ -569,15 +569,13 @@ impl OperatorResolver {
                     root_metadata_from_std(&directory.metadata()?)?,
                     "operator directory",
                 )?;
-                let resolved_relative = current
-                    .resolved_relative
-                    .as_deref()
-                    .map(|path| join_operator_component(path, &component))
-                    .or_else(|| {
-                        (metadata.dev == self.base_identity.dev
-                            && metadata.ino == self.base_identity.ino)
-                            .then(Vec::new)
-                    });
+                let resolved_relative = if let Some(path) = current.resolved_relative.as_deref() {
+                    Some(join_operator_component(path, &component))
+                } else if self.directory_is_base(&directory)? {
+                    Some(Vec::new())
+                } else {
+                    None
+                };
                 if final_name {
                     return Ok(PinnedPath::Directory(PinnedDirectory {
                         directory,
@@ -630,8 +628,15 @@ impl OperatorResolver {
     }
 
     fn relative_if_base(&self, directory: &File) -> Result<Option<Vec<u8>>> {
+        Ok(self.directory_is_base(directory)?.then(Vec::new))
+    }
+
+    fn directory_is_base(&self, directory: &File) -> Result<bool> {
         let identity = operator_directory_identity(directory)?;
-        Ok((identity == self.base_identity).then(Vec::new))
+        Ok(operator_directory_identities_match(
+            identity,
+            self.base_identity,
+        ))
     }
 
     fn authorize_symlink(&self, metadata: RootMetadata, component: &[u8]) -> Result<()> {
@@ -656,17 +661,73 @@ impl OperatorResolver {
     }
 }
 
-fn operator_directory_identity(directory: &File) -> Result<RootIdentity> {
+#[derive(Clone, Copy, Debug)]
+struct OperatorDirectoryIdentity {
+    dev: u64,
+    ino: u64,
+    #[cfg(target_os = "linux")]
+    mount_id: Option<u64>,
+}
+
+fn operator_directory_identity(directory: &File) -> Result<OperatorDirectoryIdentity> {
     let metadata = root_metadata_from_std(&directory.metadata()?)?;
-    Ok(RootIdentity {
+    Ok(OperatorDirectoryIdentity {
         dev: metadata.dev,
         ino: metadata.ino,
+        #[cfg(target_os = "linux")]
+        mount_id: operator_mount_id(directory)?,
     })
 }
 
-fn operator_base_is_process_root(identity: RootIdentity) -> Result<bool> {
+fn operator_directory_identities_match(
+    left: OperatorDirectoryIdentity,
+    right: OperatorDirectoryIdentity,
+) -> bool {
+    if left.dev != right.dev || left.ino != right.ino {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!((left.mount_id, right.mount_id), (Some(left), Some(right)) if left == right)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn operator_mount_id(directory: &File) -> Result<Option<u64>> {
+    let mut status = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let result = unsafe {
+        libc::statx(
+            directory.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            status.as_mut_ptr(),
+        )
+    };
+    if result == 0 {
+        let status = unsafe { status.assume_init() };
+        return Ok(((status.stx_mask & libc::STATX_MNT_ID) != 0).then_some(status.stx_mnt_id));
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM)
+    ) {
+        return Ok(None);
+    }
+    Err(error).context("identify operator directory mount")
+}
+
+fn operator_base_is_process_root(identity: OperatorDirectoryIdentity) -> Result<bool> {
     let root = open_operator_start(true)?;
-    Ok(operator_directory_identity(&root)? == identity)
+    Ok(operator_directory_identities_match(
+        operator_directory_identity(&root)?,
+        identity,
+    ))
 }
 
 fn append_operator_component(path: Option<&[u8]>, component: &[u8]) -> Option<Vec<u8>> {
@@ -2658,6 +2719,30 @@ mod tests {
             panic!("process root was not selected as a directory");
         };
         assert_eq!(directory.resolved_relative(), Some(&b""[..]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn operator_directory_identity_does_not_conflate_mount_contexts() {
+        let identity = OperatorDirectoryIdentity {
+            dev: 7,
+            ino: 11,
+            mount_id: Some(13),
+        };
+        assert!(!operator_directory_identities_match(
+            identity,
+            OperatorDirectoryIdentity {
+                mount_id: Some(17),
+                ..identity
+            }
+        ));
+        assert!(!operator_directory_identities_match(
+            identity,
+            OperatorDirectoryIdentity {
+                mount_id: None,
+                ..identity
+            }
+        ));
     }
 
     #[test]

@@ -10467,6 +10467,41 @@ fn native_map_uses_the_common_source_follow_policy() {
     assert_eq!(map_path(&lines[0], "dst"), "link");
 }
 
+#[test]
+fn native_map_follow_keeps_cwd_unconfined_but_named_sources_base_relative() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("outside/file"), b"outside");
+    fs::create_dir_all(t.path("base/inside")).unwrap();
+    write(&t.path("base/inside/file"), b"inside");
+    symlink("../outside", t.path("base/escape")).unwrap();
+    symlink(t.path("base/inside"), t.path("base/reenter")).unwrap();
+
+    let escaped = map_lines(&syq_map_in(
+        &t.path(""),
+        &["-C", &t.s("base"), "--follow-src", "--src-src", "escape"],
+    ));
+    assert_eq!(map_path(&escaped[0], "src"), "file");
+    assert_eq!(map_path(&escaped[0], "dst"), "file");
+
+    let named_escape = syq_map_in(
+        &t.path(""),
+        &["-C", &t.s("base"), "--follow-src", "--src", "escape"],
+    );
+    assert!(!named_escape.status.success());
+    assert!(stderr_of(&named_escape).contains("outside the mapping source base"));
+
+    let reentered = map_lines(&syq_map_in(
+        &t.path(""),
+        &["-C", &t.s("base"), "--follow-src", "--src", "reenter"],
+    ));
+    assert_eq!(map_path(&reentered[0], "src"), "inside");
+    assert_eq!(map_path(&reentered[0], "dst"), "reenter");
+    assert_eq!(map_path(&reentered[1], "src"), "inside/file");
+    assert_eq!(map_path(&reentered[1], "dst"), "reenter/file");
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn native_map_scans_the_pinned_selection_after_path_replacement() {
