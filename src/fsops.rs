@@ -1,6 +1,7 @@
 //! Local filesystem operations. Used directly by the local endpoint and
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
+use crate::descriptor_broker::{DescriptorSessionSlot, DescriptorTicket};
 use crate::proto::*;
 use crate::rooted::{
     OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root, RootIdentity,
@@ -306,11 +307,6 @@ fn operator_directory_flags() -> libc::c_int {
     {
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
     }
-}
-
-fn open_operator_directory_start(absolute: bool) -> Result<File> {
-    let component = if absolute { c"/" } else { c"." };
-    open_operator_directory_fd(libc::AT_FDCWD, component)
 }
 
 fn open_operator_directory_at(parent: &File, component: &[u8]) -> Result<File> {
@@ -730,6 +726,7 @@ pub struct FsOps {
     /// controller's decision to repair or accept that exact inode.
     held_basis: Option<HeldBasis>,
     operator_selection: Option<OperatorDirectorySelection>,
+    descriptor_session: DescriptorSessionSlot,
     destination_root: Option<File>,
     destination_prefix: Option<PathBytes>,
     initial_cwd: PathBuf,
@@ -770,11 +767,16 @@ impl Default for FsOps {
 
 impl FsOps {
     pub fn new() -> Self {
+        Self::with_descriptor_session(DescriptorSessionSlot::default())
+    }
+
+    pub(crate) fn with_descriptor_session(descriptor_session: DescriptorSessionSlot) -> Self {
         FsOps {
             fds: HashMap::new(),
             fd_order: Vec::new(),
             held_basis: None,
             operator_selection: None,
+            descriptor_session,
             destination_root: None,
             destination_prefix: None,
             initial_cwd: process_initial_cwd(),
@@ -805,49 +807,14 @@ impl FsOps {
 
     fn anchor_destination(
         &mut self,
-        path: Option<&[u8]>,
         expected_dev: u64,
         expected_ino: u64,
         request_prefix: &[u8],
-        symlink_policy: OperatorSymlinkPolicy,
-    ) -> Result<()> {
-        let selection = if let Some(path) = path {
-            match select_operator_directory(path, false, symlink_policy) {
-                Ok((selection, Some(anchor)))
-                    if (anchor.dev, anchor.ino) == (expected_dev, expected_ino) =>
-                {
-                    selection
-                }
-                result => {
-                    // TCP workers share the receiver process with the already
-                    // anchored control connection. If the external spelling
-                    // was replaced after selection, its cwd is still the exact
-                    // retained directory and is safe to reuse.
-                    let directory = open_operator_directory_start(false)?;
-                    let metadata = directory.metadata()?;
-                    if (metadata.dev(), metadata.ino()) != (expected_dev, expected_ino) {
-                        match result {
-                            Ok((_, Some(anchor))) => bail!(
-                                "destination root changed identity (expected {expected_dev}:{expected_ino}, found {}:{})",
-                                anchor.dev,
-                                anchor.ino
-                            ),
-                            Ok((_, None)) => bail!("destination root disappeared before worker setup"),
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    OperatorDirectorySelection {
-                        path: path.to_vec(),
-                        directory,
-                        missing: VecDeque::new(),
-                    }
-                }
-            }
-        } else {
-            self.operator_selection
-                .take()
-                .context("destination directory was not checked on this connection")?
-        };
+    ) -> Result<DescriptorTicket> {
+        let selection = self
+            .operator_selection
+            .take()
+            .context("destination directory was not checked on this connection")?;
         if !selection.missing.is_empty() {
             bail!("destination directory has not been created");
         }
@@ -859,23 +826,12 @@ impl FsOps {
                 anchor.ino
             );
         }
-        loop {
-            if unsafe { libc::fchdir(selection.directory.as_raw_fd()) } == 0 {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error).context("enter retained destination root");
-            }
-        }
-        self.fds.clear();
-        self.fd_order.clear();
-        self.held_basis.take();
-        self.destination_prefix = Some(request_prefix.to_vec());
-        self.destination_root = Some(selection.directory);
+        let ticket = self.descriptor_session.register(selection.directory)?;
+        let directory = self.descriptor_session.acquire(&ticket)?;
+        self.install_destination(directory, request_prefix)?;
 
         #[cfg(debug_assertions)]
-        if path.is_none() {
+        {
             if let Some(ready) = std::env::var_os("SYQ_TEST_DESTINATION_ANCHORED_FILE") {
                 fs::write(&ready, b"ready").with_context(|| {
                     format!(
@@ -890,6 +846,36 @@ impl FsOps {
                 }
             }
         }
+        Ok(ticket)
+    }
+
+    /// Install the exact control-session root delivered during worker
+    /// initialization. A same-process TCP worker clones it from the shared
+    /// registry; an independent worker claims it with SCM_RIGHTS.
+    pub(crate) fn initialize_destination(&mut self, destination: &DestinationRoot) -> Result<()> {
+        let directory = self.descriptor_session.acquire(&destination.ticket)?;
+        self.install_destination(directory, &destination.request_prefix)
+    }
+
+    fn install_destination(&mut self, directory: File, request_prefix: &[u8]) -> Result<()> {
+        // Destination operations are still pathname-based in this transitional
+        // slice, so enter the exact received descriptor as their base. The next
+        // stacked slice replaces those operations with descriptor-relative
+        // primitives and removes process-wide cwd dependence entirely.
+        loop {
+            if unsafe { libc::fchdir(directory.as_raw_fd()) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error).context("enter retained destination root");
+            }
+        }
+        self.fds.clear();
+        self.fd_order.clear();
+        self.held_basis.take();
+        self.destination_prefix = Some(request_prefix.to_vec());
+        self.destination_root = Some(directory);
         Ok(())
     }
 
@@ -3199,20 +3185,12 @@ impl FsOps {
                 .create_operator_directory(*mode, *require_absent)
                 .map(|anchor| Response::DirectorySelection(Some(anchor))),
             Request::AnchorDestination {
-                path,
                 expected_dev,
                 expected_ino,
                 request_prefix,
-                symlink_policy,
             } => self
-                .anchor_destination(
-                    path.as_deref(),
-                    *expected_dev,
-                    *expected_ino,
-                    request_prefix,
-                    *symlink_policy,
-                )
-                .map(|_| Response::Ok),
+                .anchor_destination(*expected_dev, *expected_ino, request_prefix)
+                .map(Response::DestinationRegistered),
             Request::PartialPaths {
                 paths,
                 partial_id,

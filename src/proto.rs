@@ -5,6 +5,7 @@
 //! flag bit 0 means the payload is zstd-compressed. Each writer decides
 //! independently whether to compress, readers always accept both.
 
+use crate::descriptor_broker::DescriptorTicket;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
@@ -268,12 +269,34 @@ pub enum Op {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DestinationRoot {
+    pub ticket: DescriptorTicket,
+    pub request_prefix: PathBytes,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ConnectionRole {
+    /// The one connection allowed to create endpoint-session capabilities and
+    /// start its TCP data listener.
+    Control,
+    /// A data connection used only to read a source endpoint.
+    SourceWorker,
+    /// A data connection used to mutate a destination endpoint. Unrestricted
+    /// receivers require an exact registered root; restricted receivers derive
+    /// their confinement from the signed grant and reject a supplied ticket.
+    DestinationWorker {
+        destination: Option<DestinationRoot>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Request {
     Hello {
         identity: String,
         compress: bool,
         debug: bool,
         token: Vec<u8>,
+        role: ConnectionRole,
     },
     /// Ask the server to accept data connections over TCP (see crypto.rs).
     /// `key` is None for plaintext; `token` authenticates plaintext connections.
@@ -325,15 +348,12 @@ pub enum Request {
         /// it. Intermediate directories may still be shared safely.
         require_absent: bool,
     },
-    /// Retain and enter the selected destination directory for this
-    /// connection. The control connection reuses its checked descriptor;
-    /// independent workers securely reopen `path` and verify its identity.
+    /// Register the destination directory retained by the preceding operator
+    /// walk. Only the control connection may create this session capability.
     AnchorDestination {
-        path: Option<PathBytes>,
         expected_dev: u64,
         expected_ino: u64,
         request_prefix: PathBytes,
-        symlink_policy: OperatorSymlinkPolicy,
     },
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {
@@ -502,6 +522,7 @@ pub enum Response {
     /// Absolute operator spelling plus device/inode of the securely opened
     /// directory, or None when an allowed missing suffix was reached.
     DirectorySelection(Option<DirectoryAnchor>),
+    DestinationRegistered(DescriptorTicket),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
     BatchPlan {
         partial_paths: Vec<std::result::Result<PathBytes, String>>,

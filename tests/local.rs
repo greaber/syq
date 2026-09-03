@@ -6846,21 +6846,8 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
 
         let output = child.wait_with_output().unwrap();
-        if no_tcp {
-            assert!(
-                !output.status.success(),
-                "a fresh worker reused a changed root"
-            );
-            assert!(
-                stderr_of(&output).contains("destination root changed identity"),
-                "{}",
-                stderr_of(&output)
-            );
-            assert!(!t.path("selected-and-moved/f").exists());
-        } else {
-            assert_output_ok(&output);
-            assert_eq!(read(&t.path("selected-and-moved/f")), b"payload");
-        }
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("selected-and-moved/f")), b"payload");
         assert!(!t.path("outside/f").exists());
         assert!(fs::symlink_metadata(t.path("dst"))
             .unwrap()

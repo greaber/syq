@@ -829,11 +829,12 @@ Identical to rsync:
 - An explicitly supplied destination root that is a symlink to a directory is
   that directory when the link is owned by root or by the receiver's effective
   uid (the link is kept, with or without a trailing slash). A foreign-owned
-  component is refused. Each receiving connection retains and verifies the
-  selected directory, so replacing the external destination spelling afterward
-  cannot redirect its writes. A symlink encountered below the destination root
-  is payload at that path: it is replaced rather than followed, even when it
-  points to a directory.
+  component is refused. The control connection registers the selected open
+  directory, and every worker receives that exact directory descriptor rather
+  than resolving the operator path again. Replacing the external destination
+  spelling afterward therefore cannot redirect its writes. A symlink
+  encountered below the destination root is payload at that path: it is
+  replaced rather than followed, even when it points to a directory.
 - Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
   payload and produce one warning summary. Before transfer starts, SYQ rejects
   the exceptional case where a mapped payload path exactly equals a sidecar
@@ -1237,8 +1238,9 @@ data connections across all of them (multipath) — it keeps only paths within
 2x of the fastest, so it never drags a fast transfer down by mixing in a slow
 link. Every candidate still gets its complete bounded probe window, but those
 independent probes run while the control connection prepares the destination.
-Worker Hello and destination anchoring are likewise sent in one
-pipelined setup turn. Single-homed hosts and laptops use the one best path,
+An unrestricted destination worker claims its registered directory as part of
+its authenticated Hello, and the receiver acknowledges readiness only after
+that claim succeeds. Single-homed hosts and laptops use the one best path,
 unchanged. With ufw:
 
 ```sh

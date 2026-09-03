@@ -141,17 +141,6 @@ fn is_multiplexed_ssh_session_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<MultiplexedSshSessionError>())
 }
 
-fn worker_initialization_response(response: Response) -> Result<()> {
-    match response {
-        Response::Ok => Ok(()),
-        Response::Err(error) => Err(WorkerInitializationError(error).into()),
-        other => Err(WorkerInitializationError(format!(
-            "unexpected worker initialization response {other:?}"
-        ))
-        .into()),
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn tcp_congestion_control<S: AsRawFd>(socket: &S) -> std::io::Result<String> {
     // Linux currently caps names at TCP_CA_NAME_MAX (16 including NUL). Leave
@@ -1046,16 +1035,21 @@ impl RemoteSpec {
     /// queue behind workers. In managed mode the release helper is installed
     /// on first use if the remote lacks it.
     pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
-        self.connect_with_request(compress, limited, None)
+        let role = if limited {
+            ConnectionRole::SourceWorker
+        } else {
+            ConnectionRole::Control
+        };
+        self.connect_with_role(compress, limited, role)
     }
 
-    fn connect_with_request(
+    fn connect_with_role(
         &self,
         compress: bool,
         limited: bool,
-        initial_request: Option<Request>,
+        role: ConnectionRole,
     ) -> Result<RemoteConn> {
-        let first = self.connect_retried(compress, limited, initial_request.clone());
+        let first = self.connect_retried(compress, limited, role.clone());
         let Err(first_error) = first else {
             return first;
         };
@@ -1064,7 +1058,7 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress, limited, initial_request)
+        self.connect_retried(compress, limited, role)
             .with_context(|| {
                 format!(
                     "could not start the {} helper installed on {}",
@@ -1078,14 +1072,14 @@ impl RemoteSpec {
         &self,
         compress: bool,
         limited: bool,
-        initial_request: Option<Request>,
+        role: ConnectionRole,
     ) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
         for attempt in 0..6 {
             let _slot = limited.then(connect_slot);
             let ssh_connection = self.ssh_connection(limited);
-            match self.connect_once(compress, ssh_connection, initial_request.clone()) {
+            match self.connect_once(compress, ssh_connection, role.clone()) {
                 Ok(c) => return Ok(c),
                 Err(e)
                     if ssh_connection == SshConnection::Worker
@@ -1152,7 +1146,7 @@ impl RemoteSpec {
         &self,
         compress: bool,
         ssh_connection: SshConnection,
-        initial_request: Option<Request>,
+        role: ConnectionRole,
     ) -> Result<RemoteConn> {
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = &self.restricted_grant {
@@ -1198,7 +1192,7 @@ impl RemoteSpec {
             tcp_socket: None,
             multiplexed_ssh: ssh_connection == SshConnection::Worker,
         };
-        let conn = hello(conn, compress, Vec::new(), initial_request)?;
+        let conn = hello(conn, compress, Vec::new(), role)?;
         self.record_peer(&conn);
         Ok(conn)
     }
@@ -1417,7 +1411,7 @@ impl RemoteSpec {
         &self,
         info: &TcpInfo,
         compress: bool,
-        initial_request: Option<Request>,
+        role: ConnectionRole,
     ) -> Result<RemoteConn> {
         let n = info.addrs.len();
         let start = info.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
@@ -1491,7 +1485,7 @@ impl RemoteSpec {
                 tcp_socket: Some(tcp_socket),
                 multiplexed_ssh: false,
             };
-            let conn = hello(conn, compress, info.token.clone(), initial_request.clone())?;
+            let conn = hello(conn, compress, info.token.clone(), role.clone())?;
             self.record_peer(&conn);
             return Ok(conn);
         }
@@ -1608,20 +1602,16 @@ fn hello(
     mut conn: RemoteConn,
     compress: bool,
     token: Vec<u8>,
-    initial_request: Option<Request>,
+    role: ConnectionRole,
 ) -> Result<RemoteConn> {
+    let destination_worker = matches!(role, ConnectionRole::DestinationWorker { .. });
     conn.send(Request::Hello {
         identity: crate::identity::build().to_string(),
         compress,
         debug: crate::transfer::debug(),
         token,
+        role,
     })?;
-    // Worker destination anchoring is independent of the Hello response. Put
-    // it on the wire immediately so the receiver can authenticate, anchor,
-    // and acknowledge within one WAN turn while preserving response order.
-    if let Some(request) = initial_request.as_ref() {
-        conn.send(request.clone())?;
-    }
     match conn.recv() {
         Ok(Response::HelloOk { identity, platform }) if identity == crate::identity::build() => {
             conn.peer = Some(PeerInfo { identity, platform });
@@ -1633,15 +1623,22 @@ fn hello(
                 crate::identity::build()
             )
         }
-        Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
+        Ok(Response::Err(error)) if destination_worker => {
+            return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into())
+        }
+        Ok(Response::Err(error)) => bail!("{}: {error}", conn.label),
+        Ok(other) if destination_worker => {
+            return Err(WorkerInitializationError(format!(
+                "{}: unexpected handshake response {other:?}",
+                conn.label
+            ))
+            .into())
+        }
         Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("could not start the remote syq on {}", conn.label))
         }
-    }
-    if initial_request.is_some() {
-        worker_initialization_response(conn.recv()?)?;
     }
     Ok(conn)
 }
@@ -2071,26 +2068,46 @@ impl Endpoint {
     }
 
     pub fn connect(&self, compress: bool) -> Result<Box<dyn Conn>> {
-        self.connect_with_request(compress, None)
+        self.connect_with_role(compress, ConnectionRole::SourceWorker)
     }
 
-    pub(crate) fn connect_with_request(
+    pub(crate) fn connect_with_destination(
         &self,
         compress: bool,
-        initial_request: Option<Request>,
+        destination: Option<DestinationRoot>,
     ) -> Result<Box<dyn Conn>> {
+        self.connect_with_role(compress, ConnectionRole::DestinationWorker { destination })
+    }
+
+    fn connect_with_role(&self, compress: bool, role: ConnectionRole) -> Result<Box<dyn Conn>> {
         match self {
             Endpoint::Local => {
                 let mut conn = LocalConn::new();
-                if let Some(request) = initial_request {
-                    worker_initialization_response(conn.call(request)?)?;
+                match role {
+                    ConnectionRole::DestinationWorker {
+                        destination: Some(destination),
+                    } => conn
+                        .ops
+                        .initialize_destination(&destination)
+                        .map_err(|error| {
+                            WorkerInitializationError(format!(
+                                "initialize local destination worker: {error:#}"
+                            ))
+                        })?,
+                    ConnectionRole::DestinationWorker { destination: None } => {
+                        return Err(WorkerInitializationError(
+                            "local destination worker requires a registered root".into(),
+                        )
+                        .into())
+                    }
+                    ConnectionRole::Control | ConnectionRole::SourceWorker => {}
                 }
                 Ok(Box::new(conn))
             }
             Endpoint::Remote(spec) => {
                 let info = spec.tcp.lock().unwrap().clone();
                 if let Some(info) = info.filter(|i| !i.failed) {
-                    match spec.connect_tcp(&info, compress, initial_request.clone()) {
+                    match spec.connect_tcp(&info, compress, role.clone()) {
                         Ok(c) => return Ok(Box::new(c)),
                         Err(e)
                             if is_tcp_congestion_error(&e)
@@ -2129,11 +2146,7 @@ impl Endpoint {
                         spec.label()
                     );
                 }
-                Ok(Box::new(spec.connect_with_request(
-                    compress,
-                    true,
-                    initial_request,
-                )?))
+                Ok(Box::new(spec.connect_with_role(compress, true, role)?))
             }
         }
     }
@@ -2254,7 +2267,7 @@ mod tests {
         };
 
         let error = spec
-            .connect_tcp(&info, false, None)
+            .connect_tcp(&info, false, ConnectionRole::SourceWorker)
             .err()
             .expect("unregistered congestion control should fail locally");
         let message = format!("{error:#}");
@@ -2275,14 +2288,22 @@ mod tests {
 
     #[test]
     fn rejected_worker_initialization_is_not_a_retryable_transport_error() {
-        let error = worker_initialization_response(Response::Err("destination changed".into()))
-            .unwrap_err();
+        let error: anyhow::Error = WorkerInitializationError("destination changed".into()).into();
         assert!(is_worker_initialization_error(&error));
         assert!(!is_tcp_congestion_error(&error));
     }
 
     #[test]
-    fn hello_sends_worker_initialization_before_waiting_for_its_response() {
+    fn hello_carries_destination_initialization_before_readiness() {
+        let temp = tempfile::tempdir().unwrap();
+        let descriptor_session = crate::descriptor_broker::DescriptorSessionSlot::default();
+        let ticket = descriptor_session
+            .register(std::fs::File::open(temp.path()).unwrap())
+            .unwrap();
+        let destination = DestinationRoot {
+            ticket,
+            request_prefix: b"destination".to_vec(),
+        };
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -2291,14 +2312,18 @@ mod tests {
                 .set_read_timeout(Some(std::time::Duration::from_secs(1)))
                 .unwrap();
             let mut reader = FrameReader::new(socket.try_clone().unwrap());
-            assert!(matches!(
-                reader.read_msg::<Request>().unwrap(),
-                Request::Hello { .. }
-            ));
-            assert!(matches!(
-                reader.read_msg::<Request>().unwrap(),
-                Request::AnchorDestination { .. }
-            ));
+            let hello = reader.read_msg::<Request>().unwrap();
+            let Request::Hello {
+                role:
+                    ConnectionRole::DestinationWorker {
+                        destination: Some(destination),
+                    },
+                ..
+            } = hello
+            else {
+                panic!("destination initialization was not carried in Hello");
+            };
+            assert_eq!(destination.request_prefix, b"destination");
 
             let mut writer = FrameWriter::new(socket, false);
             writer
@@ -2307,7 +2332,6 @@ mod tests {
                     platform: crate::identity::platform(),
                 })
                 .unwrap();
-            writer.write_msg(&Response::Ok).unwrap();
         });
 
         let socket = TcpStream::connect(address).unwrap();
@@ -2327,18 +2351,15 @@ mod tests {
             conn,
             false,
             Vec::new(),
-            Some(Request::AnchorDestination {
-                path: Some(b"destination".to_vec()),
-                expected_dev: 1,
-                expected_ino: 2,
-                request_prefix: b"destination".to_vec(),
-                symlink_policy: OperatorSymlinkPolicy::TrustedOwner,
-            }),
+            ConnectionRole::DestinationWorker {
+                destination: Some(destination),
+            },
         )
         .unwrap();
         assert!(conn.peer.is_some());
         drop(conn);
         server.join().unwrap();
+        descriptor_session.close();
     }
 
     #[test]

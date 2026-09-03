@@ -10,6 +10,7 @@ use crate::conn::{
 };
 use crate::fsops::{content_digest, is_partial_name, join};
 use crate::progress::{commas, human, Progress, WorkerStatus};
+use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
 use crate::tune::{self, Gate};
@@ -686,11 +687,9 @@ fn copy_identity(
 
 #[derive(Clone, Debug)]
 struct DestinationAnchor {
-    operator_path: PathBytes,
-    request_prefix: PathBytes,
+    destination: RegisteredDestinationRoot,
     dev: u64,
     ino: u64,
-    symlink_policy: OperatorSymlinkPolicy,
 }
 type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
 
@@ -1119,11 +1118,13 @@ pub fn run(args: Args) -> Result<i32> {
                     return Ok(());
                 }
                 let initial_destination = if destination_anchor_required {
-                    Some(worker_destination_request(
+                    Some(
                         destination_anchor
                             .get()
-                            .context("destination root was not anchored before workers started")?,
-                    ))
+                            .context("destination root was not anchored before workers started")?
+                            .destination
+                            .clone(),
+                    )
                 } else {
                     None
                 };
@@ -1137,7 +1138,8 @@ pub fn run(args: Args) -> Result<i32> {
                     let conns = src_ep.connect(compress).and_then(|src| {
                         Ok((
                             src,
-                            dst_ep.connect_with_request(compress, initial_destination.clone())?,
+                            dst_ep
+                                .connect_with_destination(compress, initial_destination.clone())?,
                         ))
                     });
                     let (src, dst) = match conns {
@@ -1656,12 +1658,8 @@ pub fn run(args: Args) -> Result<i32> {
             directory_selection = Some(create_operator_directory(&mut *dst_ctl, condition)?);
         }
         if let Some(selection) = directory_selection.take() {
-            let anchor = activate_control_destination(
-                &mut *dst_ctl,
-                selection,
-                request_prefix.clone(),
-                opts.operator_symlink_policy,
-            )?;
+            let anchor =
+                activate_control_destination(&mut *dst_ctl, selection, request_prefix.clone())?;
             if create_root {
                 mutation_root_condition = TargetCondition::Matches {
                     dev: anchor.dev,
@@ -2477,37 +2475,24 @@ fn activate_control_destination(
     conn: &mut dyn Conn,
     selection: DirectoryAnchor,
     request_prefix: PathBytes,
-    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<DestinationAnchor> {
-    let anchor = DestinationAnchor {
-        operator_path: selection.path,
-        request_prefix,
-        dev: selection.dev,
-        ino: selection.ino,
-        symlink_policy,
-    };
     match ok(
         conn.call(Request::AnchorDestination {
-            path: None,
-            expected_dev: anchor.dev,
-            expected_ino: anchor.ino,
-            request_prefix: anchor.request_prefix.clone(),
-            symlink_policy,
+            expected_dev: selection.dev,
+            expected_ino: selection.ino,
+            request_prefix: request_prefix.clone(),
         })?,
         "anchor destination root",
     )? {
-        Response::Ok => Ok(anchor),
+        Response::DestinationRegistered(ticket) => Ok(DestinationAnchor {
+            destination: RegisteredDestinationRoot {
+                ticket,
+                request_prefix,
+            },
+            dev: selection.dev,
+            ino: selection.ino,
+        }),
         other => bail!("unexpected response {other:?}"),
-    }
-}
-
-fn worker_destination_request(anchor: &DestinationAnchor) -> Request {
-    Request::AnchorDestination {
-        path: Some(anchor.operator_path.clone()),
-        expected_dev: anchor.dev,
-        expected_ino: anchor.ino,
-        request_prefix: anchor.request_prefix.clone(),
-        symlink_policy: anchor.symlink_policy,
     }
 }
 
@@ -3823,12 +3808,7 @@ impl Planner<'_> {
         if let Some((root, condition)) = self.create_root.take() {
             if self.use_operator_anchor {
                 let selection = create_operator_directory(self.dst, condition)?;
-                let anchor = activate_control_destination(
-                    self.dst,
-                    selection,
-                    root.clone(),
-                    self.opts.operator_symlink_policy,
-                )?;
+                let anchor = activate_control_destination(self.dst, selection, root.clone())?;
                 self.mutation_root_condition = TargetCondition::Matches {
                     dev: anchor.dev,
                     ino: anchor.ino,

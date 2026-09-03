@@ -2,9 +2,10 @@
 //! TCP data connections (see `crypto.rs`) when the client asks for them.
 
 use crate::crypto::{Cipher, RecordReader, RecordWriter};
+use crate::descriptor_broker::DescriptorSessionSlot;
 use crate::fsops::{self, FsOps};
 use crate::proto::*;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -67,19 +68,13 @@ impl Drop for RequestReader {
     }
 }
 
-pub fn run() -> Result<()> {
-    serve(
-        io::stdin(),
-        io::stdout().lock(),
-        true,
-        None,
-        None,
-        None,
-        None,
-    )
+struct ServeSession {
+    authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
+    descriptor_session: DescriptorSessionSlot,
 }
 
-pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
+pub fn run() -> Result<()> {
+    let descriptor_session = DescriptorSessionSlot::default();
     let result = serve(
         io::stdin(),
         io::stdout().lock(),
@@ -87,8 +82,30 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
         None,
         None,
         None,
-        Some(Arc::clone(&authority)),
+        ServeSession {
+            authority: None,
+            descriptor_session: descriptor_session.clone(),
+        },
     );
+    descriptor_session.close();
+    result
+}
+
+pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
+    let descriptor_session = DescriptorSessionSlot::default();
+    let result = serve(
+        io::stdin(),
+        io::stdout().lock(),
+        true,
+        None,
+        None,
+        None,
+        ServeSession {
+            authority: Some(Arc::clone(&authority)),
+            descriptor_session: descriptor_session.clone(),
+        },
+    );
+    descriptor_session.close();
     authority.close_control();
     result
 }
@@ -102,18 +119,24 @@ fn serve<R: Read + Send + 'static, W: Write>(
     expect_token: Option<Vec<u8>>,
     authed: Option<&std::sync::atomic::AtomicBool>,
     tcp_socket: Option<TcpStream>,
-    authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
+    session: ServeSession,
 ) -> Result<()> {
+    let ServeSession {
+        authority,
+        descriptor_session,
+    } = session;
     let mut r = FrameReader::new(r);
     let mut w = FrameWriter::new(w, false);
 
     let debug;
+    let role;
     match r.read_msg::<Request>()? {
         Request::Hello {
             identity,
             compress,
             debug: d,
             token,
+            role: requested_role,
         } => {
             debug = d;
             if let Some(t) = &expect_token {
@@ -137,21 +160,59 @@ fn serve<R: Read + Send + 'static, W: Write>(
             if let Some(authority) = &authority {
                 authority.validate_hello(compress)?;
             }
+            role = requested_role;
             w.compress = compress;
-            w.write_msg(&Response::HelloOk {
-                identity: expected_identity.to_string(),
-                platform: crate::identity::platform(),
-            })?;
         }
         _ => bail!("expected Hello"),
     }
+
+    if matches!(&role, ConnectionRole::Control) && !over_ssh {
+        w.write_msg(&Response::Err(
+            "control role is not allowed on a TCP data connection".into(),
+        ))?;
+        bail!("control role is not allowed on a TCP data connection");
+    }
+    let is_control = matches!(&role, ConnectionRole::Control);
+    let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
+    match &role {
+        ConnectionRole::DestinationWorker {
+            destination: Some(_),
+        } if authority.is_some() => {
+            w.write_msg(&Response::Err(
+                "a command-restricted destination derives its root from the signed grant".into(),
+            ))?;
+            bail!("command-restricted receiver rejected a supplied destination root");
+        }
+        ConnectionRole::DestinationWorker { destination: None } if authority.is_none() => {
+            w.write_msg(&Response::Err(
+                "unrestricted destination worker requires a registered root".into(),
+            ))?;
+            bail!("unrestricted destination worker has no registered root");
+        }
+        ConnectionRole::DestinationWorker {
+            destination: Some(destination),
+        } => {
+            if let Err(error) = ops.initialize_destination(destination) {
+                w.write_msg(&Response::Err(format!(
+                    "initialize destination worker: {error:#}"
+                )))?;
+                return Err(error).context("initialize destination worker");
+            }
+        }
+        ConnectionRole::Control
+        | ConnectionRole::SourceWorker
+        | ConnectionRole::DestinationWorker { destination: None } => {}
+    }
+    w.write_msg(&Response::HelloOk {
+        identity: crate::identity::build().to_string(),
+        platform: crate::identity::platform(),
+    })?;
 
     // Requests are parsed on a reader thread so incoming data keeps flowing
     // while a block is being hashed and written. TCP readers are shut down and
     // joined by the guard on every exit path.
     let reader = RequestReader::spawn(r, tcp_socket);
 
-    let mut ops = FsOps::new();
     let mut t = [0f64; 3];
     let (mut blocks, mut bytes) = (0u64, 0u64);
     loop {
@@ -163,6 +224,22 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Err(_) => break,
         };
         t[0] += t0.elapsed().as_secs_f64();
+        if !is_control
+            && matches!(
+                &req,
+                Request::TcpListen { .. }
+                    | Request::NativeRemove { .. }
+                    | Request::CheckOperatorDirectory { .. }
+                    | Request::CreateOperatorDirectory { .. }
+                    | Request::AnchorDestination { .. }
+                    | Request::Receipt
+            )
+        {
+            w.write_msg(&Response::Err(
+                "request is allowed only on the control connection".into(),
+            ))?;
+            continue;
+        }
         let settlement = match &authority {
             Some(authority) => match authority.authorize(&mut req, over_ssh) {
                 Ok(settlement) => Some(settlement),
@@ -201,7 +278,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 port_hi,
                 congestion_control,
             } => {
-                if !over_ssh {
+                if !is_control {
                     w.write_msg(&Response::Err(
                         "TcpListen only allowed on the control connection".into(),
                     ))?;
@@ -216,6 +293,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     w.compress,
                     congestion_control.as_deref(),
                     authority.clone(),
+                    descriptor_session.clone(),
                 ) {
                     Ok((port, congestion_control)) => w.write_msg(&Response::TcpListening {
                         port,
@@ -446,6 +524,7 @@ fn tcp_listen(
     compress: bool,
     congestion_control: Option<&str>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
+    descriptor_session: DescriptorSessionSlot,
 ) -> Result<(u16, Option<String>)> {
     let mut listener = None;
     for port in lo..=hi.max(lo) {
@@ -473,22 +552,19 @@ fn tcp_listen(
         .as_ref()
         .map(|authority| u32::from(authority.maximum_connections()))
         .unwrap_or(256);
-    if authority.is_some() {
-        listener.set_nonblocking(true)?;
-    }
+    listener.set_nonblocking(true)?;
     std::thread::spawn(move || {
         loop {
-            if authority
-                .as_ref()
-                .is_some_and(|authority| !authority.control_is_open())
+            if descriptor_session.is_closed()
+                || authority
+                    .as_ref()
+                    .is_some_and(|authority| !authority.control_is_open())
             {
                 break;
             }
             let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
-                Err(error)
-                    if authority.is_some() && error.kind() == std::io::ErrorKind::WouldBlock =>
-                {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(25));
                     continue;
                 }
@@ -502,12 +578,13 @@ fn tcp_listen(
                 continue; // drop; stream closes
             }
             live.fetch_add(1, Relaxed);
-            let (key, token, live, seen, authority) = (
+            let (key, token, live, seen, authority, descriptor_session) = (
                 key.clone(),
                 token.clone(),
                 live.clone(),
                 seen.clone(),
                 authority.clone(),
+                descriptor_session.clone(),
             );
             std::thread::spawn(move || {
                 if let Err(e) = serve_tcp(
@@ -519,6 +596,7 @@ fn tcp_listen(
                     compress,
                     &seen,
                     authority.clone(),
+                    descriptor_session,
                 ) {
                     if debug {
                         eprintln!("syq server (tcp {id}): {e:#}");
@@ -541,6 +619,7 @@ fn serve_tcp(
     _compress: bool,
     seen: &std::sync::Mutex<std::collections::HashSet<u32>>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
+    descriptor_session: DescriptorSessionSlot,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     // Scanners and stray connections must not hold a thread forever.
@@ -594,7 +673,10 @@ fn serve_tcp(
         Some(token),
         Some(&authed),
         Some(stream.try_clone()?),
-        authority,
+        ServeSession {
+            authority,
+            descriptor_session,
+        },
     );
     if res.is_err() && !authed.load(std::sync::atomic::Ordering::SeqCst) {
         seen.lock().unwrap().remove(&conn_id);
@@ -698,7 +780,10 @@ mod tests {
                 None,
                 None,
                 Some(socket),
-                None,
+                ServeSession {
+                    authority: None,
+                    descriptor_session: DescriptorSessionSlot::default(),
+                },
             )
             .unwrap();
         });
@@ -712,6 +797,7 @@ mod tests {
                 compress: false,
                 debug: false,
                 token: Vec::new(),
+                role: ConnectionRole::SourceWorker,
             })
             .unwrap();
         assert!(matches!(
@@ -722,5 +808,57 @@ mod tests {
         server.join().unwrap();
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(Arc::strong_count(&dropped), 1);
+    }
+
+    #[test]
+    fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
+        let selected = tempfile::tempdir().unwrap();
+        let owner = DescriptorSessionSlot::default();
+        let ticket = owner
+            .register(std::fs::File::open(selected.path()).unwrap())
+            .unwrap();
+        owner.close();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            serve(
+                socket.try_clone().unwrap(),
+                socket,
+                false,
+                None,
+                None,
+                None,
+                ServeSession {
+                    authority: None,
+                    descriptor_session: DescriptorSessionSlot::default(),
+                },
+            )
+            .unwrap_err()
+        });
+
+        let socket = TcpStream::connect(address).unwrap();
+        let mut writer = FrameWriter::new(socket.try_clone().unwrap(), false);
+        let mut reader = FrameReader::new(socket);
+        writer
+            .write_msg(&Request::Hello {
+                identity: crate::identity::build().to_string(),
+                compress: false,
+                debug: false,
+                token: Vec::new(),
+                role: ConnectionRole::DestinationWorker {
+                    destination: Some(DestinationRoot {
+                        ticket,
+                        request_prefix: b"destination".to_vec(),
+                    }),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(error) if error.contains("initialize destination worker")
+        ));
+        server.join().unwrap();
     }
 }
