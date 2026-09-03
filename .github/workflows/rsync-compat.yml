@@ -6,6 +6,10 @@ on:
     branches: [master]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -34,9 +38,9 @@ jobs:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
         run: echo 'Path classification failed.' >&2; exit 1
-      - name: Complete the required check for documentation and SDK-only changes
+      - name: Complete the required check when conformance is unaffected
         if: needs.scope.outputs.conformance != 'true'
-        run: echo 'Rsync conformance is not affected by this change set.'
+        run: echo 'Rsync conformance is deferred to affected or cumulative post-merge changes.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.scope.outputs.conformance == 'true'
         with:

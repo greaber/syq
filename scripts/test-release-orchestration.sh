@@ -22,23 +22,63 @@ expect_failure() {
   }
 }
 
-# Scope only the expensive jobs affected by a change while retaining all job
-# names as successful required checks.
+# Scope pull requests to affected fast checks and reserve the cumulative suites
+# for master pushes and explicit manual runs.
+assert_scope() {
+  local output=$1 key=$2 expected=$3
+  grep -Fx "$key=$expected" <<<"$output" >/dev/null
+}
+
 paths="$work/paths"
 printf 'README.md\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-grep -Fx 'native=false' <<<"$scope" >/dev/null
-grep -Fx 'sdks=false' <<<"$scope" >/dev/null
-grep -Fx 'conformance=false' <<<"$scope" >/dev/null
+for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
+printf 'MAPPINGS.md\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" mapping_docs true
+assert_scope "$scope" native false
 printf 'sdk/python/src/syq/syq-release-manifest.json\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-grep -Fx 'native=false' <<<"$scope" >/dev/null
-grep -Fx 'sdks=true' <<<"$scope" >/dev/null
+assert_scope "$scope" native false
+assert_scope "$scope" sdks true
+printf 'sdk/python/native-api.json\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" native true
+assert_scope "$scope" sdks true
+printf 'tests/rsync-compat/LEDGER.md\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" conformance true
+assert_scope "$scope" native false
 printf 'src/main.rs\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-grep -Fx 'native=true' <<<"$scope" >/dev/null
-grep -Fx 'sdks=true' <<<"$scope" >/dev/null
-grep -Fx 'conformance=true' <<<"$scope" >/dev/null
+assert_scope "$scope" native true
+assert_scope "$scope" sdks false
+assert_scope "$scope" conformance false
+assert_scope "$scope" macos false
+assert_scope "$scope" linux_arm64 false
+printf 'scripts/test-installer.sh\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling true
+assert_scope "$scope" native false
+printf '.github/workflows/ci.yml\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling true
+assert_scope "$scope" sdks true
+assert_scope "$scope" conformance true
+assert_scope "$scope" macos true
+assert_scope "$scope" linux_arm64 true
+printf '.github/workflows/rsync-compat.yml\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling true
+assert_scope "$scope" conformance true
+assert_scope "$scope" native false
+printf '.github/workflows/python-api-sync.yml\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling true
+assert_scope "$scope" sdks true
+assert_scope "$scope" native false
 
 scope_repo="$work/scope-repo"
 mkdir "$scope_repo"
@@ -58,13 +98,46 @@ scope_event="$work/pull-request-event.json"
 jq -n --arg base "$scope_base" --arg head "$scope_head" \
   '{pull_request:{base:{sha:$base},head:{sha:$head}}}' >"$scope_event"
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
-grep -Fx 'native=false' <<<"$scope" >/dev/null
-grep -Fx 'sdks=true' <<<"$scope" >/dev/null
+assert_scope "$scope" native false
+assert_scope "$scope" sdks true
+assert_scope "$scope" full_suite false
+
+# A pull request branch may lag master. Scope its own three-dot diff rather
+# than treating unrelated base-branch changes as part of the pull request.
+git -C "$scope_repo" switch -qc docs "$scope_base"
+printf 'more documentation\n' >>"$scope_repo/README.md"
+git -C "$scope_repo" commit -qam docs
+docs_head=$(git -C "$scope_repo" rev-parse HEAD)
+git -C "$scope_repo" switch -q master
+mkdir -p "$scope_repo/src"
+printf 'fn main() {}\n' >"$scope_repo/src/main.rs"
+git -C "$scope_repo" add src/main.rs
+git -C "$scope_repo" commit -qm native
+advanced_base=$(git -C "$scope_repo" rev-parse HEAD)
+jq -n --arg base "$advanced_base" --arg head "$docs_head" \
+  '{pull_request:{base:{sha:$base},head:{sha:$head}}}' >"$scope_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
+for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
+
+push_event="$work/push-event.json"
+jq -n --arg before "$scope_head" --arg after "$advanced_base" \
+  '{before:$before,after:$after}' >"$push_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
+assert_scope "$scope" native true
+assert_scope "$scope" sdks true
+assert_scope "$scope" conformance true
+assert_scope "$scope" macos true
+assert_scope "$scope" linux_arm64 true
+assert_scope "$scope" full_suite true
+
 printf '{}\n' >"$work/workflow-dispatch-event.json"
 scope=$(cd "$scope_repo" && \
   "$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
-grep -Fx 'native=true' <<<"$scope" >/dev/null
-grep -Fx 'sdks=true' <<<"$scope" >/dev/null
+for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" true
+done
 
 # The approval helper binds the PR and both workflow runs to the same trusted
 # repository, native pull_request event, branch, and exact head SHA.

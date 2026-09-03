@@ -246,14 +246,30 @@ as their sole release identity.
 ## CI scope
 
 The required `rust`, `sdks`, `linux-arm64`, `macos`, and `conformance` check
-names are stable. A checked-in path classifier lets those jobs finish with a
-small successful validation for documentation-only changes. SDK-only changes
-still run the full `sdks` job, including generated Python mappings, while the
-native and platform jobs finish quickly. Any Rust, test, script, build,
-installer, release-workflow, or otherwise unclassified path runs the complete
-native, SDK, platform, and conformance suites. Manual workflow runs also run
-everything. This keeps branch protection and release-tag verification attached
-to the same check names without repeatedly rebuilding unaffected code.
+names are stable, but the work behind them differs before and after merge.
+Pull requests run a fast affected-surface gate: Rust changes get formatting,
+clippy, and native unit tests; SDK and rsync-owned changes get their respective
+suites; executable examples in `MAPPINGS.md` get their focused integration
+tests; and repository-tooling changes get the packaging, release, workflow, and
+shell checks. Ordinary native pull requests defer the complete filesystem,
+SDK, conformance, ARM, and macOS suites to `master`. The working agent chooses
+and reports any additional integration tests justified by the change.
+
+Every native push to `master` runs the complete native, SDK, conformance, ARM,
+and macOS suites. Workflow concurrency cancels an older run when a newer commit
+arrives on the same pull request. Master runs are retained because a later push
+may affect a different subsystem and therefore cannot safely replace the
+earlier push's selected suites. A release candidate must be the exact commit
+whose post-merge checks completed; release preflight rejects a canceled or
+superseded commit.
+
+The checked-in classifier uses a pull request's merge-base diff rather than
+including unrelated base-branch changes. Documentation-only changes finish
+with small successful required jobs, except for documentation consumed by a
+test or generator. Unknown paths fail safe by selecting every suite. Manual
+workflow runs also select everything. This keeps branch protection and
+release-tag verification attached to stable check names while avoiding the
+same expensive validation on both sides of a merge.
 
 ## macOS signing
 

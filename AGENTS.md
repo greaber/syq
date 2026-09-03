@@ -202,15 +202,27 @@ every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
 
 **Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
 
-Run checks proportionate to the change. The normal Rust checks are:
+Run checks proportionate to the change. For a Rust change, the normal
+pre-merge baseline is:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo test --bin syq
 ```
 
-For CLI and filesystem behavior, prefer integration tests in `tests/local.rs`;
-they invoke the built binary against temporary trees. State what was and was
-not verified, especially for remote, TCP, platform-specific, or performance
-behavior.
+Then select the integration tests that can plausibly exercise the changed
+behavior. Prefer exact or narrow filters in `tests/local.rs`; those tests invoke
+the built binary against temporary trees. Run `cargo test --all-targets` before
+handoff when a change is broad, crosses subsystem boundaries, changes shared
+test infrastructure, or leaves meaningful uncertainty about the affected
+surface. Do not run unrelated suites merely because they exist.
+
+Pull-request CI intentionally mirrors this policy: it runs formatting, clippy,
+and native unit tests for Rust changes, plus a directly affected SDK, rsync, or
+executable-documentation suite. The agent remains responsible for choosing and
+reporting focused integration tests before review. The cumulative `master` CI
+run executes the complete native and cross-platform suites after merge, so a
+green pull request is not evidence that every repository test ran on that head.
+State exactly what was and was not verified, especially for remote, TCP,
+platform-specific, or performance behavior.
