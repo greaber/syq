@@ -96,7 +96,11 @@ What is different from rsync, or weaker:
 - **The rsync-mode escape hatch.** `syq rsync --insecure-links` restores the
   unconfined, name-based source traversal, including through symlinked
   `--files-from` parents. It exists for compatibility and is never selected
-  automatically.
+  automatically. It does not enable rsync's separate descendant-link modes:
+  `-L`/`--copy-links`, `--copy-unsafe-links`, `-k`/`--copy-dirlinks`, and
+  `-K`/`--keep-dirlinks` remain unsupported and are rejected before either
+  endpoint is contacted. `--safe-links` and `--munge-links` are likewise not
+  implemented; selected symlink target bytes are preserved unchanged.
 - **Older macOS.** The descriptor-bound symlink read that source registration
   relies on needs macOS 13 or newer; older releases fail registration instead
   of falling back to a name-based read.

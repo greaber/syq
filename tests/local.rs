@@ -9124,6 +9124,40 @@ fn unsupported_rsync_flags_explain_themselves() {
         "bundled -H should be explained: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // Every rsync mode that would traverse a descendant source or destination
+    // symlink is classified explicitly. In particular, --insecure-links is an
+    // operator-path/race-safety opt-out, not an alias for any of these modes.
+    for (flag, expected) in [
+        ("-aL", "source descendant-link traversal"),
+        ("-ak", "source descendant-link traversal"),
+        ("--copy-unsafe-links", "source descendant-link traversal"),
+        ("-aK", "existing destination directory symlinks"),
+        ("--keep-dirlinks", "existing destination directory symlinks"),
+    ] {
+        let out = syq(&[flag, "--insecure-links", &t.s("src/"), &t.s("link-dst/")]);
+        assert!(!out.status.success(), "{flag} unexpectedly succeeded");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(expected), "{flag}: {err}");
+        assert!(
+            !t.path("link-dst").exists(),
+            "{flag} mutated its destination"
+        );
+    }
+
+    for (flag, expected) in [
+        ("--safe-links", "without classifying"),
+        ("--munge-links", "preserved unchanged"),
+    ] {
+        let out = syq(&["-a", flag, &t.s("src/"), &t.s("link-dst/")]);
+        assert!(!out.status.success(), "{flag} unexpectedly succeeded");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(expected), "{flag}: {err}");
+        assert!(
+            !t.path("link-dst").exists(),
+            "{flag} mutated its destination"
+        );
+    }
 }
 
 #[test]
