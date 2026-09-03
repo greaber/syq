@@ -167,7 +167,7 @@ class NativeClientTests(unittest.TestCase):
             from_="source",
             follow=True,
             to="target",
-            run_at="local",
+            coordinate_at="local",
             into_existing="out",
             prune=True,
             max_delete=10,
@@ -236,7 +236,7 @@ class NativeClientTests(unittest.TestCase):
             from_="source:2222",
             to="target:2200",
             into="out",
-            run_at="local",
+            coordinate_at="local",
             rsh="ssh -F config",
             syq_path="/opt/syq",
             no_bootstrap=True,
@@ -246,7 +246,7 @@ class NativeClientTests(unittest.TestCase):
         )
         argv = self.argv()
         for expected in (
-            "--run-at",
+            "--coordinate-at",
             "--rsh",
             "--syq-path",
             "--no-bootstrap",
@@ -274,7 +274,7 @@ class NativeClientTests(unittest.TestCase):
                     "source",
                     from_="source",
                     to="target",
-                    run_at="local",
+                    coordinate_at="local",
                     into="out",
                     **parameter,
                 )
@@ -436,8 +436,8 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("a", "b", as_="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "ordinary source"):
             self.client.map(src_src="source", as_="target")
-        with self.assertRaisesRegex(syq.SyqInvocationError, "--run-at"):
-            self.client.cp("source", into="target", run_at="elsewhere")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "--coordinate-at"):
+            self.client.cp("source", into="target", coordinate_at="elsewhere")
         with self.assertRaisesRegex(ValueError, "relative"):
             syq.RelativePath("/absolute")
         with self.assertRaisesRegex(ValueError, "NUL"):

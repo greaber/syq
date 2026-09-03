@@ -40,7 +40,7 @@ policy refuses a symlinked `FILE` (pass `--follow` to allow it).
 
 The results writer lives with the transfer coordinator, so both forms
 require a local coordinator. A remote-to-remote copy is refused at
-argument parsing unless `--run-at local` is passed explicitly: the
+argument parsing unless `--coordinate-at local` is passed explicitly: the
 whole point of a remote-to-remote transfer is that data does not
 route through the invoking machine, so the relay topology is never
 chosen implicitly on the stream's behalf. (Streaming from a remote

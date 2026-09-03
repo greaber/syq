@@ -573,7 +573,7 @@ class AsyncClient:
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
-        run_at: str | None = None,
+        coordinate_at: str | None = None,
         rsh: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
@@ -598,14 +598,14 @@ class AsyncClient:
         timeout: float | None = None,
         check: bool = True,
     ) -> CpResult:
-        if from_ is not None and to is not None and run_at != "local":
+        if from_ is not None and to is not None and coordinate_at != "local":
             # A remote-to-remote copy places the coordinator — and the
             # results stream this surface relies on — on a remote host.
             # The local relay topology is never chosen implicitly: routing
             # the transfer through this machine is the operator's call.
             raise SyqInvocationError(
                 "a remote-to-remote copy cannot write the local results "
-                "stream; pass run_at='local' explicitly to route the "
+                "stream; pass coordinate_at='local' explicitly to route the "
                 "transfer through this machine, or use run() for a raw "
                 "invocation"
             )
@@ -645,7 +645,7 @@ class AsyncClient:
         )
         _append_remote_arguments(
             argv,
-            run_at=run_at,
+            coordinate_at=coordinate_at,
             rsh=rsh,
             syq_path=syq_path,
             no_bootstrap=no_bootstrap,
@@ -771,7 +771,6 @@ class AsyncClient:
         )
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
-        argv.append("--quiet")
         process_base = Path(
             os.fsdecode(
                 os.fspath(self.process_cwd)

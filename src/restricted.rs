@@ -1041,7 +1041,7 @@ impl RestrictedAuthority {
         };
         let failed = |index: usize| outcome_error(index).is_some();
         // Hash completed publications for a hashed receipt now, before the
-        // orchestrator's deferred directory modes can make them unreadable,
+        // coordinator's deferred directory modes can make them unreadable,
         // and before taking the state lock.
         let outcomes: Vec<(PendingOutcome, Option<Result<[u8; 32]>>)> = outcomes
             .into_iter()
@@ -1467,7 +1467,7 @@ impl RestrictedAuthority {
         let target = Path::new(OsStr::from_bytes(path));
         let relative = target.strip_prefix(root_path).with_context(|| {
             format!(
-                "receiver metadata target {} is outside enrolled root {}",
+                "receiver metadata destination {} is outside enrolled root {}",
                 target.display(),
                 root_path.display()
             )
@@ -1545,7 +1545,9 @@ impl RestrictedAuthority {
                         ));
                     };
                     if !metadata.is_dir() {
-                        bail!("receiver-managed directory target changed before authorization");
+                        bail!(
+                            "receiver-managed directory destination changed before authorization"
+                        );
                     }
 
                     // Mkdir itself was constrained to 0700, so a setgid bit
@@ -1715,7 +1717,7 @@ impl RestrictedAuthority {
                         expected_ctime,
                         expected_ctime_nsec,
                     ) == (dev, ino, ctime, ctime_nsec) => {}
-                    _ => bail!("receiver-managed mode target changed before authorization"),
+                    _ => bail!("receiver-managed mode destination changed before authorization"),
                 }
             }
             // From this point on MODE contains receiver-authored data. FsOps
@@ -5315,7 +5317,7 @@ mod tests {
             guard: None,
         };
 
-        // An observation the orchestrator asked for is hostB's own view.
+        // An observation the coordinator asked for is hostB's own view.
         let mut hash = Request::FileHash {
             path: path_bytes(&kept),
             guard: None,
@@ -5831,7 +5833,7 @@ mod tests {
         )
         .unwrap();
 
-        // The orchestrator refuses the same combination before signing. The
+        // The coordinator refuses the same combination before signing. The
         // rsync-shaped parser already makes --inplace and --ignore-existing
         // conflict, so the reachable case is the native --as-new placement.
         let mut args = Args::try_parse_from([

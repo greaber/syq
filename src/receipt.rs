@@ -2,8 +2,8 @@
 //! transfer did to its disk.
 //!
 //! Nothing from the receiver reaches the invoking machine except through the
-//! source-side orchestrator, so the receiver signs a summary bound to the
-//! grant's request ID with a key only it holds. The orchestrator relays the
+//! source-side coordinator, so the receiver signs a summary bound to the
+//! grant's request ID with a key only it holds. The coordinator relays the
 //! envelope opaquely; the invoking machine verifies it against the public key
 //! recorded at enrollment. The receipt attests hostB's view; it says nothing
 //! about the source's completeness or authenticity.
@@ -16,7 +16,7 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const RECEIPT_NAMESPACE: &str = "syq-receipt-v1@greaber.github";
-/// The orchestrator prints the base64 envelope after this prefix as one
+/// The coordinator prints the base64 envelope after this prefix as one
 /// stdout line; the invoking machine filters that line out and verifies it.
 pub(crate) const RECEIPT_LINE_PREFIX: &str = "syq-receipt-v1:";
 const WIRE_MAGIC: &[u8; 8] = b"SYQRCPT\0";
@@ -45,7 +45,7 @@ pub(crate) struct PublishedV1 {
     pub complete: bool,
 }
 
-/// One file the receiver hashed for the orchestrator (`--verify-only`,
+/// One file the receiver hashed for the coordinator (`--verify-only`,
 /// `--hash`); this is hostB's view of that object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ObservedV1 {

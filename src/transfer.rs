@@ -1,8 +1,9 @@
-//! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
+//! The coordinator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{
-    parse_rsh, parse_size, Args, Existence, Interface, Location, Placement, RunAt, SourceSelection,
+    parse_rsh, parse_size, Args, CoordinateAt, Existence, Interface, Location, Placement,
+    SourceSelection,
 };
 use crate::conn::{
     ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
@@ -933,9 +934,9 @@ pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &L
     source.is_remote()
         && dst.is_remote()
         && !args.relay
-        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
+        && (args.interface == Interface::Rsync || args.coordinate_at != CoordinateAt::Local)
         && (args.interface == Interface::Rsync
-            || args.run_at != RunAt::Auto
+            || args.coordinate_at != CoordinateAt::Auto
             || direct_paths_are_utf8)
 }
 
@@ -1007,11 +1008,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && dst.is_remote()
         && !original_srcs[0].same_host(dst)
         && !args.relay
-        && args.run_at != RunAt::Local
-        // Native auto placement relays raw path bytes because they cannot be
-        // represented in the remote coordinator's argv. Validate direct-only
-        // controls against the topology that will actually run.
-        && (args.run_at != RunAt::Auto || direct_paths_are_utf8);
+        && args.coordinate_at != CoordinateAt::Local
+        // Native auto placement cannot delegate raw path bytes because they
+        // cannot be represented in the remote coordinator's argv. Validate
+        // direct-only controls against the topology that will actually run.
+        && (args.coordinate_at != CoordinateAt::Auto || direct_paths_are_utf8);
     if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
     {
         bail!(
@@ -1020,14 +1021,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     if args.pscope_explicit && coordinator_is_remote {
         bail!(
-            "--pscope is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
+            "--pscope is not supported with a remote transfer coordinator; use --coordinate-at local to keep the reusable connections on this machine"
         );
     }
     if args.restricted_grant.is_some()
         && (args.no_tcp || args.tcp_plain || original_srcs[0].is_remote() || !dst.is_remote())
     {
         bail!(
-            "a signed receiver grant is valid only for a local-to-remote orchestrator using encrypted TCP data connections"
+            "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted TCP data connections"
         );
     }
     for source in original_srcs {
@@ -1108,13 +1109,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if args.connections_default {
             args.connections = tune::START_SSH;
         }
-        if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
-            return crate::direct::run_at_target(&args, srcs, dst);
+        if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dest {
+            return crate::direct::coordinate_at_dest(&args, srcs, dst);
         }
         return crate::direct::run(&args, srcs, dst);
     }
     if srcs[0].is_remote() && dst.is_remote() {
-        if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
+        if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Local {
             args.relay = true;
         }
         if !args.relay {
@@ -1124,14 +1125,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             // operands are the planned fix); until then, relaying is the
             // operator's explicit choice.
             bail!(
-                "remote-to-remote copy: these path bytes cannot be carried in a remote command line, so a direct transfer is not possible; pass --run-at local to route the transfer through this machine instead"
+                "remote-to-remote copy: these path bytes cannot be carried in a remote command line, so a direct transfer is not possible; pass --coordinate-at local to route the transfer through this machine instead"
             );
         }
         if !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
-    } else if args.interface != Interface::Rsync && args.run_at != RunAt::Auto {
-        bail!("--run-at currently applies only to copies between two remote endpoints");
+    } else if args.interface != Interface::Rsync && args.coordinate_at != CoordinateAt::Auto {
+        bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let mut dst_ep = endpoint(dst, &args)?;
@@ -1149,7 +1150,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // option forces SSH data.
     // A local receiver uses one child process and a loopback data listener so
     // every worker shares its retained destination cwd without changing the
-    // orchestrator process's cwd.
+    // coordinator process's cwd.
     let use_tcp = !args.no_tcp && (src_ep.has_data_server() || dst_ep.has_data_server());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
     // start conservatively until TCP reachability has been established below.
@@ -1164,7 +1165,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {
         bail!(
-            "{} {algorithm} requires a Linux transfer orchestrator and Linux remote endpoints",
+            "{} {algorithm} requires a Linux transfer coordinator and Linux remote endpoints",
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
@@ -1519,11 +1520,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     match args.target_existence {
         Existence::Any => {}
         Existence::New if dst_existed => bail!(
-            "target {} already exists, but the selected placement requires a new path",
+            "destination {} already exists, but the selected placement requires a new path",
             display(&dst_root)
         ),
         Existence::Existing if !dst_existed => bail!(
-            "target {} does not exist, but the selected placement requires an existing path",
+            "destination {} does not exist, but the selected placement requires an existing path",
             display(&dst_root)
         ),
         Existence::New | Existence::Existing => {}
@@ -1537,13 +1538,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .is_some_and(|entry| entry.kind == Kind::Symlink)
             {
                 bail!(
-                    "--into target {} is a symlink; pass --follow to resolve symlinks",
+                    "--into destination {} is a symlink; pass --follow to resolve symlinks",
                     display(&dst_root)
                 );
             }
             if dst_existed && !dst_entry_is_dir {
                 bail!(
-                    "--into target {} exists but is not a directory",
+                    "--into destination {} exists but is not a directory",
                     display(&dst_root)
                 );
             }
@@ -1564,7 +1565,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !dst_entry_is_dir
     {
         bail!(
-            "--into-existing target {} is not an existing directory",
+            "--into-existing destination {} is not an existing directory",
             display(&dst_root)
         );
     }
@@ -2235,7 +2236,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     // With a command-restricted receiver, ask for its signed receipt now that
     // every mutation is settled, and hand its bounded frames to the invoking
-    // machine as marked lines. That machine verifies it; this orchestrator's
+    // machine as marked lines. That machine verifies it; this coordinator's
     // own report is not trusted for what landed.
     if args.restricted_grant.is_some() {
         use base64::Engine as _;
@@ -2570,7 +2571,12 @@ fn mkdir_root(
     }
     stat_one(conn, dst_root, false)?
         .filter(|entry| entry.kind == Kind::Dir)
-        .with_context(|| format!("created target {} is not a directory", display(dst_root)))
+        .with_context(|| {
+            format!(
+                "created destination {} is not a directory",
+                display(dst_root)
+            )
+        })
 }
 
 fn mkdir_root_batches(
@@ -3398,7 +3404,7 @@ impl Planner<'_> {
         match current {
             Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
             _ => bail!(
-                "target {} changed after the placement precondition was checked",
+                "destination {} changed after the placement precondition was checked",
                 display(&self.root_path)
             ),
         }
@@ -4315,7 +4321,7 @@ impl Planner<'_> {
                         .pop()
                         .flatten()
                         .filter(|entry| entry.kind == Kind::Dir)
-                        .context("new exact target was not a directory after creation")?;
+                        .context("new exact destination was not a directory after creation")?;
                     self.exact_condition = target_identity(&created);
                     self.mutation_root_condition = target_identity(&created);
                     if self.guard_containers {
@@ -4495,7 +4501,7 @@ impl Planner<'_> {
             };
             if !target_condition_holds {
                 self.progress.error(&format!(
-                    "syq: target {} changed after the placement precondition was checked",
+                    "syq: destination {} changed after the placement precondition was checked",
                     display(&dst_path)
                 ));
                 self.collision = true;

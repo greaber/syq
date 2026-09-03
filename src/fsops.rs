@@ -156,7 +156,7 @@ impl OperatorDirectorySelection {
                     if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
                         && !(final_component && require_absent) => {}
                 Ok(metadata) if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR => {
-                    bail!("destination directory appeared after the new-target precondition")
+                    bail!("destination directory appeared after the new-path precondition")
                 }
                 Ok(_) => bail!(
                     "destination path component {:?} appeared with an unsafe type while creating the destination",
@@ -178,7 +178,7 @@ impl OperatorDirectorySelection {
                                 && final_component
                                 && require_absent =>
                         {
-                            bail!("destination directory appeared after the new-target precondition")
+                            bail!("destination directory appeared after the new-path precondition")
                         }
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                             match operator_lstat_at(&self.directory, &component) {
@@ -253,7 +253,7 @@ fn select_operator_directory(
 }
 
 /// Check the current spelling of an operator-supplied local path without
-/// traversing a symlink. This is semantic preflight for orchestrator-local
+/// traversing a symlink. This is semantic preflight for coordinator-local
 /// control files; retaining their opened identity belongs to the broader
 /// descriptor-root migration.
 pub(crate) fn check_operator_path_no_symlinks(
@@ -1317,7 +1317,7 @@ fn apply_one_unrooted(op: &Op) -> Result<()> {
                         fs::create_dir_all(parent)?;
                     }
                 }
-                // The orchestrator resolves an explicitly supplied root
+                // The coordinator resolves an explicitly supplied root
                 // symlink. Symlinks found inside the destination tree are
                 // payload conflicts and must be replaced, never traversed.
                 match condition {
@@ -1325,10 +1325,10 @@ fn apply_one_unrooted(op: &Op) -> Result<()> {
                     TargetCondition::Matches { .. }
                     | TargetCondition::MatchesFingerprint { .. } => {
                         let md = require_target_condition(&p, *condition)?
-                            .expect("matching target condition returns metadata");
+                            .expect("matching destination condition returns metadata");
                         if !md.is_dir() {
                             bail!(
-                                "target {} cannot change type under --as-existing",
+                                "destination {} cannot change type under --as-existing",
                                 p.display()
                             );
                         }
@@ -1361,10 +1361,10 @@ fn apply_one_unrooted(op: &Op) -> Result<()> {
                     TargetCondition::Matches { .. }
                     | TargetCondition::MatchesFingerprint { .. } => {
                         let metadata = require_target_condition(&p, *condition)?
-                            .expect("matching target condition returns metadata");
+                            .expect("matching destination condition returns metadata");
                         if !metadata.file_type().is_symlink() {
                             bail!(
-                                "target {} cannot change type under --as-existing",
+                                "destination {} cannot change type under --as-existing",
                                 p.display()
                             );
                         }
@@ -1392,10 +1392,10 @@ fn apply_one_unrooted(op: &Op) -> Result<()> {
                     TargetCondition::Matches { .. }
                     | TargetCondition::MatchesFingerprint { .. } => {
                         let metadata = require_target_condition(&p, *condition)?
-                            .expect("matching target condition returns metadata");
+                            .expect("matching destination condition returns metadata");
                         if file_type_bits(metadata.mode()) != file_type_bits(*mode) {
                             bail!(
-                                "target {} cannot change type under --as-existing",
+                                "destination {} cannot change type under --as-existing",
                                 p.display()
                             );
                         }
@@ -1422,7 +1422,10 @@ fn apply_one_unrooted(op: &Op) -> Result<()> {
                 match condition {
                     TargetCondition::Any => set_meta_path(&p, meta, *flags),
                     TargetCondition::Absent => {
-                        bail!("target {} appeared before metadata update", p.display())
+                        bail!(
+                            "destination {} appeared before metadata update",
+                            p.display()
+                        )
                     }
                     TargetCondition::Matches { .. }
                     | TargetCondition::MatchesFingerprint { .. } => {
@@ -1546,7 +1549,7 @@ fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> 
 fn relative_under(root: &Path, target: &Path) -> Result<RelativePath> {
     let relative = target.strip_prefix(root).with_context(|| {
         format!(
-            "target {} is outside guarded root {}",
+            "destination {} is outside guarded root {}",
             target.display(),
             root.display()
         )
@@ -1569,7 +1572,7 @@ fn observe_rooted_condition(
         (TargetCondition::Absent, None) => Ok(None),
         (TargetCondition::Absent, Some(_)) => {
             bail!(
-                "target {} appeared before no-replace creation",
+                "destination {} appeared before no-replace creation",
                 label.display()
             )
         }
@@ -1595,7 +1598,7 @@ fn observe_rooted_condition(
         }
         (TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }, _) => {
             bail!(
-                "target {} changed before it could be replaced",
+                "destination {} changed before it could be replaced",
                 label.display()
             )
         }
@@ -1631,7 +1634,7 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
                     Ok(())
                 }
                 Some(_) if *condition != TargetCondition::Any => bail!(
-                    "target {} cannot change type under a matched condition",
+                    "destination {} cannot change type under a matched condition",
                     target.label.display()
                 ),
                 Some(_) => {
@@ -1652,7 +1655,7 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
             Some(metadata) if *condition != TargetCondition::Any => {
                 if !metadata.is_symlink() {
                     bail!(
-                        "target {} cannot change type under a matched condition",
+                        "destination {} cannot change type under a matched condition",
                         target.label.display()
                     );
                 }
@@ -1677,7 +1680,7 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
             Some(metadata) if *condition != TargetCondition::Any => {
                 if file_type_bits(metadata.mode) != file_type_bits(*mode) {
                     bail!(
-                        "target {} cannot change type under a matched condition",
+                        "destination {} cannot change type under a matched condition",
                         target.label.display()
                     );
                 }
@@ -1786,7 +1789,10 @@ fn require_rooted_identity(
     match condition {
         TargetCondition::Any => Ok(()),
         TargetCondition::Absent => {
-            bail!("target {} appeared before metadata update", label.display())
+            bail!(
+                "destination {} appeared before metadata update",
+                label.display()
+            )
         }
         TargetCondition::Matches { dev, ino }
         | TargetCondition::MatchesFingerprint { dev, ino, .. }
@@ -1795,7 +1801,10 @@ fn require_rooted_identity(
             Ok(())
         }
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
-            bail!("target {} changed during metadata update", label.display())
+            bail!(
+                "destination {} changed during metadata update",
+                label.display()
+            )
         }
     }
 }
@@ -1808,7 +1817,10 @@ fn require_rooted_condition(
     match condition {
         TargetCondition::Any => Ok(()),
         TargetCondition::Absent => {
-            bail!("target {} appeared before metadata update", label.display())
+            bail!(
+                "destination {} appeared before metadata update",
+                label.display()
+            )
         }
         TargetCondition::Matches { dev, ino } if (metadata.dev, metadata.ino) == (dev, ino) => {
             Ok(())
@@ -1828,7 +1840,10 @@ fn require_rooted_condition(
             Ok(())
         }
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
-            bail!("target {} changed before metadata update", label.display())
+            bail!(
+                "destination {} changed before metadata update",
+                label.display()
+            )
         }
     }
 }
@@ -1837,7 +1852,7 @@ fn require_rooted_metadata(file: &File, expected: RootMetadata, label: &Path) ->
     let opened = file.metadata()?;
     if opened.dev() != expected.dev || opened.ino() != expected.ino {
         bail!(
-            "confined target {} changed while opening it",
+            "confined destination {} changed while opening it",
             label.display()
         );
     }
@@ -1854,14 +1869,17 @@ fn require_rooted_named_identity(
             let metadata = file.metadata()?;
             (metadata.dev(), metadata.ino())
         }
-        TargetCondition::Absent => bail!("new target unexpectedly received metadata repair"),
+        TargetCondition::Absent => bail!("new destination unexpectedly received metadata repair"),
         TargetCondition::Matches { dev, ino }
         | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
     };
     let opened = file.metadata()?;
     let named = target.root.metadata(&target.relative)?;
     if opened.dev() != dev || opened.ino() != ino || named.dev != dev || named.ino != ino {
-        bail!("target {} changed during update", target.label.display());
+        bail!(
+            "destination {} changed during update",
+            target.label.display()
+        );
     }
     Ok(())
 }
@@ -1871,7 +1889,7 @@ fn condition_identity(condition: TargetCondition) -> Result<(u64, u64)> {
         TargetCondition::Matches { dev, ino }
         | TargetCondition::MatchesFingerprint { dev, ino, .. } => Ok((dev, ino)),
         TargetCondition::Any | TargetCondition::Absent => {
-            bail!("target condition does not identify an existing object")
+            bail!("destination condition does not identify an existing object")
         }
     }
 }
@@ -1893,7 +1911,7 @@ fn exact_parent(path: &Path) -> Result<(Root, RelativePath)> {
         .unwrap_or_else(|| Path::new("."));
     let leaf = path
         .file_name()
-        .context("exact replacement target has no leaf name")?;
+        .context("exact replacement destination has no leaf name")?;
     Ok((Root::open(parent)?, RelativePath::new(leaf.as_bytes())?))
 }
 
@@ -1942,7 +1960,7 @@ fn require_target_condition(
         TargetCondition::Absent => match fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Ok(_) => bail!(
-                "target {} appeared after the new-path precondition was checked",
+                "destination {} appeared after the new-path precondition was checked",
                 path.display()
             ),
             Err(error) => Err(error).with_context(|| format!("stat {}", path.display())),
@@ -1950,7 +1968,7 @@ fn require_target_condition(
         TargetCondition::Matches { dev, ino } => match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.dev() == dev && metadata.ino() == ino => Ok(Some(metadata)),
             Ok(_) | Err(_) => bail!(
-                "target {} changed after the existing-path precondition was checked",
+                "destination {} changed after the existing-path precondition was checked",
                 path.display()
             ),
         },
@@ -1969,7 +1987,7 @@ fn require_target_condition(
                 Ok(Some(metadata))
             }
             Ok(_) | Err(_) => bail!(
-                "target {} changed after the existing-path precondition was checked",
+                "destination {} changed after the existing-path precondition was checked",
                 path.display()
             ),
         },
@@ -1980,14 +1998,14 @@ fn require_open_target(file: &File, path: &Path, condition: TargetCondition) -> 
     match condition {
         TargetCondition::Any => Ok(()),
         TargetCondition::Absent => bail!(
-            "target {} appeared after the new-path precondition was checked",
+            "destination {} appeared after the new-path precondition was checked",
             path.display()
         ),
         TargetCondition::Matches { dev, ino } => {
             let metadata = file.metadata()?;
             if metadata.dev() != dev || metadata.ino() != ino {
                 bail!(
-                    "target {} changed after the existing-path precondition was checked",
+                    "destination {} changed after the existing-path precondition was checked",
                     path.display()
                 );
             }
@@ -2006,7 +2024,7 @@ fn require_open_target(file: &File, path: &Path, condition: TargetCondition) -> 
                 || metadata.ctime_nsec() as u32 != ctime_nsec
             {
                 bail!(
-                    "target {} changed after the existing-path precondition was checked",
+                    "destination {} changed after the existing-path precondition was checked",
                     path.display()
                 );
             }
@@ -2025,7 +2043,7 @@ fn require_named_target_identity(
     match condition {
         TargetCondition::Any => Ok(()),
         TargetCondition::Absent => bail!(
-            "new-target condition cannot validate an in-place update of {}",
+            "new-destination condition cannot validate an in-place update of {}",
             path.display()
         ),
         TargetCondition::Matches { dev, ino }
@@ -2039,7 +2057,7 @@ fn require_named_target_identity(
                 || named.ino() != ino
             {
                 bail!(
-                    "target {} changed during the existing-path update",
+                    "destination {} changed during the existing-path update",
                     path.display()
                 );
             }
@@ -3443,7 +3461,7 @@ fn publish_partial(src: &Path, dst: &Path, condition: TargetCondition) -> Result
             fs::remove_file(src).with_context(|| format!("remove {}", src.display()))
         }
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
-            bail!("internal error: matched publication must update the held target inode")
+            bail!("internal error: matched publication must update the held destination inode")
         }
     }
 }
@@ -3988,7 +4006,7 @@ mod tests {
         let error = selection.create_missing(0o755, true).unwrap_err();
         assert!(error
             .to_string()
-            .contains("appeared after the new-target precondition"));
+            .contains("appeared after the new-path precondition"));
 
         fs::remove_dir_all(&dir).unwrap();
     }

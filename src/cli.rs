@@ -42,16 +42,16 @@ pub enum SourceSelection {
 
 /// Endpoint that owns the transfer coordinator for a native copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-pub enum RunAt {
+pub enum CoordinateAt {
     /// Run locally unless both endpoints are remote, then use the source when
-    /// possible and otherwise relay locally.
+    /// possible and otherwise refuse the transfer.
     #[default]
     Auto,
     /// Run the coordinator at the source endpoint.
-    Source,
-    /// Run the coordinator at the target endpoint.
-    Target,
-    /// Keep the coordinator on the invoking machine.
+    Src,
+    /// Run the coordinator at the destination endpoint.
+    Dest,
+    /// Keep the coordinator on the invoking machine and relay the data there.
     Local,
 }
 
@@ -77,7 +77,7 @@ pub struct Args {
     #[arg(skip)]
     pub locations: Vec<Location>,
     /// Endpoint-side base for native removal. Unlike copy's `--cwd`, this is
-    /// not joined into selector strings by the orchestrator.
+    /// not joined into selector strings by the coordinator.
     #[arg(skip)]
     pub native_rm_cwd: Option<Vec<u8>>,
     /// Endpoint-side containment boundary for native removal.
@@ -90,7 +90,7 @@ pub struct Args {
     /// emitted `src` values stay relative to it.
     #[arg(skip)]
     pub native_map_cwd: Option<Vec<u8>>,
-    /// The placement target for `syq map`, kept only for `--as` renaming;
+    /// The placement destination for `syq map`, kept only for `--as` renaming;
     /// `syq map` never contacts a destination.
     #[arg(skip)]
     pub native_map_target: Option<Vec<u8>>,
@@ -107,8 +107,8 @@ pub struct Args {
     pub native_results_fd: Option<i32>,
     /// Native coordinator placement.
     #[arg(skip)]
-    pub run_at: RunAt,
-    /// Native local-relay selection derived from `--run-at local`.
+    pub coordinate_at: CoordinateAt,
+    /// Native local-relay selection derived from `--coordinate-at local`.
     #[arg(skip)]
     pub relay: bool,
     /// Native detached remote coordinator.
@@ -274,7 +274,7 @@ pub struct Args {
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
     #[arg(skip)]
     pub pscope_explicit: bool,
-    /// Signed receiver grant forwarded to a native source-host orchestrator
+    /// Signed receiver grant forwarded to a native source-host coordinator
     #[arg(skip)]
     pub restricted_grant: Option<String>,
     /// Terminal width for a native remote coordinator's progress display
@@ -577,7 +577,7 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning destination-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -752,8 +752,8 @@ enum ReceiptMode {
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
     /// Choose the endpoint that runs the coordinator
-    #[arg(long, value_enum, default_value_t = RunAt::Auto)]
-    run_at: RunAt,
+    #[arg(long, value_enum, default_value_t = CoordinateAt::Auto)]
+    coordinate_at: CoordinateAt,
     /// Remote shell command (default: ssh); the command owns SSH and agent policy when set
     #[arg(long = "rsh", value_name = "COMMAND")]
     rsh: Option<String>,
@@ -811,7 +811,7 @@ enum NativePreserve {
 struct NativeCopyFields {
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Target endpoint ([USER@]HOST[:PORT]); omitted means local
+    /// Destination endpoint ([USER@]HOST[:PORT]); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
     /// Put selected names inside DIR, creating it if necessary
@@ -907,7 +907,7 @@ struct NativeCopyCommand {
     /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
-    /// After copying, remove target-only objects in mapped directory scopes;
+    /// After copying, remove destination-only objects in mapped directory scopes;
     /// ignored and size-excluded source paths remain protected
     #[arg(long, conflicts_with = "mapping")]
     prune: bool,
@@ -921,7 +921,7 @@ struct NativeCopyCommand {
     name = "syq map",
     version,
     about = "Print a local source selection as an NDJSON mapping",
-    long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8.",
+    long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future destination container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8.",
     override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeMapCommand {
@@ -1043,7 +1043,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         for source in locations.iter().filter(|source| !source.copies_contents()) {
             if native_basename(&source.path).is_none() {
                 bail!(
-                    "named source {:?} has no target basename; use --src-src to select directory contents",
+                    "named source {:?} has no destination basename; use --src-src to select directory contents",
                     String::from_utf8_lossy(&source.path)
                 );
             }
@@ -1053,7 +1053,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         Some(target) => {
             let target = trim_native_trailing_slashes(target.into_vec());
             if target.is_empty() {
-                bail!("target paths may not be empty");
+                bail!("destination paths may not be empty");
             }
             Some(target)
         }
@@ -1122,13 +1122,12 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         // The stream is written by the transfer coordinator. For a
         // remote-to-remote copy that requires the local (relay) topology,
         // which is never chosen implicitly on the stream's behalf: the
-        // operator opts in with an explicit --run-at local, even where
-        // auto placement would have relayed anyway.
+        // operator opts in with an explicit --coordinate-at local.
         let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
-        if src_remote && dst_remote && args.run_at != RunAt::Local {
+        if src_remote && dst_remote && args.coordinate_at != CoordinateAt::Local {
             bail!(
-                "--results with a remote-to-remote copy needs the local coordinator; pass --run-at local explicitly to route the transfer through this machine"
+                "--results with a remote-to-remote copy needs the local coordinator; pass --coordinate-at local explicitly to route the transfer through this machine"
             );
         }
     }
@@ -1190,11 +1189,11 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
             }
             let target = trim_native_trailing_slashes(target.into_vec());
             if target.is_empty() {
-                bail!("--as target may not be empty");
+                bail!("--as destination may not be empty");
             }
             if native_basename(&target).is_none() {
                 bail!(
-                    "--as target {:?} has no basename",
+                    "--as destination {:?} has no basename",
                     String::from_utf8_lossy(&target)
                 );
             }
@@ -1204,7 +1203,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
             for source in locations.iter().filter(|source| !source.copies_contents()) {
                 if native_basename(&source.path).is_none() {
                     bail!(
-                        "named source {:?} has no target basename; use --src-src to select directory contents",
+                        "named source {:?} has no destination basename; use --src-src to select directory contents",
                         String::from_utf8_lossy(&source.path)
                     );
                 }
@@ -1520,7 +1519,7 @@ fn apply_native_copy_operational(
 }
 
 fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> {
-    args.run_at = remote.run_at;
+    args.coordinate_at = remote.coordinate_at;
     args.rsh = remote.rsh;
     args.syq_path = remote.syq_path;
     args.no_bootstrap = remote.no_bootstrap;
@@ -1790,7 +1789,7 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
 fn parse_tcp_congestion(value: &str) -> std::result::Result<String, String> {
     // Linux's TCP_CA_NAME_MAX is 16 including the terminating NUL. Keep this
     // validation platform-independent so a forwarded command fails the same
-    // way on every orchestrator. The kernel otherwise looks up the registered
+    // way on every coordinator. The kernel otherwise looks up the registered
     // name exactly, without imposing a character whitelist.
     if value.is_empty() {
         return Err("congestion-control algorithm cannot be empty".into());
@@ -2081,7 +2080,7 @@ mod tests {
     #[test]
     fn native_remote_controls_lower_to_the_shared_engine() {
         let argv = [
-            "--run-at=target",
+            "--coordinate-at=dest",
             "--rsh=ssh -J jump",
             "--syq-path=/opt/syq",
             "--no-bootstrap",
@@ -2094,7 +2093,7 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv).unwrap();
-        assert_eq!(args.run_at, super::RunAt::Target);
+        assert_eq!(args.coordinate_at, super::CoordinateAt::Dest);
         assert_eq!(args.rsh.as_deref(), Some("ssh -J jump"));
         assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
         assert!(args.no_bootstrap);

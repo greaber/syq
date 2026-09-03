@@ -331,7 +331,7 @@ def _append_text(argv: list[Argument], option: str, value: object | None) -> Non
 def _append_remote_arguments(
     argv: list[Argument],
     *,
-    run_at: str | None,
+    coordinate_at: str | None,
     rsh: str | None,
     syq_path: str | os.PathLike[str] | None,
     no_bootstrap: bool,
@@ -343,20 +343,20 @@ def _append_remote_arguments(
     unrestricted_agent_forwarding: bool,
     agent_broker_only: bool,
 ) -> None:
-    if run_at is not None:
-        if run_at not in {"auto", "local", "source", "target"}:
+    if coordinate_at is not None:
+        if coordinate_at not in {"auto", "local", "src", "dest"}:
             raise SyqInvocationError(
-                "--run-at must be auto, local, source, or target"
+                "--coordinate-at must be auto, local, src, or dest"
             )
-        if run_at in {"source", "target"}:
+        if coordinate_at in {"src", "dest"}:
             # The results stream this library relies on is written by the
             # transfer coordinator, which these placements move to a remote
             # host; syq refuses the combination at argument parsing.
             raise SyqInvocationError(
                 "the results stream needs a local transfer coordinator; "
-                "use run_at='local' (or run() for a raw invocation)"
+                "use coordinate_at='local' (or run() for a raw invocation)"
             )
-        argv.extend(("--run-at", run_at))
+        argv.extend(("--coordinate-at", coordinate_at))
     if rsh is not None:
         argv.extend(("--rsh", _text_arg(rsh, label="rsh")))
     if syq_path is not None:
@@ -730,7 +730,7 @@ class Client:
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
-        run_at: str | None = None,
+        coordinate_at: str | None = None,
         rsh: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
@@ -755,14 +755,14 @@ class Client:
         timeout: float | None = None,
         check: bool = True,
     ) -> CpResult:
-        if from_ is not None and to is not None and run_at != "local":
+        if from_ is not None and to is not None and coordinate_at != "local":
             # A remote-to-remote copy places the coordinator — and the
             # results stream this surface relies on — on a remote host.
             # The local relay topology is never chosen implicitly: routing
             # the transfer through this machine is the operator's call.
             raise SyqInvocationError(
                 "a remote-to-remote copy cannot write the local results "
-                "stream; pass run_at='local' explicitly to route the "
+                "stream; pass coordinate_at='local' explicitly to route the "
                 "transfer through this machine, or use run() for a raw "
                 "invocation"
             )
@@ -802,7 +802,7 @@ class Client:
         )
         _append_remote_arguments(
             argv,
-            run_at=run_at,
+            coordinate_at=coordinate_at,
             rsh=rsh,
             syq_path=syq_path,
             no_bootstrap=no_bootstrap,
@@ -912,7 +912,6 @@ class Client:
         )
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
-        argv.append("--quiet")
         command = (self._executable_value(), *argv)
         process_base = Path(
             os.fsdecode(

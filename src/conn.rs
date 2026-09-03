@@ -1301,7 +1301,7 @@ impl RemoteSpec {
             }
         }
         // Probing is independent of the authenticated control stream. Let the
-        // orchestrator do destination preflight and plan payloads while every
+        // coordinator do destination preflight and plan payloads while every
         // candidate receives its complete bounded probe window.
         let probe = std::thread::spawn(move || {
             probe_reachable(&mut candidates, port);

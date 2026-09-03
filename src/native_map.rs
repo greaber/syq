@@ -72,7 +72,7 @@ pub fn run(args: &Args) -> Result<i32> {
             };
             let dst_name = match (args.placement, &args.native_map_target) {
                 (Placement::As, Some(target)) => native_basename(target)
-                    .ok_or_else(|| anyhow!("--as target has no basename"))?
+                    .ok_or_else(|| anyhow!("--as destination has no basename"))?
                     .to_vec(),
                 _ => native_basename(&location.path)
                     .expect("parse validated that named selectors have a basename")
