@@ -803,6 +803,12 @@ fn handle_tcp_setup_error(
     sched: &Sched,
     progress: &Progress,
 ) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
+        sched.abort();
+        progress.stop();
+        return Err(error).context("TCP data transport required by test");
+    }
     if crate::conn::is_tcp_congestion_error(&error) {
         sched.abort();
         progress.stop();
@@ -2134,6 +2140,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .as_ref()
                     .map(|info| (info.addrs.clone(), info.port))
             );
+        }
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
+        let remote_specs: Vec<_> = [&src_ep, &dst_ep]
+            .into_iter()
+            .filter_map(real_remote_spec)
+            .collect();
+        if remote_specs.is_empty()
+            || remote_specs
+                .iter()
+                .any(|spec| spec.data_transport() == DataTransport::Ssh)
+        {
+            sched.abort();
+            progress.stop();
+            bail!("TCP data transport required by test");
         }
     }
     if debug() {

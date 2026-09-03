@@ -2284,6 +2284,10 @@ impl Endpoint {
                                     )
                                 });
                             }
+                            #[cfg(debug_assertions)]
+                            if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
+                                return Err(e).context("TCP data transport required by test");
+                            }
                             let mut g = spec.tcp.lock().unwrap();
                             if let Some(i) = g.as_mut() {
                                 if !i.failed {

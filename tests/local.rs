@@ -96,7 +96,9 @@ fn confinement_remote_command(t: &Tmp, tcp: bool) -> Command {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"));
-    if !tcp {
+    if tcp {
+        command.env("SYQ_TEST_REQUIRE_TCP", "1");
+    } else {
         command.arg("--syq-no-tcp");
     }
     command
@@ -113,6 +115,11 @@ fn wait_for_confinement_marker(child: &mut std::process::Child, marker: &Path, s
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(marker.exists(), "timed out waiting for {stage}");
+}
+
+#[cfg(debug_assertions)]
+fn release_confinement_barrier(continuation: &Path) {
+    fs::write(continuation, b"continue").unwrap();
 }
 
 fn set_child_nofile_limit(command: &mut Command, requested: libc::rlim_t) {
@@ -343,6 +350,7 @@ fn confinement_matrix_remote_source_root_is_pinned_for_tcp_and_ssh() {
         write(&t.path("src/original"), b"original");
         write(&t.path("outside/replacement"), b"replacement");
         let ready = t.path("source-ready");
+        let continuation = t.path("source-continue");
         let source = format!("127.0.0.1:{}/", t.s("src"));
 
         let mut child = confinement_remote_command(&t, tcp)
@@ -351,7 +359,7 @@ fn confinement_matrix_remote_source_root_is_pinned_for_tcp_and_ssh() {
             .arg(t.s("dst/"))
             .arg("--no-progress")
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
@@ -360,6 +368,7 @@ fn confinement_matrix_remote_source_root_is_pinned_for_tcp_and_ssh() {
 
         fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+        release_confinement_barrier(&continuation);
 
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
@@ -375,6 +384,7 @@ fn confinement_matrix_remote_exact_source_replacement_is_rejected_for_tcp_and_ss
         let t = Tmp::new();
         write(&t.path("selected"), b"original");
         let ready = t.path("source-ready");
+        let continuation = t.path("source-continue");
         let source = format!("127.0.0.1:{}", t.s("selected"));
 
         let mut child = confinement_remote_command(&t, tcp)
@@ -383,7 +393,7 @@ fn confinement_matrix_remote_exact_source_replacement_is_rejected_for_tcp_and_ss
             .arg(t.s("destination"))
             .arg("--no-progress")
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
@@ -392,6 +402,7 @@ fn confinement_matrix_remote_exact_source_replacement_is_rejected_for_tcp_and_ss
 
         fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
         write(&t.path("selected"), b"replacement");
+        release_confinement_barrier(&continuation);
 
         let output = child.wait_with_output().unwrap();
         assert!(!output.status.success(), "tcp={tcp}: {output:?}");
@@ -413,6 +424,7 @@ fn confinement_matrix_remote_destination_root_is_pinned_for_tcp_and_ssh() {
         fs::create_dir_all(t.path("dst")).unwrap();
         fs::create_dir_all(t.path("outside")).unwrap();
         let ready = t.path("destination-ready");
+        let continuation = t.path("destination-continue");
         let destination = format!("127.0.0.1:{}/", t.s("dst"));
 
         let mut child = confinement_remote_command(&t, tcp)
@@ -421,7 +433,7 @@ fn confinement_matrix_remote_destination_root_is_pinned_for_tcp_and_ssh() {
             .arg(&destination)
             .arg("--no-progress")
             .env("SYQ_TEST_DESTINATION_ANCHORED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS", "750")
+            .env("SYQ_TEST_DESTINATION_ANCHOR_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
@@ -430,6 +442,7 @@ fn confinement_matrix_remote_destination_root_is_pinned_for_tcp_and_ssh() {
 
         fs::rename(t.path("dst"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
+        release_confinement_barrier(&continuation);
 
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
@@ -450,6 +463,8 @@ fn confinement_matrix_remote_destination_parent_swap_is_confined_for_tcp_and_ssh
         write(&t.path("src/victim/file"), &vec![b'x'; 8 * 1024 * 1024]);
         fs::create_dir_all(t.path("dst/victim")).unwrap();
         write(&t.path("outside/sentinel"), b"outside");
+        let ready = t.path("partial-ready");
+        let continuation = t.path("partial-continue");
         let destination = format!("127.0.0.1:{}/", t.s("dst"));
 
         let mut child = confinement_remote_command(&t, tcp)
@@ -457,30 +472,22 @@ fn confinement_matrix_remote_destination_parent_swap_is_confined_for_tcp_and_ssh
             .arg(t.s("src/"))
             .arg(&destination)
             .arg("--no-progress")
-            .env("SYQ_TEST_HOLD_PARTIAL_MS", "750")
+            .env("SYQ_TEST_PARTIAL_READY_FILE", &ready)
+            .env("SYQ_TEST_PARTIAL_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while partial_files(&t.path("dst/victim")).len() != 1
-            && std::time::Instant::now() < deadline
-        {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "tcp={tcp}: syq exited before preparing the remote sidecar"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_confinement_marker(&mut child, &ready, "remote sidecar preparation");
         assert_eq!(
             partial_files(&t.path("dst/victim")).len(),
             1,
-            "tcp={tcp}: remote sidecar preparation timed out"
+            "tcp={tcp}: sidecar missing at acknowledged preparation barrier"
         );
 
         fs::rename(t.path("dst/victim"), t.path("displaced-victim")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst/victim")).unwrap();
+        release_confinement_barrier(&continuation);
 
         let output = child.wait_with_output().unwrap();
         assert_eq!(
@@ -494,6 +501,31 @@ fn confinement_matrix_remote_destination_parent_swap_is_confined_for_tcp_and_ssh
         assert!(!t.path("displaced-victim/file").exists(), "tcp={tcp}");
         assert_eq!(partial_files(&t.path("displaced-victim")).len(), 1);
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn confinement_matrix_tcp_requirement_refuses_ssh_transport() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"payload");
+    let destination = format!("127.0.0.1:{}", t.s("dst"));
+
+    let output = confinement_remote_command(&t, false)
+        .env("SYQ_TEST_REQUIRE_TCP", "1")
+        .arg("-a")
+        .arg(t.s("src"))
+        .arg(destination)
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr_of(&output).contains("TCP data transport required by test"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("dst").exists());
 }
 
 #[cfg(debug_assertions)]

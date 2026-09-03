@@ -110,12 +110,13 @@ What is different from rsync, or weaker:
 
 ### How confinement is verified
 
-The confinement tests use deterministic pause points after a path has been
-selected or registered. While syq is paused, the test renames the selected
-directory or object and replaces its old pathname with a symlink or a different
-inode. The operation must either continue through the retained descriptor or
-fail without touching the replacement. This exercises the race boundary
-directly instead of relying on a race that may or may not occur during a test.
+The confinement tests use bounded two-way barriers after a path has been
+selected or registered. Syq acknowledges that it has reached the barrier and
+does not continue until the test confirms that it has renamed the selected
+directory or object and replaced its old pathname with a symlink or a different
+inode. The operation must then either continue through the retained descriptor
+or fail without touching the replacement. This exercises the race boundary
+directly instead of relying on scheduler timing.
 
 The evidence is split along the boundaries where authority changes form:
 
