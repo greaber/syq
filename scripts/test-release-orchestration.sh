@@ -4,6 +4,8 @@
 set -euo pipefail
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+grep -F 'rust,sdks,macos,linux-arm64,conformance' \
+  "$script_dir/../.github/workflows/release.yml" >/dev/null
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-release-orchestration-test.XXXXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
@@ -22,23 +24,78 @@ expect_failure() {
   }
 }
 
-# Scope only the expensive jobs affected by a change while retaining all job
-# names as successful required checks.
+# Scope pull requests to affected fast checks and reserve the cumulative suites
+# for master pushes and explicit manual runs.
+assert_scope() {
+  local output=$1 key=$2 expected=$3
+  grep -Fx "$key=$expected" <<<"$output" >/dev/null
+}
+
 paths="$work/paths"
 printf 'README.md\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-grep -Fx 'native=false' <<<"$scope" >/dev/null
-grep -Fx 'sdks=false' <<<"$scope" >/dev/null
-grep -Fx 'conformance=false' <<<"$scope" >/dev/null
+for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
+printf 'MAPPINGS.md\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" mapping_docs true
+assert_scope "$scope" native false
 printf 'sdk/python/src/syq/syq-release-manifest.json\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-grep -Fx 'native=false' <<<"$scope" >/dev/null
-grep -Fx 'sdks=true' <<<"$scope" >/dev/null
+assert_scope "$scope" native false
+assert_scope "$scope" sdks true
+printf 'sdk/python/native-api.json\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" native true
+assert_scope "$scope" sdks true
+for sdk_script in \
+  scripts/check-python-api-sync.py \
+  scripts/normalize-python-sdist.py \
+  scripts/prepare-python-sdk-release.py \
+  scripts/select-trusted-pr.jq \
+  scripts/test-python-sdk-release-tools.sh
+do
+  printf '%s\n' "$sdk_script" >"$paths"
+  scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+  assert_scope "$scope" tooling true
+  assert_scope "$scope" sdks true
+  assert_scope "$scope" native false
+done
+printf 'tests/rsync-compat/LEDGER.md\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" conformance true
+assert_scope "$scope" native false
 printf 'src/main.rs\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-grep -Fx 'native=true' <<<"$scope" >/dev/null
-grep -Fx 'sdks=true' <<<"$scope" >/dev/null
-grep -Fx 'conformance=true' <<<"$scope" >/dev/null
+assert_scope "$scope" native true
+assert_scope "$scope" sdks false
+assert_scope "$scope" conformance false
+assert_scope "$scope" macos false
+assert_scope "$scope" linux_arm64 false
+printf 'scripts/test-installer.sh\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling true
+assert_scope "$scope" native false
+printf '.github/workflows/ci.yml\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling true
+assert_scope "$scope" native true
+assert_scope "$scope" sdks true
+assert_scope "$scope" mapping_docs true
+assert_scope "$scope" conformance true
+assert_scope "$scope" macos true
+assert_scope "$scope" linux_arm64 true
+printf '.github/workflows/rsync-compat.yml\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling true
+assert_scope "$scope" conformance true
+assert_scope "$scope" native false
+printf '.github/workflows/python-api-sync.yml\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling true
+assert_scope "$scope" sdks true
+assert_scope "$scope" native false
 
 scope_repo="$work/scope-repo"
 mkdir "$scope_repo"
@@ -46,7 +103,8 @@ git -C "$scope_repo" init -b master -q
 git -C "$scope_repo" config user.name Test
 git -C "$scope_repo" config user.email test@example.com
 printf 'documentation\n' >"$scope_repo/README.md"
-git -C "$scope_repo" add README.md
+printf 'mapping\n' >"$scope_repo/MAPPINGS.md"
+git -C "$scope_repo" add README.md MAPPINGS.md
 git -C "$scope_repo" commit -qm base
 scope_base=$(git -C "$scope_repo" rev-parse HEAD)
 mkdir -p "$scope_repo/sdk/python"
@@ -58,13 +116,59 @@ scope_event="$work/pull-request-event.json"
 jq -n --arg base "$scope_base" --arg head "$scope_head" \
   '{pull_request:{base:{sha:$base},head:{sha:$head}}}' >"$scope_event"
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
-grep -Fx 'native=false' <<<"$scope" >/dev/null
-grep -Fx 'sdks=true' <<<"$scope" >/dev/null
+assert_scope "$scope" native false
+assert_scope "$scope" sdks true
+assert_scope "$scope" full_suite false
+
+# A pull request branch may lag master. Scope its own three-dot diff rather
+# than treating unrelated base-branch changes as part of the pull request.
+git -C "$scope_repo" switch -qc docs "$scope_base"
+printf 'more documentation\n' >>"$scope_repo/README.md"
+git -C "$scope_repo" commit -qam docs
+docs_head=$(git -C "$scope_repo" rev-parse HEAD)
+git -C "$scope_repo" switch -q master
+mkdir -p "$scope_repo/src"
+printf 'fn main() {}\n' >"$scope_repo/src/main.rs"
+git -C "$scope_repo" add src/main.rs
+git -C "$scope_repo" commit -qm native
+advanced_base=$(git -C "$scope_repo" rev-parse HEAD)
+jq -n --arg base "$advanced_base" --arg head "$docs_head" \
+  '{pull_request:{base:{sha:$base},head:{sha:$head}}}' >"$scope_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
+for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
+
+# Rename detection must expose both the affected source and inert destination.
+git -C "$scope_repo" switch -qc rename "$scope_base"
+mkdir "$scope_repo/docs"
+git -C "$scope_repo" mv MAPPINGS.md docs/mappings.md
+git -C "$scope_repo" commit -qm rename
+rename_head=$(git -C "$scope_repo" rev-parse HEAD)
+jq -n --arg base "$advanced_base" --arg head "$rename_head" \
+  '{pull_request:{base:{sha:$base},head:{sha:$head}}}' >"$scope_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
+assert_scope "$scope" mapping_docs true
+assert_scope "$scope" native false
+assert_scope "$scope" sdks false
+
+push_event="$work/push-event.json"
+jq -n --arg before "$scope_head" --arg after "$advanced_base" \
+  '{before:$before,after:$after}' >"$push_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
+assert_scope "$scope" native true
+assert_scope "$scope" sdks true
+assert_scope "$scope" conformance true
+assert_scope "$scope" macos true
+assert_scope "$scope" linux_arm64 true
+assert_scope "$scope" full_suite true
+
 printf '{}\n' >"$work/workflow-dispatch-event.json"
 scope=$(cd "$scope_repo" && \
   "$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
-grep -Fx 'native=true' <<<"$scope" >/dev/null
-grep -Fx 'sdks=true' <<<"$scope" >/dev/null
+for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" true
+done
 
 # The approval helper binds the PR and both workflow runs to the same trusted
 # repository, native pull_request event, branch, and exact head SHA.
@@ -198,6 +302,7 @@ case "$1:$2" in
   api:*)
     case " $* " in
       *'/commits/'*'/check-runs'*) printf '%s\n' "$SYQ_TEST_CHECKS_JSON" ;;
+      *'/actions/workflows/'*'/runs?'*) printf '%s\n' "$SYQ_TEST_WORKFLOW_RUNS_JSON" ;;
       *'/actions/permissions/selected-actions '*) printf '%s\n' "$SYQ_TEST_SELECTED_ACTIONS_JSON" ;;
       *'/actions/permissions '*) printf '{"enabled":true,"allowed_actions":"selected","sha_pinning_required":true}\n' ;;
       *'/deployment-branch-policies '*) printf '{"branch_policies":[{"name":"v*","type":"tag"}]}\n' ;;
@@ -217,7 +322,10 @@ jq -cn --arg version "${SYQ_TEST_EXISTING_CRATE_VERSION:-}" '
   {versions:(if $version == "" then [] else [{num:$version}] end)}'
 EOF
 chmod 755 "$preflight_bin/git" "$preflight_bin/gh" "$preflight_bin/curl"
-checks_json=$(jq -cn '{check_runs:["rust","sdks","macos","linux-arm64"] | map({name:.,conclusion:"success"})}')
+checks_json=$(jq -cn '{check_runs:["rust","sdks","macos","linux-arm64","conformance"] | map({name:.,conclusion:"success"})}')
+workflow_runs_json=$(jq -cn --arg head "$preflight_head" '{workflow_runs:[{
+  id:601,event:"workflow_dispatch",head_sha:$head,status:"completed",
+  conclusion:"success",run_number:1,run_attempt:1}]}')
 selected_json=$(jq -cn '{github_owned_allowed:true,verified_allowed:false,
   patterns_allowed:["rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18"]}')
 formula_b64=$(printf 'url "https://github.com/greaber/syq/releases/download/v9.9.8/syq"\n' | openssl base64 -A)
@@ -225,6 +333,7 @@ preflight_env=(
   SYQ_TEST_PREFLIGHT_HEAD="$preflight_head"
   SYQ_TEST_REAL_GIT="$real_git"
   SYQ_TEST_CHECKS_JSON="$checks_json"
+  SYQ_TEST_WORKFLOW_RUNS_JSON="$workflow_runs_json"
   SYQ_TEST_SELECTED_ACTIONS_JSON="$selected_json"
   SYQ_TEST_SIGNING_KEY="$signing_key"
   SYQ_TEST_FORMULA_B64="$formula_b64"
@@ -233,6 +342,21 @@ preflight_env=(
 (cd "$preflight_repo" && env "${preflight_env[@]}" \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/preflight.out"
 grep -F "Release preflight passed for v9.9.9 at $preflight_head" "$work/preflight.out" >/dev/null
+checks_without_conformance=$(jq -cn '{check_runs:["rust","sdks","macos","linux-arm64"] | map({name:.,conclusion:"success"})}')
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_CHECKS_JSON="$checks_without_conformance" \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted a missing conformance check' >&2
+  exit 1
+fi
+grep -F 'required check conformance is missing' "$work/failure.out" >/dev/null
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_WORKFLOW_RUNS_JSON='{"workflow_runs":[]}' \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted missing full release CI' >&2
+  exit 1
+fi
+grep -F 'has no workflow_dispatch run' "$work/failure.out" >/dev/null
 if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   SYQ_TEST_EXISTING_CRATE_VERSION=9.9.9 \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then

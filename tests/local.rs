@@ -11,6 +11,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::RwLock;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1962,59 +1964,78 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn setup_release_bootstrap(t: &Tmp) {
-    let binary_bytes = fs::read(env!("CARGO_BIN_EXE_syq")).unwrap();
-    let mut encoder = GzEncoder::new(
-        File::create(t.path("release.gz")).unwrap(),
-        Compression::best(),
-    );
-    encoder.write_all(&binary_bytes).unwrap();
-    encoder.finish().unwrap();
-    let archive_bytes = fs::read(t.path("release.gz")).unwrap();
-    let (target, asset) = match std::env::consts::ARCH {
-        "x86_64" => ("linux-x86_64", "syq-linux-x86_64"),
-        "aarch64" => ("linux-aarch64", "syq-linux-aarch64"),
-        arch => panic!("unsupported test architecture {arch}"),
-    };
-    let manifest = serde_json::json!({
-        "schema": 1,
-        "repository": "https://github.com/greaber/syq",
-        "version": env!("CARGO_PKG_VERSION"),
-        "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
-        "artifacts": {
-            (target): {
-                "binary": {
-                    "name": asset,
-                    "sha256": sha256_hex(&binary_bytes),
-                    "size": binary_bytes.len()
-                },
-                "archive": {
-                    "name": format!("{asset}.gz"),
-                    "sha256": sha256_hex(&archive_bytes),
-                    "size": archive_bytes.len()
+struct ReleaseBootstrapFixture {
+    archive: Vec<u8>,
+    manifest: Vec<u8>,
+    public_key: String,
+    asset: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+static RELEASE_BOOTSTRAP_FIXTURE: OnceLock<ReleaseBootstrapFixture> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
+    RELEASE_BOOTSTRAP_FIXTURE.get_or_init(|| {
+        let binary_bytes = fs::read(env!("CARGO_BIN_EXE_syq")).unwrap();
+        // Compression level is not part of the bootstrap contract. Build one
+        // fast archive for the whole test process instead of compressing the
+        // large debug binary independently in every parallel test.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&binary_bytes).unwrap();
+        let archive = encoder.finish().unwrap();
+        let (target, asset) = match std::env::consts::ARCH {
+            "x86_64" => ("linux-x86_64", "syq-linux-x86_64"),
+            "aarch64" => ("linux-aarch64", "syq-linux-aarch64"),
+            arch => panic!("unsupported test architecture {arch}"),
+        };
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "repository": "https://github.com/greaber/syq",
+            "version": env!("CARGO_PKG_VERSION"),
+            "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+            "artifacts": {
+                (target): {
+                    "binary": {
+                        "name": asset,
+                        "sha256": sha256_hex(&binary_bytes),
+                        "size": binary_bytes.len()
+                    },
+                    "archive": {
+                        "name": format!("{asset}.gz"),
+                            "sha256": sha256_hex(&archive),
+                            "size": archive.len()
+                    }
                 }
-            }
-        },
-        "installer": {"name": "install.sh", "sha256": "1".repeat(64), "size": 1},
-        "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
-        "signature_scheme": "ed25519-jcs-v1"
-    });
-    let signing = SigningKey::from_bytes(&[19; 32]);
-    let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
-    let signature =
-        base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
-    let mut manifest = manifest;
-    manifest["signature"] = signature.into();
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
-    write(&t.path("syq-release-manifest.json"), &manifest_bytes);
-    write(&t.path("release-manifest.json"), &manifest_bytes);
-    write(
-        &t.path("release-public-key"),
-        base64::engine::general_purpose::STANDARD
-            .encode(signing.verifying_key().to_bytes())
-            .as_bytes(),
-    );
-    fs::copy(t.path("release.gz"), t.path(&format!("{asset}.gz"))).unwrap();
+            },
+            "installer": {"name": "install.sh", "sha256": "1".repeat(64), "size": 1},
+            "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
+            "signature_scheme": "ed25519-jcs-v1"
+        });
+        let signing = SigningKey::from_bytes(&[19; 32]);
+        let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
+        let mut manifest = manifest;
+        manifest["signature"] = signature.into();
+        ReleaseBootstrapFixture {
+            archive,
+            manifest: serde_json::to_vec_pretty(&manifest).unwrap(),
+            public_key: base64::engine::general_purpose::STANDARD
+                .encode(signing.verifying_key().to_bytes()),
+            asset,
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn setup_release_bootstrap(t: &Tmp) {
+    let fixture = release_bootstrap_fixture();
+    write(&t.path("release.gz"), &fixture.archive);
+    write(&t.path(&format!("{}.gz", fixture.asset)), &fixture.archive);
+    write(&t.path("syq-release-manifest.json"), &fixture.manifest);
+    write(&t.path("release-manifest.json"), &fixture.manifest);
+    write(&t.path("release-public-key"), fixture.public_key.as_bytes());
 
     executable(
         &t.path("remote-bin/curl"),
