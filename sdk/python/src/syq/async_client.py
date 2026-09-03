@@ -771,7 +771,6 @@ class AsyncClient:
         )
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
-        argv.append("--quiet")
         process_base = Path(
             os.fsdecode(
                 os.fspath(self.process_cwd)
