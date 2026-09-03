@@ -6486,6 +6486,93 @@ fn native_rm_contents_requires_a_directory() {
 }
 
 #[test]
+fn native_rm_reports_each_failed_entry_once_without_rescanning_known_failures() {
+    let t = Tmp::new();
+    write(&t.path("tree/file"), b"keep");
+    fs::set_permissions(t.path("tree"), fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "rm",
+            "--cwd",
+            &t.s(""),
+            "--src-dir",
+            "tree",
+            "--results",
+            &t.s("results.ndjson"),
+            "-q",
+        ])
+        .run()
+        .unwrap();
+    fs::set_permissions(t.path("tree"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failed_paths = records
+        .iter()
+        .filter(|record| record["type"] == "removal_result" && record["disposition"] == "failed")
+        .map(|record| record["path"]["value"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(failed_paths, ["tree/file", "tree"]);
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["entries_failed"], 2);
+    assert_eq!(terminal["errors"], 2);
+}
+
+#[test]
+fn native_rm_endpoint_conflicts_have_the_same_local_and_remote_classification() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+
+    for (name, remote) in [("local-file", false), ("remote-file", true)] {
+        write(&t.path(name), b"keep");
+        let results = t.s(&format!("{name}.ndjson"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "rm",
+            "--cwd",
+            &t.s(""),
+            "--src-dir",
+            name,
+            "--results",
+            &results,
+            "-q",
+        ]);
+        if remote {
+            command.args(["--from", "fake", "--syq-path", env!("CARGO_BIN_EXE_syq")]);
+            command
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+                );
+        }
+
+        let output = command.run().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+        assert_eq!(read(&t.path(name)), b"keep");
+        let records: Vec<serde_json::Value> = String::from_utf8(read(Path::new(&results)))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let error = records
+            .iter()
+            .find(|record| record["type"] == "error")
+            .unwrap();
+        assert_eq!(error["class"], "conflict", "{name}: {error}");
+        assert!(error.get("os_kind").is_none(), "{name}: {error}");
+    }
+}
+
+#[test]
 fn native_copy_supports_all_six_placements() {
     let t = Tmp::new();
     for source in [

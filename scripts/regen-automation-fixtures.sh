@@ -124,14 +124,14 @@ chmod 000 "$dir/tree/blocked"
 chmod 700 "$dir/tree/blocked"
 normalize <"$dir/raw.ndjson" >"$out/rm-dry-partial.ndjson"
 
-# rm-partial: the selected directory can be read but not changed, producing a
-# structured permission-denied entry result. Exit 23.
+# rm-partial: the selected directory can be read but neither its child nor the
+# resulting non-empty parent can be removed. Each entry is reported once. Exit 23.
 dir="$work/rm-partial"
 mkdir -p "$dir/tree"
 printf 'blocked' >"$dir/tree/file"
 chmod 500 "$dir/tree"
 (cd "$dir" &&
-    "$syq" rm -j1 --src-src tree --results raw.ndjson -q) || true
+    "$syq" rm -j1 --src-dir tree --results raw.ndjson -q) || true
 chmod 700 "$dir/tree"
 normalize <"$dir/raw.ndjson" >"$out/rm-partial.ndjson"
 

@@ -412,6 +412,7 @@ struct DirectoryJob {
     parent: Option<Arc<DirectoryJob>>,
     remaining: AtomicUsize,
     retries: AtomicUsize,
+    descendant_failed: AtomicBool,
 }
 
 enum Task {
@@ -511,6 +512,10 @@ fn failed_outcome(
     }
 }
 
+fn endpoint_failure(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(crate::fsops::wire_error(&error))
+}
+
 fn removal_outcome(
     selector: u64,
     path: PathBytes,
@@ -553,8 +558,9 @@ pub(crate) fn remove(
     sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
 ) -> Result<()> {
     let mut traces = Vec::new();
-    let (base, confined) = open_base(cwd, root, selections, follow_symlinks, &mut traces)?;
-    let resolver = Resolver::new(&base, confined, follow_symlinks)?;
+    let (base, confined) =
+        open_base(cwd, root, selections, follow_symlinks, &mut traces).map_err(endpoint_failure)?;
+    let resolver = Resolver::new(&base, confined, follow_symlinks).map_err(endpoint_failure)?;
 
     // This phase is deliberately complete before the worker pool starts: a
     // later selector can never acquire a new meaning because an earlier one
@@ -572,7 +578,7 @@ pub(crate) fn remove(
                 if !selection_outcomes.is_empty() {
                     sink(std::mem::take(&mut selection_outcomes))?;
                 }
-                return Err(error);
+                return Err(endpoint_failure(error));
             }
         };
         match resolution {
@@ -639,6 +645,7 @@ pub(crate) fn remove(
                     parent: None,
                     remaining: AtomicUsize::new(1),
                     retries: AtomicUsize::new(0),
+                    descendant_failed: AtomicBool::new(false),
                 })));
             }
         }
@@ -695,7 +702,9 @@ pub(crate) fn remove(
     pool.close();
     for thread in threads {
         if thread.join().is_err() && sink_error.is_none() {
-            sink_error = Some(anyhow::anyhow!("native removal worker panicked"));
+            sink_error = Some(endpoint_failure(anyhow::anyhow!(
+                "native removal worker panicked"
+            )));
         }
     }
     if let Some(error) = sink_error {
@@ -770,9 +779,14 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
                     Err(error) => failed_outcome(selector, label, Some(kind), 1, error),
                 }
             };
+            let failed = outcome.disposition == NativeRemoveDisposition::Failed;
             pool.outcome(outcome);
             if let Some(parent) = parent {
-                directory_part_done(pool, parent);
+                if failed {
+                    directory_part_failed(pool, parent);
+                } else {
+                    directory_part_done(pool, parent);
+                }
             }
         }
         Task::Finish(job) => finish_directory(pool, job),
@@ -790,7 +804,7 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                 job.retries.load(Ordering::SeqCst) as u64 + 1,
                 error,
             ));
-            abandon_directory(pool, &job);
+            finish_parent(pool, &job, true);
             return;
         }
     };
@@ -802,6 +816,7 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
             Ok(identity) => identity,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
+                job.descendant_failed.store(true, Ordering::SeqCst);
                 pool.outcome(failed_outcome(
                     job.selector,
                     join_label(&job.label, &component),
@@ -815,6 +830,7 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
         let name = match component_cstring(&component) {
             Ok(name) => name,
             Err(error) => {
+                job.descendant_failed.store(true, Ordering::SeqCst);
                 pool.outcome(failed_outcome(
                     job.selector,
                     join_label(&job.label, &component),
@@ -847,7 +863,7 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                         1,
                         error.into(),
                     ));
-                    directory_part_done(pool, job.clone());
+                    directory_part_failed(pool, job.clone());
                     continue;
                 }
             };
@@ -862,6 +878,7 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                     parent: Some(job.clone()),
                     remaining: AtomicUsize::new(1),
                     retries: AtomicUsize::new(0),
+                    descendant_failed: AtomicBool::new(false),
                 }))),
                 Err(error) => {
                     pool.outcome(failed_outcome(
@@ -871,7 +888,7 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                         1,
                         error,
                     ));
-                    directory_part_done(pool, job.clone());
+                    directory_part_failed(pool, job.clone());
                 }
             }
         } else {
@@ -893,9 +910,7 @@ fn finish_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
         return;
     }
     let Some(removal) = &job.removal else {
-        if let Some(parent) = &job.parent {
-            directory_part_done(pool, parent.clone());
-        }
+        finish_parent(pool, &job, job.descendant_failed.load(Ordering::SeqCst));
         return;
     };
     let result = if pool.dry_run {
@@ -920,11 +935,11 @@ fn finish_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                 disposition,
                 (!pool.dry_run).then(|| job.retries.load(Ordering::SeqCst) as u64 + 1),
             ));
-            if let Some(parent) = &job.parent {
-                directory_part_done(pool, parent.clone());
-            }
+            finish_parent(pool, &job, job.descendant_failed.load(Ordering::SeqCst));
         }
-        Err(error) if is_directory_not_empty(&error) => {
+        Err(error)
+            if is_directory_not_empty(&error) && !job.descendant_failed.load(Ordering::SeqCst) =>
+        {
             let previous_failures = job.retries.fetch_add(1, Ordering::SeqCst);
             if previous_failures < RMDIR_RETRIES {
                 job.remaining.store(1, Ordering::SeqCst);
@@ -937,9 +952,7 @@ fn finish_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                     previous_failures as u64 + 1,
                     error,
                 ));
-                if let Some(parent) = &job.parent {
-                    directory_part_done(pool, parent.clone());
-                }
+                finish_parent(pool, &job, true);
             }
         }
         Err(error) => {
@@ -950,17 +963,28 @@ fn finish_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                 job.retries.load(Ordering::SeqCst) as u64 + 1,
                 error,
             ));
-            if let Some(parent) = &job.parent {
-                directory_part_done(pool, parent.clone());
-            }
+            finish_parent(pool, &job, true);
         }
     }
 }
 
 fn abandon_directory(pool: &Arc<Pool>, job: &Arc<DirectoryJob>) {
+    finish_parent(pool, job, false);
+}
+
+fn finish_parent(pool: &Arc<Pool>, job: &DirectoryJob, failed: bool) {
     if let Some(parent) = &job.parent {
-        directory_part_done(pool, parent.clone());
+        if failed {
+            directory_part_failed(pool, parent.clone());
+        } else {
+            directory_part_done(pool, parent.clone());
+        }
     }
+}
+
+fn directory_part_failed(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
+    job.descendant_failed.store(true, Ordering::SeqCst);
+    directory_part_done(pool, job);
 }
 
 fn directory_part_done(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
