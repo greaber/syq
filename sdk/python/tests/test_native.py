@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
@@ -19,6 +20,9 @@ import sys
 import time
 
 args = sys.argv[1:]
+if args == ["--version"]:
+    print("syq 9.8.7")
+    raise SystemExit(0)
 marker = os.environ.get("SYQ_FAKE_DESCENDANT")
 if marker:
     descendant_delay = os.environ.get("SYQ_FAKE_DESCENDANT_DELAY", "0.6")
@@ -41,12 +45,6 @@ if stderr_bytes:
     sys.stderr.buffer.write(b"x" * stderr_bytes)
     sys.stderr.buffer.flush()
 
-results_fd = None
-for arg in args:
-    if arg.startswith("--results-fd="):
-        results_fd = int(arg.split("=", 1)[1])
-stream = os.fdopen(results_fd, "w") if results_fd is not None else sys.stdout
-
 command = args[0]
 if command == "map":
     print(json.dumps({
@@ -55,6 +53,13 @@ if command == "map":
         "kind": "file", "size": 3, "mtime": 100,
     }))
     raise SystemExit(int(os.environ.get("SYQ_FAKE_EXIT", "0")))
+
+results_fd_arg = next(arg for arg in args if arg.startswith("--results-fd="))
+machine_output = os.fdopen(
+    int(results_fd_arg.split("=", 1)[1]), "wb", buffering=0, closefd=False
+)
+if os.environ.get("SYQ_FAKE_STDOUT"):
+    print("human presentation output", flush=True)
 
 dry_run = "--dry-run" in args
 prune = "--prune" in args
@@ -131,13 +136,32 @@ elif shape == "unknown-event":
         "seq": records[-1]["seq"], "type": "future_addition", "value": 1,
     })
     records[-1]["seq"] += 1
+elif shape == "attested":
+    records[-2].update({
+        "provenance": "receiver_attested",
+        "scope": 0,
+    })
+    records.insert(-1, {
+        "schema": "syq.automation", "schema_version": 1,
+        "seq": records[-1]["seq"], "type": "final_state",
+        "provenance": "receiver_attested", "scope": 0,
+        "dst": {"encoding": "utf-8", "value": "a.txt"},
+        "object": {"state": "absent"},
+    })
+    records[-1]["seq"] += 1
+    records[-1].update({
+        "provenance": "receiver_attested",
+        "receipt_status": "clean",
+        "operations": 1,
+        "final_states": 1,
+        "receipt_records": 2,
+        "deletions_completed": 0,
+    })
 elif shape == "oversized-line":
-    stream.buffer.write(b"x" * (16 * 1024 * 1024 + 1)) if stream is sys.stdout \
-        else stream.write("x" * (16 * 1024 * 1024 + 1))
-    stream.flush()
+    machine_output.write(b"x" * (16 * 1024 * 1024 + 1))
     raise SystemExit(0)
 for record in records:
-    print(json.dumps(record), file=stream, flush=True)
+    machine_output.write(json.dumps(record).encode("utf-8") + b"\n")
 raise SystemExit(exit_code)
 """
 
@@ -219,8 +243,61 @@ class NativeClientTests(unittest.TestCase):
             any(arg.startswith("--results-fd=") for arg in argv),
             argv,
         )
+        self.assertNotIn("--results", argv)
         self.assertNotIn("--quiet", argv)
         self.assertEqual(argv.count("--src"), 2)
+
+    def test_results_accepts_a_caller_owned_binary_file(self) -> None:
+        output = io.BytesIO()
+        client = syq.Client(
+            executable=self.executable,
+            env={**self.env, "SYQ_FAKE_STDOUT": "1"},
+        )
+
+        result = client.cp("source", into="target", results=output)
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(records[0]["type"], "run")
+        self.assertEqual(records[-1]["type"], "result")
+        self.assertEqual(records[-1]["exit_code"], result.exit_code)
+        self.assertFalse(output.closed)
+
+    def test_results_rejects_a_text_file_before_launch(self) -> None:
+        self.argv_log.unlink(missing_ok=True)
+
+        with self.assertRaisesRegex(TypeError, "accept bytes"):
+            self.client.cp("source", into="target", results=io.StringIO())
+
+        self.assertFalse(self.argv_log.exists())
+
+    def test_results_preserves_receiver_attested_records(self) -> None:
+        output = io.BytesIO()
+        events: list[syq.AutomationEvent] = []
+        client = syq.Client(
+            executable=self.executable,
+            env={**self.env, "SYQ_FAKE_SHAPE": "attested"},
+        )
+
+        result = client.cp(
+            "source", into="target", results=output, on_event=events.append
+        )
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(
+            [record["type"] for record in records],
+            ["run", "progress", "operation_result", "final_state", "result"],
+        )
+        self.assertEqual(records[-1]["provenance"], "receiver_attested")
+        self.assertEqual(result.receipt_status, syq.ReceiptStatus.CLEAN)
+        self.assertTrue(
+            any(isinstance(event, syq.FinalStateEvent) for event in events)
+        )
+
+    def test_client_version_matches_module_version(self) -> None:
+        self.assertEqual(self.client.version(), "9.8.7")
+        self.assertEqual(
+            self.client.version(), syq.version(executable=self.executable)
+        )
 
     def test_live_cp_returns_operation_results(self) -> None:
         events: list[syq.AutomationEvent] = []
@@ -285,10 +362,15 @@ class NativeClientTests(unittest.TestCase):
     def test_non_success_result_raises_or_can_be_returned(self) -> None:
         env = {**self.env, "SYQ_FAKE_STATUS": "partial"}
         client = syq.Client(executable=self.executable, env=env)
+        output = io.BytesIO()
         with self.assertRaises(syq.SyqOperationError) as caught:
-            client.cp("source", into="target")
+            client.cp("source", into="target", results=output)
         self.assertEqual(caught.exception.result.status, syq.OperationStatus.PARTIAL)
         self.assertEqual(caught.exception.stderr, b"")
+        self.assertEqual(
+            json.loads(output.getvalue().splitlines()[-1])["status"],
+            "partial",
+        )
         result = client.cp("source", into="target", check=False)
         self.assertEqual(result.exit_code, 23)
 

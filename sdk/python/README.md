@@ -64,6 +64,18 @@ def observe(event: syq.AutomationEvent) -> None:
 result = syq.cp("data", into="backup", on_event=observe)
 ```
 
+Pass a caller-owned binary file-like object as `results=` to retain the same
+validated NDJSON stream that produced the returned `CpResult`:
+
+```python
+with open("run.ndjson", "wb") as records:
+    result = syq.cp("data", into="backup", results=records)
+```
+
+The SDK flushes but never closes the object. Typed calls receive automation
+records through native `--results-fd`; stdout is not treated as machine output.
+Callers that need native `--results FILE` path behavior can use `run()`.
+
 Asyncio applications use the same command names and result types. Native
 asyncio subprocesses keep the event loop responsive; async callbacks are
 awaited in stream order:

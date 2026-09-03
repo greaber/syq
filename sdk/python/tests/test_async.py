@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -77,6 +78,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             any(arg.startswith("--results-fd=") for arg in self.argv()),
             self.argv(),
         )
+        self.assertNotIn("--results", self.argv())
         self.assertNotIn("--quiet", self.argv())
         self.assertIn("--follow-src", self.argv())
         self.assertIn("--follow-dest", self.argv())
@@ -90,6 +92,52 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsInstance(prune, syq.CpResult)
         self.assertEqual(prune.deletions_completed, 1)
+
+    async def test_results_accepts_a_caller_owned_binary_file(self) -> None:
+        output = io.BytesIO()
+        client = syq.AsyncClient(
+            executable=self.executable,
+            env={**self.env, "SYQ_FAKE_STDOUT": "1"},
+        )
+
+        result = await client.cp("source", into="target", results=output)
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(records[0]["type"], "run")
+        self.assertEqual(records[-1]["type"], "result")
+        self.assertEqual(records[-1]["exit_code"], result.exit_code)
+        self.assertFalse(output.closed)
+
+    async def test_results_rejects_a_text_file_before_launch(self) -> None:
+        self.argv_log.unlink(missing_ok=True)
+
+        with self.assertRaisesRegex(TypeError, "accept bytes"):
+            await self.client.cp(
+                "source", into="target", results=io.StringIO()
+            )
+
+        self.assertFalse(self.argv_log.exists())
+
+    async def test_results_preserves_receiver_attested_records(self) -> None:
+        output = io.BytesIO()
+        client = syq.AsyncClient(
+            executable=self.executable,
+            env={**self.env, "SYQ_FAKE_SHAPE": "attested"},
+        )
+
+        result = await client.cp("source", into="target", results=output)
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(records[-2]["type"], "final_state")
+        self.assertEqual(records[-1]["provenance"], "receiver_attested")
+        self.assertEqual(result.receipt_status, syq.ReceiptStatus.CLEAN)
+
+    async def test_version_matches_synchronous_client(self) -> None:
+        self.assertEqual(await self.client.version(), "9.8.7")
+        self.assertEqual(
+            await self.client.version(),
+            syq.Client(executable=self.executable).version(),
+        )
 
     async def test_map_is_a_lazy_async_context_managed_stream(self) -> None:
         stream = self.client.map(src_src="source", follow_src=True)

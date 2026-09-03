@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import selectors
@@ -13,6 +14,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from .bootstrap import managed_executable
 from .errors import (
@@ -125,7 +127,10 @@ def run(
 def version(*, executable: str | os.PathLike[str] | None = None) -> str:
     """Return the version of the pinned or explicitly overridden executable."""
 
-    result = run(["--version"], executable=executable)
+    return _version_from_result(run(["--version"], executable=executable))
+
+
+def _version_from_result(result: Result) -> str:
     try:
         output = result.stdout.decode("utf-8").strip()
     except UnicodeDecodeError as error:
@@ -134,6 +139,101 @@ def version(*, executable: str | os.PathLike[str] | None = None) -> str:
     if not output.startswith(prefix) or len(output) == len(prefix):
         raise SyqOutputError(f"unexpected syq --version output: {output!r}")
     return output[len(prefix) :]
+
+
+def _prepare_results_file(results: BinaryIO | None) -> BinaryIO | None:
+    if results is None:
+        return None
+    write = getattr(results, "write", None)
+    if not callable(write):
+        raise TypeError("results must be a writable binary file-like object")
+    try:
+        written = write(b"")
+    except TypeError as error:
+        raise TypeError(
+            "results must accept bytes; open text files in binary mode"
+        ) from error
+    if written not in (None, 0):
+        raise TypeError("results.write(b'') returned an invalid byte count")
+    return results
+
+
+def _write_all(stream: BinaryIO, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = stream.write(data[offset:])
+        if written is None:
+            return
+        if (
+            not isinstance(written, int)
+            or isinstance(written, bool)
+            or written <= 0
+            or written > len(data) - offset
+        ):
+            raise SyqOutputError("results.write() returned an invalid byte count")
+        offset += written
+
+
+def _results_pipe() -> tuple[int, int]:
+    """Create a close-on-exec pipe whose descriptors cannot be stdio."""
+
+    read_fd, write_fd = os.pipe()
+    try:
+        if read_fd <= 2:
+            replacement = fcntl.fcntl(read_fd, fcntl.F_DUPFD_CLOEXEC, 3)
+            os.close(read_fd)
+            read_fd = replacement
+        if write_fd <= 2:
+            replacement = fcntl.fcntl(write_fd, fcntl.F_DUPFD_CLOEXEC, 3)
+            os.close(write_fd)
+            write_fd = replacement
+    except BaseException:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
+    return read_fd, write_fd
+
+
+class _ResultsFileWriter:
+    """Bounded buffering for a caller-owned validated NDJSON destination."""
+
+    _CHUNK_SIZE = 256 * 1024
+
+    def __init__(self, stream: BinaryIO | None) -> None:
+        self.stream = stream
+        self.buffer = bytearray()
+
+    def append(self, line: bytes) -> bool:
+        if self.stream is None:
+            return False
+        self.buffer.extend(line)
+        self.buffer.append(ord("\n"))
+        return len(self.buffer) >= self._CHUNK_SIZE
+
+    def add(self, line: bytes) -> None:
+        self.append(line)
+        self.drain()
+
+    def drain(self) -> None:
+        if self.stream is None or not self.buffer:
+            return
+        chunk = bytes(self.buffer)
+        self.buffer.clear()
+        _write_all(self.stream, chunk)
+
+    def finish(self, terminal: bytes) -> None:
+        if self.stream is None:
+            return
+        self.append(terminal)
+        self.drain()
+        self.flush()
+
+    def flush(self) -> None:
+        if self.stream is None:
+            return
+        flush = getattr(self.stream, "flush", None)
+        if callable(flush):
+            flush()
 
 
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -150,7 +250,7 @@ def _remaining(deadline: float | None) -> float | None:
 
 
 class _LineProcess:
-    """An owned process whose stdout is consumed as bounded NDJSON lines."""
+    """An owned process with a bounded line-oriented machine stream."""
 
     def __init__(
         self,
@@ -159,45 +259,33 @@ class _LineProcess:
         cwd: PathArgument | None,
         env: Mapping[str, str] | None,
         timeout: float | None,
-        results_pipe: bool = False,
+        machine_output: BinaryIO | None = None,
+        pass_fds: tuple[int, ...] = (),
     ) -> None:
+        self.argv = argv
         self.timeout = timeout
         self._deadline = None if timeout is None else time.monotonic() + timeout
-        read_fd: int | None = None
-        pass_fds: tuple[int, ...] = ()
-        stdout = subprocess.PIPE
-        if results_pipe:
-            # The stream rides a descriptor this process opens and the
-            # child inherits (--results-fd); the child's human stdout is
-            # discarded so an unread pipe can never stall it.
-            read_fd, write_fd = os.pipe()
-            argv = (*argv, f"--results-fd={write_fd}")
-            pass_fds = (write_fd,)
-            stdout = subprocess.DEVNULL
-        self.argv = argv
-        try:
-            self._process = subprocess.Popen(
-                argv,
-                cwd=cwd,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=subprocess.PIPE,
-                shell=False,
-                start_new_session=True,
-                pass_fds=pass_fds,
-            )
-        finally:
-            if results_pipe:
-                os.close(write_fd)
-                if not hasattr(self, "_process"):
-                    os.close(read_fd)
+        self._process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=(
+                subprocess.PIPE
+                if machine_output is None
+                else subprocess.DEVNULL
+            ),
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=True,
+            pass_fds=pass_fds,
+        )
         assert self._process.stderr is not None
-        if read_fd is not None:
-            self._stdout = os.fdopen(read_fd, "rb", buffering=0)
-        else:
+        if machine_output is None:
             assert self._process.stdout is not None
-            self._stdout = self._process.stdout
+            self._output = self._process.stdout
+        else:
+            self._output = machine_output
         self._stderr = self._process.stderr
         self._stderr_tail = bytearray()
         self._stderr_thread = threading.Thread(
@@ -207,12 +295,40 @@ class _LineProcess:
         )
         self._stderr_thread.start()
         self._selector = selectors.DefaultSelector()
-        self._selector.register(self._stdout, selectors.EVENT_READ)
+        self._selector.register(self._output, selectors.EVENT_READ)
         self._buffer = bytearray()
         self._eof = False
         self.returncode: int | None = None
         self.stderr = b""
         self._closed = False
+
+    @classmethod
+    def start_results(
+        cls,
+        argv: tuple[Argument, ...],
+        *,
+        cwd: PathArgument | None,
+        env: Mapping[str, str] | None,
+        timeout: float | None,
+    ) -> _LineProcess:
+        read_fd, write_fd = _results_pipe()
+        output = os.fdopen(read_fd, "rb", buffering=0)
+        command = (*argv, f"--results-fd={write_fd}")
+        try:
+            try:
+                return cls(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    timeout=timeout,
+                    machine_output=output,
+                    pass_fds=(write_fd,),
+                )
+            except BaseException:
+                output.close()
+                raise
+        finally:
+            os.close(write_fd)
 
     def next_line(self) -> bytes | None:
         while True:
@@ -238,7 +354,7 @@ class _LineProcess:
             wait = _remaining(self._deadline)
             if wait == 0 or not self._selector.select(wait):
                 raise subprocess.TimeoutExpired(self.argv, self.timeout)
-            chunk = os.read(self._stdout.fileno(), 64 * 1024)
+            chunk = os.read(self._output.fileno(), 64 * 1024)
             if chunk:
                 self._buffer.extend(chunk)
                 if (
@@ -294,7 +410,7 @@ class _LineProcess:
             return
         self._closed = True
         self._selector.close()
-        self._stdout.close()
+        self._output.close()
         self._stderr.close()
 
 
@@ -660,6 +776,11 @@ class Client:
             input=input,
         )
 
+    def version(self) -> str:
+        """Return the selected syq executable's version."""
+
+        return _version_from_result(self.run(["--version"]))
+
     def _typed(
         self,
         argv: list[Argument],
@@ -668,32 +789,40 @@ class Client:
         mapping: bool,
         dry_run: bool,
         on_event: Callable[[AutomationEvent], object] | None,
+        results: BinaryIO | None,
         timeout: float | None,
         check: bool,
     ) -> OperationSummary:
         command = (self._executable_value(), *argv)
-        process = _LineProcess(
+        process = _LineProcess.start_results(
             command,
             cwd=self.process_cwd,
             env=self.env,
             timeout=self.timeout if timeout is None else timeout,
-            results_pipe=True,
         )
+        writer = _ResultsFileWriter(results)
         decoder = AutomationDecoder(
             prune=prune,
             mapping=mapping,
             dry_run=dry_run,
         )
+        terminal_line: bytes | None = None
         try:
             while True:
                 line = process.next_line()
                 if line is None:
                     break
                 event = decoder.feed(line)
+                if isinstance(event, OperationSummary):
+                    terminal_line = line
+                else:
+                    writer.add(line)
                 if event is not None and on_event is not None:
                     on_event(event)
             returncode = process.finish()
             result = decoder.finish(returncode)
+            assert terminal_line is not None
+            writer.finish(terminal_line)
         except BaseException as error:
             process.abort()
             if isinstance(error, SyqProtocolError):
@@ -724,6 +853,7 @@ class Client:
         as_new: PathArgument | None = None,
         as_existing: PathArgument | None = None,
         mapping: PathArgument | Iterable[MappingEntry] | None = None,
+        results: BinaryIO | None = None,
         prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
@@ -767,6 +897,7 @@ class Client:
                 "a remote-to-remote dry run cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
+        results = _prepare_results_file(results)
         argv, source_count = _copy_arguments(
             "cp",
             sources,
@@ -828,6 +959,7 @@ class Client:
                 mapping=False,
                 dry_run=dry_run,
                 on_event=on_event,
+                results=results,
                 timeout=timeout,
                 check=check,
             )
@@ -843,6 +975,7 @@ class Client:
                 mapping=True,
                 dry_run=dry_run,
                 on_event=on_event,
+                results=results,
                 timeout=timeout,
                 check=check,
             )
@@ -857,6 +990,7 @@ class Client:
                 mapping=True,
                 dry_run=dry_run,
                 on_event=on_event,
+                results=results,
                 timeout=timeout,
                 check=check,
             )
