@@ -11,8 +11,9 @@
 //! descendant mutation and inspection; the unrestricted implementation remains
 //! separate. Existing roots, directory scans, regular-file I/O, leaf
 //! creation/replacement, metadata, and non-recursive unlink/rmdir are supported.
-//! Recursive removal and missing-root creation stay outside this layer. Roots
-//! and directory components must be openable with `O_RDONLY | O_DIRECTORY`.
+//! Recursive removal and missing-root creation stay outside this layer.
+//! Traversal uses search-only descriptors where the platform provides them;
+//! directory enumeration separately opens an independent readable descriptor.
 //!
 //! Linux currently uses the same component walk as other Unix platforms. An
 //! `openat2` fast path should be added only with tests proving that it has
@@ -26,12 +27,13 @@
 use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
@@ -61,7 +63,7 @@ const MODE_FIFO: u32 = libc::S_IFIFO as u32;
 
 /// Stable identity of an opened root. Independent helper processes can reopen
 /// the configured path and require this identity before serving requests.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RootIdentity {
     pub(crate) dev: u64,
     pub(crate) ino: u64,
@@ -89,7 +91,15 @@ pub(crate) struct RootMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperatorFinalComponent {
     Directory,
-    Entry { follow_symlink: bool },
+    Entry {
+        follow_symlink: bool,
+    },
+    /// An input file whose final procfs magic link may be opened relative to
+    /// its retained procfs parent instead of interpreting its synthetic target
+    /// bytes as an ordinary symlink path.
+    ReadableEntry {
+        follow_symlink: bool,
+    },
 }
 
 /// One symlink hop taken while resolving an operator path. Callers use this
@@ -118,6 +128,66 @@ impl PinnedLeaf {
 
     pub(crate) fn into_parts(self) -> (File, CString, RootMetadata, Option<File>) {
         (self.parent, self.name, self.metadata, self.object)
+    }
+
+    /// Open the selected identity for input without resolving its
+    /// pathname again. The metadata handle retained by the resolver prevents
+    /// inode reuse until the newly opened descriptor has been checked.
+    pub(crate) fn open_read(self) -> Result<File> {
+        if self.metadata.is_dir() || self.metadata.is_symlink() {
+            bail!("operator path does not select a readable file");
+        }
+        if self.metadata.is_fifo() {
+            #[cfg(target_os = "linux")]
+            if let Some(object) = &self.object {
+                if let Some(file) = reopen_pinned_object_for_read(object)? {
+                    let actual = root_metadata_from_std(&file.metadata()?)?;
+                    require_operator_identity(self.metadata, actual, "operator FIFO")?;
+                    return Ok(file);
+                }
+            }
+            bail!(
+                "selected FIFO control input cannot be reopened through an exact descriptor on this platform; use --files-from - or --mapping -, or materialize ignore rules in a regular file"
+            );
+        }
+        // A pathname replacement must not make the candidate open block before
+        // its identity is checked. The selected object is not a FIFO here, but
+        // its replacement may be one. Restore ordinary blocking I/O only after
+        // the opened object has been validated.
+        let flags =
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let file = open_at(self.parent.as_raw_fd(), &self.name, flags, 0)
+            .context("open selected operator file")?;
+        let actual = root_metadata_from_std(&file.metadata()?)?;
+        require_operator_identity(self.metadata, actual, "operator file")?;
+        clear_nonblocking(&file).context("normalize selected operator file flags")?;
+        Ok(file)
+    }
+
+    /// Open the selected identity for ordinary output, validating it before
+    /// truncation so a namespace replacement cannot redirect the write.
+    pub(crate) fn open_regular_write(self, truncate: bool) -> Result<File> {
+        self.open_regular(libc::O_WRONLY, truncate)
+    }
+
+    fn open_regular(self, access: libc::c_int, truncate: bool) -> Result<File> {
+        if !self.metadata.is_file() {
+            bail!("operator path does not select a regular file");
+        }
+        let file = open_at(
+            self.parent.as_raw_fd(),
+            &self.name,
+            access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+            0,
+        )
+        .context("open selected operator file")?;
+        let actual = root_metadata_from_std(&file.metadata()?)?;
+        require_operator_identity(self.metadata, actual, "operator file")?;
+        clear_nonblocking(&file).context("normalize selected operator file flags")?;
+        if truncate {
+            file.set_len(0).context("truncate selected operator file")?;
+        }
+        Ok(file)
     }
 }
 
@@ -151,12 +221,48 @@ impl PinnedMissing {
     pub(crate) fn into_parts(self) -> (File, VecDeque<Vec<u8>>) {
         (self.directory, self.components)
     }
+
+    /// Create a single missing regular-file leaf relative to the retained
+    /// parent. Missing parents are deliberately not created for control paths.
+    pub(crate) fn create_regular(self, mode: u32) -> Result<File> {
+        let mut components = self.components;
+        if components.len() != 1 {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT).into());
+        }
+        let name = operator_component_cstring(
+            &components
+                .pop_front()
+                .expect("one missing operator component was checked"),
+        )?;
+        let file = open_at(
+            self.directory.as_raw_fd(),
+            &name,
+            libc::O_WRONLY
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_NOCTTY
+                | libc::O_CLOEXEC,
+            mode & 0o777,
+        )
+        .context("create selected operator file")?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            bail!("created operator path is not a regular file");
+        }
+        clear_nonblocking(&file).context("normalize selected operator file flags")?;
+        Ok(file)
+    }
 }
 
 pub(crate) enum PinnedPath {
     Missing(PinnedMissing),
     Leaf(PinnedLeaf),
     Directory(PinnedDirectory),
+    /// A readable object opened directly through a retained procfs magic-link
+    /// parent. This is used only for final control-file inputs.
+    OpenFile(File),
 }
 
 struct OperatorCursor {
@@ -311,6 +417,8 @@ impl OperatorResolver {
                     final_component,
                     OperatorFinalComponent::Entry {
                         follow_symlink: true
+                    } | OperatorFinalComponent::ReadableEntry {
+                        follow_symlink: true
                     }
                 );
 
@@ -334,12 +442,64 @@ impl OperatorResolver {
                         object,
                     }));
                 }
-                self.authorize_symlink(metadata, &component)?;
+                // Refusal needs no second observation. Policies that follow
+                // the link pin it first so ownership and target bytes come
+                // from the same symlink object.
+                if self.symlink_policy == OperatorSymlinkPolicy::Refuse {
+                    self.authorize_symlink(metadata, &component)?;
+                    unreachable!("the refusing policy always returns an error for a symlink");
+                }
                 symlink_count += 1;
                 if symlink_count > 40 {
                     bail!("too many symlink levels in operator path");
                 }
-                let target = operator_read_link_at(current.directory.as_raw_fd(), &name)?;
+                let object = open_operator_symlink_at(current.directory.as_raw_fd(), &name)?;
+                let target = if let Some(object) = object {
+                    let opened_metadata = root_metadata_from_std(&object.metadata()?)?;
+                    require_operator_identity(metadata, opened_metadata, "operator symlink")?;
+                    self.authorize_symlink(opened_metadata, &component)?;
+                    hold_open_operator_symlink_for_test(&component)?;
+                    match operator_read_open_link(&object)? {
+                        Some(target) => {
+                            #[cfg(target_os = "linux")]
+                            if final_name
+                                && matches!(
+                                    final_component,
+                                    OperatorFinalComponent::ReadableEntry { .. }
+                                )
+                                && operator_descriptor_is_procfs(&object)?
+                            {
+                                let file = open_at(
+                                    current.directory.as_raw_fd(),
+                                    &name,
+                                    libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+                                    0,
+                                )
+                                .context("open selected procfs magic-link input")?;
+                                let after = operator_read_open_link(&object)?
+                                    .context("procfs magic link lost descriptor-bound access")?;
+                                if after != target {
+                                    bail!("procfs magic-link target changed during selection");
+                                }
+                                let metadata = root_metadata_from_std(&file.metadata()?)?;
+                                if metadata.is_dir() || metadata.is_symlink() {
+                                    bail!("operator path does not select a readable file");
+                                }
+                                hops.push(OperatorSymlinkHop { component, target });
+                                return Ok(PinnedPath::OpenFile(file));
+                            }
+                            target
+                        }
+                        None => {
+                            require_operator_link_fallback_allowed(self.symlink_policy)?;
+                            operator_read_link_at(current.directory.as_raw_fd(), &name)?
+                        }
+                    }
+                } else {
+                    self.authorize_symlink(metadata, &component)?;
+                    require_operator_link_fallback_allowed(self.symlink_policy)?;
+                    operator_read_link_at(current.directory.as_raw_fd(), &name)?
+                };
                 hops.push(OperatorSymlinkHop {
                     component,
                     target: target.clone(),
@@ -446,6 +606,10 @@ impl RootMetadata {
         self.mode & MODE_TYPE_MASK == MODE_SYMLINK
     }
 
+    pub(crate) fn is_fifo(self) -> bool {
+        self.mode & MODE_TYPE_MASK == MODE_FIFO
+    }
+
     pub(crate) fn file_type(self) -> u32 {
         self.mode & MODE_TYPE_MASK
     }
@@ -453,7 +617,7 @@ impl RootMetadata {
 
 /// A syntactically safe descendant path. Empty means the opened root itself;
 /// operations that need a leaf reject it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RelativePath {
     components: Vec<Vec<u8>>,
 }
@@ -497,6 +661,14 @@ impl RelativePath {
         self.components.is_empty()
     }
 
+    pub(crate) fn to_path_buf(&self) -> PathBuf {
+        let mut path = PathBuf::new();
+        for component in &self.components {
+            path.push(OsStr::from_bytes(component));
+        }
+        path
+    }
+
     fn label(&self) -> String {
         if self.components.is_empty() {
             return ".".into();
@@ -524,11 +696,19 @@ impl Root {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC)
             .open(path)
             .with_context(|| format!("open confined root {}", path.display()))?;
+        Self::from_directory(directory)
+            .with_context(|| format!("validate confined root {}", path.display()))
+    }
+
+    /// Adopt an already-open directory as the authority boundary. This never
+    /// resolves a pathname and therefore preserves the selected object across
+    /// renames and namespace replacement.
+    pub(crate) fn from_directory(directory: File) -> Result<Self> {
         let metadata = directory
             .metadata()
-            .with_context(|| format!("stat confined root {}", path.display()))?;
+            .context("stat confined root descriptor")?;
         if !metadata.is_dir() {
-            bail!("confined root {} is not a directory", path.display());
+            bail!("confined root descriptor is not a directory");
         }
         Ok(Self {
             directory,
@@ -559,6 +739,10 @@ impl Root {
         self.identity
     }
 
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
+        self.directory.as_raw_fd()
+    }
+
     /// Open the root or a descendant directory without following any
     /// descendant symlink.
     pub(crate) fn open_directory(&self, path: &RelativePath) -> Result<File> {
@@ -567,6 +751,41 @@ impl Root {
             directory = open_directory_at(&directory, component)
                 .with_context(|| format!("open confined directory {}", path.label()))?;
         }
+        Ok(directory)
+    }
+
+    /// Open a directory by its root-relative name and require that it is still
+    /// the entry previously observed by a caller such as the tree scanner.
+    pub(crate) fn open_directory_verified(
+        &self,
+        path: &RelativePath,
+        expected: RootMetadata,
+    ) -> Result<File> {
+        let directory = self.open_directory(path)?;
+        require_metadata_identity(
+            expected,
+            root_metadata_from_std(&directory.metadata()?)?,
+            "confined directory",
+        )?;
+        Ok(directory)
+    }
+
+    /// Open an observed child relative to an already-open parent. This lets a
+    /// bounded scanner carry authority forward without rewalking from the
+    /// root, while the identity check rejects a rename/replacement race.
+    pub(crate) fn open_child_directory_verified(
+        &self,
+        parent: &File,
+        name: &[u8],
+        expected: RootMetadata,
+    ) -> Result<File> {
+        directory_entry_cstring(name)?;
+        let directory = open_directory_at(parent, name).context("open confined child directory")?;
+        require_metadata_identity(
+            expected,
+            root_metadata_from_std(&directory.metadata()?)?,
+            "confined child directory",
+        )?;
         Ok(directory)
     }
 
@@ -585,7 +804,15 @@ impl Root {
     }
 
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
-        let parent = self.resolve_parent(path)?;
+        let (parent, leaf) = if path.is_empty() {
+            (
+                self.directory.try_clone().context("duplicate root fd")?,
+                component_cstring(b"."),
+            )
+        } else {
+            let parent = self.resolve_parent(path)?;
+            (parent.directory, parent.leaf)
+        };
         #[cfg(target_os = "linux")]
         let flags =
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
@@ -598,7 +825,7 @@ impl Root {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let flags =
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-        open_at(parent.directory.as_raw_fd(), &parent.leaf, flags, 0)
+        open_at(parent.as_raw_fd(), &leaf, flags, 0)
             .with_context(|| format!("open confined metadata handle {}", path.label()))
     }
 
@@ -663,6 +890,52 @@ impl Root {
         .with_context(|| format!("create confined directory {}", path.label()))
     }
 
+    /// Create any missing parents of `path`, walking only through real
+    /// directories retained beneath this root. Concurrent creators are
+    /// accepted only when the resulting component opens as a directory.
+    pub(crate) fn create_missing_parents(&self, path: &RelativePath, mode: u32) -> Result<()> {
+        let (parents, _) = path.leaf()?;
+        let mut directory = self.directory.try_clone().context("duplicate root fd")?;
+        for component in parents {
+            match open_directory_at(&directory, component) {
+                Ok(child) => {
+                    directory = child;
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("resolve confined parent for {}", path.label()));
+                }
+            }
+            let component = component_cstring(component);
+            loop {
+                let result = unsafe {
+                    libc::mkdirat(
+                        directory.as_raw_fd(),
+                        component.as_ptr(),
+                        (mode & 0o777) as libc::mode_t,
+                    )
+                };
+                if result == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error)
+                        .with_context(|| format!("create confined parent for {}", path.label()));
+                }
+                break;
+            }
+            directory = open_directory_at(&directory, component.as_bytes())
+                .with_context(|| format!("open created confined parent for {}", path.label()))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn metadata(&self, path: &RelativePath) -> Result<RootMetadata> {
         if path.is_empty() {
             return root_metadata_from_std(&self.directory.metadata()?);
@@ -670,6 +943,17 @@ impl Root {
         let parent = self.resolve_parent(path)?;
         metadata_at(parent.directory.as_raw_fd(), &parent.leaf)
             .with_context(|| format!("stat confined path {}", path.label()))
+    }
+
+    /// Inspect a name relative to an already-open directory without following
+    /// a symlink in that name.
+    pub(crate) fn metadata_in_directory(
+        &self,
+        directory: &File,
+        name: &[u8],
+    ) -> Result<RootMetadata> {
+        let name = directory_entry_cstring(name)?;
+        metadata_at(directory.as_raw_fd(), &name).context("stat confined directory entry")
     }
 
     pub(crate) fn metadata_optional(&self, path: &RelativePath) -> Result<Option<RootMetadata>> {
@@ -690,11 +974,25 @@ impl Root {
     /// owns a duplicate descriptor and never reconstructs a pathname.
     pub(crate) fn read_directory(&self, path: &RelativePath) -> Result<Vec<Vec<u8>>> {
         let directory = self.open_directory(path)?;
-        let duplicated = retry_fd(|| unsafe { libc::dup(directory.as_raw_fd()) })?;
-        let stream = unsafe { libc::fdopendir(duplicated) };
+        self.read_open_directory(&directory)
+            .with_context(|| format!("read confined directory {}", path.label()))
+    }
+
+    /// List raw names from a directory already retained by the caller. The
+    /// stream gets its own open-file description, so retries and concurrent
+    /// scans never share a directory offset.
+    pub(crate) fn read_open_directory(&self, directory: &File) -> Result<Vec<Vec<u8>>> {
+        // dup()/try_clone() would share the directory open-file-description
+        // offset. Reopen `.` so concurrent scans and retries each start with
+        // an independent readable stream, including when the authority is an
+        // O_PATH/O_SEARCH descriptor.
+        let readable = open_readable_directory_at(directory, b".")
+            .context("open readable confined directory")?;
+        let descriptor = readable.into_raw_fd();
+        let stream = unsafe { libc::fdopendir(descriptor) };
         if stream.is_null() {
             let error = io::Error::last_os_error();
-            let _ = unsafe { libc::close(duplicated) };
+            let _ = unsafe { libc::close(descriptor) };
             return Err(error).context("open confined directory stream");
         }
         struct DirectoryStream(*mut libc::DIR);
@@ -724,15 +1022,54 @@ impl Root {
         Ok(names)
     }
 
+    /// Component limit for a sidecar beside `path`. Missing or non-directory
+    /// suffixes are walked back to the nearest existing real directory, never
+    /// through a symlink.
+    pub(crate) fn name_max_for_parent(&self, path: &RelativePath) -> Result<usize> {
+        let (parents, _) = path.leaf()?;
+        let mut components = parents.to_vec();
+        loop {
+            let candidate = RelativePath {
+                components: components.clone(),
+            };
+            match self.open_directory(&candidate) {
+                Ok(directory) => {
+                    set_errno(0);
+                    let limit =
+                        unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_NAME_MAX) };
+                    if limit > 0 {
+                        return Ok(limit as usize);
+                    }
+                    let errno = get_errno();
+                    if errno == 0 {
+                        return Ok(255);
+                    }
+                    return Err(io::Error::from_raw_os_error(errno))
+                        .context("query confined directory component limit");
+                }
+                Err(error) if missing_directory_suffix(&error) && !components.is_empty() => {
+                    components.pop();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(crate) fn read_link(&self, path: &RelativePath) -> Result<Vec<u8>> {
         let parent = self.resolve_parent(path)?;
+        self.read_link_in_directory(&parent.directory, parent.leaf.as_bytes())
+            .with_context(|| format!("read confined symlink {}", path.label()))
+    }
+
+    pub(crate) fn read_link_in_directory(&self, directory: &File, name: &[u8]) -> Result<Vec<u8>> {
+        let name = directory_entry_cstring(name)?;
         let mut buffer = vec![0u8; 256];
         loop {
             let read = loop {
                 let result = unsafe {
                     libc::readlinkat(
-                        parent.directory.as_raw_fd(),
-                        parent.leaf.as_ptr(),
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
                         buffer.as_mut_ptr().cast(),
                         buffer.len(),
                     )
@@ -742,7 +1079,7 @@ impl Root {
                 }
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error).context("read confined symlink");
+                    return Err(error).context("read confined directory-entry symlink");
                 }
             };
             if read < buffer.len() {
@@ -803,11 +1140,19 @@ impl Root {
     }
 
     pub(crate) fn set_times(&self, path: &RelativePath, times: &[libc::timespec; 2]) -> Result<()> {
-        let parent = self.resolve_parent(path)?;
+        let (parent, leaf) = if path.is_empty() {
+            (
+                self.directory.try_clone().context("duplicate root fd")?,
+                component_cstring(b"."),
+            )
+        } else {
+            let parent = self.resolve_parent(path)?;
+            (parent.directory, parent.leaf)
+        };
         retry_zero(|| unsafe {
             libc::utimensat(
-                parent.directory.as_raw_fd(),
-                parent.leaf.as_ptr(),
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
                 times.as_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
             )
@@ -875,6 +1220,17 @@ impl Root {
             );
         }
         let temporary = create_temporary(&parent, create)?;
+        let replacement = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+        if replacement.file_type() != expected_type || replacement.nlink != 1 {
+            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
+            bail!("confined replacement for {} is not safe", path.label());
+        }
+        #[cfg(test)]
+        run_publication_test_hook(
+            self.identity,
+            path,
+            PublicationTestPoint::BeforeMatchedExchange,
+        );
         if let Err(error) = rename_exchange(
             parent.directory.as_raw_fd(),
             &temporary,
@@ -885,19 +1241,35 @@ impl Root {
             return Err(error)
                 .with_context(|| format!("atomically replace confined path {}", path.label()));
         }
+        #[cfg(test)]
+        run_publication_test_hook(
+            self.identity,
+            path,
+            PublicationTestPoint::AfterMatchedExchange,
+        );
+        let published = metadata_at(parent.directory.as_raw_fd(), &parent.leaf)?;
         let swapped = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+        if published.dev != replacement.dev
+            || published.ino != replacement.ino
+            || published.file_type() != expected_type
+            || published.nlink != 1
+        {
+            // The replacement name was raced before the exchange, or another
+            // writer has already updated the target. Either way, the target
+            // name must not be touched again.
+            bail!(
+                "confined replacement for {} changed during replacement",
+                path.label()
+            );
+        }
         if swapped.dev != expected_dev
             || swapped.ino != expected_ino
             || swapped.file_type() != expected_type
         {
-            rename_exchange(
-                parent.directory.as_raw_fd(),
-                &temporary,
-                parent.directory.as_raw_fd(),
-                &parent.leaf,
-            )
-            .with_context(|| format!("restore raced destination {}", path.label()))?;
-            unlink_at(parent.directory.as_raw_fd(), &temporary, 0)?;
+            // Another writer may already have replaced `path` after our
+            // exchange. Never mutate that name again: a compensating exchange
+            // could remove the later writer's result. Preserve the displaced
+            // entry under the temporary name and report the race.
             bail!(
                 "confined destination {} changed during replacement",
                 path.label()
@@ -930,6 +1302,42 @@ impl Root {
         })
     }
 
+    /// Atomically publish a staged regular file with ordinary rename
+    /// replacement semantics. Both parents are retained before the rename, so
+    /// a concurrent ancestor replacement cannot redirect either side. A later
+    /// writer is never rolled back: post-rename validation can report a race,
+    /// but it must not mutate the target name again.
+    pub(crate) fn rename_regular_if_same(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+        staged_identity: (u64, u64),
+    ) -> Result<()> {
+        let (staged_dev, staged_ino) = staged_identity;
+        let (source_parent, target_parent) = self.resolve_publish_parents(source, target)?;
+        let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+        require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
+        retry_zero(|| unsafe {
+            libc::renameat(
+                source_parent.directory.as_raw_fd(),
+                source_parent.leaf.as_ptr(),
+                target_parent.directory.as_raw_fd(),
+                target_parent.leaf.as_ptr(),
+            )
+        })
+        .with_context(|| format!("publish confined path {}", target.label()))?;
+        #[cfg(test)]
+        run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAnyRename);
+        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
+        if !is_safe_staged_identity(published, staged_dev, staged_ino) {
+            bail!(
+                "confined staged path {} changed during publication",
+                source.label()
+            );
+        }
+        Ok(())
+    }
+
     /// Publish a staged regular file only if the target name is still absent.
     /// The hard link makes the final name visible atomically without replacing
     /// a raced target; removing the staged name leaves one link on success.
@@ -937,16 +1345,12 @@ impl Root {
         &self,
         source: &RelativePath,
         target: &RelativePath,
+        staged_identity: (u64, u64),
     ) -> Result<()> {
-        let source_parent = self.resolve_parent(source)?;
-        let target_parent = self.resolve_parent(target)?;
+        let (staged_dev, staged_ino) = staged_identity;
+        let (source_parent, target_parent) = self.resolve_publish_parents(source, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
-        if !staged.is_file() {
-            bail!(
-                "confined staged path {} is not a regular file",
-                source.label()
-            );
-        }
+        require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
         retry_zero(|| unsafe {
             libc::linkat(
                 source_parent.directory.as_raw_fd(),
@@ -963,30 +1367,36 @@ impl Root {
                 target.label()
             )
         })?;
+        #[cfg(test)]
+        run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAbsentLink);
+        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
+        if !is_safe_staged_identity_after_link(published, staged_dev, staged_ino) {
+            bail!(
+                "confined staged path {} changed during publication",
+                source.label()
+            );
+        }
         unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
             .with_context(|| format!("remove staged confined path {}", source.label()))
     }
 
     /// Atomically replace exactly one previously observed regular-file inode.
     /// The exchange retains the displaced inode under the staged name long
-    /// enough to verify it. A raced target is exchanged back and left intact.
+    /// enough to verify it. After the exchange, mismatch handling never
+    /// touches the target name again, so a later writer cannot be rolled back.
     pub(crate) fn replace_regular_if_same(
         &self,
         source: &RelativePath,
         target: &RelativePath,
+        staged_identity: (u64, u64),
         expected_dev: u64,
         expected_ino: u64,
         expected_ctime: Option<(i64, u32)>,
     ) -> Result<()> {
-        let source_parent = self.resolve_parent(source)?;
-        let target_parent = self.resolve_parent(target)?;
+        let (staged_dev, staged_ino) = staged_identity;
+        let (source_parent, target_parent) = self.resolve_publish_parents(source, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
-        if !staged.is_file() {
-            bail!(
-                "confined staged path {} is not a regular file",
-                source.label()
-            );
-        }
+        require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
         let before = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
         let has_expected_identity = |metadata: RootMetadata| {
             metadata.is_file() && metadata.dev == expected_dev && metadata.ino == expected_ino
@@ -1001,6 +1411,12 @@ impl Root {
                 target.label()
             );
         }
+        #[cfg(test)]
+        run_publication_test_hook(
+            self.identity,
+            target,
+            PublicationTestPoint::BeforeMatchedExchange,
+        );
         rename_exchange(
             source_parent.directory.as_raw_fd(),
             &source_parent.leaf,
@@ -1008,18 +1424,27 @@ impl Root {
             &target_parent.leaf,
         )
         .with_context(|| format!("atomically publish confined path {}", target.label()))?;
+        #[cfg(test)]
+        run_publication_test_hook(
+            self.identity,
+            target,
+            PublicationTestPoint::AfterMatchedExchange,
+        );
+        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
         let displaced = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+        if !is_safe_staged_identity(published, staged_dev, staged_ino) {
+            bail!(
+                "confined staged path {} changed during publication",
+                source.label()
+            );
+        }
         // The exchange itself may update the displaced inode's ctime. Its
         // dev/inode identity cannot be recycled while the link still exists,
         // so the pre-exchange fingerprint plus this identity check is enough.
         if !has_expected_identity(displaced) {
-            rename_exchange(
-                source_parent.directory.as_raw_fd(),
-                &source_parent.leaf,
-                target_parent.directory.as_raw_fd(),
-                &target_parent.leaf,
-            )
-            .with_context(|| format!("restore raced destination {}", target.label()))?;
+            // The target may already contain a still-later writer's result.
+            // Never exchange it again after publication; retain the displaced
+            // entry under the staged name and report the race.
             bail!(
                 "confined destination {} changed during publication",
                 target.label()
@@ -1027,6 +1452,28 @@ impl Root {
         }
         unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
             .with_context(|| format!("remove displaced confined path {}", target.label()))
+    }
+
+    fn resolve_publish_parents(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+    ) -> Result<(ResolvedParent, ResolvedParent)> {
+        let (source_parents, _) = source.leaf()?;
+        let (target_parents, target_leaf) = target.leaf()?;
+        let source_parent = self.resolve_parent(source)?;
+        let target_parent = if source_parents == target_parents {
+            ResolvedParent {
+                directory: source_parent
+                    .directory
+                    .try_clone()
+                    .context("duplicate publication parent fd")?,
+                leaf: component_cstring(target_leaf),
+            }
+        } else {
+            self.resolve_parent(target)?
+        };
+        Ok((source_parent, target_parent))
     }
 
     /// Remove a non-directory leaf. Symlinks are removed themselves, never
@@ -1075,6 +1522,13 @@ struct ResolvedParent {
 
 fn component_cstring(component: &[u8]) -> CString {
     CString::new(component).expect("RelativePath already rejected NUL")
+}
+
+fn directory_entry_cstring(name: &[u8]) -> Result<CString> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        bail!("confined directory entry must be one non-dot component");
+    }
+    CString::new(name).context("confined directory entry contains NUL")
 }
 
 fn operator_components(path: &[u8]) -> VecDeque<Vec<u8>> {
@@ -1161,13 +1615,97 @@ fn open_operator_symlink_at(parent: RawFd, name: &CString) -> Result<Option<File
     }
 }
 
+#[cfg(debug_assertions)]
+fn hold_open_operator_symlink_for_test(component: &[u8]) -> Result<()> {
+    let Some(expected) = std::env::var_os("SYQ_TEST_OPERATOR_SYMLINK_COMPONENT") else {
+        return Ok(());
+    };
+    if expected.as_encoded_bytes() != component {
+        return Ok(());
+    }
+    if let Some(ready) = std::env::var_os("SYQ_TEST_OPERATOR_SYMLINK_READY_FILE") {
+        std::fs::write(&ready, b"ready").with_context(|| {
+            format!(
+                "write operator-symlink-ready signal {}",
+                Path::new(&ready).display()
+            )
+        })?;
+    }
+    let Some(release) = std::env::var_os("SYQ_TEST_OPERATOR_SYMLINK_RELEASE_FILE") else {
+        return Ok(());
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !Path::new(&release).exists() {
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for operator-symlink release signal {}",
+                Path::new(&release).display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_open_operator_symlink_for_test(_component: &[u8]) -> Result<()> {
+    Ok(())
+}
+
+/// Read target bytes through an already-open symlink when the platform has a
+/// descriptor-bound API. `None` means that only the insecure pathname API is
+/// available; callers enforcing trusted-owner traversal must fail closed.
+fn operator_read_open_link(object: &File) -> Result<Option<Vec<u8>>> {
+    read_open_symlink(object)
+}
+
 fn operator_read_link_at(parent: RawFd, name: &CString) -> Result<Vec<u8>> {
+    read_link_bytes(|target, capacity| unsafe {
+        libc::readlinkat(parent, name.as_ptr(), target, capacity)
+    })
+}
+
+/// Read raw target bytes through an already-open symlink object. `None` means
+/// the running platform lacks a descriptor-bound API; security-sensitive
+/// callers must fail closed instead of reopening the symlink by name.
+pub(crate) fn read_open_symlink(object: &File) -> Result<Option<Vec<u8>>> {
+    #[cfg(target_os = "linux")]
+    {
+        let empty = c"";
+        read_link_bytes(|target, capacity| unsafe {
+            libc::readlinkat(object.as_raw_fd(), empty.as_ptr(), target, capacity)
+        })
+        .map(Some)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `freadlink` was added in macOS 13. Resolve it dynamically so a binary
+        // that otherwise runs on an older release does not gain a hard loader
+        // dependency. Callers reject `None` rather than re-address by name.
+        type Freadlink =
+            unsafe extern "C" fn(libc::c_int, *mut libc::c_char, libc::size_t) -> libc::ssize_t;
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"freadlink".as_ptr()) };
+        if symbol.is_null() {
+            return Ok(None);
+        }
+        let freadlink: Freadlink = unsafe { std::mem::transmute(symbol) };
+        read_link_bytes(|target, capacity| unsafe {
+            freadlink(object.as_raw_fd(), target, capacity)
+        })
+        .map(Some)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = object;
+        Ok(None)
+    }
+}
+
+fn read_link_bytes(mut read: impl FnMut(*mut libc::c_char, usize) -> isize) -> Result<Vec<u8>> {
     let mut capacity = 256usize;
     loop {
         let mut target = Vec::<u8>::with_capacity(capacity);
-        let length = unsafe {
-            libc::readlinkat(parent, name.as_ptr(), target.as_mut_ptr().cast(), capacity)
-        };
+        let length = read(target.as_mut_ptr().cast(), capacity);
         if length < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -1200,11 +1738,93 @@ fn require_operator_identity(
     Ok(())
 }
 
+fn require_metadata_identity(
+    expected: RootMetadata,
+    actual: RootMetadata,
+    label: &str,
+) -> Result<()> {
+    if (actual.dev, actual.ino, actual.file_type())
+        != (expected.dev, expected.ino, expected.file_type())
+    {
+        bail!("{label} changed identity");
+    }
+    Ok(())
+}
+
 fn operator_symlink_owner_is_trusted(owner: u32, euid: u32) -> bool {
     owner == 0 || owner == euid
 }
 
+fn require_operator_link_fallback_allowed(policy: OperatorSymlinkPolicy) -> Result<()> {
+    if policy == OperatorSymlinkPolicy::TrustedOwner {
+        bail!(
+            "trusted-owner symlink traversal requires descriptor-bound link reads on this platform"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn operator_descriptor_is_procfs(file: &File) -> Result<bool> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    loop {
+        if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } == 0 {
+            let stats = unsafe { stats.assume_init() };
+            return Ok(stats.f_type as u32 == libc::PROC_SUPER_MAGIC as u32);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error).context("identify operator descriptor filesystem");
+        }
+    }
+}
+
+/// Upgrade a retained Linux `O_PATH` object to a readable descriptor without
+/// consulting its former pathname. A verified procfs directory makes the
+/// decimal entry an exact reference to `object`, even after namespace rename.
+#[cfg(target_os = "linux")]
+fn reopen_pinned_object_for_read(object: &File) -> Result<Option<File>> {
+    let proc_path = CString::new("/proc/self/fd").expect("fixed procfs path contains no NUL");
+    let proc_fd = match open_at(
+        libc::AT_FDCWD,
+        &proc_path,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(proc_fd) => proc_fd,
+        Err(_) => return Ok(None),
+    };
+    if !operator_descriptor_is_procfs(&proc_fd)? {
+        return Ok(None);
+    }
+    let name = CString::new(object.as_raw_fd().to_string())
+        .expect("decimal file descriptor contains no NUL");
+    open_at(
+        proc_fd.as_raw_fd(),
+        &name,
+        libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+        0,
+    )
+    .map(Some)
+    .context("reopen selected FIFO through its retained descriptor")
+}
+
 fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    let access = libc::O_PATH;
+    #[cfg(target_os = "macos")]
+    let access = libc::O_SEARCH;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let access = libc::O_RDONLY;
+    open_at(
+        parent.as_raw_fd(),
+        &component_cstring(component),
+        access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+fn open_readable_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     open_at(
         parent.as_raw_fd(),
         &component_cstring(component),
@@ -1216,6 +1836,15 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
             | libc::O_CLOEXEC,
         0,
     )
+}
+
+fn missing_directory_suffix(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            .is_some_and(|errno| matches!(errno, libc::ENOENT | libc::ENOTDIR | libc::ELOOP))
+    })
 }
 
 fn open_at(parent: RawFd, name: &CString, flags: libc::c_int, mode: u32) -> io::Result<File> {
@@ -1265,19 +1894,6 @@ fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
     }
 }
 
-fn retry_fd(mut operation: impl FnMut() -> libc::c_int) -> io::Result<libc::c_int> {
-    loop {
-        let descriptor = operation();
-        if descriptor >= 0 {
-            return Ok(descriptor);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
 fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     retry_zero(|| unsafe {
@@ -1299,7 +1915,7 @@ fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
     })
 }
 
-fn root_metadata_from_std(metadata: &std::fs::Metadata) -> Result<RootMetadata> {
+pub(crate) fn root_metadata_from_std(metadata: &std::fs::Metadata) -> Result<RootMetadata> {
     Ok(RootMetadata {
         dev: metadata.dev(),
         ino: metadata.ino(),
@@ -1475,6 +2091,122 @@ fn require_regular(file: &File, path: &RelativePath) -> Result<()> {
         bail!("confined path {} is not a regular file", path.label());
     }
     Ok(())
+}
+
+fn is_safe_staged_identity(metadata: RootMetadata, expected_dev: u64, expected_ino: u64) -> bool {
+    metadata.is_file()
+        && metadata.nlink == 1
+        && metadata.dev == expected_dev
+        && metadata.ino == expected_ino
+}
+
+fn is_safe_staged_identity_after_link(
+    metadata: RootMetadata,
+    expected_dev: u64,
+    expected_ino: u64,
+) -> bool {
+    metadata.is_file()
+        && metadata.nlink == 2
+        && metadata.dev == expected_dev
+        && metadata.ino == expected_ino
+}
+
+fn require_safe_staged_identity(
+    metadata: RootMetadata,
+    expected_dev: u64,
+    expected_ino: u64,
+    path: &RelativePath,
+) -> Result<()> {
+    if !is_safe_staged_identity(metadata, expected_dev, expected_ino) {
+        bail!(
+            "confined staged path {} is not the expected singly-linked regular file",
+            path.label()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PublicationTestPoint {
+    AfterAnyRename,
+    AfterAbsentLink,
+    BeforeMatchedExchange,
+    AfterMatchedExchange,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PublicationTestHookKey {
+    root: RootIdentity,
+    target: RelativePath,
+    point: PublicationTestPoint,
+}
+
+#[cfg(test)]
+type PublicationTestAction = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+fn publication_test_hooks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<PublicationTestHookKey, PublicationTestAction>,
+> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PublicationTestHookKey, PublicationTestAction>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+struct PublicationTestHookGuard(PublicationTestHookKey);
+
+#[cfg(test)]
+impl Drop for PublicationTestHookGuard {
+    fn drop(&mut self) {
+        publication_test_hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+fn install_publication_test_hook(
+    root: RootIdentity,
+    target: &RelativePath,
+    point: PublicationTestPoint,
+    action: impl FnOnce() + Send + 'static,
+) -> PublicationTestHookGuard {
+    let key = PublicationTestHookKey {
+        root,
+        target: target.clone(),
+        point,
+    };
+    let previous = publication_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Box::new(action));
+    assert!(previous.is_none(), "duplicate publication test hook");
+    PublicationTestHookGuard(key)
+}
+
+#[cfg(test)]
+fn run_publication_test_hook(
+    root: RootIdentity,
+    target: &RelativePath,
+    point: PublicationTestPoint,
+) {
+    let key = PublicationTestHookKey {
+        root,
+        target: target.clone(),
+        point,
+    };
+    let action = publication_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    if let Some(action) = action {
+        action();
+    }
 }
 
 #[cfg(test)]
@@ -1656,6 +2388,88 @@ mod tests {
     }
 
     #[test]
+    fn trusted_owner_never_falls_back_to_a_second_pathname_lookup() {
+        assert!(
+            require_operator_link_fallback_allowed(OperatorSymlinkPolicy::TrustedOwner).is_err()
+        );
+        assert!(require_operator_link_fallback_allowed(OperatorSymlinkPolicy::FollowAll).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_fifo_reopens_exactly_and_waits_for_a_writer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tree = TestDir::new("operator-fifo-read");
+        let fifo = tree.path().join("rules");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let base = File::open(tree.path()).unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+        let selected = resolver
+            .resolve(
+                b"rules",
+                OperatorFinalComponent::ReadableEntry {
+                    follow_symlink: true,
+                },
+                false,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let PinnedPath::Leaf(leaf) = selected else {
+            panic!("FIFO was not selected as a leaf");
+        };
+
+        let (opened_tx, opened_rx) = mpsc::sync_channel(1);
+        let opener = std::thread::spawn(move || opened_tx.send(leaf.open_read()).unwrap());
+        assert!(matches!(
+            opened_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let mut writer = File::options().write(true).open(&fifo).unwrap();
+        writer.write_all(b"drop\n").unwrap();
+        drop(writer);
+        let mut reader = opened_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exact FIFO reopen did not rendezvous with its writer")
+            .unwrap();
+        let mut contents = Vec::new();
+        reader.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"drop\n");
+        opener.join().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn selected_fifo_fails_closed_without_an_exact_reopen() {
+        let tree = TestDir::new("operator-fifo-cutout");
+        let fifo = tree.path().join("rules");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let base = File::open(tree.path()).unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+        let selected = resolver
+            .resolve(
+                b"rules",
+                OperatorFinalComponent::ReadableEntry {
+                    follow_symlink: true,
+                },
+                false,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let PinnedPath::Leaf(leaf) = selected else {
+            panic!("FIFO was not selected as a leaf");
+        };
+        let error = leaf.open_read().unwrap_err().to_string();
+        assert!(error.contains("exact descriptor"), "{error}");
+    }
+
+    #[test]
     fn confined_operator_resolver_rejects_relative_and_absolute_link_escapes() {
         let tree = TestDir::new("operator-confined");
         let base_path = tree.path().join("base");
@@ -1809,6 +2623,31 @@ mod tests {
     }
 
     #[test]
+    fn opened_directory_apis_reject_non_component_names() {
+        let tree = TestDir::new("opened-directory-name");
+        let root = Root::open(tree.path()).unwrap();
+        let empty = relative(b"");
+        let directory = root.open_directory(&empty).unwrap();
+        let expected = root.metadata(&empty).unwrap();
+
+        for unsafe_name in [
+            &b""[..],
+            &b"."[..],
+            &b".."[..],
+            &b"child/grandchild"[..],
+            &b"nul\0name"[..],
+        ] {
+            assert!(root.metadata_in_directory(&directory, unsafe_name).is_err());
+            assert!(root
+                .read_link_in_directory(&directory, unsafe_name)
+                .is_err());
+            assert!(root
+                .open_child_directory_verified(&directory, unsafe_name, expected)
+                .is_err());
+        }
+    }
+
+    #[test]
     fn follows_only_the_explicit_root_symlink() {
         let tree = TestDir::new("root-symlink");
         let real = tree.path().join("real");
@@ -1851,6 +2690,61 @@ mod tests {
         old.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"old");
         assert!(root.open_regular_read(&relative(b"new")).is_err());
+    }
+
+    #[test]
+    fn adopted_operator_descriptor_stays_stable_and_can_be_enumerated_repeatedly() {
+        let tree = TestDir::new("adopted-root");
+        let selected = tree.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("first"), b"first").unwrap();
+        fs::write(selected.join("second"), b"second").unwrap();
+        let pinned = OperatorResolver::resolve_process(
+            selected.as_os_str().as_bytes(),
+            OperatorSymlinkPolicy::Refuse,
+            OperatorFinalComponent::Directory,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let PinnedPath::Directory(directory) = pinned else {
+            panic!("operator directory was not pinned");
+        };
+        let root = Root::from_directory(directory.into_parts().0).unwrap();
+
+        fs::rename(&selected, tree.path().join("moved")).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("replacement"), b"replacement").unwrap();
+
+        let mut first = root.read_directory(&relative(b"")).unwrap();
+        let mut second = root.read_directory(&relative(b"")).unwrap();
+        first.sort();
+        second.sort();
+        assert_eq!(first, [b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(second, first);
+        assert!(root.metadata(&relative(b"replacement")).is_err());
+    }
+
+    #[test]
+    fn descendant_traversal_needs_search_but_not_read_permission() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tree = TestDir::new("search-only");
+        let child = tree.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("file"), b"contents").unwrap();
+        let root = Root::open(tree.path()).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o111)).unwrap();
+
+        let metadata = root.metadata(&relative(b"child/file")).unwrap();
+        assert!(metadata.is_file());
+        let mut file = root.open_regular_read(&relative(b"child/file")).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"contents");
+
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
@@ -2047,6 +2941,253 @@ mod tests {
         let new_fifo = root.metadata(&fifo).unwrap();
         assert_eq!(new_fifo.file_type(), MODE_FIFO);
         assert_ne!(new_fifo.ino, old_fifo.ino);
+    }
+
+    #[test]
+    fn any_publication_never_rolls_back_a_later_writer() {
+        let tree = TestDir::new("any-publication-race");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_file = File::open(tree.path().join("staged")).unwrap();
+        let metadata = staged_file.metadata().unwrap();
+
+        let target_path = tree.path().join("target");
+        let _hook = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::AfterAnyRename,
+            move || {
+                fs::remove_file(&target_path).unwrap();
+                fs::write(&target_path, b"later").unwrap();
+            },
+        );
+        let error = root
+            .rename_regular_if_same(&staged, &target, (metadata.dev(), metadata.ino()))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed during publication"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
+        assert!(!tree.path().join("staged").exists());
+        assert_eq!(metadata.ino(), staged_file.metadata().unwrap().ino());
+    }
+
+    #[test]
+    fn absent_publication_never_unlinks_a_later_writer() {
+        let tree = TestDir::new("absent-publication-race");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        let metadata = fs::metadata(tree.path().join("staged")).unwrap();
+
+        let target_path = tree.path().join("target");
+        let _hook = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::AfterAbsentLink,
+            move || {
+                fs::remove_file(&target_path).unwrap();
+                fs::write(&target_path, b"later").unwrap();
+            },
+        );
+        let error = root
+            .publish_new_regular(&staged, &target, (metadata.dev(), metadata.ino()))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed during publication"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
+        assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"staged");
+    }
+
+    #[test]
+    fn matched_publication_authenticates_the_held_staged_inode() {
+        let tree = TestDir::new("matched-publication-staged-identity");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_file = File::open(tree.path().join("staged")).unwrap();
+        let staged_metadata = staged_file.metadata().unwrap();
+        let target_metadata = root.metadata(&target).unwrap();
+
+        fs::rename(tree.path().join("staged"), tree.path().join("held-staged")).unwrap();
+        fs::write(tree.path().join("staged"), b"impostor").unwrap();
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                target_metadata.dev,
+                target_metadata.ino,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("not the expected singly-linked regular file"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"old");
+        assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"impostor");
+        assert_eq!(
+            staged_metadata.ino(),
+            fs::metadata(tree.path().join("held-staged")).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn matched_publication_detects_a_staged_race_during_exchange() {
+        let tree = TestDir::new("matched-publication-staged-race");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_file = File::open(tree.path().join("staged")).unwrap();
+        let staged_metadata = staged_file.metadata().unwrap();
+        let target_metadata = root.metadata(&target).unwrap();
+
+        let staged_path = tree.path().join("staged");
+        let held_staged_path = tree.path().join("held-staged");
+        let _before_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::BeforeMatchedExchange,
+            move || {
+                fs::rename(&staged_path, &held_staged_path).unwrap();
+                fs::write(&staged_path, b"impostor").unwrap();
+            },
+        );
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                target_metadata.dev,
+                target_metadata.ino,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("staged path staged changed during publication"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"impostor");
+        assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"old");
+        assert_eq!(
+            fs::read(tree.path().join("held-staged")).unwrap(),
+            b"staged"
+        );
+    }
+
+    #[test]
+    fn matched_publication_never_rolls_back_a_later_writer() {
+        let tree = TestDir::new("matched-publication-race");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let target_metadata = root.metadata(&target).unwrap();
+
+        let target_path = tree.path().join("target");
+        let old_target_path = tree.path().join("old-target");
+        let _before_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::BeforeMatchedExchange,
+            move || {
+                fs::rename(&target_path, &old_target_path).unwrap();
+                fs::write(&target_path, b"raced-before-exchange").unwrap();
+            },
+        );
+        let target_path = tree.path().join("target");
+        let published_staged_path = tree.path().join("published-staged");
+        let _after_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::AfterMatchedExchange,
+            move || {
+                fs::rename(&target_path, &published_staged_path).unwrap();
+                fs::write(&target_path, b"later").unwrap();
+            },
+        );
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                target_metadata.dev,
+                target_metadata.ino,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed during publication"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
+        assert_eq!(
+            fs::read(tree.path().join("staged")).unwrap(),
+            b"raced-before-exchange"
+        );
+        assert_eq!(fs::read(tree.path().join("old-target")).unwrap(), b"old");
+        assert_eq!(
+            fs::read(tree.path().join("published-staged")).unwrap(),
+            b"staged"
+        );
+    }
+
+    #[test]
+    fn matched_leaf_replacement_never_rolls_back_a_later_writer() {
+        let tree = TestDir::new("matched-leaf-race");
+        let root = Root::open(tree.path()).unwrap();
+        let target = relative(b"target");
+        root.create_symlink(&target, b"old").unwrap();
+        let target_metadata = root.metadata(&target).unwrap();
+
+        let target_path = tree.path().join("target");
+        let old_target_path = tree.path().join("old-target");
+        let _before_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::BeforeMatchedExchange,
+            move || {
+                fs::rename(&target_path, &old_target_path).unwrap();
+                symlink("raced-before-exchange", &target_path).unwrap();
+            },
+        );
+        let target_path = tree.path().join("target");
+        let published_replacement_path = tree.path().join("published-replacement");
+        let _after_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::AfterMatchedExchange,
+            move || {
+                fs::rename(&target_path, &published_replacement_path).unwrap();
+                symlink("later", &target_path).unwrap();
+            },
+        );
+        let error = root
+            .replace_symlink_if_same(
+                &target,
+                b"replacement",
+                target_metadata.dev,
+                target_metadata.ino,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed during replacement"));
+        assert_eq!(
+            fs::read_link(tree.path().join("target")).unwrap(),
+            Path::new("later")
+        );
+        assert_eq!(
+            fs::read_link(tree.path().join("old-target")).unwrap(),
+            Path::new("old")
+        );
+        assert_eq!(
+            fs::read_link(tree.path().join("published-replacement")).unwrap(),
+            Path::new("replacement")
+        );
     }
 
     #[test]

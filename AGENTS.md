@@ -220,6 +220,17 @@ handoff when a change is broad, crosses subsystem boundaries, changes shared
 test infrastructure, or leaves meaningful uncertainty about the affected
 surface. Do not run unrelated suites merely because they exist.
 
+Changes to SSH, remote helpers, enrollment, restricted receivers, transports,
+or remote coordinator placement should also run the local-only three-container
+OpenSSH suite:
+
+```bash
+scripts/test-real-ssh.sh
+```
+
+It is intentionally not part of ordinary CI or `cargo test`; see
+`tests/real-ssh/README.md` for its isolation and coverage.
+
 Pull-request CI intentionally mirrors this policy: it runs formatting, clippy,
 and native unit tests for Rust changes, plus a directly affected SDK, rsync, or
 executable-documentation suite. The agent remains responsible for choosing and

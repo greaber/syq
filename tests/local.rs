@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -79,6 +80,607 @@ fn native_syq(args: &[&str]) -> Output {
         .expect("run native syq command")
 }
 
+#[test]
+fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creation() {
+    let t = Tmp::new();
+    write(&t.path("source"), &vec![b'x'; 8 * 1024 * 1024]);
+    let mut command = compat_command();
+    command.args([
+        "-a",
+        "--syq-connections",
+        "64",
+        "--no-progress",
+        &t.s("source"),
+        &t.s("destination"),
+    ]);
+    // Local and remote-TCP sources feed the same shared-worker count into FD
+    // admission. At 64 workers the conservative exact-leaf model plus the 64
+    // cross-session destination claims requires current_open + 1764 slots. Use
+    // a portable low limit here to verify that admission fails before
+    // destination creation; the exact per-worker arithmetic, including the
+    // uncached hash descriptor, is asserted in the FsOps unit test. The child
+    // must retain the lowered hard limit because syq
+    // normally raises a
+    // low soft limit to the inherited hard limit during startup. Never try to
+    // raise an inherited hard limit: supported environments commonly cap it
+    // at 1024. getrlimit/setrlimit are async-signal-safe on supported Unix.
+    unsafe {
+        command.pre_exec(|| {
+            let mut inherited = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let low_limit = inherited.rlim_max.min(128);
+            let limit = libc::rlimit {
+                rlim_cur: low_limit,
+                rlim_max: low_limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.run().unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("source setup needs about"), "{stderr}");
+    let required: usize = stderr
+        .split("source setup needs about ")
+        .nth(1)
+        .and_then(|tail| tail.split(" open-file slots").next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let current_open: usize = stderr
+        .split(" open-file slots (")
+        .nth(1)
+        .and_then(|tail| tail.split(" currently open)").next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Conservatively budget every selector as parent + exact object for the
+    // registry, control, and all 64 shared workers, plus worker/cache reserve.
+    assert_eq!(required, current_open + 1764, "{stderr}");
+    assert!(
+        !t.path("destination").exists(),
+        "source FD admission failed after destination creation"
+    );
+}
+
+#[test]
+fn source_fd_preflight_accounts_for_independent_ssh_broker_claims() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    write(&t.path("source"), &vec![b'x'; 8 * 1024 * 1024]);
+    let cache = t.path("tuning.json");
+    write(
+        &cache,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "paths": { "v1|fake>local|ssh": 64 }
+        }))
+        .unwrap()
+        .as_bytes(),
+    );
+    let remote = format!("fake:{}", t.s("source"));
+    let mut command = compat_command();
+    command
+        .arg("-e")
+        .arg(&ssh)
+        .args([
+            "--syq-no-bootstrap",
+            "--syq-no-tcp",
+            "--no-progress",
+            &remote,
+            &t.s("destination"),
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("SYQ_TUNING_CACHE", &cache);
+    unsafe {
+        command.pre_exec(|| {
+            let mut inherited = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let low_limit = inherited.rlim_max.min(128);
+            let limit = libc::rlimit {
+                rlim_cur: low_limit,
+                rlim_max: low_limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.run().unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("32 independent workers"), "{stderr}");
+    assert!(
+        !t.path("destination").exists(),
+        "independent-claim FD admission failed after destination creation"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn source_scan_uses_registered_root_after_operator_path_replacement() {
+    let t = Tmp::new();
+    write(&t.path("src/original"), b"original");
+    write(&t.path("outside/replacement"), b"replacement");
+    let ready = t.path("source-ready");
+
+    let mut child = compat_command()
+        .args([
+            "-anv",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the source root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "source root was not registered before timeout"
+    );
+
+    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/original (destination missing)"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("/replacement (destination missing)"),
+        "{stdout}"
+    );
+    assert!(
+        !t.path("dst").exists(),
+        "dry run unexpectedly created output"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn self_copy_guard_does_not_reject_a_destination_outside_the_moved_source() {
+    let t = Tmp::new();
+    write(&t.path("src/original"), b"original");
+    let ready = t.path("source-ready");
+    let source = format!("{}/", t.s("src"));
+    let destination = format!("{}/", t.s("src/out"));
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &source,
+            &destination,
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the source root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "source registration timed out");
+
+    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+    fs::create_dir(t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("src/out/original")), b"original");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn self_copy_guard_rejects_a_destination_inside_the_moved_source() {
+    let t = Tmp::new();
+    write(&t.path("src/original"), b"original");
+    let ready = t.path("source-ready");
+    let source = format!("{}/", t.s("src"));
+    let destination = format!("{}/", t.s("selected-and-moved/out"));
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &source,
+            &destination,
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the source root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "source registration timed out");
+
+    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+    fs::create_dir(t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    assert!(
+        stderr_of(&output).contains("maps inside source"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("selected-and-moved/out").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn exact_regular_source_replacement_is_rejected_after_registration() {
+    let t = Tmp::new();
+    write(&t.path("selected"), b"original");
+    let ready = t.path("source-ready");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-file",
+            &t.s("selected"),
+            "--as-new",
+            &t.s("destination"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the exact regular source"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "source registration timed out");
+    fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
+    write(&t.path("selected"), b"replacement");
+
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    assert!(
+        stderr_of(&output).contains("registered source leaf changed identity"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("destination").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn exact_symlink_source_replacement_is_rejected_after_registration() {
+    let t = Tmp::new();
+    write(&t.path("target-a"), b"a");
+    write(&t.path("target-b"), b"b");
+    std::os::unix::fs::symlink("target-a", t.path("selected")).unwrap();
+    let ready = t.path("source-ready");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-file",
+            &t.s("selected"),
+            "--as-new",
+            &t.s("destination"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the exact symlink source"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "source registration timed out");
+    fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
+    std::os::unix::fs::symlink("target-b", t.path("selected")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    assert!(
+        stderr_of(&output).contains("registered source leaf changed identity"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("destination").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
+    let t = Tmp::new();
+    let original_large = vec![b'o'; 5 << 20];
+    write(&t.path("src/small"), b"original");
+    write(&t.path("src/large"), &original_large);
+    write(&t.path("outside/small"), b"replaced");
+    write(&t.path("outside/large"), &vec![b'r'; 5 << 20]);
+    let ready = t.path("source-content-ready");
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+            "--no-progress",
+        ])
+        // Keep the test on the ranged transport path instead of the excluded
+        // same-machine CopyLocal optimization.
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the source root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "source root was not registered before timeout"
+    );
+
+    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/small")), b"original");
+    assert_eq!(read(&t.path("dst/large")), original_large);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_uses_registered_source_after_path_replacement() {
+    let t = Tmp::new();
+    let original = vec![b'o'; 8 << 20];
+    write(&t.path("src/file"), &original);
+    write(&t.path("outside/file"), &vec![b'r'; original.len()]);
+    let ready = t.path("source-capability-ready");
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        // A pathname fallback would read through the replacement below. A
+        // streaming fallback fails instead of hiding that CopyLocal was not
+        // exercised.
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the source root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "source root was not registered before timeout"
+    );
+
+    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/file")), original);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_refuses_a_replaced_destination_parent() {
+    let t = Tmp::new();
+    write(&t.path("src/tree/file"), &vec![b's'; 8 << 20]);
+    fs::create_dir_all(t.path("dst/tree")).unwrap();
+    write(&t.path("outside/sentinel"), b"unchanged");
+    let ready = t.path("copy-local-ready");
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before reaching the local-copy destination open"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "local copy did not reach the test hook");
+
+    fs::rename(t.path("dst/tree"), t.path("dst/tree-original")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("dst/tree")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    assert_eq!(read(&t.path("outside/sentinel")), b"unchanged");
+    assert!(!t.path("outside/file").exists());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn inplace_copy_local_replaces_a_raced_destination_symlink() {
+    let t = Tmp::new();
+    let contents = vec![b's'; 8 << 20];
+    write(&t.path("src"), &contents);
+    write(&t.path("dst"), &vec![b'd'; contents.len()]);
+    write(&t.path("outside"), b"unchanged");
+    set_mtime(&t.path("src"), 1_700_000_000);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+    let ready = t.path("copy-local-ready");
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--inplace",
+            "--syq-connections",
+            "1",
+            &t.s("src"),
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before reaching the local-copy destination open"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "local copy did not reach the test hook");
+
+    fs::remove_file(t.path("dst")).unwrap();
+    std::os::unix::fs::symlink("outside", t.path("dst")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("outside")), b"unchanged");
+    assert!(fs::symlink_metadata(t.path("dst")).unwrap().is_file());
+    assert_eq!(read(&t.path("dst")), contents);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn insecure_links_does_not_delegate_unconfined_names_to_copy_local() {
+    let t = Tmp::new();
+    let contents = vec![b'u'; 8 << 20];
+    fs::create_dir_all(t.path("src")).unwrap();
+    write(&t.path("outside/secret"), &contents);
+    std::os::unix::fs::symlink("../outside", t.path("src/link")).unwrap();
+    write(&t.path("list"), b"link/secret\n");
+    let copy_local_ready = t.path("copy-local-ready");
+
+    let output = compat_command()
+        .args([
+            "-a",
+            "-r",
+            "--insecure-links",
+            "--files-from",
+            &t.s("list"),
+            &t.s("src"),
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &copy_local_ready)
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    assert!(!copy_local_ready.exists());
+    assert_eq!(read(&t.path("dst/link/secret")), contents);
+}
+
 fn run_native_ok(args: &[&str]) -> String {
     let out = native_syq(args);
     assert!(
@@ -139,6 +741,58 @@ fn read(p: &Path) -> Vec<u8> {
     let mut v = Vec::new();
     File::open(p).unwrap().read_to_end(&mut v).unwrap();
     v
+}
+
+#[cfg(debug_assertions)]
+fn start_held_control_path(
+    command: &mut Command,
+    selected: &Path,
+    ready: &Path,
+) -> std::process::Child {
+    command
+        .env("SYQ_TEST_CONTROL_PATH", selected)
+        .env("SYQ_TEST_CONTROL_PATH_READY_FILE", ready)
+        .env("SYQ_TEST_HOLD_CONTROL_PATH_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap()
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_control_path_selection(child: &mut std::process::Child, ready: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before retaining the selected control path"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "control path was not retained before timeout"
+    );
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_control_path_output(mut child: std::process::Child) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "syq did not finish after the control-path race\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn partial_files(dir: &Path) -> Vec<PathBuf> {
@@ -1100,6 +1754,421 @@ fn native_copy_control_file_paths_use_the_common_follow_policy() {
         &t.s("mapping-output"),
     ]);
     assert_eq!(read(&t.path("mapping-output/renamed")), b"data");
+    symlink("real-results", t.path("results-link")).unwrap();
+    let refused = native_syq(&[
+        "cp",
+        "--results",
+        &t.s("results-link"),
+        &t.s("src/keep"),
+        "--as",
+        &t.s("results-output"),
+    ]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(!t.path("real-results").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--follow",
+        "--results",
+        &t.s("results-link"),
+        &t.s("src/keep"),
+        "--as",
+        &t.s("results-output"),
+    ]);
+    assert!(!read(&t.path("real-results")).is_empty());
+
+    run_native_ok(&[
+        "cp",
+        "--ignore-from",
+        "/dev/null",
+        "--src-src",
+        &t.s("src"),
+        "--into",
+        &t.s("device-input-output"),
+    ]);
+    assert_eq!(read(&t.path("device-input-output/keep")), b"data");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn control_input_replacement_symlinks_cannot_redirect_reads() {
+    use std::os::unix::fs::symlink;
+
+    for family in ["native-ignore", "rsync-ignore", "files-from", "mapping"] {
+        let t = Tmp::new();
+        write(&t.path("src/keep"), b"data");
+        let selected = t.path("selected-control");
+        let outside = t.path("outside-control");
+        let control_contents = if family == "mapping" {
+            entry_line("keep", "keep", None)
+        } else if family == "files-from" {
+            "keep\n".to_string()
+        } else {
+            "# no exclusions\n".to_string()
+        };
+        write(&selected, control_contents.as_bytes());
+        write(&outside, control_contents.as_bytes());
+        let destination = t.path("dst");
+        let ready = t.path("control-ready");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        match family {
+            "native-ignore" => {
+                command
+                    .args(["cp", "--ignore-from"])
+                    .arg(&selected)
+                    .arg("--src-src")
+                    .arg(t.path("src"))
+                    .arg("--into")
+                    .arg(&destination)
+                    .arg("-q");
+            }
+            "rsync-ignore" => {
+                command
+                    .args(["rsync", "-a", "--syq-ignore-from"])
+                    .arg(&selected)
+                    .arg(t.s("src/"))
+                    .arg(&destination)
+                    .arg("--no-progress");
+            }
+            "files-from" => {
+                command
+                    .args(["rsync", "-a", "--files-from"])
+                    .arg(&selected)
+                    .arg(t.path("src"))
+                    .arg(&destination)
+                    .arg("--no-progress");
+            }
+            "mapping" => {
+                command
+                    .args(["cp", "--mapping"])
+                    .arg(&selected)
+                    .arg("-C")
+                    .arg(t.path("src"))
+                    .arg("--into")
+                    .arg(&destination)
+                    .arg("-q");
+            }
+            _ => unreachable!(),
+        }
+        let mut child = start_held_control_path(&mut command, &selected, &ready);
+        wait_for_control_path_selection(&mut child, &ready);
+
+        fs::rename(&selected, t.path("original-control")).unwrap();
+        symlink(&outside, &selected).unwrap();
+
+        let output = wait_for_control_path_output(child);
+        assert!(
+            !output.status.success(),
+            "{family} followed a replacement symlink"
+        );
+        assert!(
+            stderr_of(&output).contains("operator file"),
+            "{family}: {}",
+            stderr_of(&output)
+        );
+        assert!(
+            !destination.exists(),
+            "{family} mutated its destination after the control-path race"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn regular_control_input_raced_to_fifo_fails_without_blocking() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"data");
+    let selected = t.path("selected-control");
+    write(&selected, b"# no exclusions\n");
+    let destination = t.path("dst");
+    let ready = t.path("control-ready");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args(["cp", "--ignore-from"])
+        .arg(&selected)
+        .arg("--src-src")
+        .arg(t.path("src"))
+        .arg("--into")
+        .arg(&destination)
+        .arg("-q");
+    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    wait_for_control_path_selection(&mut child, &ready);
+
+    fs::rename(&selected, t.path("original-control")).unwrap();
+    mkfifo(&selected);
+
+    let output = wait_for_control_path_output(child);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("changed identity"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!destination.exists());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn selected_fifo_replacement_reads_the_retained_fifo() {
+    use std::sync::mpsc;
+
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"data");
+    let selected = t.path("selected-control");
+    mkfifo(&selected);
+    let destination = t.path("dst");
+    let ready = t.path("control-ready");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args(["cp", "--ignore-from"])
+        .arg(&selected)
+        .arg("--src-src")
+        .arg(t.path("src"))
+        .arg("--into")
+        .arg(&destination)
+        .arg("-q");
+    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    wait_for_control_path_selection(&mut child, &ready);
+
+    let original = t.path("original-control");
+    fs::rename(&selected, &original).unwrap();
+    mkfifo(&selected);
+    let (writer_tx, writer_rx) = mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let result = File::options()
+            .write(true)
+            .open(original)
+            .and_then(|mut file| file.write_all(b"# no exclusions\n"));
+        writer_tx.send(result).unwrap();
+    });
+
+    let output = wait_for_control_path_output(child);
+    let used_retained_fifo = match writer_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(result) => {
+            result.expect("retained FIFO writer failed");
+            true
+        }
+        Err(_) => {
+            // Unblock the owned writer so a failed assertion never leaks a thread.
+            let _rescue = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(t.path("original-control"))
+                .unwrap();
+            writer_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("FIFO writer did not finish after rescue")
+                .unwrap();
+            false
+        }
+    };
+    writer.join().unwrap();
+    assert!(
+        used_retained_fifo,
+        "syq opened the replacement FIFO instead of its retained selection"
+    );
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/keep")), b"data");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn named_fifo_control_input_fails_before_destination_mutation() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"data");
+    let selected = t.path("selected-control");
+    mkfifo(&selected);
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--ignore-from"])
+        .arg(&selected)
+        .arg("--src-src")
+        .arg(t.path("src"))
+        .arg("--into")
+        .arg(t.path("dst"))
+        .arg("-q")
+        .run()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("exact descriptor"));
+    assert!(!t.path("dst").exists());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn trusted_control_symlink_target_is_read_from_the_opened_link() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"keep");
+    write(&t.path("src/drop"), b"drop");
+    write(&t.path("original-rules"), b"drop\n");
+    write(&t.path("replacement-rules"), b"keep\n");
+    let selected = t.path("selected-control-link");
+    symlink("original-rules", &selected).unwrap();
+    let destination = t.path("dst");
+    let ready = t.path("symlink-ready");
+    let release = t.path("symlink-release");
+
+    let mut child = compat_command()
+        .args(["-a", "--syq-ignore-from"])
+        .arg(&selected)
+        .arg(t.s("src/"))
+        .arg(&destination)
+        .arg("--no-progress")
+        .env(
+            "SYQ_TEST_OPERATOR_SYMLINK_COMPONENT",
+            "selected-control-link",
+        )
+        .env("SYQ_TEST_OPERATOR_SYMLINK_READY_FILE", &ready)
+        .env("SYQ_TEST_OPERATOR_SYMLINK_RELEASE_FILE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_control_path_selection(&mut child, &ready);
+
+    fs::rename(&selected, t.path("moved-control-link")).unwrap();
+    symlink("replacement-rules", &selected).unwrap();
+    write(&release, b"continue");
+
+    let output = wait_for_control_path_output(child);
+    assert_output_ok(&output);
+    assert_eq!(listing(&destination), ["keep"]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn results_replacement_symlinks_cannot_redirect_creation_or_truncation() {
+    use std::os::unix::fs::symlink;
+
+    for initially_exists in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src"), b"data");
+        let selected = t.path("results.ndjson");
+        let outside = t.path("outside-results");
+        write(&outside, b"do not replace");
+        if initially_exists {
+            write(&selected, b"old results");
+        }
+        let destination = t.path("dst");
+        let ready = t.path("control-ready");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--results"])
+            .arg(&selected)
+            .arg(t.path("src"))
+            .arg("--as")
+            .arg(&destination)
+            .arg("-q");
+        let mut child = start_held_control_path(&mut command, &selected, &ready);
+        wait_for_control_path_selection(&mut child, &ready);
+
+        if initially_exists {
+            fs::rename(&selected, t.path("original-results")).unwrap();
+        }
+        symlink(&outside, &selected).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !output.status.success(),
+            "results {} followed a replacement symlink",
+            if initially_exists {
+                "truncation"
+            } else {
+                "creation"
+            }
+        );
+        assert!(stderr_of(&output).contains("--results"));
+        assert_eq!(read(&outside), b"do not replace");
+        assert!(!destination.exists());
+        if initially_exists {
+            assert_eq!(read(&t.path("original-results")), b"old results");
+        }
+    }
+}
+
+#[test]
+fn named_results_refuse_fifos_devices_and_trailing_slashes() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    let fifo = t.path("results-fifo");
+    mkfifo(&fifo);
+    let mut fifo_reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+
+    for (label, selected) in [("fifo", fifo), ("device", PathBuf::from("/dev/null"))] {
+        let destination = t.path(&format!("{label}-destination"));
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--results"])
+            .arg(&selected)
+            .arg(t.path("src"))
+            .arg("--as")
+            .arg(&destination)
+            .arg("-q")
+            .run()
+            .unwrap();
+        assert!(!output.status.success(), "named results accepted {label}");
+        assert!(stderr_of(&output).contains("already exists"));
+        assert!(!destination.exists());
+    }
+    let mut fifo_bytes = Vec::new();
+    fifo_reader.read_to_end(&mut fifo_bytes).unwrap();
+    assert!(fifo_bytes.is_empty(), "the refused FIFO was written");
+
+    let trailing = format!("{}/", t.s("missing-results"));
+    let output = native_syq(&[
+        "cp",
+        "--results",
+        &trailing,
+        &t.s("src"),
+        "--as",
+        &t.s("trailing-destination"),
+    ]);
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("trailing slash"));
+    assert!(!t.path("missing-results").exists());
+    assert!(!t.path("trailing-destination").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    write(&t.path("outside-results"), b"do not replace");
+    let selected = t.path("results-link");
+    symlink("intended-results", &selected).unwrap();
+    let ready = t.path("control-ready");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args(["cp", "--follow", "--results"])
+        .arg(&selected)
+        .arg(t.path("src"))
+        .arg("--as")
+        .arg(t.path("dst"))
+        .arg("-q");
+    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    wait_for_control_path_selection(&mut child, &ready);
+
+    fs::remove_file(&selected).unwrap();
+    symlink(t.path("outside-results"), &selected).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("outside-results")), b"do not replace");
+    let intended = read(&t.path("intended-results"));
+    assert!(
+        String::from_utf8_lossy(&intended).contains("\"type\":\"result\""),
+        "{}",
+        String::from_utf8_lossy(&intended)
+    );
+    assert_eq!(read(&t.path("dst")), b"data");
 }
 
 #[test]
@@ -4890,6 +5959,69 @@ fn native_rm_removes_named_tree_and_contents_keeps_root() {
 }
 
 #[test]
+fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    for name in ["explicit", "path"] {
+        write(&t.path(&format!("{name}/file")), b"remove");
+    }
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+
+    let run = |helper: &[&str], selected: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("rm")
+            .args(helper)
+            .args(["--from", "fake", "--cwd", &t.s(""), "--src", selected, "-q"])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+            )
+            .run()
+            .expect("run native remote removal");
+        assert_output_ok(&output);
+        assert!(!t.path(selected).exists());
+    };
+    run(&["--syq-path", env!("CARGO_BIN_EXE_syq")], "explicit");
+    run(&["--no-bootstrap"], "path");
+
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(log.contains(env!("CARGO_BIN_EXE_syq")), "{log}");
+    assert!(log.contains("syq --server"), "{log}");
+}
+
+#[test]
+fn native_rm_rejects_conflicting_or_local_remote_helper_selection() {
+    let t = Tmp::new();
+    write(&t.path("keep"), b"keep");
+    let conflict = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "rm",
+            "--from",
+            "fake",
+            "--syq-path",
+            "/opt/syq",
+            "--no-bootstrap",
+            "keep",
+        ])
+        .run()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(stderr_of(&conflict).contains("cannot be used with"));
+
+    let local = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rm", "--cwd", &t.s(""), "--syq-path", "/opt/syq", "keep"])
+        .run()
+        .unwrap();
+    assert_eq!(local.status.code(), Some(2));
+    assert!(stderr_of(&local).contains("only to a remote removal endpoint"));
+    assert_eq!(read(&t.path("keep")), b"keep");
+}
+
+#[test]
 fn native_rm_contents_requires_a_directory() {
     let t = Tmp::new();
     write(&t.path("file"), b"keep");
@@ -5210,6 +6342,114 @@ fn ignore_from_file_and_later_negation_wins() {
     ]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--syq-ignore-from"));
+}
+
+#[test]
+fn rsync_control_inputs_follow_links_owned_by_the_effective_user() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"keep");
+    write(&t.path("src/drop"), b"drop");
+    write(&t.path("patterns"), b"drop\n");
+    write(&t.path("list"), b"keep\n");
+    symlink("patterns", t.path("patterns-link")).unwrap();
+    symlink("list", t.path("list-link")).unwrap();
+
+    run_ok(&[
+        "-a",
+        "--syq-ignore-from",
+        &t.s("patterns-link"),
+        &t.s("src/"),
+        &t.s("ignored"),
+    ]);
+    assert_eq!(listing(&t.path("ignored")), ["keep"]);
+
+    run_ok(&[
+        "-a",
+        "--files-from",
+        &t.s("list-link"),
+        &t.s("src"),
+        &t.s("listed"),
+    ]);
+    assert_eq!(listing(&t.path("listed")), ["keep"]);
+}
+
+#[test]
+fn control_file_names_preserve_non_utf8_bytes() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"keep");
+    write(&t.path("src/drop"), b"drop");
+    let rules = t
+        .path("")
+        .join(std::ffi::OsString::from_vec(b"rules-\xff".to_vec()));
+    let list = t
+        .path("")
+        .join(std::ffi::OsString::from_vec(b"list-\xfe".to_vec()));
+    write(&rules, b"drop\n");
+    write(&list, b"keep\n");
+
+    let native = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--ignore-from"])
+        .arg(&rules)
+        .arg("--src-src")
+        .arg(t.path("src"))
+        .arg("--into")
+        .arg(t.path("native"))
+        .arg("-q")
+        .run()
+        .unwrap();
+    assert_output_ok(&native);
+    assert_eq!(listing(&t.path("native")), ["keep"]);
+
+    let compatible = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", "-a", "--syq-ignore-from"])
+        .arg(&rules)
+        .arg(t.s("src/"))
+        .arg(t.path("compatible"))
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&compatible);
+    assert_eq!(listing(&t.path("compatible")), ["keep"]);
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", "-a", "--files-from"])
+        .arg(&list)
+        .arg(t.path("src"))
+        .arg(t.path("listed"))
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&listed);
+    assert_eq!(listing(&t.path("listed")), ["keep"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rsync_control_input_accepts_an_inherited_procfs_pipe() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"keep");
+    write(&t.path("src/drop"), b"drop");
+    let mut descriptors = [0; 2];
+    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+    let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+    let mut writer = unsafe { File::from_raw_fd(descriptors[1]) };
+    writer.write_all(b"drop\n").unwrap();
+    drop(writer);
+    let rules = format!("/proc/self/fd/{}", reader.as_raw_fd());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", "-a", "--syq-ignore-from", &rules])
+        .arg(t.s("src/"))
+        .arg(t.path("dst"))
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(listing(&t.path("dst")), ["keep"]);
 }
 
 #[test]
@@ -5679,17 +6919,37 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
         &t.s("src"),
         &t.s("dst"),
     ]);
-    // `link` resolves to a directory, so the listed path is followed: the
-    // implied parent becomes a real directory on the destination (never a
-    // symlink a later write could go through). `a` was not recursed into
-    // despite -r: only listed directories are walked.
+    // SYQ deliberately refuses this earlier than hardened rsync 3.5: neither
+    // follows the implied source ancestor and both exit 23, but SYQ also avoids
+    // emitting the implied destination directory. Other valid paths complete.
+    assert_eq!(out.status.code(), Some(23));
+    assert!(stderr_of(&out).contains("link is not a directory"));
+    assert_eq!(listing(&t.path("dst")), ["a", "a/listed"]);
+    assert!(!t.path("dst/link/secret").exists());
+
+    // The compatibility escape hatch is explicit and unconfined. It restores
+    // the old followed-ancestor behavior; implied parents are materialized as
+    // real destination directories. `a` is still not recursively walked.
+    let out = syq(&[
+        "-a",
+        "-r",
+        "--insecure-links",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst-insecure"),
+    ]);
     assert!(out.status.success(), "{}", stderr_of(&out));
     assert_eq!(
-        listing(&t.path("dst")),
+        listing(&t.path("dst-insecure")),
         ["a", "a/listed", "link", "link/secret"]
     );
-    assert!(t.path("dst/link").symlink_metadata().unwrap().is_dir());
-    assert_eq!(read(&t.path("dst/link/secret")), b"secret");
+    assert!(t
+        .path("dst-insecure/link")
+        .symlink_metadata()
+        .unwrap()
+        .is_dir());
+    assert_eq!(read(&t.path("dst-insecure/link/secret")), b"secret");
 
     // An ancestor that resolves to a file, or dangles, is an error.
     std::os::unix::fs::symlink("a/listed", t.path("src/tofile")).unwrap();
@@ -5697,6 +6957,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
     write(&t.path("list2"), b"tofile/x\ndangling/y\n");
     let out = syq(&[
         "-a",
+        "--insecure-links",
         "--files-from",
         &t.s("list2"),
         &t.s("src"),
@@ -5715,6 +6976,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
     write(&t.path("list3"), b"link\nlink/secret\n");
     let out = syq(&[
         "-a",
+        "--insecure-links",
         "--files-from",
         &t.s("list3"),
         &t.s("src"),
@@ -7153,8 +8415,8 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
     let original = vec![b'a'; 8 * 1024 * 1024];
     let mut changed = original.clone();
     changed[0] = b'b';
-    write(&t.path("src"), &original);
-    set_mtime(&t.path("src"), 1_600_000_000);
+    write(&t.path("src/file"), &original);
+    set_mtime(&t.path("src/file"), 1_600_000_000);
 
     let child = compat_command()
         .args([
@@ -7163,8 +8425,8 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
             "--bwlimit",
             "1G",
             "--no-progress",
-            &t.s("src"),
-            &t.s("dst"),
+            &t.s("src/"),
+            &t.s("dst/"),
         ])
         .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
         .stdout(Stdio::piped())
@@ -7172,15 +8434,15 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
         .start()
         .unwrap();
     for _ in 0..200 {
-        if t.path("dst").exists() {
+        if t.path("dst/file").exists() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(t.path("dst").exists(), "first attempt never finalized");
+    assert!(t.path("dst/file").exists(), "first attempt never finalized");
     write(&t.path("replacement"), &changed);
     set_mtime(&t.path("replacement"), 1_600_000_001);
-    fs::rename(t.path("replacement"), t.path("src")).unwrap();
+    fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
 
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -7189,7 +8451,7 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(read(&t.path("dst")), changed);
+    assert_eq!(read(&t.path("dst/file")), changed);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("bytes transferred: 12,582,912"),
@@ -7203,11 +8465,11 @@ fn changed_source_retry_still_uses_copy_file_range() {
     let t = Tmp::new();
     let original = vec![b'a'; 8 * 1024 * 1024];
     let changed = vec![b'b'; 8 * 1024 * 1024];
-    write(&t.path("src"), &original);
-    set_mtime(&t.path("src"), 1_600_000_000);
+    write(&t.path("src/file"), &original);
+    set_mtime(&t.path("src/file"), 1_600_000_000);
 
     let child = compat_command()
-        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
         .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
         .stdout(Stdio::piped())
@@ -7215,15 +8477,15 @@ fn changed_source_retry_still_uses_copy_file_range() {
         .start()
         .unwrap();
     for _ in 0..200 {
-        if t.path("dst").exists() {
+        if t.path("dst/file").exists() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(t.path("dst").exists(), "first attempt never finalized");
+    assert!(t.path("dst/file").exists(), "first attempt never finalized");
     write(&t.path("replacement"), &changed);
     set_mtime(&t.path("replacement"), 1_600_000_001);
-    fs::rename(t.path("replacement"), t.path("src")).unwrap();
+    fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
 
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -7232,7 +8494,7 @@ fn changed_source_retry_still_uses_copy_file_range() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(read(&t.path("dst")), changed);
+    assert_eq!(read(&t.path("dst/file")), changed);
 }
 
 // A destination given as a symlink to a directory is that directory, whether
@@ -7330,23 +8592,195 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
 
         let output = child.wait_with_output().unwrap();
-        if no_tcp {
-            assert!(
-                !output.status.success(),
-                "a fresh worker reused a changed root"
-            );
-            assert!(
-                stderr_of(&output).contains("destination root changed identity"),
-                "{}",
-                stderr_of(&output)
-            );
-            assert!(!t.path("selected-and-moved/f").exists());
-        } else {
-            assert_output_ok(&output);
-            assert_eq!(read(&t.path("selected-and-moved/f")), b"payload");
-        }
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("selected-and-moved/f")), b"payload");
         assert!(!t.path("outside/f").exists());
         assert!(fs::symlink_metadata(t.path("dst"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn destination_file_write_refuses_descendant_symlink_swap() {
+    for no_tcp in [false, true] {
+        let t = Tmp::new();
+        let contents = vec![b'x'; 8 * 1024 * 1024];
+        write(&t.path("src/victim/file"), &contents);
+        fs::create_dir_all(t.path("dst/victim")).unwrap();
+        write(&t.path("outside/sentinel"), b"outside");
+
+        let mut command = compat_command();
+        command.args([
+            "-a",
+            "--bwlimit",
+            "1G",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
+        if no_tcp {
+            command.arg("--syq-no-tcp");
+        }
+        let mut child = command
+            .arg("--no-progress")
+            .env("SYQ_TEST_HOLD_PARTIAL_MS", "1000")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while partial_files(&t.path("dst/victim")).len() != 1
+            && std::time::Instant::now() < deadline
+        {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before preparing the destination sidecar"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            partial_files(&t.path("dst/victim")).len(),
+            1,
+            "destination sidecar was not prepared before timeout"
+        );
+
+        fs::rename(t.path("dst/victim"), t.path("displaced-victim")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("dst/victim")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+        assert_eq!(read(&t.path("outside/sentinel")), b"outside");
+        assert!(!t.path("outside/file").exists());
+        assert!(!t.path("displaced-victim/file").exists());
+        assert_eq!(partial_files(&t.path("displaced-victim")).len(), 1);
+        assert!(fs::symlink_metadata(t.path("dst/victim"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn destination_prune_scan_uses_retained_root_after_replacement() {
+    for no_tcp in [false, true] {
+        let t = Tmp::new();
+        fs::create_dir_all(t.path("src")).unwrap();
+        write(&t.path("dst/extra"), b"extra");
+        write(&t.path("outside/sentinel"), b"outside");
+        let ready = t.path("anchor-ready");
+
+        let mut command = compat_command();
+        command.args([
+            "-a",
+            "--delete",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
+        if no_tcp {
+            command.arg("--syq-no-tcp");
+        }
+        let mut child = command
+            .arg("--no-progress")
+            .env("SYQ_TEST_DESTINATION_ANCHORED_FILE", &ready)
+            .env("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS", "750")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before retaining the destination root"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "destination root was not retained before timeout"
+        );
+
+        fs::rename(t.path("dst"), t.path("selected-and-moved")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        assert!(!t.path("selected-and-moved/extra").exists());
+        assert_eq!(read(&t.path("outside/sentinel")), b"outside");
+        assert!(fs::symlink_metadata(t.path("dst"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn destination_prune_scan_refuses_descendant_symlink_swap() {
+    for no_tcp in [false, true] {
+        let t = Tmp::new();
+        fs::create_dir_all(t.path("src/victim")).unwrap();
+        write(&t.path("dst/victim/extra"), b"extra");
+        write(&t.path("outside/sentinel"), b"outside");
+        let ready = t.path("scan-ready");
+
+        let mut command = compat_command();
+        command.args([
+            "-a",
+            "--delete",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
+        if no_tcp {
+            command.arg("--syq-no-tcp");
+        }
+        let mut child = command
+            .arg("--no-progress")
+            .env("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY", "victim")
+            .env("SYQ_TEST_DESTINATION_SCAN_DIRECTORY_READY_FILE", &ready)
+            .env("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY_MS", "750")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before reaching the descendant directory scan"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "destination descendant scan was not reached before timeout"
+        );
+
+        fs::rename(t.path("dst/victim"), t.path("displaced-victim")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("dst/victim")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+        assert!(
+            stderr_of(&output).contains("delete victim/extra"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(read(&t.path("outside/sentinel")), b"outside");
+        assert_eq!(read(&t.path("displaced-victim/extra")), b"extra");
+        assert!(fs::symlink_metadata(t.path("dst/victim"))
             .unwrap()
             .file_type()
             .is_symlink());
@@ -7841,13 +9275,11 @@ fn files_from_symlink_conflict_is_order_independent() {
             stderr_of(&out)
         );
         let md = t.path(&format!("dst{n}/link")).symlink_metadata().unwrap();
-        // Either the symlink alone (order 1) or a real directory (order 2) —
-        // never a write through a destination symlink.
-        assert!(md.is_symlink() || md.is_dir());
+        // The listed symlink itself is preserved in either order, while the
+        // path through it is rejected before any implied directory is emitted.
+        assert!(md.is_symlink());
         assert!(!t.path("outside/secret2").exists());
     }
-    assert_eq!(read(&t.path("dst2/link/secret")), b"s");
-    assert!(t.path("dst2/link").symlink_metadata().unwrap().is_dir());
 }
 
 #[test]
@@ -9152,6 +10584,32 @@ fn native_cp_mapping_hard_refusals() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("cannot be used with"), "{stderr}");
     assert!(stderr.contains("--prune"), "{stderr}");
+}
+
+#[test]
+fn native_mapping_names_never_inherit_operator_follow() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src")).unwrap();
+    write(&t.path("outside/secret"), b"secret");
+    std::os::unix::fs::symlink("../outside", t.path("src/link")).unwrap();
+    let manifest = entry_line("link/secret", "copied", None);
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--follow",
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("source link/secret does not exist"));
+    assert!(!t.path("dst/copied").exists());
 }
 
 #[test]

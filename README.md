@@ -57,10 +57,10 @@ cargo install --locked --path . # or: put it on your PATH
 
 Managed remote bootstrap is available only from official release builds.
 For Cargo and checkout builds, install a compatible `syq` on the remote and
-select it explicitly. Native `syq cp` uses `--syq-path PATH`, or
-`--no-bootstrap` when the binary is on the remote `PATH`; `syq rsync` uses the
-rsync-compatible `--rsync-path PATH`, or `--syq-no-bootstrap` for the same
-`PATH` lookup.
+select it explicitly. Native `syq cp` and remote `syq rm` use `--syq-path
+PATH`, or `--no-bootstrap` when the binary is on the remote `PATH`; `syq
+rsync` uses the rsync-compatible `--rsync-path PATH`, or
+`--syq-no-bootstrap` for the same `PATH` lookup.
 
 Standalone installs download and verify one signed release manifest at most
 once a day after a successful interactive command. When a newer release is
@@ -82,8 +82,8 @@ usually produce Gatekeeper prompts. A binary downloaded through a browser may;
 browser-oriented distribution would need Apple Developer ID signing and
 notarization in addition to this terminal-first path.
 
-The remote side runs `syq --server`, but it does not need to be installed or
-configured first. An official syq uses its exact release helper under
+An ordinary remote side runs `syq --server`, but it does not need to be
+installed or configured first. An official syq uses its exact release helper under
 `~/.cache/syq/helpers/`. On first use of a version it detects the remote
 platform and checks for a downloader, SHA-256 implementation, and `gzip`. When
 that complete toolchain is available, the remote downloads the matching
@@ -108,10 +108,10 @@ discarded and produces an integrity warning even if the verified upload then
 succeeds.
 
 The managed cache accepts only a verified release binary. To opt out of
-managed bootstrap, install a compatible binary yourself. Native `syq cp` uses
-`--syq-path /path/to/syq`, or `--no-bootstrap` when the binary is on the
-non-interactive remote `PATH`; `syq rsync` uses `--rsync-path /path/to/syq` or
-`--syq-no-bootstrap`.
+managed bootstrap, install a compatible binary yourself. Native `syq cp` and
+remote `syq rm` use `--syq-path /path/to/syq`, or `--no-bootstrap` when the
+binary is on the non-interactive remote `PATH`; `syq rsync` uses `--rsync-path
+/path/to/syq` or `--syq-no-bootstrap`.
 
 The local client verifies the manifest's embedded Ed25519 signature over its
 RFC 8785 canonical JSON. Direct remote download uses `curl` or `wget`, `gzip`,
@@ -156,6 +156,7 @@ syq cp --inplace disk.img --to server --as-existing /images/disk.img
 syq cp --prune --src-src build --to server --into-existing /srv/app
 syq rm cache old-output
 syq rm --from server --cwd /srv --src old-output
+syq rm --from server --syq-path /opt/syq-dev --src old-output
 syq rm --root /srv --src-dir cache
 syq rm --cwd /srv --follow-src --src-dir current-release
 ```
@@ -240,14 +241,89 @@ A relative value printed by `readlink` is relative to the directory containing
 the link, not necessarily the shell's current directory. `realpath` is usually
 the safer way to turn a link chain into an explicit operand.
 
-This is the native selection policy, not yet a complete hostile-namespace
-containment guarantee for copy. Native `rm` retains the resolved directories
-and selected identities through mutation, and copy retains its selected
-destination directory, but ordinary copy source walks and descendant
-operations have not all moved to descriptor-relative access. The default
-therefore rejects links present during preflight; the planned containment work
-must additionally prevent a concurrent rename or link substitution from
-changing an identity after that check.
+These rules form the hostile-namespace containment model for native copy and
+removal. Native `rm` retains the resolved directories and selected identities
+through mutation. Copy resolves and registers every
+selected source before destination mutation, and every source worker claims
+those exact directory or parent descriptors during authenticated startup,
+before it reports readiness. Source discovery and metadata stats, including
+retry checks, source content hashes, and range/small reads, use the resulting
+opaque root ID plus strict relative bytes as their authority. They do not
+reopen the operator spelling or follow descendant symlinks; a selected file
+authorizes only the exact leaf observed at registration, not siblings beneath
+its retained parent. The endpoint registry and every initialized worker also
+keep that selected object open, so the pin remains valid even if the control
+connection exits first, and every content open verifies its identity.
+Exact-symlink target bytes are snapshotted through the opened symlink object and
+never reread through its mutable directory name. Replacing an exact selected
+leaf is an error, while changed-source retry remains available for entries
+beneath a selected directory. On macOS this descriptor-bound symlink operation
+requires macOS 13 or newer; older releases fail source registration rather than
+fall back to a name-based read.
+
+Copy gives every destination worker the selected directory descriptor.
+Destination observation, scanning and prune planning, directory and special-
+file creation, metadata changes, and planned non-recursive deletion are
+relative to it. Regular-file probing, preparation, basis holding and seeding,
+destination block hashing, ranged and small writes, finalization, sidecar
+cleanup, and publication also stay beneath that retained descriptor and never
+follow descendant symlinks. Activating that capability does not change the
+worker process's current directory; destination operations have no process-cwd
+dependency.
+
+Local control inputs are identity-safe too: `--ignore-from`,
+`--syq-ignore-from`, `--files-from`, and a named `--mapping` are read from the
+file selected by the component walk, so replacing their pathname afterward
+cannot redirect the read. Their filenames retain raw Unix path bytes even
+though ignore-pattern contents must be UTF-8. Mapping bytes are acquired before
+destination mutation. On Linux, a selected FIFO input is reopened from its
+retained `O_PATH` descriptor through a verified procfs `/proc/self/fd`; it
+therefore waits for a writer like an ordinary blocking open and still reads the
+originally selected FIFO after a rename. A final Linux procfs descriptor link
+is opened relative to its retained procfs parent, so shell process substitution
+remains usable without a general pathname fallback. A Linux system without
+procfs, and macOS, refuse named FIFO control inputs before destination mutation
+because they lack a safe exact blocking reopen. Use `--files-from -` or
+`--mapping -` for those stdin-capable inputs, or materialize ignore rules in a
+regular file. A named `--results` file is likewise created fresh through its
+retained parent; every existing entry is refused rather than truncated. With
+`--follow`, that retained selection is the resolved referent, and a missing
+referent is created beneath its retained parent. Replacing the link afterward
+does not redirect the output. Use `--results-fd` when the caller needs a pipe,
+process substitution, device, or other non-file sink.
+
+On Linux, the same-machine `CopyLocal` optimization gives its destination
+worker both endpoints' exact capabilities during authenticated startup, then
+opens the source and destination relative to those descriptors. Rsync-mode
+`--insecure-links` skips that optimization because its explicitly unconfined
+source names cannot be represented by the capability-only request. Directory
+self-copy preflight also uses capabilities: on a confined same-machine copy,
+the destination endpoint claims the exact opened source directory and walks
+parents from its retained destination selection. Renaming either command-line
+spelling cannot redirect that decision.
+
+Rsync-mode `--insecure-links` is the explicit compatibility opt-out: that
+session uses the legacy unconfined pathname discovery and content-read paths,
+including traversal through symlinked `--files-from` ancestors. Native
+mapping/generated names never inherit native `--follow`; they remain strict
+descendants of the registered source root. Rsync-compatible operator control
+paths retain rsync's implicit policy of following a symlink owned by root or
+the endpoint's effective user. Ownership and target bytes are taken from the
+same opened symlink object on Linux and macOS 13 or newer. On platforms without
+a descriptor-bound link-read API (including older macOS releases), this
+implicit trusted-owner traversal fails closed instead of re-reading the link by
+name. Native `--follow` remains the explicit ownership-independent convenience
+policy.
+
+Registration budgets the process's
+currently open descriptors, one retained parent descriptor per source root and
+one object descriptor per exact leaf for the registry, control connection, and
+every worker that may share its process, plus conservative per-worker
+file-cache, transport, and concurrent independent-worker broker-claim overhead.
+Same-machine Linux copies include the destination workers' cross-session claims
+in that admission check. If the endpoint's open-file limit cannot hold that
+set, the copy fails before destination mutation with guidance to reduce
+selectors or `--connections`.
 
 Placement is always explicit in this initial native surface:
 
@@ -260,12 +336,14 @@ Placement is always explicit in this initial native surface:
 | `--as-new PATH` | Map one named source exactly to `PATH` | Must not exist |
 | `--as-existing PATH` | Map one named source exactly to `PATH` | Must exist |
 
-The `new` and `existing` forms are lightweight placement-root pathname checks
-during the ordinary initial destination inspection. A mismatch fails before
-transfer mutation begins. After a successful check, the current engine's
-ordinary pathname and publication behavior applies: these forms do not pin an
-inode or provide compare-and-swap behavior against a concurrent namespace
-writer. Changed regular files continue to use staged atomic publication.
+The `new` and `existing` forms are checked during the ordinary initial
+destination inspection. A mismatch fails before transfer mutation begins, and
+the selected destination directory remains pinned while workers operate on
+strict relative names. Conditional regular-file updates and staged publication
+then verify the observed target identity instead of following a replaced name.
+This is not a namespace snapshot: an unconditional placement may still replace
+the non-directory entry present when it publishes. Changed regular files
+continue to use staged atomic publication.
 Mapping a non-directory source exactly onto an existing directory is rejected
 during the source's first scan batch, in both dry-run and execution. On the
 command-restricted remote-to-remote path the precondition is also signed: the
@@ -383,6 +461,9 @@ explicit `--rsh` is the complete SSH and agent policy and bypasses automatic
 broker/receiver setup. A port in native endpoint syntax can be combined with
 the default SSH command or an explicit command whose executable is `ssh`; an
 arbitrary remote-shell wrapper must carry its own port option.
+Remote `rm` accepts the same `--syq-path PATH` and `--no-bootstrap` helper
+selection; those options are mutually exclusive and are rejected for a local
+removal.
 
 For two remote endpoints, `--coordinate-at auto` (the default) places the coordinator
 at the source. Path operands travel base64-encoded inside the delegated
@@ -457,6 +538,12 @@ the masters still leave after their five-minute idle limit; the inert scope
 can be inspected or removed later with the printed path. Scope paths beginning
 with a literal `~` or containing `${...}` are refused because OpenSSH expands
 those forms before opening a control socket.
+
+`--pscope` is intentionally not an ordinary control-file selection. It names a
+private directory created and permission-checked by the persistence subsystem;
+OpenSSH derives socket names beneath that directory. Its confinement therefore
+comes from that private-directory model, not from the retained single-file
+descriptors used for filters, mappings, file lists, and results.
 
 During either persistence window, anything able to act as the same local user
 can open sessions through the socket without touching the key or agent. This
@@ -562,6 +649,7 @@ accept them.
 | `--max-size SIZE`, `--min-size SIZE` | Don't transfer regular files larger / smaller than SIZE |
 | `--files-from FILE` | Copy only the listed paths (relative to the one source directory; see below) |
 | `--from0` | `--files-from` entries are NUL-separated |
+| `--insecure-links` | Permit legacy unconfined traversal through symlinked source ancestors, including `--files-from` implied parents |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
 Like rsync, `-q` suppresses ordinary non-error output: progress, summaries,
@@ -597,6 +685,10 @@ data does not traverse the invoking machine; path operands travel encoded in
 the delegated command, so any filename works. Matching helpers are installed
 automatically on both hosts and output is streamed back. When both endpoints
 name the same host and user, syq runs a local copy on that host.
+For a source build, `--syq-path` or `--no-bootstrap` selects the ordinary hostA
+coordinator, including on the command-restricted path. It is not forwarded as
+authority to choose hostB's receiver: that executable is the separately
+enrolled forced command and is refreshed by enrollment.
 
 With implicit OpenSSH, the default combines a pre-enrolled forced receiver on
 hostB with a temporary local agent broker. The first transfer to a destination
@@ -610,10 +702,22 @@ under `~/.local/share/syq/restricted/`; the receipt key's public half is
 returned to the local machine and recorded with the enrollment. Before
 publishing the forced key, syq verifies that the installed receiver is a
 regular executable and that it and every path ancestor are trusted-owner- or
-root-owned, non-writable by other users, and free of non-owner ACL grants.
+root-owned and non-writable by other users. On Linux, access ACLs are evaluated
+by their effective permissions: named entries are accepted when they are
+read-only or identify root, the target user, or its verified user-private
+group. A default ACL does not make its existing directory writable, and every
+new directory or file syq creates is validated before use. Group-write from the
+conventional umask 002 is accepted only when account and group database lookups
+prove that the group is user-private (same name and no other member or non-root
+primary-group user). Otherwise group-write still fails closed. Private
+enrollment directories and secret files remain exactly 0700 and 0600. A
+failure names the machine and reports every unsafe component of the path that
+syq could securely inspect.
 
-Enrollment first tries local→hostB directly. If that network path is
-unavailable, it retries through hostA with OpenSSH `ProxyJump`; hostA gets only
+Enrollment first tries local→hostB directly. If SSH reports a transport
+failure, it retries through hostA with OpenSSH `ProxyJump`; a remote validation
+or installation error is reported against hostB without repeating it through
+the proxy. HostA gets only
 `ssh -W` byte forwarding and cannot see the encrypted hostB session, an agent
 socket, or the enrollment key. The destination parent must already exist.
 Enrollment is durable, is reused for later destination leaves sharing that
@@ -793,8 +897,15 @@ also refreshes the installed
 receiver to the exact local syq binary; the receipt key is kept for the life
 of the enrollment, so a refresh, or a retry after a lost reply, never leaves
 the two sides holding different keys. To rotate it, revoke and enroll again.
-Revocation leaves that shared binary because other enrollments may use it. It
-prevents new receiver sessions. A
+Revocation keeps the shared receiver while another enrollment or managed
+forced-key entry may use it. The final revoke removes the shared receiver and
+empty `syq/restricted` state namespace on hostB. General account directories
+such as `.local`, `share`, and `libexec` are preserved even when empty because
+syq does not assume it created them. Each installer or revoker uploads and runs
+its temporary management helper within one SSH session whose cleanup trap owns
+the stage. Install and revoke serialize the shared receiver lifecycle, so a
+concurrent enrollment recreates the receiver before publishing its forced key.
+Revocation prevents new receiver sessions. A
 session that already claimed its signed request can finish an operation already
 in progress; later protocol requests are rejected once the signed execution
 deadline expires rather than forcibly interrupting a filesystem syscall.
@@ -878,11 +989,12 @@ Identical to rsync:
 - An explicitly supplied destination root that is a symlink to a directory is
   that directory when the link is owned by root or by the receiver's effective
   uid (the link is kept, with or without a trailing slash). A foreign-owned
-  component is refused. Each receiving connection retains and verifies the
-  selected directory, so replacing the external destination spelling afterward
-  cannot redirect its writes. A symlink encountered below the destination root
-  is payload at that path: it is replaced rather than followed, even when it
-  points to a directory.
+  component is refused. The control connection registers the selected open
+  directory, and every worker receives that exact directory descriptor rather
+  than resolving the operator path again. Replacing the external destination
+  spelling afterward therefore cannot redirect its writes. A symlink
+  encountered below the destination root is payload at that path: it is
+  replaced rather than followed, even when it points to a directory.
 - Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
   payload and produce one warning summary. Before transfer starts, SYQ rejects
   the exceptional case where a mapped payload path exactly equals a sidecar
@@ -1319,8 +1431,9 @@ data connections across all of them (multipath) — it keeps only paths within
 2x of the fastest, so it never drags a fast transfer down by mixing in a slow
 link. Every candidate still gets its complete bounded probe window, but those
 independent probes run while the control connection prepares the destination.
-Worker Hello and destination anchoring are likewise sent in one
-pipelined setup turn. Single-homed hosts and laptops use the one best path,
+An unrestricted destination worker claims its registered directory as part of
+its authenticated Hello, and the receiver acknowledges readiness only after
+that claim succeeds. Single-homed hosts and laptops use the one best path,
 unchanged. With ufw:
 
 ```sh
@@ -1489,10 +1602,15 @@ the same command would transfer and nothing else.
 relative to the single source directory, to the same relative path under the
 destination. The source is not walked, which is the point on a slow
 filesystem when the list is known. Parent directories of listed paths are
-created (with their metadata). A parent that is a symlink on the source is
-followed — you named a path through it — and becomes a real directory on the
-destination, so nothing is ever written through a destination symlink; a
-parent that resolves to a file or dangles is an error. A listed directory is copied *without*
+created (with their metadata). By default, a parent that is a symlink on the
+source is not traversed and that listed path fails. This is deliberately
+stricter than hardened rsync 3.5.0: rsync may first emit the implied destination
+directory and then fail the content open, while SYQ refuses the path before
+emitting that implied parent. Both report a partial-transfer error (exit 23).
+`--insecure-links` opts the whole source session into the legacy unconfined
+pathname behavior: such a parent is followed and becomes a real directory on
+the destination. A parent that resolves to a file or dangles is an error. A
+listed directory is copied *without*
 its contents unless `-r` is given on the command line itself — `-a` alone
 does not count, as in rsync — so `-a -r --files-from` walks the directories
 the list names (never the implied parents).
