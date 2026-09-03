@@ -1,7 +1,7 @@
 # Automation results, schema version 1
 
-`syq cp --results -` writes a machine-readable NDJSON stream of
-operation outcomes to stdout. This document is the contract for that stream:
+`syq cp --results FILE` writes a machine-readable NDJSON stream of
+operation outcomes. This document is the contract for that stream:
 what each record means, which fields a consumer may rely on, and how
 exit codes correspond to terminal statuses. The machine-checkable
 counterpart is [`schemas/automation-v1.schema.json`](../schemas/automation-v1.schema.json);
@@ -14,31 +14,36 @@ this stream, and the two formats never mix.
 ## The channel
 
 ```text
-syq cp [--prune] ... --results -
+syq cp [--prune] ... --results FILE
+syq cp [--prune] ... --results-fd N
 ```
 
-The stream is NDJSON on stdout. The machine owns stdout: syq
-suppresses its own human stdout output (no `-q` needed), and stderr
-stays human-readable — progress, warnings, errors — and is not part
-of the contract. `-` is the only accepted target; to keep a file,
-redirect: `--results - > run.ndjson`. syq never resolves or creates
-an operator-supplied output path — whatever opens the stream's
-destination (a shell redirect, a pipe, a supervisor) does so with its
-own authority before the run starts. `--results` is not available on
-`syq map` (its stdout is the manifest format) or, yet, on other
-commands. `--dry-run` composes; see below.
+One stream, two ways to name its destination. `--results FILE`
+creates the file fresh and refuses an existing one: a results file
+holds exactly one run (`seq` from 0, one terminal record), so
+recurring jobs use fresh names — timestamps work well
+(`run-$(date +%s).ndjson`). `--results-fd N` writes to a descriptor
+the caller opened before syq ran (`--results-fd 3 3>run.ndjson`, or a
+pipe / process substitution for live consumption); N must be above 2,
+and a descriptor nobody connected is a startup error. Human output is
+untouched in both forms: stdout and stderr keep their ordinary roles
+and are not part of this contract.
 
-The results writer lives with the transfer coordinator. For a direct
-remote-to-remote copy the stream rides the coordinator connection
-back to the invoking terminal, and the remote coordinator owns it end
-to end — run record, sequence numbers, and terminal record all come
-from one writer. When a signed receiver receipt is expected, the
-relayed terminal record is withheld until the receipt verifies, so a
-terminal claiming success can never precede a failed verification; on
-verification failure the stream ends without a terminal record and
-syq exits nonzero. If the transport collapses, the relayed stream can
-likewise end without a terminal record; both are the standard
-unknown-outcome case below. `--results` cannot be combined with `--detach`, because
+Choose a `FILE` outside the transfer's source and destination trees.
+syq does not police this: a results file inside the trees it is
+copying or pruning can be copied mid-write, deleted as
+destination-only, or otherwise make the run's own accounting
+unpredictable. Placing output files in directories only you can write
+is the same rule as for any `>` redirect. The file is opened once and
+the descriptor held for the whole run; the default operator-path
+policy refuses a symlinked `FILE` (pass `--follow` to allow it).
+
+The results writer lives with the transfer coordinator, so both forms
+require a local coordinator: a direct remote-to-remote copy must use
+`--run-at local` to produce a stream. `--results` is not available on
+`syq map` (its stdout is the manifest format) or, yet, on other
+commands, and cannot be combined with `--detach`. `--dry-run`
+composes; see below. `--results` cannot be combined with `--detach`, because
 the caller would not remain attached for the stream and its terminal
 record.
 
@@ -48,12 +53,7 @@ stderr and stops writing; the consumer detects this as a missing
 terminal record. Argument and usage errors exit `2` with no stream at
 all — a consumer constructs its own argv, so a usage error is a
 consumer bug and gets no JSON. Every run that gets past argument
-parsing emits a terminal record, fatal setup failures included — with
-one exception: a remote-coordinator copy refused before the
-coordinator starts leaves stdout empty, because the stream's one
-owner never existed. Treat that like the transport-collapse case:
-no terminal record means the outcome is unknown (here, nothing ran),
-and rerunning is safe.
+parsing emits a terminal record, fatal setup failures included.
 
 ## Record envelope
 

@@ -8350,89 +8350,6 @@ fn native_auto_raw_path_relay_rejects_direct_only_controls() {
 }
 
 #[test]
-fn native_remote_coordinator_streams_results_to_the_invoker() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    write(&t.path("src"), b"result stream");
-
-    for placement in ["auto", "source", "target"] {
-        let destination = t.s(&format!("dst-{placement}"));
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args(["cp", "--rsh"])
-            .arg(&rsh)
-            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-            .args([
-                "--no-tcp",
-                "-j",
-                "1",
-                "--from",
-                "hostA",
-                "--src",
-                &t.s("src"),
-                "--to",
-                "hostB",
-                "--run-at",
-                placement,
-                "--as",
-                &destination,
-                "--results",
-                "-",
-                "-q",
-            ])
-            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-            .env("FAKE_RSH_LOG", t.path("rsh.log"))
-            .run()
-            .expect("stream remote-coordinator results");
-
-        assert_output_ok(&out);
-        assert_eq!(read(Path::new(&destination)), b"result stream");
-        let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("results line is JSON"))
-            .collect();
-        // The coordinator owns the stream end to end: exactly one run and
-        // terminal record, with no second writer restarting the sequence.
-        assert_eq!(records.first().unwrap()["type"], "run");
-        for (index, record) in records.iter().enumerate() {
-            assert_eq!(record["seq"], index as u64, "{placement}: {records:?}");
-        }
-        assert_eq!(
-            records.iter().filter(|r| r["type"] == "run").count(),
-            1,
-            "{placement}: {records:?}"
-        );
-        assert_eq!(
-            records.iter().filter(|r| r["type"] == "result").count(),
-            1,
-            "{placement}: {records:?}"
-        );
-        let terminal = records.last().unwrap();
-        assert_eq!(terminal["type"], "result");
-        assert_eq!(terminal["status"], "success");
-        assert_eq!(terminal["exit_code"], 0);
-    }
-}
-
-#[test]
-fn native_results_file_target_is_refused() {
-    let t = Tmp::new();
-    write(&t.path("src/f.txt"), b"data");
-    // stdout is the only stream target; a pathname is refused before
-    // anything runs, with a pointer at shell redirection.
-    let out = syq_cp_in(
-        &t.path(""),
-        &["--src-src", "src", "--into", "dst", "--results", "r.ndjson"],
-        None,
-    );
-    assert!(!out.status.success());
-    let stderr = stderr_of(&out);
-    assert!(stderr.contains("redirect"), "{stderr}");
-    assert!(!t.path("r.ndjson").exists());
-    assert!(!t.path("dst").exists());
-}
-#[test]
 fn native_detach_rejects_an_unattached_results_stream() {
     let t = Tmp::new();
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -8450,7 +8367,7 @@ fn native_detach_rejects_an_unattached_results_stream() {
             "--as",
             &t.s("dst"),
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ])
         .run()
@@ -9119,13 +9036,13 @@ fn native_cp_results_stream_success_and_partial() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
     );
     assert_eq!(out.status.code(), Some(23));
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).expect("results line is JSON"))
@@ -9196,7 +9113,7 @@ fn native_cp_results_stream_success_and_partial() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r2.ndjson",
             "-q",
         ],
         Some(retry.as_bytes()),
@@ -9207,7 +9124,7 @@ fn native_cp_results_stream_success_and_partial() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(read(&t.path("dst/g.txt")), b"late");
-    let last: serde_json::Value = String::from_utf8(out.stdout.clone())
+    let last: serde_json::Value = String::from_utf8(read(&t.path("r2.ndjson")))
         .unwrap()
         .lines()
         .last()
@@ -9231,7 +9148,15 @@ fn native_cp_results_without_mapping_and_refusals() {
     write(&t.path("src/f.txt"), b"data");
     let out = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "out", "--results", "-", "-q"],
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "out",
+            "--results",
+            "r1.ndjson",
+            "-q",
+        ],
         None,
     );
     assert!(
@@ -9239,7 +9164,7 @@ fn native_cp_results_without_mapping_and_refusals() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9266,7 +9191,7 @@ fn native_cp_results_without_mapping_and_refusals() {
             "--into",
             "pruned",
             "--results",
-            "-",
+            "r2.ndjson",
         ],
         None,
     );
@@ -9275,7 +9200,7 @@ fn native_cp_results_without_mapping_and_refusals() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r2.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9314,7 +9239,7 @@ fn native_cp_results_dry_run_emits_traces() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-n",
             "-q",
         ],
@@ -9326,7 +9251,7 @@ fn native_cp_results_dry_run_emits_traces() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!t.path("dst/f.txt").exists(), "dry run must not write");
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9371,14 +9296,14 @@ fn native_cp_mapping_dry_run_implicit_ancestor_trace_has_no_src() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-n",
             "-q",
         ],
         Some(manifest.as_bytes()),
     );
     assert!(out.status.success());
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9419,13 +9344,13 @@ fn native_cp_mapping_ancestor_conflict_gets_failed_record() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
     );
     assert_eq!(out.status.code(), Some(23));
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9447,7 +9372,15 @@ fn native_cp_results_preexisting_directory_is_not_reported_created() {
     fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o555)).unwrap();
     let out = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst", "--results", "-", "-q"],
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r1.ndjson",
+            "-q",
+        ],
         None,
     );
     assert!(
@@ -9456,7 +9389,7 @@ fn native_cp_results_preexisting_directory_is_not_reported_created() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(read(&t.path("dst/sub/f.txt")), b"f");
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9481,13 +9414,13 @@ fn native_cp_results_fatal_failure_emits_terminal_record() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ],
         None,
     );
     assert_eq!(out.status.code(), Some(1));
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9497,26 +9430,6 @@ fn native_cp_results_fatal_failure_emits_terminal_record() {
     assert_eq!(last["type"], "result");
     assert_eq!(last["status"], "failed");
     assert_eq!(last["exit_code"], 1);
-}
-
-#[test]
-fn native_cp_results_stdout_mode_owns_stdout() {
-    let t = Tmp::new();
-    write(&t.path("src/a.txt"), b"abc");
-    // No -q: the machine owns stdout anyway; the human summary is suppressed.
-    let out = syq_cp_in(
-        &t.path(""),
-        &["--src-src", "src", "--into", "dst", "--results", "-"],
-        None,
-    );
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    for line in stdout.lines() {
-        let value: serde_json::Value =
-            serde_json::from_str(line).unwrap_or_else(|_| panic!("non-JSON stdout line: {line}"));
-        assert_eq!(value["schema"], "syq.automation");
-    }
-    assert!(stdout.lines().count() >= 2, "run and result at least");
 }
 
 #[test]
@@ -9535,7 +9448,7 @@ fn native_cp_prune_results_cover_deletions() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ])
         .current_dir(t.path(""))
@@ -9547,7 +9460,7 @@ fn native_cp_prune_results_cover_deletions() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!t.path("dst/extra.txt").exists());
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9588,7 +9501,7 @@ fn native_cp_prune_results_cover_deletions() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r2.ndjson",
             "--max-delete",
             "0",
             "-q",
@@ -9598,7 +9511,7 @@ fn native_cp_prune_results_cover_deletions() {
         .expect("run cp --prune");
     assert_eq!(out.status.code(), Some(25));
     assert!(t.path("dst/extra2.txt").exists());
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r2.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9624,7 +9537,7 @@ fn native_cp_prune_results_cover_deletions() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r3.ndjson",
             "--max-delete",
             "0",
             "-n",
@@ -9634,7 +9547,7 @@ fn native_cp_prune_results_cover_deletions() {
         .run()
         .expect("run cp --prune");
     assert_eq!(out.status.code(), Some(25));
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r3.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9666,7 +9579,7 @@ fn native_cp_results_implicit_dir_failure_is_not_a_retry_entry() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
@@ -9677,7 +9590,7 @@ fn native_cp_results_implicit_dir_failure_is_not_a_retry_entry() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9728,7 +9641,7 @@ fn native_cp_mapping_specials_are_visible_skips_not_failures() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
@@ -9740,7 +9653,7 @@ fn native_cp_mapping_specials_are_visible_skips_not_failures() {
     );
     assert!(!t.path("dst/pipe").exists());
     assert_eq!(read(&t.path("dst/a.txt")), b"abc");
-    let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9963,13 +9876,13 @@ fn mappings_md_retry_gate_example_works_verbatim() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
     );
     assert_eq!(cp.status.code(), Some(23));
-    let results = cp.stdout.clone();
+    let results = read(&t.path("r1.ndjson"));
     assert_documented(&["-cs"], DOC_JQ_RETRY_GATE);
     // Complete partial stream: the gate passes and emits the retry entry.
     let out = jq(DOC_JQ_RETRY_GATE, &["-cs"], &results);
@@ -10452,6 +10365,7 @@ fn native_cp_mapping_child_before_explicit_directory_is_order_independent() {
         ),
     ] {
         let dst = format!("dst-{name}");
+        let results = format!("r-{name}.ndjson");
         let out = syq_cp_in(
             &t.path(""),
             &[
@@ -10462,7 +10376,7 @@ fn native_cp_mapping_child_before_explicit_directory_is_order_independent() {
                 "--into",
                 &dst,
                 "--results",
-                "-",
+                &results,
                 "-q",
             ],
             Some(manifest.as_bytes()),
@@ -10472,7 +10386,7 @@ fn native_cp_mapping_child_before_explicit_directory_is_order_independent() {
             "{name}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let lines: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+        let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path(&results)))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -10492,7 +10406,16 @@ fn native_cp_results_dry_and_live_directory_totals_agree() {
     write(&t.path("src/sub/f.txt"), b"f");
     for (mode, extra) in [("dry", vec!["-n"]), ("live", vec![])] {
         let dst = format!("dst-{mode}");
-        let mut args = vec!["--src-src", "src", "--into", &dst, "--results", "-", "-q"];
+        let results = format!("r-{mode}.ndjson");
+        let mut args = vec![
+            "--src-src",
+            "src",
+            "--into",
+            &dst,
+            "--results",
+            &results,
+            "-q",
+        ];
         args.extend(extra);
         let out = syq_cp_in(&t.path(""), &args, None);
         assert!(
@@ -10500,7 +10423,7 @@ fn native_cp_results_dry_and_live_directory_totals_agree() {
             "{mode}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let last: serde_json::Value = String::from_utf8(out.stdout.clone())
+        let last: serde_json::Value = String::from_utf8(read(&t.path(&results)))
             .unwrap()
             .lines()
             .last()
@@ -10529,13 +10452,13 @@ fn native_cp_results_non_tty_run_emits_progress_records() {
             "--bwlimit",
             "32",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ],
         None,
     );
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let progress_records = String::from_utf8(out.stdout.clone())
+    let progress_records = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -10570,13 +10493,13 @@ fn native_cp_mapping_cross_chunk_directory_upgrade_emits_one_trace() {
             "dst",
             "-n",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
     );
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let x_traces: Vec<serde_json::Value> = String::from_utf8(out.stdout.clone())
+    let x_traces: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -10603,13 +10526,13 @@ fn native_cp_prune_fatal_failure_reports_deletion_aggregates() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ],
         None,
     );
     assert!(!out.status.success());
-    let terminal: serde_json::Value = String::from_utf8(out.stdout.clone())
+    let terminal: serde_json::Value = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .last()
@@ -10717,10 +10640,11 @@ fn automation_v1_live_streams_validate_against_schema() {
         write(&t.path("src/Notes.TXT"), b"hello");
         let mut args = vec!["-C", "src", "--mapping", "-", "--into", "dst"];
         args.extend_from_slice(extra);
-        args.extend_from_slice(&["--results", "-", "-q"]);
+        let results = format!("r-{name}.ndjson");
+        args.extend_from_slice(&["--results", &results, "-q"]);
         let out = syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes()));
         assert!(out.status.success(), "{name}: {}", stderr_of(&out));
-        let content = String::from_utf8(out.stdout.clone()).unwrap();
+        let content = String::from_utf8(read(&t.path(&results))).unwrap();
         assert_automation_v1_stream(&validator, &content, name);
     }
 
@@ -10738,13 +10662,13 @@ fn automation_v1_live_streams_validate_against_schema() {
                 "--into",
                 "dst",
                 "--results",
-                "-",
+                "r.ndjson",
                 "-q",
             ],
             Some(manifest.as_bytes()),
         );
         assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
-        let content = String::from_utf8(out.stdout.clone()).unwrap();
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
         assert_automation_v1_stream(&validator, &content, "partial");
     }
 
@@ -10766,13 +10690,13 @@ fn automation_v1_live_streams_validate_against_schema() {
                 "--into",
                 "dst",
                 "--results",
-                "-",
+                "r.ndjson",
                 "-q",
             ],
             None,
         );
         assert_eq!(out.status.code(), Some(25), "{}", stderr_of(&out));
-        let content = String::from_utf8(out.stdout.clone()).unwrap();
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
         assert_automation_v1_stream(&validator, &content, "refused");
     }
 
@@ -10787,13 +10711,13 @@ fn automation_v1_live_streams_validate_against_schema() {
                 "--into",
                 "dst",
                 "--results",
-                "-",
+                "r.ndjson",
                 "-q",
             ],
             None,
         );
         assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
-        let content = String::from_utf8(out.stdout.clone()).unwrap();
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
         assert_automation_v1_stream(&validator, &content, "failed");
     }
 }
@@ -10819,13 +10743,13 @@ fn native_cp_mapping_symlinked_manifest_failure_still_settles_the_stream() {
             "--into",
             "dst",
             "--results",
-            "-",
+            "r1.ndjson",
         ],
         None,
     );
     assert!(!out.status.success());
     assert!(stderr_of(&out).contains("pass --follow"));
-    let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -10855,11 +10779,19 @@ fn native_cp_dry_summary_and_terminal_record_count_the_same_directories() {
     );
     let machine = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst2", "-n", "--results", "-"],
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst2",
+            "-n",
+            "--results",
+            "r1.ndjson",
+        ],
         None,
     );
     assert!(machine.status.success(), "{}", stderr_of(&machine));
-    let terminal: serde_json::Value = String::from_utf8(machine.stdout)
+    let terminal: serde_json::Value = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .last()
@@ -10869,66 +10801,97 @@ fn native_cp_dry_summary_and_terminal_record_count_the_same_directories() {
 }
 
 #[test]
-fn native_remote_results_withhold_terminal_on_lost_exit_status() {
+fn native_cp_results_refuses_an_existing_file() {
     let t = Tmp::new();
-    let inner = fake_rsh(&t);
-    // An rsh whose transport "loses" the exit status: the remote command
-    // runs to completion (full stream relayed) but the wrapper exits 255,
-    // the way ssh reports its own transport failures.
-    let wrapper = t.path("lossy-rsh");
-    executable(
-        &wrapper,
-        format!("#!/bin/sh\n\"{}\" \"$@\"\nexit 255\n", inner.display()).as_bytes(),
+    write(&t.path("src/f.txt"), b"data");
+    write(&t.path("r.ndjson"), b"yesterday's run");
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst", "--results", "r.ndjson"],
+        None,
     );
-    write(&t.path("src"), b"held back");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["cp", "--rsh"])
-        .arg(&wrapper)
-        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args([
-            "--no-tcp",
-            "-j",
-            "1",
-            "--from",
-            "hostA",
-            "--src",
-            &t.s("src"),
-            "--to",
-            "hostB",
-            "--run-at",
-            "target",
-            "--as",
-            &t.s("dst"),
-            "--results",
-            "-",
-            "-q",
-        ])
-        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_RSH_LOG", t.path("rsh.log"))
-        .run()
-        .expect("run with a lossy transport");
-
     assert!(!out.status.success());
     let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains("withholding the relayed terminal record"),
-        "{stderr}"
-    );
-    // The copy itself completed remotely; only the confirmation was lost.
-    assert_eq!(read(&t.path("dst")), b"held back");
-    // The stream must end unsettled: records relayed, but no terminal that
-    // the exit status could not confirm.
-    let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+    assert!(stderr.contains("already exists"), "{stderr}");
+    // Refused before anything ran: yesterday's stream and the destination
+    // are untouched.
+    assert_eq!(read(&t.path("r.ndjson")), b"yesterday's run");
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn native_cp_results_fd_streams_to_a_caller_opened_descriptor() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    // The caller opens fd 3 (`3>fd.ndjson`); syq only ever writes to it.
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec \"$1\" cp --src-src src --into dst --results-fd 3 -q 3>fd.ndjson")
+        .arg("sh")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("fd.ndjson")))
         .unwrap()
         .lines()
-        .map(|line| serde_json::from_str(line).expect("results line is JSON"))
+        .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert!(!records.is_empty());
-    assert_eq!(records.first().unwrap()["type"], "run");
-    assert!(
-        records.iter().all(|record| record["type"] != "result"),
-        "terminal must be withheld"
+    assert_eq!(lines.first().unwrap()["type"], "run");
+    assert_eq!(lines.last().unwrap()["status"], "success");
+    // Human stdout is untouched by the stream.
+    assert!(out.stdout.is_empty() || !String::from_utf8_lossy(&out.stdout).contains("schema"));
+}
+
+#[test]
+fn native_cp_results_fd_refusals() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    // A descriptor nobody connected fails loudly at startup.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst", "--results-fd", "37"],
+        None,
     );
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("not open"), "{}", stderr_of(&out));
+    assert!(!t.path("dst").exists());
+    // Slots 0-2 belong to stdin/stdout/stderr.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst", "--results-fd", "1"],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("above 2"), "{}", stderr_of(&out));
+}
+
+#[test]
+fn native_results_require_a_local_coordinator() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"local results");
+    for flag in [
+        &["--results", "r-remote.ndjson"][..],
+        &["--results-fd", "3"][..],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--from", "hostA", "--src", &t.s("src")])
+            .args(["--to", "hostB", "--run-at", "target"])
+            .args(["--as", &t.s("dst-remote")])
+            .args(flag)
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .run()
+            .expect("reject results with a remote coordinator");
+        assert!(!out.status.success());
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains("--run-at local"), "{stderr}");
+        assert!(!t.path("dst-remote").exists());
+        assert!(!t.path("r-remote.ndjson").exists());
+    }
 }

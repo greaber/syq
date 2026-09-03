@@ -213,15 +213,21 @@ class _AsyncLineProcess:
         argv: tuple[Argument, ...],
         process: asyncio.subprocess.Process,
         timeout: float | None,
+        results_reader: asyncio.StreamReader | None = None,
+        results_transport: asyncio.ReadTransport | None = None,
     ) -> None:
         self.argv = argv
         self.timeout = timeout
         loop = asyncio.get_running_loop()
         self._deadline = None if timeout is None else loop.time() + timeout
         self._process = process
-        assert process.stdout is not None
         assert process.stderr is not None
-        self._stdout = process.stdout
+        if results_reader is None:
+            assert process.stdout is not None
+            self._stdout = process.stdout
+        else:
+            self._stdout = results_reader
+        self._results_transport = results_transport
         self._stderr_task = asyncio.create_task(
             _read_stderr_tail(process.stderr),
             name="syq-stderr-drain",
@@ -239,28 +245,64 @@ class _AsyncLineProcess:
         cwd: PathArgument | None,
         env: Mapping[str, str] | None,
         timeout: float | None,
+        results_pipe: bool = False,
     ) -> _AsyncLineProcess:
+        read_fd: int | None = None
+        pass_fds: tuple[int, ...] = ()
+        stdout = asyncio.subprocess.PIPE
+        if results_pipe:
+            # The stream rides a descriptor this process opens and the
+            # child inherits (--results-fd); the child's human stdout is
+            # discarded so an unread pipe can never stall it.
+            read_fd, write_fd = os.pipe()
+            argv = (*argv, f"--results-fd={write_fd}")
+            pass_fds = (write_fd,)
+            stdout = asyncio.subprocess.DEVNULL
         try:
-            spawn = asyncio.create_task(
-                asyncio.create_subprocess_exec(
-                    *argv,
-                    cwd=cwd,
-                    env=env,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,
-                    limit=_LINE_LIMIT,
+            try:
+                spawn = asyncio.create_task(
+                    asyncio.create_subprocess_exec(
+                        *argv,
+                        cwd=cwd,
+                        env=env,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=stdout,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                        limit=_LINE_LIMIT,
+                        pass_fds=pass_fds,
+                    )
                 )
-            )
-            process = await _complete_task(spawn)
-        except asyncio.CancelledError:
-            if spawn.done() and not spawn.cancelled() and spawn.exception() is None:
-                process = spawn.result()
-                _kill_process_group(process)
-                await _wait_for_exit(process)
+                process = await _complete_task(spawn)
+            except asyncio.CancelledError:
+                if spawn.done() and not spawn.cancelled() and spawn.exception() is None:
+                    process = spawn.result()
+                    _kill_process_group(process)
+                    await _wait_for_exit(process)
+                raise
+        except BaseException:
+            if read_fd is not None:
+                os.close(read_fd)
             raise
-        return cls(argv, process, timeout)
+        finally:
+            if results_pipe:
+                os.close(write_fd)
+        results_reader = None
+        results_transport = None
+        if read_fd is not None:
+            loop = asyncio.get_running_loop()
+            results_reader = asyncio.StreamReader(limit=_LINE_LIMIT)
+            protocol = asyncio.StreamReaderProtocol(results_reader)
+            results_transport, _ = await loop.connect_read_pipe(
+                lambda: protocol, os.fdopen(read_fd, "rb")
+            )
+        return cls(
+            argv,
+            process,
+            timeout,
+            results_reader=results_reader,
+            results_transport=results_transport,
+        )
 
     def _remaining(self) -> float | None:
         if self._deadline is None:
@@ -294,6 +336,8 @@ class _AsyncLineProcess:
         self.stderr = await self._before_deadline(
             asyncio.shield(self._stderr_task)
         )
+        if self._results_transport is not None:
+            self._results_transport.close()
         self._closed = True
         return self.returncode
 
@@ -305,6 +349,8 @@ class _AsyncLineProcess:
             self.returncode = await _wait_for_exit(self._process)
         if not self._closed:
             self.stderr = await _complete_task(self._stderr_task)
+            if self._results_transport is not None:
+                self._results_transport.close()
             self._closed = True
 
 
@@ -444,7 +490,11 @@ class AsyncClient:
         return output[len(prefix) :]
 
     async def _start_line(
-        self, argv: list[Argument], *, timeout: float | None
+        self,
+        argv: list[Argument],
+        *,
+        timeout: float | None,
+        results_pipe: bool = False,
     ) -> _AsyncLineProcess:
         command = (await self._executable_value(), *argv)
         return await _AsyncLineProcess.start(
@@ -452,6 +502,7 @@ class AsyncClient:
             cwd=self.process_cwd,
             env=self.env,
             timeout=self.timeout if timeout is None else timeout,
+            results_pipe=results_pipe,
         )
 
     async def _typed(
@@ -465,8 +516,7 @@ class AsyncClient:
         timeout: float | None,
         check: bool,
     ) -> OperationSummary:
-        argv.append("--results=-")
-        process = await self._start_line(argv, timeout=timeout)
+        process = await self._start_line(argv, timeout=timeout, results_pipe=True)
         decoder = AutomationDecoder(
             prune=prune,
             mapping=mapping,

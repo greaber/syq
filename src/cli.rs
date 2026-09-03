@@ -113,6 +113,10 @@ pub struct Args {
     /// `--results` NDJSON outcome stream for native cp (`-` writes stdout).
     #[arg(skip)]
     pub native_results: Option<Vec<u8>>,
+    /// `--results-fd`: an inherited descriptor the caller opened for the
+    /// stream; validated and wrapped at startup.
+    #[arg(skip)]
+    pub native_results_fd: Option<i32>,
     /// Native coordinator placement. Rsync-shaped commands retain `--relay`.
     #[arg(skip)]
     pub run_at: RunAt,
@@ -862,11 +866,14 @@ struct NativeCopyFields {
     /// dst paths are relative to the --into container
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     mapping: Option<OsString>,
-    /// Write the machine-readable NDJSON result stream to stdout (`-` is
-    /// the only accepted target; redirect to keep a file) and suppress
-    /// human stdout output. Automation schema version 1
+    /// Write the machine-readable NDJSON result stream to FILE (created
+    /// fresh; an existing file is refused). Automation schema version 1
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     results: Option<OsString>,
+    /// Write the result stream to an inherited file descriptor the caller
+    /// opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2
+    #[arg(long, value_name = "FD", conflicts_with = "results")]
+    results_fd: Option<i32>,
     #[command(flatten)]
     operational: NativeCopyOperationalArgs,
 }
@@ -997,10 +1004,16 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     if results.is_some() && interface == Interface::NativeMap {
         bail!("--results is only available on syq cp");
     }
-    if results.as_deref().is_some_and(|target| target != "-") {
-        bail!(
-            "--results writes the NDJSON stream to stdout and accepts only `-`; redirect to keep a file: --results - > run.ndjson"
-        );
+    let results_fd = parsed.results_fd.take();
+    if results_fd.is_some() && interface == Interface::NativeMap {
+        bail!("--results-fd is only available on syq cp");
+    }
+    if let Some(fd) = results_fd {
+        if fd <= 2 {
+            bail!(
+                "--results-fd needs a descriptor above 2 (0-2 are stdin, stdout, and stderr); open one in the caller, e.g. --results-fd 3 3>run.ndjson"
+            );
+        }
     }
     let mut locations = if mapping.is_some() {
         let has_selectors = !(parsed.selection.src.is_empty()
@@ -1164,6 +1177,7 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.native_map_target = native_map_target;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
+    args.native_results_fd = results_fd;
     args.pscope = pscope;
     args.native_follow = parsed.selection.follow;
     if args.native_mapping.is_some() {

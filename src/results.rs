@@ -1,8 +1,8 @@
 //! `--results`: an NDJSON stream of machine-readable operation outcomes for
 //! native cp. Automation schema version 1: every record carries `schema`
 //! (`syq.automation`), `schema_version`, and a monotonic `seq`. The stream
-//! is stdout (`--results -`), and syq suppresses its own human stdout
-//! output so the stream stays parseable; a file is a shell redirect.
+//! target is a freshly created file (`--results FILE`) or a descriptor the
+//! caller opened (`--results-fd N`); human output is untouched.
 //!
 //! Version-1 coverage: one `run` record first (run id, mode, prune/mapping/
 //! dry-run flags, sanitized endpoints); sampled `progress` records; one
@@ -308,9 +308,14 @@ impl ResultsWriter {
         object.insert("schema".into(), SCHEMA.into());
         object.insert("schema_version".into(), SCHEMA_VERSION.into());
         object.insert("seq".into(), seq.into());
-        let written = serde_json::to_writer(&mut *out, &record)
+        // One buffer, one write: the record lands whole and immediately, so
+        // a consumer tailing the file or reading a pipe sees events live.
+        let written = serde_json::to_vec(&record)
             .map_err(std::io::Error::from)
-            .and_then(|()| out.write_all(b"\n"))
+            .and_then(|mut line| {
+                line.push(b'\n');
+                out.write_all(&line)
+            })
             // The terminal record leaves the process with the stream, so it
             // flushes inside the same critical section that seals it.
             .and_then(|()| if seal { out.flush() } else { Ok(()) });

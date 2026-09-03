@@ -159,23 +159,45 @@ class _LineProcess:
         cwd: PathArgument | None,
         env: Mapping[str, str] | None,
         timeout: float | None,
+        results_pipe: bool = False,
     ) -> None:
-        self.argv = argv
         self.timeout = timeout
         self._deadline = None if timeout is None else time.monotonic() + timeout
-        self._process = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
-        )
-        assert self._process.stdout is not None
+        read_fd: int | None = None
+        pass_fds: tuple[int, ...] = ()
+        stdout = subprocess.PIPE
+        if results_pipe:
+            # The stream rides a descriptor this process opens and the
+            # child inherits (--results-fd); the child's human stdout is
+            # discarded so an unread pipe can never stall it.
+            read_fd, write_fd = os.pipe()
+            argv = (*argv, f"--results-fd={write_fd}")
+            pass_fds = (write_fd,)
+            stdout = subprocess.DEVNULL
+        self.argv = argv
+        try:
+            self._process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=subprocess.PIPE,
+                shell=False,
+                start_new_session=True,
+                pass_fds=pass_fds,
+            )
+        finally:
+            if results_pipe:
+                os.close(write_fd)
+                if not hasattr(self, "_process"):
+                    os.close(read_fd)
         assert self._process.stderr is not None
-        self._stdout = self._process.stdout
+        if read_fd is not None:
+            self._stdout = os.fdopen(read_fd, "rb", buffering=0)
+        else:
+            assert self._process.stdout is not None
+            self._stdout = self._process.stdout
         self._stderr = self._process.stderr
         self._stderr_tail = bytearray()
         self._stderr_thread = threading.Thread(
@@ -643,13 +665,13 @@ class Client:
         timeout: float | None,
         check: bool,
     ) -> OperationSummary:
-        argv.append("--results=-")
         command = (self._executable_value(), *argv)
         process = _LineProcess(
             command,
             cwd=self.process_cwd,
             env=self.env,
             timeout=self.timeout if timeout is None else timeout,
+            results_pipe=True,
         )
         decoder = AutomationDecoder(
             prune=prune,

@@ -55,9 +55,6 @@ pub struct Progress {
     workers: Mutex<Vec<Option<WorkerStatus>>>,
     term: Mutex<TermState>,
     stop: AtomicBool,
-    /// --results -: the machine owns stdout; every human stdout line is
-    /// suppressed so the stream stays parseable.
-    suppress_stdout: AtomicBool,
     /// `--results`: machine-readable NDJSON outcome stream, set once after
     /// construction so workers and the planner reach it with no plumbing.
     results: std::sync::OnceLock<Arc<crate::results::ResultsWriter>>,
@@ -111,7 +108,6 @@ impl Progress {
                 last_results: None,
             }),
             stop: AtomicBool::new(false),
-            suppress_stdout: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
         })
     }
@@ -137,19 +133,8 @@ impl Progress {
         self.tuning_high_water.fetch_max(done, Relaxed);
     }
 
-    pub fn suppress_stdout(&self) {
-        self.suppress_stdout.store(true, Relaxed);
-    }
-
-    pub fn stdout_suppressed(&self) -> bool {
-        self.suppress_stdout.load(Relaxed)
-    }
-
     /// Print a line to stdout, keeping the progress area intact.
     pub fn println(&self, line: &str) {
-        if self.suppress_stdout.load(Relaxed) {
-            return;
-        }
         let mut t = self.term.lock().unwrap();
         self.erase(&mut t);
         let mut out = std::io::stdout().lock();

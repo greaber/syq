@@ -71,7 +71,10 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.dry_run)
         self.assertIs(events[-1], result)
         self.assertTrue(any(isinstance(event, syq.TraceEvent) for event in events))
-        self.assertIn("--results=-", self.argv())
+        self.assertTrue(
+            any(arg.startswith("--results-fd=") for arg in self.argv()),
+            self.argv(),
+        )
         self.assertNotIn("--quiet", self.argv())
         self.assertIn("--follow", self.argv())
         self.assertIn("--max-entries", self.argv())

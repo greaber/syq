@@ -20,62 +20,31 @@ struct ReceiptExpectation {
 /// The receipt envelope is bounded at 64 MiB; allow for base64 and slack.
 const MAX_RECEIPT_LINE_BYTES: usize = 96 * 1024 * 1024;
 
-/// A relayed line that may be the stream's terminal `result` record is
-/// held back until the receipt settles (serde orders keys, so the type
-/// marker sits mid-line and a line must be complete before it can be
-/// judged). Terminal records are small; a line that outgrows this bound is
-/// spilled straight through, keeping the no-large-buffering property.
-const TERMINAL_HOLD_LIMIT: usize = 64 * 1024;
-const TERMINAL_MARKER: &[u8] = b"\"type\":\"result\"";
-
-/// What the relay hands back: the receipt payload it captured, and the
-/// terminal-shaped line it withheld for receipt settlement.
-struct RelayedStream {
-    receipt: Option<Vec<u8>>,
-    held_terminal: Option<Vec<u8>>,
-}
-
-fn looks_like_terminal(line: &[u8]) -> bool {
-    line.windows(TERMINAL_MARKER.len())
-        .any(|window| window == TERMINAL_MARKER)
-}
-
 /// Pass the orchestrator's stdout through byte for byte, keeping only the
-/// receipt line to ourselves and holding back the most recent line that
-/// looks like a terminal `result` record, so the caller can verify the
-/// receipt before releasing it (a terminal claiming success must not reach
-/// consumers ahead of a failed verification). Used only when a receipt is
-/// expected; other transfers inherit stdout untouched. Returns the last
-/// receipt payload and the held line.
-fn relay_stdout(stdout: impl std::io::Read) -> Result<RelayedStream> {
+/// receipt line to ourselves. Used only when a receipt is expected; other
+/// transfers inherit stdout untouched. Returns the last receipt payload.
+fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<Vec<u8>>> {
     let mut out = std::io::stdout().lock();
     relay_stdout_bounded(stdout, &mut out, MAX_RECEIPT_LINE_BYTES)
 }
 
 /// Streams every ordinary line straight through without holding more than
-/// one bounded buffer of it, so a hostile orchestrator cannot make this
-/// machine buffer an arbitrarily long line; only a receipt line (up to
-/// `limit` bytes) and one terminal-shaped line (up to
-/// `TERMINAL_HOLD_LIMIT`) are collected.
+/// one buffer of it, so a hostile orchestrator cannot make this machine
+/// buffer an arbitrarily long line; only a receipt line is collected, up
+/// to `limit` bytes.
 fn relay_stdout_bounded(
     stdout: impl std::io::Read,
     out: &mut dyn std::io::Write,
     limit: usize,
-) -> Result<RelayedStream> {
+) -> Result<Option<Vec<u8>>> {
     let prefix = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes();
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
     let mut receipt = None;
-    let mut held: Option<Vec<u8>> = None;
     // The first bytes of the current line, held only until the prefix
-    // decision; then either the receipt payload being collected or the
-    // buffered ordinary line.
+    // decision; then either the receipt payload being collected or nothing.
     let mut head: Vec<u8> = Vec::with_capacity(prefix.len());
     let mut decided = false;
     let mut capturing: Option<Vec<u8>> = None;
-    // The current ordinary line, buffered until its newline so a terminal
-    // record can be withheld; once spilled it streams through unbuffered.
-    let mut line: Vec<u8> = Vec::new();
-    let mut spilled = false;
     let finish_capture = |payload: &mut Vec<u8>| {
         while payload
             .last()
@@ -106,30 +75,17 @@ fn relay_stdout_bounded(
                     decided = true;
                     if head.starts_with(prefix) {
                         capturing = Some(head[prefix.len()..].to_vec());
-                        head.clear();
                     } else {
-                        line.append(&mut head);
+                        out.write_all(&head)
+                            .context("relay remote orchestrator output")?;
                     }
+                    head.clear();
                 }
             } else if let Some(payload) = capturing.as_mut() {
                 payload.extend_from_slice(segment);
-            } else if spilled {
+            } else {
                 out.write_all(segment)
                     .context("relay remote orchestrator output")?;
-            } else {
-                line.extend_from_slice(segment);
-            }
-            if !spilled && capturing.is_none() && line.len() > TERMINAL_HOLD_LIMIT {
-                // Too big to be a terminal record: release everything in
-                // order and stream the rest of this line through.
-                if let Some(previous) = held.take() {
-                    out.write_all(&previous)
-                        .context("relay remote orchestrator output")?;
-                }
-                out.write_all(&line)
-                    .context("relay remote orchestrator output")?;
-                line.clear();
-                spilled = true;
             }
             if let Some(payload) = capturing.as_mut() {
                 if payload.len() > limit {
@@ -140,68 +96,28 @@ fn relay_stdout_bounded(
                 if let Some(payload) = capturing.as_mut() {
                     receipt = Some(finish_capture(payload));
                     capturing = None;
-                } else if spilled {
-                    spilled = false;
-                    out.flush().context("relay remote orchestrator output")?;
                 } else {
-                    let complete = std::mem::take(&mut line);
-                    if looks_like_terminal(&complete) {
-                        if let Some(previous) = held.replace(complete) {
-                            out.write_all(&previous)
-                                .context("relay remote orchestrator output")?;
-                        }
-                    } else {
-                        if let Some(previous) = held.take() {
-                            out.write_all(&previous)
-                                .context("relay remote orchestrator output")?;
-                        }
-                        out.write_all(&complete)
-                            .context("relay remote orchestrator output")?;
-                        out.flush().context("relay remote orchestrator output")?;
-                    }
+                    out.flush().context("relay remote orchestrator output")?;
                 }
                 decided = false;
             }
         }
         reader.consume(consumed);
     }
-    // Output that ended without a newline. An incomplete trailing line
-    // cannot be a complete terminal record; release it in order.
+    // Output that ended without a newline.
     if !head.is_empty() {
         if head.starts_with(prefix) {
             capturing = Some(head[prefix.len()..].to_vec());
         } else {
-            line.append(&mut head);
+            out.write_all(&head)
+                .context("relay remote orchestrator output")?;
         }
     }
     if let Some(payload) = capturing.as_mut() {
         receipt = Some(finish_capture(payload));
     }
-    if !line.is_empty() {
-        if let Some(previous) = held.take() {
-            out.write_all(&previous)
-                .context("relay remote orchestrator output")?;
-        }
-        out.write_all(&line)
-            .context("relay remote orchestrator output")?;
-    }
     out.flush().context("relay remote orchestrator output")?;
-    Ok(RelayedStream {
-        receipt,
-        held_terminal: held,
-    })
-}
-
-/// Forward a line the relay held back for receipt settlement.
-fn release_held_line(held: Option<Vec<u8>>) -> Result<()> {
-    use std::io::Write;
-    if let Some(line) = held {
-        let mut out = std::io::stdout().lock();
-        out.write_all(&line)
-            .context("relay remote orchestrator output")?;
-        out.flush().context("relay remote orchestrator output")?;
-    }
-    Ok(())
+    Ok(receipt)
 }
 
 /// Verify hostB's receipt against the grant this machine signed. A missing,
@@ -1064,15 +980,13 @@ fn run_remote(
     let run = || {
         let mut cmd = make_command();
         cmd.stdin(Stdio::null()).stderr(Stdio::inherit());
-        if receipt_expectation.is_none() && args.native_results.is_none() {
+        if receipt_expectation.is_none() {
             // Nothing to intercept: leave stdout to the terminal or pipe the
-            // user gave us, bytes and all. A results stream is relayed even
-            // without a receipt, so its terminal record can be withheld
-            // when the coordinator's exit status fails to confirm it.
+            // user gave us, bytes and all.
             let status = cmd
                 .status()
                 .with_context(|| format!("spawn {:?}", rsh[0]))?;
-            return Ok::<_, anyhow::Error>((status, None, None));
+            return Ok::<_, anyhow::Error>((status, None));
         }
         cmd.stdout(Stdio::piped());
         let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", rsh[0]))?;
@@ -1082,14 +996,12 @@ fn run_remote(
         let status = child
             .wait()
             .with_context(|| format!("wait for {:?}", rsh[0]))?;
-        let relayed = relayed?;
-        Ok((status, relayed.receipt, relayed.held_terminal))
+        Ok((status, relayed?))
     };
-    let (mut status, mut receipt_payload, mut held_terminal) = run()?;
+    let (mut status, mut receipt_payload) = run()?;
     if helper_missing(status.code(), spec.auto_helper) {
-        release_held_line(held_terminal.take())?;
         spec.install_helper()?;
-        (status, receipt_payload, held_terminal) = run()?;
+        (status, receipt_payload) = run()?;
     }
     // Keep the broker alive until the outer SSH connection and all forwarded
     // channels have closed.
@@ -1129,63 +1041,17 @@ fn run_remote(
             "remote syq on {coordinator_host} killed by signal"
         )),
     };
-    // A held line that is not actually a terminal record is ordinary
-    // output and is always released. A genuine terminal is released only
-    // when the coordinator's exit status, the record's own exit_code, and
-    // (when expected) the receipt all confirm it — otherwise the stream
-    // ends without a terminal record, the documented unknown-outcome
-    // signal, rather than with a result the transport or receipt could
-    // not vouch for.
-    let terminal_exit_code = held_terminal.as_deref().and_then(|line| {
-        serde_json::from_slice::<serde_json::Value>(line)
-            .ok()
-            .filter(|record| record["type"] == "result")
-            .map(|record| record["exit_code"].as_i64())
-    });
-    let code = match outcome {
-        Ok(code) => code,
-        Err(error) => {
-            if terminal_exit_code.is_some() {
-                eprintln!(
-                    "syq: withholding the relayed terminal record: the coordinator's exit status did not confirm it"
-                );
-            } else {
-                release_held_line(held_terminal)?;
-            }
-            return Err(error);
-        }
-    };
+    let code = outcome?;
     if let Some(expectation) = &receipt_expectation {
-        if let Err(error) = settle_receipt(
+        settle_receipt(
             expectation,
             receipt_payload.as_deref(),
             &coordinator_host,
             peer.host.as_deref().unwrap_or("the peer endpoint"),
             code == 0,
             args.verbose > 0,
-        ) {
-            if terminal_exit_code.is_some() {
-                eprintln!(
-                    "syq: withholding the relayed terminal record: the receipt did not verify"
-                );
-            } else {
-                release_held_line(held_terminal)?;
-            }
-            return Err(error);
-        }
+        )?;
     }
-    if let Some(advertised) = terminal_exit_code {
-        if advertised != Some(i64::from(code)) {
-            // Same struct drives both on the coordinator, so any mismatch
-            // means corruption or mangling in between.
-            eprintln!(
-                "syq: withholding the relayed terminal record: it advertises exit code {} but the coordinator exited {code}",
-                advertised.map_or_else(|| "none".to_string(), |c| c.to_string())
-            );
-            bail!("the relayed terminal record disagrees with the coordinator exit status");
-        }
-    }
-    release_held_line(held_terminal)?;
     Ok(code)
 }
 
@@ -1573,17 +1439,15 @@ mod tests {
         output.extend_from_slice(good.as_bytes());
         output.extend_from_slice(b"\r\n");
         let mut relayed = Vec::new();
-        let stream =
+        let receipt =
             relay_stdout_bounded(output.as_slice(), &mut relayed, MAX_RECEIPT_LINE_BYTES).unwrap();
-        assert_eq!(stream.receipt.as_deref(), Some(good.as_bytes()));
-        assert_eq!(stream.held_terminal, None);
+        assert_eq!(receipt.as_deref(), Some(good.as_bytes()));
         assert_eq!(relayed, b"syq: transferred 1 files\xff\r\n");
         let mut relayed = Vec::new();
-        let stream =
+        let receipt =
             relay_stdout_bounded(b"plain\n".as_slice(), &mut relayed, MAX_RECEIPT_LINE_BYTES)
                 .unwrap();
-        assert_eq!(stream.receipt, None);
-        assert_eq!(stream.held_terminal, None);
+        assert_eq!(receipt, None);
         assert_eq!(relayed, b"plain\n");
 
         // Ordinary lines stream through however long they are, a receipt
@@ -1594,66 +1458,14 @@ mod tests {
         long.extend_from_slice(crate::receipt::RECEIPT_LINE_PREFIX.as_bytes());
         long.extend_from_slice(good.as_bytes());
         let mut relayed = Vec::new();
-        let stream = relay_stdout_bounded(long.as_slice(), &mut relayed, 4096).unwrap();
-        assert_eq!(stream.receipt.as_deref(), Some(good.as_bytes()));
-        assert_eq!(stream.held_terminal, None);
+        let receipt = relay_stdout_bounded(long.as_slice(), &mut relayed, 4096).unwrap();
+        assert_eq!(receipt.as_deref(), Some(good.as_bytes()));
         assert_eq!(relayed.len(), 300 * 1024 + 1);
         let mut oversized = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
         oversized.extend(std::iter::repeat_n(b'A', 5000));
         oversized.push(b'\n');
         let mut relayed = Vec::new();
         assert!(relay_stdout_bounded(oversized.as_slice(), &mut relayed, 4096).is_err());
-    }
-
-    #[test]
-    fn relay_holds_back_the_terminal_record() {
-        let run = b"{\"schema\":\"syq.automation\",\"seq\":0,\"type\":\"run\"}\n";
-        let progress = b"{\"bytes_done\":1,\"seq\":1,\"type\":\"progress\"}\n";
-        let result = b"{\"exit_code\":0,\"seq\":2,\"status\":\"success\",\"type\":\"result\"}\n";
-        let mut stream = Vec::new();
-        stream.extend_from_slice(run);
-        stream.extend_from_slice(progress);
-        stream.extend_from_slice(result);
-        let mut relayed = Vec::new();
-        let relayed_stream =
-            relay_stdout_bounded(stream.as_slice(), &mut relayed, MAX_RECEIPT_LINE_BYTES).unwrap();
-        assert_eq!(relayed_stream.receipt, None);
-        // Everything before the terminal streams through; the terminal is
-        // withheld for receipt settlement.
-        assert_eq!(relayed, [run.as_slice(), progress.as_slice()].concat());
-        assert_eq!(
-            relayed_stream.held_terminal.as_deref(),
-            Some(result.as_slice())
-        );
-
-        // A non-terminal line containing the raw marker (impossible in
-        // valid JSON, where inner quotes are escaped) is briefly held, then
-        // released in order as soon as a later line completes; the real
-        // terminal stays held.
-        let error = b"noise \"type\":\"result\" noise\n";
-        let mut stream = Vec::new();
-        stream.extend_from_slice(error);
-        stream.extend_from_slice(progress);
-        stream.extend_from_slice(result);
-        let mut relayed = Vec::new();
-        let relayed_stream =
-            relay_stdout_bounded(stream.as_slice(), &mut relayed, MAX_RECEIPT_LINE_BYTES).unwrap();
-        assert_eq!(relayed, [error.as_slice(), progress.as_slice()].concat());
-        assert_eq!(
-            relayed_stream.held_terminal.as_deref(),
-            Some(result.as_slice())
-        );
-
-        // A trailing partial line cannot be the terminal record: the held
-        // line and the partial are both released, in order.
-        let mut stream = Vec::new();
-        stream.extend_from_slice(result);
-        stream.extend_from_slice(b"partial");
-        let mut relayed = Vec::new();
-        let relayed_stream =
-            relay_stdout_bounded(stream.as_slice(), &mut relayed, MAX_RECEIPT_LINE_BYTES).unwrap();
-        assert_eq!(relayed_stream.held_terminal, None);
-        assert_eq!(relayed, [result.as_slice(), b"partial".as_slice()].concat());
     }
 
     #[test]

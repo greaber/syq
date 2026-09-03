@@ -45,7 +45,7 @@ mkdir -p "$dir/src/Berlin"
 printf 'img' >"$dir/src/Berlin/IMG.JPG"
 printf 'hello' >"$dir/src/Notes.TXT"
 (cd "$dir" && printf '%s\n' "$mapping_manifest" |
-    "$syq" cp -j1 -C src --mapping - --into dst --results - -q >raw.ndjson)
+    "$syq" cp -j1 -C src --mapping - --into dst --results raw.ndjson -q)
 normalize <"$dir/raw.ndjson" >"$out/success.ndjson"
 
 # partial: one mapping entry's source is missing; the rest settle. Exit 23.
@@ -55,7 +55,7 @@ printf 'ok' >"$dir/src/present.txt"
 (cd "$dir" && printf '%s\n' \
     '{"src":{"encoding":"utf-8","value":"present.txt"},"dst":{"encoding":"utf-8","value":"present.txt"},"kind":"file"}' \
     '{"src":{"encoding":"utf-8","value":"missing.txt"},"dst":{"encoding":"utf-8","value":"missing.txt"},"kind":"file"}' |
-    "$syq" cp -j1 -C src --mapping - --into dst --results - -q >raw.ndjson) || true
+    "$syq" cp -j1 -C src --mapping - --into dst --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/partial.ndjson"
 
 # dry-run: the success scenario against a stale destination, emitting
@@ -71,7 +71,7 @@ printf 'stale' >"$dir/dst/berlin/2024/07/img.jpg"
 find "$dir/src" -exec touch -h -d '2024-07-01T12:00:00Z' {} +
 find "$dir/dst" -exec touch -h -d '2024-01-01T00:00:00Z' {} +
 (cd "$dir" && printf '%s\n' "$mapping_manifest" |
-    "$syq" cp -j1 -C src --mapping - --into dst -n --results - -q >raw.ndjson)
+    "$syq" cp -j1 -C src --mapping - --into dst -n --results raw.ndjson -q)
 normalize <"$dir/raw.ndjson" >"$out/dry-run.ndjson"
 
 # refused: --prune finds more destination-only entries than --max-delete
@@ -84,7 +84,7 @@ printf 'x' >"$dir/dst/extra-1.txt"
 printf 'x' >"$dir/dst/extra-2.txt"
 (cd "$dir" &&
     "$syq" cp -j1 --prune --max-delete 1 --src-src src --into dst \
-        --results - -q >raw.ndjson) || true
+        --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/refused.ndjson"
 
 # failed: the source does not exist; a fatal setup failure still emits the
@@ -92,7 +92,7 @@ normalize <"$dir/raw.ndjson" >"$out/refused.ndjson"
 dir="$work/failed"
 mkdir -p "$dir"
 (cd "$dir" &&
-    "$syq" cp -j1 --src-src missing --into dst --results - -q >raw.ndjson) || true
+    "$syq" cp -j1 --src-src missing --into dst --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/failed.ndjson"
 
 echo "regenerated $(ls "$out" | wc -l) fixtures in $out"

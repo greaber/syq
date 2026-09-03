@@ -41,6 +41,12 @@ if stderr_bytes:
     sys.stderr.buffer.write(b"x" * stderr_bytes)
     sys.stderr.buffer.flush()
 
+results_fd = None
+for arg in args:
+    if arg.startswith("--results-fd="):
+        results_fd = int(arg.split("=", 1)[1])
+stream = os.fdopen(results_fd, "w") if results_fd is not None else sys.stdout
+
 command = args[0]
 if command == "map":
     print(json.dumps({
@@ -126,11 +132,12 @@ elif shape == "unknown-event":
     })
     records[-1]["seq"] += 1
 elif shape == "oversized-line":
-    sys.stdout.buffer.write(b"x" * (16 * 1024 * 1024 + 1))
-    sys.stdout.buffer.flush()
+    stream.buffer.write(b"x" * (16 * 1024 * 1024 + 1)) if stream is sys.stdout \
+        else stream.write("x" * (16 * 1024 * 1024 + 1))
+    stream.flush()
     raise SystemExit(0)
 for record in records:
-    print(json.dumps(record), flush=True)
+    print(json.dumps(record), file=stream, flush=True)
 raise SystemExit(exit_code)
 """
 
@@ -202,9 +209,13 @@ class NativeClientTests(unittest.TestCase):
             "--hash", "--no-compress", "--bwlimit", "--connections",
             "--max-entries", "--max-total-bytes",
             "--max-runtime", "--ignore", "--ignore-from", "--preserve",
-            "--inplace", "--max-size", "--min-size", "--results=-",
+            "--inplace", "--max-size", "--min-size",
         ):
             self.assertIn(expected, argv)
+        self.assertTrue(
+            any(arg.startswith("--results-fd=") for arg in argv),
+            argv,
+        )
         self.assertNotIn("--quiet", argv)
         self.assertEqual(argv.count("--src"), 2)
 
@@ -243,6 +254,10 @@ class NativeClientTests(unittest.TestCase):
             "--tcp-congestion",
         ):
             self.assertIn(expected, argv)
+        self.assertTrue(
+            any(arg.startswith("--results-fd=") for arg in argv),
+            argv,
+        )
 
         for parameter, option in (
             ({"no_tcp": True}, "--no-tcp"),

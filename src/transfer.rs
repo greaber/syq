@@ -756,34 +756,65 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
-    let mut results_setup = args.native_results.is_some();
-    if results_setup {
-        // The stream target is stdout, full stop (the CLI accepts only
-        // `--results -`): the shell owns turning a name into a file, so
-        // syq never resolves or creates an operator-supplied output path.
+    let results_requested = args.native_results.is_some() || args.native_results_fd.is_some();
+    if results_requested {
         if args.detach {
             bail!(
-                "--results cannot be used with --detach because the remote result stream would not remain attached"
+                "--results cannot be used with --detach because the result stream would not remain attached"
             );
         }
-        let coordinator_is_remote = args
+        // The stream writer lives with the transfer coordinator; a local
+        // file or descriptor cannot be written by a remote one.
+        if args
             .locations
             .split_last()
-            .is_some_and(|(dst, sources)| uses_remote_coordinator(&args, sources, dst));
-        // The machine owns stdout either way: suppress every human stdout
-        // line so the stream stays parseable.
-        progress.suppress_stdout();
-        if coordinator_is_remote {
-            // The remote coordinator owns the stream end to end: it emits
-            // the run record, sequence numbers, and terminal record, and
-            // this process only pipes the bytes through. Attaching a local
-            // writer too would put a second run record and a restarted seq
-            // into the same stdout.
-            results_setup = false;
+            .is_some_and(|(dst, sources)| uses_remote_coordinator(&args, sources, dst))
+        {
+            bail!(
+                "--results is written by the transfer coordinator, which is remote for this copy; use --run-at local to keep it on this machine"
+            );
         }
     }
-    if results_setup {
-        let out: Box<dyn std::io::Write + Send> = Box::new(std::io::stdout());
+    if results_requested {
+        let out: Box<dyn std::io::Write + Send> = if let Some(fd) = args.native_results_fd {
+            // The caller opened this descriptor (e.g. `3>run.ndjson`)
+            // before syq ran; verify it is actually connected so a
+            // forgotten redirection fails here, loudly, instead of at the
+            // first lost record.
+            if unsafe { libc::fcntl(fd, libc::F_GETFL) } == -1 {
+                bail!(
+                    "--results-fd {fd}: descriptor is not open; connect it in the caller, e.g. --results-fd {fd} {fd}>run.ndjson"
+                );
+            }
+            // Safety: the fd is inherited, open, and named by the operator
+            // for exactly this purpose; syq owns it for the run.
+            Box::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+        } else {
+            let results = args.native_results.as_deref().expect("results requested");
+            if !args.native_follow {
+                crate::fsops::check_operator_path_no_symlinks(results, false, true)
+                    .map_err(|error| anyhow::anyhow!("--results: {error}"))?;
+            }
+            let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
+            // A results file is one run: created fresh, never truncated or
+            // appended. Refusal keeps yesterday's stream (and anything a
+            // hostile name points at) intact; recurring jobs use fresh
+            // names. Placement is the operator's job — a path inside the
+            // source or destination trees is documented as unpredictable,
+            // not policed.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
+                        "--results {}: the file already exists; a results file holds exactly one run — remove it or choose a new name (recurring jobs can timestamp: run-$(date +%s).ndjson)",
+                        path.display()
+                    ),
+                    _ => anyhow::anyhow!("--results {}: {e}", path.display()),
+                })?;
+            Box::new(file)
+        };
         let writer = Arc::new(crate::results::ResultsWriter::new(out));
         let run_id = {
             let mut bytes = [0u8; 16];
@@ -2292,9 +2323,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
-    // With --results -, the machine owns stdout: every human summary line
-    // (which all render from the same terminal record) is suppressed.
-    if !args.quiet && !aborted && !progress.stdout_suppressed() {
+    if !args.quiet && !aborted {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
                 println!(

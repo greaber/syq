@@ -48,7 +48,8 @@
         "min-size"
       ],
       "internal": [
-        "results"
+        "results",
+        "results-fd"
       ],
       "aliases": {
         "srcs": "src",
@@ -124,30 +125,31 @@
         "src-dirs": "src-dir"
       },
       "raw_only": [
-        "from",
-        "into-new",
-        "into-existing",
-        "as-new",
         "as-existing",
-        "mapping",
-        "results",
-        "dry-run",
-        "verbose",
-        "connections",
-        "progress",
-        "no-progress",
-        "progress-json",
-        "hash",
-        "no-compress",
+        "as-new",
         "bwlimit",
-        "stats",
-        "max-entries",
-        "max-total-bytes",
-        "max-runtime",
+        "connections",
+        "dry-run",
+        "from",
+        "hash",
         "ignore",
         "ignore-from",
+        "inplace",
+        "into-existing",
+        "into-new",
+        "mapping",
+        "max-entries",
+        "max-runtime",
+        "max-total-bytes",
+        "no-compress",
+        "no-progress",
         "preserve",
-        "inplace"
+        "progress",
+        "progress-json",
+        "results",
+        "results-fd",
+        "stats",
+        "verbose"
       ],
       "follow_up": [
         "receipt"

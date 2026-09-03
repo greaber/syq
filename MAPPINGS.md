@@ -273,9 +273,10 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
 
 ## Machine-readable results
 
-`syq cp --results -` (with or without `--prune`) writes an NDJSON
-outcome stream to stdout and suppresses syq's own human stdout output;
-redirect (`--results - > r.ndjson`) to keep a file. The
+`syq cp --results FILE` (with or without `--prune`) writes an NDJSON
+outcome stream to a freshly created file, alongside the ordinary human
+output; `--results-fd N` writes to a caller-opened descriptor instead
+(`--results-fd 3 3>r.ndjson`, or a pipe). The
 full contract — every record type and field, the exit-code table,
 the JSON Schema, and example streams — is
 [docs/automation-v1.md](docs/automation-v1.md). In brief: the
@@ -302,7 +303,7 @@ manifest is one filter away:
 
 ```bash
 set -o pipefail
-syq cp --mapping big.ndjson -C src --to nas --into /data --results - > r.ndjson
+syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
 jq -cs 'if (.[-1].type? // "") != "result"
         then "incomplete results stream (no terminal record)" | halt_error
         elif (.[-1].status != "success" and .[-1].status != "partial")

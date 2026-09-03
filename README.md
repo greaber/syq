@@ -358,16 +358,20 @@ receiver to record a BLAKE3 digest of every file it publishes in its signed
 receipt. They are signed into the grant and enforced or honored by hostB, and
 are refused anywhere else because nothing would act on them.
 `cp` additionally accepts `--mapping` (see [MAPPINGS.md](MAPPINGS.md))
-and `--results -`, a machine-readable NDJSON outcome stream on stdout —
-redirect to keep a file (see
-[docs/automation-v1.md](docs/automation-v1.md)). For a direct
-remote-to-remote copy the stream rides the coordinator connection back
-to the invoking terminal. `--results` is rejected with `--detach`,
-because its stream would no longer remain attached. `--mapping` cannot
-be combined with `--prune` because mapping manifests define no deletion
-region; `--results` covers `--prune` runs, including their removals.
-`--max-delete` requires `--prune`; `rm` additionally accepts `--root`
-plus its endpoint-side removal semantics.
+and a machine-readable NDJSON outcome stream: `--results FILE` creates
+the file fresh (an existing file is refused — one file, one run), and
+`--results-fd N` writes to a descriptor the caller opened, e.g.
+`--results-fd 3 3>run.ndjson` (see
+[docs/automation-v1.md](docs/automation-v1.md)). The stream is written
+by the transfer coordinator, so both forms require it to be local
+(`--run-at local` for remote-to-remote copies), and both are rejected
+with `--detach`. Choose a results path outside the source and
+destination trees; one inside them can make the run's own accounting
+unpredictable. `--mapping` cannot be combined with `--prune` because
+mapping manifests define no deletion region; `--results` covers
+`--prune` runs, including their removals. `--max-delete` requires
+`--prune`; `rm` additionally accepts `--root` plus its endpoint-side
+removal semantics.
 
 Native `cp` exposes the remote runtime and transport controls
 directly: `--rsh COMMAND`, `--syq-path PATH`, `--no-bootstrap`, `--no-tcp`,
