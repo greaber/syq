@@ -89,7 +89,15 @@ pub(crate) struct RootMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperatorFinalComponent {
     Directory,
-    Entry { follow_symlink: bool },
+    Entry {
+        follow_symlink: bool,
+    },
+    /// An input file whose final procfs magic link may be opened relative to
+    /// its retained procfs parent instead of interpreting its synthetic target
+    /// bytes as an ordinary symlink path.
+    ReadableEntry {
+        follow_symlink: bool,
+    },
 }
 
 /// One symlink hop taken while resolving an operator path. Callers use this
@@ -118,6 +126,66 @@ impl PinnedLeaf {
 
     pub(crate) fn into_parts(self) -> (File, CString, RootMetadata, Option<File>) {
         (self.parent, self.name, self.metadata, self.object)
+    }
+
+    /// Open the selected identity for input without resolving its
+    /// pathname again. The metadata handle retained by the resolver prevents
+    /// inode reuse until the newly opened descriptor has been checked.
+    pub(crate) fn open_read(self) -> Result<File> {
+        if self.metadata.is_dir() || self.metadata.is_symlink() {
+            bail!("operator path does not select a readable file");
+        }
+        if self.metadata.is_fifo() {
+            #[cfg(target_os = "linux")]
+            if let Some(object) = &self.object {
+                if let Some(file) = reopen_pinned_object_for_read(object)? {
+                    let actual = root_metadata_from_std(&file.metadata()?)?;
+                    require_operator_identity(self.metadata, actual, "operator FIFO")?;
+                    return Ok(file);
+                }
+            }
+            bail!(
+                "selected FIFO control input cannot be reopened through an exact descriptor on this platform; use --files-from - or --mapping -, or materialize ignore rules in a regular file"
+            );
+        }
+        // A pathname replacement must not make the candidate open block before
+        // its identity is checked. The selected object is not a FIFO here, but
+        // its replacement may be one. Restore ordinary blocking I/O only after
+        // the opened object has been validated.
+        let flags =
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let file = open_at(self.parent.as_raw_fd(), &self.name, flags, 0)
+            .context("open selected operator file")?;
+        let actual = root_metadata_from_std(&file.metadata()?)?;
+        require_operator_identity(self.metadata, actual, "operator file")?;
+        clear_nonblocking(&file).context("normalize selected operator file flags")?;
+        Ok(file)
+    }
+
+    /// Open the selected identity for ordinary output, validating it before
+    /// truncation so a namespace replacement cannot redirect the write.
+    pub(crate) fn open_regular_write(self, truncate: bool) -> Result<File> {
+        self.open_regular(libc::O_WRONLY, truncate)
+    }
+
+    fn open_regular(self, access: libc::c_int, truncate: bool) -> Result<File> {
+        if !self.metadata.is_file() {
+            bail!("operator path does not select a regular file");
+        }
+        let file = open_at(
+            self.parent.as_raw_fd(),
+            &self.name,
+            access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+            0,
+        )
+        .context("open selected operator file")?;
+        let actual = root_metadata_from_std(&file.metadata()?)?;
+        require_operator_identity(self.metadata, actual, "operator file")?;
+        clear_nonblocking(&file).context("normalize selected operator file flags")?;
+        if truncate {
+            file.set_len(0).context("truncate selected operator file")?;
+        }
+        Ok(file)
     }
 }
 
@@ -151,12 +219,48 @@ impl PinnedMissing {
     pub(crate) fn into_parts(self) -> (File, VecDeque<Vec<u8>>) {
         (self.directory, self.components)
     }
+
+    /// Create a single missing regular-file leaf relative to the retained
+    /// parent. Missing parents are deliberately not created for control paths.
+    pub(crate) fn create_regular(self, mode: u32) -> Result<File> {
+        let mut components = self.components;
+        if components.len() != 1 {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT).into());
+        }
+        let name = operator_component_cstring(
+            &components
+                .pop_front()
+                .expect("one missing operator component was checked"),
+        )?;
+        let file = open_at(
+            self.directory.as_raw_fd(),
+            &name,
+            libc::O_WRONLY
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_NOCTTY
+                | libc::O_CLOEXEC,
+            mode & 0o777,
+        )
+        .context("create selected operator file")?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            bail!("created operator path is not a regular file");
+        }
+        clear_nonblocking(&file).context("normalize selected operator file flags")?;
+        Ok(file)
+    }
 }
 
 pub(crate) enum PinnedPath {
     Missing(PinnedMissing),
     Leaf(PinnedLeaf),
     Directory(PinnedDirectory),
+    /// A readable object opened directly through a retained procfs magic-link
+    /// parent. This is used only for final control-file inputs.
+    OpenFile(File),
 }
 
 struct OperatorCursor {
@@ -311,6 +415,8 @@ impl OperatorResolver {
                     final_component,
                     OperatorFinalComponent::Entry {
                         follow_symlink: true
+                    } | OperatorFinalComponent::ReadableEntry {
+                        follow_symlink: true
                     }
                 );
 
@@ -334,12 +440,64 @@ impl OperatorResolver {
                         object,
                     }));
                 }
-                self.authorize_symlink(metadata, &component)?;
+                // Refusal needs no second observation. Policies that follow
+                // the link pin it first so ownership and target bytes come
+                // from the same symlink object.
+                if self.symlink_policy == OperatorSymlinkPolicy::Refuse {
+                    self.authorize_symlink(metadata, &component)?;
+                    unreachable!("the refusing policy always returns an error for a symlink");
+                }
                 symlink_count += 1;
                 if symlink_count > 40 {
                     bail!("too many symlink levels in operator path");
                 }
-                let target = operator_read_link_at(current.directory.as_raw_fd(), &name)?;
+                let object = open_operator_symlink_at(current.directory.as_raw_fd(), &name)?;
+                let target = if let Some(object) = object {
+                    let opened_metadata = root_metadata_from_std(&object.metadata()?)?;
+                    require_operator_identity(metadata, opened_metadata, "operator symlink")?;
+                    self.authorize_symlink(opened_metadata, &component)?;
+                    hold_open_operator_symlink_for_test(&component)?;
+                    match operator_read_open_link(&object)? {
+                        Some(target) => {
+                            #[cfg(target_os = "linux")]
+                            if final_name
+                                && matches!(
+                                    final_component,
+                                    OperatorFinalComponent::ReadableEntry { .. }
+                                )
+                                && operator_descriptor_is_procfs(&object)?
+                            {
+                                let file = open_at(
+                                    current.directory.as_raw_fd(),
+                                    &name,
+                                    libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+                                    0,
+                                )
+                                .context("open selected procfs magic-link input")?;
+                                let after = operator_read_open_link(&object)?
+                                    .context("procfs magic link lost descriptor-bound access")?;
+                                if after != target {
+                                    bail!("procfs magic-link target changed during selection");
+                                }
+                                let metadata = root_metadata_from_std(&file.metadata()?)?;
+                                if metadata.is_dir() || metadata.is_symlink() {
+                                    bail!("operator path does not select a readable file");
+                                }
+                                hops.push(OperatorSymlinkHop { component, target });
+                                return Ok(PinnedPath::OpenFile(file));
+                            }
+                            target
+                        }
+                        None => {
+                            require_operator_link_fallback_allowed(self.symlink_policy)?;
+                            operator_read_link_at(current.directory.as_raw_fd(), &name)?
+                        }
+                    }
+                } else {
+                    self.authorize_symlink(metadata, &component)?;
+                    require_operator_link_fallback_allowed(self.symlink_policy)?;
+                    operator_read_link_at(current.directory.as_raw_fd(), &name)?
+                };
                 hops.push(OperatorSymlinkHop {
                     component,
                     target: target.clone(),
@@ -444,6 +602,10 @@ impl RootMetadata {
 
     pub(crate) fn is_symlink(self) -> bool {
         self.mode & MODE_TYPE_MASK == MODE_SYMLINK
+    }
+
+    pub(crate) fn is_fifo(self) -> bool {
+        self.mode & MODE_TYPE_MASK == MODE_FIFO
     }
 
     pub(crate) fn file_type(self) -> u32 {
@@ -1412,6 +1574,50 @@ fn open_operator_symlink_at(parent: RawFd, name: &CString) -> Result<Option<File
     }
 }
 
+#[cfg(debug_assertions)]
+fn hold_open_operator_symlink_for_test(component: &[u8]) -> Result<()> {
+    let Some(expected) = std::env::var_os("SYQ_TEST_OPERATOR_SYMLINK_COMPONENT") else {
+        return Ok(());
+    };
+    if expected.as_encoded_bytes() != component {
+        return Ok(());
+    }
+    if let Some(ready) = std::env::var_os("SYQ_TEST_OPERATOR_SYMLINK_READY_FILE") {
+        std::fs::write(&ready, b"ready").with_context(|| {
+            format!(
+                "write operator-symlink-ready signal {}",
+                Path::new(&ready).display()
+            )
+        })?;
+    }
+    let Some(release) = std::env::var_os("SYQ_TEST_OPERATOR_SYMLINK_RELEASE_FILE") else {
+        return Ok(());
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !Path::new(&release).exists() {
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for operator-symlink release signal {}",
+                Path::new(&release).display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_open_operator_symlink_for_test(_component: &[u8]) -> Result<()> {
+    Ok(())
+}
+
+/// Read target bytes through an already-open symlink when the platform has a
+/// descriptor-bound API. `None` means that only the insecure pathname API is
+/// available; callers enforcing trusted-owner traversal must fail closed.
+fn operator_read_open_link(object: &File) -> Result<Option<Vec<u8>>> {
+    read_open_symlink(object)
+}
+
 fn operator_read_link_at(parent: RawFd, name: &CString) -> Result<Vec<u8>> {
     read_link_bytes(|target, capacity| unsafe {
         libc::readlinkat(parent, name.as_ptr(), target, capacity)
@@ -1506,6 +1712,60 @@ fn require_metadata_identity(
 
 fn operator_symlink_owner_is_trusted(owner: u32, euid: u32) -> bool {
     owner == 0 || owner == euid
+}
+
+fn require_operator_link_fallback_allowed(policy: OperatorSymlinkPolicy) -> Result<()> {
+    if policy == OperatorSymlinkPolicy::TrustedOwner {
+        bail!(
+            "trusted-owner symlink traversal requires descriptor-bound link reads on this platform"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn operator_descriptor_is_procfs(file: &File) -> Result<bool> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    loop {
+        if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } == 0 {
+            let stats = unsafe { stats.assume_init() };
+            return Ok(stats.f_type as u32 == libc::PROC_SUPER_MAGIC as u32);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error).context("identify operator descriptor filesystem");
+        }
+    }
+}
+
+/// Upgrade a retained Linux `O_PATH` object to a readable descriptor without
+/// consulting its former pathname. A verified procfs directory makes the
+/// decimal entry an exact reference to `object`, even after namespace rename.
+#[cfg(target_os = "linux")]
+fn reopen_pinned_object_for_read(object: &File) -> Result<Option<File>> {
+    let proc_path = CString::new("/proc/self/fd").expect("fixed procfs path contains no NUL");
+    let proc_fd = match open_at(
+        libc::AT_FDCWD,
+        &proc_path,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(proc_fd) => proc_fd,
+        Err(_) => return Ok(None),
+    };
+    if !operator_descriptor_is_procfs(&proc_fd)? {
+        return Ok(None);
+    }
+    let name = CString::new(object.as_raw_fd().to_string())
+        .expect("decimal file descriptor contains no NUL");
+    open_at(
+        proc_fd.as_raw_fd(),
+        &name,
+        libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+        0,
+    )
+    .map(Some)
+    .context("reopen selected FIFO through its retained descriptor")
 }
 
 fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
@@ -2082,6 +2342,88 @@ mod tests {
         assert!(operator_symlink_owner_is_trusted(1000, 1000));
         assert!(!operator_symlink_owner_is_trusted(1001, 1000));
         assert!(!operator_symlink_owner_is_trusted(1000, 0));
+    }
+
+    #[test]
+    fn trusted_owner_never_falls_back_to_a_second_pathname_lookup() {
+        assert!(
+            require_operator_link_fallback_allowed(OperatorSymlinkPolicy::TrustedOwner).is_err()
+        );
+        assert!(require_operator_link_fallback_allowed(OperatorSymlinkPolicy::FollowAll).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_fifo_reopens_exactly_and_waits_for_a_writer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tree = TestDir::new("operator-fifo-read");
+        let fifo = tree.path().join("rules");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let base = File::open(tree.path()).unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+        let selected = resolver
+            .resolve(
+                b"rules",
+                OperatorFinalComponent::ReadableEntry {
+                    follow_symlink: true,
+                },
+                false,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let PinnedPath::Leaf(leaf) = selected else {
+            panic!("FIFO was not selected as a leaf");
+        };
+
+        let (opened_tx, opened_rx) = mpsc::sync_channel(1);
+        let opener = std::thread::spawn(move || opened_tx.send(leaf.open_read()).unwrap());
+        assert!(matches!(
+            opened_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let mut writer = File::options().write(true).open(&fifo).unwrap();
+        writer.write_all(b"drop\n").unwrap();
+        drop(writer);
+        let mut reader = opened_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exact FIFO reopen did not rendezvous with its writer")
+            .unwrap();
+        let mut contents = Vec::new();
+        reader.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"drop\n");
+        opener.join().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn selected_fifo_fails_closed_without_an_exact_reopen() {
+        let tree = TestDir::new("operator-fifo-cutout");
+        let fifo = tree.path().join("rules");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let base = File::open(tree.path()).unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+        let selected = resolver
+            .resolve(
+                b"rules",
+                OperatorFinalComponent::ReadableEntry {
+                    follow_symlink: true,
+                },
+                false,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let PinnedPath::Leaf(leaf) = selected else {
+            panic!("FIFO was not selected as a leaf");
+        };
+        let error = leaf.open_read().unwrap_err().to_string();
+        assert!(error.contains("exact descriptor"), "{error}");
     }
 
     #[test]
