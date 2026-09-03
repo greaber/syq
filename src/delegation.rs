@@ -362,7 +362,7 @@ impl FilterPolicy {
                 bail!("signed filter roots must be sorted and unique");
             }
         }
-        // `delete_excluded` is also a scan policy: with it, the orchestrator
+        // `delete_excluded` is also a scan policy: with it, the coordinator
         // inspects the destination unfiltered, and the receiver requires
         // exactly that. It therefore stays meaningful when deletion is
         // forbidden (a dry run, or a zero deletion budget); the receiver's

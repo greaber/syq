@@ -1,4 +1,4 @@
-//! Direct remote-to-remote: run the orchestrator on the source host so data
+//! Direct remote-to-remote: run the coordinator on the source host so data
 //! flows source→destination without passing through this machine.
 
 use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, SourceSelection};
@@ -146,7 +146,7 @@ enum ReceiptLineKind {
     V2,
 }
 
-/// Pass the orchestrator's stdout through byte for byte, keeping only the
+/// Pass the coordinator's stdout through byte for byte, keeping only the
 /// receipt marker lines to ourselves. Used only when a receipt is expected;
 /// other transfers inherit stdout untouched. V2 frames are decoded one line
 /// at a time and spooled rather than accumulated in memory.
@@ -155,7 +155,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
 }
 
 /// Streams every ordinary line straight through without holding more than
-/// one buffer of it, so a hostile orchestrator cannot make this machine
+/// one buffer of it, so a hostile coordinator cannot make this machine
 /// buffer an arbitrarily long line; only a receipt line is collected, up to
 /// its protocol-specific limit.
 fn relay_stdout_bounded(
@@ -185,7 +185,7 @@ fn relay_stdout_bounded(
     loop {
         let buffer = reader
             .fill_buf()
-            .context("read remote orchestrator output")?;
+            .context("read remote coordinator output")?;
         if buffer.is_empty() {
             break;
         }
@@ -207,7 +207,7 @@ fn relay_stdout_bounded(
                         capturing = Some((ReceiptLineKind::V1, head[v1_prefix.len()..].to_vec()));
                     } else {
                         out.write_all(&head)
-                            .context("relay remote orchestrator output")?;
+                            .context("relay remote coordinator output")?;
                     }
                     head.clear();
                 }
@@ -215,7 +215,7 @@ fn relay_stdout_bounded(
                 payload.extend_from_slice(segment);
             } else {
                 out.write_all(segment)
-                    .context("relay remote orchestrator output")?;
+                    .context("relay remote coordinator output")?;
             }
             if let Some((kind, payload)) = capturing.as_mut() {
                 let limit = match kind {
@@ -230,7 +230,7 @@ fn relay_stdout_bounded(
                 if let Some((kind, mut payload)) = capturing.take() {
                     store_receipt_line(&mut receipt, kind, finish_capture(&mut payload))?;
                 } else {
-                    out.flush().context("relay remote orchestrator output")?;
+                    out.flush().context("relay remote coordinator output")?;
                 }
                 decided = false;
             }
@@ -245,13 +245,13 @@ fn relay_stdout_bounded(
             capturing = Some((ReceiptLineKind::V1, head[v1_prefix.len()..].to_vec()));
         } else {
             out.write_all(&head)
-                .context("relay remote orchestrator output")?;
+                .context("relay remote coordinator output")?;
         }
     }
     if let Some((kind, mut payload)) = capturing.take() {
         store_receipt_line(&mut receipt, kind, finish_capture(&mut payload))?;
     }
-    out.flush().context("relay remote orchestrator output")?;
+    out.flush().context("relay remote coordinator output")?;
     Ok(receipt)
 }
 
@@ -263,7 +263,7 @@ fn store_receipt_line(
     match kind {
         ReceiptLineKind::V1 => {
             if captured.is_some() {
-                bail!("the remote orchestrator relayed more than one legacy receipt line");
+                bail!("the remote coordinator relayed more than one legacy receipt line");
             }
             *captured = Some(CapturedReceipt::V1(payload));
         }
@@ -275,7 +275,7 @@ fn store_receipt_line(
                 *captured = Some(CapturedReceipt::V2(CapturedReceiptV2::new()?));
             }
             let Some(CapturedReceipt::V2(receipt)) = captured.as_mut() else {
-                bail!("the remote orchestrator mixed receipt protocol versions");
+                bail!("the remote coordinator mixed receipt protocol versions");
             };
             receipt.push(&encoded)?;
         }
@@ -285,7 +285,7 @@ fn store_receipt_line(
 
 /// Verify hostB's receipt against the grant this machine signed. A missing,
 /// unverifiable, or mismatching receipt fails the transfer regardless of
-/// what the source-side orchestrator reported.
+/// what the source-side coordinator reported.
 fn settle_receipt(
     expectation: &ReceiptExpectation,
     captured: Option<&mut CapturedReceipt>,
@@ -755,9 +755,9 @@ pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     run_remote(args, srcs, dst, false)
 }
 
-pub fn run_at_target(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
+pub fn coordinate_at_dest(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
     if args.interface == Interface::Rsync {
-        bail!("--run-at target is available only through native copy syntax");
+        bail!("--coordinate-at dest is available only through native copy syntax");
     }
     if !srcs[0].same_host(dst)
         && args.rsh.is_none()
@@ -766,7 +766,7 @@ pub fn run_at_target(args: &Args, srcs: &[Location], dst: &Location) -> Result<i
         && !args.agent_broker_only
     {
         bail!(
-            "--run-at target requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with target-host credentials, or an explicit --rsh policy"
+            "--coordinate-at dest requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with destination-host credentials, or an explicit --rsh policy"
         );
     }
     run_remote(args, srcs, dst, true)
@@ -776,7 +776,7 @@ fn run_remote(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
-    coordinator_at_target: bool,
+    coordinator_at_destination: bool,
 ) -> Result<i32> {
     match args.native_results.as_deref() {
         Some(b"-") if args.detach => bail!(
@@ -784,12 +784,20 @@ fn run_remote(
         ),
         Some(b"-") | None => {}
         Some(_) => bail!(
-            "a remote transfer coordinator accepts only --results -; use --run-at local to create a named results file"
+            "a remote transfer coordinator accepts only --results -; use --coordinate-at local to create a named results file"
         ),
     }
     let rsh = parse_rsh(&args.rsh)?;
-    let coordinator = if coordinator_at_target { dst } else { &srcs[0] };
-    let peer = if coordinator_at_target { &srcs[0] } else { dst };
+    let coordinator = if coordinator_at_destination {
+        dst
+    } else {
+        &srcs[0]
+    };
+    let peer = if coordinator_at_destination {
+        &srcs[0]
+    } else {
+        dst
+    };
     let coordinator_host = coordinator.host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
     if args.detach && args.rsh.is_none() && !same_host && !args.no_forward_agent {
@@ -833,7 +841,7 @@ fn run_remote(
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
         // form instead of silently keeping only the constrained broker.
-        let prepared = (!coordinator_at_target && !args.agent_broker_only)
+        let prepared = (!coordinator_at_destination && !args.agent_broker_only)
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
@@ -910,7 +918,7 @@ fn run_remote(
         diagnostics: Default::default(),
     };
 
-    // Rebuild the native command for the remote orchestrator. Placement stays
+    // Rebuild the native command for the remote coordinator. Placement stays
     // explicit rather than being translated into trailing-slash heuristics.
     let mut remote: Vec<String> = vec![match args.interface {
         Interface::Rsync => unreachable!("checked above"),
@@ -1018,7 +1026,7 @@ fn run_remote(
         remote.push("--progress".into());
     }
 
-    if coordinator_at_target && !same_host {
+    if coordinator_at_destination && !same_host {
         remote.push("--from".into());
         remote.push(endpoint_arg(
             &srcs[0],
@@ -1040,7 +1048,7 @@ fn run_remote(
         );
         remote.push(utf8_path(&source.path, "source path")?);
     }
-    if !coordinator_at_target && !same_host {
+    if !coordinator_at_destination && !same_host {
         remote.push("--to".into());
         remote.push(endpoint_arg(
             dst,
@@ -1052,7 +1060,7 @@ fn run_remote(
     remote.push(
         restricted_destination_path
             .clone()
-            .unwrap_or(utf8_path(&dst.path, "target path")?),
+            .unwrap_or(utf8_path(&dst.path, "destination path")?),
     );
 
     if args.detach {
@@ -1507,7 +1515,7 @@ mod tests {
         let refused = encode(&refused, request_id);
         assert!(settle(&expectation, Some(&refused)).is_err());
 
-        // An incomplete in-place file contradicts a successful orchestrator
+        // An incomplete in-place file contradicts a successful coordinator
         // but is only a warning beside a failure it already reported.
         let mut partial = crate::receipt::Ledger::default();
         partial.published.insert(

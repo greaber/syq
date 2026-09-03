@@ -58,7 +58,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             from_="source",
             follow=True,
             to="target",
-            run_at="local",
+            coordinate_at="local",
             into_existing="out",
             dry_run=True,
             hash=True,
@@ -112,7 +112,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             from_="source:2222",
             to="target:2200",
             into="out",
-            run_at="local",
+            coordinate_at="local",
             rsh="ssh -F config",
             syq_path="/opt/syq",
             no_bootstrap=True,
@@ -122,7 +122,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         )
         argv = self.argv()
         for expected in (
-            "--run-at",
+            "--coordinate-at",
             "--rsh",
             "--syq-path",
             "--no-bootstrap",
@@ -146,7 +146,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
                     "source",
                     from_="source",
                     to="target",
-                    run_at="local",
+                    coordinate_at="local",
                     into="out",
                     **parameter,
                 )

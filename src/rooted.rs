@@ -868,7 +868,7 @@ impl Root {
             || before.file_type() != expected_type
         {
             bail!(
-                "confined target {} changed before replacement",
+                "confined destination {} changed before replacement",
                 path.label()
             );
         }
@@ -894,10 +894,10 @@ impl Root {
                 parent.directory.as_raw_fd(),
                 &parent.leaf,
             )
-            .with_context(|| format!("restore raced target {}", path.label()))?;
+            .with_context(|| format!("restore raced destination {}", path.label()))?;
             unlink_at(parent.directory.as_raw_fd(), &temporary, 0)?;
             bail!(
-                "confined target {} changed during replacement",
+                "confined destination {} changed during replacement",
                 path.label()
             );
         }
@@ -995,7 +995,7 @@ impl Root {
             })
         {
             bail!(
-                "confined target {} changed before publication",
+                "confined destination {} changed before publication",
                 target.label()
             );
         }
@@ -1017,9 +1017,9 @@ impl Root {
                 target_parent.directory.as_raw_fd(),
                 &target_parent.leaf,
             )
-            .with_context(|| format!("restore raced target {}", target.label()))?;
+            .with_context(|| format!("restore raced destination {}", target.label()))?;
             bail!(
-                "confined target {} changed during publication",
+                "confined destination {} changed during publication",
                 target.label()
             );
         }

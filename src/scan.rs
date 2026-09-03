@@ -306,7 +306,7 @@ pub fn scan_rooted(
     let target = crate::fsops::resolve(requested_root);
     let target_relative = target.strip_prefix(&root_path).with_context(|| {
         format!(
-            "scan target {} is outside enrolled root {}",
+            "scan destination {} is outside enrolled root {}",
             target.display(),
             root_path.display()
         )

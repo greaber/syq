@@ -42,7 +42,7 @@ preview = client.cp(
 )
 ```
 
-Remote-copy controls use the same names with underscores, including `run_at`,
+Remote-copy controls use the same names with underscores, including `coordinate_at`,
 `rsh`, `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
 `tcp_congestion`, and the native agent-forwarding policy flags. `detach` stays
 on raw `run()` because a detached command cannot return typed attached results.
