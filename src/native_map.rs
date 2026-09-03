@@ -12,13 +12,19 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs::Metadata;
+use std::fs::File;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
 use crate::cli::{native_basename, Args, Placement, SourceSelection};
+use crate::fsops::{require_source_leaf_identity, rooted_entry_in_directory, rooted_source_entry};
+use crate::proto::{Entry, Kind, OperatorSymlinkPolicy, SourceLeafIdentity};
+use crate::rooted::{
+    read_open_symlink, OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root,
+    OPERATOR_SYMLINK_FOLLOW_ADVICE,
+};
 
 #[derive(Serialize)]
 struct TaggedPath<'a> {
@@ -37,41 +43,37 @@ struct MapRecord<'a> {
     mtime: Option<i64>,
 }
 
+struct MapSelection {
+    root: Arc<Root>,
+    relative: Vec<u8>,
+    expected_leaf: Option<SourceLeafIdentity>,
+    _leaf_object: Option<File>,
+    emitted_source: Vec<u8>,
+}
+
+struct PendingMapEntry {
+    root_relative: Vec<u8>,
+    entry: Entry,
+    metadata: crate::rooted::RootMetadata,
+}
+
 pub fn run(args: &Args) -> Result<i32> {
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    let mut top_level_dst: HashSet<Vec<u8>> = HashSet::new();
     let follow_src = args.follows_native_source_paths();
-    for location in &args.locations {
-        let full = full_path(args, &location.path);
-        if !follow_src {
-            crate::fsops::check_operator_path_no_symlinks(
-                full.as_os_str().as_bytes(),
-                location.selection != SourceSelection::Contents,
-                false,
-            )?;
-        }
-        if location.selection == SourceSelection::Contents {
-            let md = metadata(&full, follow_src)
-                .with_context(|| format!("--src-src {}", full.display()))?;
-            if !md.is_dir() {
-                bail!("--src-src {} is not a directory", full.display());
+    let symlink_policy = if follow_src {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    };
+    let base = pin_base(args, symlink_policy)?;
+    let mut top_level_dst: HashSet<Vec<u8>> = HashSet::new();
+    let destination_prefixes = args
+        .locations
+        .iter()
+        .map(|location| {
+            if location.selection == SourceSelection::Contents {
+                return Ok(Vec::new());
             }
-            walk_children(&full, &location.path, b"", b"", &mut out)?;
-        } else {
-            let md = metadata(&full, follow_src)
-                .with_context(|| format!("source {}", full.display()))?;
-            crate::transfer::validate_native_source_type(
-                &location.path,
-                location.selection,
-                metadata_kind(&md),
-            )?;
-            let src_name = if follow_src {
-                resolved_named_source(args, &full)?
-            } else {
-                location.path.clone()
-            };
-            let dst_name = match (args.placement, &args.native_map_target) {
+            let destination = match (args.placement, &args.native_map_target) {
                 (Placement::As, Some(target)) => native_basename(target)
                     .ok_or_else(|| anyhow!("--as destination has no basename"))?
                     .to_vec(),
@@ -79,68 +81,292 @@ pub fn run(args: &Args) -> Result<i32> {
                     .expect("parse validated that named selectors have a basename")
                     .to_vec(),
             };
-            if !top_level_dst.insert(dst_name.clone()) {
+            if !top_level_dst.insert(destination.clone()) {
                 bail!(
                     "two selectors map to the same destination name {:?}",
-                    String::from_utf8_lossy(&dst_name)
+                    String::from_utf8_lossy(&destination)
                 );
             }
-            emit(&mut out, &src_name, &dst_name, &md)?;
-            if md.is_dir() {
-                walk_children(&full, &location.path, &src_name, &dst_name, &mut out)?;
-            }
-        }
+            Ok(destination)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for (location, destination) in args.locations.iter().zip(destination_prefixes) {
+        let selection = pin_selection(&base, location, follow_src, symlink_policy)?;
+        hold_map_selection_for_test()?;
+        emit_selection(location, selection, &destination, &mut out)?;
     }
     out.flush().context("writing mapping to stdout")?;
     Ok(0)
 }
 
-/// Emit every descendant of `dir`, byte-sorted, parents before children.
-/// `sel` is the selector spelling used only in error messages; `src_prefix`
-/// and `dst_prefix` are the emitted relative prefixes (empty for a contents
-/// root).
-fn walk_children(
-    dir: &Path,
-    sel: &[u8],
-    src_prefix: &[u8],
-    dst_prefix: &[u8],
+fn pin_base(args: &Args, symlink_policy: OperatorSymlinkPolicy) -> Result<File> {
+    let path = args.native_map_cwd.as_deref().unwrap_or(b".");
+    let mut hops = Vec::new();
+    let selection = OperatorResolver::resolve_process(
+        path,
+        symlink_policy,
+        OperatorFinalComponent::Directory,
+        false,
+        &mut hops,
+    )
+    .with_context(|| {
+        format!(
+            "resolve syq map source base {}",
+            Path::new(OsStr::from_bytes(path)).display()
+        )
+    })?;
+    match selection {
+        PinnedPath::Directory(directory) => Ok(directory.into_parts().0),
+        PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
+            bail!("syq map source base is not a directory")
+        }
+        PinnedPath::Missing(_) => unreachable!("map base resolution requires an existing path"),
+    }
+}
+
+fn pin_selection(
+    base: &File,
+    location: &crate::cli::Location,
+    follow_src: bool,
+    symlink_policy: OperatorSymlinkPolicy,
+) -> Result<MapSelection> {
+    let resolver = OperatorResolver::beneath(base, true, symlink_policy)?;
+    let mut hops = Vec::new();
+    let selection = resolver
+        .resolve(
+            &location.path,
+            OperatorFinalComponent::Entry {
+                follow_symlink: follow_src,
+            },
+            false,
+            &mut hops,
+        )
+        .with_context(|| format!("resolve source {}", display(&location.path)))?;
+    match selection {
+        PinnedPath::Directory(directory) => {
+            let emitted_source =
+                emitted_source(location, follow_src, directory.resolved_relative())?;
+            let (directory, _) = directory.into_parts();
+            Ok(MapSelection {
+                root: Arc::new(Root::from_directory(directory)?),
+                relative: Vec::new(),
+                expected_leaf: None,
+                _leaf_object: None,
+                emitted_source,
+            })
+        }
+        PinnedPath::Leaf(leaf) => {
+            if location.selection == SourceSelection::Contents && leaf.metadata().is_symlink() {
+                bail!(
+                    "--src-src {} encounters a last-component symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
+                    display(&location.path)
+                );
+            }
+            let emitted_source = emitted_source(location, follow_src, leaf.resolved_relative())?;
+            let (parent, name, metadata, object) = leaf.into_parts();
+            let object = object
+                .context("this platform cannot retain the selected map source leaf safely")?;
+            let symlink_target = if metadata.is_symlink() {
+                Some(
+                    read_open_symlink(&object)?.context(
+                        "this platform cannot snapshot a selected map symlink through its pinned object (macOS 13 or newer is required on Darwin)",
+                    )?,
+                )
+            } else {
+                None
+            };
+            Ok(MapSelection {
+                root: Arc::new(Root::from_directory(parent)?),
+                relative: name.as_bytes().to_vec(),
+                expected_leaf: Some(SourceLeafIdentity {
+                    dev: metadata.dev,
+                    ino: metadata.ino,
+                    file_type: metadata.file_type(),
+                    symlink_target,
+                }),
+                _leaf_object: Some(object),
+                emitted_source,
+            })
+        }
+        PinnedPath::Missing(_) => unreachable!("map selection requires an existing path"),
+        PinnedPath::OpenFile(_) => unreachable!("map selection never opens a procfs input"),
+    }
+}
+
+fn emitted_source(
+    location: &crate::cli::Location,
+    follow_src: bool,
+    resolved_relative: &[u8],
+) -> Result<Vec<u8>> {
+    if !follow_src || location.selection == SourceSelection::Contents {
+        return Ok(location.path.clone());
+    }
+    if resolved_relative.is_empty() {
+        bail!(
+            "followed source {} resolves to the source base itself; select its contents instead",
+            display(&location.path)
+        );
+    }
+    Ok(resolved_relative.to_vec())
+}
+
+fn emit_selection(
+    location: &crate::cli::Location,
+    selection: MapSelection,
+    destination_prefix: &[u8],
     out: &mut impl Write,
 ) -> Result<()> {
-    let mut names: Vec<Vec<u8>> = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
-        names.push(entry.file_name().as_bytes().to_vec());
+    let contents = location.selection == SourceSelection::Contents;
+    let scan_relative = RelativePath::new(&selection.relative)?;
+    let metadata = selection.root.metadata(&scan_relative)?;
+    if let Some(expected) = selection.expected_leaf.as_ref() {
+        require_source_leaf_identity(expected, metadata)?;
     }
-    names.sort();
-    for name in names {
-        let full = dir.join(OsStr::from_bytes(&name));
-        let md = std::fs::symlink_metadata(&full)
-            .with_context(|| format!("under {}", String::from_utf8_lossy(sel)))?;
-        let src_rel = join_rel(src_prefix, &name);
-        let dst_rel = join_rel(dst_prefix, &name);
-        emit(out, &src_rel, &dst_rel, &md)?;
-        if md.is_dir() {
-            walk_children(&full, sel, &src_rel, &dst_rel, out)?;
+    let root_entry = rooted_source_entry(
+        &selection.root,
+        &scan_relative,
+        Vec::new(),
+        metadata,
+        selection.expected_leaf.as_ref(),
+    )?;
+    if let Some(expected) = selection.expected_leaf.as_ref() {
+        require_source_leaf_identity(expected, selection.root.metadata(&scan_relative)?)?;
+    }
+    if contents {
+        if root_entry.kind != Kind::Dir {
+            bail!("--src-src {} is not a directory", display(&location.path));
+        }
+    } else {
+        crate::transfer::validate_native_source_type(
+            &location.path,
+            location.selection,
+            root_entry.kind,
+        )?;
+        emit(
+            out,
+            &selection.emitted_source,
+            destination_prefix,
+            &root_entry,
+        )?;
+    }
+    if root_entry.kind != Kind::Dir {
+        return Ok(());
+    }
+    walk_directory(
+        &selection.root,
+        &selection.relative,
+        metadata,
+        &selection.emitted_source,
+        destination_prefix,
+        contents,
+        out,
+    )
+}
+
+/// Emit a descriptor-relative, byte-sorted depth-first walk. Pending entries
+/// carry strict root-relative names and observed identities, never open parent
+/// descriptors, so deep trees do not consume one fd per component. Each
+/// directory is reopened beneath the retained root without following links
+/// and checked against the identity observed by its opened parent.
+fn walk_directory(
+    root: &Root,
+    scan_root: &[u8],
+    scan_root_metadata: crate::rooted::RootMetadata,
+    source_prefix: &[u8],
+    destination_prefix: &[u8],
+    contents: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let mut pending = Vec::new();
+    push_directory_children(root, scan_root, b"", scan_root_metadata, &mut pending)?;
+    while let Some(PendingMapEntry {
+        root_relative,
+        entry,
+        metadata,
+    }) = pending.pop()
+    {
+        let relative = &entry.path;
+        let source = if contents {
+            relative.clone()
+        } else {
+            join_rel(source_prefix, relative)
+        };
+        let destination = if contents {
+            relative.clone()
+        } else {
+            join_rel(destination_prefix, relative)
+        };
+        emit(out, &source, &destination, &entry)?;
+        if entry.kind == Kind::Dir {
+            push_directory_children(root, &root_relative, relative, metadata, &mut pending)?;
         }
     }
     Ok(())
 }
 
-fn emit(out: &mut impl Write, src: &[u8], dst: &[u8], md: &Metadata) -> Result<()> {
+fn push_directory_children(
+    root: &Root,
+    root_relative: &[u8],
+    output_relative: &[u8],
+    expected: crate::rooted::RootMetadata,
+    pending: &mut Vec<PendingMapEntry>,
+) -> Result<()> {
+    let directory_relative = RelativePath::new(root_relative)?;
+    let directory = root.open_directory_verified(&directory_relative, expected)?;
+    let mut names = root.read_open_directory(&directory)?;
+    names.sort();
+    let mut children = Vec::with_capacity(names.len());
+    for name in names {
+        let metadata = root.metadata_in_directory(&directory, &name)?;
+        let output_relative = join_rel(output_relative, &name);
+        let entry = rooted_entry_in_directory(root, &directory, &name, output_relative, metadata)?;
+        children.push(PendingMapEntry {
+            root_relative: join_rel(root_relative, &name),
+            entry,
+            metadata,
+        });
+    }
+    children.reverse();
+    pending.extend(children);
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn hold_map_selection_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_MAP_SELECTION_READY_FILE") {
+        std::fs::write(&ready, b"ready").with_context(|| {
+            format!(
+                "write map-selection-ready signal {}",
+                Path::new(&ready).display()
+            )
+        })?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_MAP_SELECTION_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_map_selection_for_test() -> Result<()> {
+    Ok(())
+}
+
+fn emit(out: &mut impl Write, src: &[u8], dst: &[u8], entry: &Entry) -> Result<()> {
     let src = utf8(src)?;
     let dst = utf8(dst)?;
-    let file_type = md.file_type();
-    let kind = if file_type.is_dir() {
-        "dir"
-    } else if file_type.is_file() {
-        "file"
-    } else if file_type.is_symlink() {
-        "symlink"
-    } else {
-        "special"
+    let kind = match entry.kind {
+        Kind::Dir => "dir",
+        Kind::File => "file",
+        Kind::Symlink => "symlink",
+        _ => "special",
     };
     let (size, mtime) = if kind == "file" {
-        (Some(md.len()), Some(md.mtime()))
+        (Some(entry.size), Some(entry.mtime))
     } else {
         (None, None)
     };
@@ -182,71 +408,6 @@ fn join_rel(prefix: &[u8], name: &[u8]) -> Vec<u8> {
     joined
 }
 
-fn metadata_kind(md: &Metadata) -> crate::proto::Kind {
-    use crate::proto::Kind;
-    use std::os::unix::fs::FileTypeExt;
-    let file_type = md.file_type();
-    if file_type.is_dir() {
-        Kind::Dir
-    } else if file_type.is_file() {
-        Kind::File
-    } else if file_type.is_symlink() {
-        Kind::Symlink
-    } else if file_type.is_fifo() {
-        Kind::Fifo
-    } else if file_type.is_socket() {
-        Kind::Socket
-    } else if file_type.is_char_device() {
-        Kind::CharDev
-    } else if file_type.is_block_device() {
-        Kind::BlockDev
-    } else {
-        Kind::Other
-    }
-}
-
-fn metadata(path: &Path, follow: bool) -> std::io::Result<Metadata> {
-    if follow {
-        std::fs::metadata(path)
-    } else {
-        std::fs::symlink_metadata(path)
-    }
-}
-
-/// Mapping entries are data and are never affected by the consumer's
-/// `--follow`. Materialize a followed named selector as the referent's path
-/// relative to the mapping base so the emitted manifest still selects the
-/// same object when it is consumed.
-fn resolved_named_source(args: &Args, full: &Path) -> Result<Vec<u8>> {
-    let base = match &args.native_map_cwd {
-        Some(cwd) => PathBuf::from(OsStr::from_bytes(cwd)),
-        None => std::env::current_dir().context("resolve syq map working directory")?,
-    };
-    let base = std::fs::canonicalize(&base)
-        .with_context(|| format!("resolve syq map source base {}", base.display()))?;
-    let resolved = std::fs::canonicalize(full)
-        .with_context(|| format!("resolve followed source {}", full.display()))?;
-    let relative = resolved.strip_prefix(&base).map_err(|_| {
-        anyhow!(
-            "followed source {} resolves outside source base {}; pass its real path with a matching -C base",
-            full.display(),
-            base.display()
-        )
-    })?;
-    let bytes = relative.as_os_str().as_bytes();
-    if bytes.is_empty() {
-        bail!(
-            "followed source {} resolves to the source base itself; select its contents instead",
-            full.display()
-        );
-    }
-    Ok(bytes.to_vec())
-}
-
-fn full_path(args: &Args, selector: &[u8]) -> PathBuf {
-    let full = match &args.native_map_cwd {
-        Some(cwd) => crate::fsops::join(cwd, selector),
-        None => selector.to_vec(),
-    };
-    PathBuf::from(OsStr::from_bytes(&full).to_os_string())
+fn display(path: &[u8]) -> String {
+    Path::new(OsStr::from_bytes(path)).display().to_string()
 }

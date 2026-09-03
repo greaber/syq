@@ -119,6 +119,7 @@ pub(crate) struct PinnedLeaf {
     name: CString,
     metadata: RootMetadata,
     object: Option<File>,
+    resolved_relative: Vec<u8>,
 }
 
 impl PinnedLeaf {
@@ -128,6 +129,13 @@ impl PinnedLeaf {
 
     pub(crate) fn into_parts(self) -> (File, CString, RootMetadata, Option<File>) {
         (self.parent, self.name, self.metadata, self.object)
+    }
+
+    /// Canonical components from the resolver's initial directory to this
+    /// selection. Callers that expose the value must use a confined resolver,
+    /// so an unconfined `..` cannot make the spelling lose its original base.
+    pub(crate) fn resolved_relative(&self) -> &[u8] {
+        &self.resolved_relative
     }
 
     /// Open the selected identity for input without resolving its
@@ -198,6 +206,7 @@ pub(crate) struct PinnedDirectory {
     directory: File,
     entry: Option<PinnedLeaf>,
     metadata: RootMetadata,
+    resolved_relative: Vec<u8>,
 }
 
 impl PinnedDirectory {
@@ -207,6 +216,13 @@ impl PinnedDirectory {
 
     pub(crate) fn into_parts(self) -> (File, Option<PinnedLeaf>) {
         (self.directory, self.entry)
+    }
+
+    /// Canonical components from the resolver's initial directory to this
+    /// selection. See `PinnedLeaf::resolved_relative` for the confinement
+    /// precondition on callers that expose the value.
+    pub(crate) fn resolved_relative(&self) -> &[u8] {
+        &self.resolved_relative
     }
 }
 
@@ -348,6 +364,7 @@ impl OperatorResolver {
             let Some(component) = components.pop_front() else {
                 let current = stack.last().expect("operator resolver stack is nonempty");
                 let metadata = root_metadata_from_std(&current.directory.metadata()?)?;
+                let resolved_relative = operator_cursor_path(&stack, None);
                 let entry = if let Some(entry) = &current.entry {
                     let parent = &stack
                         .iter()
@@ -362,6 +379,7 @@ impl OperatorResolver {
                         name: entry.name.clone(),
                         metadata: entry.metadata,
                         object: None,
+                        resolved_relative: resolved_relative.clone(),
                     })
                 } else {
                     None
@@ -373,6 +391,7 @@ impl OperatorResolver {
                         .context("pin selected directory")?,
                     entry,
                     metadata,
+                    resolved_relative,
                 }));
             };
 
@@ -424,6 +443,7 @@ impl OperatorResolver {
 
             if metadata.is_symlink() {
                 if !follow_symlink {
+                    let resolved_relative = operator_cursor_path(&stack, Some(&component));
                     let object = open_operator_symlink_at(current.directory.as_raw_fd(), &name)?;
                     if let Some(object) = &object {
                         require_operator_identity(
@@ -440,6 +460,7 @@ impl OperatorResolver {
                         name,
                         metadata,
                         object,
+                        resolved_relative,
                     }));
                 }
                 // Refusal needs no second observation. Policies that follow
@@ -528,6 +549,7 @@ impl OperatorResolver {
                     "operator directory",
                 )?;
                 if final_name {
+                    let resolved_relative = operator_cursor_path(&stack, Some(&component));
                     return Ok(PinnedPath::Directory(PinnedDirectory {
                         directory,
                         entry: Some(PinnedLeaf {
@@ -538,8 +560,10 @@ impl OperatorResolver {
                             name,
                             metadata,
                             object: None,
+                            resolved_relative: resolved_relative.clone(),
                         }),
                         metadata,
+                        resolved_relative,
                     }));
                 }
                 stack.push(OperatorCursor {
@@ -567,6 +591,7 @@ impl OperatorResolver {
                 name,
                 metadata,
                 object: Some(object),
+                resolved_relative: operator_cursor_path(&stack, Some(&component)),
             }));
         }
     }
@@ -591,6 +616,22 @@ impl OperatorResolver {
             OperatorSymlinkPolicy::TrustedOwner | OperatorSymlinkPolicy::FollowAll => Ok(()),
         }
     }
+}
+
+fn operator_cursor_path(stack: &[OperatorCursor], final_component: Option<&[u8]>) -> Vec<u8> {
+    let mut path = Vec::new();
+    for component in stack
+        .iter()
+        .filter_map(|cursor| cursor.entry.as_ref())
+        .map(|entry| entry.name.as_bytes())
+        .chain(final_component)
+    {
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(component);
+    }
+    path
 }
 
 impl RootMetadata {

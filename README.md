@@ -562,6 +562,12 @@ executes such a manifest — a generalized `--as` covering many entries, each
 with its own destination. Between the two, any tool that edits JSON can reshape
 a transfer:
 
+`syq map` pins its source base and each selected source while it scans that
+selection. Enumeration and metadata reads are descriptor-relative, so replacing
+an operator pathname with a symlink cannot redirect the emitted tree. When a
+named selector is followed, its manifest `src` path comes from that same pinned
+component walk rather than a later pathname resolution.
+
 ```bash
 set -o pipefail
 syq map --src-src photos \

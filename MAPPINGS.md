@@ -254,6 +254,11 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   pass the real path with a matching `-C` base instead. A followed contents
   selector keeps ordinary contents-relative entries and requires the consumer
   to select the same base with the same source follow option.
+- `syq map` pins its source base and each selected source before scanning it.
+  Directory enumeration and metadata reads stay beneath that descriptor, so a
+  concurrent rename or symlink replacement cannot redirect the emitted tree.
+  A followed named selector's emitted `src` is derived from that same component
+  walk rather than a second `realpath` lookup.
 - Symlinks selected by mapping entries are never resolved by mapping handling:
   a symlink maps as a symlink, and a destination path that would traverse a
   symlink inside the destination container fails that entry. Resolve links before

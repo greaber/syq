@@ -9921,6 +9921,97 @@ fn native_map_uses_the_common_source_follow_policy() {
     );
     assert_output_ok(&copied);
     assert_eq!(read(&destination.path("mapped/link/file")), b"data");
+
+    fs::create_dir(t.path("nested")).unwrap();
+    symlink("../real", t.path("nested/link")).unwrap();
+    let lines = map_lines(&syq_map_in(
+        &t.path(""),
+        &["--follow-src", "--src", "nested/link"],
+    ));
+    assert_eq!(map_path(&lines[0], "src"), "real");
+    assert_eq!(map_path(&lines[0], "dst"), "link");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_map_scans_the_pinned_selection_after_path_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("selected/original.txt"), b"original");
+    write(&t.path("outside/outside.txt"), b"outside");
+    let ready = t.path("map-ready");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["map", "--src-src", "selected"])
+        .current_dir(t.path(""))
+        .env("SYQ_TEST_MAP_SELECTION_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_MAP_SELECTION_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq map exited before pinning its selection"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "syq map did not reach the selection hook");
+
+    fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
+    symlink("outside", t.path("selected")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    let lines = map_lines(&output);
+    let sources: Vec<_> = lines.iter().map(|line| map_path(line, "src")).collect();
+    assert_eq!(sources, ["original.txt"]);
+}
+
+#[test]
+fn native_map_descriptor_walk_has_bounded_fd_use() {
+    let t = Tmp::new();
+    let mut directory = t.path("selected");
+    for index in 0..80 {
+        directory.push(format!("d{index:02}"));
+    }
+    fs::create_dir_all(&directory).unwrap();
+    write(&directory.join("leaf"), b"leaf");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args(["map", "--src-src", "selected"])
+        .current_dir(t.path(""));
+    unsafe {
+        command.pre_exec(|| {
+            let mut inherited = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let low_limit = inherited.rlim_max.min(32);
+            if low_limit < 16 {
+                return Err(std::io::Error::other(
+                    "inherited descriptor limit is too low for the test",
+                ));
+            }
+            let limit = libc::rlimit {
+                rlim_cur: low_limit,
+                rlim_max: low_limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let lines = map_lines(&command.run().unwrap());
+    assert_eq!(lines.len(), 81);
+    assert!(map_path(lines.last().unwrap(), "src").ends_with("/leaf"));
 }
 
 #[test]
