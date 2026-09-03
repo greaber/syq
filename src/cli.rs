@@ -809,6 +809,11 @@ enum NativePreserve {
 
 #[derive(clap::Args, Debug)]
 struct NativeCopyFields {
+    /// Internal: this argv was delegated by a remote-to-remote coordinator,
+    /// and every path-valued operand is standard unpadded base64 of its raw
+    /// bytes, so any filename survives the remote shell.
+    #[arg(long, hide = true)]
+    delegated_operands_b64: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
     /// Target endpoint ([USER@]HOST[:PORT]); omitted means local
@@ -958,6 +963,52 @@ fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
     }
 }
 
+/// Decode the base64 path operands of a delegated remote-to-remote argv
+/// back into raw bytes (see --delegated-operands-b64).
+fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
+    fn decode_one(value: &mut OsString) -> Result<()> {
+        use anyhow::Context as _;
+        use base64::Engine as _;
+        let encoded = value.to_str().context("delegated operand is not base64")?;
+        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(encoded)
+            .context("decode delegated operand")?;
+        *value = OsString::from_vec(bytes);
+        Ok(())
+    }
+    let source = &mut copy.selection.source;
+    for list in [
+        &mut source.src,
+        &mut source.src_src,
+        &mut source.src_file,
+        &mut source.src_dir,
+        &mut source.src_files,
+        &mut source.src_dirs,
+        &mut source.srcs,
+        &mut source.src_srcs,
+        &mut source.sources,
+    ] {
+        for value in list.iter_mut() {
+            decode_one(value)?;
+        }
+    }
+    for value in [
+        source.cwd.as_mut(),
+        copy.into.as_mut(),
+        copy.into_new.as_mut(),
+        copy.into_existing.as_mut(),
+        copy.r#as.as_mut(),
+        copy.as_new.as_mut(),
+        copy.as_existing.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        decode_one(value)?;
+    }
+    Ok(())
+}
+
 fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
@@ -975,6 +1026,9 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     } = parsed;
     if pscope.is_some() && remote.rsh.is_some() {
         bail!("--pscope cannot be used with --rsh");
+    }
+    if copy.delegated_operands_b64 {
+        decode_delegated_operands(&mut copy)?;
     }
     let mapping = copy.mapping.take();
     let results = copy.results.take();

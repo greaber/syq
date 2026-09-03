@@ -926,17 +926,10 @@ pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &L
     let Some(source) = sources.first() else {
         return false;
     };
-    let direct_paths_are_utf8 = sources
-        .iter()
-        .chain(std::iter::once(dst))
-        .all(|location| std::str::from_utf8(&location.path).is_ok());
     source.is_remote()
         && dst.is_remote()
         && !args.relay
         && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
-        && (args.interface == Interface::Rsync
-            || args.run_at != RunAt::Auto
-            || direct_paths_are_utf8)
 }
 
 fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
@@ -998,20 +991,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if args.interface == Interface::Rsync && original_srcs[0].is_remote() && dst.is_remote() {
         bail!("syq rsync does not support remote-to-remote transfers");
     }
-    let direct_paths_are_utf8 = original_srcs
-        .iter()
-        .chain(std::iter::once(dst))
-        .all(|location| std::str::from_utf8(&location.path).is_ok());
     let coordinator_is_remote = uses_remote_coordinator(&args, original_srcs, dst);
     let direct_remote_to_remote = original_srcs[0].is_remote()
         && dst.is_remote()
         && !original_srcs[0].same_host(dst)
         && !args.relay
-        && args.run_at != RunAt::Local
-        // Native auto placement relays raw path bytes because they cannot be
-        // represented in the remote coordinator's argv. Validate direct-only
-        // controls against the topology that will actually run.
-        && (args.run_at != RunAt::Auto || direct_paths_are_utf8);
+        && args.run_at != RunAt::Local;
     if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
     {
         bail!(
@@ -1117,16 +1102,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
             args.relay = true;
         }
-        if !args.relay {
-            // Data is never routed through this machine implicitly. Path
-            // bytes that cannot travel in a remote command line make the
-            // direct topology unavailable today (encoded delegation
-            // operands are the planned fix); until then, relaying is the
-            // operator's explicit choice.
-            bail!(
-                "remote-to-remote copy: these path bytes cannot be carried in a remote command line, so a direct transfer is not possible; pass --run-at local to route the transfer through this machine instead"
-            );
-        }
+        // Delegated operands are base64 in the remote argv, so every
+        // non-relay remote-to-remote copy took the direct return above; the
+        // only way here is the operator's explicit --run-at local.
+        debug_assert!(args.relay);
         if !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }

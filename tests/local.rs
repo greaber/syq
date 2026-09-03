@@ -7910,37 +7910,6 @@ fn native_target_dry_run_labels_the_real_endpoints_and_ports() {
 }
 
 #[test]
-fn native_auto_raw_path_relay_rejects_direct_only_controls() {
-    let mut raw_source = b"/source-".to_vec();
-    raw_source.push(0xff);
-    let raw_source = std::ffi::OsString::from_vec(raw_source);
-
-    for option in [
-        "--detach",
-        "--no-forward-agent",
-        "--agent-broker-only",
-        "--unrestricted-agent-forwarding",
-    ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .arg("cp")
-            .arg(option)
-            .args(["--from", "hostA", "--src"])
-            .arg(&raw_source)
-            .args(["--to", "hostB", "--as", "/target"])
-            .run()
-            .expect("reject a direct-only option before automatic relay");
-
-        assert!(!out.status.success(), "{option} unexpectedly succeeded");
-        let stderr = stderr_of(&out);
-        assert!(stderr.contains("direct"), "{option}: {stderr}");
-        assert!(
-            !stderr.contains("relaying raw path bytes"),
-            "{option} entered relay execution: {stderr}"
-        );
-    }
-}
-
-#[test]
 fn native_detach_rejects_an_unattached_results_stream() {
     let t = Tmp::new();
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -10617,27 +10586,38 @@ fn native_results_require_a_local_coordinator() {
 }
 
 #[test]
-fn native_remote_to_remote_never_relays_implicitly() {
+fn native_remote_to_remote_carries_any_path_bytes_directly() {
     use std::os::unix::ffi::OsStrExt;
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // A source path with non-UTF-8 bytes cannot ride the delegated remote
-    // command line, so the direct topology is unavailable — and the relay
-    // is never chosen on the operator's behalf.
+    // Non-UTF-8 path bytes ride the delegated command line as encoded
+    // operands: the direct topology works for every filename, with no
+    // implicit relay through this machine.
+    let name = std::ffi::OsStr::from_bytes(b"src-\xff");
+    write(&t.path("").join(name), b"raw bytes travel");
+    let mut destination = t.path("").into_os_string();
+    destination.push("/dst-\u{1}");
+    let mut destination_bytes = t.s("").into_bytes();
+    destination_bytes.extend_from_slice(b"dst-\xfe");
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--rsh"])
         .arg(&rsh)
-        .args(["--from", "hostA"])
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args(["--no-tcp", "-j", "1", "--from", "hostA"])
         .arg("--src")
-        .arg(std::ffi::OsStr::from_bytes(b"src-\xff"))
-        .args(["--to", "hostB", "--as", &t.s("dst")])
+        .arg(t.path("").join(name))
+        .args(["--to", "hostB", "--as"])
+        .arg(std::ffi::OsStr::from_bytes(&destination_bytes))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .run()
         .unwrap();
-    assert!(!out.status.success());
+    assert!(out.status.success(), "{}", stderr_of(&out));
     let stderr = stderr_of(&out);
-    assert!(stderr.contains("--run-at local"), "{stderr}");
     assert!(!stderr.contains("relaying"), "no implicit relay: {stderr}");
+    assert_eq!(
+        read(Path::new(std::ffi::OsStr::from_bytes(&destination_bytes))),
+        b"raw bytes travel"
+    );
 }

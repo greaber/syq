@@ -596,9 +596,12 @@ fn automatic_enrollment_allowed(dry_run: bool, verify_only: bool) -> bool {
     !(dry_run || verify_only)
 }
 
-fn utf8_path(path: &[u8], role: &str) -> Result<String> {
-    String::from_utf8(path.to_vec())
-        .map_err(|_| anyhow::anyhow!("native direct remote-to-remote {role} must be valid UTF-8"))
+/// Encode a delegated path operand: standard unpadded base64 of the raw
+/// bytes, decoded by the remote coordinator's --delegated-operands-b64
+/// handling, so any filename survives the remote shell.
+fn delegated_operand(path: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(path)
 }
 
 fn endpoint_arg(
@@ -822,6 +825,7 @@ fn run_remote(
         Interface::NativeMap => bail!("syq map runs locally and is never remoted"),
     }
     .into()];
+    remote.push("--delegated-operands-b64".into());
     let mut short = String::new();
     for (flag, on) in [('n', args.dry_run), ('q', args.quiet)] {
         if on {
@@ -941,7 +945,7 @@ fn run_remote(
             }
             .into(),
         );
-        remote.push(utf8_path(&source.path, "source path")?);
+        remote.push(delegated_operand(&source.path));
     }
     if !coordinator_at_target && !same_host {
         remote.push("--to".into());
@@ -952,11 +956,12 @@ fn run_remote(
         ));
     }
     remote.push(native_placement_arg(args)?.into());
-    remote.push(
+    remote.push(delegated_operand(
         restricted_destination_path
-            .clone()
-            .unwrap_or(utf8_path(&dst.path, "target path")?),
-    );
+            .as_deref()
+            .map(str::as_bytes)
+            .unwrap_or(&dst.path),
+    ));
 
     if args.detach {
         // Detached: log JSON progress instead of a live display.
