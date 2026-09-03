@@ -57,10 +57,10 @@ cargo install --locked --path . # or: put it on your PATH
 
 Managed remote bootstrap is available only from official release builds.
 For Cargo and checkout builds, install a compatible `syq` on the remote and
-select it explicitly. Native `syq cp` uses `--syq-path PATH`, or
-`--no-bootstrap` when the binary is on the remote `PATH`; `syq rsync` uses the
-rsync-compatible `--rsync-path PATH`, or `--syq-no-bootstrap` for the same
-`PATH` lookup.
+select it explicitly. Native `syq cp` and remote `syq rm` use `--syq-path
+PATH`, or `--no-bootstrap` when the binary is on the remote `PATH`; `syq
+rsync` uses the rsync-compatible `--rsync-path PATH`, or
+`--syq-no-bootstrap` for the same `PATH` lookup.
 
 Standalone installs download and verify one signed release manifest at most
 once a day after a successful interactive command. When a newer release is
@@ -82,8 +82,8 @@ usually produce Gatekeeper prompts. A binary downloaded through a browser may;
 browser-oriented distribution would need Apple Developer ID signing and
 notarization in addition to this terminal-first path.
 
-The remote side runs `syq --server`, but it does not need to be installed or
-configured first. An official syq uses its exact release helper under
+An ordinary remote side runs `syq --server`, but it does not need to be
+installed or configured first. An official syq uses its exact release helper under
 `~/.cache/syq/helpers/`. On first use of a version it detects the remote
 platform and checks for a downloader, SHA-256 implementation, and `gzip`. When
 that complete toolchain is available, the remote downloads the matching
@@ -108,10 +108,10 @@ discarded and produces an integrity warning even if the verified upload then
 succeeds.
 
 The managed cache accepts only a verified release binary. To opt out of
-managed bootstrap, install a compatible binary yourself. Native `syq cp` uses
-`--syq-path /path/to/syq`, or `--no-bootstrap` when the binary is on the
-non-interactive remote `PATH`; `syq rsync` uses `--rsync-path /path/to/syq` or
-`--syq-no-bootstrap`.
+managed bootstrap, install a compatible binary yourself. Native `syq cp` and
+remote `syq rm` use `--syq-path /path/to/syq`, or `--no-bootstrap` when the
+binary is on the non-interactive remote `PATH`; `syq rsync` uses `--rsync-path
+/path/to/syq` or `--syq-no-bootstrap`.
 
 The local client verifies the manifest's embedded Ed25519 signature over its
 RFC 8785 canonical JSON. Direct remote download uses `curl` or `wget`, `gzip`,
@@ -156,6 +156,7 @@ syq cp --inplace disk.img --to server --as-existing /images/disk.img
 syq cp --prune --src-src build --to server --into-existing /srv/app
 syq rm cache old-output
 syq rm --from server --cwd /srv --src old-output
+syq rm --from server --syq-path /opt/syq-dev --src old-output
 syq rm --root /srv --src-dir cache
 syq rm --cwd /srv --follow-src --src-dir current-release
 ```
@@ -383,6 +384,9 @@ explicit `--rsh` is the complete SSH and agent policy and bypasses automatic
 broker/receiver setup. A port in native endpoint syntax can be combined with
 the default SSH command or an explicit command whose executable is `ssh`; an
 arbitrary remote-shell wrapper must carry its own port option.
+Remote `rm` accepts the same `--syq-path PATH` and `--no-bootstrap` helper
+selection; those options are mutually exclusive and are rejected for a local
+removal.
 
 For two remote endpoints, `--coordinate-at auto` (the default) places the coordinator
 at the source. Path operands travel base64-encoded inside the delegated
@@ -597,6 +601,10 @@ data does not traverse the invoking machine; path operands travel encoded in
 the delegated command, so any filename works. Matching helpers are installed
 automatically on both hosts and output is streamed back. When both endpoints
 name the same host and user, syq runs a local copy on that host.
+For a source build, `--syq-path` or `--no-bootstrap` selects the ordinary hostA
+coordinator, including on the command-restricted path. It is not forwarded as
+authority to choose hostB's receiver: that executable is the separately
+enrolled forced command and is refreshed by enrollment.
 
 With implicit OpenSSH, the default combines a pre-enrolled forced receiver on
 hostB with a temporary local agent broker. The first transfer to a destination
@@ -610,10 +618,18 @@ under `~/.local/share/syq/restricted/`; the receipt key's public half is
 returned to the local machine and recorded with the enrollment. Before
 publishing the forced key, syq verifies that the installed receiver is a
 regular executable and that it and every path ancestor are trusted-owner- or
-root-owned, non-writable by other users, and free of non-owner ACL grants.
+root-owned, non-writable by other users, and free of extended ACLs. On Linux,
+group-write from the conventional umask 002 is accepted only when account and
+group database lookups prove that the group is user-private (same name and no
+other member or non-root primary-group user). Otherwise group-write still
+fails closed. Private enrollment directories and secret files remain exactly
+0700 and 0600. A failure names the machine and reports every unsafe component
+of the path that syq could securely inspect.
 
-Enrollment first tries local→hostB directly. If that network path is
-unavailable, it retries through hostA with OpenSSH `ProxyJump`; hostA gets only
+Enrollment first tries local→hostB directly. If SSH reports a transport
+failure, it retries through hostA with OpenSSH `ProxyJump`; a remote validation
+or installation error is reported against hostB without repeating it through
+the proxy. HostA gets only
 `ssh -W` byte forwarding and cannot see the encrypted hostB session, an agent
 socket, or the enrollment key. The destination parent must already exist.
 Enrollment is durable, is reused for later destination leaves sharing that
@@ -793,8 +809,11 @@ also refreshes the installed
 receiver to the exact local syq binary; the receipt key is kept for the life
 of the enrollment, so a refresh, or a retry after a lost reply, never leaves
 the two sides holding different keys. To rotate it, revoke and enroll again.
-Revocation leaves that shared binary because other enrollments may use it. It
-prevents new receiver sessions. A
+Revocation keeps the shared receiver while another enrollment or managed
+forced-key entry may use it. The final revoke removes the shared receiver and
+empty syq-owned state directories on hostB. Install and revoke serialize that
+lifecycle, so a concurrent enrollment recreates the receiver before publishing
+its forced key. Revocation prevents new receiver sessions. A
 session that already claimed its signed request can finish an operation already
 in progress; later protocol requests are rejected once the signed execution
 deadline expires rather than forcibly interrupting a filesystem syscall.
