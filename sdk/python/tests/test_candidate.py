@@ -63,7 +63,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
             (mapping_source / "mapped.txt").write_bytes(b"mapped")
             mapping_alias = root / "mapping-source-link"
             mapping_alias.symlink_to(mapping_source, target_is_directory=True)
-            with client.map(src_src=mapping_alias.name, follow=True) as mapping:
+            with client.map(src_src=mapping_alias.name, follow_src=True) as mapping:
                 entries = list(mapping)
             self.assertEqual(entries[0].src, syq.RelativePath("mapped.txt"))
             physical_temp = root / "physical-temp"

@@ -58,7 +58,7 @@ pub fn run(mut args: Args) -> Result<i32> {
         args.native_rm_cwd.as_deref(),
         args.native_rm_root.as_deref(),
         &selections,
-        args.native_follow,
+        args.follows_native_source_paths(),
         args.dry_run,
         args.connections,
         &mut |messages| {

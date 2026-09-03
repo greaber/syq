@@ -947,6 +947,13 @@ fn run_remote(
     }
     if args.native_follow {
         remote.push("--follow".into());
+    } else {
+        if args.native_follow_src {
+            remote.push("--follow-src".into());
+        }
+        if args.native_follow_dest {
+            remote.push("--follow-dest".into());
+        }
     }
     if args.delete {
         remote.push("--prune".into());

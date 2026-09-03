@@ -86,6 +86,12 @@ pub struct Args {
     /// Permit symlinks that must be traversed in directly supplied native paths.
     #[arg(skip)]
     pub native_follow: bool,
+    /// Permit symlinks that must be traversed in directly supplied source paths.
+    #[arg(skip)]
+    pub native_follow_src: bool,
+    /// Permit symlinks that must be traversed in directly supplied destination paths.
+    #[arg(skip)]
+    pub native_follow_dest: bool,
     /// Source-side base for `syq map` selectors, joined at walk time so the
     /// emitted `src` values stay relative to it.
     #[arg(skip)]
@@ -386,6 +392,14 @@ pub struct Args {
 }
 
 impl Args {
+    pub(crate) fn follows_native_source_paths(&self) -> bool {
+        self.native_follow || self.native_follow_src
+    }
+
+    pub(crate) fn follows_native_destination_paths(&self) -> bool {
+        self.native_follow || self.native_follow_dest
+    }
+
     /// Parse the command line and read ignore files, keeping command-line and
     /// file patterns in the order they were given (later lines win, as in
     /// a .gitignore file).
@@ -586,9 +600,12 @@ struct NativeSourceArgs {
     /// Resolve relative source selectors from DIR
     #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
     cwd: Option<OsString>,
-    /// Follow symlinks that must be traversed in directly supplied endpoint paths
+    /// Follow symlinks in all directly supplied filesystem paths
     #[arg(long)]
     follow: bool,
+    /// Follow symlinks in directly supplied source paths
+    #[arg(long)]
+    follow_src: bool,
     /// Select a named source object (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src: Vec<OsString>,
@@ -644,9 +661,12 @@ struct NativeRmSelectionArgs {
     /// Confine resolution and removal beneath DIR
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     root: Option<OsString>,
-    /// Follow symlinks that must be traversed in directly supplied endpoint paths
+    /// Follow symlinks in all directly supplied filesystem paths
     #[arg(long)]
     follow: bool,
+    /// Follow symlinks in directly supplied source paths
+    #[arg(long)]
+    follow_src: bool,
     /// Select an object without constraining the selected object's type (repeatable)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     src: Vec<OsString>,
@@ -814,6 +834,9 @@ struct NativeCopyFields {
     /// Destination endpoint ([USER@]HOST[:PORT]); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
+    /// Follow symlinks in directly supplied destination paths
+    #[arg(long)]
+    follow_dest: bool,
     /// Put selected names inside DIR, creating it if necessary
     #[arg(
         long,
@@ -1081,6 +1104,8 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.native_results_fd = results_fd;
     args.pscope = pscope;
     args.native_follow = copy.selection.source.follow;
+    args.native_follow_src = copy.selection.source.follow_src;
+    args.native_follow_dest = copy.follow_dest;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
         // through the source connection; a direct remote-to-remote copy has
@@ -1219,6 +1244,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     args.native_map_cwd = map_cwd;
     args.native_map_target = target;
     args.native_follow = parsed.source.follow;
+    args.native_follow_src = parsed.source.follow_src;
     Ok(args)
 }
 
@@ -1300,6 +1326,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     args.native_rm_cwd = parsed.selection.cwd.map(OsStringExt::into_vec);
     args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
     args.native_follow = parsed.selection.follow;
+    args.native_follow_src = parsed.selection.follow_src;
     args.pscope = parsed.pscope;
     args.rm = true;
     apply_native_operational(&mut args, parsed.operational);
@@ -2060,6 +2087,32 @@ mod tests {
         assert!(args.inplace);
         assert_eq!(args.min_size.as_deref(), Some("1K"));
         assert_eq!(args.max_size.as_deref(), Some("1M"));
+    }
+
+    #[test]
+    fn native_directional_follow_is_distinct_from_the_umbrella() {
+        let argv = [
+            "--follow-src",
+            "source",
+            "--follow-dest",
+            "--into",
+            "destination",
+        ]
+        .map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv).unwrap();
+        assert!(!args.native_follow);
+        assert!(args.native_follow_src);
+        assert!(args.native_follow_dest);
+        assert!(args.follows_native_source_paths());
+        assert!(args.follows_native_destination_paths());
+
+        let argv = ["--follow", "source", "--into", "destination"].map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv).unwrap();
+        assert!(args.native_follow);
+        assert!(!args.native_follow_src);
+        assert!(!args.native_follow_dest);
+        assert!(args.follows_native_source_paths());
+        assert!(args.follows_native_destination_paths());
     }
 
     #[test]

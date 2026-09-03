@@ -68,8 +68,8 @@ one-line transforms are safe by construction); mappings you author
 yourself may use the base64 form for such names.
 
 `syq map` deliberately has a destination-independent surface: `-C`,
-`--follow`, the source-selector family, and `--as`. It takes either
-`--src-src DIR` as the only selector or any number of relative named
+`--follow-src`/`--follow`, the source-selector family, and `--as`. It takes
+either `--src-src DIR` as the only selector or any number of relative named
 selectors. `--as` renames the single selected root. Destination, filtering,
 transfer, execution, result, receiver-ceiling, and receipt options belong to
 the later `syq cp --mapping` invocation or to a manifest transform, not to
@@ -237,15 +237,17 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
 - An entry claims exactly one object. A `dir` entry claims the
   directory itself, without its contents.
 - The command-line path naming a manifest, the `-C` source base, and the
-  `--into` placement are directly supplied paths: native mode refuses to
-  traverse symlinks in them by default, while `--follow` resolves them. Paths
-  inside the manifest are data and are not changed by `--follow`.
-- When `syq map --follow` resolves a named selector, it emits the referent's
-  source-base-relative path so the manifest remains executable without link
-  traversal. It refuses a referent outside that base; pass the real path with a
-  matching `-C` base instead. A followed contents selector keeps ordinary
-  contents-relative entries and requires the consumer to select the same base
-  with `--follow`.
+  `--into` placement are directly supplied paths. Native mode refuses to
+  traverse symlinks in them by default. `--follow-src` controls the source
+  base, `--follow-dest` controls placement, and only the `--follow` umbrella
+  also controls the coordinator-local manifest path. Paths inside the manifest
+  are data and are not changed by any follow option.
+- When `syq map --follow-src` (or `--follow`) resolves a named selector, it
+  emits the referent's source-base-relative path so the manifest remains
+  executable without link traversal. It refuses a referent outside that base;
+  pass the real path with a matching `-C` base instead. A followed contents
+  selector keeps ordinary contents-relative entries and requires the consumer
+  to select the same base with the same source follow option.
 - Symlinks selected by mapping entries are never resolved by mapping handling:
   a symlink maps as a symlink, and a destination path that would traverse a
   symlink inside the destination container fails that entry. Resolve links before

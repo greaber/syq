@@ -47,6 +47,8 @@ learn a second set of names for concepts that syq already names.
 | `syq rm` | `syq.run(["rm", ...])` or `Client.run(["rm", ...])` |
 | `syq map` | `syq.map()` or `Client.map()` |
 | `--src-src` | `src_src=` |
+| `--follow-src` | `follow_src=` |
+| `--follow-dest` | `follow_dest=` |
 | `--into-existing` | `into_existing=` |
 | `--no-compress` | `no_compress=` |
 | `--max-delete` | `max_delete=` |
@@ -194,6 +196,8 @@ syq.cp(
     from_=None,
     cwd=None,
     follow=False,
+    follow_src=False,
+    follow_dest=False,
     to=None,
     into=None,
     into_new=None,
@@ -262,10 +266,11 @@ Copy selectors may be absolute, with the same behavior as native `cp`. Input
 paths accept text and byte path-like objects on supported Unix systems; byte
 paths are not decoded merely to build argv.
 
-`follow`, `hash`, `no_compress`, `bwlimit`, `connections`, `ignore`,
-`ignore_from`, `preserve`, `inplace`, `max_size`, `min_size`, and `dry_run`
-retain the exact native meanings. `max_entries`, `max_total_bytes`, and
-`max_runtime` expose the native command-restricted receiver ceilings and are
+`follow`, `follow_src`, `follow_dest`, `hash`, `no_compress`, `bwlimit`,
+`connections`, `ignore`, `ignore_from`, `preserve`, `inplace`, `max_size`,
+`min_size`, and `dry_run` retain the exact native meanings. `max_entries`,
+`max_total_bytes`, and `max_runtime` expose the native command-restricted
+receiver ceilings and are
 therefore accepted only for a direct remote-to-remote copy using an enrolled
 receiver. Rate, size, and duration values accept the native spellings; the
 Python API does not replace them with differently defined unit types.
@@ -378,7 +383,8 @@ interruption raises instead of presenting the yielded prefix as a complete
 mapping.
 
 The method retains `syq map`'s native limits for the pinned binary, including
-`follow=True` for resolving explicitly selected symlink paths. Initially,
+`follow_src=True` (or the `follow=True` umbrella) for resolving explicitly
+selected symlink paths. Initially,
 mapping emission is local and read-only, and the accepted selector and
 placement combinations are the ones documented for the executable. The
 client may reject a known-invalid combination before launch, but it does not
