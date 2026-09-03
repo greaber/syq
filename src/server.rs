@@ -1002,7 +1002,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             reader.read_msg::<Response>().unwrap(),
-            Response::Err(error) if error.contains("omitted")
+            Response::EndpointError(error) if error.message.contains("omitted")
         ));
         writer
             .write_msg(&Request::RegisterSourceRoots {

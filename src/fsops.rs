@@ -6133,7 +6133,7 @@ mod tests {
             guard: None,
         });
         assert!(
-            matches!(response, Response::Err(message) if message.contains(
+            matches!(response, Response::EndpointError(error) if error.message.contains(
                 "canonicalize is not valid after destination capability activation"
             ))
         );
@@ -7241,7 +7241,7 @@ mod tests {
         });
         assert!(matches!(
             response,
-            Response::Err(error) if error.contains("registered source leaf changed identity")
+            Response::EndpointError(error) if error.message.contains("registered source leaf changed identity")
         ));
     }
 
@@ -7275,7 +7275,7 @@ mod tests {
         let response = control.handle(&register(&second));
         assert!(matches!(
             response,
-            Response::Err(error) if error.contains("already registered")
+            Response::EndpointError(error) if error.message.contains("already registered")
         ));
         assert_eq!(control.source_roots.len(), 1);
         let pin = control.source_roots[&original_id]
@@ -7353,7 +7353,9 @@ mod tests {
             follow: false,
             guard: None,
         });
-        assert!(matches!(response, Response::Err(error) if error.contains("does not authorize")));
+        assert!(
+            matches!(response, Response::EndpointError(error) if error.message.contains("does not authorize"))
+        );
 
         let response = worker.handle(&Request::StatMany {
             paths: vec![selected.as_os_str().as_bytes().to_vec()],
@@ -7361,7 +7363,9 @@ mod tests {
             follow: false,
             guard: None,
         });
-        assert!(matches!(response, Response::Err(error) if error.contains("omitted")));
+        assert!(
+            matches!(response, Response::EndpointError(error) if error.message.contains("omitted"))
+        );
 
         fs::rename(&selected, temporary.path().join("selected-original")).unwrap();
         fs::write(&selected, b"replacement").unwrap();
@@ -7373,7 +7377,7 @@ mod tests {
         });
         assert!(matches!(
             response,
-            Response::Err(error) if error.contains("registered source leaf changed identity")
+            Response::EndpointError(error) if error.message.contains("registered source leaf changed identity")
         ));
     }
 
@@ -7644,7 +7648,7 @@ mod tests {
             }),
         ] {
             assert!(
-                matches!(response, Response::Err(error) if error.contains("registered source leaf changed identity"))
+                matches!(response, Response::EndpointError(error) if error.message.contains("registered source leaf changed identity"))
             );
         }
         let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
@@ -7694,7 +7698,7 @@ mod tests {
                 guard: None,
             }),
         ] {
-            assert!(matches!(response, Response::Err(_)));
+            assert!(matches!(response, Response::EndpointError(_)));
         }
         let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
             path: label,
@@ -7773,7 +7777,7 @@ mod tests {
                 off: 0,
                 len: 8,
             });
-            assert!(matches!(response, Response::Err(_)));
+            assert!(matches!(response, Response::EndpointError(_)));
         }
 
         for response in [
@@ -7792,7 +7796,9 @@ mod tests {
                 guard: None,
             }),
         ] {
-            assert!(matches!(response, Response::Err(error) if error.contains("omitted")));
+            assert!(
+                matches!(response, Response::EndpointError(error) if error.message.contains("omitted"))
+            );
         }
         let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
             path: selected.as_os_str().as_bytes().to_vec(),
@@ -7814,7 +7820,7 @@ mod tests {
             guard: None,
         });
         assert!(
-            matches!(response, Response::Err(error) if error.contains("only valid for the final source"))
+            matches!(response, Response::EndpointError(error) if error.message.contains("only valid for the final source"))
         );
     }
 
@@ -7872,7 +7878,9 @@ mod tests {
             off: 0,
             len: 6,
         });
-        assert!(matches!(response, Response::Err(error) if error.contains("destination worker")));
+        assert!(
+            matches!(response, Response::EndpointError(error) if error.message.contains("destination worker"))
+        );
         let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
             path: b"marker".to_vec(),
             source: None,
