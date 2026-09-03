@@ -433,19 +433,35 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(stream.cwd, Path.cwd() / "source-root" / "source")
 
     def test_map_cwd_preserves_the_unresolved_source_spelling(self) -> None:
-        actual = self.root / "actual"
-        actual.mkdir()
-        (self.root / "root-link").symlink_to(actual, target_is_directory=True)
+        base = self.root / "base"
+        outside = self.root / "outside"
+        base.mkdir()
+        outside.mkdir()
+        (base / "link").symlink_to(outside, target_is_directory=True)
         client = syq.Client(
             executable=self.executable,
             env=self.env,
             process_cwd=self.root,
         )
         with client.map(
-            src_src="selected", root="root-link", follow_src=True
+            src_src="link/../selected", cwd="base", follow_src=True
         ) as stream:
             list(stream)
-        self.assertEqual(stream.cwd, self.root / "root-link" / "selected")
+        self.assertEqual(
+            os.fspath(stream.cwd),
+            os.path.join(os.fspath(self.root), "base", "link/../selected"),
+        )
+
+    def test_map_cwd_expands_tilde_with_the_subprocess_home(self) -> None:
+        home = self.root / "native-home"
+        client = syq.Client(
+            executable=self.executable,
+            env={**self.env, "HOME": os.fspath(home)},
+            process_cwd=self.root,
+        )
+        with client.map(src_src="~/selected", cwd="ignored") as stream:
+            list(stream)
+        self.assertEqual(stream.cwd, home / "selected")
 
     def test_structural_validation_happens_before_launch(self) -> None:
         with self.assertRaisesRegex(syq.SyqInvocationError, "exactly one"):

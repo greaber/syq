@@ -112,6 +112,11 @@ async with client.map(src_src="photos") as mapping:
     )
 ```
 
+`mapping.cwd` is the absolute source-base spelling to pass to the consuming
+copy. It preserves component order such as `link/../selected` so the native
+walker encounters the link before `..`, and it expands `~/` with the mapping
+subprocess's `HOME`. Do not normalize or resolve it between `map` and `cp`.
+
 The source tree may contain typed support ahead of the latest released syq
 pin. During that development interval, use `Client(executable=...)` or
 `AsyncClient(executable=...)` with the candidate binary; the next SDK release

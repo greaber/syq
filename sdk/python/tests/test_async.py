@@ -114,19 +114,39 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.argv()[0], "cp")
 
     async def test_map_cwd_preserves_the_unresolved_source_spelling(self) -> None:
-        actual = self.root / "actual"
-        actual.mkdir()
-        (self.root / "root-link").symlink_to(actual, target_is_directory=True)
+        base = self.root / "base"
+        outside = self.root / "outside"
+        base.mkdir()
+        outside.mkdir()
+        (base / "link").symlink_to(outside, target_is_directory=True)
         client = syq.AsyncClient(
             executable=self.executable,
             env=self.env,
             process_cwd=self.root,
         )
-        stream = client.map(src_src="selected", root="root-link", follow_src=True)
+        stream = client.map(
+            src_src="link/../selected", cwd="base", follow_src=True
+        )
         async with stream:
             entries = [entry async for entry in stream]
         self.assertEqual(len(entries), 1)
-        self.assertEqual(stream.cwd, self.root / "root-link" / "selected")
+        self.assertEqual(
+            os.fspath(stream.cwd),
+            os.path.join(os.fspath(self.root), "base", "link/../selected"),
+        )
+
+    async def test_map_cwd_expands_tilde_with_the_subprocess_home(self) -> None:
+        home = self.root / "native-home"
+        client = syq.AsyncClient(
+            executable=self.executable,
+            env={**self.env, "HOME": os.fspath(home)},
+            process_cwd=self.root,
+        )
+        stream = client.map(src_src="~/selected", cwd="ignored")
+        async with stream:
+            entries = [entry async for entry in stream]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(stream.cwd, home / "selected")
 
     async def test_cp_forwards_native_remote_controls(self) -> None:
         await self.client.cp(

@@ -30,6 +30,7 @@ from .client import (
     _append_remote_arguments,
     _argument,
     _copy_arguments,
+    _map_stream_cwd,
     _mapping_line,
     _text_arg,
     _values,
@@ -783,27 +784,18 @@ class AsyncClient:
         )
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
-        process_base = Path(
-            os.fsdecode(
-                os.fspath(self.process_cwd)
-                if self.process_cwd is not None
-                else os.getcwd()
-            )
-        )
         selected_base = root if root is not None else cwd
-        native_base = (
-            Path(os.fsdecode(os.fspath(selected_base)))
-            if selected_base is not None
-            else Path()
-        )
-        effective_cwd = process_base / native_base
+        contents_selector = None
         if src_src_values:
             if len(src_src_values) != 1 or source_count != 1:
                 raise SyqInvocationError(
                     "syq map takes --src-src as its only selector"
                 )
-            effective_cwd /= os.fsdecode(src_src_values[0])
-        # Preserve the command-line spelling rather than racing the map
-        # subprocess with an independent symlink resolution.
-        effective_cwd = Path(os.path.abspath(effective_cwd))
+            contents_selector = src_src_values[0]
+        effective_cwd = _map_stream_cwd(
+            self.process_cwd,
+            self.env,
+            selected_base,
+            contents_selector,
+        )
         return AsyncMapStream(self, argv, effective_cwd, timeout)

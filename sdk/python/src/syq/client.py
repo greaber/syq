@@ -71,6 +71,50 @@ def _argument(value: PathArgument, *, label: str) -> Argument:
     return result
 
 
+def _native_path_spelling(
+    value: PathArgument, env: Mapping[str, str] | None
+) -> str:
+    """Apply native ``~`` expansion without normalizing path components."""
+
+    spelling = os.fsdecode(os.fspath(value))
+    if spelling == "~" or spelling.startswith("~/"):
+        home = (os.environ if env is None else env).get("HOME")
+        if home is not None:
+            suffix = spelling[2:] if len(spelling) > 2 else ""
+            return os.path.join(home, suffix) if suffix else home
+    return spelling
+
+
+def _join_path_spelling(base: str, path: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(base, path)
+
+
+def _map_stream_cwd(
+    process_cwd: PathArgument | None,
+    env: Mapping[str, str] | None,
+    selected_base: PathArgument | None,
+    contents_selector: PathArgument | None,
+) -> Path:
+    """Derive the consumer base using the native component spelling."""
+
+    if process_cwd is None:
+        process_base = os.getcwd()
+    else:
+        process_spelling = os.fsdecode(os.fspath(process_cwd))
+        process_base = _join_path_spelling(os.getcwd(), process_spelling)
+    base_spelling = _native_path_spelling(
+        "." if selected_base is None else selected_base, env
+    )
+    effective = _join_path_spelling(process_base, base_spelling)
+    if contents_selector is not None:
+        effective = _join_path_spelling(
+            effective, _native_path_spelling(contents_selector, env)
+        )
+    # Path preserves `..` components. In particular, do not use abspath or
+    # resolve here: the native walker must encounter symlinks before `..`.
+    return Path(effective)
+
+
 def run(
     args: Sequence[PathArgument],
     *,
@@ -928,30 +972,20 @@ class Client:
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
         command = (self._executable_value(), *argv)
-        process_base = Path(
-            os.fsdecode(
-                os.fspath(self.process_cwd)
-                if self.process_cwd is not None
-                else os.getcwd()
-            )
-        )
         selected_base = root if root is not None else cwd
-        native_base = (
-            Path(os.fsdecode(os.fspath(selected_base)))
-            if selected_base is not None
-            else Path()
-        )
-        effective_cwd = process_base / native_base
+        contents_selector = None
         if src_src_values:
             if len(src_src_values) != 1 or source_count != 1:
                 raise SyqInvocationError(
                     "syq map takes --src-src as its only selector"
                 )
-            effective_cwd /= os.fsdecode(src_src_values[0])
-        # Return an absolute command-line spelling without resolving symlinks.
-        # The map subprocess owns the pinned producer descriptor; a later copy
-        # must resolve this path independently under its own follow policy.
-        effective_cwd = Path(os.path.abspath(effective_cwd))
+            contents_selector = src_src_values[0]
+        effective_cwd = _map_stream_cwd(
+            self.process_cwd,
+            self.env,
+            selected_base,
+            contents_selector,
+        )
         return MapStream(
             _LineProcess(
                 command,

@@ -88,6 +88,36 @@ class CandidateCompatibilityTests(unittest.TestCase):
             self.assertEqual(mapped.files_transferred, 1)
             self.assertEqual((root / "mapped" / "mapped.txt").read_bytes(), b"mapped")
 
+            component_base = root / "component-base"
+            component_base.mkdir()
+            component_outside = root / "component-outside"
+            component_outside.mkdir()
+            (component_base / "link").symlink_to(
+                component_outside, target_is_directory=True
+            )
+            component_selected = root / "component-selected"
+            component_selected.mkdir()
+            (component_selected / "chosen.txt").write_bytes(b"chosen")
+            wrong_selected = component_base / "component-selected"
+            wrong_selected.mkdir()
+            (wrong_selected / "chosen.txt").write_bytes(b"wrong")
+            with client.map(
+                src_src="link/../component-selected",
+                cwd=component_base.name,
+                follow_src=True,
+            ) as component_mapping:
+                component_copy = client.cp(
+                    mapping=component_mapping,
+                    cwd=component_mapping.cwd,
+                    follow_src=True,
+                    into="component-mapped",
+                )
+            self.assertEqual(component_copy.files_transferred, 1)
+            self.assertEqual(
+                (root / "component-mapped" / "chosen.txt").read_bytes(),
+                b"chosen",
+            )
+
             generated_source = root / "generated-source"
             generated_source.mkdir()
             (generated_source / "generated.txt").write_bytes(b"generated")
