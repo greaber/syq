@@ -143,6 +143,7 @@ destination placement in separate arguments:
 syq cp project --to server --into /backup       # named object → /backup/project
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
+syq cp --from server --root /data --src a --src b --into ./data
 syq cp --from server:2222 data --to backup:2200 --into /archive
 syq cp --from server data --to backup --coordinate-at dest --into /archive
 syq cp --src-file report --src-dir assets --into /backup
@@ -167,10 +168,18 @@ override is used consistently for the SSH connection, `ssh -G` policy
 resolution, known-host lookup, automatic enrollment, and later enrollment
 reuse. A local path containing `:` stays local because native mode never
 guesses endpoints from path text.
+Native `cp`, `map`, and `rm` share two mutually exclusive source bases.
 `--cwd DIR`/`-C DIR` changes where relative source selectors are resolved at
-the source endpoint. Copy selectors may be absolute and then ignore `--cwd`.
-Removal selectors are always relative; native `rm` rejects a leading slash and
-any `.` or `..` component.
+the source endpoint, but is not a containment boundary: a relative selector
+may use `..` to leave it. An absolute selector ignores `--cwd`. `--root DIR`
+instead pins a containment boundary. Its selectors must be relative (and may
+not start with `~`); `.` and `..` are accepted but resolution fails if a
+component would leave the pinned root. Components are processed in order, so
+`file/.` still requires `file` to be a directory and `link/../name` still
+encounters `link` under the selected symlink policy. These rules apply only to
+paths supplied directly by the operator. Paths read from a mapping manifest or
+received from a scanner or peer retain their strict relative grammar, which
+rejects empty, `.` and `..` components.
 
 Bare paths and repeatable `--src PATH` select named objects. A named directory
 keeps its basename at the destination; by default a named symlink is copied as a
@@ -196,7 +205,7 @@ selected object rather than something to traverse, so a symlink there remains
 symlink payload. A directory-required selector such as `--src-src` or
 `--src-dir` cannot use a symlink as its selected directory by default.
 `--follow-src` permits this traversal only in directly supplied source paths,
-including `--cwd`, `rm --root`, and source selectors. `cp --follow-dest`
+including `--cwd`, `--root`, and source selectors. `cp --follow-dest`
 permits it only in the destination placement path. `--follow` is the umbrella:
 it enables both directions and also permits traversal in coordinator-local
 control paths such as `--ignore-from`, `--mapping`, and `--results`. The
@@ -240,9 +249,9 @@ A relative value printed by `readlink` is relative to the directory containing
 the link, not necessarily the shell's current directory. `realpath` is usually
 the safer way to turn a link chain into an explicit operand.
 
-These rules form the hostile-namespace containment model for native copy and
-removal. Native `rm` retains the resolved directories and selected identities
-through mutation. Copy resolves and registers every
+These rules form the hostile-namespace containment model for native copy,
+mapping emission, and removal. Native `rm` retains the resolved directories and
+selected identities through mutation. Copy resolves and registers every
 selected source before destination mutation, and every source worker claims
 those exact directory or parent descriptors during authenticated startup,
 before it reports readiness. Source discovery and metadata stats, including
@@ -376,9 +385,9 @@ dangling.
 option, the root path must contain no symlink. With `--follow-src` or
 `--follow`, SYQ resolves and pins the root's referent before resolving
 selectors; this does not weaken the containment boundary. Selector resolution
-is confined to the pinned root and fails as soon as a relative or absolute
-symlink target would leave it, even if later components would re-enter.
-`--cwd` is not a containment boundary when source links are followed.
+is confined to the pinned root and fails as soon as `..` or a relative or
+absolute symlink target would leave it, even if later components would
+re-enter. `--cwd` is only a resolution base and never a containment boundary.
 
 For removal, `--src PATH` and bare paths accept either a selected file or
 directory and remove that object, recursively for a directory. As with copy,
@@ -450,8 +459,8 @@ destination trees; one inside them can make the run's own accounting
 unpredictable. `--mapping` cannot be combined with `--prune` because
 mapping manifests define no deletion region; `--results` covers
 `--prune` runs, including their removals. `--max-delete` requires
-`--prune`; `rm` additionally accepts `--root` plus its endpoint-side
-removal semantics.
+`--prune`. Both ordinary selectors and mapping sources may use the common
+`--cwd` or `--root` source-base semantics described above.
 
 Native `cp` exposes the remote runtime and transport controls
 directly: `--rsh COMMAND`, `--syq-path PATH`, `--no-bootstrap`, `--no-tcp`,
@@ -575,7 +584,7 @@ syq map --src-src photos \
   | syq cp --mapping - -C photos --to nas --into /pub
 ```
 
-`syq map` is local and destination-independent. Its options are `-C`,
+`syq map` is local and destination-independent. Its options are `-C`, `--root`,
 `--follow-src`/`--follow`, the source-selector family, and `--as` for renaming
 one selected root. Copy destinations, filtering, transfer policy, execution
 controls, results, receiver ceilings, and receipts belong to the downstream `cp`

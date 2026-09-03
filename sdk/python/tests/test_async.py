@@ -56,6 +56,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             src=["a", "b"],
             src_dir="assets",
             from_="source",
+            root="source-root",
             follow_src=True,
             follow_dest=True,
             to="target",
@@ -78,6 +79,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             self.argv(),
         )
         self.assertNotIn("--quiet", self.argv())
+        self.assertIn("--root", self.argv())
         self.assertIn("--follow-src", self.argv())
         self.assertIn("--follow-dest", self.argv())
         self.assertIn("--max-entries", self.argv())
@@ -92,7 +94,9 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prune.deletions_completed, 1)
 
     async def test_map_is_a_lazy_async_context_managed_stream(self) -> None:
-        stream = self.client.map(src_src="source", follow_src=True)
+        stream = self.client.map(
+            src_src="source", root="source-root", follow_src=True
+        )
         self.assertFalse(self.argv_log.exists(), "map started before it was consumed")
         async with stream:
             deadline = time.monotonic() + 2
@@ -101,11 +105,12 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
                     self.fail("fake syq map did not record its arguments")
                 await asyncio.sleep(0.01)
             self.assertIn("--follow-src", self.argv())
+            self.assertIn("--root", self.argv())
             copied = await self.client.cp(
                 mapping=stream, cwd=stream.cwd, into="target"
             )
         self.assertEqual(copied.files_transferred, 1)
-        self.assertEqual(stream.cwd, Path.cwd() / "source")
+        self.assertEqual(stream.cwd, Path.cwd() / "source-root" / "source")
         self.assertEqual(self.argv()[0], "cp")
 
     async def test_cp_forwards_native_remote_controls(self) -> None:

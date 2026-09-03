@@ -31,8 +31,8 @@ One JSON object per line (NDJSON):
  "kind": "file", "size": 4194304, "mtime": 1721900000}
 ```
 
-- `src`, `dst` (required): paths relative to the source root (`-C DIR`,
-  default the working directory) and the destination container (`--into
+- `src`, `dst` (required): paths relative to the source base (`-C DIR`,
+  `--root DIR`, or by default the working directory) and the destination container (`--into
   DIR`). Absolute paths, empty paths, and any `.` or `..` component are
   rejected. Paths are tagged: `encoding` is `utf-8`, or `base64` for a
   name that is not valid UTF-8 (`value` is then standard base64 of the
@@ -67,7 +67,7 @@ Emission refuses names that are not valid UTF-8 (so published
 one-line transforms are safe by construction); mappings you author
 yourself may use the base64 form for such names.
 
-`syq map` deliberately has a destination-independent surface: `-C`,
+`syq map` deliberately has a destination-independent surface: `-C`, `--root`,
 `--follow-src`/`--follow`, the source-selector family, and `--as`. It takes
 either `--src-src DIR` as the only selector or any number of relative named
 selectors. `--as` renames the single selected root. Destination, filtering,
@@ -236,7 +236,7 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   policy: preservation and comparison behavior stay global.
 - An entry claims exactly one object. A `dir` entry claims the
   directory itself, without its contents.
-- The command-line path naming a manifest, the `-C` source base, and the
+- The command-line path naming a manifest, the `-C`/`--root` source base, and the
   `--into` placement are directly supplied paths. Native mode refuses to
   traverse symlinks in them by default. `--follow-src` controls the source
   base, `--follow-dest` controls placement, and only the `--follow` umbrella
@@ -259,6 +259,12 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   concurrent rename or symlink replacement cannot redirect the emitted tree.
   A followed named selector's emitted `src` is derived from that same component
   walk rather than a second `realpath` lookup.
+- `-C` is only a resolution base: directly supplied selectors may contain
+  `.` and `..` and may resolve outside it. `--root` is mutually exclusive with
+  `-C` and confines those selectors beneath the pinned root. A mapping emitted
+  from a contents selector is relative to the selected directory, so its
+  consumer must use that directory as its source base. These operator-path
+  rules do not relax the strict manifest grammar described above.
 - Symlinks selected by mapping entries are never resolved by mapping handling:
   a symlink maps as a symlink, and a destination path that would traverse a
   symlink inside the destination container fails that entry. Resolve links before

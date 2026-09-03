@@ -411,6 +411,7 @@ def _copy_arguments(
     src_dir: Selector | None,
     from_: str | None,
     cwd: PathArgument | None,
+    root: PathArgument | None,
     follow: bool,
     follow_src: bool,
     follow_dest: bool,
@@ -456,8 +457,12 @@ def _copy_arguments(
             contents_count += appended
     if from_ is not None:
         argv.extend(("--from", _text_arg(from_, label="from_")))
+    if cwd is not None and root is not None:
+        raise SyqInvocationError("cwd and root are mutually exclusive")
     if cwd is not None:
         argv.extend(("--cwd", _argument(cwd, label="cwd")))
+    if root is not None:
+        argv.extend(("--root", _argument(root, label="root")))
     if follow:
         argv.append("--follow")
     if follow_src:
@@ -721,6 +726,7 @@ class Client:
         src_dir: Selector | None = None,
         from_: str | None = None,
         cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
         follow: bool = False,
         follow_src: bool = False,
         follow_dest: bool = False,
@@ -783,6 +789,7 @@ class Client:
             src_dir=src_dir,
             from_=from_,
             cwd=cwd,
+            root=root,
             follow=follow,
             follow_src=follow_src,
             follow_dest=follow_dest,
@@ -876,6 +883,7 @@ class Client:
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
         follow: bool = False,
         follow_src: bool = False,
         as_: PathArgument | None = None,
@@ -896,6 +904,7 @@ class Client:
             src_dir=src_dir_values,
             from_=None,
             cwd=cwd,
+            root=root,
             follow=follow,
             follow_src=follow_src,
             follow_dest=False,
@@ -933,7 +942,12 @@ class Client:
                 else os.getcwd()
             )
         )
-        native_base = Path(os.fsdecode(os.fspath(cwd))) if cwd is not None else Path()
+        selected_base = root if root is not None else cwd
+        native_base = (
+            Path(os.fsdecode(os.fspath(selected_base)))
+            if selected_base is not None
+            else Path()
+        )
         effective_cwd = (process_base / native_base).resolve()
         if src_src_values:
             if len(src_src_values) != 1 or source_count != 1:

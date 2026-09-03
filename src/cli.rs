@@ -84,6 +84,13 @@ pub struct Args {
     /// Endpoint-side containment boundary for native removal.
     #[arg(skip)]
     pub native_rm_root: Option<Vec<u8>>,
+    /// Endpoint-side base for native copy source selectors. Unlike `--root`,
+    /// this is not a containment boundary.
+    #[arg(skip)]
+    pub native_source_cwd: Option<Vec<u8>>,
+    /// Endpoint-side containment boundary for native copy source selectors.
+    #[arg(skip)]
+    pub native_source_root: Option<Vec<u8>>,
     /// Permit symlinks that must be traversed in directly supplied native paths.
     #[arg(skip)]
     pub native_follow: bool,
@@ -97,6 +104,9 @@ pub struct Args {
     /// emitted `src` values stay relative to it.
     #[arg(skip)]
     pub native_map_cwd: Option<Vec<u8>>,
+    /// Confined source-side base for `syq map` selectors.
+    #[arg(skip)]
+    pub native_map_root: Option<Vec<u8>>,
     /// The placement destination for `syq map`, kept only for `--as` renaming;
     /// `syq map` never contacts a destination.
     #[arg(skip)]
@@ -604,8 +614,17 @@ fn print_root_help() {
 #[derive(clap::Args, Debug)]
 struct NativeSourceArgs {
     /// Resolve relative source selectors from DIR
-    #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
+    #[arg(
+        short = 'C',
+        long,
+        value_name = "DIR",
+        allow_hyphen_values = true,
+        conflicts_with = "root"
+    )]
     cwd: Option<OsString>,
+    /// Resolve source selectors beneath DIR and refuse any escape
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    root: Option<OsString>,
     /// Follow symlinks in all directly supplied filesystem paths
     #[arg(long)]
     follow: bool,
@@ -1028,19 +1047,12 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
             bail!("--mapping replaces source selectors; do not combine them");
         }
         let endpoint = parse_native_endpoint(copy.selection.from.as_deref())?;
-        let base = trim_native_trailing_slashes(
-            copy.selection
-                .source
-                .cwd
-                .clone()
-                .map(OsStringExt::into_vec)
-                .unwrap_or_else(|| b".".to_vec()),
-        );
-        if base.is_empty() {
-            bail!("source base may not be empty");
-        }
         // The manifest is the selection; its entries resolve against this root.
-        vec![Location::native(endpoint, base, SourceSelection::Contents)]
+        vec![Location::native(
+            endpoint,
+            b".".to_vec(),
+            SourceSelection::Contents,
+        )]
     } else {
         lower_native_selection(&copy.selection, &matches)?
     };
@@ -1109,6 +1121,13 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.native_results = results.map(OsStringExt::into_vec);
     args.native_results_fd = results_fd;
     args.pscope = pscope;
+    args.native_source_cwd = copy.selection.source.cwd.clone().map(OsStringExt::into_vec);
+    args.native_source_root = copy
+        .selection
+        .source
+        .root
+        .clone()
+        .map(OsStringExt::into_vec);
     args.native_follow = copy.selection.source.follow;
     args.native_follow_src = copy.selection.source.follow_src;
     args.native_follow_dest = copy.follow_dest;
@@ -1176,34 +1195,20 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     // Keep `-C` out of selector paths so emitted `src` values stay relative
     // to it; the walk joins it back.
     let map_cwd = parsed.source.cwd.take().map(OsStringExt::into_vec);
+    let map_root = parsed.source.root.take().map(OsStringExt::into_vec);
     let mut locations = lower_native_sources(&parsed.source, &matches, None)?;
     for source in &mut locations {
-        if source.path.starts_with(b"/") || source.path == b"~" || source.path.starts_with(b"~/") {
+        if source.selection != SourceSelection::Contents
+            && (source.path.starts_with(b"/")
+                || source.path == b"~"
+                || source.path.starts_with(b"~/"))
+        {
             bail!(
-                "syq map selector {:?} is absolute; mapping entries are root-relative (use -C to set the base)",
+                "named syq map selector {:?} is absolute and cannot be emitted relative to its mapping source base; use -C with a relative selector",
                 String::from_utf8_lossy(&source.path)
             );
         }
-        // Normalize the way --files-from does — drop `.` and empty
-        // components, reject `..` — so emitted paths are always valid
-        // manifest paths.
-        let mut parts: Vec<&[u8]> = Vec::new();
-        for component in source.path.split(|&byte| byte == b'/') {
-            match component {
-                b"" | b"." => {}
-                b".." => bail!(
-                    "syq map selector {:?} contains a `..` component",
-                    String::from_utf8_lossy(&source.path)
-                ),
-                other => parts.push(other),
-            }
-        }
-        let normalized = parts.join(&b"/"[..]);
-        source.path = if normalized.is_empty() {
-            b".".to_vec()
-        } else {
-            normalized
-        };
+        validate_native_source_selector(&source.path, map_root.is_some())?;
     }
     if locations
         .iter()
@@ -1248,6 +1253,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     args.placement = placement;
     args.locations = locations;
     args.native_map_cwd = map_cwd;
+    args.native_map_root = map_root;
     args.native_map_target = target;
     args.native_follow = parsed.source.follow;
     args.native_follow_src = parsed.source.follow_src;
@@ -1322,7 +1328,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         .into_iter()
         .map(|(_, selection, path)| {
             let path = trim_native_trailing_slashes(path.into_vec());
-            validate_native_rm_selector(&path)?;
+            validate_native_source_selector(&path, parsed.selection.root.is_some())?;
             Ok(Location::native(endpoint.clone(), path, selection))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1377,14 +1383,11 @@ fn lower_native_sources(
         bail!("native operations need at least one source selector");
     }
 
-    let cwd = parsed.cwd.as_deref().map(OsStrExt::as_bytes);
     ordered
         .into_iter()
         .map(|(_, selection, path)| {
-            let path = trim_native_trailing_slashes(qualify_source(cwd, path.into_vec()));
-            if path.is_empty() {
-                bail!("source selectors may not be empty");
-            }
+            let path = trim_native_trailing_slashes(path.into_vec());
+            validate_native_source_selector(&path, parsed.root.is_some())?;
             Ok(Location::native(endpoint.clone(), path, selection))
         })
         .collect()
@@ -1602,16 +1605,6 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
     Ok(())
 }
 
-fn qualify_source(cwd: Option<&[u8]>, path: Vec<u8>) -> Vec<u8> {
-    let Some(cwd) = cwd else {
-        return path;
-    };
-    if path.starts_with(b"/") || path == b"~" || path.starts_with(b"~/") {
-        return path;
-    }
-    crate::fsops::join(cwd, &path)
-}
-
 fn trim_native_trailing_slashes(mut path: Vec<u8>) -> Vec<u8> {
     while path.len() > 1 && path.ends_with(b"/") {
         path.pop();
@@ -1619,27 +1612,18 @@ fn trim_native_trailing_slashes(mut path: Vec<u8>) -> Vec<u8> {
     path
 }
 
-fn validate_native_rm_selector(path: &[u8]) -> Result<()> {
+fn validate_native_source_selector(path: &[u8], confined: bool) -> Result<()> {
     if path.is_empty() {
         bail!("source selectors may not be empty");
     }
-    if path.starts_with(b"/") {
+    if confined && (path.starts_with(b"/") || path == b"~" || path.starts_with(b"~/")) {
         bail!(
-            "source selector {:?} must be relative",
+            "source selector {:?} beneath --root must be relative",
             String::from_utf8_lossy(path)
         );
     }
     if path.contains(&0) {
         bail!("source selector contains NUL");
-    }
-    if path
-        .split(|byte| *byte == b'/')
-        .any(|component| component == b"." || component == b"..")
-    {
-        bail!(
-            "source selector {:?} contains forbidden `.` or `..` component",
-            String::from_utf8_lossy(path)
-        );
     }
     Ok(())
 }
@@ -2358,8 +2342,10 @@ mod tests {
         assert_eq!(args.placement, Placement::Into);
         assert_eq!(args.locations.len(), 2);
         assert_eq!(args.locations[0].host.as_deref(), Some("source.test"));
-        assert_eq!(args.locations[0].path, b"base/one");
+        assert_eq!(args.locations[0].path, b"one");
         assert_eq!(args.locations[0].selection, SourceSelection::NamedNoFollow);
+        assert_eq!(args.native_source_cwd.as_deref(), Some(&b"base"[..]));
+        assert!(args.native_source_root.is_none());
         assert_eq!(args.locations[1].host.as_deref(), Some("target.test"));
         assert_eq!(args.locations[1].path, b"dest");
     }

@@ -695,8 +695,13 @@ fn copy_identity(
 ) -> Result<String> {
     let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
     for source in srcs {
-        let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
-        src_roots.push((path_identity(&path), source.copies_contents()));
+        let identity = if args.interface == Interface::NativeCp {
+            native_source_identity(args, source)
+        } else {
+            let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
+            path_identity(&path)
+        };
+        src_roots.push((identity, source.copies_contents()));
     }
     let dst_root = match dst_canonical {
         Some(path) => path,
@@ -710,6 +715,31 @@ fn copy_identity(
         &dst_root,
         &semantic_flags(opts, args, srcs),
     ))
+}
+
+/// Native source authority is the pinned endpoint-side base plus the raw
+/// operator selector. Do not canonicalize the selector again after source
+/// registration: doing so could observe a different namespace identity from
+/// the descriptor-backed one the transfer actually uses.
+fn native_source_identity(args: &Args, source: &Location) -> String {
+    let (base_kind, base) = if let Some(path) = args.native_source_root.as_deref() {
+        ("root", Some(path))
+    } else if let Some(path) = args.native_source_cwd.as_deref() {
+        ("cwd", Some(path))
+    } else {
+        ("endpoint-cwd", None)
+    };
+    serde_json::json!({
+        "native_source_identity": 1,
+        "base_kind": base_kind,
+        "base": base.map(path_bytes_identity),
+        "selector": path_bytes_identity(&source.path),
+    })
+    .to_string()
+}
+
+fn path_bytes_identity(path: &[u8]) -> String {
+    path_identity(std::path::Path::new(OsStr::from_bytes(path)))
 }
 
 #[derive(Clone, Debug)]
@@ -2869,6 +2899,17 @@ fn register_source_roots(
     shared_workers: usize,
     independent_claim_workers: usize,
 ) -> Result<Vec<RegisteredSourceRoot>> {
+    let base = if let Some(path) = &args.native_source_root {
+        SourceRootBase {
+            path: Some(path.clone()),
+            confined: true,
+        }
+    } else {
+        SourceRootBase {
+            path: args.native_source_cwd.clone(),
+            confined: false,
+        }
+    };
     let selections = sources
         .iter()
         .map(|source| SourceRootSelection {
@@ -2882,6 +2923,7 @@ fn register_source_roots(
         .collect();
     match ok(
         conn.call(Request::RegisterSourceRoots {
+            base,
             selections,
             symlink_policy: source_operator_symlink_policy(args),
             allow_unconfined_paths: args.interface == Interface::Rsync && args.insecure_links,

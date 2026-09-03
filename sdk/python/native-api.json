@@ -6,6 +6,7 @@
       "python": [
         "from",
         "cwd",
+        "root",
         "follow",
         "follow-src",
         "follow-dest",
@@ -110,6 +111,7 @@
       "python": [
         "as",
         "cwd",
+        "root",
         "follow",
         "follow-src",
         "src",

@@ -46,6 +46,7 @@ learn a second set of names for concepts that syq already names.
 | `syq cp --prune` | `syq.cp(prune=True)` or `Client.cp(prune=True)` |
 | `syq rm` | `syq.run(["rm", ...])` or `Client.run(["rm", ...])` |
 | `syq map` | `syq.map()` or `Client.map()` |
+| `--root` | `root=` |
 | `--src-src` | `src_src=` |
 | `--follow-src` | `follow_src=` |
 | `--follow-dest` | `follow_dest=` |
@@ -195,6 +196,7 @@ syq.cp(
     src_dir=None,
     from_=None,
     cwd=None,
+    root=None,
     follow=False,
     follow_src=False,
     follow_dest=False,
@@ -262,9 +264,15 @@ remains authoritative for path resolution, type checks, endpoint behavior,
 and filesystem state. Errors use native option names so they remain searchable
 in `syq --help` and the README.
 
-Copy selectors may be absolute, with the same behavior as native `cp`. Input
-paths accept text and byte path-like objects on supported Unix systems; byte
-paths are not decoded merely to build argv.
+`cwd` and `root` are mutually exclusive and retain the native source-base
+meanings for both `cp` and `map`. `cwd` is a resolution base rather than a
+containment boundary; relative selectors may leave it through `..`, and
+absolute selectors ignore it. `root` confines component-by-component
+resolution beneath the pinned directory, so its selectors must be relative.
+Directly supplied selectors may otherwise contain `.` and `..`; mapping-entry
+paths retain their separate strict relative grammar. Input paths accept text
+and byte path-like objects on supported Unix systems; byte paths are not
+decoded merely to build argv.
 
 `follow`, `follow_src`, `follow_dest`, `hash`, `no_compress`, `bwlimit`,
 `connections`, `ignore`, `ignore_from`, `preserve`, `inplace`, `max_size`,
@@ -374,7 +382,10 @@ This corresponds to `syq map --src-src photos` followed by a transformed
 manifest and `syq cp --mapping ... -C photos --to storage --into /archive`.
 `MapStream.cwd` is the effective source base needed to execute its emitted
 `src` paths. Keeping that property named `cwd` makes it directly usable as the
-native `cwd=` parameter.
+native `cwd=` parameter. If `map(root=...)` was used, that root confines the
+mapping producer; the returned path names the selected effective base for the
+separate consumer process, which cannot inherit the producer's pinned
+descriptor.
 
 `MapStream` yields entries as `syq map` emits them. Reaching normal EOF
 verifies the producer's process status. Leaving the context early kills and

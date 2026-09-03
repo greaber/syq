@@ -1038,6 +1038,140 @@ fn native_copy_uses_explicit_endpoints_cwd_and_option_safe_selectors() {
 }
 
 #[test]
+fn native_copy_cwd_may_escape_while_root_confines_component_resolution() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("base/inside"), b"inside");
+    fs::create_dir_all(t.path("base/nested")).unwrap();
+    write(&t.path("outside/external"), b"outside");
+
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("base"),
+        "--src",
+        "../outside/external",
+        "--into-new",
+        &t.s("cwd-destination"),
+    ]);
+    assert_eq!(read(&t.path("cwd-destination/external")), b"outside");
+
+    let escape = native_syq(&[
+        "cp",
+        "--root",
+        &t.s("base"),
+        "--src",
+        "inside",
+        "--src",
+        "../outside/external",
+        "--into-new",
+        &t.s("root-escape"),
+    ]);
+    assert!(!escape.status.success());
+    assert!(stderr_of(&escape).contains("outside its confined root"));
+    assert!(!t.path("root-escape").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--root",
+        &t.s("base"),
+        "--src",
+        "nested/../inside",
+        "--into-new",
+        &t.s("root-destination"),
+    ]);
+    assert_eq!(read(&t.path("root-destination/inside")), b"inside");
+
+    run_native_ok(&[
+        "cp",
+        "--root",
+        &t.s("base"),
+        "--src",
+        ".",
+        "--as-new",
+        &t.s("exact-root-copy"),
+    ]);
+    assert_eq!(read(&t.path("exact-root-copy/inside")), b"inside");
+
+    write(&t.path("base/file"), b"file");
+    let non_directory = native_syq(&[
+        "cp",
+        "--root",
+        &t.s("base"),
+        "--src",
+        "file/.",
+        "--into-new",
+        &t.s("non-directory"),
+    ]);
+    assert!(!non_directory.status.success());
+    assert!(!t.path("non-directory").exists());
+
+    symlink("nested", t.path("base/link")).unwrap();
+    let no_follow = native_syq(&[
+        "cp",
+        "--root",
+        &t.s("base"),
+        "--src",
+        "link/../inside",
+        "--into-new",
+        &t.s("no-follow"),
+    ]);
+    assert!(!no_follow.status.success());
+    assert!(!t.path("no-follow").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--root",
+        &t.s("base"),
+        "--follow-src",
+        "--src",
+        "link/../inside",
+        "--into-new",
+        &t.s("followed"),
+    ]);
+    assert_eq!(read(&t.path("followed/inside")), b"inside");
+
+    symlink("base", t.path("base-link")).unwrap();
+    let linked_base = native_syq(&[
+        "cp",
+        "--root",
+        &t.s("base-link"),
+        "--src",
+        "inside",
+        "--into-new",
+        &t.s("linked-base-refused"),
+    ]);
+    assert!(!linked_base.status.success());
+    assert!(!t.path("linked-base-refused").exists());
+    run_native_ok(&[
+        "cp",
+        "--root",
+        &t.s("base-link"),
+        "--follow-src",
+        "--src",
+        "inside",
+        "--into-new",
+        &t.s("linked-base-followed"),
+    ]);
+    assert_eq!(read(&t.path("linked-base-followed/inside")), b"inside");
+}
+
+#[test]
+fn native_copy_and_map_cwd_and_root_are_mutually_exclusive() {
+    let copy = native_syq(&[
+        "cp", "--cwd", ".", "--root", ".", "--src", "source", "--into", "dest",
+    ]);
+    assert_eq!(copy.status.code(), Some(2));
+
+    let map = syq_map_in(
+        Path::new("."),
+        &["--cwd", ".", "--root", ".", "--src", "source"],
+    );
+    assert_eq!(map.status.code(), Some(2));
+}
+
+#[test]
 fn native_copy_typed_selectors_are_source_preconditions() {
     use std::os::unix::fs::symlink;
 
@@ -2564,14 +2698,60 @@ fn native_rm_missing_selectors_succeed() {
 }
 
 #[test]
-fn native_rm_rejects_absolute_dot_and_dotdot_selectors_before_mutation() {
+fn native_rm_cwd_may_escape_while_root_confines_dotdot() {
     let t = Tmp::new();
-    for bad in [t.s("other"), "a/./other".into(), "a/../other".into()] {
-        write(&t.path("victim"), b"keep");
-        let output = native_syq(&["rm", "--cwd", &t.s(""), "--src", "victim", "--src", &bad]);
-        assert!(!output.status.success(), "accepted selector {bad:?}");
-        assert_eq!(read(&t.path("victim")), b"keep");
-    }
+    fs::create_dir_all(t.path("base/nested")).unwrap();
+    write(&t.path("base/inside"), b"inside");
+    write(&t.path("outside/remove"), b"outside");
+
+    run_native_ok(&["rm", "--cwd", &t.s("base"), "--src", "../outside/remove"]);
+    assert!(!t.path("outside/remove").exists());
+
+    write(&t.path("outside/absolute"), b"absolute");
+    run_native_ok(&[
+        "rm",
+        "--cwd",
+        &t.s("base"),
+        "--src",
+        &t.s("outside/absolute"),
+    ]);
+    assert!(!t.path("outside/absolute").exists());
+
+    write(&t.path("outside/keep"), b"outside");
+    let escape = native_syq(&[
+        "rm",
+        "--root",
+        &t.s("base"),
+        "--src",
+        "inside",
+        "--src",
+        "../outside/keep",
+    ]);
+    assert!(!escape.status.success());
+    assert_eq!(read(&t.path("base/inside")), b"inside");
+    assert_eq!(read(&t.path("outside/keep")), b"outside");
+
+    let absolute_escape = native_syq(&[
+        "rm",
+        "--root",
+        &t.s("base"),
+        "--src",
+        "inside",
+        "--src",
+        &t.s("outside/keep"),
+    ]);
+    assert!(!absolute_escape.status.success());
+    assert_eq!(read(&t.path("base/inside")), b"inside");
+    assert_eq!(read(&t.path("outside/keep")), b"outside");
+
+    run_native_ok(&["rm", "--root", &t.s("base"), "--src", "nested/../inside"]);
+    assert!(!t.path("base/inside").exists());
+
+    write(&t.path("base/a"), b"a");
+    write(&t.path("base/sub/b"), b"b");
+    run_native_ok(&["rm", "--root", &t.s("base"), "--src-src", "."]);
+    assert!(t.path("base").is_dir());
+    assert!(listing(&t.path("base")).is_empty());
 }
 
 #[test]
@@ -9307,8 +9487,10 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "fake",
             "--follow-src",
             "--follow-dest",
-            "--src-src",
+            "--root",
             &t.s("src"),
+            "--src-src",
+            ".",
             "--to",
             "fake",
             "--ignore=*.tmp",
@@ -9341,6 +9523,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     for option in [
         "--follow-src",
         "--follow-dest",
+        "--root",
         "--ignore=*.tmp",
         "--preserve=permissions",
         "--inplace",
@@ -10575,16 +10758,50 @@ fn native_cp_results_without_mapping_and_refusals() {
 // ---- review-round fixes ----
 
 #[test]
-fn native_map_normalizes_dot_components_and_rejects_dotdot() {
+fn native_map_cwd_may_escape_while_root_confines_component_resolution() {
     let t = Tmp::new();
-    write(&t.path("photos/a.jpg"), b"a");
-    let lines = map_lines(&syq_map_in(&t.path(""), &["./photos"]));
+    write(&t.path("base/photos/a.jpg"), b"a");
+    fs::create_dir_all(t.path("base/nested")).unwrap();
+    write(&t.path("outside/b.jpg"), b"b");
+
+    let lines = map_lines(&syq_map_in(&t.path("base"), &["nested/../photos"]));
     let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
     assert_eq!(dsts, ["photos", "photos/a.jpg"]);
     assert_eq!(map_path(&lines[0], "src"), "photos");
-    let out = syq_map_in(&t.path("photos"), &["--src", "../photos"]);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("`..` component"));
+
+    let lines = map_lines(&syq_map_in(&t.path("base"), &["--src-src", "../outside"]));
+    assert_eq!(map_path(&lines[0], "src"), "b.jpg");
+    assert_eq!(map_path(&lines[0], "dst"), "b.jpg");
+
+    let lines = map_lines(&syq_map_in(
+        &t.path("base"),
+        &["--src-src", &t.s("outside")],
+    ));
+    assert_eq!(map_path(&lines[0], "src"), "b.jpg");
+
+    let escape = syq_map_in(
+        &t.path(""),
+        &["--root", &t.s("base"), "--src-src", "../outside"],
+    );
+    assert!(!escape.status.success());
+    assert!(stderr_of(&escape).contains("outside its confined root"));
+
+    let absolute_escape = syq_map_in(
+        &t.path(""),
+        &["--root", &t.s("base"), "--src-src", &t.s("outside")],
+    );
+    assert!(!absolute_escape.status.success());
+
+    let rooted = syq_map_in(
+        &t.path(""),
+        &["--root", &t.s("base"), "--src", "nested/../photos"],
+    );
+    let lines = map_lines(&rooted);
+    assert_eq!(map_path(&lines[0], "src"), "photos");
+
+    write(&t.path("base/file"), b"file");
+    let non_directory = syq_map_in(&t.path(""), &["--root", &t.s("base"), "--src", "file/."]);
+    assert!(!non_directory.status.success());
 }
 
 #[test]

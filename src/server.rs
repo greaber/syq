@@ -1006,6 +1006,7 @@ mod tests {
         ));
         writer
             .write_msg(&Request::RegisterSourceRoots {
+                base: SourceRootBase::default(),
                 selections: vec![SourceRootSelection {
                     path: b".".to_vec(),
                     follow_root: false,
