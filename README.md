@@ -904,6 +904,7 @@ syq: dry-run summary
   changes: 82,411 regular files; 96 directories; 14 symlinks; 3 metadata-only entries; 2 type replacements among them
   deletions: 7 entries planned after a successful copy
   logical data: 1.70 TiB in 82,411 files needing content work (upper bound); 340 GiB in 18,204 files with unchanged content
+  capacity: 1.70 TiB logical data required; 2.30 TiB available; 82,522 destination objects; 14,200,000 inodes available (appears sufficient)
   exclusions: 3 paths/subtrees pruned by ignore rules; 12 other entries
   route: encrypted TCP to gpu01; 16 initial connections (auto-tuned)
 ```
@@ -926,7 +927,25 @@ old leaf (including an old symlink).
 The logical-data upper bound is the full size of regular files that fail the
 planning-time metadata check. Resume state, block reuse, reflinks, compression,
 server-side copying, or a content comparison can make the real I/O or wire-byte
-count smaller. An ignored directory is pruned without scanning its descendants,
+count smaller.
+
+When the effective destination is missing or is an existing empty directory,
+SYQ also has a useful simple capacity check: no replaced destination payload can
+release space, and newly created descendants cannot already cross filesystem
+boundaries. After scanning the selected source entries, SYQ rechecks the same
+destination filesystem and refuses a real copy if their logical file sizes
+exceed the space available to the receiving user, or if their object count
+exceeds an available inode count reported by the filesystem. The dry-run
+`capacity` line shows the same assessment. The line is omitted for a nonempty
+destination, an unsupported receiver/filesystem, or a changed filesystem;
+those cases retain allocation-time checks because updates, mounts, and
+replacement order make a simple whole-copy estimate misleading. An
+insufficient dry run exits unsuccessfully while still printing its plan and
+capacity line. This is a sanity check rather than a reservation, and it imposes
+no separate free-space reserve: another process can still consume or release
+space after it runs.
+
+An ignored directory is pruned without scanning its descendants,
 so the exclusions line counts that directory as one `path/subtree`; it does not
 invent a descendant count. Other exclusions cover state and size options and
 unsupported entry types. With `--delete`, the destination is walked and the
@@ -977,8 +996,16 @@ counts.
 On the receiving side a file that needs content changes is written beside its
 destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
 written with `pwrite` from several workers), given its metadata, and `rename`d
+<<<<<<< HEAD
 over the target. Newly created sidecars are mode `0600`; final metadata is
 applied just before publication. When an existing final file is the comparison
+=======
+over the destination. Newly created sidecars are mode `0600`; final metadata is
+applied just before publication. On Linux, SYQ uses the sparse-length fallback
+only when `fallocate` is unsupported; actual space and quota failures remain
+errors and abort the whole transfer instead of letting later files keep filling
+the filesystem. When an existing final file is the comparison
+>>>>>>> origin/master
 basis, the receiver retains that open descriptor while its blocks are hashed.
 If every block matches, metadata is applied through the descriptor without
 allocating or publishing a sidecar; otherwise that exact descriptor seeds the

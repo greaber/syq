@@ -627,9 +627,10 @@ file.
 
 ## Compatibility and versioning
 
-Every published Python package pins one exact syq release. That is the tested
-default pairing. Several Python releases may pin the same syq release, but one
-published Python version never changes its pin.
+Every published Python package has the same version as the exact syq release it
+pins. That is the tested default pairing, and a published Python version never
+changes its pin. Python-only changes ship with the next syq release rather than
+creating an independently numbered package.
 
 The automation schema has its own version. The Python package supports stated
 schema major versions rather than guessing compatibility from the executable's
@@ -639,8 +640,10 @@ schema's compatibility policy.
 Mapping entries are supported at the exact SDK/binary pairing. A separately
 versioned mapping schema can broaden that compatibility boundary later.
 
-Python API changes follow Python package semantic versioning. Adding support
-for a new syq release does not by itself justify a breaking Python API change.
+The Python package does not maintain a compatibility version separate from the
+syq product release. Python API and native changes still follow their documented
+compatibility contracts; sharing a release number does not make the executable
+version a substitute for the automation schema version.
 
 The naming rule is part of compatibility. A new native command `foo-bar`
 reserves `foo_bar`; a new semantic `--some-option` reserves `some_option`.

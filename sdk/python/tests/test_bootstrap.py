@@ -77,9 +77,10 @@ class BootstrapTests(unittest.TestCase):
             mock.patch.object(bootstrap, "_host_target", return_value="linux-x86_64"),
         )
 
-    def test_package_pin_matches_embedded_manifest(self) -> None:
+    def test_package_version_and_pin_match_embedded_manifest(self) -> None:
         manifest_path = Path(bootstrap.__file__).with_name("syq-release-manifest.json")
         manifest = json.loads(manifest_path.read_bytes())
+        self.assertEqual(syq.__version__, manifest["version"])
         self.assertEqual(syq.PINNED_SYQ_VERSION, manifest["version"])
 
     def test_downloads_validates_and_reuses_the_exact_binary(self) -> None:

@@ -118,6 +118,7 @@
         "already_exists",
         "invalid_input",
         "no_space",
+        "quota_exceeded",
         "read_only",
         "other"
       ]

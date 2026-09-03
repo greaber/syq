@@ -155,6 +155,7 @@ case "$1:$2" in
   api:*/git/tags/*) printf '%s\n' "$SYQ_TEST_TAG_JSON" ;;
   api:*/compare/*) printf '%s\n' "$SYQ_TEST_COMPARE_JSON" ;;
   api:*/check-runs*) printf '%s\n' "$SYQ_TEST_CHECKS_JSON" ;;
+  api:*/actions/workflows/*/runs?*) printf '%s\n' "$SYQ_TEST_WORKFLOW_RUNS_JSON" ;;
   release:download)
     shift 2
     destination=
@@ -179,13 +180,31 @@ tag_json=$(jq -cn --arg commit "$commit" '
 compare_json=$(jq -cn --arg commit "$commit" \
   '{base_commit:{sha:$commit},merge_base_commit:{sha:$commit}}')
 checks_json=$(jq -cn '{check_runs:[
-  {name:"rust",status:"completed",conclusion:"success"},
+  {id:1,name:"rust",started_at:"2026-01-01T00:00:00Z",status:"completed",conclusion:"failure"},
+  {id:2,name:"rust",started_at:"2026-01-01T00:01:00Z",status:"completed",conclusion:"success"},
   {name:"macos",status:"completed",conclusion:"success"},
   {name:"verify signed release tag",status:"in_progress",conclusion:null}]}')
+workflow_runs_json=$(jq -cn --arg commit "$commit" '{workflow_runs:[{
+  id:701,event:"workflow_dispatch",head_sha:$commit,status:"completed",
+  conclusion:"success",run_number:1,run_attempt:1}]}')
 SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
   SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$checks_json" \
   PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos >/dev/null
+
+SYQ_TEST_WORKFLOW_RUNS_JSON="$workflow_runs_json" PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-ci.sh" greaber/syq "$commit" >/dev/null
+expect_failure 'has no workflow_dispatch run' env \
+  SYQ_TEST_WORKFLOW_RUNS_JSON='{"workflow_runs":[]}' PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
+failed_workflow_runs=$(jq -cn --arg commit "$commit" '{workflow_runs:[
+  {id:701,event:"workflow_dispatch",head_sha:$commit,status:"completed",
+   conclusion:"success",run_number:1,run_attempt:1},
+  {id:702,event:"workflow_dispatch",head_sha:$commit,status:"completed",
+   conclusion:"failure",run_number:2,run_attempt:1}]}')
+expect_failure 'is completed/failure' env \
+  SYQ_TEST_WORKFLOW_RUNS_JSON="$failed_workflow_runs" PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
 
 lightweight=$(jq -cn --arg sha "$commit" '{object:{type:"commit",sha:$sha}}')
 expect_failure 'is lightweight' env \
