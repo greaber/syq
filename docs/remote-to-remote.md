@@ -50,9 +50,10 @@ read-only or identify root, the target user, or its verified user-private
 group. A default ACL does not make its existing directory writable, and every
 new directory or file syq creates is validated before use. Group-write from the
 conventional umask 002 is accepted only when account and group database lookups
-prove that the group is user-private (same name and no other member or non-root
+check that the group is user-private (same name and no other member or non-root
 primary-group user). Otherwise group-write still fails closed. Private
-enrollment directories and secret files remain exactly 0700 and 0600. A
+enrollment directories require exactly 0700 access bits; directory special bits
+do not affect this check. Secret files remain exactly mode 0600. A
 failure names the machine and reports every unsafe component of the path that
 syq could securely inspect.
 

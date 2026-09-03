@@ -3018,6 +3018,10 @@ pub(crate) fn remote_revoke() -> Result<()> {
     }
     request.id.validate()?;
     let (account, home) = current_account()?;
+    revoke_for_account(&request, &account, &home)
+}
+
+fn revoke_for_account(request: &RevokeRequest, account: &str, home: &Path) -> Result<()> {
     if account != request.target_login {
         bail!("revocation target login does not match the remote account");
     }
@@ -3025,6 +3029,7 @@ pub(crate) fn remote_revoke() -> Result<()> {
     let state = state_base.join(request.id.to_string());
     let (receiver_path, remove_state) = match fs::symlink_metadata(&state) {
         Ok(_) => {
+            delegation::validate_private_directory_path(&state)?;
             let (config, allowed_signers, _) = receiver_config(request.id)?;
             if config.target_login != request.target_login {
                 bail!("revocation target login does not match receiver state");
@@ -3038,13 +3043,16 @@ pub(crate) fn remote_revoke() -> Result<()> {
             )
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (receiver_install_path(&home), None)
+            (receiver_install_path(home), None)
         }
         Err(error) => return Err(error).context("inspect restricted receiver state"),
     };
     let transport = TransportPublicKey::parse(&request.public_key)?;
     let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &transport)?;
-    let ssh = ensure_private_chain(&home, &[".ssh"])?;
+    // Validate the shared state chain before removing the credential. The
+    // second check below determines whether the now-updated state is empty.
+    let _ = directory_is_empty(&state_base)?;
+    let ssh = ensure_private_chain(home, &[".ssh"])?;
     let directory = open_directory(&ssh)?;
     lock_directory(&directory)?;
     let original =
@@ -3053,21 +3061,20 @@ pub(crate) fn remote_revoke() -> Result<()> {
     let (updated, _) = enrollment::revoke_authorized_key(&normalized, &entry)?;
     atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
     if let Some(state) = remove_state {
-        delegation::validate_private_directory_path(&state)?;
         fs::remove_dir_all(&state)
             .with_context(|| format!("remove revoked receiver state {}", state.display()))?;
     }
     let last_enrollment =
         !contains_managed_enrollment(&updated) && directory_is_empty(&state_base)?;
     if last_enrollment {
-        let installed_receiver = receiver_install_path(&home);
+        let installed_receiver = receiver_install_path(home);
         if receiver_path != installed_receiver {
             bail!(
                 "refusing to remove unexpected restricted receiver path {}",
                 receiver_path.display()
             );
         }
-        remove_final_enrollment_state_directories(&home)?;
+        remove_final_enrollment_state_directories(home)?;
         match fs::symlink_metadata(&installed_receiver) {
             Ok(_) => {
                 delegation::validate_secure_executable(&installed_receiver, "restricted receiver")?;
@@ -4231,6 +4238,56 @@ mod tests {
         assert!(contains_managed_enrollment(
             b"restrict,command=\"syq\" ssh-ed25519 key syq-enrollment:id\n"
         ));
+    }
+
+    #[test]
+    fn revoke_validates_all_state_before_rewriting_authorized_keys() {
+        for unsafe_enrollment in [false, true] {
+            let (account, account_home) = current_account().unwrap();
+            let temporary = tempfile::Builder::new()
+                .prefix("syq-revoke-order-")
+                .tempdir_in(account_home)
+                .unwrap();
+            let home = temporary.path();
+            fs::set_permissions(home, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let id = EnrollmentId::test_v4(41);
+            let state_base = home.join(".local/share/syq/restricted");
+            fs::create_dir_all(&state_base).unwrap();
+            fs::set_permissions(
+                &state_base,
+                fs::Permissions::from_mode(if unsafe_enrollment { 0o700 } else { 0o755 }),
+            )
+            .unwrap();
+            if unsafe_enrollment {
+                let state = state_base.join(id.to_string());
+                fs::create_dir(&state).unwrap();
+                fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let ssh = home.join(".ssh");
+            fs::create_dir(&ssh).unwrap();
+            fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let key = generate_transport_key(id).unwrap();
+            let public_key = key.public_key().to_openssh().unwrap();
+            let transport = TransportPublicKey::parse(&public_key).unwrap();
+            let entry =
+                AuthorizedKeyEntry::new(id, &receiver_install_path(home), &transport).unwrap();
+            let original = format!("{}\n", entry.line()).into_bytes();
+            let authorized_keys = ssh.join("authorized_keys");
+            fs::write(&authorized_keys, &original).unwrap();
+            fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let request = RevokeRequest {
+                version: CONFIG_VERSION,
+                id,
+                target_login: account.clone(),
+                public_key,
+            };
+            let error = revoke_for_account(&request, &account, home).unwrap_err();
+            assert!(error.to_string().contains("must have mode 0700"));
+            assert_eq!(fs::read(authorized_keys).unwrap(), original);
+        }
     }
 
     #[test]
