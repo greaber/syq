@@ -176,8 +176,8 @@ jobs:
             exit 1
           }
           pinned_version=${pinned_tag#v}
-          python_version=$(python -c \
-            'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
+          python_version=$(sed -n 's/^version = "\(.*\)"/\1/p' \
+            sdk/python/pyproject.toml)
           test "$python_version" = "$pinned_version" || {
             echo "Python SDK $python_version pins syq $pinned_version; versions must match" >&2
             exit 1
