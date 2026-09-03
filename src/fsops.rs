@@ -7,7 +7,7 @@ use crate::descriptor_broker::{
 use crate::proto::*;
 use crate::rooted::{
     read_open_symlink, root_metadata_from_std, OperatorFinalComponent, OperatorResolver,
-    PinnedPath, RelativePath, Root, RootIdentity, RootMetadata, OPERATOR_SYMLINK_FOLLOW_ADVICE,
+    PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -538,42 +538,6 @@ pub(crate) fn create_operator_file(
         }
         PinnedPath::Missing(missing) => missing.create_regular(0o666),
         PinnedPath::OpenFile(_) => unreachable!("output resolution never opens a procfs input"),
-    }
-}
-
-/// Check the current spelling of an operator-supplied local path without
-/// traversing a symlink. Source walkers that have not yet moved to retained
-/// descriptors use this only as semantic preflight.
-pub(crate) fn check_operator_path_no_symlinks(
-    path: &[u8],
-    allow_final_symlink: bool,
-    allow_missing_final: bool,
-) -> Result<()> {
-    match resolve_operator_entry(
-        path,
-        OperatorSymlinkPolicy::Refuse,
-        allow_missing_final,
-        false,
-        false,
-    )?
-    .1
-    {
-        PinnedPath::Directory(_) => Ok(()),
-        PinnedPath::Leaf(leaf) if !leaf.metadata().is_symlink() || allow_final_symlink => Ok(()),
-        PinnedPath::Leaf(_) => bail!(
-            "operator path encounters a last-component symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}"
-        ),
-        PinnedPath::Missing(missing) => {
-            let (_, components) = missing.into_parts();
-            if components.len() == 1 {
-                Ok(())
-            } else {
-                Err(io::Error::from_raw_os_error(libc::ENOENT).into())
-            }
-        }
-        PinnedPath::OpenFile(_) => {
-            unreachable!("semantic preflight never opens a procfs input")
-        }
     }
 }
 
