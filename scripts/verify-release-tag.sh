@@ -78,8 +78,9 @@ check_runs=$(gh api "repos/$repository/commits/$target_commit/check-runs?filter=
 IFS=, read -ra check_names <<<"$required_checks"
 for check_name in "${check_names[@]}"; do
   conclusion=$(jq -r --arg name "$check_name" '
-    [.check_runs[] | select(.name == $name)] | if length == 0 then "missing"
-    elif length > 1 then "ambiguous" else .[0].conclusion // "pending" end' <<<"$check_runs")
+    [.check_runs[] | select(.name == $name)] |
+    sort_by([(.started_at // .completed_at // ""), (.id // 0)]) |
+    if length == 0 then "missing" else last.conclusion // "pending" end' <<<"$check_runs")
   test "$conclusion" = success || {
     echo "required check $check_name is $conclusion on release commit $target_commit" >&2
     exit 1

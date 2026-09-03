@@ -51,7 +51,7 @@ jobs:
           test "$(jq -er .tag \
             "$RUNNER_TEMP/syq-release/syq-release-manifest.json")" = \
             "$RELEASE_TAG"
-      - name: Prepare the next Python SDK mapping
+      - name: Prepare the matching Python SDK release
         id: prepare
         env:
           RELEASE_MANIFEST: ${{ runner.temp }}/syq-release/syq-release-manifest.json
@@ -72,6 +72,7 @@ jobs:
           python_version=$(python3 -c \
             'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
           syq_version=$(jq -er .version "$RELEASE_MANIFEST")
+          test "$python_version" = "$syq_version"
           {
             echo 'changed=true'
             echo "python_version=$python_version"
@@ -104,20 +105,20 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git switch -c "$branch"
-          git add sdk/README.md sdk/python sdk/RELEASING.md
+          git add sdk/python
           git diff --cached --check
-          git commit -m "Pin Python SDK $PYTHON_VERSION to syq $SYQ_VERSION"
+          git commit -m "Prepare Python SDK $PYTHON_VERSION"
           git push origin "$branch"
           body=$(printf '%s\n\n%s\n%s\n%s\n\n%s' \
             "Automated follow-up to the immutable syq v$SYQ_VERSION release." \
-            "- bumps the Python SDK to $PYTHON_VERSION" \
+            "- sets the Python SDK version to match syq $SYQ_VERSION" \
             "- embeds the exact signed v$SYQ_VERSION release manifest" \
-            "- updates the documented SDK-to-syq mapping" \
+            "- updates the managed executable cache documentation" \
             "The native pull-request checks are approved explicitly because GitHub puts workflow runs caused by GITHUB_TOKEN into an approval-required state. Auto-merge is requested only after the substantive sdks check succeeds on this exact commit; publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
           pr_url=$(gh pr create \
             --base master \
             --head "$branch" \
-            --title "Pin Python SDK $PYTHON_VERSION to syq $SYQ_VERSION" \
+            --title "Prepare Python SDK $PYTHON_VERSION" \
             --body "$body")
           echo "Created $pr_url"
           head_sha=$(git rev-parse HEAD)

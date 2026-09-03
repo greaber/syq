@@ -1,4 +1,4 @@
-//! Direct remote-to-remote: run the coordinator on the source host so data
+//! Direct remote-to-remote: run the orchestrator on the source host so data
 //! flows source→destination without passing through this machine.
 
 use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, SourceSelection};
@@ -16,7 +16,7 @@ struct ReceiptExpectation {
     enrollment_id: EnrollmentId,
     request_id: RequestId,
     recipient_secret: Option<crate::receipt_v2::RecipientSecret>,
-    policy: Option<crate::receipt_v2::ReceiptPolicyV2>,
+    policy: crate::receipt_v2::ReceiptPolicyV2,
     grant_digest: Option<[u8; 32]>,
 }
 
@@ -32,25 +32,37 @@ fn receipt_settlement_outcome(
     refusals: u64,
     orchestrator_exit_code: i32,
 ) -> ReceiptSettlementOutcome {
+    // The receipt decides whether verification fails the run: a non-clean
+    // receipt against a coordinator that claimed success is a contradiction
+    // the exit code must surface.
     let rejects_receipt = refusals > 0
         || (receipt_status != crate::receipt_v2::ReceiptStatusV2::Clean
             && orchestrator_exit_code == 0);
-    let exit_code = if rejects_receipt {
-        1
-    } else {
-        orchestrator_exit_code
-    };
+    // Status first, then the exit code the automation contract pairs with
+    // it — the two can never disagree.
     let results_status = if receipt_status == crate::receipt_v2::ReceiptStatusV2::Incomplete {
         // An incomplete receipt stream can omit operations. Never describe it
         // as safe input for a per-entry retry, even when the coordinator also
         // reported a conventional partial-transfer exit.
         "aborted"
+    } else if orchestrator_exit_code == 1 {
+        // A coordinator-fatal run may hold unsettled entries; the attested
+        // records still describe what did land.
+        "failed"
     } else if refusals > 0 || orchestrator_exit_code == 25 {
         "refused"
-    } else if exit_code == 0 {
-        "success"
-    } else {
+    } else if receipt_status != crate::receipt_v2::ReceiptStatusV2::Clean
+        || orchestrator_exit_code == 23
+    {
         "partial"
+    } else {
+        "success"
+    };
+    let exit_code = match results_status {
+        "success" => 0,
+        "partial" => 23,
+        "refused" => 25,
+        _ => 1,
     };
     ReceiptSettlementOutcome {
         results_status,
@@ -159,7 +171,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
     loop {
         let buffer = reader
             .fill_buf()
-            .context("read remote coordinator output")?;
+            .context("read remote orchestrator output")?;
         if buffer.is_empty() {
             break;
         }
@@ -179,7 +191,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                         capturing = Some(head[prefix.len()..].to_vec());
                     } else {
                         out.write_all(&head)
-                            .context("relay remote coordinator output")?;
+                            .context("relay remote orchestrator output")?;
                     }
                     head.clear();
                 }
@@ -187,7 +199,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                 payload.extend_from_slice(segment);
             } else {
                 out.write_all(segment)
-                    .context("relay remote coordinator output")?;
+                    .context("relay remote orchestrator output")?;
             }
             if let Some(payload) = capturing.as_mut() {
                 if payload.len() > MAX_RECEIPT_V2_LINE_BYTES {
@@ -198,7 +210,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                 if let Some(mut payload) = capturing.take() {
                     store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
                 } else {
-                    out.flush().context("relay remote coordinator output")?;
+                    out.flush().context("relay remote orchestrator output")?;
                 }
                 decided = false;
             }
@@ -211,64 +223,72 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
             capturing = Some(head[prefix.len()..].to_vec());
         } else {
             out.write_all(&head)
-                .context("relay remote coordinator output")?;
+                .context("relay remote orchestrator output")?;
         }
     }
     if let Some(mut payload) = capturing.take() {
         store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
     }
-    out.flush().context("relay remote coordinator output")?;
+    out.flush().context("relay remote orchestrator output")?;
     Ok(receipt)
 }
 
 fn store_receipt_line(captured: &mut Option<CapturedReceipt>, payload: Vec<u8>) -> Result<()> {
     let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(payload.trim_ascii())
-        .context("decode a receipt frame relayed from the source host")?;
-    if captured.is_none() {
-        *captured = Some(CapturedReceipt::new()?);
-    }
-    captured.as_mut().unwrap().push(&encoded)?;
-    Ok(())
+        .context("decode a receipt v2 frame relayed from the source host")?;
+    let receipt = match captured {
+        Some(receipt) => receipt,
+        None => captured.insert(CapturedReceipt::new()?),
+    };
+    receipt.push(&encoded)
 }
 
 /// Verify hostB's receipt against the grant this machine signed. A missing,
 /// unverifiable, or mismatching receipt fails the transfer regardless of
-/// what the source-side coordinator reported.
+/// what the source-side orchestrator reported.
+/// The context a captured receipt settles against.
+struct ReceiptSettlement<'a> {
+    src_host: &'a str,
+    dst_host: &'a str,
+    orchestrator_exit_code: i32,
+    results: Option<&'a crate::results::ResultsWriter>,
+    elapsed_ms: u64,
+    verbose: bool,
+    quiet: bool,
+}
+
+/// Returns the process exit code the settled stream advertises, so the two
+/// can never disagree.
 fn settle_receipt(
     expectation: &ReceiptExpectation,
     captured: Option<&mut CapturedReceipt>,
-    src_host: &str,
-    dst_host: &str,
-    orchestrator_exit_code: i32,
-    emit_results: bool,
-    verbose: bool,
-) -> Result<()> {
+    settlement: ReceiptSettlement<'_>,
+) -> Result<i32> {
     let Some(captured) = captured else {
         bail!(
-            "the command-restricted receiver on {dst_host} issued no receipt through {src_host}; what landed cannot be verified"
+            "the command-restricted receiver on {} issued no receipt through {}; what landed cannot be verified",
+            settlement.dst_host,
+            settlement.src_host
         );
     };
-    settle_receipt_v2(
-        expectation,
-        captured,
-        src_host,
-        dst_host,
-        orchestrator_exit_code,
-        emit_results,
-        verbose,
-    )
+    settle_receipt_v2(expectation, captured, settlement)
 }
 
 fn settle_receipt_v2(
     expectation: &ReceiptExpectation,
     captured: &mut CapturedReceipt,
-    src_host: &str,
-    dst_host: &str,
-    orchestrator_exit_code: i32,
-    emit_results: bool,
-    verbose: bool,
-) -> Result<()> {
+    settlement: ReceiptSettlement<'_>,
+) -> Result<i32> {
+    let ReceiptSettlement {
+        src_host,
+        dst_host,
+        orchestrator_exit_code,
+        results,
+        elapsed_ms,
+        verbose,
+        quiet,
+    } = settlement;
     if !captured.ended {
         bail!("the receipt relayed through {src_host} has no terminal frame");
     }
@@ -276,10 +296,7 @@ fn settle_receipt_v2(
         .recipient_secret
         .as_ref()
         .context("the local HPKE receipt key is unavailable")?;
-    let policy = expectation
-        .policy
-        .as_ref()
-        .context("the signed receipt policy is unavailable")?;
+    let policy = &expectation.policy;
     if !matches!(
         policy.delivery,
         crate::receipt_v2::ReceiptDeliveryV2::AttachedEncrypted { .. }
@@ -382,14 +399,36 @@ fn settle_receipt_v2(
         None
     };
     debug_assert_eq!(outcome.rejects_receipt, settlement_error.is_some());
-    if emit_results {
-        crate::receipt_v2::write_automation_results(
+    if let Some(writer) = results {
+        let emitted = crate::receipt_v2::emit_automation_records(
             &mut receipt,
-            &mut std::io::stdout().lock(),
+            writer,
             outcome.results_status,
             outcome.exit_code,
+            elapsed_ms,
         )
         .context("write receiver-attested --results stream")?;
+        // The human summary renders from the same verified terminal the
+        // machine just received (the coordinator's own summary was
+        // suppressed), so the two can never disagree.
+        if !quiet {
+            println!(
+                "syq: receiver-attested: {} files published ({}), {} deleted, {} error(s); receipt {}; {}",
+                terminal.summary.published_files,
+                crate::progress::human(terminal.summary.transferred_bytes),
+                terminal.summary.deletions,
+                emitted.errors,
+                crate::receipt_v2::receipt_status_label(terminal.status),
+                outcome.results_status,
+            );
+        }
+        // A stream was settled: the process must exit with the code that
+        // stream advertises. Verification complaints reach stderr; they do
+        // not fork the exit code away from the terminal record.
+        if let Some(message) = settlement_error {
+            eprintln!("syq: {message}");
+        }
+        return Ok(outcome.exit_code);
     }
     if let Some(message) = settlement_error {
         bail!(message);
@@ -415,7 +454,7 @@ fn settle_receipt_v2(
             terminal.summary.deletions
         );
     }
-    Ok(())
+    Ok(orchestrator_exit_code)
 }
 
 #[derive(Clone, Debug)]
@@ -590,9 +629,12 @@ fn automatic_enrollment_allowed(dry_run: bool, verify_only: bool) -> bool {
     !(dry_run || verify_only)
 }
 
-fn utf8_path(path: &[u8], role: &str) -> Result<String> {
-    String::from_utf8(path.to_vec())
-        .map_err(|_| anyhow::anyhow!("native direct remote-to-remote {role} must be valid UTF-8"))
+/// Encode a delegated path operand: standard unpadded base64 of the raw
+/// bytes, decoded by the remote coordinator's --delegated-operands-b64
+/// handling, so any filename survives the remote shell.
+fn delegated_operand(path: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(path)
 }
 
 fn endpoint_arg(
@@ -645,14 +687,24 @@ fn detached_launcher_command(
     )
 }
 
-pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
+pub fn run(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+) -> Result<i32> {
     if args.interface == Interface::Rsync {
         bail!("syq rsync does not support remote-to-remote transfers");
     }
-    run_remote(args, srcs, dst, false)
+    run_remote(args, srcs, dst, false, results)
 }
 
-pub fn coordinate_at_dest(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
+pub fn coordinate_at_dest(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+) -> Result<i32> {
     if args.interface == Interface::Rsync {
         bail!("--coordinate-at dest is available only through native copy syntax");
     }
@@ -663,38 +715,23 @@ pub fn coordinate_at_dest(args: &Args, srcs: &[Location], dst: &Location) -> Res
         && !args.agent_broker_only
     {
         bail!(
-            "--coordinate-at dest requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with destination-host credentials, or an explicit --rsh policy"
+            "--coordinate-at dest requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with target-host credentials, or an explicit --rsh policy"
         );
     }
-    run_remote(args, srcs, dst, true)
+    run_remote(args, srcs, dst, true, results)
 }
 
 fn run_remote(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
-    coordinator_at_destination: bool,
+    coordinator_at_target: bool,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
 ) -> Result<i32> {
-    match args.native_results.as_deref() {
-        Some(b"-") if args.detach => bail!(
-            "--results cannot be used with --detach because the remote result stream would not remain attached"
-        ),
-        Some(b"-") | None => {}
-        Some(_) => bail!(
-            "a remote transfer coordinator accepts only --results -; use --coordinate-at local to create a named results file"
-        ),
-    }
+    let started = std::time::Instant::now();
     let rsh = parse_rsh(&args.rsh)?;
-    let coordinator = if coordinator_at_destination {
-        dst
-    } else {
-        &srcs[0]
-    };
-    let peer = if coordinator_at_destination {
-        &srcs[0]
-    } else {
-        dst
-    };
+    let coordinator = if coordinator_at_target { dst } else { &srcs[0] };
+    let peer = if coordinator_at_target { &srcs[0] } else { dst };
     let coordinator_host = coordinator.host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
     if args.detach && args.rsh.is_none() && !same_host && !args.no_forward_agent {
@@ -738,7 +775,7 @@ fn run_remote(
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
         // form instead of silently keeping only the constrained broker.
-        let prepared = (!coordinator_at_destination && !args.agent_broker_only)
+        let prepared = (!coordinator_at_target && !args.agent_broker_only)
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
@@ -763,7 +800,7 @@ fn run_remote(
                 enrollment_id: prepared.enrollment_id,
                 request_id: prepared.request_id,
                 recipient_secret: prepared.receipt_recipient_secret,
-                policy: Some(prepared.receipt_policy),
+                policy: prepared.receipt_policy,
                 grant_digest: Some(prepared.grant_digest),
             });
             if !args.quiet {
@@ -815,7 +852,7 @@ fn run_remote(
         diagnostics: Default::default(),
     };
 
-    // Rebuild the native command for the remote coordinator. Placement stays
+    // Rebuild the native command for the remote orchestrator. Placement stays
     // explicit rather than being translated into trailing-slash heuristics.
     let mut remote: Vec<String> = vec![match args.interface {
         Interface::Rsync => unreachable!("checked above"),
@@ -824,6 +861,13 @@ fn run_remote(
         Interface::NativeMap => bail!("syq map runs locally and is never remoted"),
     }
     .into()];
+    remote.push("--delegated-operands-b64".into());
+    if results.is_some() && receipt_expectation.is_some() {
+        // The invoking machine renders the summary from the verified
+        // attested terminal; the coordinator's own summary would race it
+        // and could disagree.
+        remote.push("--suppress-summary".into());
+    }
     let mut short = String::new();
     for (flag, on) in [('n', args.dry_run), ('q', args.quiet)] {
         if on {
@@ -889,12 +933,14 @@ fn run_remote(
     if let Some(n) = args.max_delete {
         remote.push(format!("--max-delete={n}"));
     }
-    if args.native_results.is_some() && receipt_expectation.is_none() {
-        // run_remote accepts only stdout above. The outer SSH process inherits
-        // stdout, so the NDJSON stream and its terminal record reach the
-        // original caller without assigning surprising remote path semantics.
-        remote.push("--results".into());
-        remote.push("-".into());
+    if results.is_some() && receipt_expectation.is_none() {
+        // Without a command-restricted receiver there is no verified
+        // channel to carry per-operation records home from a remote
+        // coordinator; the wrapper turns this into a failed terminal
+        // record, so the stream still settles.
+        bail!(
+            "--results with a direct remote-to-remote copy needs a command-restricted receiver enrollment (its verified receipt is the stream) or --coordinate-at local to route the transfer through this machine"
+        );
     }
     if args.no_bootstrap {
         remote.push("--no-bootstrap".into());
@@ -930,7 +976,7 @@ fn run_remote(
         remote.push("--progress".into());
     }
 
-    if coordinator_at_destination && !same_host {
+    if coordinator_at_target && !same_host {
         remote.push("--from".into());
         remote.push(endpoint_arg(
             &srcs[0],
@@ -950,9 +996,9 @@ fn run_remote(
             }
             .into(),
         );
-        remote.push(utf8_path(&source.path, "source path")?);
+        remote.push(delegated_operand(&source.path));
     }
-    if !coordinator_at_destination && !same_host {
+    if !coordinator_at_target && !same_host {
         remote.push("--to".into());
         remote.push(endpoint_arg(
             dst,
@@ -961,11 +1007,9 @@ fn run_remote(
         ));
     }
     remote.push(native_placement_arg(args)?.into());
-    remote.push(
-        restricted_destination_path
-            .clone()
-            .unwrap_or(utf8_path(&dst.path, "destination path")?),
-    );
+    remote.push(delegated_operand(
+        restricted_destination_path.as_deref().unwrap_or(&dst.path),
+    ));
 
     if args.detach {
         // Detached: log JSON progress instead of a live display.
@@ -1131,11 +1175,14 @@ fn run_remote(
     drop(broker_guard);
     let outcome: Result<i32> = match status.code() {
         Some(0) => Ok(0),
-        // 23 (some files failed) and 25 (--max-delete refused) pass through:
-        // they are transfer results, and the remote's stderr was inherited so
-        // its errors are already printed. Other statuses receive source-host
-        // connectivity or constrained-authentication context here.
-        Some(c @ (23 | 25)) => Ok(c),
+        // 1 (fatal), 23 (some files failed) and 25 (--max-delete refused)
+        // pass through: they are defined transfer results, the remote's
+        // stderr was inherited so its errors are already printed, and the
+        // coordinator requested the receipt before exiting — settlement
+        // below still emits the captured attested evidence. Other statuses
+        // receive source-host connectivity or constrained-authentication
+        // context here.
+        Some(c @ (1 | 23 | 25)) => Ok(c),
         // These arms build Err values rather than bailing: every failure
         // must pass through the held-terminal settlement below.
         Some(c) => {
@@ -1152,16 +1199,20 @@ fn run_remote(
             "remote syq on {coordinator_host} killed by signal"
         )),
     };
-    let code = outcome?;
+    let mut code = outcome?;
     if let Some(expectation) = &receipt_expectation {
-        settle_receipt(
+        code = settle_receipt(
             expectation,
             receipt_payload.as_mut(),
-            &coordinator_host,
-            peer.host.as_deref().unwrap_or("the peer endpoint"),
-            code,
-            args.native_results.is_some(),
-            args.verbose > 0,
+            ReceiptSettlement {
+                src_host: &coordinator_host,
+                dst_host: peer.host.as_deref().unwrap_or("the peer endpoint"),
+                orchestrator_exit_code: code,
+                results: results.as_deref(),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                verbose: args.verbose > 0,
+                quiet: args.quiet,
+            },
         )?;
     }
     Ok(code)
@@ -1342,15 +1393,22 @@ mod tests {
     fn receipt_settlement_preserves_terminal_outcomes() {
         use crate::receipt_v2::ReceiptStatusV2::{Clean, Failed, Incomplete};
 
+        // Every (status, exit_code) pair matches the automation contract's
+        // table: success/0, partial/23, refused/25, failed/1, aborted/1.
         let cases = [
             (Clean, 0, 0, "success", 0, false),
             (Clean, 0, 23, "partial", 23, false),
             (Clean, 0, 25, "refused", 25, false),
-            (Failed, 0, 0, "partial", 1, true),
-            (Failed, 1, 23, "refused", 1, true),
+            (Clean, 0, 1, "failed", 1, false),
+            (Failed, 0, 0, "partial", 23, true),
+            (Failed, 0, 23, "partial", 23, false),
+            (Failed, 1, 23, "refused", 25, true),
+            (Failed, 0, 1, "failed", 1, false),
+            (Failed, 1, 1, "failed", 1, true),
             (Incomplete, 0, 0, "aborted", 1, true),
-            (Incomplete, 0, 23, "aborted", 23, false),
+            (Incomplete, 0, 23, "aborted", 1, false),
             (Incomplete, 1, 23, "aborted", 1, true),
+            (Incomplete, 0, 1, "aborted", 1, false),
         ];
         for (receipt_status, refusals, coordinator, status, exit_code, rejects) in cases {
             let outcome = receipt_settlement_outcome(receipt_status, refusals, coordinator);
@@ -1361,7 +1419,15 @@ mod tests {
     }
 
     #[test]
-    fn receipt_marker_lines_are_decoded_and_spooled() {
+    fn relay_passes_output_through_and_spools_v2_frames() {
+        // Ordinary output streams through byte for byte, including bytes
+        // that are not UTF-8; a stream with no receipt lines captures
+        // nothing.
+        assert!(relay_stdout(b"plain\n".as_slice()).unwrap().is_none());
+        assert!(relay_stdout(b"syq: transferred 1 files\xff\r\n".as_slice())
+            .unwrap()
+            .is_none());
+
         // Marker lines are decoded and spooled as separate bounded frames,
         // not accumulated into one receipt allocation.
         let frames = [
@@ -1379,7 +1445,7 @@ mod tests {
             },
         ]
         .map(|frame| crate::receipt_v2::encode_transport_frame(&frame).unwrap());
-        let mut output = Vec::new();
+        let mut output = b"ordinary line\n".to_vec();
         for frame in &frames {
             output.extend_from_slice(crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes());
             output.extend_from_slice(
@@ -1389,13 +1455,15 @@ mod tests {
             );
             output.push(b'\n');
         }
-        let mut captured = relay_stdout(&output[..]).unwrap().unwrap();
+        let mut captured = relay_stdout(&output[..])
+            .unwrap()
+            .expect("captured receipt v2 frames");
         let captured: Vec<Vec<u8>> = captured.frames().unwrap().map(Result::unwrap).collect();
         assert_eq!(captured, frames);
 
-        assert!(relay_stdout(b"plain\n".as_slice()).unwrap().is_none());
+        // An oversized marker line is refused instead of buffered.
         let mut oversized = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
-        oversized.extend(std::iter::repeat_n(b'A', MAX_RECEIPT_V2_LINE_BYTES));
+        oversized.extend(std::iter::repeat_n(b'A', MAX_RECEIPT_V2_LINE_BYTES + 1));
         oversized.push(b'\n');
         assert!(relay_stdout(oversized.as_slice()).is_err());
     }

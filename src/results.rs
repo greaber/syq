@@ -293,6 +293,18 @@ impl ResultsWriter {
         self.write_and_seal(record, false);
     }
 
+    /// Emit a caller-built record (receipt-attested emission); the envelope
+    /// and sequencing are applied like any other record.
+    pub(crate) fn emit_value(&self, record: serde_json::Value) {
+        self.write_and_seal(record, false);
+    }
+
+    /// Emit a caller-built terminal record and seal the stream, flushing
+    /// inside the same critical section like `emit_result`.
+    pub(crate) fn emit_terminal_value(&self, record: serde_json::Value) {
+        self.write_and_seal(record, true);
+    }
+
     fn write_and_seal(&self, mut record: serde_json::Value, seal: bool) {
         if self.dead.load(Relaxed) {
             return;

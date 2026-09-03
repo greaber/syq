@@ -600,16 +600,17 @@ class AsyncClient:
         timeout: float | None = None,
         check: bool = True,
     ) -> CpResult:
-        if from_ is not None and to is not None and coordinate_at != "local":
-            # A remote-to-remote copy places the coordinator — and the
-            # results stream this surface relies on — on a remote host.
-            # The local relay topology is never chosen implicitly: routing
-            # the transfer through this machine is the operator's call.
+        if (
+            from_ is not None
+            and to is not None
+            and dry_run
+            and coordinate_at != "local"
+        ):
+            # Mirrors the CLI's usage-lane refusal: a dry run's traces exist
+            # only on the coordinator, which these placements move remote.
             raise SyqInvocationError(
-                "a remote-to-remote copy cannot write the local results "
-                "stream; pass coordinate_at='local' explicitly to route the "
-                "transfer through this machine, or use run() for a raw "
-                "invocation"
+                "a remote-to-remote dry run cannot produce the results "
+                "stream this surface relies on; pass coordinate_at='local'"
             )
         argv, source_count = _copy_arguments(
             "cp",

@@ -6,8 +6,9 @@ before a tag can publish anything. The workflow uses a draft until every file
 is uploaded and checked, then publishes it once. Enable GitHub's immutable
 releases setting so published assets and tags cannot be changed afterward.
 
-Python, JavaScript, and Go SDKs have independent versions and tag conventions.
-Their registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.md).
+The Python SDK shares the version of the syq release it pins. JavaScript and Go
+SDKs have independent versions, and every SDK has its own tag convention. Their
+registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.md).
 
 ## One-time repository setup
 
@@ -138,33 +139,37 @@ connection, so enable it only for a trusted release host rather than globally.
    `sdk/python/native-api.json`. A feature may use the `follow_up` disposition
    so its merge is not blocked on SDK work, but `scripts/check-python-api-sync.py`
    and the tag workflow refuse a release until every follow-up is resolved.
-2. Wait for the post-merge `ci` run on `master` to succeed for the release
-   commit. Pull requests are checked against their own head rather than the
-   merged result, and the release workflow refuses a commit whose `rust`,
-   `sdks`, `macos`, and `linux-arm64` checks have not all succeeded. The `sdks`
-   check builds the candidate syq and exercises it through the Python adapter,
-   so tagging a red or still-running `master` only produces a failed release
-   run:
+2. Once the release commit is the exact `master` tip, explicitly dispatch both
+   full validation workflows on it. Selective push checks are insufficient for
+   a release candidate because an unaffected job may have completed with a
+   successful stub. A manual run selects every native, SDK, conformance, ARM,
+   and macOS suite; the release gates require the latest manual run of each
+   workflow on the exact candidate SHA to succeed:
 
    ```sh
-   gh run watch --exit-status "$(gh run list --workflow ci.yml --branch master --commit "$(git rev-parse master)" --json databaseId --jq '.[0].databaseId')"
+   candidate=$(git rev-parse master)
+   gh workflow run ci.yml --ref master
+   gh workflow run rsync-compat.yml --ref master
    ```
 
-   Run the read-only preflight before creating the tag:
+   After both runs complete, verify their exact-SHA certification and run the
+   read-only preflight before creating the tag:
 
    ```sh
+   scripts/verify-release-ci.sh greaber/syq "$candidate"
    scripts/release-preflight.sh v0.1.9
    ```
 
    It requires the exact clean, synchronized `master` tip; no pending Python
-   API follow-ups; matching Cargo metadata; successful required checks on that SHA; an SSH tag-signing key
-   registered with GitHub; the selected-Actions allowlist; the protected
-   `release` environment, tag policy, variables, and secret names; and absence
-   of the tag or version from GitHub, crates.io, and the Homebrew tap. It makes
-   no local or remote changes. Then create and push a signed annotated tag
-   matching the package version. Its signing key and email must be configured
-   on your GitHub account so
-   GitHub reports the tag-object signature as verified:
+   API follow-ups; matching Cargo metadata; successful `rust`, `sdks`,
+   `macos`, `linux-arm64`, and `conformance` checks on that SHA; the two full
+   manual workflow certifications; an SSH tag-signing key registered with
+   GitHub; the selected-Actions allowlist; the protected `release` environment,
+   tag policy, variables, and secret names; and absence of the tag or version
+   from GitHub, crates.io, and the Homebrew tap. It makes no local or remote
+   changes. Then create and push a signed annotated tag matching the package
+   version. Its signing key and email must be configured on your GitHub account
+   so GitHub reports the tag-object signature as verified:
 
    ```sh
    git tag -s v0.1.0 -m 'syq 0.1.0'
@@ -177,8 +182,9 @@ connection, so enable it only for a trusted release host rather than globally.
    boundary. The workflow
    first verifies that the annotated tag's signature is valid and that it
    directly targets the workflow commit, that this commit is reachable
-   from protected `master`, and that the `rust`, `sdks`, `macos`, and
-   `linux-arm64` checks all succeeded on that exact commit. It then builds
+   from protected `master`, that the `rust`, `sdks`, `macos`, `linux-arm64`,
+   and `conformance` checks all succeeded on that exact commit, and that both
+   full manual workflow certifications succeeded. It then builds
    static GNU Linux x86-64/ARM64
    binaries and native macOS Apple Silicon/Intel binaries, embeds an Ed25519
    signature over the manifest's RFC 8785 canonical JSON, verifies the exact
@@ -186,7 +192,7 @@ connection, so enable it only for a trusted release host rather than globally.
    every uploaded byte, publishes it, publishes the matching source package to
    crates.io with a short-lived OIDC credential, and finally updates the tap.
    Once the entire release workflow succeeds, the Python SDK preparation
-   workflow opens a pull request for the next SDK patch release using this
+   workflow opens a pull request for the matching SDK release using this
    immutable syq manifest. PyPI publication remains a separate signed-tag and
    protected-environment action, so a registry outage cannot block syq.
    Track the complete state at any time with:
@@ -197,7 +203,7 @@ connection, so enable it only for a trusted release host rather than globally.
    ```
 
    The report correlates the exact tag commit, release runs and pending
-   environments, GitHub release state, crates.io, the mapped PyPI SDK version,
+   environments, GitHub release state, crates.io, the matching PyPI SDK version,
    and the Homebrew formula without modifying any of them.
 4. Verify one or more downloaded artifacts and exercise all install paths:
 
@@ -246,14 +252,31 @@ as their sole release identity.
 ## CI scope
 
 The required `rust`, `sdks`, `linux-arm64`, `macos`, and `conformance` check
-names are stable. A checked-in path classifier lets those jobs finish with a
-small successful validation for documentation-only changes. SDK-only changes
-still run the full `sdks` job, including generated Python mappings, while the
-native and platform jobs finish quickly. Any Rust, test, script, build,
-installer, release-workflow, or otherwise unclassified path runs the complete
-native, SDK, platform, and conformance suites. Manual workflow runs also run
-everything. This keeps branch protection and release-tag verification attached
-to the same check names without repeatedly rebuilding unaffected code.
+names are stable, but the work behind them differs before and after merge.
+Pull requests run a fast affected-surface gate: Rust changes get formatting,
+clippy, and native unit tests; SDK and rsync-owned changes get their respective
+suites; executable examples in `MAPPINGS.md` get their focused integration
+tests; and repository-tooling changes get the packaging, release, workflow, and
+shell checks. Ordinary native pull requests defer the complete filesystem,
+SDK, conformance, ARM, and macOS suites to `master`. The working agent chooses
+and reports any additional integration tests justified by the change.
+
+Every native push to `master` runs the complete native, SDK, conformance, ARM,
+and macOS suites. Workflow concurrency cancels an older run when a newer commit
+arrives on the same pull request. Each non-PR run has a unique concurrency
+group, including while it is pending, because a later push may affect a
+different subsystem and therefore cannot safely replace the earlier push's
+selected suites. A release candidate must additionally have successful,
+exact-SHA manual runs of both workflows; release preflight and tag verification
+reject selective stubs as release evidence.
+
+The checked-in classifier uses a pull request's merge-base diff rather than
+including unrelated base-branch changes. Documentation-only changes finish
+with small successful required jobs, except for documentation consumed by a
+test or generator. Unknown paths fail safe by selecting every suite. Manual
+workflow runs also select everything. This keeps branch protection and
+release-tag verification attached to stable check names while avoiding the
+same expensive validation on both sides of a merge.
 
 ## macOS signing
 

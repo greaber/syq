@@ -1070,6 +1070,36 @@ fn errstr(e: &anyhow::Error) -> String {
     format!("{e:#}")
 }
 
+fn wire_error(error: &anyhow::Error) -> WireError {
+    let io_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>());
+    WireError {
+        message: errstr(error),
+        io_kind: io_error.map(wire_io_kind),
+        raw_os_error: io_error.and_then(io::Error::raw_os_error),
+    }
+}
+
+fn wire_io_kind(error: &io::Error) -> WireIoKind {
+    match error.raw_os_error() {
+        Some(libc::ENOSPC) => WireIoKind::NoSpace,
+        Some(libc::EDQUOT) => WireIoKind::QuotaExceeded,
+        Some(libc::EROFS) => WireIoKind::ReadOnly,
+        _ => match error.kind() {
+            io::ErrorKind::NotFound => WireIoKind::NotFound,
+            io::ErrorKind::PermissionDenied => WireIoKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists => WireIoKind::AlreadyExists,
+            io::ErrorKind::InvalidInput => WireIoKind::InvalidInput,
+            _ => WireIoKind::Other,
+        },
+    }
+}
+
+fn statvfs_counter<T: Into<u64>>(value: T) -> u64 {
+    value.into()
+}
+
 fn cstr(p: &Path) -> Result<CString> {
     CString::new(p.as_os_str().as_bytes()).map_err(|_| anyhow!("path contains NUL"))
 }
@@ -1813,6 +1843,105 @@ impl FsOps {
         Ok(())
     }
 
+    fn destination_filesystem_info(
+        &self,
+        check_empty: bool,
+        target: Option<&DestinationFilesystemTarget>,
+    ) -> Result<DestinationFilesystemInfo> {
+        let target_directory = if let Some(target) = target {
+            if target.relative_path.is_empty()
+                || target.relative_path.contains(&0)
+                || target.relative_path.contains(&b'/')
+                || matches!(target.relative_path.as_slice(), b"." | b"..")
+            {
+                bail!("destination filesystem target is not one relative path component");
+            }
+            let directory = if let Some(base) = &self.destination_root {
+                base.open_directory(&RelativePath::new(&target.relative_path)?)?
+            } else {
+                let selection = self
+                    .operator_selection
+                    .as_ref()
+                    .context("destination directory has not been selected")?;
+                open_operator_directory_at(&selection.directory, &target.relative_path)?
+            };
+            let metadata = directory.metadata()?;
+            if (metadata.dev(), metadata.ino()) != (target.dev, target.ino) {
+                bail!("destination filesystem target changed while inspecting capacity");
+            }
+            Some(directory)
+        } else {
+            None
+        };
+        let directory = if let Some(directory) = target_directory {
+            directory
+        } else if let Some(directory) = &self.destination_root {
+            directory.open_directory(&RelativePath::new(b"")?)?
+        } else {
+            let selection = self
+                .operator_selection
+                .as_ref()
+                .context("destination directory has not been selected")?;
+            selection
+                .directory
+                .try_clone()
+                .context("duplicate selected destination directory")?
+        };
+        let metadata = directory.metadata()?;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error()).context("inspect destination filesystem");
+        }
+        let stats = unsafe { stats.assume_init() };
+        let fragment_size = if stats.f_frsize == 0 {
+            statvfs_counter(stats.f_bsize)
+        } else {
+            statvfs_counter(stats.f_frsize)
+        };
+        let blocks_available = statvfs_counter(stats.f_bavail);
+        let files = statvfs_counter(stats.f_files);
+        let files_available = statvfs_counter(stats.f_favail);
+        let mut available_bytes = blocks_available.saturating_mul(fragment_size);
+        let mut available_inodes =
+            (files != 0 && files_available <= files).then_some(files_available);
+        #[cfg(debug_assertions)]
+        {
+            if let Some(value) = std::env::var_os("SYQ_TEST_AVAILABLE_BYTES") {
+                available_bytes = value
+                    .to_string_lossy()
+                    .parse()
+                    .context("parse SYQ_TEST_AVAILABLE_BYTES")?;
+            }
+            if let Some(value) = std::env::var_os("SYQ_TEST_AVAILABLE_INODES") {
+                available_inodes = Some(
+                    value
+                        .to_string_lossy()
+                        .parse()
+                        .context("parse SYQ_TEST_AVAILABLE_INODES")?,
+                );
+            }
+        }
+        let empty = check_empty
+            .then(|| Self::selected_directory_empty(&directory))
+            .flatten();
+        Ok(DestinationFilesystemInfo {
+            device: metadata.dev(),
+            available_bytes,
+            available_inodes,
+            empty,
+        })
+    }
+
+    /// Inspect emptiness through the retained directory itself. The result can
+    /// become stale like every unlocked capacity preflight observation, but a
+    /// namespace replacement cannot redirect the read outside the capability.
+    fn selected_directory_empty(directory: &File) -> Option<bool> {
+        let root = Root::from_directory(directory.try_clone().ok()?).ok()?;
+        root.read_open_directory(directory)
+            .ok()
+            .map(|entries| entries.is_empty())
+    }
+
     fn destination_relative(&self, path: &[u8]) -> Result<PathBytes> {
         let Some(prefix) = self.destination_prefix.as_deref() else {
             return Ok(path.to_vec());
@@ -1997,6 +2126,7 @@ impl FsOps {
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }
+            | Request::DestinationFilesystemInfo { .. }
             | Request::TransportStats
             | Request::Receipt
             | Request::Shutdown => {}
@@ -2285,7 +2415,7 @@ impl FsOps {
 
     /// Ops within a batch are independent (the planner orders batches so that
     /// parents come first), so they run in parallel too.
-    pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<String>> {
+    pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
         // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
@@ -2305,12 +2435,12 @@ impl FsOps {
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
-        let mut out: Vec<Option<String>> = vec![None; ops.len()];
+        let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
         let gres = parallel_map(&guarded_idx, |&i| {
             apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
                 .err()
                 .as_ref()
-                .map(errstr)
+                .map(wire_error)
         });
         for (i, r) in guarded_idx.iter().zip(gres) {
             out[*i] = r;
@@ -2326,7 +2456,7 @@ impl FsOps {
             apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
                 .err()
                 .as_ref()
-                .map(errstr)
+                .map(wire_error)
         });
         for (i, r) in create_idx.iter().zip(cres) {
             out[*i] = r;
@@ -2335,7 +2465,7 @@ impl FsOps {
             apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
                 .err()
                 .as_ref()
-                .map(errstr)
+                .map(wire_error)
         });
         for (i, r) in meta_idx.iter().zip(mres) {
             out[*i] = r;
@@ -2382,6 +2512,13 @@ fn apply_one(
     } else {
         None
     };
+    #[cfg(debug_assertions)]
+    fail_apply_capacity_for_test(
+        registered_target
+            .as_ref()
+            .map_or_else(|| resolve(op_path(op)), |target| target.label.clone())
+            .as_path(),
+    )?;
     #[cfg(debug_assertions)]
     if matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. }) {
         fail_set_meta_for_test(
@@ -3380,6 +3517,17 @@ fn fail_set_meta_for_test(p: &Path) -> Result<()> {
     if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_SETMETA") {
         if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
             return Err(anyhow!("set metadata {}: injected failure", p.display()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn fail_apply_capacity_for_test(p: &Path) -> Result<()> {
+    if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_APPLY_ENOSPC") {
+        if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                .with_context(|| format!("apply {}: injected capacity failure", p.display()));
         }
     }
     Ok(())
@@ -4721,7 +4869,7 @@ impl FsOps {
         }
         let req = match self.map_request(req) {
             Ok(req) => req,
-            Err(error) => return Response::Err(errstr(&error)),
+            Err(error) => return Response::EndpointError(wire_error(&error)),
         };
         // HashAndHold's next request must consume the retained descriptor.
         // Any other request means the controller abandoned that comparison
@@ -4774,6 +4922,12 @@ impl FsOps {
             } => self
                 .anchor_destination(*expected_dev, *expected_ino, request_prefix)
                 .map(Response::DestinationRegistered),
+            Request::DestinationFilesystemInfo {
+                check_empty,
+                target,
+            } => self
+                .destination_filesystem_info(*check_empty, target.as_ref())
+                .map(Response::DestinationFilesystemInfo),
             Request::PartialPaths {
                 paths,
                 partial_id,
@@ -4889,7 +5043,8 @@ impl FsOps {
                             put.condition,
                         )
                         .err()
-                        .map(|error| errstr(&error))
+                        .as_ref()
+                        .map(wire_error)
                     })
                     .collect(),
             )),
@@ -5012,7 +5167,7 @@ impl FsOps {
         };
         match r {
             Ok(resp) => self.rebase_response(resp),
-            Err(e) => Response::Err(errstr(&e)),
+            Err(e) => Response::EndpointError(wire_error(&e)),
         }
     }
 }
@@ -5292,15 +5447,43 @@ fn preallocate(f: &File, size: u64) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        let r = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) };
-        if r == 0 {
-            return Ok(());
+        let fallocate_error = if let Some(raw) = test_fallocate_errno() {
+            Some(io::Error::from_raw_os_error(raw))
+        } else {
+            let length = libc::off_t::try_from(size).context("file is too large to preallocate")?;
+            let result = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, length) };
+            (result != 0).then(io::Error::last_os_error)
+        };
+        match fallocate_error {
+            None => return Ok(()),
+            Some(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL)
+                ) => {}
+            Some(error) => return Err(error).context("preallocate destination file"),
         }
         // Unsupported filesystem (tmpfs, some NFS): fall through to sparse.
     }
     // Portable fallback (also macOS): a sparse file of the right size.
     f.set_len(size)?;
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn test_fallocate_errno() -> Option<i32> {
+    let value = std::env::var_os("SYQ_TEST_FALLOCATE_ERRNO")?;
+    match value.to_string_lossy().as_ref() {
+        "unsupported" => Some(libc::EOPNOTSUPP),
+        "no_space" => Some(libc::ENOSPC),
+        "quota" => Some(libc::EDQUOT),
+        value => value.parse().ok(),
+    }
+}
+
+#[cfg(all(target_os = "linux", not(debug_assertions)))]
+fn test_fallocate_errno() -> Option<i32> {
+    None
 }
 
 fn timespec(sec: i64, nsec: u32) -> libc::timespec {
@@ -5821,7 +6004,8 @@ mod tests {
             None,
         );
         assert!(errs[0]
-            .as_deref()
+            .as_ref()
+            .map(WireError::as_str)
             .is_some_and(|e| e.contains("is now a directory")));
         assert!(
             dir.join("d/inside").is_dir(),
