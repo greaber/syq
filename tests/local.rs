@@ -5959,6 +5959,69 @@ fn native_rm_removes_named_tree_and_contents_keeps_root() {
 }
 
 #[test]
+fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    for name in ["explicit", "path"] {
+        write(&t.path(&format!("{name}/file")), b"remove");
+    }
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+
+    let run = |helper: &[&str], selected: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("rm")
+            .args(helper)
+            .args(["--from", "fake", "--cwd", &t.s(""), "--src", selected, "-q"])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+            )
+            .run()
+            .expect("run native remote removal");
+        assert_output_ok(&output);
+        assert!(!t.path(selected).exists());
+    };
+    run(&["--syq-path", env!("CARGO_BIN_EXE_syq")], "explicit");
+    run(&["--no-bootstrap"], "path");
+
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(log.contains(env!("CARGO_BIN_EXE_syq")), "{log}");
+    assert!(log.contains("syq --server"), "{log}");
+}
+
+#[test]
+fn native_rm_rejects_conflicting_or_local_remote_helper_selection() {
+    let t = Tmp::new();
+    write(&t.path("keep"), b"keep");
+    let conflict = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "rm",
+            "--from",
+            "fake",
+            "--syq-path",
+            "/opt/syq",
+            "--no-bootstrap",
+            "keep",
+        ])
+        .run()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(stderr_of(&conflict).contains("cannot be used with"));
+
+    let local = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rm", "--cwd", &t.s(""), "--syq-path", "/opt/syq", "keep"])
+        .run()
+        .unwrap();
+    assert_eq!(local.status.code(), Some(2));
+    assert!(stderr_of(&local).contains("only to a remote removal endpoint"));
+    assert_eq!(read(&t.path("keep")), b"keep");
+}
+
+#[test]
 fn native_rm_contents_requires_a_directory() {
     let t = Tmp::new();
     write(&t.path("file"), b"keep");
