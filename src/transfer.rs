@@ -1159,7 +1159,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         args.connections = if src_ep.is_remote() || dst_ep.is_remote() {
             tune::START_SSH
         } else {
-            tune::START_LOCAL
+            tune::start_local()
         };
     }
     #[cfg(not(target_os = "linux"))]

@@ -190,8 +190,9 @@ pub struct Args {
 
     /// Parallel connections/workers. Default for copies: auto-tuned — starts at
     /// the last settled count remembered for this host path and transport, or 16
-    /// over TCP, 8 over ssh, or 32 when local. It probes from 1 to 64 while the
-    /// copy has enough work to measure. Give a number to fix it.
+    /// over TCP, 8 over ssh, or 16 when local with at most two available CPUs
+    /// (otherwise 32). It probes from 1 to 64 while the copy has enough work to
+    /// measure. Give a number to fix it.
     #[arg(long = "syq-connections", value_name = "N")]
     pub connections_opt: Option<usize>,
     #[arg(skip)]

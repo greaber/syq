@@ -103,6 +103,14 @@ fn run_ok(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn expected_local_start() -> usize {
+    if std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() <= 2) {
+        16
+    } else {
+        32
+    }
+}
+
 /// Parse "syq: transferred N files" from the summary line.
 fn transferred(stdout: &str) -> u64 {
     let line = stdout
@@ -3672,7 +3680,10 @@ fn dry_run_reports_typed_preflight_summary() {
         "{out}"
     );
     assert!(
-        out.contains("route: local filesystem; 32 initial workers (auto-tuned)"),
+        out.contains(&format!(
+            "route: local filesystem; {} initial workers (auto-tuned)",
+            expected_local_start()
+        )),
         "{out}"
     );
     assert!(t.path("dst/extra").exists());
@@ -7209,10 +7220,13 @@ fn stats_report_connection_tuning_mode() {
         std::fs::write(t.path(&format!("src/f{i}")), vec![b'x'; 1000]).unwrap();
     }
     // Without -j the count is auto-tuned; a short local copy never leaves the
-    // local starting count of 32.
+    // CPU-sensitive local starting count.
     let out = run_ok(&["-a", "--stats", &t.s("src/"), &t.s("auto/")]);
     assert!(
-        out.contains("connections: auto: settled at 32 (path 32, peak 32)"),
+        out.contains(&format!(
+            "connections: auto: settled at {0} (path {0}, peak {0})",
+            expected_local_start()
+        )),
         "{out}"
     );
     // An explicit -j is used as given, with no tuning.
