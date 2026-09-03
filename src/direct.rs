@@ -244,40 +244,44 @@ fn store_receipt_line(captured: &mut Option<CapturedReceiptV2>, payload: Vec<u8>
 /// Verify hostB's receipt against the grant this machine signed. A missing,
 /// unverifiable, or mismatching receipt fails the transfer regardless of
 /// what the source-side orchestrator reported.
+/// The context a captured receipt settles against.
+struct ReceiptSettlement<'a> {
+    src_host: &'a str,
+    dst_host: &'a str,
+    orchestrator_exit_code: i32,
+    results: Option<&'a crate::results::ResultsWriter>,
+    elapsed_ms: u64,
+    verbose: bool,
+}
+
 fn settle_receipt(
     expectation: &ReceiptExpectation,
     captured: Option<&mut CapturedReceiptV2>,
-    src_host: &str,
-    dst_host: &str,
-    orchestrator_exit_code: i32,
-    emit_results: bool,
-    verbose: bool,
+    settlement: ReceiptSettlement<'_>,
 ) -> Result<()> {
     let Some(captured) = captured else {
         bail!(
-            "the command-restricted receiver on {dst_host} issued no receipt through {src_host}; what landed cannot be verified"
+            "the command-restricted receiver on {} issued no receipt through {}; what landed cannot be verified",
+            settlement.dst_host,
+            settlement.src_host
         );
     };
-    settle_receipt_v2(
-        expectation,
-        captured,
-        src_host,
-        dst_host,
-        orchestrator_exit_code,
-        emit_results,
-        verbose,
-    )
+    settle_receipt_v2(expectation, captured, settlement)
 }
 
 fn settle_receipt_v2(
     expectation: &ReceiptExpectation,
     captured: &mut CapturedReceiptV2,
-    src_host: &str,
-    dst_host: &str,
-    orchestrator_exit_code: i32,
-    emit_results: bool,
-    verbose: bool,
+    settlement: ReceiptSettlement<'_>,
 ) -> Result<()> {
+    let ReceiptSettlement {
+        src_host,
+        dst_host,
+        orchestrator_exit_code,
+        results,
+        elapsed_ms,
+        verbose,
+    } = settlement;
     if !captured.ended {
         bail!("the receipt relayed through {src_host} has no terminal frame");
     }
@@ -388,12 +392,13 @@ fn settle_receipt_v2(
         None
     };
     debug_assert_eq!(outcome.rejects_receipt, settlement_error.is_some());
-    if emit_results {
-        crate::receipt_v2::write_automation_results(
+    if let Some(writer) = results {
+        crate::receipt_v2::emit_automation_records(
             &mut receipt,
-            &mut std::io::stdout().lock(),
+            writer,
             outcome.results_status,
             outcome.exit_code,
+            elapsed_ms,
         )
         .context("write receiver-attested --results stream")?;
     }
@@ -654,14 +659,24 @@ fn detached_launcher_command(
     )
 }
 
-pub fn run(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
+pub fn run(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+) -> Result<i32> {
     if args.interface == Interface::Rsync {
         bail!("syq rsync does not support remote-to-remote transfers");
     }
-    run_remote(args, srcs, dst, false)
+    run_remote(args, srcs, dst, false, results)
 }
 
-pub fn run_at_target(args: &Args, srcs: &[Location], dst: &Location) -> Result<i32> {
+pub fn run_at_target(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+) -> Result<i32> {
     if args.interface == Interface::Rsync {
         bail!("--run-at target is available only through native copy syntax");
     }
@@ -675,7 +690,7 @@ pub fn run_at_target(args: &Args, srcs: &[Location], dst: &Location) -> Result<i
             "--run-at target requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with target-host credentials, or an explicit --rsh policy"
         );
     }
-    run_remote(args, srcs, dst, true)
+    run_remote(args, srcs, dst, true, results)
 }
 
 fn run_remote(
@@ -683,16 +698,9 @@ fn run_remote(
     srcs: &[Location],
     dst: &Location,
     coordinator_at_target: bool,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
 ) -> Result<i32> {
-    match args.native_results.as_deref() {
-        Some(b"-") if args.detach => bail!(
-            "--results cannot be used with --detach because the remote result stream would not remain attached"
-        ),
-        Some(b"-") | None => {}
-        Some(_) => bail!(
-            "a remote transfer coordinator accepts only --results -; use --run-at local to create a named results file"
-        ),
-    }
+    let started = std::time::Instant::now();
     let rsh = parse_rsh(&args.rsh)?;
     let coordinator = if coordinator_at_target { dst } else { &srcs[0] };
     let peer = if coordinator_at_target { &srcs[0] } else { dst };
@@ -884,12 +892,14 @@ fn run_remote(
     if let Some(n) = args.max_delete {
         remote.push(format!("--max-delete={n}"));
     }
-    if args.native_results.is_some() && receipt_expectation.is_none() {
-        // run_remote accepts only stdout above. The outer SSH process inherits
-        // stdout, so the NDJSON stream and its terminal record reach the
-        // original caller without assigning surprising remote path semantics.
-        remote.push("--results".into());
-        remote.push("-".into());
+    if results.is_some() && receipt_expectation.is_none() {
+        // Without a command-restricted receiver there is no verified
+        // channel to carry per-operation records home from a remote
+        // coordinator; the wrapper turns this into a failed terminal
+        // record, so the stream still settles.
+        bail!(
+            "--results with a direct remote-to-remote copy needs a command-restricted receiver enrollment (its verified receipt is the stream) or --run-at local to route the transfer through this machine"
+        );
     }
     if args.no_bootstrap {
         remote.push("--no-bootstrap".into());
@@ -1153,11 +1163,14 @@ fn run_remote(
         settle_receipt(
             expectation,
             receipt_payload.as_mut(),
-            &coordinator_host,
-            peer.host.as_deref().unwrap_or("the peer endpoint"),
-            code,
-            args.native_results.is_some(),
-            args.verbose > 0,
+            ReceiptSettlement {
+                src_host: &coordinator_host,
+                dst_host: peer.host.as_deref().unwrap_or("the peer endpoint"),
+                orchestrator_exit_code: code,
+                results: results.as_deref(),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                verbose: args.verbose > 0,
+            },
         )?;
     }
     Ok(code)

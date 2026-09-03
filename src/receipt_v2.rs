@@ -724,45 +724,19 @@ impl VerifiedReceiptV2 {
 /// stream. These records deliberately identify their provenance: unlike the
 /// coordinator's ordinary `--results`, every fact here came from the signed
 /// receipt. Scope-relative paths are not expanded into ambient hostB paths.
-pub(crate) fn write_automation_results(
+/// Emit the receiver-attested automation records into the run's results
+/// stream: one v1-vocabulary `operation_result` per receipt operation, an
+/// `error` record per refusal, a `final_state` record per closure-time
+/// observation, and the sealed terminal `result`. Every attested record
+/// carries `provenance: "receiver_attested"`.
+pub(crate) fn emit_automation_records(
     receipt: &mut VerifiedReceiptV2,
-    out: &mut dyn Write,
+    writer: &crate::results::ResultsWriter,
     results_status: &'static str,
     exit_code: i32,
+    elapsed_ms: u64,
 ) -> Result<()> {
-    fn write_record(
-        out: &mut dyn Write,
-        seq: &mut u64,
-        mut value: serde_json::Value,
-    ) -> Result<()> {
-        let object = value
-            .as_object_mut()
-            .expect("automation record is an object");
-        object.insert("schema".into(), crate::results::SCHEMA.into());
-        object.insert(
-            "schema_version".into(),
-            crate::results::SCHEMA_VERSION.into(),
-        );
-        object.insert("seq".into(), (*seq).into());
-        *seq += 1;
-        serde_json::to_writer(&mut *out, &value)?;
-        out.write_all(b"\n")?;
-        Ok(())
-    }
-
-    let mut seq = 0;
-    write_record(
-        out,
-        &mut seq,
-        serde_json::json!({
-            "type": "run",
-            "syq_version": env!("CARGO_PKG_VERSION"),
-            "mode": "cp",
-            "mapping": false,
-            "provenance": "receiver_attested",
-        }),
-    )?;
-    let mut directories_ensured = 0u64;
+    let mut directories_created = 0u64;
     let mut symlinks_created = 0u64;
     let mut specials_created = 0u64;
     receipt.for_each_record(|record| {
@@ -770,44 +744,48 @@ pub(crate) fn write_automation_results(
             RecordV2::Operation(record) => {
                 let (action, kind, bytes) = match record.action {
                     OperationActionV2::PublishFile { size, .. } => {
-                        ("transfer_file", "file", Some(size))
+                        ("transfer_file", Some("file"), Some(size))
                     }
                     OperationActionV2::EnsureDirectory => {
                         if record.disposition == OperationDispositionV2::Applied {
-                            directories_ensured += 1;
+                            directories_created += 1;
                         }
-                        ("create_directory", "directory", None)
+                        ("create_directory", Some("dir"), None)
                     }
                     OperationActionV2::CreateSymlink => {
                         if record.disposition == OperationDispositionV2::Applied {
                             symlinks_created += 1;
                         }
-                        ("create_symlink", "symlink", None)
+                        ("create_symlink", Some("symlink"), None)
                     }
                     OperationActionV2::CreateSpecial { .. } => {
                         if record.disposition == OperationDispositionV2::Applied {
                             specials_created += 1;
                         }
-                        ("create_special", "special", None)
+                        ("create_special", Some("special"), None)
                     }
-                    OperationActionV2::SetMetadata { .. } => ("set_metadata", "object", None),
-                    OperationActionV2::DeleteFile => ("delete_file", "object", None),
-                    OperationActionV2::DeleteDirectory => ("delete_directory", "directory", None),
-                    OperationActionV2::ObserveFileHash => ("observe_hash", "file", None),
+                    OperationActionV2::SetMetadata { .. } => ("set_metadata", None, None),
+                    OperationActionV2::DeleteFile => ("delete", Some("file"), None),
+                    OperationActionV2::DeleteDirectory => ("delete", Some("dir"), None),
+                    OperationActionV2::ObserveFileHash => ("observe_hash", Some("file"), None),
                 };
                 let mut value = serde_json::json!({
                     "type": "operation_result",
                     "provenance": "receiver_attested",
                     "action": action,
-                    "kind": kind,
                     "scope": record.scope,
                     "dst": tagged_path(&record.path),
                     "disposition": disposition_name(record.disposition),
-                    "code": outcome_name(record.code),
                 });
                 let object = value
                     .as_object_mut()
                     .expect("operation record is an object");
+                if let Some(kind) = kind {
+                    object.insert("kind".into(), kind.into());
+                }
+                if record.code != OutcomeCodeV2::None {
+                    object.insert("code".into(), outcome_name(record.code).into());
+                }
                 if let Some(bytes) = bytes {
                     object.insert("bytes".into(), bytes.into());
                 }
@@ -819,6 +797,8 @@ pub(crate) fn write_automation_results(
             RecordV2::Refusal(record) => serde_json::json!({
                 "type": "error",
                 "provenance": "receiver_attested",
+                // The receiver's guard deliberately refused the request.
+                "class": "safety_limit",
                 "code": outcome_name(record.code),
                 "message": record.diagnostic,
             }),
@@ -871,7 +851,7 @@ pub(crate) fn write_automation_results(
                     }
                 };
                 serde_json::json!({
-                    "type": "receiver_final_state",
+                    "type": "final_state",
                     "provenance": "receiver_attested",
                     "scope": record.scope,
                     "dst": tagged_path(&record.path),
@@ -879,7 +859,8 @@ pub(crate) fn write_automation_results(
                 })
             }
         };
-        write_record(out, &mut seq, value)
+        writer.emit_value(value);
+        Ok(())
     })?;
 
     let terminal = &receipt.terminal;
@@ -889,28 +870,30 @@ pub(crate) fn write_automation_results(
         .saturating_add(terminal.summary.incomplete)
         .saturating_add(terminal.summary.refusals)
         .saturating_add(terminal.summary.observation_failures);
-    write_record(
-        out,
-        &mut seq,
-        serde_json::json!({
-            "type": "result",
-            "provenance": "receiver_attested",
-            "status": results_status,
-            "receipt_status": receipt_status_name(terminal.status),
-            "exit_code": exit_code,
-            "files_transferred": terminal.summary.published_files,
-            "directories_ensured": directories_ensured,
-            "symlinks_created": symlinks_created,
-            "specials_created": specials_created,
-            "errors": errors,
-            "bytes_transferred": terminal.summary.transferred_bytes,
-            "operations": terminal.summary.operations,
-            "final_states": terminal.summary.final_states,
-            "deletions": terminal.summary.deletions,
-            "receipt_records": terminal.record_count,
-        }),
-    )?;
-    out.flush()?;
+    // Aggregates describe receiver-visible work only: unchanged and
+    // excluded entries are orchestrator concepts a receipt cannot attest.
+    writer.emit_terminal_value(serde_json::json!({
+        "type": "result",
+        "provenance": "receiver_attested",
+        "status": results_status,
+        "receipt_status": receipt_status_name(terminal.status),
+        "exit_code": exit_code,
+        "dry_run": false,
+        "files_transferred": terminal.summary.published_files,
+        "files_unchanged": 0,
+        "files_excluded": 0,
+        "directories_created": directories_created,
+        "symlinks_created": symlinks_created,
+        "specials_created": specials_created,
+        "errors": errors,
+        "bytes_transferred": terminal.summary.transferred_bytes,
+        "bytes_unchanged": 0,
+        "elapsed_ms": elapsed_ms,
+        "deletions_completed": terminal.summary.deletions,
+        "operations": terminal.summary.operations,
+        "final_states": terminal.summary.final_states,
+        "receipt_records": terminal.record_count,
+    }));
     Ok(())
 }
 
@@ -963,7 +946,7 @@ fn receipt_status_name(status: ReceiptStatusV2) -> &'static str {
 
 fn kind_name(kind: Kind) -> &'static str {
     match kind {
-        Kind::Dir => "directory",
+        Kind::Dir => "dir",
         Kind::File => "file",
         Kind::Symlink => "symlink",
         Kind::Fifo => "fifo",
@@ -1515,24 +1498,51 @@ mod tests {
             .unwrap();
         assert_eq!(records.len(), 2);
 
-        let mut automation = Vec::new();
-        write_automation_results(&mut verified, &mut automation, "refused", 25).unwrap();
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = crate::results::ResultsWriter::new(Box::new(sink.clone()));
+        emit_automation_records(&mut verified, &writer, "refused", 25, 7).unwrap();
+        let automation = sink.0.lock().unwrap().clone();
         let records: Vec<serde_json::Value> = String::from_utf8(automation)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        // The records ride the shared envelope with contiguous sequencing
+        // and validate against the committed automation schema.
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schemas/automation-v1.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["seq"], index as u64);
+            assert_eq!(record["schema"], "syq.automation");
+            if let Err(error) = validator.validate(record) {
+                panic!("line {}: {error}: {record}", index + 1);
+            }
+        }
+        assert_eq!(records[0]["type"], "operation_result");
         assert_eq!(records[0]["provenance"], "receiver_attested");
-        assert_eq!(records[1]["type"], "operation_result");
-        assert_eq!(records[2]["type"], "receiver_final_state");
+        assert_eq!(records[1]["type"], "final_state");
         assert_eq!(
-            records[2]["object"]["digest"]["value"],
+            records[1]["object"]["digest"]["value"],
             "0909090909090909090909090909090909090909090909090909090909090909"
         );
         let result = records.last().unwrap();
+        assert_eq!(result["type"], "result");
         assert_eq!(result["status"], "refused");
         assert_eq!(result["receipt_status"], "clean");
         assert_eq!(result["exit_code"], 25);
+        assert_eq!(result["elapsed_ms"], 7);
 
         let mut missing = frames;
         missing.remove(1);

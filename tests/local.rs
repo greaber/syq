@@ -10546,45 +10546,55 @@ fn native_cp_results_fd_refusals() {
 }
 
 #[test]
-fn native_results_require_a_local_coordinator() {
+fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src"), b"local results");
-    // Every placement except an explicit --run-at local is refused: the
-    // local (relay) topology is never chosen implicitly on the stream's
-    // behalf, auto included.
-    for run_at in [
-        &["--run-at", "target"][..],
-        &["--run-at", "source"][..],
-        &[][..],
-    ] {
-        for flag in [
-            &["--results", "r-remote.ndjson"][..],
-            &["--results-fd", "3"][..],
-        ] {
-            let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-                .args(["cp", "--rsh"])
-                .arg(&rsh)
-                .args(["--from", "hostA", "--src", &t.s("src")])
-                .args(["--to", "hostB"])
-                .args(run_at)
-                .args(["--as", &t.s("dst-remote")])
-                .args(flag)
-                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-                .env("FAKE_RSH_LOG", t.path("rsh.log"))
-                .run()
-                .expect("reject results with a remote coordinator");
-            // Usage lane: exit 2, no stream ever existed.
-            assert_eq!(out.status.code(), Some(2));
-            let stderr = stderr_of(&out);
-            assert!(stderr.contains("--run-at local"), "{stderr}");
-            assert!(!t.path("dst-remote").exists());
-            assert!(!t.path("r-remote.ndjson").exists());
-        }
-    }
+    // Without a command-restricted receiver there is no verified channel to
+    // carry records home from a remote coordinator: the run fails, but the
+    // stream still settles with a failed terminal record.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+        ])
+        .args([
+            "--to",
+            "hostB",
+            "--run-at",
+            "target",
+            "--as",
+            &t.s("dst-remote"),
+        ])
+        .args(["--results", "r-remote.ndjson"])
+        .current_dir(t.path(""))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("refuse results without a receiver");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("command-restricted receiver"), "{stderr}");
+    assert!(stderr.contains("--run-at local"), "{stderr}");
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r-remote.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.first().unwrap()["type"], "run");
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "failed");
 }
-
 #[test]
 fn native_remote_to_remote_carries_any_path_bytes_directly() {
     use std::os::unix::ffi::OsStrExt;

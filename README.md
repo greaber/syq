@@ -359,10 +359,10 @@ the file fresh (an existing file is refused — one file, one run), and
 by the transfer coordinator, so both forms require it to be local; a
 remote-to-remote copy is refused unless `--run-at local` is passed
 explicitly — routing through this machine is never chosen implicitly
-on the stream's behalf. (Receiver-attested streams for restricted
-direct copies, derived locally from the verified receipt, exist in the
-engine and return once wired to these targets.) Both forms are
-rejected with `--detach`. Choose a results path outside the source and
+on the stream's behalf — or through a command-restricted receiver
+enrollment, whose verified receipt becomes a receiver-attested stream
+written locally while data flows directly between the remotes. Both
+forms are rejected with `--detach`. Choose a results path outside the source and
 destination trees; one inside them can make the run's own accounting
 unpredictable. `--mapping` cannot be combined with `--prune` because
 mapping manifests define no deletion region; `--results` covers

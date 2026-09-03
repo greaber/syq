@@ -1094,9 +1094,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_SSH;
         }
         if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
-            return crate::direct::run_at_target(&args, srcs, dst);
+            return crate::direct::run_at_target(
+                &args,
+                srcs,
+                dst,
+                progress.results_writer().cloned(),
+            );
         }
-        return crate::direct::run(&args, srcs, dst);
+        return crate::direct::run(&args, srcs, dst, progress.results_writer().cloned());
     }
     if srcs[0].is_remote() && dst.is_remote() {
         if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
