@@ -258,6 +258,28 @@ fn interface_option<'a>(args: &Args, native: &'a str, rsync: &'a str) -> &'a str
     }
 }
 
+fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
+    if spec.auto_helper {
+        if *spec.helper_install.lock().unwrap() {
+            "managed; installed now"
+        } else {
+            "managed helper cache"
+        }
+    } else if spec.restricted_grant.is_some() {
+        "restricted grant"
+    } else if spec.syq_path.is_some() {
+        match interface {
+            Interface::Rsync => "--rsync-path",
+            _ => "--syq-path",
+        }
+    } else {
+        match interface {
+            Interface::Rsync => "remote PATH (--syq-no-bootstrap)",
+            _ => "remote PATH (--no-bootstrap)",
+        }
+    }
+}
+
 fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
     let diagnostics = spec.diagnostics();
     eprintln!("syq: {}:", spec.label());
@@ -267,21 +289,7 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
             spec.remote_shell_name(),
             peer.platform
         );
-        let helper_mode = if spec.auto_helper {
-            if *spec.helper_install.lock().unwrap() {
-                "managed; installed now"
-            } else {
-                "managed helper cache"
-            }
-        } else if spec.syq_path.is_some() {
-            interface_option(args, "--syq-path", "--rsync-path")
-        } else {
-            interface_option(
-                args,
-                "remote PATH (--no-bootstrap)",
-                "remote PATH (--syq-no-bootstrap)",
-            )
-        };
+        let helper_mode = remote_helper_mode(spec, args.interface);
         eprintln!("  helper: {} ({helper_mode})", peer.identity);
     }
 
@@ -693,10 +701,29 @@ fn copy_identity(
     dst_canonical: Option<std::path::PathBuf>,
     opts: &Opts,
 ) -> Result<String> {
+    // Relative native bases and selectors get their meaning from the source
+    // endpoint's process cwd. Identify that already-held cwd separately;
+    // never canonicalize the registered selection after it has been pinned.
+    let native_endpoint_cwd = (args.interface == Interface::NativeCp)
+        .then(|| {
+            canonical_path(src_ctl, b".", srcs[0].is_remote()).map(|path| path_identity(&path))
+        })
+        .transpose()?;
     let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
     for source in srcs {
-        let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
-        src_roots.push((path_identity(&path), source.copies_contents()));
+        let identity = if args.interface == Interface::NativeCp {
+            native_source_identity(
+                args,
+                source,
+                native_endpoint_cwd
+                    .as_deref()
+                    .expect("native endpoint cwd was identified"),
+            )
+        } else {
+            let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
+            path_identity(&path)
+        };
+        src_roots.push((identity, source.copies_contents()));
     }
     let dst_root = match dst_canonical {
         Some(path) => path,
@@ -710,6 +737,32 @@ fn copy_identity(
         &dst_root,
         &semantic_flags(opts, args, srcs),
     ))
+}
+
+/// Native source authority is the pinned endpoint-side base plus the raw
+/// operator selector. Do not canonicalize the selector again after source
+/// registration: doing so could observe a different namespace identity from
+/// the descriptor-backed one the transfer actually uses.
+fn native_source_identity(args: &Args, source: &Location, endpoint_cwd: &str) -> String {
+    let (base_kind, base) = if let Some(path) = args.native_source_root.as_deref() {
+        ("root", Some(path))
+    } else if let Some(path) = args.native_source_cwd.as_deref() {
+        ("cwd", Some(path))
+    } else {
+        ("endpoint-cwd", None)
+    };
+    serde_json::json!({
+        "native_source_identity": 1,
+        "endpoint_cwd": endpoint_cwd,
+        "base_kind": base_kind,
+        "base": base.map(path_bytes_identity),
+        "selector": path_bytes_identity(&source.path),
+    })
+    .to_string()
+}
+
+fn path_bytes_identity(path: &[u8]) -> String {
+    path_identity(std::path::Path::new(OsStr::from_bytes(path)))
 }
 
 #[derive(Clone, Debug)]
@@ -3004,6 +3057,17 @@ fn register_source_roots(
     shared_workers: usize,
     independent_claim_workers: usize,
 ) -> Result<Vec<RegisteredSourceRoot>> {
+    let base = if let Some(path) = &args.native_source_root {
+        SourceRootBase {
+            path: Some(path.clone()),
+            confined: true,
+        }
+    } else {
+        SourceRootBase {
+            path: args.native_source_cwd.clone(),
+            confined: false,
+        }
+    };
     let selections = sources
         .iter()
         .map(|source| SourceRootSelection {
@@ -3017,6 +3081,7 @@ fn register_source_roots(
         .collect();
     match ok(
         conn.call(Request::RegisterSourceRoots {
+            base,
             selections,
             symlink_policy: source_operator_symlink_policy(args),
             allow_unconfined_paths: args.interface == Interface::Rsync && args.insecure_links,
@@ -7642,6 +7707,17 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restricted_remote_diagnostics_name_the_grant_helper() {
+        let mut spec = RemoteSpec::local_receiver(false);
+        spec.restricted_grant = Some("signed-grant".into());
+
+        assert_eq!(
+            remote_helper_mode(&spec, Interface::NativeCp),
+            "restricted grant"
+        );
+    }
 
     #[test]
     fn endpoint_semantic_error_kind_wins_over_numeric_errno() {

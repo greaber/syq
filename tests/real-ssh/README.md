@@ -68,9 +68,3 @@ This suite is intentionally outside `cargo test` and CI. Run it after changing
 SSH, remote-helper, enrollment, restricted-receiver, transport, or remote
 topology behavior, and before cutting a release. A failure retains public logs
 under `target/real-ssh.*`; the ephemeral private key is always removed.
-
-## Known findings from bringing up the suite
-
-- The first signed TCP worker can currently receive a connection reset and
-  recover on its built-in retry. The suite requires final success and leaves
-  this diagnostic visible rather than treating the recovered run as clean.

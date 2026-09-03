@@ -7,7 +7,7 @@ use crate::descriptor_broker::{
 use crate::proto::*;
 use crate::rooted::{
     read_open_symlink, root_metadata_from_std, OperatorFinalComponent, OperatorResolver,
-    PinnedPath, RelativePath, Root, RootIdentity, RootMetadata, OPERATOR_SYMLINK_FOLLOW_ADVICE,
+    PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -602,42 +602,6 @@ pub(crate) fn create_operator_file(
     }
 }
 
-/// Check the current spelling of an operator-supplied local path without
-/// traversing a symlink. Source walkers that have not yet moved to retained
-/// descriptors use this only as semantic preflight.
-pub(crate) fn check_operator_path_no_symlinks(
-    path: &[u8],
-    allow_final_symlink: bool,
-    allow_missing_final: bool,
-) -> Result<()> {
-    match resolve_operator_entry(
-        path,
-        OperatorSymlinkPolicy::Refuse,
-        allow_missing_final,
-        false,
-        false,
-    )?
-    .1
-    {
-        PinnedPath::Directory(_) => Ok(()),
-        PinnedPath::Leaf(leaf) if !leaf.metadata().is_symlink() || allow_final_symlink => Ok(()),
-        PinnedPath::Leaf(_) => bail!(
-            "operator path encounters a last-component symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}"
-        ),
-        PinnedPath::Missing(missing) => {
-            let (_, components) = missing.into_parts();
-            if components.len() == 1 {
-                Ok(())
-            } else {
-                Err(io::Error::from_raw_os_error(libc::ENOENT).into())
-            }
-        }
-        PinnedPath::OpenFile(_) => {
-            unreachable!("semantic preflight never opens a procfs input")
-        }
-    }
-}
-
 fn operator_directory_flags() -> libc::c_int {
     #[cfg(target_os = "linux")]
     {
@@ -1207,13 +1171,6 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-fn process_initial_cwd() -> PathBuf {
-    static INITIAL_CWD: OnceLock<PathBuf> = OnceLock::new();
-    INITIAL_CWD
-        .get_or_init(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .clone()
-}
-
 fn source_descriptor_requirement(
     current_open: usize,
     root_count: usize,
@@ -1328,7 +1285,6 @@ pub struct FsOps {
     allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
-    initial_cwd: PathBuf,
 }
 
 struct HeldBasis {
@@ -1482,7 +1438,6 @@ impl FsOps {
             allow_unconfined_source_paths: false,
             destination_root: None,
             destination_prefix: None,
-            initial_cwd: process_initial_cwd(),
         }
     }
 
@@ -1597,6 +1552,7 @@ impl FsOps {
     /// leaf's opened parent plus its literal name.
     fn register_source_roots(
         &mut self,
+        base: &SourceRootBase,
         selections: &[SourceRootSelection],
         symlink_policy: OperatorSymlinkPolicy,
         allow_unconfined_paths: bool,
@@ -1615,26 +1571,83 @@ impl FsOps {
                 selections.len()
             );
         }
+        base.validate()?;
         require_source_descriptor_capacity(selections.len(), shared_workers, independent_workers)?;
-        let mut resolved = Vec::with_capacity(selections.len());
-        for selection in selections {
-            let path = resolve(&selection.path);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                self.initial_cwd.join(path)
-            };
-            let mut hops = Vec::new();
-            let pinned = OperatorResolver::resolve_process(
-                path.as_os_str().as_bytes(),
+        let paths = selections
+            .iter()
+            .map(|selection| {
+                if selection.path.is_empty() {
+                    bail!("source selectors may not be empty");
+                }
+                if selection.path.contains(&0) {
+                    bail!("source selector contains NUL");
+                }
+                Ok(resolve(&selection.path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let needs_base = base.confined || paths.iter().any(|path| !path.is_absolute());
+        let relative_resolver = if needs_base {
+            let base_path = resolve(base.path.as_deref().unwrap_or(b"."));
+            let mut base_hops = Vec::new();
+            let base_directory = match OperatorResolver::resolve_process(
+                base_path.as_os_str().as_bytes(),
                 symlink_policy,
-                OperatorFinalComponent::Entry {
-                    follow_symlink: selection.follow_root,
-                },
+                OperatorFinalComponent::Directory,
                 false,
-                &mut hops,
+                &mut base_hops,
             )
-            .with_context(|| format!("resolve source selection {}", path.display()))?;
+            .with_context(|| format!("resolve source base {}", base_path.display()))?
+            {
+                PinnedPath::Directory(directory) => directory.into_parts().0,
+                PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
+                    bail!("source base {} is not a directory", base_path.display())
+                }
+                PinnedPath::Missing(_) => {
+                    unreachable!("source base resolution requires an existing directory")
+                }
+            };
+            Some(OperatorResolver::beneath(
+                &base_directory,
+                base.confined,
+                symlink_policy,
+            )?)
+        } else {
+            None
+        };
+        let mut resolved = Vec::with_capacity(selections.len());
+        for (selection, path) in selections.iter().zip(paths) {
+            let mut hops = Vec::new();
+            let pinned = if path.is_absolute() {
+                if base.confined {
+                    bail!(
+                        "source selector {} beneath --root must be relative",
+                        path.display()
+                    );
+                }
+                OperatorResolver::resolve_process(
+                    path.as_os_str().as_bytes(),
+                    symlink_policy,
+                    OperatorFinalComponent::Entry {
+                        follow_symlink: selection.follow_root,
+                    },
+                    false,
+                    &mut hops,
+                )
+            } else {
+                relative_resolver
+                    .as_ref()
+                    .expect("relative source selection requires a pinned base")
+                    .resolve(
+                        path.as_os_str().as_bytes(),
+                        OperatorFinalComponent::Entry {
+                            follow_symlink: selection.follow_root,
+                        },
+                        false,
+                        &mut hops,
+                    )
+            };
+            let pinned =
+                pinned.with_context(|| format!("resolve source selection {}", path.display()))?;
             match pinned {
                 PinnedPath::Directory(directory) => {
                     let (directory, _) = directory.into_parts();
@@ -5398,6 +5411,7 @@ impl FsOps {
                 .check_operator_directory_ancestry(checks)
                 .map(Response::DirectoryRelations),
             Request::RegisterSourceRoots {
+                base,
                 selections,
                 symlink_policy,
                 allow_unconfined_paths,
@@ -5405,6 +5419,7 @@ impl FsOps {
                 independent_claim_workers,
             } => self
                 .register_source_roots(
+                    base,
                     selections,
                     *symlink_policy,
                     *allow_unconfined_paths,
@@ -6229,6 +6244,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session.clone());
         let response = control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: selections
                 .iter()
                 .map(|path| SourceRootSelection {
@@ -7962,6 +7978,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session.clone());
         let response = control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![SourceRootSelection {
                 path: selected.as_os_str().as_bytes().to_vec(),
                 follow_root: false,
@@ -8030,6 +8047,7 @@ mod tests {
         let source_session = DescriptorSessionSlot::default();
         let mut source_control = FsOps::with_descriptor_session(source_session);
         let response = source_control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![SourceRootSelection {
                 path: source.as_os_str().as_bytes().to_vec(),
                 follow_root: false,
@@ -8079,6 +8097,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session.clone());
         let response = control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![
                 SourceRootSelection {
                     path: first.as_os_str().as_bytes().to_vec(),
@@ -8133,6 +8152,7 @@ mod tests {
         fs::write(&second, b"second").unwrap();
         let register = |control: &mut FsOps, path: &Path| {
             let response = control.handle(&Request::RegisterSourceRoots {
+                base: SourceRootBase::default(),
                 selections: vec![SourceRootSelection {
                     path: path.as_os_str().as_bytes().to_vec(),
                     follow_root: false,
@@ -8205,6 +8225,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session.clone());
         let response = control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![SourceRootSelection {
                 path: selected.as_os_str().as_bytes().to_vec(),
                 follow_root: false,
@@ -8259,6 +8280,7 @@ mod tests {
         fs::write(&second, b"second").unwrap();
         let mut control = FsOps::new();
         let register = |path: &Path| Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![SourceRootSelection {
                 path: path.as_os_str().as_bytes().to_vec(),
                 follow_root: false,
@@ -8311,6 +8333,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session.clone());
         let response = control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![SourceRootSelection {
                 path: selected.as_os_str().as_bytes().to_vec(),
                 follow_root: false,
@@ -8396,6 +8419,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session);
         let response = control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![SourceRootSelection {
                 path: selected.as_os_str().as_bytes().to_vec(),
                 follow_root: false,
@@ -8450,6 +8474,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session);
         let response = control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![SourceRootSelection {
                 path: selected.as_os_str().as_bytes().to_vec(),
                 follow_root: false,
@@ -8521,6 +8546,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session.clone());
         let response = control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![SourceRootSelection {
                 path: selected.as_os_str().as_bytes().to_vec(),
                 follow_root: false,
@@ -8913,6 +8939,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session.clone());
         let response = control.handle(&Request::RegisterSourceRoots {
+            base: SourceRootBase::default(),
             selections: vec![SourceRootSelection {
                 path: selected.as_os_str().as_bytes().to_vec(),
                 follow_root: false,

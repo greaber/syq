@@ -1406,7 +1406,7 @@ fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
             path.display()
         );
     }
-    let mode = metadata.permissions().mode() & 0o7777;
+    let mode = metadata.permissions().mode() & 0o777;
     if mode != 0o700 {
         bail!(
             "private directory {} must have mode 0700 (found {:04o})",
@@ -3216,6 +3216,18 @@ mod tests {
         let link = directory.join("state-link");
         std::os::unix::fs::symlink(&private, &link).expect("create state symlink");
         assert!(ReplayStore::open(&link).is_err());
+    }
+
+    #[test]
+    fn replay_store_accepts_a_setgid_private_directory() {
+        let directory = TestDir::new("setgid-private");
+        let state = directory.join("state");
+        provision_test_replay_directory(&state);
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o2700))
+            .expect("set setgid on private state directory");
+        assert_eq!(fs::metadata(&state).unwrap().mode() & 0o2000, 0o2000);
+
+        ReplayStore::open(&state).expect("setgid does not grant another principal access");
     }
 
     #[test]

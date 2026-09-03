@@ -30,6 +30,7 @@ from .client import (
     _append_remote_arguments,
     _argument,
     _copy_arguments,
+    _map_stream_cwd,
     _mapping_line,
     _prepare_results_file,
     _results_pipe,
@@ -590,6 +591,7 @@ class AsyncClient:
         src_dir: Selector | None = None,
         from_: str | None = None,
         cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
         follow: bool = False,
         follow_src: bool = False,
         follow_dest: bool = False,
@@ -662,6 +664,7 @@ class AsyncClient:
             src_dir=src_dir,
             from_=from_,
             cwd=cwd,
+            root=root,
             follow=follow,
             follow_src=follow_src,
             follow_dest=follow_dest,
@@ -776,6 +779,7 @@ class AsyncClient:
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
         follow: bool = False,
         follow_src: bool = False,
         as_: PathArgument | None = None,
@@ -794,6 +798,7 @@ class AsyncClient:
             src_dir=src_dir_values,
             from_=None,
             cwd=cwd,
+            root=root,
             follow=follow,
             follow_src=follow_src,
             follow_dest=False,
@@ -823,19 +828,18 @@ class AsyncClient:
         )
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
-        process_base = Path(
-            os.fsdecode(
-                os.fspath(self.process_cwd)
-                if self.process_cwd is not None
-                else os.getcwd()
-            )
-        )
-        native_base = Path(os.fsdecode(os.fspath(cwd))) if cwd is not None else Path()
-        effective_cwd = (process_base / native_base).resolve()
+        selected_base = root if root is not None else cwd
+        contents_selector = None
         if src_src_values:
             if len(src_src_values) != 1 or source_count != 1:
                 raise SyqInvocationError(
                     "syq map takes --src-src as its only selector"
                 )
-            effective_cwd /= os.fsdecode(src_src_values[0])
+            contents_selector = src_src_values[0]
+        effective_cwd = _map_stream_cwd(
+            self.process_cwd,
+            self.env,
+            selected_base,
+            contents_selector,
+        )
         return AsyncMapStream(self, argv, effective_cwd, timeout)

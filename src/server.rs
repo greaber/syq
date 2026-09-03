@@ -73,6 +73,22 @@ struct ServeSession {
     descriptor_session: DescriptorSessionSlot,
 }
 
+/// Ceiling on accepted TCP sockets being served at once, authenticated or
+/// not. It bounds thread use against scanners and stray connections; the
+/// signed grant's `max_connections` is charged separately, after a worker
+/// authenticates.
+const MAX_LIVE_TCP_CONNECTIONS: u32 = 256;
+
+/// One authenticated worker's share of a signed grant's connection allowance,
+/// returned when the connection ends.
+struct ConnectionPermit(Arc<crate::restricted::RestrictedAuthority>);
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.release_connection();
+    }
+}
+
 pub fn run() -> Result<()> {
     let descriptor_session = DescriptorSessionSlot::default();
     let result = serve(
@@ -130,6 +146,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
 
     let debug;
     let role;
+    // Held for the life of the connection; dropping it releases the worker
+    // permit even when a later request fails.
+    let _permit: Option<ConnectionPermit>;
     match r.read_msg::<Request>()? {
         Request::Hello {
             identity,
@@ -150,6 +169,16 @@ fn serve<R: Read + Send + 'static, W: Write>(
             if let Some(a) = authed {
                 a.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            // Only an authenticated data connection counts against the signed
+            // grant's worker allowance. The control connection arrives over
+            // ssh and is not a worker.
+            _permit = match (&authority, over_ssh) {
+                (Some(authority), false) => {
+                    authority.acquire_connection()?;
+                    Some(ConnectionPermit(authority.clone()))
+                }
+                _ => None,
+            };
             let expected_identity = crate::identity::build();
             if identity != expected_identity {
                 w.write_msg(&Response::Err(format!(
@@ -647,13 +676,15 @@ fn tcp_listen(
     // Bound in-flight data connections (a peer shouldn't be able to spawn
     // unbounded threads), and remember which client connection ids we've seen
     // so a captured record stream can't be replayed while the listener is up.
+    // This bound covers every accepted socket, including reachability probes
+    // and other peers that never authenticate. A signed grant's connection
+    // limit is a separate allowance for authenticated workers only; `serve`
+    // charges it once the Hello token has matched, so a probe or scanner
+    // cannot consume a worker's permit and force a reset on a real worker.
     let live = Arc::new(AtomicU32::new(0));
     let seen: Arc<std::sync::Mutex<std::collections::HashSet<u32>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-    let max_live = authority
-        .as_ref()
-        .map(|authority| u32::from(authority.maximum_connections()))
-        .unwrap_or(256);
+    let max_live = MAX_LIVE_TCP_CONNECTIONS;
     listener.set_nonblocking(true)?;
     std::thread::spawn(move || {
         loop {
@@ -731,18 +762,6 @@ fn serve_tcp(
     let mut idbuf = [0u8; 4];
     (&stream).read_exact(&mut idbuf)?;
     let conn_id = u32::from_be_bytes(idbuf);
-    if let Some(authority) = &authority {
-        authority.acquire_connection()?;
-    }
-    struct ConnectionPermit(Option<Arc<crate::restricted::RestrictedAuthority>>);
-    impl Drop for ConnectionPermit {
-        fn drop(&mut self) {
-            if let Some(authority) = &self.0 {
-                authority.release_connection();
-            }
-        }
-    }
-    let _permit = ConnectionPermit(authority.clone());
     let _ = id;
     // Each client connection id is single-use: a replayed record stream carries
     // the original id (it must, to decrypt) and is rejected here.
@@ -1006,6 +1025,7 @@ mod tests {
         ));
         writer
             .write_msg(&Request::RegisterSourceRoots {
+                base: SourceRootBase::default(),
                 selections: vec![SourceRootSelection {
                     path: b".".to_vec(),
                     follow_root: false,
@@ -1133,5 +1153,118 @@ mod tests {
             Response::Err(error) if error.contains("initialize source worker")
         ));
         server.join().unwrap();
+    }
+
+    /// Connect to the data listener and complete a token-authenticated Hello
+    /// as a destination worker. Returns the still-open socket on success so
+    /// the caller controls when the worker's permit is released.
+    fn authenticated_worker(
+        port: u16,
+        token: &[u8],
+    ) -> std::result::Result<TcpStream, anyhow::Error> {
+        let socket = TcpStream::connect(("127.0.0.1", port))?;
+        socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let conn_id = TEST_TCP_CONN_ID.fetch_add(1, Relaxed);
+        (&socket).write_all(&conn_id.to_be_bytes())?;
+        let mut writer = FrameWriter::new(RecordWriter::new(socket.try_clone()?, None), false);
+        let mut reader = FrameReader::new(RecordReader::new(socket.try_clone()?, None));
+        writer.write_msg(&Request::Hello {
+            identity: crate::identity::build().to_string(),
+            compress: true,
+            debug: false,
+            token: token.to_vec(),
+            role: ConnectionRole::DestinationWorker {
+                destination: None,
+                copy_sources: Vec::new(),
+            },
+        })?;
+        match reader.read_msg::<Response>()? {
+            Response::HelloOk { .. } => Ok(socket),
+            other => bail!("unexpected Hello response {other:?}"),
+        }
+    }
+
+    static TEST_TCP_CONN_ID: AtomicU32 = AtomicU32::new(1000);
+
+    #[test]
+    fn unauthenticated_sockets_do_not_consume_signed_worker_permits() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let authority = Arc::new(crate::restricted::tests::tcp_test_authority(&root));
+        let max_workers = usize::from(crate::restricted::tests::TEST_AUTHORITY_MAX_CONNECTIONS);
+        let token = b"data-token".to_vec();
+        let descriptor_session = DescriptorSessionSlot::default();
+        let (port, _) = tcp_listen(
+            None,
+            token.clone(),
+            0,
+            0,
+            false,
+            true,
+            None,
+            Some(authority.clone()),
+            descriptor_session.clone(),
+        )
+        .unwrap();
+
+        // Pending handshakes that never authenticate, held open for the whole
+        // test. One of them presents a connection id but never a Hello.
+        let mut pending: Vec<TcpStream> = (0..max_workers + 1)
+            .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
+            .collect();
+        pending[0].write_all(&0u32.to_be_bytes()).unwrap();
+        // Reachability probes: connect and hang up without sending anything.
+        for _ in 0..max_workers + 1 {
+            drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        }
+        // Give the accept loop (which polls every 25ms) time to take every
+        // pending socket, then confirm each is being served rather than
+        // dropped: a served socket stays silent, a dropped one reads EOF.
+        std::thread::sleep(Duration::from_millis(200));
+        for socket in &pending {
+            socket
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut byte = [0u8; 1];
+            match (&*socket).read(&mut byte) {
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                other => panic!("pending socket was not held open: {other:?}"),
+            }
+        }
+
+        // Every granted worker must still authenticate despite the probes and
+        // pending sockets above.
+        let mut workers: Vec<TcpStream> = (0..max_workers)
+            .map(|_| authenticated_worker(port, &token).unwrap())
+            .collect();
+
+        // The grant's allowance is exhausted by authenticated workers alone.
+        let refused = authenticated_worker(port, &token);
+        assert!(
+            refused.is_err(),
+            "worker beyond the grant limit was accepted"
+        );
+
+        // Releasing one worker returns its permit.
+        drop(workers.pop());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let replacement = loop {
+            match authenticated_worker(port, &token) {
+                Ok(socket) => break socket,
+                Err(error) if std::time::Instant::now() < deadline => {
+                    let _ = error;
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => panic!("released permit was not reusable: {error:#}"),
+            }
+        };
+        workers.push(replacement);
+
+        drop(pending);
+        drop(workers);
+        authority.close_control();
+        descriptor_session.close();
     }
 }

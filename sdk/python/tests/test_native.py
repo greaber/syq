@@ -205,6 +205,7 @@ class NativeClientTests(unittest.TestCase):
             src=["a", "b"],
             src_dir="assets",
             from_="source",
+            root="source-root",
             follow_src=True,
             follow_dest=True,
             to="target",
@@ -246,7 +247,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(trace.reason, syq.TraceReason.DESTINATION_MISSING)
         argv = self.argv()
         for expected in (
-            "cp", "--src", "--src-dir", "--from", "--follow-src",
+            "cp", "--src", "--src-dir", "--from", "--root", "--follow-src",
             "--follow-dest", "--to",
             "--into-existing", "--prune", "--max-delete", "--dry-run",
             "--hash", "--no-compress", "--bwlimit", "--connections",
@@ -530,13 +531,48 @@ class NativeClientTests(unittest.TestCase):
         )
 
     def test_map_is_streaming_typed_and_context_managed(self) -> None:
-        with self.client.map(src_src="source", follow_src=True) as stream:
+        with self.client.map(
+            src_src="source", root="source-root", follow_src=True
+        ) as stream:
             entries = list(stream)
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].src, syq.RelativePath("a.txt"))
         self.assertEqual(entries[0].kind, syq.EntryKind.FILE)
         self.assertEqual(self.argv()[0], "map")
+        self.assertIn("--root", self.argv())
         self.assertIn("--follow-src", self.argv())
+        self.assertEqual(stream.cwd, Path.cwd() / "source-root" / "source")
+
+    def test_map_cwd_preserves_the_unresolved_source_spelling(self) -> None:
+        base = self.root / "base"
+        outside = self.root / "outside"
+        base.mkdir()
+        outside.mkdir()
+        (base / "link").symlink_to(outside, target_is_directory=True)
+        client = syq.Client(
+            executable=self.executable,
+            env=self.env,
+            process_cwd=self.root,
+        )
+        with client.map(
+            src_src="link/../selected", cwd="base", follow_src=True
+        ) as stream:
+            list(stream)
+        self.assertEqual(
+            os.fspath(stream.cwd),
+            os.path.join(os.fspath(self.root), "base", "link/../selected"),
+        )
+
+    def test_map_cwd_expands_tilde_with_the_subprocess_home(self) -> None:
+        home = self.root / "native-home"
+        client = syq.Client(
+            executable=self.executable,
+            env={**self.env, "HOME": os.fspath(home)},
+            process_cwd=self.root,
+        )
+        with client.map(src_src="~/selected", cwd="ignored") as stream:
+            list(stream)
+        self.assertEqual(stream.cwd, home / "selected")
 
     def test_structural_validation_happens_before_launch(self) -> None:
         with self.assertRaisesRegex(syq.SyqInvocationError, "exactly one"):
@@ -549,6 +585,10 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("a", "b", as_="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "ordinary source"):
             self.client.map(src_src="source", as_="target")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "mutually exclusive"):
+            self.client.cp("source", cwd="a", root="b", into="target")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "mutually exclusive"):
+            self.client.map("source", cwd="a", root="b")
         with self.assertRaisesRegex(syq.SyqInvocationError, "--coordinate-at"):
             self.client.cp("source", into="target", coordinate_at="elsewhere")
         with self.assertRaisesRegex(syq.SyqInvocationError, "dry run"):
