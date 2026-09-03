@@ -378,12 +378,7 @@ pub fn ok(resp: Response, what: &str) -> Result<Response> {
 }
 
 pub fn endpoint_error(error: WireError) -> anyhow::Error {
-    match error.raw_os_error {
-        Some(raw) => {
-            anyhow::Error::new(std::io::Error::from_raw_os_error(raw)).context(error.message)
-        }
-        None => anyhow!(error.message),
-    }
+    anyhow::Error::new(error)
 }
 
 pub struct LocalConn {

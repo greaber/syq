@@ -709,14 +709,33 @@ fn errstr(e: &anyhow::Error) -> String {
 }
 
 fn wire_error(error: &anyhow::Error) -> WireError {
-    let raw_os_error = error
+    let io_error = error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<io::Error>())
-        .and_then(io::Error::raw_os_error);
+        .find_map(|cause| cause.downcast_ref::<io::Error>());
     WireError {
         message: errstr(error),
-        raw_os_error,
+        io_kind: io_error.map(wire_io_kind),
+        raw_os_error: io_error.and_then(io::Error::raw_os_error),
     }
+}
+
+fn wire_io_kind(error: &io::Error) -> WireIoKind {
+    match error.raw_os_error() {
+        Some(libc::ENOSPC) => WireIoKind::NoSpace,
+        Some(libc::EDQUOT) => WireIoKind::QuotaExceeded,
+        Some(libc::EROFS) => WireIoKind::ReadOnly,
+        _ => match error.kind() {
+            io::ErrorKind::NotFound => WireIoKind::NotFound,
+            io::ErrorKind::PermissionDenied => WireIoKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists => WireIoKind::AlreadyExists,
+            io::ErrorKind::InvalidInput => WireIoKind::InvalidInput,
+            _ => WireIoKind::Other,
+        },
+    }
+}
+
+fn statvfs_counter<T: Into<u64>>(value: T) -> u64 {
+    value.into()
 }
 
 fn cstr(p: &Path) -> Result<CString> {
@@ -921,13 +940,16 @@ impl FsOps {
         }
         let stats = unsafe { stats.assume_init() };
         let fragment_size = if stats.f_frsize == 0 {
-            stats.f_bsize
+            statvfs_counter(stats.f_bsize)
         } else {
-            stats.f_frsize
+            statvfs_counter(stats.f_frsize)
         };
-        let mut available_bytes = stats.f_bavail.saturating_mul(fragment_size);
+        let blocks_available = statvfs_counter(stats.f_bavail);
+        let files = statvfs_counter(stats.f_files);
+        let files_available = statvfs_counter(stats.f_favail);
+        let mut available_bytes = blocks_available.saturating_mul(fragment_size);
         let mut available_inodes =
-            (stats.f_files != 0 && stats.f_favail <= stats.f_files).then_some(stats.f_favail);
+            (files != 0 && files_available <= files).then_some(files_available);
         #[cfg(debug_assertions)]
         {
             if let Some(value) = std::env::var_os("SYQ_TEST_AVAILABLE_BYTES") {
@@ -1376,6 +1398,8 @@ fn op_path(op: &Op) -> &[u8] {
 }
 
 fn apply_one(op: &Op, guard: Option<&ContainerGuard>) -> Result<()> {
+    #[cfg(debug_assertions)]
+    fail_apply_capacity_for_test(&resolve(op_path(op)))?;
     #[cfg(debug_assertions)]
     if matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. }) {
         fail_set_meta_for_test(&resolve(op_path(op)))?;
@@ -2243,6 +2267,17 @@ fn fail_set_meta_for_test(p: &Path) -> Result<()> {
     if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_SETMETA") {
         if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
             return Err(anyhow!("set metadata {}: injected failure", p.display()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn fail_apply_capacity_for_test(p: &Path) -> Result<()> {
+    if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_APPLY_ENOSPC") {
+        if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                .with_context(|| format!("apply {}: injected capacity failure", p.display()));
         }
     }
     Ok(())

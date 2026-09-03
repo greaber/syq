@@ -3748,6 +3748,32 @@ fn fresh_missing_destination_refuses_clear_byte_shortage_before_creation() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn fresh_exact_destination_refuses_shortage_before_creating_missing_parents() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+
+    let output = compat_command()
+        .args([
+            "-a",
+            &t.s("src/file"),
+            &t.s("missing/parent/file"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("fresh destination capacity preflight failed"));
+    assert!(
+        !t.path("missing").exists(),
+        "the capacity preflight must precede parent creation"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn fresh_existing_empty_destination_refuses_clear_byte_shortage_automatically() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"payload");
@@ -3974,6 +4000,56 @@ fn fallocate_quota_error_is_preserved_in_results() {
             .any(|record| record["os_kind"] == "quota_exceeded"),
         "quota classification missing from {records:#?}"
     );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn capacity_failure_reports_other_settled_apply_outcomes_before_aborting() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src")).unwrap();
+    std::os::unix::fs::symlink("good-target", t.path("src/a-good")).unwrap();
+    std::os::unix::fs::symlink("full-target", t.path("src/z-full")).unwrap();
+    write(&t.path("dst/existing"), b"make this an update");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            "src",
+            "--into-existing",
+            "dst",
+            "--results",
+            "results.ndjson",
+            "-q",
+        ])
+        .current_dir(&t.0)
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "z-full")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_link(t.path("dst/a-good")).unwrap(),
+        Path::new("good-target")
+    );
+    assert!(!t.path("dst/z-full").exists());
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let operation = |name: &str| {
+        records
+            .iter()
+            .find(|record| record["type"] == "operation_result" && record["dst"]["value"] == name)
+            .unwrap_or_else(|| panic!("missing operation result for {name}: {records:#?}"))
+    };
+    assert_eq!(operation("a-good")["disposition"], "succeeded");
+    assert_eq!(operation("z-full")["disposition"], "failed");
+    assert_eq!(operation("z-full")["os_kind"], "no_space");
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["status"], "aborted");
+    assert_eq!(terminal["symlinks_created"], 1);
 }
 
 #[test]

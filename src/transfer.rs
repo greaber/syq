@@ -951,6 +951,12 @@ pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &L
 }
 
 fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WireError>())
+    {
+        return wire_os_kind(error);
+    }
     let io = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())?;
@@ -969,17 +975,28 @@ fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
 }
 
 fn wire_os_kind(error: &WireError) -> Option<&'static str> {
-    match error.raw_os_error {
-        Some(libc::ENOSPC) => Some("no_space"),
-        Some(libc::EDQUOT) => Some("quota_exceeded"),
-        Some(libc::EACCES) | Some(libc::EPERM) => Some("permission_denied"),
-        Some(libc::EROFS) => Some("read_only"),
-        _ => None,
-    }
+    Some(match error.io_kind? {
+        WireIoKind::NotFound => "not_found",
+        WireIoKind::PermissionDenied => "permission_denied",
+        WireIoKind::AlreadyExists => "already_exists",
+        WireIoKind::InvalidInput => "invalid_input",
+        WireIoKind::NoSpace => "no_space",
+        WireIoKind::QuotaExceeded => "quota_exceeded",
+        WireIoKind::ReadOnly => "read_only",
+        WireIoKind::Other => "other",
+    })
 }
 
 fn capacity_os_kind(kind: Option<&str>) -> bool {
     matches!(kind, Some("no_space" | "quota_exceeded"))
+}
+
+fn first_capacity_error(errors: &[Option<WireError>]) -> Option<WireError> {
+    errors
+        .iter()
+        .flatten()
+        .find(|error| capacity_os_kind(wire_os_kind(error)))
+        .cloned()
 }
 
 fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
@@ -1853,12 +1870,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let dry_run_creates_root =
         args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let root_create_condition = TargetCondition::Any;
+    let defer_operator_directory_creation = use_operator_anchor
+        && directory_selection.is_none()
+        && !args.dry_run
+        && !args.verify_only
+        && !args.existing
+        && defer_destination_mutations;
     if use_operator_anchor {
         let create_operator_directory_now = directory_selection.is_none()
             && !args.dry_run
             && !args.verify_only
             && !args.existing
-            && (!dst_is_dir || !defer_destination_mutations);
+            && !defer_operator_directory_creation;
         if create_operator_directory_now {
             let condition = if dst_is_dir {
                 root_create_condition
@@ -2028,8 +2051,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
         mapping_mode: false,
-        create_root: if create_root && defer_destination_mutations {
-            Some((dst_root.clone(), root_create_condition))
+        create_root: if defer_operator_directory_creation {
+            Some((
+                request_prefix.clone(),
+                if dst_is_dir {
+                    root_create_condition
+                } else {
+                    TargetCondition::Any
+                },
+                dst_is_dir,
+            ))
+        } else if !use_operator_anchor && create_root && defer_destination_mutations {
+            Some((dst_root.clone(), root_create_condition, true))
         } else {
             None
         },
@@ -3493,9 +3526,11 @@ struct Planner<'a> {
     mutation_root_condition: TargetCondition,
     container_guard: Option<ContainerGuard>,
     guard_containers: bool,
-    /// Several sources into a destination that doesn't exist yet: create it
-    /// only once the scans have been validated against each other.
-    create_root: Option<(PathBytes, TargetCondition)>,
+    /// A missing retained operator directory: (request prefix, creation
+    /// condition, whether it is the destination root). Create it only after
+    /// namespace and fresh-capacity preflight. Restricted transfers use the
+    /// same slot only for their missing destination root.
+    create_root: Option<(PathBytes, TargetCondition, bool)>,
     destination_anchor: &'a DestinationAnchorSlot,
     use_operator_anchor: bool,
     /// --files-from: listed directories are created even without -r (which
@@ -4201,10 +4236,24 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// All sources scanned and the sidecar namespace preflight passed: retire
-    /// its maps and add deferred payloads to the buffer. The caller runs the
-    /// fresh-target capacity check before replaying that buffer.
+    /// All sources scanned and the sidecar namespace preflight passed: add
+    /// deferred payloads to the buffer. The caller runs the fresh-target
+    /// capacity check before replaying that buffer. Planning maps remain live
+    /// until replay because applying buffered entries still consults them.
     fn finish_planning(&mut self) -> Result<()> {
+        let deferred = std::mem::take(&mut self.deferred_payloads);
+        if let Some(buf) = &mut self.buffer {
+            buf.extend(deferred);
+        } else {
+            for m in deferred {
+                self.apply_mapped(m)?;
+            }
+            self.retire_planning_state();
+        }
+        Ok(())
+    }
+
+    fn retire_planning_state(&mut self) {
         // The preflight maps are dead now — except the sidecar set, which
         // --delete needs (only its keys) to tell a live sidecar from an
         // orphan. On multi-million-file trees these are the difference
@@ -4216,15 +4265,6 @@ impl Planner<'_> {
             keys.sort_unstable();
             self.live_sidecars = keys;
         }
-        let deferred = std::mem::take(&mut self.deferred_payloads);
-        if let Some(buf) = &mut self.buffer {
-            buf.extend(deferred);
-        } else {
-            for m in deferred {
-                self.apply_mapped(m)?;
-            }
-        }
-
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
         // alone still needs the destination claims and live sidecar names.
@@ -4243,7 +4283,6 @@ impl Planner<'_> {
             self.live_sidecars = Vec::new();
             self.delete_roots = Vec::new();
         }
-        Ok(())
     }
 
     /// The mapping loop: decide and claim everything about each entry.
@@ -4380,9 +4419,10 @@ impl Planner<'_> {
             }
         }
         if self.collision {
+            self.retire_planning_state();
             return Ok(());
         }
-        if let Some((root, condition)) = self.create_root.take() {
+        if let Some((root, condition, is_destination_root)) = self.create_root.take() {
             if self.use_operator_anchor {
                 let selection = create_operator_directory(self.dst, condition)?;
                 let anchor = activate_control_destination(
@@ -4391,21 +4431,24 @@ impl Planner<'_> {
                     root.clone(),
                     self.opts.operator_symlink_policy,
                 )?;
-                self.mutation_root_condition = TargetCondition::Matches {
-                    dev: anchor.dev,
-                    ino: anchor.ino,
-                };
-                if self.guard_containers {
-                    self.container_guard = Some(ContainerGuard {
-                        root,
+                if is_destination_root {
+                    self.mutation_root_condition = TargetCondition::Matches {
                         dev: anchor.dev,
                         ino: anchor.ino,
-                    });
+                    };
+                    if self.guard_containers {
+                        self.container_guard = Some(ContainerGuard {
+                            root,
+                            dev: anchor.dev,
+                            ino: anchor.ino,
+                        });
+                    }
                 }
                 self.destination_anchor
                     .set(anchor)
                     .expect("destination anchor set once");
             } else {
+                debug_assert!(is_destination_root);
                 let created =
                     mkdir_root(self.dst, &root, condition, self.opts.restricted_receiver)?;
                 self.mutation_root_condition = target_identity(&created);
@@ -4424,6 +4467,7 @@ impl Planner<'_> {
         for m in buffered {
             self.apply_mapped(m)?;
         }
+        self.retire_planning_state();
         Ok(())
     }
 
@@ -4609,7 +4653,15 @@ impl Planner<'_> {
                     let root_op = new_dirs.remove(root_index);
                     let error = self.apply(vec![root_op])?.into_iter().next().flatten();
                     if let Some(error) = error {
-                        self.progress.error(&format!("syq: {error}"));
+                        let os_kind = wire_os_kind(&error);
+                        self.progress.error_classified(
+                            &format!("syq: {error}"),
+                            Some("io"),
+                            os_kind,
+                        );
+                        if capacity_os_kind(os_kind) {
+                            return Err(endpoint_error(error)).context("apply destination changes");
+                        }
                         self.collision = true;
                         return Ok(());
                     }
@@ -4641,18 +4693,20 @@ impl Planner<'_> {
                         })
                         .collect();
                     let errs = self.apply(new_dirs)?;
+                    let capacity_error = first_capacity_error(&errs);
                     let mut failed = 0;
                     let mut reopened = 0;
                     for ((name, condition), err) in op_info.iter().zip(errs) {
                         let preexisting = existing_dirs.contains(name);
                         let succeeded = err.is_none();
                         let created = succeeded && !preexisting;
-                        if let Some(err) = err {
+                        let os_kind = err.as_ref().and_then(wire_os_kind);
+                        if let Some(err) = &err {
                             failed += 1;
                             self.progress.error_classified(
                                 &format!("syq: {err}"),
                                 Some("io"),
-                                None,
+                                os_kind,
                             );
                             if name == &self.root_path && *condition != TargetCondition::Any {
                                 self.collision = true;
@@ -4692,14 +4746,17 @@ impl Planner<'_> {
                                     "unknown"
                                 }),
                                 class: (!created).then_some("io"),
-                                os_kind: None,
-                                message: None,
+                                os_kind,
+                                message: err.as_ref().map(WireError::as_str),
                             });
                         }
                     }
                     self.progress
                         .dirs_created
                         .fetch_add((n - failed - reopened) as u64, Relaxed);
+                    if let Some(error) = capacity_error {
+                        return Err(endpoint_error(error)).context("apply destination changes");
+                    }
                 }
                 let mut flags = opts.flags;
                 if !opts.perms {
@@ -5159,20 +5216,27 @@ impl Planner<'_> {
             }
         }
         if !meta_fixes.is_empty() {
-            for err in self.apply(meta_fixes)?.into_iter().flatten() {
+            let errors = self.apply(meta_fixes)?;
+            let capacity_error = first_capacity_error(&errors);
+            for err in errors.into_iter().flatten() {
                 self.progress.error(&format!("syq: {err}"));
+            }
+            if let Some(error) = capacity_error {
+                return Err(endpoint_error(error)).context("apply destination changes");
             }
         }
         if !ops.is_empty() {
             let errs = self.apply(ops)?;
+            let capacity_error = first_capacity_error(&errs);
             // Two ops per item: creation then metadata.
             for (i, queued) in op_names.iter().enumerate() {
                 let e1 = errs.get(2 * i).cloned().flatten();
                 let e2 = errs.get(2 * i + 1).cloned().flatten();
                 let error = e1.or(e2);
+                let os_kind = error.as_ref().and_then(wire_os_kind);
                 if let Some(e) = &error {
                     self.progress
-                        .error_classified(&format!("syq: {e}"), Some("io"), None);
+                        .error_classified(&format!("syq: {e}"), Some("io"), os_kind);
                 } else {
                     // Counted only once the operation settles: a fatal
                     // unwind between queueing and applying must not leave
@@ -5204,10 +5268,13 @@ impl Planner<'_> {
                         attempts: None,
                         retryable: error.is_some().then_some("unknown"),
                         class: error.is_some().then_some("io"),
-                        os_kind: None,
+                        os_kind,
                         message: error.as_ref().map(WireError::as_str),
                     });
                 }
+            }
+            if let Some(error) = capacity_error {
+                return Err(endpoint_error(error)).context("apply destination changes");
             }
         }
         Ok(())
@@ -5991,16 +6058,7 @@ impl Planner<'_> {
             })?,
             "apply",
         )? {
-            Response::Applied(v) => {
-                if let Some(error) = v
-                    .iter()
-                    .flatten()
-                    .find(|error| capacity_os_kind(wire_os_kind(error)))
-                {
-                    return Err(endpoint_error(error.clone())).context("apply destination changes");
-                }
-                Ok(v)
-            }
+            Response::Applied(v) => Ok(v),
             other => bail!("unexpected response {other:?}"),
         }
     }
@@ -6019,8 +6077,13 @@ impl Planner<'_> {
                     condition: *condition,
                 })
                 .collect();
-            for err in self.apply(ops)?.into_iter().flatten() {
+            let errors = self.apply(ops)?;
+            let capacity_error = first_capacity_error(&errors);
+            for err in errors.into_iter().flatten() {
                 self.progress.error(&format!("syq: {err}"));
+            }
+            if let Some(error) = capacity_error {
+                return Err(endpoint_error(error)).context("apply destination changes");
             }
         }
         Ok(())
@@ -7296,6 +7359,21 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_semantic_error_kind_wins_over_numeric_errno() {
+        let error = WireError {
+            message: "receiver quota exhausted".into(),
+            io_kind: Some(WireIoKind::QuotaExceeded),
+            // Deliberately contradict the semantic kind. Numeric errno values
+            // belong to the receiver ABI and must never drive coordinator
+            // policy.
+            raw_os_error: Some(libc::ENOSPC),
+        };
+        assert_eq!(wire_os_kind(&error), Some("quota_exceeded"));
+        assert!(capacity_os_kind(wire_os_kind(&error)));
+        assert_eq!(os_kind_of(&endpoint_error(error)), Some("quota_exceeded"));
+    }
 
     #[test]
     fn raw_path_identity_is_lossless_without_changing_utf8_identity() {

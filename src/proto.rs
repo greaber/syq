@@ -562,7 +562,22 @@ pub struct DestinationFilesystemInfo {
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct WireError {
     pub message: String,
+    /// Receiver-derived meaning. Numeric errno values are retained only for
+    /// diagnostics because their values differ between operating systems.
+    pub io_kind: Option<WireIoKind>,
     pub raw_os_error: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WireIoKind {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    InvalidInput,
+    NoSpace,
+    QuotaExceeded,
+    ReadOnly,
+    Other,
 }
 
 impl WireError {
@@ -575,6 +590,7 @@ impl From<String> for WireError {
     fn from(message: String) -> Self {
         WireError {
             message,
+            io_kind: None,
             raw_os_error: None,
         }
     }
@@ -591,6 +607,8 @@ impl std::fmt::Display for WireError {
         formatter.write_str(&self.message)
     }
 }
+
+impl std::error::Error for WireError {}
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct DirectoryAnchor {

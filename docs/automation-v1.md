@@ -140,8 +140,9 @@ refusal, e.g. `--max-delete`), `usage`, `internal`. `os_kind`
 appears on endpoint operations where the OS error is known: `not_found`,
 `permission_denied`, `already_exists`, `invalid_input`, `no_space`,
 `quota_exceeded`, `read_only`, `other`. Filesystem errors preserve their OS
-error number across remote connections when one is available; errors without
-one cannot always be classified more narrowly than `other`.
+error meaning across remote connections even when the endpoints use different
+numeric errno values. Errors without an OS classification cannot always be
+classified more narrowly than `other`.
 
 ### `result` — exactly one, always last, flushed
 
