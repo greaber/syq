@@ -6383,6 +6383,86 @@ mod tests {
     }
 
     #[test]
+    fn confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps() {
+        const CHILD_ENV: &str = "SYQ_TEST_GUARDED_MUTATION_CHILD";
+        const ROOT_ENV: &str = "SYQ_TEST_GUARDED_MUTATION_ROOT";
+        const TEST_NAME: &str =
+            "fsops::tests::confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root_path = PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+            let identity = Root::open(&root_path).unwrap().identity();
+            let guard = ContainerGuard {
+                root: root_path.as_os_str().as_bytes().to_vec(),
+                dev: identity.dev,
+                ino: identity.ino,
+            };
+            let target = root_path.join("target/parent/escaped");
+            let errors = FsOps::new().apply(
+                &[Op::Mkdir {
+                    path: target.as_os_str().as_bytes().to_vec(),
+                    mode: 0o755,
+                    condition: TargetCondition::Any,
+                }],
+                Some(&guard),
+            );
+            assert!(
+                errors[0].is_some(),
+                "guarded mutation followed a raced namespace"
+            );
+            return;
+        }
+
+        for swap_root in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root_path = temporary.path().join("root");
+            let outside = temporary.path().join("outside");
+            fs::create_dir_all(root_path.join("target/parent")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("sentinel"), b"outside").unwrap();
+            let ready = temporary.path().join("guarded-ready");
+
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env(ROOT_ENV, &root_path)
+                .env("SYQ_TEST_GUARDED_MUTATION_SUFFIX", "parent/escaped")
+                .env("SYQ_TEST_GUARDED_MUTATION_READY_FILE", &ready)
+                .env("SYQ_TEST_HOLD_GUARDED_MUTATION_MS", "750")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "guarded-mutation child exited before its race window"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "guarded-mutation race window timed out");
+
+            if swap_root {
+                fs::rename(&root_path, temporary.path().join("displaced-root")).unwrap();
+                symlink(&outside, &root_path).unwrap();
+            } else {
+                fs::rename(
+                    root_path.join("target/parent"),
+                    root_path.join("target/displaced-parent"),
+                )
+                .unwrap();
+                symlink(&outside, root_path.join("target/parent")).unwrap();
+            }
+
+            assert!(
+                child.wait().unwrap().success(),
+                "guarded-mutation child failed for swap_root={swap_root}"
+            );
+            assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
+            assert!(!outside.join("escaped").exists());
+        }
+    }
+
+    #[test]
     fn operator_directory_walk_follows_owned_links_and_reports_missing_suffixes() {
         let dir = test_dir();
         let real = dir.join("real/nested");

@@ -291,6 +291,9 @@ jobs:
       - name: Exercise macOS descriptor-pressure bounds
         if: needs.scope.outputs.macos == 'true'
         run: cargo test --locked --test local source_fd_budget_
+      - name: Exercise macOS adversarial confinement matrix
+        if: needs.scope.outputs.macos == 'true'
+        run: cargo test --locked confinement_matrix_
       - if: needs.scope.outputs.macos == 'true'
         run: scripts/test-installer.sh
       - if: needs.scope.outputs.macos == 'true'
