@@ -766,9 +766,17 @@ pub fn run(args: Args) -> Result<i32> {
             // before syq ran; verify it is actually connected so a
             // forgotten redirection fails here, loudly, instead of at the
             // first lost record.
-            if unsafe { libc::fcntl(fd, libc::F_GETFL) } == -1 {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags == -1 {
                 bail!(
                     "--results-fd {fd}: descriptor is not open; connect it in the caller, e.g. --results-fd {fd} {fd}>run.ndjson"
+                );
+            }
+            // A read-only descriptor (e.g. {fd}<file) would fail on every
+            // write and silently produce no stream; refuse it up front.
+            if flags & libc::O_ACCMODE == libc::O_RDONLY {
+                bail!(
+                    "--results-fd {fd}: descriptor is open read-only; connect it for writing, e.g. --results-fd {fd} {fd}>run.ndjson"
                 );
             }
             // Children (ssh, helpers) must not inherit the stream's write

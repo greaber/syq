@@ -10857,6 +10857,18 @@ fn native_cp_results_fd_refusals() {
     assert!(!out.status.success());
     assert!(stderr_of(&out).contains("not open"), "{}", stderr_of(&out));
     assert!(!t.path("dst").exists());
+    // A read-only descriptor would swallow every record silently.
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec \"$1\" cp --src-src src --into dst --results-fd 3 3</dev/null")
+        .arg("sh")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("read-only"), "{}", stderr_of(&out));
+    assert!(!t.path("dst").exists());
     // Slots 0-2 belong to stdin/stdout/stderr.
     let out = syq_cp_in(
         &t.path(""),
