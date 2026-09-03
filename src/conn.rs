@@ -42,6 +42,7 @@ pub trait Conn: Send {
     fn scan(
         &mut self,
         root: &[u8],
+        _source: Option<&RegisteredPath>,
         follow_root: bool,
         ignore: &[String],
         report_ignored: bool,
@@ -361,19 +362,41 @@ pub fn ok(resp: Response, what: &str) -> Result<Response> {
 pub struct LocalConn {
     ops: FsOps,
     pending: VecDeque<Response>,
+    is_control: bool,
 }
 
 impl LocalConn {
-    pub fn new() -> Self {
+    fn new(
+        is_control: bool,
+        descriptor_session: crate::descriptor_broker::DescriptorSessionSlot,
+    ) -> Self {
         LocalConn {
-            ops: FsOps::new(),
+            ops: FsOps::with_descriptor_session(descriptor_session),
             pending: VecDeque::new(),
+            is_control,
         }
     }
 }
 
 impl Conn for LocalConn {
     fn send(&mut self, req: Request) -> Result<()> {
+        if !self.is_control
+            && matches!(
+                &req,
+                Request::TcpListen { .. }
+                    | Request::NativeRemove { .. }
+                    | Request::CheckOperatorDirectory { .. }
+                    | Request::RegisterSourceRoots { .. }
+                    | Request::CreateOperatorDirectory { .. }
+                    | Request::AnchorDestination { .. }
+                    | Request::Receipt
+            )
+        {
+            self.pending.push_back(Response::Err(
+                "request is allowed only on the control connection".into(),
+            ));
+            return Ok(());
+        }
         let resp = self.ops.handle(&req);
         self.pending.push_back(resp);
         Ok(())
@@ -386,6 +409,7 @@ impl Conn for LocalConn {
     fn scan(
         &mut self,
         root: &[u8],
+        _source: Option<&RegisteredPath>,
         follow_root: bool,
         ignore: &[String],
         report_ignored: bool,
@@ -597,6 +621,7 @@ impl Conn for RemoteConn {
     fn scan(
         &mut self,
         root: &[u8],
+        source: Option<&RegisteredPath>,
         follow_root: bool,
         ignore: &[String],
         report_ignored: bool,
@@ -606,6 +631,7 @@ impl Conn for RemoteConn {
     ) -> Result<()> {
         self.send(Request::Scan {
             root: root.to_vec(),
+            source: source.cloned(),
             follow_root,
             ignore: ignore.to_vec(),
             report_ignored,
@@ -1048,7 +1074,7 @@ impl RemoteSpec {
     /// on first use if the remote lacks it.
     pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
         let role = if limited {
-            ConnectionRole::SourceWorker
+            ConnectionRole::SourceWorker { roots: Vec::new() }
         } else {
             ConnectionRole::Control
         };
@@ -1616,7 +1642,7 @@ fn hello(
     token: Vec<u8>,
     role: ConnectionRole,
 ) -> Result<RemoteConn> {
-    let destination_worker = matches!(role, ConnectionRole::DestinationWorker { .. });
+    let worker = !matches!(role, ConnectionRole::Control);
     conn.send(Request::Hello {
         identity: crate::identity::build().to_string(),
         compress,
@@ -1635,11 +1661,11 @@ fn hello(
                 crate::identity::build()
             )
         }
-        Ok(Response::Err(error)) if destination_worker => {
+        Ok(Response::Err(error)) if worker => {
             return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into())
         }
         Ok(Response::Err(error)) => bail!("{}: {error}", conn.label),
-        Ok(other) if destination_worker => {
+        Ok(other) if worker => {
             return Err(WorkerInitializationError(format!(
                 "{}: unexpected handshake response {other:?}",
                 conn.label
@@ -2064,13 +2090,30 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-#[derive(Clone, Debug)]
-pub enum Endpoint {
-    Local,
+#[derive(Clone)]
+pub(crate) enum Endpoint {
+    Local {
+        descriptor_session: crate::descriptor_broker::DescriptorSessionSlot,
+    },
     Remote(RemoteSpec),
 }
 
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Endpoint::Local { .. } => formatter.write_str("Local"),
+            Endpoint::Remote(spec) => formatter.debug_tuple("Remote").field(spec).finish(),
+        }
+    }
+}
+
 impl Endpoint {
+    pub(crate) fn local() -> Self {
+        Self::Local {
+            descriptor_session: Default::default(),
+        }
+    }
+
     pub fn is_remote(&self) -> bool {
         matches!(self, Endpoint::Remote(spec) if !spec.local_process)
     }
@@ -2079,8 +2122,16 @@ impl Endpoint {
         matches!(self, Endpoint::Remote(_))
     }
 
-    pub fn connect(&self, compress: bool) -> Result<Box<dyn Conn>> {
-        self.connect_with_role(compress, ConnectionRole::SourceWorker)
+    pub(crate) fn connect_control(&self, compress: bool) -> Result<Box<dyn Conn>> {
+        self.connect_with_role(compress, ConnectionRole::Control)
+    }
+
+    pub(crate) fn connect_with_sources(
+        &self,
+        compress: bool,
+        roots: Vec<RegisteredSourceRoot>,
+    ) -> Result<Box<dyn Conn>> {
+        self.connect_with_role(compress, ConnectionRole::SourceWorker { roots })
     }
 
     pub(crate) fn connect_with_destination(
@@ -2093,8 +2144,17 @@ impl Endpoint {
 
     fn connect_with_role(&self, compress: bool, role: ConnectionRole) -> Result<Box<dyn Conn>> {
         match self {
-            Endpoint::Local => {
-                let mut conn = LocalConn::new();
+            Endpoint::Local { descriptor_session } => {
+                // Every connection clone for this logical local endpoint uses
+                // the control connection's process-local session slot. Once
+                // the control registers roots, workers clone those retained
+                // descriptors in process instead of claiming SCM_RIGHTS from
+                // the broker after worker threads exist (unsupported on
+                // Darwin).
+                let mut conn = LocalConn::new(
+                    matches!(&role, ConnectionRole::Control),
+                    descriptor_session.clone(),
+                );
                 match role {
                     ConnectionRole::DestinationWorker {
                         destination: Some(destination),
@@ -2112,7 +2172,14 @@ impl Endpoint {
                         )
                         .into())
                     }
-                    ConnectionRole::Control | ConnectionRole::SourceWorker => {}
+                    ConnectionRole::SourceWorker { roots } => {
+                        conn.ops.initialize_sources(&roots).map_err(|error| {
+                            WorkerInitializationError(format!(
+                                "initialize local source worker: {error:#}"
+                            ))
+                        })?
+                    }
+                    ConnectionRole::Control => {}
                 }
                 Ok(Box::new(conn))
             }
@@ -2168,10 +2235,44 @@ impl Endpoint {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
 
     struct ExitObserved<R> {
         inner: R,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[test]
+    fn local_workers_clone_the_control_descriptor_session_in_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        let endpoint = Endpoint::local();
+        let mut control = endpoint.connect_control(false).unwrap();
+        let response = control
+            .call(Request::RegisterSourceRoots {
+                selections: vec![SourceRootSelection {
+                    path: selected.as_os_str().as_bytes().to_vec(),
+                    follow_root: false,
+                }],
+                symlink_policy: OperatorSymlinkPolicy::Refuse,
+                shared_workers: 1,
+            })
+            .unwrap();
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+
+        // Once the socket name is gone, an empty session slot cannot claim the
+        // ticket with SCM_RIGHTS. The endpoint clone still succeeds because it
+        // reaches the control connection's process-local registry instead.
+        std::fs::remove_file(roots[0].ticket.broker_path()).unwrap();
+        endpoint.connect_with_sources(false, roots.clone()).unwrap();
+        let error = Endpoint::local()
+            .connect_with_sources(false, roots)
+            .err()
+            .expect("a fresh local endpoint must not share another session");
+        assert!(format!("{error:#}").contains("connect to descriptor broker"));
     }
 
     impl<R: Read> Read for ExitObserved<R> {
@@ -2279,7 +2380,11 @@ mod tests {
         };
 
         let error = spec
-            .connect_tcp(&info, false, ConnectionRole::SourceWorker)
+            .connect_tcp(
+                &info,
+                false,
+                ConnectionRole::SourceWorker { roots: Vec::new() },
+            )
             .err()
             .expect("unregistered congestion control should fail locally");
         let message = format!("{error:#}");

@@ -1683,6 +1683,7 @@ impl RestrictedAuthority {
                 paths,
                 follow,
                 guard,
+                ..
             } => {
                 if *follow {
                     bail!("signed destination stat cannot follow symlinks");
@@ -1724,7 +1725,7 @@ impl RestrictedAuthority {
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
             }
-            Request::FileHash { path, guard } => {
+            Request::FileHash { path, guard, .. } => {
                 self.check_observation_path(path)?;
                 outcomes.push(PendingOutcome::Observe { path: path.clone() });
                 *guard = Some(self.guard.clone());
@@ -1915,6 +1916,7 @@ impl RestrictedAuthority {
                 bail!("request is not valid on a command-restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
+            | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. } => {
                 bail!("destination-anchor management is not valid on a root-confined receiver")
@@ -3818,6 +3820,7 @@ mod tests {
 
         let mut stat = Request::StatMany {
             paths: vec![target.clone()],
+            sources: None,
             follow: false,
             guard: Some(ContainerGuard {
                 root: outside.clone(),
@@ -3852,6 +3855,7 @@ mod tests {
 
         let mut outside_stat = Request::StatMany {
             paths: vec![outside.clone()],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -3924,6 +3928,7 @@ mod tests {
 
         let mut exact = Request::StatMany {
             paths: vec![destination],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -3967,6 +3972,7 @@ mod tests {
 
         let scan = |ignore: Vec<String>| Request::Scan {
             root: target.clone(),
+            source: None,
             follow_root: false,
             ignore,
             report_ignored: true,
@@ -4758,6 +4764,7 @@ mod tests {
         // An observation the orchestrator asked for is hostB's own view.
         let mut hash = Request::FileHash {
             path: path_bytes(&kept),
+            source: None,
             guard: None,
         };
         let settlement = authority.authorize(&mut hash, false).unwrap();
@@ -4864,6 +4871,7 @@ mod tests {
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
         let mut observe = Request::StatMany {
             paths: vec![path_bytes(&kept)],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -5599,6 +5607,7 @@ mod tests {
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let request = |block, len| Request::HashBlocks {
             path: target.clone(),
+            source: None,
             which: proto::Which::Final,
             partial_id: [0; 16],
             block,
@@ -5783,6 +5792,7 @@ mod tests {
 
         let mut observation = Request::StatMany {
             paths: vec![target],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -5823,6 +5833,7 @@ mod tests {
 
         let mut observe_container = Request::StatMany {
             paths: vec![target],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -5843,6 +5854,7 @@ mod tests {
                 .as_os_str()
                 .as_bytes()
                 .to_vec()],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -5884,6 +5896,7 @@ mod tests {
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let mut unfiltered_scan = Request::Scan {
             root: target,
+            source: None,
             follow_root: false,
             ignore: Vec::new(),
             report_ignored: true,
@@ -5988,6 +6001,7 @@ mod tests {
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let mut scan = Request::Scan {
             root: target.clone(),
+            source: None,
             follow_root: false,
             ignore: Vec::new(),
             report_ignored: false,
@@ -6224,6 +6238,7 @@ mod tests {
 
         let mut scan = Request::Scan {
             root: target.as_os_str().as_bytes().to_vec(),
+            source: None,
             follow_root: false,
             ignore: Vec::new(),
             report_ignored: false,
@@ -6259,6 +6274,7 @@ mod tests {
 
         let response = crate::fsops::FsOps::new().handle(&Request::HashBlocks {
             path: target.join("escape").as_os_str().as_bytes().to_vec(),
+            source: None,
             which: proto::Which::Final,
             partial_id: [0; 16],
             block: 4096,
@@ -6267,5 +6283,25 @@ mod tests {
         });
         assert!(matches!(response, proto::Response::Err(_)));
         assert_eq!(fs::metadata(outside.join("secret")).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn restricted_authority_rejects_caller_source_registration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+        let mut request = Request::RegisterSourceRoots {
+            selections: vec![proto::SourceRootSelection {
+                path: root.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
+            shared_workers: 0,
+        };
+        let error = authority.authorize(&mut request, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("not valid on a root-confined receiver"));
     }
 }

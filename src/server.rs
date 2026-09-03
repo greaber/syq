@@ -175,6 +175,20 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let is_control = matches!(&role, ConnectionRole::Control);
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
     match &role {
+        ConnectionRole::SourceWorker { .. } if authority.is_some() => {
+            w.write_msg(&Response::Err(
+                "a command-restricted receiver does not accept caller-supplied source roots".into(),
+            ))?;
+            bail!("command-restricted receiver rejected supplied source roots");
+        }
+        ConnectionRole::SourceWorker { roots } => {
+            if let Err(error) = ops.initialize_sources(roots) {
+                w.write_msg(&Response::Err(format!(
+                    "initialize source worker: {error:#}"
+                )))?;
+                return Err(error).context("initialize source worker");
+            }
+        }
         ConnectionRole::DestinationWorker {
             destination: Some(_),
         } if authority.is_some() => {
@@ -199,9 +213,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 return Err(error).context("initialize destination worker");
             }
         }
-        ConnectionRole::Control
-        | ConnectionRole::SourceWorker
-        | ConnectionRole::DestinationWorker { destination: None } => {}
+        ConnectionRole::Control | ConnectionRole::DestinationWorker { destination: None } => {}
     }
     w.write_msg(&Response::HelloOk {
         identity: crate::identity::build().to_string(),
@@ -230,6 +242,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 Request::TcpListen { .. }
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
+                    | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
                     | Request::Receipt
@@ -342,6 +355,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             }
             Request::Scan {
                 root,
+                source: _,
                 follow_root,
                 ignore,
                 report_ignored,
@@ -788,6 +802,16 @@ mod tests {
     fn tcp_server_joins_request_reader_on_shutdown() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
+        let selected = tempfile::tempdir().unwrap();
+        let descriptor_session = DescriptorSessionSlot::default();
+        let ticket = descriptor_session
+            .register(std::fs::File::open(selected.path()).unwrap())
+            .unwrap();
+        let source = RegisteredSourceRoot {
+            selection: RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap(),
+            ticket,
+        };
+        let server_session = descriptor_session.clone();
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed = dropped.clone();
         let server = std::thread::spawn(move || {
@@ -804,7 +828,7 @@ mod tests {
                 Some(socket),
                 ServeSession {
                     authority: None,
-                    descriptor_session: DescriptorSessionSlot::default(),
+                    descriptor_session: server_session,
                 },
             )
             .unwrap();
@@ -819,12 +843,28 @@ mod tests {
                 compress: false,
                 debug: false,
                 token: Vec::new(),
-                role: ConnectionRole::SourceWorker,
+                role: ConnectionRole::SourceWorker {
+                    roots: vec![source],
+                },
             })
             .unwrap();
         assert!(matches!(
             reader.read_msg::<Response>().unwrap(),
             Response::HelloOk { .. }
+        ));
+        writer
+            .write_msg(&Request::RegisterSourceRoots {
+                selections: vec![SourceRootSelection {
+                    path: b".".to_vec(),
+                    follow_root: false,
+                }],
+                symlink_policy: OperatorSymlinkPolicy::Refuse,
+                shared_workers: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(error) if error.contains("only on the control connection")
         ));
         writer.write_msg(&Request::Shutdown).unwrap();
         server.join().unwrap();
@@ -880,6 +920,59 @@ mod tests {
         assert!(matches!(
             reader.read_msg::<Response>().unwrap(),
             Response::Err(error) if error.contains("initialize destination worker")
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rejected_source_ticket_is_not_acknowledged_as_ready() {
+        let selected = tempfile::tempdir().unwrap();
+        let owner = DescriptorSessionSlot::default();
+        let ticket = owner
+            .register(std::fs::File::open(selected.path()).unwrap())
+            .unwrap();
+        let source = RegisteredSourceRoot {
+            selection: RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap(),
+            ticket,
+        };
+        owner.close();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            serve(
+                socket.try_clone().unwrap(),
+                socket,
+                false,
+                None,
+                None,
+                None,
+                ServeSession {
+                    authority: None,
+                    descriptor_session: DescriptorSessionSlot::default(),
+                },
+            )
+            .unwrap_err()
+        });
+
+        let socket = TcpStream::connect(address).unwrap();
+        let mut writer = FrameWriter::new(socket.try_clone().unwrap(), false);
+        let mut reader = FrameReader::new(socket);
+        writer
+            .write_msg(&Request::Hello {
+                identity: crate::identity::build().to_string(),
+                compress: false,
+                debug: false,
+                token: Vec::new(),
+                role: ConnectionRole::SourceWorker {
+                    roots: vec![source],
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(error) if error.contains("initialize source worker")
         ));
         server.join().unwrap();
     }

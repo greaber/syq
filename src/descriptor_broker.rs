@@ -28,7 +28,7 @@ const RESPONSE_OK: u8 = 0;
 const RESPONSE_REJECTED: u8 = 1;
 const RESPONSE_INTERNAL: u8 = 2;
 const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_MAX_ROOTS: usize = 256;
+pub(crate) const DEFAULT_MAX_ROOTS: usize = 256;
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
 const FD_CONTROL_LEN: usize =
     unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as libc::c_uint) as usize };
@@ -41,6 +41,12 @@ union FdControl {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct RegisteredRootId(u64);
+
+impl RegisteredRootId {
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+}
 
 struct RegisteredRoot {
     directory: File,
@@ -72,29 +78,50 @@ impl RegisteredRootRegistry {
     }
 
     pub(crate) fn register(&self, directory: File) -> Result<RegisteredRootId> {
-        let metadata = directory
-            .metadata()
-            .context("inspect directory registered with descriptor session")?;
-        if !metadata.is_dir() {
-            bail!("only directories may be registered as session roots");
+        Ok(self.register_many(vec![directory])?.remove(0))
+    }
+
+    pub(crate) fn register_many(&self, directories: Vec<File>) -> Result<Vec<RegisteredRootId>> {
+        if directories.is_empty() {
+            return Ok(Vec::new());
+        }
+        for directory in &directories {
+            let metadata = directory
+                .metadata()
+                .context("inspect directory registered with descriptor session")?;
+            if !metadata.is_dir() {
+                bail!("only directories may be registered as session roots");
+            }
         }
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.roots.len() >= self.max_roots {
+        let new_len = state
+            .roots
+            .len()
+            .checked_add(directories.len())
+            .context("descriptor session root count overflow")?;
+        if new_len > self.max_roots {
             bail!(
                 "descriptor session root limit ({}) exceeded; split the operation into fewer distinct roots",
                 self.max_roots
             );
         }
-        let id = RegisteredRootId(state.next_id);
-        state.next_id = state
+        let count = u64::try_from(directories.len()).context("too many session roots")?;
+        let next_id = state
             .next_id
-            .checked_add(1)
+            .checked_add(count)
             .context("descriptor session exhausted root identifiers")?;
-        state.roots.insert(id, RegisteredRoot { directory });
-        Ok(id)
+        let first_id = state.next_id;
+        state.next_id = next_id;
+        let mut ids = Vec::with_capacity(directories.len());
+        for (offset, directory) in directories.into_iter().enumerate() {
+            let id = RegisteredRootId(first_id + offset as u64);
+            state.roots.insert(id, RegisteredRoot { directory });
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     /// Used by local workers and TCP workers hosted by the control process.
@@ -144,6 +171,15 @@ impl std::fmt::Debug for DescriptorTicket {
 impl DescriptorTicket {
     fn socket_path(&self) -> PathBuf {
         PathBuf::from(OsStr::from_bytes(&self.socket_path))
+    }
+
+    pub(crate) fn root_id(&self) -> RegisteredRootId {
+        self.root_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn broker_path(&self) -> PathBuf {
+        self.socket_path()
     }
 }
 
@@ -237,6 +273,13 @@ impl Default for DescriptorSessionSlot {
 
 impl DescriptorSessionSlot {
     pub(crate) fn register(&self, directory: File) -> Result<DescriptorTicket> {
+        Ok(self.register_many(vec![directory])?.remove(0))
+    }
+
+    pub(crate) fn register_many(&self, directories: Vec<File>) -> Result<Vec<DescriptorTicket>> {
+        if directories.is_empty() {
+            return Ok(Vec::new());
+        }
         if self.closed.load(Ordering::Acquire) {
             bail!("descriptor session is closed");
         }
@@ -254,8 +297,12 @@ impl DescriptorSessionSlot {
             )?);
         }
         let session = session.as_ref().expect("descriptor session initialized");
-        let root_id = session.register(directory)?;
-        session.ticket(root_id)
+        session
+            .registry
+            .register_many(directories)?
+            .into_iter()
+            .map(|root_id| session.ticket(root_id))
+            .collect()
     }
 
     pub(crate) fn acquire(&self, ticket: &DescriptorTicket) -> Result<File> {
@@ -668,6 +715,37 @@ mod tests {
         assert!(session.registry().acquire(first_id).is_ok());
         let error = session.register(File::open(&first).unwrap()).unwrap_err();
         assert!(error.to_string().contains("root limit (1) exceeded"));
+    }
+
+    #[test]
+    fn batch_registration_checks_capacity_before_consuming_any_root_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = DescriptorSession::start(1, 1).unwrap();
+        let error = session
+            .registry()
+            .register_many(vec![
+                File::open(temp.path()).unwrap(),
+                File::open(temp.path()).unwrap(),
+            ])
+            .unwrap_err();
+        assert!(error.to_string().contains("root limit (1) exceeded"));
+
+        let id = session.register(File::open(temp.path()).unwrap()).unwrap();
+        assert_eq!(id.get(), 1);
+    }
+
+    #[test]
+    fn repeated_inode_registrations_keep_distinct_authority_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = DescriptorSession::start(2, 1).unwrap();
+        let ids = session
+            .registry()
+            .register_many(vec![
+                File::open(temp.path()).unwrap(),
+                File::open(temp.path()).unwrap(),
+            ])
+            .unwrap();
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]

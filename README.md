@@ -238,13 +238,33 @@ the safer way to turn a link chain into an explicit operand.
 
 This is the native selection policy, not yet a complete hostile-namespace
 containment guarantee for copy. Native `rm` retains the resolved directories
-and selected identities through mutation. Copy gives every destination worker
-the selected directory descriptor; destination observation, directory and
-special-file creation, metadata changes, and planned non-recursive deletion
-are relative to that descriptor. Destination scanning, including the walk that
-plans `--delete`, is relative to it too and never follows descendant symlinks.
-Regular-file transfer state, along with ordinary source walks and reads, has
-not all moved to descriptor-relative access yet. The default therefore rejects
+and selected identities through mutation. Copy resolves and registers every
+selected source before destination mutation, and every source worker claims
+those exact directory or parent descriptors during authenticated startup,
+before it reports readiness. Source jobs and requests already carry the
+resulting opaque root ID plus strict relative bytes. This is deliberately
+inert transitional vocabulary: ordinary source scans, stats, hashes, and reads
+still execute the parallel legacy pathname field, and the registered reference
+is not an allowlist or confinement boundary yet. Worker startup validates the
+ticket/root correspondence and retains the exact descriptor; the source-role,
+request-reference, and descriptor-relative access boundary lands with the
+source-operation cutover. Copy also gives
+every destination worker the selected directory descriptor; destination
+observation, directory and special-file creation, metadata changes, and
+planned non-recursive deletion are relative to that descriptor. Destination
+scanning, including the walk that plans `--delete`, is relative to it too and
+never follows descendant symlinks.
+Source registration does not change `--files-from`'s documented treatment of
+symlinks in listed or implied paths; that policy is settled with the source-read
+cutover rather than by worker initialization.
+Registration also budgets the process's currently open descriptors, one
+retained descriptor per source root for the registry, control connection, and
+every worker that may share its process, plus conservative per-worker file
+cache and transport overhead. If the endpoint's open-file limit cannot hold
+that set, the copy fails before destination mutation with guidance to reduce
+selectors or `--connections`.
+Regular-file destination transfer state has not all moved to
+descriptor-relative access yet either. The default therefore rejects
 links present during preflight, while the remaining containment work must also
 prevent a concurrent rename or link substitution from redirecting those
 unmigrated operation families.

@@ -5,8 +5,9 @@
 //! flag bit 0 means the payload is zstd-compressed. Each writer decides
 //! independently whether to compress, readers always accept both.
 
-use crate::descriptor_broker::DescriptorTicket;
-use serde::{Deserialize, Serialize};
+use crate::descriptor_broker::{DescriptorTicket, RegisteredRootId};
+use anyhow::{bail, Result};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
@@ -30,6 +31,73 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
 
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
+
+/// Transitional, syntactically strict descriptor-relative path vocabulary.
+///
+/// In the initialization-only protocol this is carried beside a legacy
+/// pathname but is deliberately inert: it neither authorizes nor confines the
+/// operation. The source-operation cutover will make the registered reference
+/// authoritative after the worker has acquired its corresponding ticket.
+#[derive(Serialize, Clone, Debug, Eq, PartialEq)]
+pub struct RegisteredPath {
+    pub(crate) root: RegisteredRootId,
+    pub relative: PathBytes,
+}
+
+impl RegisteredPath {
+    pub(crate) fn new(root: RegisteredRootId, relative: PathBytes) -> Result<Self> {
+        validate_relative_path(&relative)?;
+        Ok(Self { root, relative })
+    }
+
+    pub(crate) fn root(&self) -> RegisteredRootId {
+        self.root
+    }
+
+    pub(crate) fn join(&self, relative: &[u8]) -> Result<Self> {
+        validate_relative_path(relative)?;
+        let mut joined = self.relative.clone();
+        if !joined.is_empty() && !relative.is_empty() {
+            joined.push(b'/');
+        }
+        joined.extend_from_slice(relative);
+        Self::new(self.root, joined)
+    }
+}
+
+impl<'de> Deserialize<'de> for RegisteredPath {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WirePath {
+            root: RegisteredRootId,
+            relative: PathBytes,
+        }
+        let wire = WirePath::deserialize(deserializer)?;
+        RegisteredPath::new(wire.root, wire.relative).map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_relative_path(path: &[u8]) -> Result<()> {
+    if path.starts_with(b"/") {
+        bail!("registered path must be relative");
+    }
+    if path.contains(&0) {
+        bail!("registered path contains NUL");
+    }
+    if path.is_empty() {
+        return Ok(());
+    }
+    if path
+        .split(|byte| *byte == b'/')
+        .any(|component| component.is_empty() || component == b"." || component == b"..")
+    {
+        bail!("registered path contains an unsafe component");
+    }
+    Ok(())
+}
 /// Full BLAKE3 digest used whenever content equality affects copy behavior.
 pub type ContentDigest = [u8; 32];
 
@@ -149,6 +217,9 @@ pub struct ContainerGuard {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallRead {
     pub path: PathBytes,
+    /// Inert registered spelling for `path`; execution remains pathname-based
+    /// until the descriptor source-read cutover.
+    pub source: Option<RegisteredPath>,
     pub attempt: u32,
     pub len: u32,
 }
@@ -274,13 +345,43 @@ pub struct DestinationRoot {
     pub request_prefix: PathBytes,
 }
 
+/// One operator source selection registered by the endpoint control session.
+/// `selection` is either empty beneath a selected directory or a literal leaf
+/// beneath its selected parent.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RegisteredSourceRoot {
+    pub ticket: DescriptorTicket,
+    pub selection: RegisteredPath,
+}
+
+impl RegisteredSourceRoot {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.ticket.root_id() != self.selection.root() {
+            bail!("source root ticket and registered path identify different roots");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SourceRootSelection {
+    pub path: PathBytes,
+    pub follow_root: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ConnectionRole {
     /// The one connection allowed to create endpoint-session capabilities and
     /// start its TCP data listener.
     Control,
-    /// A data connection used only to read a source endpoint.
-    SourceWorker,
+    /// A data connection reserved for reading a source endpoint. Request-time
+    /// source-role enforcement lands with the source-operation cutover.
+    SourceWorker {
+        /// Every registered source root is acquired before HelloOk. Local and
+        /// same-process TCP workers clone in process; a fresh SSH helper
+        /// finishes SCM_RIGHTS receipt while single-threaded.
+        roots: Vec<RegisteredSourceRoot>,
+    },
     /// A data connection used to mutate a destination endpoint. Unrestricted
     /// receivers require an exact registered root; restricted receivers derive
     /// their confinement from the signed grant and reject a supplied ticket.
@@ -311,6 +412,9 @@ pub enum Request {
     /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
     Scan {
         root: PathBytes,
+        /// Inert registered spelling of `root`; the source scanner cutover
+        /// makes it authoritative.
+        source: Option<RegisteredPath>,
         follow_root: bool,
         ignore: Vec<String>,
         report_ignored: bool,
@@ -330,6 +434,9 @@ pub enum Request {
     /// lstat each path; with `follow`, stat through symlinks instead.
     StatMany {
         paths: Vec<PathBytes>,
+        /// Inert registered spellings for source-side calls; these are not an
+        /// allowlist until the source stat cutover.
+        sources: Option<Vec<RegisteredPath>>,
         follow: bool,
         guard: Option<ContainerGuard>,
     },
@@ -339,6 +446,16 @@ pub enum Request {
         path: PathBytes,
         allow_missing: bool,
         symlink_policy: OperatorSymlinkPolicy,
+    },
+    /// Resolve every operator source selection, then atomically register its
+    /// opened directory or parent descriptor. Only a control connection may
+    /// create these endpoint-session capabilities.
+    RegisterSourceRoots {
+        selections: Vec<SourceRootSelection>,
+        symlink_policy: OperatorSymlinkPolicy,
+        /// Maximum source workers that can share the control helper process.
+        /// Zero still budgets the registry and control connection themselves.
+        shared_workers: usize,
     },
     /// Create the missing suffix retained by CheckOperatorDirectory, then
     /// return the selected directory's stable identity.
@@ -436,6 +553,9 @@ pub enum Request {
     },
     HashBlocks {
         path: PathBytes,
+        /// Inert registered spelling; the descriptor hash cutover makes it
+        /// authoritative.
+        source: Option<RegisteredPath>,
         which: Which,
         partial_id: PartialId,
         block: u64,
@@ -444,6 +564,9 @@ pub enum Request {
     },
     ReadRange {
         path: PathBytes,
+        /// Inert registered spelling; the descriptor read cutover makes it
+        /// authoritative.
+        source: Option<RegisteredPath>,
         attempt: u32,
         off: u64,
         len: u32,
@@ -474,6 +597,9 @@ pub enum Request {
     PutSmallBatch(Vec<SmallPut>),
     FileHash {
         path: PathBytes,
+        /// Inert registered spelling; the descriptor hash cutover makes it
+        /// authoritative.
+        source: Option<RegisteredPath>,
         guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
@@ -523,6 +649,7 @@ pub enum Response {
     /// directory, or None when an allowed missing suffix was reached.
     DirectorySelection(Option<DirectoryAnchor>),
     DestinationRegistered(DescriptorTicket),
+    SourceRootsRegistered(Vec<RegisteredSourceRoot>),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
     BatchPlan {
         partial_paths: Vec<std::result::Result<PathBytes, String>>,
@@ -797,5 +924,35 @@ mod tests {
             incompressible[4], 0,
             "an expanded compressed representation was selected"
         );
+    }
+
+    #[test]
+    fn registered_paths_reject_unsafe_wire_components() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session = crate::descriptor_broker::DescriptorSessionSlot::default();
+        let ticket = session
+            .register(std::fs::File::open(temporary.path()).unwrap())
+            .unwrap();
+        let root = ticket.root_id();
+        assert_eq!(
+            RegisteredPath::new(root, b"safe/non-utf8-\xff".to_vec())
+                .unwrap()
+                .relative,
+            b"safe/non-utf8-\xff"
+        );
+        for relative in [
+            b"/absolute".as_slice(),
+            b"a//b",
+            b".",
+            b"a/../b",
+            b"nul\0byte",
+        ] {
+            let invalid = RegisteredPath {
+                root,
+                relative: relative.to_vec(),
+            };
+            let encoded = postcard::to_allocvec(&invalid).unwrap();
+            assert!(postcard::from_bytes::<RegisteredPath>(&encoded).is_err());
+        }
     }
 }

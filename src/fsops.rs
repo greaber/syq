@@ -1,7 +1,9 @@
 //! Local filesystem operations. Used directly by the local endpoint and
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
-use crate::descriptor_broker::{DescriptorSessionSlot, DescriptorTicket};
+use crate::descriptor_broker::{
+    DescriptorSessionSlot, DescriptorTicket, RegisteredRootId, DEFAULT_MAX_ROOTS,
+};
 use crate::proto::*;
 use crate::rooted::{
     OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root, RootIdentity,
@@ -23,6 +25,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub const PARTIAL_MARKER: &str = ".syq-part.";
 const FD_CACHE_MAX: usize = 16;
+const SOURCE_FD_RESERVE: usize = 32;
+// A shared worker may fill its source file cache, retain five copies of its
+// transport socket in a TCP serving process, and open one uncached source file
+// for HashBlocks or FileHash. Those operations are sequential per worker, so
+// one uncached descriptor is the peak. Local source workers have no transport
+// themselves and retain only three client-side copies of a destination TCP
+// socket, but budget the larger remote-source shape for both shared variants.
+const SOURCE_TCP_TRANSPORT_FDS: usize = 5;
+const SOURCE_UNCACHED_FILE_FDS: usize = 1;
+const SOURCE_SHARED_WORKER_FD_RESERVE: usize =
+    FD_CACHE_MAX + SOURCE_TCP_TRANSPORT_FDS + SOURCE_UNCACHED_FILE_FDS;
 const COMMON_NAME_MAX: usize = 255;
 const COMPACT_HASH_BYTES: usize = 10;
 const NAME_MAX_CACHE_CAP: usize = 1024;
@@ -770,6 +783,92 @@ fn process_initial_cwd() -> PathBuf {
         .clone()
 }
 
+fn source_descriptor_requirement(
+    current_open: usize,
+    root_count: usize,
+    shared_workers: usize,
+) -> Result<usize> {
+    // Registry + control connection retain each root. Every shared local/TCP
+    // worker retains another descriptor; independent SSH workers pay that
+    // one-root-set cost in their own process. Add live process descriptors and
+    // per-worker cache/transport state separately: a fixed reserve alone does
+    // not grow with concurrency and can admit a setup that later hits EMFILE.
+    root_count
+        .checked_mul(
+            shared_workers
+                .checked_add(2)
+                .context("source worker count overflow")?,
+        )
+        .and_then(|count| {
+            SOURCE_SHARED_WORKER_FD_RESERVE
+                .checked_mul(shared_workers)
+                .and_then(|workers| count.checked_add(workers))
+        })
+        .and_then(|count| count.checked_add(SOURCE_FD_RESERVE))
+        .and_then(|count| count.checked_add(current_open))
+        .context("source descriptor requirement overflow")
+}
+
+/// Count a snapshot of the process's live descriptors. Reading an fd directory keeps
+/// the common Linux and Darwin paths proportional to the number of open
+/// descriptors. Its directory descriptor is visible in the listing, which is
+/// a harmless conservative overcount. The portable fallback scans the finite
+/// descriptor range and treats unexpected `fcntl` errors as open.
+fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<usize> {
+    for fd_directory in ["/proc/self/fd", "/dev/fd"] {
+        if let Ok(entries) = fs::read_dir(fd_directory) {
+            return Ok(entries.count());
+        }
+    }
+
+    let limit = usize::try_from(soft_limit).context("open-file limit does not fit usize")?;
+    let max_fd = usize::try_from(libc::c_int::MAX).expect("c_int maximum fits usize");
+    if limit > max_fd {
+        bail!("cannot conservatively inspect {limit} possible open descriptors on this platform");
+    }
+    let mut open = 0usize;
+    for fd in 0..limit {
+        let fd = fd as libc::c_int;
+        loop {
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
+                open += 1;
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() != Some(libc::EBADF) {
+                open += 1;
+            }
+            break;
+        }
+    }
+    Ok(open)
+}
+
+fn require_source_descriptor_capacity(root_count: usize, shared_workers: usize) -> Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error()).context("read source endpoint file limit");
+    }
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return Ok(());
+    }
+    let current_open = current_open_descriptor_count(limit.rlim_cur)?;
+    let required = source_descriptor_requirement(current_open, root_count, shared_workers)?;
+    if required as u128 > limit.rlim_cur as u128 {
+        bail!(
+            "source setup needs about {required} open-file slots ({current_open} currently open) for {root_count} roots and {shared_workers} shared workers, but this endpoint permits {}; reduce the number of source selectors or use a smaller explicit --connections value",
+            limit.rlim_cur
+        );
+    }
+    Ok(())
+}
+
 pub struct FsOps {
     fds: HashMap<FdKey, File>,
     fd_order: Vec<FdKey>,
@@ -778,6 +877,7 @@ pub struct FsOps {
     held_basis: Option<HeldBasis>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
+    source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
     initial_cwd: PathBuf,
@@ -787,6 +887,13 @@ struct HeldBasis {
     path: PathBuf,
     partial_id: PartialId,
     file: File,
+}
+
+struct SourceRootHandle {
+    _root: Arc<Root>,
+    /// Transitional selection spelling retained for the source-operation
+    /// cutover. It does not authorize the parallel legacy pathname yet.
+    _selection: PathBytes,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -828,6 +935,7 @@ impl FsOps {
             held_basis: None,
             operator_selection: None,
             descriptor_session,
+            source_roots: HashMap::new(),
             destination_root: None,
             destination_prefix: None,
             initial_cwd: process_initial_cwd(),
@@ -906,6 +1014,127 @@ impl FsOps {
     pub(crate) fn initialize_destination(&mut self, destination: &DestinationRoot) -> Result<()> {
         let directory = self.descriptor_session.acquire(&destination.ticket)?;
         self.install_destination(directory, &destination.request_prefix)
+    }
+
+    /// Resolve a batch completely before registering any of it. Each result is
+    /// represented by the smallest registration directory that preserves the
+    /// operator selection: the selected directory itself, or a selected
+    /// leaf's opened parent plus its literal name.
+    fn register_source_roots(
+        &mut self,
+        selections: &[SourceRootSelection],
+        symlink_policy: OperatorSymlinkPolicy,
+        shared_workers: usize,
+    ) -> Result<Vec<RegisteredSourceRoot>> {
+        if selections.is_empty() {
+            bail!("source registration requires at least one selection");
+        }
+        if selections.len() > DEFAULT_MAX_ROOTS {
+            bail!(
+                "source root count ({}) exceeds the endpoint-session limit ({DEFAULT_MAX_ROOTS})",
+                selections.len()
+            );
+        }
+        require_source_descriptor_capacity(selections.len(), shared_workers)?;
+        let mut resolved = Vec::with_capacity(selections.len());
+        for selection in selections {
+            let path = resolve(&selection.path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                self.initial_cwd.join(path)
+            };
+            let mut hops = Vec::new();
+            let pinned = OperatorResolver::resolve_process(
+                path.as_os_str().as_bytes(),
+                symlink_policy,
+                OperatorFinalComponent::Entry {
+                    follow_symlink: selection.follow_root,
+                },
+                false,
+                &mut hops,
+            )
+            .with_context(|| format!("resolve source selection {}", path.display()))?;
+            match pinned {
+                PinnedPath::Directory(directory) => {
+                    let (directory, _) = directory.into_parts();
+                    resolved.push((directory, Vec::new()));
+                }
+                PinnedPath::Leaf(leaf) => {
+                    let (parent, name, _, _) = leaf.into_parts();
+                    resolved.push((parent, name.as_bytes().to_vec()));
+                }
+                PinnedPath::Missing(_) => {
+                    unreachable!("source resolution did not allow a missing suffix")
+                }
+            }
+        }
+
+        let relative: Vec<_> = resolved
+            .iter()
+            .map(|(_, relative)| relative.clone())
+            .collect();
+        let tickets = self.descriptor_session.register_many(
+            resolved
+                .into_iter()
+                .map(|(directory, _)| directory)
+                .collect(),
+        )?;
+        let registered: Vec<_> = tickets
+            .into_iter()
+            .zip(relative)
+            .map(|(ticket, relative)| {
+                let selection = RegisteredPath::new(ticket.root_id(), relative)?;
+                Ok(RegisteredSourceRoot { ticket, selection })
+            })
+            .collect::<Result<_>>()?;
+        self.initialize_sources(&registered)?;
+        Ok(registered)
+    }
+
+    /// Acquire every registered source root before acknowledging worker
+    /// readiness. Local and same-process TCP workers clone from the shared
+    /// process registry; fresh SSH workers claim while still single-threaded.
+    /// Build the new table off to the side so a bad ticket cannot leave a
+    /// partially initialized worker.
+    pub(crate) fn initialize_sources(&mut self, sources: &[RegisteredSourceRoot]) -> Result<()> {
+        if sources.is_empty() {
+            bail!("source worker requires at least one registered root");
+        }
+        if sources.len() > DEFAULT_MAX_ROOTS {
+            bail!(
+                "source worker root count ({}) exceeds the endpoint-session limit ({DEFAULT_MAX_ROOTS})",
+                sources.len()
+            );
+        }
+        let mut roots = HashMap::with_capacity(sources.len());
+        for source in sources {
+            source.validate()?;
+            let id = source.selection.root();
+            if roots.contains_key(&id) {
+                bail!(
+                    "source worker received duplicate registered root {}",
+                    id.get()
+                );
+            }
+            let directory = self.descriptor_session.acquire(&source.ticket)?;
+            roots.insert(
+                id,
+                SourceRootHandle {
+                    _root: Arc::new(Root::from_directory(directory)?),
+                    _selection: source.selection.relative.clone(),
+                },
+            );
+        }
+        self.source_roots = roots;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn source_root_identity(&self, id: RegisteredRootId) -> Option<RootIdentity> {
+        self.source_roots
+            .get(&id)
+            .map(|source| source._root.identity())
     }
 
     fn install_destination(&mut self, directory: File, request_prefix: &[u8]) -> Result<()> {
@@ -1071,7 +1300,7 @@ impl FsOps {
             | Request::HashBlocks { path, guard, .. }
             | Request::WriteRange { path, guard, .. }
             | Request::Finalize { path, guard, .. }
-            | Request::FileHash { path, guard }
+            | Request::FileHash { path, guard, .. }
             | Request::Canonicalize { path, guard } => {
                 if guard.is_none() {
                     map(path)?;
@@ -1098,6 +1327,7 @@ impl FsOps {
             | Request::TcpListen { .. }
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
+            | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }
             | Request::TransportStats
@@ -3386,6 +3616,7 @@ impl FsOps {
                 paths,
                 follow,
                 guard,
+                ..
             } => Ok(Response::Stats(self.stat_many(
                 paths,
                 *follow,
@@ -3399,6 +3630,13 @@ impl FsOps {
                 .check_operator_directory(path, *allow_missing, *symlink_policy)
                 .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
                 .map(Response::DirectorySelection),
+            Request::RegisterSourceRoots {
+                selections,
+                symlink_policy,
+                shared_workers,
+            } => self
+                .register_source_roots(selections, *symlink_policy, *shared_workers)
+                .map(Response::SourceRootsRegistered),
             Request::CreateOperatorDirectory {
                 mode,
                 require_absent,
@@ -3535,6 +3773,7 @@ impl FsOps {
                 block,
                 len,
                 guard,
+                ..
             } => self
                 .hash_blocks(path, *which, partial_id, *block, *len, guard.as_ref())
                 .map(Response::Hashes),
@@ -3543,6 +3782,7 @@ impl FsOps {
                 attempt,
                 off,
                 len,
+                ..
             } => self.read_range(path, *attempt, *off, *len),
             Request::ReadSmallBatch(reads) => Ok(Response::SmallBlocks(
                 reads
@@ -3600,7 +3840,7 @@ impl FsOps {
                     },
                 )
                 .map(|_| Response::Ok),
-            Request::FileHash { path, guard } => self.file_hash(path, guard.as_ref()),
+            Request::FileHash { path, guard, .. } => self.file_hash(path, guard.as_ref()),
             Request::Canonicalize { path, guard } => {
                 if let Some(guard) = guard {
                     guarded_target(path, guard)
@@ -4657,5 +4897,159 @@ mod tests {
                 0xe4, 0x1f, 0x32, 0x62,
             ]
         );
+    }
+
+    #[test]
+    fn source_workers_adopt_registered_descriptor_after_path_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        let identity = fs::metadata(&selected).unwrap();
+        let session = DescriptorSessionSlot::default();
+        let mut control = FsOps::with_descriptor_session(session.clone());
+        let response = control.handle(&Request::RegisterSourceRoots {
+            selections: vec![SourceRootSelection {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            shared_workers: 0,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        let id = roots[0].selection.root();
+
+        fs::rename(&selected, temporary.path().join("moved")).unwrap();
+        fs::create_dir(&selected).unwrap();
+
+        let mut shared = FsOps::with_descriptor_session(session);
+        shared.initialize_sources(&roots).unwrap();
+        let mut fresh = FsOps::new();
+        fresh.initialize_sources(&roots).unwrap();
+        for worker in [&shared, &fresh] {
+            let adopted = worker.source_root_identity(id).unwrap();
+            assert_eq!((adopted.dev, adopted.ino), (identity.dev(), identity.ino()));
+        }
+        assert_ne!(
+            (
+                fs::metadata(&selected).unwrap().dev(),
+                fs::metadata(&selected).unwrap().ino()
+            ),
+            (identity.dev(), identity.ino())
+        );
+    }
+
+    #[test]
+    fn source_initialization_rejects_mismatched_bad_and_excess_roots_atomically() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let session = DescriptorSessionSlot::default();
+        let mut control = FsOps::with_descriptor_session(session.clone());
+        let response = control.handle(&Request::RegisterSourceRoots {
+            selections: vec![
+                SourceRootSelection {
+                    path: first.as_os_str().as_bytes().to_vec(),
+                    follow_root: false,
+                },
+                SourceRootSelection {
+                    path: second.as_os_str().as_bytes().to_vec(),
+                    follow_root: false,
+                },
+            ],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            shared_workers: 0,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+
+        let mut mismatched = roots[0].clone();
+        mismatched.selection = roots[1].selection.clone();
+        let mut worker = FsOps::with_descriptor_session(session.clone());
+        assert!(worker.initialize_sources(&[mismatched]).is_err());
+        assert!(worker.source_roots.is_empty());
+
+        session.close();
+        assert!(worker.initialize_sources(&roots).is_err());
+        assert!(worker.source_roots.is_empty());
+
+        let excess = vec![roots[0].clone(); DEFAULT_MAX_ROOTS + 1];
+        let error = worker.initialize_sources(&excess).unwrap_err();
+        assert!(error.to_string().contains("root count"));
+        assert!(worker.source_roots.is_empty());
+    }
+
+    #[test]
+    fn source_request_reference_is_inert_until_operation_cutover() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::write(&selected, b"selected").unwrap();
+        fs::write(temporary.path().join("sibling"), b"sibling").unwrap();
+        let session = DescriptorSessionSlot::default();
+        let mut control = FsOps::with_descriptor_session(session.clone());
+        let response = control.handle(&Request::RegisterSourceRoots {
+            selections: vec![SourceRootSelection {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            shared_workers: 0,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        assert_eq!(roots[0].selection.relative, b"selected");
+
+        let mut worker = FsOps::with_descriptor_session(session);
+        worker.initialize_sources(&roots).unwrap();
+        let sibling = RegisteredPath::new(roots[0].selection.root(), b"sibling".to_vec()).unwrap();
+        let response = worker.handle(&Request::StatMany {
+            paths: vec![temporary
+                .path()
+                .join("sibling")
+                .as_os_str()
+                .as_bytes()
+                .to_vec()],
+            // This intentionally does not correspond to the legacy pathname.
+            // The field is syntax-only until the source-stat cutover; treating
+            // it as a partial allowlist would create a bypassable boundary.
+            sources: Some(vec![sibling]),
+            follow: false,
+            guard: None,
+        });
+        let Response::Stats(stats) = response else {
+            panic!("unexpected stat response: {response:?}")
+        };
+        assert_eq!(stats.len(), 1);
+        assert!(stats[0].is_some());
+    }
+
+    #[test]
+    fn source_descriptor_budget_accounts_for_registry_control_and_workers() {
+        assert_eq!(SOURCE_SHARED_WORKER_FD_RESERVE, 16 + 5 + 1);
+        assert_eq!(
+            source_descriptor_requirement(7, 4, 3).unwrap(),
+            7 + SOURCE_FD_RESERVE + 4 * 5 + SOURCE_SHARED_WORKER_FD_RESERVE * 3
+        );
+        assert!(source_descriptor_requirement(0, usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn live_descriptor_snapshot_includes_this_process() {
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        if limits.rlim_cur != libc::RLIM_INFINITY {
+            assert!(current_open_descriptor_count(limits.rlim_cur).unwrap() >= 3);
+        }
     }
 }

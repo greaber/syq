@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -75,6 +76,73 @@ fn native_syq(args: &[&str]) -> Output {
         .arg("-q")
         .run()
         .expect("run native syq command")
+}
+
+#[test]
+fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creation() {
+    let t = Tmp::new();
+    write(&t.path("source"), &vec![b'x'; 8 * 1024 * 1024]);
+    let mut command = compat_command();
+    command.args([
+        "-a",
+        "--syq-connections",
+        "64",
+        "--no-progress",
+        &t.s("source"),
+        &t.s("destination"),
+    ]);
+    // Local and remote-TCP sources feed the same shared-worker count into FD
+    // admission. At 64 workers the complete model requires current_open +
+    // 1506 slots. Use a portable low limit here to verify that admission fails
+    // before destination creation; the exact per-worker arithmetic, including
+    // the uncached hash descriptor, is asserted in the FsOps unit test. The
+    // child must retain the lowered hard limit because syq normally raises a
+    // low soft limit to the inherited hard limit during startup. Never try to
+    // raise an inherited hard limit: supported environments commonly cap it
+    // at 1024. getrlimit/setrlimit are async-signal-safe on supported Unix.
+    unsafe {
+        command.pre_exec(|| {
+            let mut inherited = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let low_limit = inherited.rlim_max.min(128);
+            let limit = libc::rlimit {
+                rlim_cur: low_limit,
+                rlim_max: low_limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.run().unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("source setup needs about"), "{stderr}");
+    let required: usize = stderr
+        .split("source setup needs about ")
+        .nth(1)
+        .and_then(|tail| tail.split(" open-file slots").next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let current_open: usize = stderr
+        .split(" open-file slots (")
+        .nth(1)
+        .and_then(|tail| tail.split(" currently open)").next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(required, current_open + 1506, "{stderr}");
+    assert!(
+        !t.path("destination").exists(),
+        "source FD admission failed after destination creation"
+    );
 }
 
 fn run_native_ok(args: &[&str]) -> String {
