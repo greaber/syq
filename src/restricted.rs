@@ -1029,8 +1029,15 @@ impl RestrictedAuthority {
                     size,
                     inplace,
                     stage,
+                    skip_if_absent,
                 } => {
                     if state.ledger_v2.is_none() {
+                        continue;
+                    }
+                    // Observation-only Prepare replaces the old partial probe.
+                    // If no sidecar existed, it performed no file-lifecycle
+                    // mutation and must not create an incomplete receipt entry.
+                    if skip_if_absent && matches!(response, proto::Response::PartialSize(None)) {
                         continue;
                     }
                     let error = outcome_error(index);
@@ -2066,6 +2073,7 @@ impl RestrictedAuthority {
                     size: *len,
                     inplace: false,
                     stage: FileStageV2::Prepare,
+                    skip_if_absent: false,
                 });
                 *guard = Some(self.guard.clone());
             }
@@ -2099,6 +2107,7 @@ impl RestrictedAuthority {
                 size,
                 inplace,
                 partial_id,
+                create_if_missing,
                 guard,
                 ..
             } => {
@@ -2118,6 +2127,7 @@ impl RestrictedAuthority {
                     size: *size,
                     inplace: *inplace,
                     stage: FileStageV2::Prepare,
+                    skip_if_absent: !*create_if_missing,
                 });
                 if *inplace {
                     // In-place preparation resizes the final file itself:
@@ -2155,6 +2165,7 @@ impl RestrictedAuthority {
                     size: declared,
                     inplace: *inplace,
                     stage: FileStageV2::Write,
+                    skip_if_absent: false,
                 });
                 self.charge_bytes(path, *off, data.len())?;
                 *guard = Some(self.guard.clone());
@@ -2182,6 +2193,7 @@ impl RestrictedAuthority {
                     size: self.declared_size(path, *partial_id)?,
                     inplace: *inplace,
                     stage: FileStageV2::Finalize,
+                    skip_if_absent: false,
                 });
                 touched_v2.push(path.clone());
                 self.constrain_receiver_mode(
@@ -2194,8 +2206,10 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::PutSmallBatch(puts) => {
-                if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
-                    bail!("in-place signed receiver forbids staged small-file publication");
+                if self.copy.policy.publication != PublicationPolicy::AtomicStaged
+                    || puts.iter().any(|put| put.inplace)
+                {
+                    bail!("small-file publication does not match the signed publication policy");
                 }
                 if let Some(limit) = &self.file_data_limit {
                     let bytes = puts.iter().try_fold(0u64, |total, put| {
@@ -2319,6 +2333,9 @@ enum PendingOutcome {
         size: u64,
         inplace: bool,
         stage: FileStageV2,
+        /// Ignore a successful observation-only Prepare when it found no
+        /// resumable sidecar and therefore performed no lifecycle mutation.
+        skip_if_absent: bool,
     },
 }
 
@@ -4327,6 +4344,7 @@ mod tests {
                 mtime_nsec: 0,
             },
             flags: proto::flags::RECEIVER_MODE,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: Some(ContainerGuard {
                 root: outside,
@@ -4426,6 +4444,8 @@ mod tests {
             inplace: false,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let mut included_prepare = prepare(included);
@@ -4503,6 +4523,8 @@ mod tests {
             inplace: false,
             partial_id: [2; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let mut cache_root = prepare(cache.clone());
@@ -4531,6 +4553,8 @@ mod tests {
             inplace,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         let mut inplace = prepare(true);
@@ -4579,6 +4603,8 @@ mod tests {
             inplace: false,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         }
     }
@@ -4610,6 +4636,7 @@ mod tests {
             hash: crate::fsops::content_digest(b"new"),
             meta: plain_meta(),
             flags: 0,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: None,
         }])
@@ -4764,6 +4791,7 @@ mod tests {
             path: path_bytes(&kept),
             partial_id: [1; 16],
             len: 3,
+            attempt: 0,
             guard: None,
         };
         assert!(authority.authorize(&mut seed, false).is_err());
@@ -5361,6 +5389,62 @@ mod tests {
     }
 
     #[test]
+    fn observation_only_prepare_records_a_lifecycle_only_when_a_partial_exists() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let authority = test_authority_with_receipt(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((
+                generate_receipt_key(EnrollmentId::random()).unwrap(),
+                test_receipt_policy(),
+            )),
+        )
+        .unwrap();
+        let prepare = |path: &Path| {
+            let mut request = prepare_request(path);
+            let Request::Prepare {
+                create_if_missing, ..
+            } = &mut request
+            else {
+                unreachable!()
+            };
+            *create_if_missing = false;
+            request
+        };
+
+        let mut absent = prepare(&target.join("absent"));
+        let settlement = authority.authorize(&mut absent, false).unwrap();
+        authority.settle(settlement, &proto::Response::PartialSize(None));
+        assert!(authority
+            .state
+            .lock()
+            .unwrap()
+            .file_lifecycles_v2
+            .is_empty());
+
+        let present_path = target.join("present");
+        let mut present = prepare(&present_path);
+        let settlement = authority.authorize(&mut present, false).unwrap();
+        authority.settle(settlement, &proto::Response::PartialSize(Some(0)));
+        assert!(authority
+            .state
+            .lock()
+            .unwrap()
+            .file_lifecycles_v2
+            .contains_key(&(path_bytes(&present_path), [1; 16])));
+    }
+
+    #[test]
     fn receipt_v2_records_each_outcome_and_closure_state_then_encrypts_it() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
@@ -5406,6 +5490,7 @@ mod tests {
             hash: crate::fsops::content_digest(b"new"),
             meta: plain_meta(),
             flags: 0,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: None,
         };
@@ -6094,6 +6179,7 @@ mod tests {
                 mtime_nsec: 0,
             },
             flags: proto::flags::RECEIVER_MODE,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: None,
         };
@@ -6250,6 +6336,7 @@ mod tests {
             partial_id: [0; 16],
             block,
             len,
+            attempt: 0,
             guard: None,
         };
 
@@ -6301,6 +6388,8 @@ mod tests {
             inplace: false,
             partial_id: [0; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         authority.authorize(&mut prepare, false).unwrap();
@@ -6423,6 +6512,7 @@ mod tests {
                 mtime_nsec: 0,
             },
             flags: 0,
+            inplace: false,
             condition: proto::TargetCondition::Any,
             guard: None,
         }]);
@@ -6567,6 +6657,8 @@ mod tests {
             inplace: false,
             partial_id: [1; 16],
             mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
             guard: None,
         };
         authority.authorize(&mut prepare("a", 10), false).unwrap();
@@ -6582,6 +6674,7 @@ mod tests {
             path: root.join("target/b").as_os_str().as_bytes().to_vec(),
             partial_id: [1; 16],
             len: 3,
+            attempt: 0,
             guard: None,
         };
         assert!(authority.authorize(&mut seed, false).is_err());
@@ -6911,6 +7004,7 @@ mod tests {
             partial_id: [0; 16],
             block: 4096,
             len: 1,
+            attempt: 0,
             guard: Some(guard),
         });
         assert!(matches!(response, proto::Response::EndpointError(_)));

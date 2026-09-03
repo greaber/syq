@@ -1411,6 +1411,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
     let spawn_workers = |initial: usize| {
+        gate.set_active(initial);
         for id in gate.begin_warming(initial) {
             spawn_worker(id);
         }
@@ -2236,15 +2237,21 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
             } else {
-                let multiplex_small_files = !opts.verify_only
-                    && !opts.inplace
-                    && bwlimit.is_none()
-                    && sched
-                        .jobs
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .all(|job| job.entry.size <= opts.block && job.dst_entry.is_none());
+                let (multiplex_small_files, file_jobs) = {
+                    let jobs = sched.jobs.lock().unwrap();
+                    (
+                        !opts.verify_only
+                            && bwlimit.is_none()
+                            && jobs.iter().all(|job| {
+                                job.entry.size <= opts.block
+                                    && job.dst_entry.is_none()
+                                    && (!opts.inplace
+                                        || (job.target_condition == TargetCondition::Any
+                                            && job.container_guard.is_none()))
+                            }),
+                        jobs.len(),
+                    )
+                };
                 if multiplex_small_files {
                     for spec in [&src_ep, &dst_ep]
                         .into_iter()
@@ -2271,12 +2278,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             let jobs = sched.jobs.lock().unwrap();
                             matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
                         };
+                    let mut initial = if multiplex_small_files {
+                        args.connections
+                            .min(file_jobs.div_ceil(FAST_BATCH_FILES).max(1))
+                    } else {
+                        args.connections
+                    };
                     if single_direct_candidate {
                         sched.arm_direct_fallback(args.connections);
-                        args.connections = 1;
-                        gate.set_active(1);
+                        initial = 1;
                     }
-                    spawn_workers(args.connections);
+                    spawn_workers(initial);
                 }
             }
         }
@@ -6297,16 +6309,17 @@ impl Worker {
         }
     }
 
-    /// Small new files are sent without a per-file round trip: one pipelined
-    /// burst of reads and one of atomic sidecar writes — a few RTTs for the
-    /// whole batch.
+    /// Small new files are sent without a per-file protocol round trip. The
+    /// default publishes sidecars atomically; explicit --inplace batches write
+    /// final names directly when no placement guard requires staging.
     fn fast_eligible(&self, idx: usize) -> bool {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.verify_only
-            && !self.opts.inplace
             && j.entry.size <= self.transfer_block()
             && j.dst_entry.is_none()
+            && (!self.opts.inplace
+                || (j.target_condition == TargetCondition::Any && j.container_guard.is_none()))
     }
 
     fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
@@ -6402,6 +6415,7 @@ impl Worker {
                 hash,
                 meta,
                 flags,
+                inplace: self.opts.inplace,
                 condition: j.target_condition,
                 guard: j.container_guard.clone(),
             });
@@ -6612,37 +6626,6 @@ impl Worker {
         let inplace = self.opts.inplace
             && job.target_condition == TargetCondition::Any
             && job.container_guard.is_none();
-        // The planner already statted the final path. Only the deterministic
-        // sidecar needs another lookup before choosing the transfer basis.
-        // --inplace never uses that sidecar, so it avoids the lookup entirely.
-        let partial_size = if inplace {
-            None
-        } else {
-            let probed: Result<Option<u64>> = (|| match ok(
-                self.dst.call(Request::ProbePartial {
-                    path: job.dst.clone(),
-                    partial_id: self.partial_id(),
-                    guard: None,
-                })?,
-                "probe partial",
-            )? {
-                Response::PartialSize(size) => Ok(size),
-                other => bail!("unexpected response {other:?}"),
-            })();
-            match probed {
-                Ok(size) => size,
-                Err(error) => {
-                    self.sched.ranges_ready(idx, vec![]);
-                    if self.transport_dead() {
-                        self.sched.requeue(idx);
-                    }
-                    return Err(error);
-                }
-            }
-        };
-        if partial_size.is_some() {
-            self.sched.request_direct_fallback();
-        }
         // Same-machine copy: let the receiver move the bytes directly (kernel
         // offload, or one sequential writer for cross-mount NFS) instead of
         // framing, hashing and scheduling them through the transport.
@@ -6652,7 +6635,6 @@ impl Worker {
             && !self.opts.checksum
             && self.bwlimit.is_none()
             && job.entry.size > 0
-            && partial_size.is_none()
             && job.container_guard.is_none()
         {
             match self.try_copy_local(idx, &job) {
@@ -6696,35 +6678,33 @@ impl Worker {
             // the batched small-file path instead of reaching this worker path.
             self.set_inplace(idx, inplace);
 
+            // One receiver turn now both observes resumable state and prepares
+            // it. When a final-file basis exists, leave an absent sidecar
+            // absent until SeedBasis proves that bytes actually differ.
+            let partial_size = match ok(
+                self.dst.call(Request::Prepare {
+                    path: job.dst.clone(),
+                    size,
+                    inplace,
+                    partial_id: self.partial_id(),
+                    mode: self.create_mode(&job),
+                    attempt: job.attempts,
+                    create_if_missing: inplace || !final_is_file,
+                    guard: job.container_guard.clone(),
+                })?,
+                "prepare",
+            )? {
+                Response::PartialSize(size) => size,
+                other => bail!("unexpected response {other:?}"),
+            };
+
             if inplace {
-                ok(
-                    self.dst.call(Request::Prepare {
-                        path: job.dst.clone(),
-                        size,
-                        inplace: true,
-                        partial_id: self.partial_id(),
-                        mode: self.create_mode(&job),
-                        guard: job.container_guard.clone(),
-                    })?,
-                    "prepare",
-                )?;
                 if final_is_file && size > 0 {
                     return Ok((self.diff_blocks(&job, Which::Final)?, true));
                 }
                 return Ok((full(), true));
             }
             if partial_size.is_some() {
-                ok(
-                    self.dst.call(Request::Prepare {
-                        path: job.dst.clone(),
-                        size,
-                        inplace: false,
-                        partial_id: self.partial_id(),
-                        mode: self.create_mode(&job),
-                        guard: job.container_guard.clone(),
-                    })?,
-                    "prepare",
-                )?;
                 if size == 0 {
                     return Ok((vec![], true));
                 }
@@ -6753,23 +6733,13 @@ impl Worker {
                         path: job.dst.clone(),
                         partial_id: self.partial_id(),
                         len: size,
+                        attempt: job.attempts,
                         guard: job.container_guard.clone(),
                     })?,
                     "seed partial from destination basis",
                 )?;
                 return Ok((ranges, true));
             }
-            ok(
-                self.dst.call(Request::Prepare {
-                    path: job.dst.clone(),
-                    size,
-                    inplace: false,
-                    partial_id: self.partial_id(),
-                    mode: self.create_mode(&job),
-                    guard: job.container_guard.clone(),
-                })?,
-                "prepare",
-            )?;
             Ok((full(), true))
         })();
 
@@ -6931,6 +6901,7 @@ impl Worker {
                 partial_id: self.partial_id(),
                 block: self.opts.block,
                 len: job.entry.size,
+                attempt: job.attempts,
                 guard: None,
             },
             "hash destination",
@@ -6974,6 +6945,7 @@ impl Worker {
             partial_id: self.partial_id(),
             block,
             len: size,
+            attempt: job.attempts,
             guard: None,
         })?;
         self.dst.send(destination_request)?;
