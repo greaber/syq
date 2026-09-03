@@ -170,7 +170,10 @@ outlive its premise and steer later work in the wrong direction.
   documentation site published with GitHub Pages (mdBook, configured by
   `book.toml`; every page must be listed in `docs/SUMMARY.md`;
   `scripts/check-doc-links.py` checks links). `docs/reference.md` carries the
-  detailed behavior. The code is authoritative for everything else.
+  detailed behavior. Write these documents directly and conversationally, in
+  plain words; a reader should not need project jargon such as "retained" or
+  "the ordinary engine" to follow them. The code is authoritative for
+  everything else.
 - Distinguish explicit requirements from assumptions and design choices. If a
   supposed requirement creates substantial complexity, question the premise
   and look for a simpler interpretation. Ask the user when the answer would
