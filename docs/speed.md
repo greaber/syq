@@ -63,10 +63,13 @@ table](reference.md#compatibility-options)).
    control connection per host alive for five minutes between commands, so a
    series of small copies pays for authentication (and a hardware-token touch)
    once.
-8. **Metadata latency hidden, not multiplied.** Parallel stat and I/O hide the
-   per-operation latency of NFS, FUSE, and object-backed filesystems. Syq does
-   not do fewer metadata operations per file than rsync: staged publication
-   costs a rename per file, and it deliberately does not `fsync` transfer data.
+8. **Metadata round trips avoided or amortized.** Parallel stat and I/O hide the
+   per-operation latency of NFS, FUSE, and object-backed filesystems. Syq also
+   reuses syscall results instead of repeating type and identity checks, caches
+   filesystem traits and component limits, skips metadata updates whose values
+   already match, and lets NFS sidecars grow from data writes rather than
+   preallocating them. Staged publication still costs a rename per file, and syq
+   deliberately does not `fsync` transfer data.
 9. **One authentication for direct remote-to-remote transfers.** The default
    restricted path authenticates hostB once with the enrollment key and then
    runs token-authenticated TCP workers; `--agent-broker-only` instead pays an
@@ -325,9 +328,10 @@ tuning](server-tuning.md).
 
 Small files are read and written in pipelined batches, but every non-`--inplace`
 write still finishes with an atomic rename. When both ends are local, auto-tuning
-starts with 16 workers on a process limited to one or two CPUs, and 32 otherwise.
-This costs one rename per file on NFS, but avoids exposing incomplete final-named
-files. `--inplace` is the explicit space/safety tradeoff.
+starts with 16 workers on a process limited to one or two CPUs, and 32 otherwise;
+an all-new small-file job starts no more workers than it has batches. This costs
+one rename per file on NFS, but avoids exposing incomplete final-named files.
+`--inplace` is the explicit space/safety tradeoff.
 
 ## Same-machine copies (copy_file_range and NFS)
 

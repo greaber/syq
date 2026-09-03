@@ -755,6 +755,10 @@ fn serve_tcp(
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
 ) -> Result<()> {
+    // The listening socket is nonblocking so its owner can notice session
+    // shutdown. Darwin propagates that status flag to accepted sockets, while
+    // Linux does not. Framed connections use blocking I/O on every platform.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     // Scanners and stray connections must not hold a thread forever.
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;

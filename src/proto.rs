@@ -248,6 +248,9 @@ pub struct SmallPut {
     pub hash: ContentDigest,
     pub meta: Meta,
     pub flags: u8,
+    /// Write the final name directly. This is used only for the caller's
+    /// explicit --inplace policy; the default keeps atomic sidecar publication.
+    pub inplace: bool,
     pub condition: TargetCondition,
     pub guard: Option<ContainerGuard>,
 }
@@ -653,7 +656,10 @@ pub enum Request {
         partial_id: PartialId,
         guard: Option<ContainerGuard>,
     },
-    /// Create/adjust the write target for `path` with the given final size.
+    /// Inspect and, when requested, create/adjust the write target for `path`.
+    /// Returns PartialSize with the size observed before any adjustment. A
+    /// false `create_if_missing` lets content-identical final files complete
+    /// without ever allocating a sidecar.
     /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
     /// private until final metadata is applied immediately before publication.
     Prepare {
@@ -662,6 +668,8 @@ pub enum Request {
         inplace: bool,
         partial_id: PartialId,
         mode: u32,
+        attempt: u32,
+        create_if_missing: bool,
         guard: Option<ContainerGuard>,
     },
     /// Hash an existing final file and retain that open inode as the repair
@@ -690,6 +698,7 @@ pub enum Request {
         path: PathBytes,
         partial_id: PartialId,
         len: u64,
+        attempt: u32,
         guard: Option<ContainerGuard>,
     },
     /// Receiver-side copy of a same-machine file (copy_file_range when
@@ -714,6 +723,7 @@ pub enum Request {
         partial_id: PartialId,
         block: u64,
         len: u64,
+        attempt: u32,
         guard: Option<ContainerGuard>,
     },
     ReadRange {

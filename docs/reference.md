@@ -200,6 +200,13 @@ in that admission check. If the endpoint's open-file limit cannot hold that
 set, the copy fails before destination mutation with guidance to reduce
 selectors or `--connections`.
 
+The integration suite also exercises successful constrained runs rather than
+only the refusal calculation: one worker copies an 80-component tree with a
+96-descriptor hard limit, and copies ten distinct exact source selections with
+a 128-descriptor hard limit. These are regression ceilings for those workloads,
+not promised minimum limits; endpoint transports and the descriptors already
+open in the invoking environment remain part of admission.
+
 Placement is always explicit:
 
 | Placement | Mapping | Target precondition |
@@ -751,14 +758,17 @@ left, so the tail of a transfer stays parallel without pre-deciding chunk
 counts.
 
 On the receiving side a file that needs content changes is written beside its
-destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
-written with `pwrite` from several workers), given its metadata, and `rename`d
-over the target. Newly created sidecars are mode `0600`; final metadata is
-applied just before publication. On Linux, SYQ uses the sparse-length fallback
-only when `fallocate` is unsupported; actual space and quota failures remain
-errors and abort the whole transfer instead of letting later files keep filling
-the filesystem. When an existing final file is the comparison
-basis, the receiver retains that open descriptor while its blocks are hashed.
+target as `.name.syq-part.<job-id>`, written with `pwrite` from several workers,
+given its metadata, and `rename`d over the target. Eligible local filesystems
+preallocate fresh sidecars with `fallocate`; NFS sidecars grow from the data
+writes themselves so allocation and initial-size requests do not add
+metadata-server round trips. Newly created sidecars are mode `0600`; final
+metadata is applied just before publication. On Linux, local filesystems use
+the sparse-length fallback only when `fallocate` is unsupported; actual space
+and quota failures remain errors and abort the whole transfer instead of
+letting later files keep filling the filesystem. When an existing final file is
+the comparison basis, the receiver retains that open descriptor while its
+blocks are hashed.
 If every block matches, metadata is applied through the descriptor without
 allocating or publishing a sidecar; otherwise that exact descriptor seeds the
 sidecar.
@@ -766,13 +776,14 @@ The job ID is a 128-bit digest of the normalized source/destination mapping and
 content-affecting options, and is stable when the same logical command is
 rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
 semantics and block size, but not operational controls such as checksum
-checking, connection count, verbosity, progress or bandwidth limiting. Filesystem
-component limits are queried and cached per directory; long basenames are
-deterministically truncated and disambiguated to fit. An exceptionally long
-full path still fails that one file with a clear error (even when it is
-already up to date) while the rest of the transfer continues, and so does a
-destination entry — say, a directory some other tool left — already occupying
-the exact path this job's sidecar for that file needs. SYQ does not `fsync` transfer data;
+checking, connection count, verbosity, progress or bandwidth limiting.
+Filesystem component limits are queried once per observed filesystem and reused
+by missing descendants; long basenames are deterministically truncated and
+disambiguated to fit. An exceptionally long full path still fails that one file
+with a clear error (even when it is already up to date) while the rest of the
+transfer continues. The same is true when a destination entry — say, a directory
+some other tool left — already occupies the exact path this job's sidecar for
+that file needs. SYQ does not `fsync` transfer data;
 atomic sidecar publication provides old-or-new visibility and resumable
 interrupted work, not crash-durability across power loss.
 Small files still use a pipelined whole-file request, but the receiver writes
@@ -783,8 +794,9 @@ keeps its inode and any destination hardlinks. The same-host kernel-copy fast
 path may replace a byte-identical destination that failed the quick check,
 because it deliberately avoids that comparison.
 `--inplace` writes every file directly (for example, to update a large file
-without room for a second copy), so readers can observe partially updated
-contents and an interruption leaves the final file unfinished.
+without room for a second copy); eligible new small files retain the same
+pipelined batching without creating sidecars. Readers can observe partially
+updated contents and an interruption leaves the final file unfinished.
 
 Local → local runs the same machinery in-process with N threads, which helps
 on NFS and NVMe.

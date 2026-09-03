@@ -26,7 +26,7 @@
 
 use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Context, Result};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -35,8 +35,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
+const COMMON_NAME_MAX: usize = 255;
+const NAME_MAX_CACHE_CAP: usize = 1024;
 
 pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dest for destination paths, or --follow for all directly supplied filesystem paths";
 
@@ -904,6 +907,23 @@ impl Root {
         Ok(directory)
     }
 
+    /// Open the longest directory prefix without following a descendant
+    /// symlink. The count identifies how many components that prefix consumed.
+    /// A component that is missing, is not a directory, or cannot be inspected
+    /// ends the walk so best-effort callers can use the retained ancestor.
+    pub(crate) fn open_nearest_directory(&self, path: &RelativePath) -> Result<(File, usize)> {
+        let mut directory = self.directory.try_clone().context("duplicate root fd")?;
+        let mut consumed = 0;
+        for component in &path.components {
+            let Ok(next) = open_operator_directory_at(&directory, component) else {
+                break;
+            };
+            directory = next;
+            consumed += 1;
+        }
+        Ok((directory, consumed))
+    }
+
     /// Open a directory by its root-relative name and require that it is still
     /// the entry previously observed by a caller such as the tree scanner.
     pub(crate) fn open_directory_verified(
@@ -1176,6 +1196,29 @@ impl Root {
     /// suffixes are walked back to the nearest existing real directory, never
     /// through a symlink.
     pub(crate) fn name_max_for_parent(&self, path: &RelativePath) -> Result<usize> {
+        static CACHE: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        self.name_max_for_parent_cached(path, cache, &|directory| {
+            set_errno(0);
+            let limit = unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_NAME_MAX) };
+            if limit > 0 {
+                return Ok(limit as usize);
+            }
+            let errno = get_errno();
+            if errno == 0 {
+                return Ok(COMMON_NAME_MAX);
+            }
+            Err(io::Error::from_raw_os_error(errno))
+                .context("query confined directory component limit")
+        })
+    }
+
+    fn name_max_for_parent_cached(
+        &self,
+        path: &RelativePath,
+        cache: &Mutex<HashMap<u64, usize>>,
+        query: &impl Fn(&File) -> Result<usize>,
+    ) -> Result<usize> {
         let (parents, _) = path.leaf()?;
         let mut components = parents.to_vec();
         loop {
@@ -1184,18 +1227,21 @@ impl Root {
             };
             match self.open_directory(&candidate) {
                 Ok(directory) => {
-                    set_errno(0);
-                    let limit =
-                        unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_NAME_MAX) };
-                    if limit > 0 {
-                        return Ok(limit as usize);
+                    let device = directory.metadata()?.dev();
+                    // Serialize the first query too: PartialPaths resolves a
+                    // batch in parallel, and every worker must reuse the first
+                    // fpathconf result instead of issuing the same filesystem
+                    // round trip concurrently.
+                    let mut cache = cache.lock().unwrap();
+                    if let Some(limit) = cache.get(&device).copied() {
+                        return Ok(limit);
                     }
-                    let errno = get_errno();
-                    if errno == 0 {
-                        return Ok(255);
+                    let limit = query(&directory)?;
+                    if cache.len() >= NAME_MAX_CACHE_CAP {
+                        cache.clear();
                     }
-                    return Err(io::Error::from_raw_os_error(errno))
-                        .context("query confined directory component limit");
+                    cache.insert(device, limit);
+                    return Ok(limit);
                 }
                 Err(error) if missing_directory_suffix(&error) && !components.is_empty() => {
                     components.pop();
@@ -2369,7 +2415,7 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
@@ -2398,6 +2444,32 @@ mod tests {
 
     fn relative(path: &[u8]) -> RelativePath {
         RelativePath::new(path).unwrap()
+    }
+
+    #[test]
+    fn rooted_name_max_queries_each_filesystem_once() {
+        let tree = TestDir::new("name-max-cache");
+        fs::create_dir_all(tree.path().join("first")).unwrap();
+        fs::create_dir_all(tree.path().join("second")).unwrap();
+        let root = Root::open(tree.path()).unwrap();
+        let cache = Mutex::new(HashMap::new());
+        let queries = AtomicUsize::new(0);
+        let query = |_directory: &File| {
+            queries.fetch_add(1, Ordering::Relaxed);
+            Ok(143)
+        };
+
+        assert_eq!(
+            root.name_max_for_parent_cached(&relative(b"first/missing/file"), &cache, &query,)
+                .unwrap(),
+            143
+        );
+        assert_eq!(
+            root.name_max_for_parent_cached(&relative(b"second/file"), &cache, &query)
+                .unwrap(),
+            143
+        );
+        assert_eq!(queries.load(Ordering::Relaxed), 1);
     }
 
     #[test]
