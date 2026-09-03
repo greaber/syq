@@ -69,9 +69,9 @@ enum CompletionAction {
     /// Internal Bash entry point that preserves SSH word-break characters
     #[command(name = "__complete-bash", hide = true)]
     CompleteBash {
-        /// Byte offset of the cursor in the command line
-        point: usize,
-        /// Complete command line as supplied by Bash
+        /// Current fragment that Readline will replace
+        replacement: OsString,
+        /// Command line through the cursor, already sliced by Bash
         #[arg(last = true, allow_hyphen_values = true)]
         line: OsString,
     },
@@ -199,14 +199,17 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             };
             write_candidates(shell, candidates)?;
         }
-        CompletionAction::CompleteBash { point, line } => {
+        CompletionAction::CompleteBash { replacement, line } => {
             if std::env::var_os("SYQ_COMPLETION_DEBUG").is_none() {
                 silence_stderr()?;
             }
-            let (index, words) = bash_command_words(line.as_bytes(), point);
+            let (index, words) = bash_command_words(line.as_bytes());
+            let current = words.get(index).cloned().unwrap_or_default();
             let words: Vec<OsString> = words.into_iter().map(OsString::from_vec).collect();
             let candidates = match candidates(index, &words) {
-                Ok(candidates) => candidates,
+                Ok(candidates) => {
+                    bash_replacement_candidates(candidates, &current, replacement.as_bytes())
+                }
                 Err(error) => {
                     if std::env::var_os("SYQ_COMPLETION_DEBUG").is_some() {
                         eprintln!("syq completion: {error:#}");
@@ -393,9 +396,12 @@ fn lock_cache(parent: &Path, _directory: &File) -> Result<CacheLock> {
             path.display()
         );
     }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("lock completion cache {}", path.display()));
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            bail!("completion cache is busy; try again");
+        }
+        return Err(error).with_context(|| format!("lock completion cache {}", path.display()));
     }
     Ok(CacheLock(file))
 }
@@ -515,7 +521,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
 /// on bash-completion's `_get_comp_words_by_ref`. This intentionally performs
 /// lexical quote removal, not expansion: the result is the same kind of word
 /// spelling that Bash exposes to programmable completion.
-fn bash_command_words(line: &[u8], point: usize) -> (usize, Vec<Vec<u8>>) {
+fn bash_command_words(line: &[u8]) -> (usize, Vec<Vec<u8>>) {
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum Quote {
         None,
@@ -523,7 +529,6 @@ fn bash_command_words(line: &[u8], point: usize) -> (usize, Vec<Vec<u8>>) {
         Double,
     }
 
-    let line = &line[..point.min(line.len())];
     let mut words = Vec::new();
     let mut word = Vec::new();
     let mut started = false;
@@ -604,6 +609,30 @@ fn bash_command_words(line: &[u8], point: usize) -> (usize, Vec<Vec<u8>>) {
     (words.len().saturating_sub(1), words)
 }
 
+/// Bash replaces only the part after its last active word-break character.
+/// The completion engine works with the complete dequoted token, so trim the
+/// prefix Readline leaves in place before returning matches to Bash.
+fn bash_replacement_candidates(
+    mut candidates: Vec<Candidate>,
+    current: &[u8],
+    replacement: &[u8],
+) -> Vec<Candidate> {
+    let Some(prefix_length) = current
+        .strip_suffix(replacement)
+        .map(|prefix| prefix.len())
+        .filter(|length| *length > 0)
+    else {
+        return candidates;
+    };
+    let prefix = &current[..prefix_length];
+    for candidate in &mut candidates {
+        if candidate.value.starts_with(prefix) {
+            candidate.value.drain(..prefix_length);
+        }
+    }
+    candidates
+}
+
 fn root_candidates(current: &[u8]) -> Vec<Candidate> {
     [
         "cp",
@@ -675,6 +704,17 @@ enum ValueCompletion {
     LocalPath { directories_only: bool },
     Enum(&'static [&'static str]),
     None,
+}
+
+#[derive(Clone, Copy)]
+enum SourceBase<'a> {
+    Cwd(&'a [u8]),
+    Root(&'a [u8]),
+}
+
+struct CompletionDirectory {
+    path: Vec<u8>,
+    confined_root: Option<Vec<u8>>,
 }
 
 fn filesystem_command_candidates(
@@ -879,7 +919,7 @@ fn complete_source_path(
     current: &[u8],
     apply_base: bool,
 ) -> Result<Vec<Candidate>> {
-    let base = apply_base.then(|| source_base(args)).flatten();
+    let base = if apply_base { source_base(args) } else { None };
     if command == "map" {
         return Ok(local_path_candidates_at(current, false, base));
     }
@@ -892,10 +932,11 @@ fn complete_source_path(
     remote_path_candidates(command, args, endpoint, current, Vec::new(), base)
 }
 
-fn source_base(args: &[Vec<u8>]) -> Option<&[u8]> {
+fn source_base(args: &[Vec<u8>]) -> Option<SourceBase<'_>> {
     find_option_bytes(args, b"--root")
-        .or_else(|| find_option_bytes(args, b"--cwd"))
-        .or_else(|| find_option_bytes(args, b"-C"))
+        .map(SourceBase::Root)
+        .or_else(|| find_option_bytes(args, b"--cwd").map(SourceBase::Cwd))
+        .or_else(|| find_option_bytes(args, b"-C").map(SourceBase::Cwd))
 }
 
 fn complete_rsync_operand(args: &[Vec<u8>], current: &[u8]) -> Result<Vec<Candidate>> {
@@ -953,13 +994,15 @@ fn remote_path_candidates(
     endpoint: NativeEndpoint,
     current: &[u8],
     wrapper: Vec<u8>,
-    base: Option<&[u8]>,
+    base: Option<SourceBase<'_>>,
 ) -> Result<Vec<Candidate>> {
     if has_explicit_rsh(command, args) {
         return Ok(Vec::new());
     }
     let (directory, typed_directory, prefix) = split_path(current);
-    let directory = apply_path_base(base, &directory);
+    let Some(directory) = apply_path_base(base, &directory) else {
+        return Ok(Vec::new());
+    };
     let syq_path = find_option_value(
         args,
         if command == "rsync" {
@@ -979,7 +1022,8 @@ fn remote_path_candidates(
     );
     let pscope = pscope_from_args(command, args).map(PathBuf::from);
     let endpoint_for_thread = endpoint.clone();
-    let directory_for_thread = directory.clone();
+    let directory_for_thread = directory.path;
+    let root_for_thread = directory.confined_root;
     let prefix_for_thread = prefix.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -989,6 +1033,7 @@ fn remote_path_candidates(
             syq_path,
             no_bootstrap,
             directory_for_thread,
+            root_for_thread,
             prefix_for_thread,
         );
         let _ = sender.send(result);
@@ -1010,6 +1055,7 @@ fn fetch_remote_entries(
     syq_path: Option<String>,
     no_bootstrap: bool,
     directory: Vec<u8>,
+    confined_root: Option<Vec<u8>>,
     prefix: Vec<u8>,
 ) -> Result<Vec<CompletionEntry>> {
     let multiplexer = match crate::persistence::scope_for_implicit_ssh(pscope)? {
@@ -1051,6 +1097,7 @@ fn fetch_remote_entries(
     let mut connection = spec.connect_completion()?;
     match connection.call(Request::ListDir {
         directory,
+        confined_root,
         prefix: prefix.clone(),
         limit: MAX_DIRECTORY_CANDIDATES,
     })? {
@@ -1089,9 +1136,9 @@ fn local_path_candidates(current: &[u8], directories_only: bool) -> Vec<Candidat
 fn local_path_candidates_at(
     current: &[u8],
     directories_only: bool,
-    base: Option<&[u8]>,
+    base: Option<SourceBase<'_>>,
 ) -> Vec<Candidate> {
-    if current == b"~" {
+    if current == b"~" && !matches!(base, Some(SourceBase::Root(_))) {
         return std::env::var_os("HOME")
             .map(|_| vec![Candidate::prefix(b"~/".to_vec())])
             .unwrap_or_default();
@@ -1100,9 +1147,22 @@ fn local_path_candidates_at(
         return Vec::new();
     }
     let (directory, typed_directory, prefix) = split_path(current);
-    let directory = apply_path_base(base, &directory);
+    let Some(directory) = apply_path_base(base, &directory) else {
+        return Vec::new();
+    };
+    if let Some(root) = directory.confined_root.as_deref() {
+        let Ok(root) = std::fs::canonicalize(crate::fsops::resolve(root)) else {
+            return Vec::new();
+        };
+        let Ok(resolved) = std::fs::canonicalize(crate::fsops::resolve(&directory.path)) else {
+            return Vec::new();
+        };
+        if !resolved.starts_with(root) {
+            return Vec::new();
+        }
+    }
     let mut entries = Vec::new();
-    let Ok(items) = std::fs::read_dir(crate::fsops::resolve(&directory)) else {
+    let Ok(items) = std::fs::read_dir(crate::fsops::resolve(&directory.path)) else {
         return Vec::new();
     };
     for item in items.flatten() {
@@ -1128,26 +1188,66 @@ fn local_path_candidates_at(
     path_candidates_from_entries(&[], &typed_directory, &prefix, entries)
 }
 
-fn apply_path_base(base: Option<&[u8]>, directory: &[u8]) -> Vec<u8> {
+fn apply_path_base(base: Option<SourceBase<'_>>, directory: &[u8]) -> Option<CompletionDirectory> {
     let Some(base) = base else {
-        return directory.to_vec();
+        return Some(CompletionDirectory {
+            path: directory.to_vec(),
+            confined_root: None,
+        });
     };
-    if directory.starts_with(b"/")
-        || directory == b"~"
-        || directory.starts_with(b"~/")
-        || base.is_empty()
-    {
-        return directory.to_vec();
-    }
+    let (base, confined_root) = match base {
+        SourceBase::Cwd(base) => {
+            if directory.starts_with(b"/")
+                || directory == b"~"
+                || directory.starts_with(b"~/")
+                || base.is_empty()
+            {
+                return Some(CompletionDirectory {
+                    path: directory.to_vec(),
+                    confined_root: None,
+                });
+            }
+            (base, None)
+        }
+        SourceBase::Root(root) => {
+            if !root_relative_directory_is_safe(directory) {
+                return None;
+            }
+            (root, Some(root.to_vec()))
+        }
+    };
     if directory == b"." {
-        return base.to_vec();
+        return Some(CompletionDirectory {
+            path: base.to_vec(),
+            confined_root,
+        });
     }
     let mut joined = base.to_vec();
-    if !joined.ends_with(b"/") {
+    if !joined.is_empty() && !joined.ends_with(b"/") {
         joined.push(b'/');
     }
     joined.extend_from_slice(directory);
-    joined
+    Some(CompletionDirectory {
+        path: joined,
+        confined_root,
+    })
+}
+
+fn root_relative_directory_is_safe(directory: &[u8]) -> bool {
+    if directory.starts_with(b"/") || directory == b"~" || directory.starts_with(b"~/") {
+        return false;
+    }
+    let mut depth = 0usize;
+    for component in directory.split(|byte| *byte == b'/') {
+        match component {
+            b"" => return false,
+            b"." => {}
+            b".." if depth == 0 => return false,
+            b".." => depth -= 1,
+            _ => depth += 1,
+        }
+    }
+    true
 }
 
 fn split_path(value: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -1351,7 +1451,8 @@ fn has_explicit_rsh(command: &str, args: &[Vec<u8>]) -> bool {
         &[b"--rsh"]
     };
     args.iter().any(|argument| {
-        names.iter().any(|name| argument == *name)
+        (command == "rsync" && argument.starts_with(b"-e") && argument.len() > 2)
+            || names.iter().any(|name| argument == *name)
             || names.iter().any(|name| {
                 name.starts_with(b"--")
                     && argument.starts_with(name)
@@ -1411,7 +1512,7 @@ _syq_complete() {
         kind=${record:0:1}
         COMPREPLY+=("${record:1}")
         [[ $kind == p ]] && no_space=1
-    done < <(command syq completion __complete-bash "$COMP_POINT" -- "$COMP_LINE")
+    done < <(command syq completion __complete-bash "${COMP_WORDS[COMP_CWORD]-}" -- "${COMP_LINE:0:COMP_POINT}")
     compopt -o filenames 2>/dev/null || true
     (( no_space )) && compopt -o nospace 2>/dev/null || true
 }
@@ -1430,8 +1531,8 @@ _syq_complete() {
             values+=("${record[2,-1]}")
         fi
     done < <(command syq completion __complete zsh "$((CURRENT - 1))" -- "${words[@]}")
-    (( ${#values} )) && compadd -Q -- "${values[@]}"
-    (( ${#prefixes} )) && compadd -Q -S '' -- "${prefixes[@]}"
+    (( ${#values} )) && compadd -- "${values[@]}"
+    (( ${#prefixes} )) && compadd -S '' -- "${prefixes[@]}"
 }
 compdef _syq_complete syq
 "#;
@@ -1479,7 +1580,7 @@ mod tests {
     fn bash_line_parser_preserves_ssh_syntax_quotes_and_escapes() {
         let line = b"syq cp --cwd 'dir with spaces' user@host:some\\ path/fi";
         assert_eq!(
-            bash_command_words(line, line.len()),
+            bash_command_words(line),
             (
                 4,
                 vec![
@@ -1492,16 +1593,75 @@ mod tests {
             )
         );
         assert_eq!(
-            bash_command_words(b"printf x | syq rsync host:di", 29),
+            bash_command_words(b"printf x | syq rsync host:di"),
             (
                 2,
                 vec![b"syq".to_vec(), b"rsync".to_vec(), b"host:di".to_vec()]
             )
         );
         assert_eq!(
-            bash_command_words(b"syq cp ", 7),
+            bash_command_words(b"syq cp "),
             (2, vec![b"syq".to_vec(), b"cp".to_vec(), Vec::new()])
         );
+        assert_eq!(
+            bash_command_words("syq cp éa".as_bytes()),
+            (
+                2,
+                vec![b"syq".to_vec(), b"cp".to_vec(), "éa".as_bytes().to_vec()]
+            )
+        );
+    }
+
+    #[test]
+    fn bash_candidates_replace_only_the_fragment_after_a_word_break() {
+        let candidates = vec![
+            Candidate::text(b"host:dir/file".to_vec()),
+            Candidate::prefix(b"host:dir/nested/".to_vec()),
+        ];
+        let candidates = bash_replacement_candidates(candidates, b"host:di", b"di");
+        assert_eq!(candidates[0].value, b"dir/file");
+        assert!(!candidates[0].no_space);
+        assert_eq!(candidates[1].value, b"dir/nested/");
+        assert!(candidates[1].no_space);
+
+        assert_eq!(
+            values(bash_replacement_candidates(
+                vec![Candidate::text(b"--from=fake.example".to_vec())],
+                b"--from=fake",
+                b"fake",
+            )),
+            vec![b"fake.example".to_vec()]
+        );
+    }
+
+    #[test]
+    fn root_bases_reject_paths_that_can_escape_the_root() {
+        let root = Some(SourceBase::Root(b"/confined"));
+        assert!(apply_path_base(root, b"../sibling").is_none());
+        assert!(apply_path_base(root, b"/absolute").is_none());
+        assert!(apply_path_base(root, b"~/home").is_none());
+        assert_eq!(
+            apply_path_base(root, b"inside/..").map(|directory| directory.path),
+            Some(b"/confined/inside/..".to_vec())
+        );
+    }
+
+    #[test]
+    fn attached_rsync_rsh_options_disable_remote_completion() {
+        assert!(has_explicit_rsh("rsync", &[b"-efalse".to_vec()]));
+        assert!(has_explicit_rsh("rsync", &[b"--rsh=false".to_vec()]));
+        assert!(!has_explicit_rsh("cp", &[b"-efalse".to_vec()]));
+    }
+
+    #[test]
+    fn completion_cache_lock_fails_immediately_when_already_held() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = open_cache_directory(temporary.path(), true)
+            .unwrap()
+            .unwrap();
+        let _first = lock_cache(temporary.path(), &directory).unwrap();
+        let error = lock_cache(temporary.path(), &directory).err().unwrap();
+        assert!(error.to_string().contains("completion cache is busy"));
     }
 
     #[test]

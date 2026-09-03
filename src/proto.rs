@@ -546,6 +546,8 @@ pub enum Request {
     /// a read-only control-connection operation used by shell completion.
     ListDir {
         directory: PathBytes,
+        /// When present, the resolved directory must remain beneath this root.
+        confined_root: Option<PathBytes>,
         prefix: PathBytes,
         limit: u16,
     },
@@ -992,8 +994,11 @@ impl SizeHint for Request {
                     + 64
             }
             Request::ListDir {
-                directory, prefix, ..
-            } => directory.len() + prefix.len() + 32,
+                directory,
+                confined_root,
+                prefix,
+                ..
+            } => directory.len() + confined_root.as_ref().map_or(0, Vec::len) + prefix.len() + 32,
             _ => 256,
         }
     }

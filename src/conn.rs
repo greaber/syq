@@ -2453,6 +2453,7 @@ mod tests {
         let response = source
             .call(Request::ListDir {
                 directory: selected.as_os_str().as_bytes().to_vec(),
+                confined_root: None,
                 prefix: b"mar".to_vec(),
                 limit: 10,
             })

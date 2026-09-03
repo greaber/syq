@@ -2155,12 +2155,24 @@ impl FsOps {
     fn completion_entries(
         &self,
         directory: &[u8],
+        confined_root: Option<&[u8]>,
         prefix: &[u8],
         requested_limit: u16,
     ) -> Result<Response> {
         const MAX_COMPLETION_ENTRIES: usize = 1_000;
-        if directory.contains(&0) || prefix.contains(&0) || prefix.contains(&b'/') {
+        if directory.contains(&0)
+            || confined_root.is_some_and(|root| root.contains(&0))
+            || prefix.contains(&0)
+            || prefix.contains(&b'/')
+        {
             bail!("invalid completion directory or prefix");
+        }
+        if let Some(root) = confined_root {
+            let resolved_root = std::fs::canonicalize(resolve(root))?;
+            let resolved_directory = std::fs::canonicalize(resolve(directory))?;
+            if !resolved_directory.starts_with(&resolved_root) {
+                bail!("completion directory is outside the requested root");
+            }
         }
         let limit = usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES);
         if limit == 0 {
@@ -4933,9 +4945,10 @@ impl FsOps {
         let r: Result<Response> = match &req {
             Request::ListDir {
                 directory,
+                confined_root,
                 prefix,
                 limit,
-            } => self.completion_entries(directory, prefix, *limit),
+            } => self.completion_entries(directory, confined_root.as_deref(), prefix, *limit),
             Request::StatMany {
                 paths,
                 sources,

@@ -104,7 +104,7 @@ rm -f /tmp/syq-real-ssh-ssh.trace
 syq persist on >/dev/null
 completion_output=/tmp/syq-real-ssh-completion.out
 completion_expected=/tmp/syq-real-ssh-completion.expected
-for attempt in 1 2; do
+for _ in 1 2; do
     syq completion __complete fish 6 -- \
         syq cp --syq-path /usr/local/bin/syq --from source \
         /tmp/syq-real-ssh/completion/al >"$completion_output"

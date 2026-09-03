@@ -12029,6 +12029,8 @@ fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     fs::create_dir(t.path("alpine")).unwrap();
     fs::create_dir(t.path("source-base")).unwrap();
     write(&t.path("source-base/beta"), b"based source");
+    write(&t.path("éalpha"), b"unicode");
+    write(&t.path("ébeta"), b"unicode");
     let raw_name = std::ffi::OsString::from_vec(b"raw-\xff".to_vec());
     write(&t.path("").join(&raw_name), b"raw");
 
@@ -12050,12 +12052,21 @@ fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     let syntax = syntax.wait_with_output().unwrap();
     assert_output_ok(&syntax);
 
+    let zsh = completion_command(&t, &["zsh"]).run().unwrap();
+    assert_output_ok(&zsh);
+    let zsh = String::from_utf8(zsh.stdout).unwrap();
+    assert!(!zsh.contains("compadd -Q"), "{zsh}");
+    assert!(zsh.contains("compadd --"), "{zsh}");
+    assert!(zsh.contains("compadd -S '' --"), "{zsh}");
+
     let registered = Command::new("bash")
         .arg("-c")
         .arg(
             r#"source <("$SYQ" completion bash)
 COMP_LINE='syq c'
 COMP_POINT=${#COMP_LINE}
+COMP_WORDS=(syq c)
+COMP_CWORD=1
 _syq_complete
 printf '%s\n' "${COMPREPLY[@]}"
 complete -p syq"#,
@@ -12081,6 +12092,39 @@ complete -p syq"#,
         "{registered}"
     );
     assert!(registered.contains("complete -F _syq_complete syq"));
+
+    let unicode = Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"source <("$SYQ" completion bash)
+COMP_LINE='syq cp éa'
+COMP_POINT=${#COMP_LINE}
+COMP_WORDS=(syq cp éa)
+COMP_CWORD=2
+_syq_complete
+printf '%s\n' "${COMPREPLY[@]}""#,
+        )
+        .current_dir(t.path(""))
+        .env("LC_ALL", "C.utf8")
+        .env("SYQ", env!("CARGO_BIN_EXE_syq"))
+        .env("HOME", t.path("home"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin",
+                Path::new(env!("CARGO_BIN_EXE_syq"))
+                    .parent()
+                    .unwrap()
+                    .display()
+            ),
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&unicode);
+    assert_eq!(unicode.stdout, "éalpha\n".as_bytes());
 
     let prefix = t.s("al");
     let output = completion_command(&t, &["__complete", "bash", "2", "--", "syq", "cp", &prefix])
@@ -12150,6 +12194,47 @@ complete -p syq"#,
         completion_values(&based.stdout),
         vec![(b'f', b"beta".to_vec())]
     );
+
+    let rooted = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "4",
+            "--",
+            "syq",
+            "cp",
+            "--root",
+            &t.s("source-base"),
+            "b",
+        ],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&rooted);
+    assert_eq!(
+        completion_values(&rooted.stdout),
+        vec![(b'f', b"beta".to_vec())]
+    );
+
+    let escaped_root = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "4",
+            "--",
+            "syq",
+            "cp",
+            "--root",
+            &t.s("source-base"),
+            "../al",
+        ],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&escaped_root);
+    assert!(completion_values(&escaped_root.stdout).is_empty());
 }
 
 #[test]
@@ -12246,6 +12331,42 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
         ]
     );
 
+    let rooted = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "8",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            executable,
+            "--from",
+            "fake.example",
+            "--root",
+            &t.s("remote-home/data"),
+            "n",
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&rooted);
+    assert_eq!(
+        completion_values(&rooted.stdout),
+        vec![
+            (b'f', b"name with spaces".to_vec()),
+            (b'p', b"nested/".to_vec()),
+        ]
+    );
+
     let destination = completion_command(
         &t,
         &[
@@ -12331,6 +12452,104 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
         ]
     );
 
+    let bash_rsync_line = format!("syq rsync --rsync-path {executable} {remote_operand}");
+    let bash_rsync = completion_command(&t, &["__complete-bash", &path, "--", &bash_rsync_line])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&bash_rsync);
+    assert_eq!(
+        completion_values(&bash_rsync.stdout),
+        vec![
+            (
+                b'f',
+                t.path("remote-home/data/name with spaces")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+            (
+                b'p',
+                t.path("remote-home/data/nested/")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+        ]
+    );
+
+    let ssh_log_length = fs::metadata(t.path("rsh.log")).unwrap().len();
+    let explicit_rsh = completion_command(
+        &t,
+        &[
+            "__complete",
+            "fish",
+            "5",
+            "--",
+            "syq",
+            "rsync",
+            "--rsync-path",
+            executable,
+            "-efalse",
+            &remote_operand,
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&explicit_rsh);
+    assert!(explicit_rsh.stdout.is_empty());
+    assert_eq!(
+        fs::metadata(t.path("rsh.log")).unwrap().len(),
+        ssh_log_length
+    );
+
+    let escaped_root = completion_command(
+        &t,
+        &[
+            "__complete",
+            "fish",
+            "8",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            executable,
+            "--from",
+            "fake.example",
+            "--root",
+            &t.s("remote-home/data"),
+            "../n",
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&escaped_root);
+    assert!(escaped_root.stdout.is_empty());
+    assert_eq!(
+        fs::metadata(t.path("rsh.log")).unwrap().len(),
+        ssh_log_length
+    );
+
     let listed = completion_command(&t, &["cache", "list"]).run().unwrap();
     assert_output_ok(&listed);
     assert_eq!(listed.stdout, b"fake.example\n");
@@ -12354,6 +12573,14 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     .unwrap();
     assert_output_ok(&suggested);
     assert!(completion_values(&suggested.stdout)
+        .iter()
+        .any(|candidate| candidate == &(b'f', b"fake.example".to_vec())));
+
+    let inline = completion_command(&t, &["__complete-bash", "fake", "--", "syq cp --from=fake"])
+        .run()
+        .unwrap();
+    assert_output_ok(&inline);
+    assert!(completion_values(&inline.stdout)
         .iter()
         .any(|candidate| candidate == &(b'f', b"fake.example".to_vec())));
 
