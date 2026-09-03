@@ -1051,6 +1051,42 @@ impl Root {
         })
     }
 
+    /// Atomically publish a staged regular file with ordinary rename
+    /// replacement semantics. Both parents are retained before the rename, so
+    /// a concurrent ancestor replacement cannot redirect either side. A later
+    /// writer is never rolled back: post-rename validation can report a race,
+    /// but it must not mutate the target name again.
+    pub(crate) fn rename_regular_if_same(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+        staged_identity: (u64, u64),
+    ) -> Result<()> {
+        let (staged_dev, staged_ino) = staged_identity;
+        let (source_parent, target_parent) = self.resolve_publish_parents(source, target)?;
+        let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+        require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
+        retry_zero(|| unsafe {
+            libc::renameat(
+                source_parent.directory.as_raw_fd(),
+                source_parent.leaf.as_ptr(),
+                target_parent.directory.as_raw_fd(),
+                target_parent.leaf.as_ptr(),
+            )
+        })
+        .with_context(|| format!("publish confined path {}", target.label()))?;
+        #[cfg(test)]
+        run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAnyRename);
+        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
+        if !is_safe_staged_identity(published, staged_dev, staged_ino) {
+            bail!(
+                "confined staged path {} changed during publication",
+                source.label()
+            );
+        }
+        Ok(())
+    }
+
     /// Publish a staged regular file only if the target name is still absent.
     /// The hard link makes the final name visible atomically without replacing
     /// a raced target; removing the staged name leaves one link on success.
@@ -1058,16 +1094,12 @@ impl Root {
         &self,
         source: &RelativePath,
         target: &RelativePath,
+        staged_identity: (u64, u64),
     ) -> Result<()> {
-        let source_parent = self.resolve_parent(source)?;
-        let target_parent = self.resolve_parent(target)?;
+        let (staged_dev, staged_ino) = staged_identity;
+        let (source_parent, target_parent) = self.resolve_publish_parents(source, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
-        if !staged.is_file() {
-            bail!(
-                "confined staged path {} is not a regular file",
-                source.label()
-            );
-        }
+        require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
         retry_zero(|| unsafe {
             libc::linkat(
                 source_parent.directory.as_raw_fd(),
@@ -1084,6 +1116,15 @@ impl Root {
                 target.label()
             )
         })?;
+        #[cfg(test)]
+        run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAbsentLink);
+        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
+        if !is_safe_staged_identity_after_link(published, staged_dev, staged_ino) {
+            bail!(
+                "confined staged path {} changed during publication",
+                source.label()
+            );
+        }
         unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
             .with_context(|| format!("remove staged confined path {}", source.label()))
     }
@@ -1148,6 +1189,28 @@ impl Root {
         }
         unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
             .with_context(|| format!("remove displaced confined path {}", target.label()))
+    }
+
+    fn resolve_publish_parents(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+    ) -> Result<(ResolvedParent, ResolvedParent)> {
+        let (source_parents, _) = source.leaf()?;
+        let (target_parents, target_leaf) = target.leaf()?;
+        let source_parent = self.resolve_parent(source)?;
+        let target_parent = if source_parents == target_parents {
+            ResolvedParent {
+                directory: source_parent
+                    .directory
+                    .try_clone()
+                    .context("duplicate publication parent fd")?,
+                leaf: component_cstring(target_leaf),
+            }
+        } else {
+            self.resolve_parent(target)?
+        };
+        Ok((source_parent, target_parent))
     }
 
     /// Remove a non-directory leaf. Symlinks are removed themselves, never
@@ -1607,6 +1670,120 @@ fn require_regular(file: &File, path: &RelativePath) -> Result<()> {
         bail!("confined path {} is not a regular file", path.label());
     }
     Ok(())
+}
+
+fn is_safe_staged_identity(metadata: RootMetadata, expected_dev: u64, expected_ino: u64) -> bool {
+    metadata.is_file()
+        && metadata.nlink == 1
+        && metadata.dev == expected_dev
+        && metadata.ino == expected_ino
+}
+
+fn is_safe_staged_identity_after_link(
+    metadata: RootMetadata,
+    expected_dev: u64,
+    expected_ino: u64,
+) -> bool {
+    metadata.is_file()
+        && metadata.nlink == 2
+        && metadata.dev == expected_dev
+        && metadata.ino == expected_ino
+}
+
+fn require_safe_staged_identity(
+    metadata: RootMetadata,
+    expected_dev: u64,
+    expected_ino: u64,
+    path: &RelativePath,
+) -> Result<()> {
+    if !is_safe_staged_identity(metadata, expected_dev, expected_ino) {
+        bail!(
+            "confined staged path {} is not the expected singly-linked regular file",
+            path.label()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PublicationTestPoint {
+    AfterAnyRename,
+    AfterAbsentLink,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PublicationTestHookKey {
+    root: RootIdentity,
+    target: RelativePath,
+    point: PublicationTestPoint,
+}
+
+#[cfg(test)]
+type PublicationTestAction = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+fn publication_test_hooks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<PublicationTestHookKey, PublicationTestAction>,
+> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PublicationTestHookKey, PublicationTestAction>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+struct PublicationTestHookGuard(PublicationTestHookKey);
+
+#[cfg(test)]
+impl Drop for PublicationTestHookGuard {
+    fn drop(&mut self) {
+        publication_test_hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+fn install_publication_test_hook(
+    root: RootIdentity,
+    target: &RelativePath,
+    point: PublicationTestPoint,
+    action: impl FnOnce() + Send + 'static,
+) -> PublicationTestHookGuard {
+    let key = PublicationTestHookKey {
+        root,
+        target: target.clone(),
+        point,
+    };
+    let previous = publication_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Box::new(action));
+    assert!(previous.is_none(), "duplicate publication test hook");
+    PublicationTestHookGuard(key)
+}
+
+#[cfg(test)]
+fn run_publication_test_hook(
+    root: RootIdentity,
+    target: &RelativePath,
+    point: PublicationTestPoint,
+) {
+    let key = PublicationTestHookKey {
+        root,
+        target: target.clone(),
+        point,
+    };
+    let action = publication_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    if let Some(action) = action {
+        action();
+    }
 }
 
 #[cfg(test)]
@@ -2234,6 +2411,65 @@ mod tests {
         let new_fifo = root.metadata(&fifo).unwrap();
         assert_eq!(new_fifo.file_type(), MODE_FIFO);
         assert_ne!(new_fifo.ino, old_fifo.ino);
+    }
+
+    #[test]
+    fn any_publication_never_rolls_back_a_later_writer() {
+        let tree = TestDir::new("any-publication-race");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_file = File::open(tree.path().join("staged")).unwrap();
+        let metadata = staged_file.metadata().unwrap();
+
+        let target_path = tree.path().join("target");
+        let _hook = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::AfterAnyRename,
+            move || {
+                fs::remove_file(&target_path).unwrap();
+                fs::write(&target_path, b"later").unwrap();
+            },
+        );
+        let error = root
+            .rename_regular_if_same(&staged, &target, (metadata.dev(), metadata.ino()))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed during publication"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
+        assert!(!tree.path().join("staged").exists());
+        assert_eq!(metadata.ino(), staged_file.metadata().unwrap().ino());
+    }
+
+    #[test]
+    fn absent_publication_never_unlinks_a_later_writer() {
+        let tree = TestDir::new("absent-publication-race");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        let metadata = fs::metadata(tree.path().join("staged")).unwrap();
+
+        let target_path = tree.path().join("target");
+        let _hook = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::AfterAbsentLink,
+            move || {
+                fs::remove_file(&target_path).unwrap();
+                fs::write(&target_path, b"later").unwrap();
+            },
+        );
+        let error = root
+            .publish_new_regular(&staged, &target, (metadata.dev(), metadata.ino()))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed during publication"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
+        assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"staged");
     }
 
     #[test]

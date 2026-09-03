@@ -242,9 +242,10 @@ and selected identities through mutation. Copy gives every destination worker
 the selected directory descriptor; destination observation, directory and
 special-file creation, metadata changes, and planned non-recursive deletion
 are relative to that descriptor. Regular-file probing, preparation, basis
-holding and seeding, and destination block hashing are descriptor-relative as
-well. Destination scanning, small and ranged writes, publication, ordinary
-source walks and reads, and same-machine copy have not all moved to
+holding and seeding, destination block hashing, ranged and small writes,
+finalization, sidecar cleanup, and publication also stay beneath that retained
+descriptor. Destination scanning and the same-machine `CopyLocal` shortcut,
+along with ordinary source walks and reads, have not all moved to
 descriptor-relative access yet. The default therefore rejects links present
 during preflight, while the remaining containment work must also prevent a
 concurrent rename or link substitution from redirecting those unmigrated
@@ -261,12 +262,14 @@ Placement is always explicit in this initial native surface:
 | `--as-new PATH` | Map one named source exactly to `PATH` | Must not exist |
 | `--as-existing PATH` | Map one named source exactly to `PATH` | Must exist |
 
-The `new` and `existing` forms are lightweight placement-root pathname checks
-during the ordinary initial destination inspection. A mismatch fails before
-transfer mutation begins. After a successful check, the current engine's
-ordinary pathname and publication behavior applies: these forms do not pin an
-inode or provide compare-and-swap behavior against a concurrent namespace
-writer. Changed regular files continue to use staged atomic publication.
+The `new` and `existing` forms are checked during the ordinary initial
+destination inspection. A mismatch fails before transfer mutation begins, and
+the selected destination directory remains pinned while workers operate on
+strict relative names. Conditional regular-file updates and staged publication
+then verify the observed target identity instead of following a replaced name.
+This is not a namespace snapshot: an unconditional placement may still replace
+the non-directory entry present when it publishes. Changed regular files
+continue to use staged atomic publication.
 Mapping a non-directory source exactly onto an existing directory is rejected
 during the source's first scan batch, in both dry-run and execution. On the
 command-restricted remote-to-remote path the precondition is also signed: the
