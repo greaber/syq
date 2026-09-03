@@ -783,7 +783,16 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
         &t.s("never-created"),
     ]);
     assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
+    let stderr = stderr_of(&refused);
+    assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
+    assert!(
+        stderr.contains("--follow-dest for destination paths"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--follow for all directly supplied filesystem paths"),
+        "{stderr}"
+    );
     assert!(!t.path("never-created").exists());
 }
 
@@ -855,7 +864,11 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
         &t.s("control-refused"),
     ]);
     assert!(!control_refused.status.success());
-    assert!(stderr_of(&control_refused).contains("pass --follow"));
+    let stderr = stderr_of(&control_refused);
+    assert!(
+        stderr.contains("--follow for all directly supplied filesystem paths"),
+        "{stderr}"
+    );
     assert!(!t.path("control-refused").exists());
 }
 
@@ -966,7 +979,11 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     symlink("real-parent", t.path("parent-link")).unwrap();
     let refused = native_syq(&["cp", &t.s("source"), "--as", &t.s("parent-link/exact-name")]);
     assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("--follow-dest for destination paths"),
+        "{stderr}"
+    );
     assert!(!t.path("real-parent/exact-name").exists());
     run_native_ok(&[
         "cp",
@@ -1291,7 +1308,8 @@ fn native_rm_refuses_an_intermediate_symlink_before_mutating_any_selector() {
         "link/file",
     ]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("pass --follow"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
     assert_eq!(read(&t.path("victim")), b"keep");
     assert_eq!(read(&t.path("real/file")), b"keep");
     assert!(t.path("link").is_symlink());
@@ -8450,7 +8468,12 @@ fn native_map_uses_the_common_source_follow_policy() {
 
     let refused = syq_map_in(&t.path(""), &["--src-src", "link"]);
     assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(stderr_of(&refused).contains("--follow-src"));
+
+    let intermediate = syq_map_in(&t.path(""), &["--src", "link/file"]);
+    assert!(!intermediate.status.success());
+    let stderr = stderr_of(&intermediate);
+    assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
 
     let lines = map_lines(&syq_map_in(
         &t.path(""),
