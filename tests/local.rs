@@ -6856,6 +6856,128 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn destination_prune_scan_uses_retained_root_after_replacement() {
+    for no_tcp in [false, true] {
+        let t = Tmp::new();
+        fs::create_dir_all(t.path("src")).unwrap();
+        write(&t.path("dst/extra"), b"extra");
+        write(&t.path("outside/sentinel"), b"outside");
+        let ready = t.path("anchor-ready");
+
+        let mut command = compat_command();
+        command.args([
+            "-a",
+            "--delete",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
+        if no_tcp {
+            command.arg("--syq-no-tcp");
+        }
+        let mut child = command
+            .arg("--no-progress")
+            .env("SYQ_TEST_DESTINATION_ANCHORED_FILE", &ready)
+            .env("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS", "750")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before retaining the destination root"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "destination root was not retained before timeout"
+        );
+
+        fs::rename(t.path("dst"), t.path("selected-and-moved")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        assert!(!t.path("selected-and-moved/extra").exists());
+        assert_eq!(read(&t.path("outside/sentinel")), b"outside");
+        assert!(fs::symlink_metadata(t.path("dst"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn destination_prune_scan_refuses_descendant_symlink_swap() {
+    for no_tcp in [false, true] {
+        let t = Tmp::new();
+        fs::create_dir_all(t.path("src/victim")).unwrap();
+        write(&t.path("dst/victim/extra"), b"extra");
+        write(&t.path("outside/sentinel"), b"outside");
+        let ready = t.path("scan-ready");
+
+        let mut command = compat_command();
+        command.args([
+            "-a",
+            "--delete",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
+        if no_tcp {
+            command.arg("--syq-no-tcp");
+        }
+        let mut child = command
+            .arg("--no-progress")
+            .env("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY", "victim")
+            .env("SYQ_TEST_DESTINATION_SCAN_DIRECTORY_READY_FILE", &ready)
+            .env("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY_MS", "750")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before reaching the descendant directory scan"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "destination descendant scan was not reached before timeout"
+        );
+
+        fs::rename(t.path("dst/victim"), t.path("displaced-victim")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("dst/victim")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+        assert!(
+            stderr_of(&output).contains("delete victim/extra"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(read(&t.path("outside/sentinel")), b"outside");
+        assert_eq!(read(&t.path("displaced-victim/extra")), b"extra");
+        assert!(fs::symlink_metadata(t.path("dst/victim"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+}
+
 #[test]
 fn in_tree_destination_symlink_is_replaced_not_followed() {
     let t = Tmp::new();

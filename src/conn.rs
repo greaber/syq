@@ -393,6 +393,18 @@ impl Conn for LocalConn {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
+        if let Some((destination_root, relative)) = self.ops.destination_scan_root(root)? {
+            return crate::scan::scan_descriptor(
+                destination_root,
+                &relative,
+                follow_root,
+                ignore,
+                report_ignored,
+                sink,
+                ignored,
+                warn,
+            );
+        }
         let root = self.ops.scan_root(root)?;
         crate::scan::scan(
             &fsops::resolve(&root),

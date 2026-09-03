@@ -684,7 +684,51 @@ pub(crate) fn rooted_entry(
     } else {
         None
     };
-    Ok(Entry {
+    Ok(entry_from_root_metadata(path, metadata, kind, link))
+}
+
+/// Build an entry relative to a directory already opened by a descriptor
+/// scanner. Symlink target reads and the confirming stat use that same parent
+/// descriptor, so neither operation has to rewalk a possibly renamed path.
+pub(crate) fn rooted_entry_in_directory(
+    root: &Root,
+    directory: &File,
+    name: &[u8],
+    path: PathBytes,
+    metadata: RootMetadata,
+) -> Result<Entry> {
+    let kind = match metadata.file_type() {
+        MODE_DIR => Kind::Dir,
+        MODE_FILE => Kind::File,
+        MODE_LINK => Kind::Symlink,
+        MODE_FIFO => Kind::Fifo,
+        MODE_SOCKET => Kind::Socket,
+        MODE_CHAR => Kind::CharDev,
+        MODE_BLOCK => Kind::BlockDev,
+        _ => Kind::Other,
+    };
+    let link = if kind == Kind::Symlink {
+        let target = root.read_link_in_directory(directory, name)?;
+        let after = root.metadata_in_directory(directory, name)?;
+        if (after.dev, after.ino, after.file_type())
+            != (metadata.dev, metadata.ino, metadata.file_type())
+        {
+            bail!("symlink changed while reading its target");
+        }
+        Some(target)
+    } else {
+        None
+    };
+    Ok(entry_from_root_metadata(path, metadata, kind, link))
+}
+
+fn entry_from_root_metadata(
+    path: PathBytes,
+    metadata: RootMetadata,
+    kind: Kind,
+    link: Option<PathBytes>,
+) -> Entry {
+    Entry {
         path,
         kind,
         size: if kind == Kind::File { metadata.len } else { 0 },
@@ -699,7 +743,7 @@ pub(crate) fn rooted_entry(
         ctime: metadata.ctime,
         ctime_nsec: metadata.ctime_nsec,
         link,
-    })
+    }
 }
 
 pub fn lstat_entry(rel: PathBytes, full: &Path) -> io::Result<Entry> {
@@ -1065,6 +1109,21 @@ impl FsOps {
 
     pub fn scan_root(&self, root: &[u8]) -> Result<PathBytes> {
         self.destination_relative(root)
+    }
+
+    /// Return the retained destination capability and a strict path beneath it
+    /// when this connection has adopted a destination root. Callers must use
+    /// this instead of resolving the rebased spelling through process cwd.
+    pub(crate) fn destination_scan_root(
+        &self,
+        requested: &[u8],
+    ) -> Result<Option<(Arc<Root>, PathBytes)>> {
+        let Some(root) = &self.destination_root else {
+            return Ok(None);
+        };
+        let relative = self.destination_relative(requested)?;
+        RelativePath::new(&relative)?;
+        Ok(Some((root.clone(), relative)))
     }
 
     fn rebase_response(&self, response: Response) -> Response {

@@ -241,12 +241,13 @@ containment guarantee for copy. Native `rm` retains the resolved directories
 and selected identities through mutation. Copy gives every destination worker
 the selected directory descriptor; destination observation, directory and
 special-file creation, metadata changes, and planned non-recursive deletion
-are relative to that descriptor. Destination scanning and regular-file
-transfer state, along with ordinary source walks and reads, have not all moved
-to descriptor-relative access yet. The default therefore rejects links present
-during preflight, while the remaining containment work must also prevent a
-concurrent rename or link substitution from redirecting those unmigrated
-operation families.
+are relative to that descriptor. Destination scanning, including the walk that
+plans `--delete`, is relative to it too and never follows descendant symlinks.
+Regular-file transfer state, along with ordinary source walks and reads, has
+not all moved to descriptor-relative access yet. The default therefore rejects
+links present during preflight, while the remaining containment work must also
+prevent a concurrent rename or link substitution from redirecting those
+unmigrated operation families.
 
 Placement is always explicit in this initial native surface:
 

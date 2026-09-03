@@ -581,6 +581,41 @@ impl Root {
         Ok(directory)
     }
 
+    /// Open a directory by its root-relative name and require that it is still
+    /// the entry previously observed by a caller such as the tree scanner.
+    pub(crate) fn open_directory_verified(
+        &self,
+        path: &RelativePath,
+        expected: RootMetadata,
+    ) -> Result<File> {
+        let directory = self.open_directory(path)?;
+        require_metadata_identity(
+            expected,
+            root_metadata_from_std(&directory.metadata()?)?,
+            "confined directory",
+        )?;
+        Ok(directory)
+    }
+
+    /// Open an observed child relative to an already-open parent. This lets a
+    /// bounded scanner carry authority forward without rewalking from the
+    /// root, while the identity check rejects a rename/replacement race.
+    pub(crate) fn open_child_directory_verified(
+        &self,
+        parent: &File,
+        name: &[u8],
+        expected: RootMetadata,
+    ) -> Result<File> {
+        directory_entry_cstring(name)?;
+        let directory = open_directory_at(parent, name).context("open confined child directory")?;
+        require_metadata_identity(
+            expected,
+            root_metadata_from_std(&directory.metadata()?)?,
+            "confined child directory",
+        )?;
+        Ok(directory)
+    }
+
     pub(crate) fn open_regular_read(&self, path: &RelativePath) -> Result<File> {
         self.open_regular(path, libc::O_RDONLY, false)
     }
@@ -737,6 +772,17 @@ impl Root {
             .with_context(|| format!("stat confined path {}", path.label()))
     }
 
+    /// Inspect a name relative to an already-open directory without following
+    /// a symlink in that name.
+    pub(crate) fn metadata_in_directory(
+        &self,
+        directory: &File,
+        name: &[u8],
+    ) -> Result<RootMetadata> {
+        let name = directory_entry_cstring(name)?;
+        metadata_at(directory.as_raw_fd(), &name).context("stat confined directory entry")
+    }
+
     pub(crate) fn metadata_optional(&self, path: &RelativePath) -> Result<Option<RootMetadata>> {
         if path.is_empty() {
             return self.metadata(path).map(Some);
@@ -755,12 +801,20 @@ impl Root {
     /// owns a duplicate descriptor and never reconstructs a pathname.
     pub(crate) fn read_directory(&self, path: &RelativePath) -> Result<Vec<Vec<u8>>> {
         let directory = self.open_directory(path)?;
+        self.read_open_directory(&directory)
+            .with_context(|| format!("read confined directory {}", path.label()))
+    }
+
+    /// List raw names from a directory already retained by the caller. The
+    /// stream gets its own open-file description, so retries and concurrent
+    /// scans never share a directory offset.
+    pub(crate) fn read_open_directory(&self, directory: &File) -> Result<Vec<Vec<u8>>> {
         // dup()/try_clone() would share the directory open-file-description
         // offset. Reopen `.` so concurrent scans and retries each start with
         // an independent readable stream, including when the authority is an
         // O_PATH/O_SEARCH descriptor.
-        let readable = open_readable_directory_at(&directory, b".")
-            .with_context(|| format!("open readable confined directory {}", path.label()))?;
+        let readable = open_readable_directory_at(directory, b".")
+            .context("open readable confined directory")?;
         let descriptor = readable.into_raw_fd();
         let stream = unsafe { libc::fdopendir(descriptor) };
         if stream.is_null() {
@@ -830,13 +884,19 @@ impl Root {
 
     pub(crate) fn read_link(&self, path: &RelativePath) -> Result<Vec<u8>> {
         let parent = self.resolve_parent(path)?;
+        self.read_link_in_directory(&parent.directory, parent.leaf.as_bytes())
+            .with_context(|| format!("read confined symlink {}", path.label()))
+    }
+
+    pub(crate) fn read_link_in_directory(&self, directory: &File, name: &[u8]) -> Result<Vec<u8>> {
+        let name = directory_entry_cstring(name)?;
         let mut buffer = vec![0u8; 256];
         loop {
             let read = loop {
                 let result = unsafe {
                     libc::readlinkat(
-                        parent.directory.as_raw_fd(),
-                        parent.leaf.as_ptr(),
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
                         buffer.as_mut_ptr().cast(),
                         buffer.len(),
                     )
@@ -846,7 +906,7 @@ impl Root {
                 }
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error).context("read confined symlink");
+                    return Err(error).context("read confined directory-entry symlink");
                 }
             };
             if read < buffer.len() {
@@ -1189,6 +1249,13 @@ fn component_cstring(component: &[u8]) -> CString {
     CString::new(component).expect("RelativePath already rejected NUL")
 }
 
+fn directory_entry_cstring(name: &[u8]) -> Result<CString> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        bail!("confined directory entry must be one non-dot component");
+    }
+    CString::new(name).context("confined directory entry contains NUL")
+}
+
 fn operator_components(path: &[u8]) -> VecDeque<Vec<u8>> {
     path.split(|byte| *byte == b'/')
         .filter(|component| !component.is_empty())
@@ -1308,6 +1375,19 @@ fn require_operator_identity(
         != (expected.dev, expected.ino, expected.file_type())
     {
         bail!("{label} changed identity during resolution");
+    }
+    Ok(())
+}
+
+fn require_metadata_identity(
+    expected: RootMetadata,
+    actual: RootMetadata,
+    label: &str,
+) -> Result<()> {
+    if (actual.dev, actual.ino, actual.file_type())
+        != (expected.dev, expected.ino, expected.file_type())
+    {
+        bail!("{label} changed identity");
     }
     Ok(())
 }
@@ -1928,6 +2008,31 @@ mod tests {
                 "accepted {:?}",
                 String::from_utf8_lossy(unsafe_path)
             );
+        }
+    }
+
+    #[test]
+    fn opened_directory_apis_reject_non_component_names() {
+        let tree = TestDir::new("opened-directory-name");
+        let root = Root::open(tree.path()).unwrap();
+        let empty = relative(b"");
+        let directory = root.open_directory(&empty).unwrap();
+        let expected = root.metadata(&empty).unwrap();
+
+        for unsafe_name in [
+            &b""[..],
+            &b"."[..],
+            &b".."[..],
+            &b"child/grandchild"[..],
+            &b"nul\0name"[..],
+        ] {
+            assert!(root.metadata_in_directory(&directory, unsafe_name).is_err());
+            assert!(root
+                .read_link_in_directory(&directory, unsafe_name)
+                .is_err());
+            assert!(root
+                .open_child_directory_verified(&directory, unsafe_name, expected)
+                .is_err());
         }
     }
 

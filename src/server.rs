@@ -348,6 +348,17 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 guard,
             } => {
                 let requested_root = root.clone();
+                let destination_scan = if guard.is_none() {
+                    match ops.destination_scan_root(&root) {
+                        Ok(scan) => scan,
+                        Err(error) => {
+                            w.write_msg(&Response::Err(format!("{error:#}")))?;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let root = match ops.scan_root(&root) {
                     Ok(root) => root,
                     Err(error) => {
@@ -386,6 +397,17 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         &ignore,
                         report_ignored,
                         &guard,
+                        &mut sink,
+                        &mut ignored,
+                        &mut |msg| warns.borrow_mut().push(msg),
+                    )
+                } else if let Some((destination_root, relative)) = destination_scan {
+                    crate::scan::scan_descriptor(
+                        destination_root,
+                        &relative,
+                        follow_root,
+                        &ignore,
+                        report_ignored,
                         &mut sink,
                         &mut ignored,
                         &mut |msg| warns.borrow_mut().push(msg),
