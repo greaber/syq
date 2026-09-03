@@ -20,6 +20,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -102,22 +103,23 @@ enum ResolvedSelection {
 
 struct Resolver {
     resolver: OperatorResolver,
+    confined: bool,
     follow: bool,
+    symlink_policy: OperatorSymlinkPolicy,
 }
 
 impl Resolver {
     fn new(base: &File, confined: bool, follow: bool) -> Result<Self> {
+        let symlink_policy = if follow {
+            OperatorSymlinkPolicy::FollowAll
+        } else {
+            OperatorSymlinkPolicy::Refuse
+        };
         Ok(Self {
-            resolver: OperatorResolver::beneath(
-                base,
-                confined,
-                if follow {
-                    OperatorSymlinkPolicy::FollowAll
-                } else {
-                    OperatorSymlinkPolicy::Refuse
-                },
-            )?,
+            resolver: OperatorResolver::beneath(base, confined, symlink_policy)?,
+            confined,
             follow,
+            symlink_policy,
         })
     }
 
@@ -126,17 +128,29 @@ impl Resolver {
         selection: &NativeRemoveSelection,
         traces: &mut Vec<String>,
     ) -> Result<ResolvedSelection> {
-        validate_selector(&selection.path)?;
+        validate_selector(&selection.path, self.confined)?;
         let label = selection.path.clone();
+        let path = crate::fsops::resolve(&selection.path);
         let mut hops = Vec::new();
-        let resolved = self.resolver.resolve(
-            &selection.path,
-            OperatorFinalComponent::Entry {
-                follow_symlink: self.follow,
-            },
-            true,
-            &mut hops,
-        );
+        let final_component = OperatorFinalComponent::Entry {
+            follow_symlink: self.follow,
+        };
+        let resolved = if path.is_absolute() {
+            OperatorResolver::resolve_process(
+                path.as_os_str().as_bytes(),
+                self.symlink_policy,
+                final_component,
+                true,
+                &mut hops,
+            )
+        } else {
+            self.resolver.resolve(
+                path.as_os_str().as_bytes(),
+                final_component,
+                true,
+                &mut hops,
+            )
+        };
         append_selector_hops(&selection.path, &hops, traces);
         let resolved = resolved.with_context(|| {
             format!(
@@ -237,27 +251,18 @@ fn identity_from_root(metadata: RootMetadata) -> Identity {
     }
 }
 
-fn validate_selector(path: &[u8]) -> Result<()> {
+fn validate_selector(path: &[u8], confined: bool) -> Result<()> {
     if path.is_empty() {
         bail!("source selectors may not be empty");
     }
-    if path.starts_with(b"/") {
+    if confined && (path.starts_with(b"/") || path == b"~" || path.starts_with(b"~/")) {
         bail!(
-            "source selector {:?} must be relative",
+            "source selector {:?} beneath --root must be relative",
             String::from_utf8_lossy(path)
         );
     }
     if path.contains(&0) {
         bail!("source selector contains NUL");
-    }
-    if path
-        .split(|byte| *byte == b'/')
-        .any(|component| component == b"." || component == b"..")
-    {
-        bail!(
-            "source selector {:?} contains forbidden `.` or `..` component",
-            String::from_utf8_lossy(path)
-        );
     }
     Ok(())
 }
@@ -279,11 +284,35 @@ fn require_kind(kind: NativeRemoveKind, identity: Identity, label: &[u8]) -> Res
 fn open_base(
     cwd: Option<&[u8]>,
     root: Option<&[u8]>,
+    selections: &[NativeRemoveSelection],
     follow: bool,
     traces: &mut Vec<String>,
 ) -> Result<(File, bool)> {
     if cwd.is_some() && root.is_some() {
         bail!("--cwd and --root are mutually exclusive");
+    }
+    for (option, path) in [("--cwd", cwd), ("--root", root)] {
+        if let Some(path) = path {
+            if path.is_empty() {
+                bail!("{option} may not be empty");
+            }
+            if path.contains(&0) {
+                bail!("{option} contains NUL");
+            }
+        }
+    }
+    if root.is_none()
+        && selections
+            .iter()
+            .all(|selection| crate::fsops::resolve(&selection.path).is_absolute())
+    {
+        let directory = resolve_base_path(b".", false, "endpoint working directory", traces)?;
+        let identity = identity_from_file(&directory)?;
+        traces.push(format!(
+            "endpoint working directory pinned as {}:{}",
+            identity.dev, identity.ino
+        ));
+        return Ok((directory, false));
     }
     if let Some(path) = root {
         let directory = resolve_base_path(path, follow, "--root", traces)?;
@@ -328,9 +357,10 @@ fn resolve_base_path(
     if path.contains(&0) {
         bail!("{option} contains NUL");
     }
+    let path = crate::fsops::resolve(path);
     let mut hops = Vec::new();
     let selected = OperatorResolver::resolve_process(
-        path,
+        path.as_os_str().as_bytes(),
         if follow {
             OperatorSymlinkPolicy::FollowAll
         } else {
@@ -343,14 +373,14 @@ fn resolve_base_path(
     for hop in &hops {
         traces.push(format!(
             "{option} {:?}: symlink {:?} -> {:?}",
-            String::from_utf8_lossy(path),
+            path.display(),
             String::from_utf8_lossy(&hop.component),
             String::from_utf8_lossy(&hop.target)
         ));
     }
-    let selected = selected.with_context(|| format!("resolve {option} {:?}", bytes(path)))?;
+    let selected = selected.with_context(|| format!("resolve {option} {}", path.display()))?;
     let PinnedPath::Directory(directory) = selected else {
-        bail!("{option} {:?} is not a directory", bytes(path));
+        bail!("{option} {} is not a directory", path.display());
     };
     Ok(directory.into_parts().0)
 }
@@ -456,7 +486,7 @@ pub(crate) fn remove(
     sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
 ) -> Result<()> {
     let mut traces = Vec::new();
-    let (base, confined) = open_base(cwd, root, follow_symlinks, &mut traces)?;
+    let (base, confined) = open_base(cwd, root, selections, follow_symlinks, &mut traces)?;
     let resolver = Resolver::new(&base, confined, follow_symlinks)?;
 
     // This phase is deliberately complete before the worker pool starts: a
@@ -788,10 +818,6 @@ fn join_label(parent: &[u8], child: &[u8]) -> PathBytes {
     path
 }
 
-fn bytes(path: &[u8]) -> String {
-    String::from_utf8_lossy(path).into_owned()
-}
-
 fn component_cstring(component: &[u8]) -> Result<CString> {
     CString::new(component).context("path component contains NUL")
 }
@@ -1006,11 +1032,17 @@ mod tests {
     }
 
     #[test]
-    fn selector_grammar_rejects_ambiguous_components() {
-        for path in [&b"/absolute"[..], b".", b"..", b"a/../b", b"a/./b"] {
-            assert!(validate_selector(path).is_err());
+    fn selector_grammar_distinguishes_unconfined_and_rooted_bases() {
+        for path in [&b"."[..], b"..", b"a/../b", b"a/./b", b"a//b/"] {
+            assert!(validate_selector(path, false).is_ok());
+            assert!(validate_selector(path, true).is_ok());
         }
-        assert!(validate_selector(b"a//b/").is_ok());
+        for path in [&b"/absolute"[..], b"~", b"~/absolute"] {
+            assert!(validate_selector(path, false).is_ok());
+            assert!(validate_selector(path, true).is_err());
+        }
+        assert!(validate_selector(b"", false).is_err());
+        assert!(validate_selector(b"nul\0name", false).is_err());
     }
 
     #[test]

@@ -1006,6 +1006,13 @@ fn run_remote(
             peer_connection_host.as_deref(),
         ));
     }
+    if let Some(path) = &args.native_source_root {
+        remote.push("--root".into());
+        remote.push(delegated_operand(path));
+    } else if let Some(path) = &args.native_source_cwd {
+        remote.push("--cwd".into());
+        remote.push(delegated_operand(path));
+    }
     for source in srcs {
         remote.push(
             match source.selection {

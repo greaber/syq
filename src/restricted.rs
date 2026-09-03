@@ -7428,6 +7428,7 @@ pub(crate) mod tests {
         fs::create_dir(&root).unwrap();
         let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut request = Request::RegisterSourceRoots {
+            base: proto::SourceRootBase::default(),
             selections: vec![proto::SourceRootSelection {
                 path: root.as_os_str().as_bytes().to_vec(),
                 follow_root: false,

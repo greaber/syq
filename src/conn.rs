@@ -2332,6 +2332,7 @@ mod tests {
         let mut control = endpoint.connect_control(false).unwrap();
         let response = control
             .call(Request::RegisterSourceRoots {
+                base: SourceRootBase::default(),
                 selections: vec![SourceRootSelection {
                     path: selected.as_os_str().as_bytes().to_vec(),
                     follow_root: false,
@@ -2369,6 +2370,7 @@ mod tests {
         let mut control = endpoint.connect_control(false).unwrap();
         let response = control
             .call(Request::RegisterSourceRoots {
+                base: SourceRootBase::default(),
                 selections: vec![SourceRootSelection {
                     path: selected.as_os_str().as_bytes().to_vec(),
                     follow_root: false,

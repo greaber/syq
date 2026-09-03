@@ -2653,6 +2653,14 @@ mod tests {
                 )
                 .is_err());
         }
+        assert!(resolver
+            .resolve(
+                b"../outside",
+                OperatorFinalComponent::Directory,
+                false,
+                &mut Vec::new(),
+            )
+            .is_err());
     }
 
     #[test]
@@ -2692,6 +2700,25 @@ mod tests {
             select_directory(b"absolute-reentry"),
             Some(b"inside".to_vec())
         );
+    }
+
+    #[test]
+    fn confined_process_root_accepts_parent_components_that_stay_at_root() {
+        let base = File::open("/").unwrap();
+        let resolver =
+            OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+        let selected = resolver
+            .resolve(
+                b"..",
+                OperatorFinalComponent::Directory,
+                false,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let PinnedPath::Directory(directory) = selected else {
+            panic!("process root was not selected as a directory");
+        };
+        assert_eq!(directory.resolved_relative(), Some(&b""[..]));
     }
 
     #[cfg(target_os = "linux")]

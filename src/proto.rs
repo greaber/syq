@@ -429,6 +429,33 @@ pub struct SourceRootSelection {
     pub follow_root: bool,
 }
 
+/// One endpoint-local base for a batch of operator source selections. `None`
+/// means the endpoint process's working directory. A confined base is the
+/// native `--root` boundary; an unconfined base is native `--cwd` or the
+/// process working directory.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceRootBase {
+    pub path: Option<PathBytes>,
+    pub confined: bool,
+}
+
+impl SourceRootBase {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.confined && self.path.is_none() {
+            bail!("a confined source base requires an explicit path");
+        }
+        if let Some(path) = &self.path {
+            if path.is_empty() {
+                bail!("source base may not be empty");
+            }
+            if path.contains(&0) {
+                bail!("source base contains NUL");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Compare effective destination directories beneath the receiver's retained
 /// operator selection with one exact source-directory capability. `suffixes`
 /// are operator-relative spellings rather than transfer paths: an empty value
@@ -542,6 +569,7 @@ pub enum Request {
     /// create these endpoint-session capabilities, and it may do so only once
     /// so every issued worker identity keeps its original pins alive.
     RegisterSourceRoots {
+        base: SourceRootBase,
         selections: Vec<SourceRootSelection>,
         symlink_policy: OperatorSymlinkPolicy,
         /// Explicit rsync compatibility opt-out. It permits legacy unconfined

@@ -51,6 +51,11 @@ struct MapSelection {
     emitted_source: Vec<u8>,
 }
 
+struct MapBase {
+    directory: Option<File>,
+    confined: bool,
+}
+
 struct PendingMapEntry {
     root_relative: Vec<u8>,
     entry: Entry,
@@ -64,7 +69,7 @@ pub fn run(args: &Args) -> Result<i32> {
     } else {
         OperatorSymlinkPolicy::Refuse
     };
-    let base = pin_base(args, symlink_policy)?;
+    let base = pin_base(args, &args.locations, symlink_policy)?;
     let mut top_level_dst: HashSet<Vec<u8>> = HashSet::new();
     let destination_prefixes = args
         .locations
@@ -101,24 +106,52 @@ pub fn run(args: &Args) -> Result<i32> {
     Ok(0)
 }
 
-fn pin_base(args: &Args, symlink_policy: OperatorSymlinkPolicy) -> Result<File> {
-    let path = args.native_map_cwd.as_deref().unwrap_or(b".");
+fn pin_base(
+    args: &Args,
+    locations: &[crate::cli::Location],
+    symlink_policy: OperatorSymlinkPolicy,
+) -> Result<MapBase> {
+    if args.native_map_cwd.is_some() && args.native_map_root.is_some() {
+        bail!("--cwd and --root are mutually exclusive");
+    }
+    let (path, confined) = if let Some(path) = args.native_map_root.as_deref() {
+        (Some(path), true)
+    } else {
+        (args.native_map_cwd.as_deref(), false)
+    };
+    if let Some(path) = path {
+        if path.is_empty() {
+            bail!("source base may not be empty");
+        }
+        if path.contains(&0) {
+            bail!("source base contains NUL");
+        }
+    }
+    let needs_base = confined
+        || locations
+            .iter()
+            .any(|location| !crate::fsops::resolve(&location.path).is_absolute());
+    if !needs_base {
+        return Ok(MapBase {
+            directory: None,
+            confined,
+        });
+    }
+    let path = crate::fsops::resolve(path.unwrap_or(b"."));
     let mut hops = Vec::new();
     let selection = OperatorResolver::resolve_process(
-        path,
+        path.as_os_str().as_bytes(),
         symlink_policy,
         OperatorFinalComponent::Directory,
         false,
         &mut hops,
     )
-    .with_context(|| {
-        format!(
-            "resolve syq map source base {}",
-            Path::new(OsStr::from_bytes(path)).display()
-        )
-    })?;
+    .with_context(|| format!("resolve syq map source base {}", path.display()))?;
     match selection {
-        PinnedPath::Directory(directory) => Ok(directory.into_parts().0),
+        PinnedPath::Directory(directory) => Ok(MapBase {
+            directory: Some(directory.into_parts().0),
+            confined,
+        }),
         PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
             bail!("syq map source base is not a directory")
         }
@@ -127,30 +160,51 @@ fn pin_base(args: &Args, symlink_policy: OperatorSymlinkPolicy) -> Result<File> 
 }
 
 fn pin_selection(
-    base: &File,
+    base: &MapBase,
     location: &crate::cli::Location,
     follow_src: bool,
     symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<MapSelection> {
-    // `-C` is a resolution base, not a containment boundary. A followed
-    // selector may leave it; named selectors are checked separately below
-    // because their emitted `src` still has to be relative to this base.
-    let resolver = OperatorResolver::beneath(base, false, symlink_policy)?;
+    let path = crate::fsops::resolve(&location.path);
     let mut hops = Vec::new();
-    let selection = resolver
-        .resolve(
-            &location.path,
+    let selection = if path.is_absolute() {
+        if base.confined {
+            bail!(
+                "source {} beneath --root must be relative",
+                display(&location.path)
+            );
+        }
+        OperatorResolver::resolve_process(
+            path.as_os_str().as_bytes(),
+            symlink_policy,
             OperatorFinalComponent::Entry {
                 follow_symlink: follow_src,
             },
             false,
             &mut hops,
         )
-        .with_context(|| format!("resolve source {}", display(&location.path)))?;
+    } else {
+        OperatorResolver::beneath(
+            base.directory
+                .as_ref()
+                .expect("relative map selection requires a pinned base"),
+            base.confined,
+            symlink_policy,
+        )?
+        .resolve(
+            path.as_os_str().as_bytes(),
+            OperatorFinalComponent::Entry {
+                follow_symlink: follow_src,
+            },
+            false,
+            &mut hops,
+        )
+    };
+    let selection =
+        selection.with_context(|| format!("resolve source {}", display(&location.path)))?;
     match selection {
         PinnedPath::Directory(directory) => {
-            let emitted_source =
-                emitted_source(location, follow_src, directory.resolved_relative())?;
+            let emitted_source = emitted_source(location, directory.resolved_relative())?;
             let (directory, _) = directory.into_parts();
             Ok(MapSelection {
                 root: Arc::new(Root::from_directory(directory)?),
@@ -167,7 +221,7 @@ fn pin_selection(
                     display(&location.path)
                 );
             }
-            let emitted_source = emitted_source(location, follow_src, leaf.resolved_relative())?;
+            let emitted_source = emitted_source(location, leaf.resolved_relative())?;
             let (parent, name, metadata, object) = leaf.into_parts();
             let object = object
                 .context("this platform cannot retain the selected map source leaf safely")?;
@@ -200,21 +254,20 @@ fn pin_selection(
 
 fn emitted_source(
     location: &crate::cli::Location,
-    follow_src: bool,
     resolved_relative: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    if !follow_src || location.selection == SourceSelection::Contents {
-        return Ok(location.path.clone());
+    if location.selection == SourceSelection::Contents {
+        return Ok(Vec::new());
     }
     let resolved_relative = resolved_relative.with_context(|| {
         format!(
-            "followed source {} resolves outside the mapping source base; choose a source base that contains it",
+            "source {} resolves outside the mapping source base; choose a source base that contains it",
             display(&location.path)
         )
     })?;
     if resolved_relative.is_empty() {
         bail!(
-            "followed source {} resolves to the source base itself; select its contents instead",
+            "source {} resolves to the source base itself; select its contents instead",
             display(&location.path)
         );
     }
