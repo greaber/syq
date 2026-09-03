@@ -58,6 +58,15 @@ fn fast_batch_file_limit(
     }
 }
 
+fn initial_fast_workers(max_connections: usize, file_jobs: usize, file_bytes: u64) -> usize {
+    // A batch is independently bounded by its entry count and its payload.
+    // Provision enough fixed workers for whichever ceiling yields more work;
+    // automatic runs may still tune from this bounded starting point.
+    let file_batches = file_jobs.div_ceil(FAST_BATCH_FILES);
+    let byte_batches = usize::try_from(file_bytes.div_ceil(FAST_BATCH_BYTES)).unwrap_or(usize::MAX);
+    max_connections.min(file_batches.max(byte_batches).max(1))
+}
+
 pub struct Opts {
     pub block: u64,
     pub flags: u8,
@@ -2400,7 +2409,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
             } else {
-                let (multiplex_small_files, file_jobs) = {
+                let (multiplex_small_files, file_jobs, file_bytes) = {
                     let jobs = sched.jobs.lock().unwrap();
                     (
                         !opts.verify_only
@@ -2413,6 +2422,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                             && job.container_guard.is_none()))
                             }),
                         jobs.len(),
+                        jobs.iter()
+                            .fold(0u64, |total, job| total.saturating_add(job.entry.size)),
                     )
                 };
                 if multiplex_small_files {
@@ -2442,8 +2453,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
                         };
                     let mut initial = if multiplex_small_files {
-                        args.connections
-                            .min(file_jobs.div_ceil(FAST_BATCH_FILES).max(1))
+                        initial_fast_workers(args.connections, file_jobs, file_bytes)
                     } else {
                         args.connections
                     };
@@ -7824,6 +7834,13 @@ mod tests {
             fast_batch_file_limit(None, None, true),
             HIGH_RTT_FAST_BATCH_FILES
         );
+    }
+
+    #[test]
+    fn initial_fast_workers_respect_file_and_byte_batch_limits() {
+        assert_eq!(initial_fast_workers(32, 100, 100 * (4 << 20)), 25);
+        assert_eq!(initial_fast_workers(8, 100, 100 * (4 << 20)), 8);
+        assert_eq!(initial_fast_workers(32, 300, 300), 3);
     }
 
     #[test]
