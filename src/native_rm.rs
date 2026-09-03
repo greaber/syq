@@ -284,11 +284,35 @@ fn require_kind(kind: NativeRemoveKind, identity: Identity, label: &[u8]) -> Res
 fn open_base(
     cwd: Option<&[u8]>,
     root: Option<&[u8]>,
+    selections: &[NativeRemoveSelection],
     follow: bool,
     traces: &mut Vec<String>,
 ) -> Result<(File, bool)> {
     if cwd.is_some() && root.is_some() {
         bail!("--cwd and --root are mutually exclusive");
+    }
+    for (option, path) in [("--cwd", cwd), ("--root", root)] {
+        if let Some(path) = path {
+            if path.is_empty() {
+                bail!("{option} may not be empty");
+            }
+            if path.contains(&0) {
+                bail!("{option} contains NUL");
+            }
+        }
+    }
+    if root.is_none()
+        && selections
+            .iter()
+            .all(|selection| crate::fsops::resolve(&selection.path).is_absolute())
+    {
+        let directory = resolve_base_path(b".", false, "endpoint working directory", traces)?;
+        let identity = identity_from_file(&directory)?;
+        traces.push(format!(
+            "endpoint working directory pinned as {}:{}",
+            identity.dev, identity.ino
+        ));
+        return Ok((directory, false));
     }
     if let Some(path) = root {
         let directory = resolve_base_path(path, follow, "--root", traces)?;
@@ -462,7 +486,7 @@ pub(crate) fn remove(
     sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
 ) -> Result<()> {
     let mut traces = Vec::new();
-    let (base, confined) = open_base(cwd, root, follow_symlinks, &mut traces)?;
+    let (base, confined) = open_base(cwd, root, selections, follow_symlinks, &mut traces)?;
     let resolver = Resolver::new(&base, confined, follow_symlinks)?;
 
     // This phase is deliberately complete before the worker pool starts: a

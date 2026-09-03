@@ -432,6 +432,21 @@ class NativeClientTests(unittest.TestCase):
         self.assertIn("--follow-src", self.argv())
         self.assertEqual(stream.cwd, Path.cwd() / "source-root" / "source")
 
+    def test_map_cwd_preserves_the_unresolved_source_spelling(self) -> None:
+        actual = self.root / "actual"
+        actual.mkdir()
+        (self.root / "root-link").symlink_to(actual, target_is_directory=True)
+        client = syq.Client(
+            executable=self.executable,
+            env=self.env,
+            process_cwd=self.root,
+        )
+        with client.map(
+            src_src="selected", root="root-link", follow_src=True
+        ) as stream:
+            list(stream)
+        self.assertEqual(stream.cwd, self.root / "root-link" / "selected")
+
     def test_structural_validation_happens_before_launch(self) -> None:
         with self.assertRaisesRegex(syq.SyqInvocationError, "exactly one"):
             self.client.cp("source")

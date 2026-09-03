@@ -941,13 +941,17 @@ class Client:
             if selected_base is not None
             else Path()
         )
-        effective_cwd = (process_base / native_base).resolve()
+        effective_cwd = process_base / native_base
         if src_src_values:
             if len(src_src_values) != 1 or source_count != 1:
                 raise SyqInvocationError(
                     "syq map takes --src-src as its only selector"
                 )
             effective_cwd /= os.fsdecode(src_src_values[0])
+        # Return an absolute command-line spelling without resolving symlinks.
+        # The map subprocess owns the pinned producer descriptor; a later copy
+        # must resolve this path independently under its own follow policy.
+        effective_cwd = Path(os.path.abspath(effective_cwd))
         return MapStream(
             _LineProcess(
                 command,

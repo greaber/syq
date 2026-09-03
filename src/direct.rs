@@ -986,10 +986,10 @@ fn run_remote(
     }
     if let Some(path) = &args.native_source_root {
         remote.push("--root".into());
-        remote.push(utf8_path(path, "source root")?);
+        remote.push(delegated_operand(path));
     } else if let Some(path) = &args.native_source_cwd {
         remote.push("--cwd".into());
-        remote.push(utf8_path(path, "source cwd")?);
+        remote.push(delegated_operand(path));
     }
     for source in srcs {
         remote.push(

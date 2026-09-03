@@ -693,10 +693,24 @@ fn copy_identity(
     dst_canonical: Option<std::path::PathBuf>,
     opts: &Opts,
 ) -> Result<String> {
+    // Relative native bases and selectors get their meaning from the source
+    // endpoint's process cwd. Identify that already-held cwd separately;
+    // never canonicalize the registered selection after it has been pinned.
+    let native_endpoint_cwd = (args.interface == Interface::NativeCp)
+        .then(|| {
+            canonical_path(src_ctl, b".", srcs[0].is_remote()).map(|path| path_identity(&path))
+        })
+        .transpose()?;
     let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
     for source in srcs {
         let identity = if args.interface == Interface::NativeCp {
-            native_source_identity(args, source)
+            native_source_identity(
+                args,
+                source,
+                native_endpoint_cwd
+                    .as_deref()
+                    .expect("native endpoint cwd was identified"),
+            )
         } else {
             let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
             path_identity(&path)
@@ -721,7 +735,7 @@ fn copy_identity(
 /// operator selector. Do not canonicalize the selector again after source
 /// registration: doing so could observe a different namespace identity from
 /// the descriptor-backed one the transfer actually uses.
-fn native_source_identity(args: &Args, source: &Location) -> String {
+fn native_source_identity(args: &Args, source: &Location, endpoint_cwd: &str) -> String {
     let (base_kind, base) = if let Some(path) = args.native_source_root.as_deref() {
         ("root", Some(path))
     } else if let Some(path) = args.native_source_cwd.as_deref() {
@@ -731,6 +745,7 @@ fn native_source_identity(args: &Args, source: &Location) -> String {
     };
     serde_json::json!({
         "native_source_identity": 1,
+        "endpoint_cwd": endpoint_cwd,
         "base_kind": base_kind,
         "base": base.map(path_bytes_identity),
         "selector": path_bytes_identity(&source.path),

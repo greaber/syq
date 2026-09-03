@@ -1059,6 +1059,17 @@ fn native_copy_cwd_may_escape_while_root_confines_component_resolution() {
     ]);
     assert_eq!(read(&t.path("cwd-destination/external")), b"outside");
 
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("missing-base"),
+        "--src",
+        &t.s("outside/external"),
+        "--as-new",
+        &t.s("absolute-source"),
+    ]);
+    assert_eq!(read(&t.path("absolute-source")), b"outside");
+
     let escape = native_syq(&[
         "cp",
         "--root",
@@ -1171,6 +1182,50 @@ fn native_copy_and_map_cwd_and_root_are_mutually_exclusive() {
         &["--cwd", ".", "--root", ".", "--src", "source"],
     );
     assert_eq!(map.status.code(), Some(2));
+}
+
+#[test]
+fn native_mapping_uses_root_without_following_manifest_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("base/file"), b"inside");
+    write(&t.path("outside/secret"), b"outside");
+    symlink("../outside", t.path("base/link")).unwrap();
+
+    let manifest = entry_line("file", "copied", Some("file"));
+    let copied = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "--root",
+            &t.s("base"),
+            "--into-new",
+            &t.s("destination"),
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_output_ok(&copied);
+    assert_eq!(read(&t.path("destination/copied")), b"inside");
+
+    let escaped = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "--root",
+            &t.s("base"),
+            "--follow-src",
+            "--into-new",
+            &t.s("escaped"),
+            "-q",
+        ],
+        Some(entry_line("link/secret", "secret", Some("file")).as_bytes()),
+    );
+    assert!(!escaped.status.success());
+    assert!(!t.path("escaped/secret").exists());
 }
 
 #[test]
@@ -2673,7 +2728,7 @@ fn native_rm_cwd_may_escape_while_root_confines_dotdot() {
     run_native_ok(&[
         "rm",
         "--cwd",
-        &t.s("base"),
+        &t.s("missing-base"),
         "--src",
         &t.s("outside/absolute"),
     ]);
@@ -11072,7 +11127,7 @@ fn native_map_cwd_may_escape_while_root_confines_component_resolution() {
 
     let lines = map_lines(&syq_map_in(
         &t.path("base"),
-        &["--src-src", &t.s("outside")],
+        &["--cwd", "missing-base", "--src-src", &t.s("outside")],
     ));
     assert_eq!(map_path(&lines[0], "src"), "b.jpg");
 
@@ -12826,8 +12881,10 @@ fn native_remote_to_remote_carries_any_path_bytes_directly() {
     // Non-UTF-8 path bytes ride the delegated command line as encoded
     // operands: the direct topology works for every filename, with no
     // implicit relay through this machine.
+    let base_name = std::ffi::OsStr::from_bytes(b"base-\xfd");
     let name = std::ffi::OsStr::from_bytes(b"src-\xff");
-    write(&t.path("").join(name), b"raw bytes travel");
+    let source_base = t.path("").join(base_name);
+    write(&source_base.join(name), b"raw bytes travel");
     let mut destination = t.path("").into_os_string();
     destination.push("/dst-\u{1}");
     let mut destination_bytes = t.s("").into_bytes();
@@ -12836,9 +12893,10 @@ fn native_remote_to_remote_carries_any_path_bytes_directly() {
         .args(["cp", "--rsh"])
         .arg(&rsh)
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args(["--no-tcp", "-j", "1", "--from", "hostA"])
+        .args(["--no-tcp", "-j", "1", "--from", "hostA", "--root"])
+        .arg(&source_base)
         .arg("--src")
-        .arg(t.path("").join(name))
+        .arg(name)
         .args(["--to", "hostB", "--as"])
         .arg(std::ffi::OsStr::from_bytes(&destination_bytes))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))

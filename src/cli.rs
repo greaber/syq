@@ -1051,6 +1051,7 @@ fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
     }
     for value in [
         source.cwd.as_mut(),
+        source.root.as_mut(),
         copy.into.as_mut(),
         copy.into_new.as_mut(),
         copy.into_existing.as_mut(),

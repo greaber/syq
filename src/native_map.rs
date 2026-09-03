@@ -52,7 +52,7 @@ struct MapSelection {
 }
 
 struct MapBase {
-    directory: File,
+    directory: Option<File>,
     confined: bool,
 }
 
@@ -69,7 +69,7 @@ pub fn run(args: &Args) -> Result<i32> {
     } else {
         OperatorSymlinkPolicy::Refuse
     };
-    let base = pin_base(args, symlink_policy)?;
+    let base = pin_base(args, &args.locations, symlink_policy)?;
     let mut top_level_dst: HashSet<Vec<u8>> = HashSet::new();
     let destination_prefixes = args
         .locations
@@ -106,16 +106,38 @@ pub fn run(args: &Args) -> Result<i32> {
     Ok(0)
 }
 
-fn pin_base(args: &Args, symlink_policy: OperatorSymlinkPolicy) -> Result<MapBase> {
+fn pin_base(
+    args: &Args,
+    locations: &[crate::cli::Location],
+    symlink_policy: OperatorSymlinkPolicy,
+) -> Result<MapBase> {
     if args.native_map_cwd.is_some() && args.native_map_root.is_some() {
         bail!("--cwd and --root are mutually exclusive");
     }
     let (path, confined) = if let Some(path) = args.native_map_root.as_deref() {
-        (path, true)
+        (Some(path), true)
     } else {
-        (args.native_map_cwd.as_deref().unwrap_or(b"."), false)
+        (args.native_map_cwd.as_deref(), false)
     };
-    let path = crate::fsops::resolve(path);
+    if let Some(path) = path {
+        if path.is_empty() {
+            bail!("source base may not be empty");
+        }
+        if path.contains(&0) {
+            bail!("source base contains NUL");
+        }
+    }
+    let needs_base = confined
+        || locations
+            .iter()
+            .any(|location| !crate::fsops::resolve(&location.path).is_absolute());
+    if !needs_base {
+        return Ok(MapBase {
+            directory: None,
+            confined,
+        });
+    }
+    let path = crate::fsops::resolve(path.unwrap_or(b"."));
     let mut hops = Vec::new();
     let selection = OperatorResolver::resolve_process(
         path.as_os_str().as_bytes(),
@@ -127,7 +149,7 @@ fn pin_base(args: &Args, symlink_policy: OperatorSymlinkPolicy) -> Result<MapBas
     .with_context(|| format!("resolve syq map source base {}", path.display()))?;
     match selection {
         PinnedPath::Directory(directory) => Ok(MapBase {
-            directory: directory.into_parts().0,
+            directory: Some(directory.into_parts().0),
             confined,
         }),
         PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
@@ -162,7 +184,14 @@ fn pin_selection(
             &mut hops,
         )
     } else {
-        OperatorResolver::beneath(&base.directory, base.confined, symlink_policy)?.resolve(
+        OperatorResolver::beneath(
+            base.directory
+                .as_ref()
+                .expect("relative map selection requires a pinned base"),
+            base.confined,
+            symlink_policy,
+        )?
+        .resolve(
             path.as_os_str().as_bytes(),
             OperatorFinalComponent::Entry {
                 follow_symlink: follow_src,

@@ -1459,37 +1459,49 @@ impl FsOps {
         }
         base.validate()?;
         require_source_descriptor_capacity(selections.len(), shared_workers, independent_workers)?;
-        let base_path = base.path.as_deref().unwrap_or(b".");
-        let base_path = resolve(base_path);
-        let mut base_hops = Vec::new();
-        let base_directory = match OperatorResolver::resolve_process(
-            base_path.as_os_str().as_bytes(),
-            symlink_policy,
-            OperatorFinalComponent::Directory,
-            false,
-            &mut base_hops,
-        )
-        .with_context(|| format!("resolve source base {}", base_path.display()))?
-        {
-            PinnedPath::Directory(directory) => directory.into_parts().0,
-            PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
-                bail!("source base {} is not a directory", base_path.display())
-            }
-            PinnedPath::Missing(_) => {
-                unreachable!("source base resolution requires an existing directory")
-            }
+        let paths = selections
+            .iter()
+            .map(|selection| {
+                if selection.path.is_empty() {
+                    bail!("source selectors may not be empty");
+                }
+                if selection.path.contains(&0) {
+                    bail!("source selector contains NUL");
+                }
+                Ok(resolve(&selection.path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let needs_base = base.confined || paths.iter().any(|path| !path.is_absolute());
+        let relative_resolver = if needs_base {
+            let base_path = resolve(base.path.as_deref().unwrap_or(b"."));
+            let mut base_hops = Vec::new();
+            let base_directory = match OperatorResolver::resolve_process(
+                base_path.as_os_str().as_bytes(),
+                symlink_policy,
+                OperatorFinalComponent::Directory,
+                false,
+                &mut base_hops,
+            )
+            .with_context(|| format!("resolve source base {}", base_path.display()))?
+            {
+                PinnedPath::Directory(directory) => directory.into_parts().0,
+                PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
+                    bail!("source base {} is not a directory", base_path.display())
+                }
+                PinnedPath::Missing(_) => {
+                    unreachable!("source base resolution requires an existing directory")
+                }
+            };
+            Some(OperatorResolver::beneath(
+                &base_directory,
+                base.confined,
+                symlink_policy,
+            )?)
+        } else {
+            None
         };
-        let relative_resolver =
-            OperatorResolver::beneath(&base_directory, base.confined, symlink_policy)?;
         let mut resolved = Vec::with_capacity(selections.len());
-        for selection in selections {
-            if selection.path.is_empty() {
-                bail!("source selectors may not be empty");
-            }
-            if selection.path.contains(&0) {
-                bail!("source selector contains NUL");
-            }
-            let path = resolve(&selection.path);
+        for (selection, path) in selections.iter().zip(paths) {
             let mut hops = Vec::new();
             let pinned = if path.is_absolute() {
                 if base.confined {
@@ -1508,14 +1520,17 @@ impl FsOps {
                     &mut hops,
                 )
             } else {
-                relative_resolver.resolve(
-                    path.as_os_str().as_bytes(),
-                    OperatorFinalComponent::Entry {
-                        follow_symlink: selection.follow_root,
-                    },
-                    false,
-                    &mut hops,
-                )
+                relative_resolver
+                    .as_ref()
+                    .expect("relative source selection requires a pinned base")
+                    .resolve(
+                        path.as_os_str().as_bytes(),
+                        OperatorFinalComponent::Entry {
+                            follow_symlink: selection.follow_root,
+                        },
+                        false,
+                        &mut hops,
+                    )
             };
             let pinned =
                 pinned.with_context(|| format!("resolve source selection {}", path.display()))?;

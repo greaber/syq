@@ -379,12 +379,14 @@ with syq.map(src_src="photos") as mapping:
 
 This corresponds to `syq map --src-src photos` followed by a transformed
 manifest and `syq cp --mapping ... -C photos --to storage --into /archive`.
-`MapStream.cwd` is the effective source base needed to execute its emitted
-`src` paths. Keeping that property named `cwd` makes it directly usable as the
-native `cwd=` parameter. If `map(root=...)` was used, that root confines the
-mapping producer; the returned path names the selected effective base for the
-separate consumer process, which cannot inherit the producer's pinned
-descriptor.
+`MapStream.cwd` is the absolute, unresolved spelling of the source base needed
+to execute its emitted `src` paths. Keeping that property named `cwd` makes it
+directly usable as the native `cwd=` parameter. If `map(root=...)` was used,
+that root confines the mapping producer. The separate consumer process cannot
+inherit the producer's pinned descriptor, so it resolves this spelling again
+under its own source follow policy. If the spelling contains a symlink that the
+producer followed, pass `follow_src=True` to the consumer too; use `realpath`
+explicitly when a stable referent spelling is preferable.
 
 `MapStream` yields entries as `syq map` emits them. Reaching normal EOF
 verifies the producer's process status. Leaving the context early kills and

@@ -113,6 +113,21 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream.cwd, Path.cwd() / "source-root" / "source")
         self.assertEqual(self.argv()[0], "cp")
 
+    async def test_map_cwd_preserves_the_unresolved_source_spelling(self) -> None:
+        actual = self.root / "actual"
+        actual.mkdir()
+        (self.root / "root-link").symlink_to(actual, target_is_directory=True)
+        client = syq.AsyncClient(
+            executable=self.executable,
+            env=self.env,
+            process_cwd=self.root,
+        )
+        stream = client.map(src_src="selected", root="root-link", follow_src=True)
+        async with stream:
+            entries = [entry async for entry in stream]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(stream.cwd, self.root / "root-link" / "selected")
+
     async def test_cp_forwards_native_remote_controls(self) -> None:
         await self.client.cp(
             "source",
