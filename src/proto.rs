@@ -1,9 +1,11 @@
-//! Wire protocol: message types and length-prefixed framing.
+//! Wire protocol: build-identified preambles, message types, and framing.
 //!
-//! Every connection (control or data) speaks the same request/response
-//! protocol. Frames are `u32 len | u8 flags | payload`, payload is postcard;
-//! flag bit 0 means the payload is zstd-compressed. Each writer decides
-//! independently whether to compress, readers always accept both.
+//! Every connection (control or data) begins each direction with a plain-byte
+//! preamble containing a fixed magic string and the sender's build identity.
+//! Only after that identity matches do frames begin. Frames are
+//! `u32 len | u8 flags | payload`, payload is postcard; flag bit 0 means the
+//! payload is zstd-compressed. Each writer decides independently whether to
+//! compress, readers always accept both.
 
 use crate::descriptor_broker::{DescriptorTicket, RegisteredRootId};
 use anyhow::{bail, Result};
@@ -17,6 +19,9 @@ const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
 const HASH_RESPONSE_OVERHEAD: u64 = 24;
 const COMPRESS_MIN: usize = 512;
 const COMPRESS_LEVEL: i32 = 1;
+const WIRE_PREAMBLE_MAGIC: &[u8; 8] = b"SYQWIRE\0";
+const WIRE_PREAMBLE_FIXED_LEN: usize = WIRE_PREAMBLE_MAGIC.len() + 2;
+const MAX_BUILD_IDENTITY_BYTES: usize = 512;
 #[cfg(target_os = "linux")]
 const MODE_SYMLINK: u32 = libc::S_IFLNK;
 #[cfg(not(target_os = "linux"))]
@@ -1028,6 +1033,7 @@ impl SizeHint for Response {
 pub struct FrameWriter<W: Write> {
     w: BufWriter<W>,
     pub compress: bool,
+    preamble_written: bool,
 }
 
 impl<W: Write> FrameWriter<W> {
@@ -1035,10 +1041,34 @@ impl<W: Write> FrameWriter<W> {
         FrameWriter {
             w: BufWriter::with_capacity(1 << 20, w),
             compress,
+            preamble_written: false,
         }
     }
 
+    pub fn write_preamble(&mut self) -> io::Result<()> {
+        if self.preamble_written {
+            return Ok(());
+        }
+        let identity = crate::identity::build().as_bytes();
+        let identity_len = u16::try_from(identity.len())
+            .ok()
+            .filter(|length| usize::from(*length) <= MAX_BUILD_IDENTITY_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "local build identity exceeds the wire preamble limit",
+                )
+            })?;
+        self.w.write_all(WIRE_PREAMBLE_MAGIC)?;
+        self.w.write_all(&identity_len.to_be_bytes())?;
+        self.w.write_all(identity)?;
+        self.w.flush()?;
+        self.preamble_written = true;
+        Ok(())
+    }
+
     pub fn write_msg<T: Serialize + SizeHint>(&mut self, msg: &T) -> io::Result<()> {
+        self.write_preamble()?;
         let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut flag = 0u8;
@@ -1068,16 +1098,79 @@ impl<W: Write> FrameWriter<W> {
 
 pub struct FrameReader<R: Read> {
     r: BufReader<R>,
+    preamble_read: bool,
 }
 
 impl<R: Read> FrameReader<R> {
     pub fn new(r: R) -> Self {
         FrameReader {
             r: BufReader::with_capacity(1 << 20, r),
+            preamble_read: false,
         }
     }
 
+    fn read_preamble(&mut self) -> io::Result<()> {
+        if self.preamble_read {
+            return Ok(());
+        }
+        let mut fixed = [0u8; WIRE_PREAMBLE_FIXED_LEN];
+        self.r.read_exact(&mut fixed).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "read wire preamble from remote syq: {error}; remote may be incompatible with local build {}",
+                    crate::identity::build()
+                ),
+            )
+        })?;
+        if &fixed[..WIRE_PREAMBLE_MAGIC.len()] != WIRE_PREAMBLE_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "wire preamble magic mismatch; remote syq may predate the build-identified preamble (local {})",
+                    crate::identity::build()
+                ),
+            ));
+        }
+        let identity_len = u16::from_be_bytes(
+            fixed[WIRE_PREAMBLE_MAGIC.len()..]
+                .try_into()
+                .expect("fixed preamble length"),
+        ) as usize;
+        if identity_len == 0 || identity_len > MAX_BUILD_IDENTITY_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("remote syq build identity length {identity_len} is invalid"),
+            ));
+        }
+        let mut identity = vec![0u8; identity_len];
+        self.r.read_exact(&mut identity).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("read remote syq build identity: {error}"),
+            )
+        })?;
+        let identity = std::str::from_utf8(&identity).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("remote syq build identity is not UTF-8: {error}"),
+            )
+        })?;
+        if identity != crate::identity::build() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "build identity mismatch (remote {identity}, local {})",
+                    crate::identity::build()
+                ),
+            ));
+        }
+        self.preamble_read = true;
+        Ok(())
+    }
+
     pub fn read_msg<T: for<'de> Deserialize<'de>>(&mut self) -> io::Result<T> {
+        self.read_preamble()?;
         let mut hdr = [0u8; 4];
         self.r.read_exact(&mut hdr)?;
         let len = u32::from_le_bytes(hdr) as usize;
@@ -1118,6 +1211,10 @@ impl<R: Read> FrameReader<R> {
 mod tests {
     use super::*;
 
+    fn local_preamble_len() -> usize {
+        WIRE_PREAMBLE_FIXED_LEN + crate::identity::build().len()
+    }
+
     fn block_frame(data: Vec<u8>, compress: bool) -> Vec<u8> {
         let mut frame = Vec::new();
         FrameWriter::new(&mut frame, compress)
@@ -1134,7 +1231,11 @@ mod tests {
     fn compression_is_per_frame_and_never_expands_the_wire_payload() {
         let data = vec![b'a'; 64 * 1024];
         let compressed = block_frame(data.clone(), true);
-        assert_eq!(compressed[4], 1, "compressible frame was not compressed");
+        assert_eq!(
+            compressed[local_preamble_len() + 4],
+            1,
+            "compressible frame was not compressed"
+        );
 
         let decoded = FrameReader::new(compressed.as_slice())
             .read_msg::<Response>()
@@ -1152,7 +1253,11 @@ mod tests {
         }
 
         let disabled = block_frame(data, false);
-        assert_eq!(disabled[4], 0, "disabled compression changed the frame");
+        assert_eq!(
+            disabled[local_preamble_len() + 4],
+            0,
+            "disabled compression changed the frame"
+        );
 
         let mut random = vec![0u8; 64 * 1024];
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -1164,9 +1269,50 @@ mod tests {
         }
         let incompressible = block_frame(random, true);
         assert_eq!(
-            incompressible[4], 0,
+            incompressible[local_preamble_len() + 4],
+            0,
             "an expanded compressed representation was selected"
         );
+    }
+
+    #[test]
+    fn captured_old_format_handshake_is_rejected_before_postcard_decode() {
+        // Captured pre-preamble frame for Request::Hello { identity: "v0.1.8",
+        // compress: false, debug: false, token: [], role: Control }.
+        const OLD_FORMAT_HELLO: &[u8] = &[
+            0x0d, 0x00, 0x00, 0x00, // frame length
+            0x00, // frame flags
+            0x00, // Request::Hello
+            0x06, b'v', b'0', b'.', b'1', b'.', b'8', // identity
+            0x00, 0x00, // compress, debug
+            0x00, // empty token
+            0x00, // ConnectionRole::Control
+        ];
+
+        let error = FrameReader::new(OLD_FORMAT_HELLO)
+            .read_msg::<Request>()
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("wire preamble magic mismatch"));
+        assert!(diagnostic.contains("may predate"));
+    }
+
+    #[test]
+    fn build_identity_mismatch_is_reported_before_frame_decode() {
+        let remote_identity = b"v0.0.0+different-build";
+        let mut input = Vec::new();
+        input.extend_from_slice(WIRE_PREAMBLE_MAGIC);
+        input.extend_from_slice(&(remote_identity.len() as u16).to_be_bytes());
+        input.extend_from_slice(remote_identity);
+        input.extend_from_slice(b"not a postcard frame");
+
+        let error = FrameReader::new(input.as_slice())
+            .read_msg::<Response>()
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("build identity mismatch"));
+        assert!(diagnostic.contains("remote v0.0.0+different-build"));
+        assert!(diagnostic.contains(crate::identity::build()));
     }
 
     #[test]

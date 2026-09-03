@@ -132,6 +132,7 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || message.contains("build identity mismatch")
+        || message.contains("wire preamble")
         || message.contains("unexpected handshake response")
         || message.contains("exit status: 127")
         || message.contains(&format!(
@@ -638,7 +639,10 @@ impl RemoteConn {
 
     fn io_err(&mut self, e: anyhow::Error) -> anyhow::Error {
         self.dead = true;
-        // If the child has exited (or does so shortly), that's the more useful error.
+        let detail = format!("{e:#}");
+        // If the child has exited (or does so shortly), that's usually the
+        // more useful error. A multiplexed SSH refusal in particular must win
+        // over the missing-preamble EOF so the caller can retry independently.
         if let Some(child) = &mut self.child {
             for _ in 0..20 {
                 if let Ok(Some(status)) = child.try_wait() {
@@ -649,10 +653,21 @@ impl RemoteConn {
                         ))
                         .into();
                     }
+                    // For other early exits, a preamble failure is the
+                    // actionable version-skew diagnosis; the exit status is
+                    // commonly just the old helper rejecting unknown bytes.
+                    if detail.contains("wire preamble")
+                        || detail.contains("build identity mismatch")
+                    {
+                        return anyhow!("{}: {detail}", self.label);
+                    }
                     return anyhow!("{}: remote syq exited ({status})", self.label);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+        }
+        if detail.contains("wire preamble") || detail.contains("build identity mismatch") {
+            return anyhow!("{}: {detail}", self.label);
         }
         let msg = if e
             .downcast_ref::<std::io::Error>()
@@ -660,7 +675,7 @@ impl RemoteConn {
         {
             "connection closed by remote".to_string()
         } else {
-            format!("{e:#}")
+            detail
         };
         anyhow!("{}: {msg}", self.label)
     }
@@ -1601,6 +1616,7 @@ fn helper_needs_install(e: &anyhow::Error) -> bool {
         "exit status: {}",
         remote_helper::HELPER_NOT_EXECUTABLE_EXIT
     )) || message.contains("build identity mismatch")
+        || message.contains("wire preamble")
 }
 
 /// Concurrently probe which (addr, speed) entries accept a TCP connection on
@@ -2705,6 +2721,15 @@ mod tests {
         );
         assert!(is_non_retryable_connect_error(&error));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn missing_wire_preamble_is_non_retryable_and_refreshes_a_managed_helper() {
+        let error = anyhow!(
+            "wire preamble magic mismatch; remote syq may predate the build-identified preamble"
+        );
+        assert!(is_non_retryable_connect_error(&error));
+        assert!(helper_needs_install(&error));
     }
 
     #[test]
