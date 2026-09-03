@@ -2267,14 +2267,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             loop {
                 match dst_ctl.recv() {
-                    Ok(Response::Receipt(envelope)) => {
-                        println!(
-                            "{}{}",
-                            crate::receipt::RECEIPT_LINE_PREFIX,
-                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(envelope)
-                        );
-                        break;
-                    }
                     Ok(Response::ReceiptV2(frame)) => {
                         let terminal = match crate::receipt_v2::transport_frame_is_end(&frame) {
                             Ok(terminal) => terminal,
@@ -3981,8 +3973,13 @@ impl Planner<'_> {
         self.missing_dirs = std::collections::HashSet::new();
         self.dry_run_replaced_dirs = std::collections::HashSet::new();
         self.unusable_files = std::collections::HashSet::new();
-        self.src_overrides = std::collections::HashMap::new();
-        self.implicit_dirs = std::collections::HashSet::new();
+        // Dry-run directory traces are intentionally deferred until after
+        // planning, when a later explicit directory can have upgraded an
+        // implicit ancestor. They still need these two source-mapping sets.
+        if !self.opts.dry_run {
+            self.src_overrides = std::collections::HashMap::new();
+            self.implicit_dirs = std::collections::HashSet::new();
+        }
         if !self.opts.delete {
             self.dst_seen = std::collections::HashMap::new();
             self.live_sidecars = Vec::new();

@@ -1697,17 +1697,31 @@ fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
     } else {
         let input = std::fs::File::open(file)
             .map_err(|error| anyhow::anyhow!("--files-from {file}: {error}"))?;
-        read_files_from_reader(BufReader::new(input), nul)
+        read_files_from_reader_named(BufReader::new(input), nul, Some(file))
     }
 }
 
-fn read_files_from_reader(mut input: impl std::io::BufRead, nul: bool) -> Result<Vec<Vec<u8>>> {
+fn read_files_from_reader(input: impl std::io::BufRead, nul: bool) -> Result<Vec<Vec<u8>>> {
+    read_files_from_reader_named(input, nul, None)
+}
+
+fn read_files_from_reader_named(
+    mut input: impl std::io::BufRead,
+    nul: bool,
+    file: Option<&str>,
+) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     let mut item = Vec::new();
     let separator = if nul { 0 } else { b'\n' };
     loop {
         item.clear();
-        if input.read_until(separator, &mut item)? == 0 {
+        let read = input
+            .read_until(separator, &mut item)
+            .map_err(|error| match file {
+                Some(file) => anyhow::anyhow!("--files-from {file}: {error}"),
+                None => anyhow::anyhow!(error),
+            })?;
+        if read == 0 {
             break;
         }
         if item.last() == Some(&separator) {
@@ -1957,7 +1971,39 @@ mod tests {
         native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
         parse_size, read_files_from_reader, Args, Placement, SourceSelection,
     };
+    use anyhow::{bail, Result};
     use clap::Parser;
+
+    fn read_files_from_buffered_reference(raw: &[u8], nul: bool) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let items: Vec<&[u8]> = if nul {
+            raw.split(|&byte| byte == 0).collect()
+        } else {
+            raw.split(|&byte| byte == b'\n')
+                .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+                .collect()
+        };
+        for item in items {
+            if item.is_empty() || matches!(item.first(), Some(b'#' | b';')) {
+                continue;
+            }
+            if item.contains(&0) {
+                bail!("entry contains a NUL byte");
+            }
+            if item.split(|&byte| byte == b'/').any(|part| part == b"..") {
+                bail!("entry contains a `..` component");
+            }
+            let parts: Vec<&[u8]> = item
+                .split(|&byte| byte == b'/')
+                .filter(|part| *part != b"." && !part.is_empty())
+                .collect();
+            if parts.is_empty() {
+                bail!("entry names the source root itself");
+            }
+            out.push(parts.join(&b'/'));
+        }
+        Ok(out)
+    }
 
     #[test]
     fn files_from_is_parsed_record_by_record() {
@@ -1971,6 +2017,35 @@ mod tests {
             read_files_from_reader(&b"a/./b\0./;literal\0"[..], true).unwrap(),
             [b"a/b".to_vec(), b";literal".to_vec()]
         );
+    }
+
+    #[test]
+    fn incremental_files_from_keeps_buffered_parser_validation() {
+        const ALPHABET: &[u8] = b"a./\r\n\0#;";
+        for nul in [false, true] {
+            for length in 0usize..=5 {
+                let cases = ALPHABET.len().pow(length as u32);
+                for mut encoded in 0..cases {
+                    let mut raw = vec![0; length];
+                    for byte in &mut raw {
+                        *byte = ALPHABET[encoded % ALPHABET.len()];
+                        encoded /= ALPHABET.len();
+                    }
+                    let expected = read_files_from_buffered_reference(&raw, nul);
+                    let actual = read_files_from_reader(&raw[..], nul);
+                    assert_eq!(
+                        actual.as_ref().ok(),
+                        expected.as_ref().ok(),
+                        "input {raw:?}, nul={nul}; actual={actual:?}, expected={expected:?}"
+                    );
+                    assert_eq!(
+                        actual.is_err(),
+                        expected.is_err(),
+                        "input {raw:?}, nul={nul}; actual={actual:?}, expected={expected:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
