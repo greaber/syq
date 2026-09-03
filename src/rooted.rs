@@ -570,6 +570,23 @@ impl Root {
         Ok(directory)
     }
 
+    /// Open the longest directory prefix without following a descendant
+    /// symlink. The count identifies how many components that prefix consumed.
+    /// A component that is missing, is not a directory, or cannot be inspected
+    /// ends the walk so best-effort callers can use the retained ancestor.
+    pub(crate) fn open_nearest_directory(&self, path: &RelativePath) -> Result<(File, usize)> {
+        let mut directory = self.directory.try_clone().context("duplicate root fd")?;
+        let mut consumed = 0;
+        for component in &path.components {
+            let Ok(next) = open_operator_directory_at(&directory, component) else {
+                break;
+            };
+            directory = next;
+            consumed += 1;
+        }
+        Ok((directory, consumed))
+    }
+
     pub(crate) fn open_regular_read(&self, path: &RelativePath) -> Result<File> {
         self.open_regular(path, libc::O_RDONLY, false)
     }

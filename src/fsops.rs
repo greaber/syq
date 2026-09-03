@@ -477,11 +477,8 @@ fn base32(bytes: &[u8]) -> String {
 fn name_max(parent: &Path) -> usize {
     static CACHE: OnceLock<Mutex<NameMaxCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(NameMaxCache::default()));
-    name_max_cached(parent, cache, |candidate| {
-        let Ok(path) = cstr(candidate) else {
-            return COMMON_NAME_MAX;
-        };
-        let limit = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_NAME_MAX) };
+    name_max_cached(parent, cache, |_candidate, directory| {
+        let limit = unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_NAME_MAX) };
         if limit > 0 {
             limit as usize
         } else {
@@ -493,7 +490,7 @@ fn name_max(parent: &Path) -> usize {
 fn name_max_cached(
     parent: &Path,
     cache: &Mutex<NameMaxCache>,
-    query: impl Fn(&Path) -> usize,
+    query: impl Fn(&Path, &File) -> usize,
 ) -> usize {
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
@@ -501,35 +498,51 @@ fn name_max_cached(
         parent
     };
     let key = lexical_absolute(parent);
-    let mut candidate = key.clone();
-    loop {
-        let cached_path = cache.lock().unwrap().paths.get(&candidate).copied();
-        if let Some(limit) = cached_path {
-            cache.lock().unwrap().paths.insert(key, limit);
-            return limit;
-        }
-        // Preflight often runs before mapped destination subdirectories have
-        // been created. Missing descendants inherit the nearest existing
-        // ancestor's mount unless a concurrent mount change occurs.
-        if let Ok(metadata) = fs::symlink_metadata(&candidate) {
-            if metadata.is_dir() {
-                let dev = metadata.dev();
-                let cached = cache.lock().unwrap().devices.get(&dev).copied();
-                let limit = cached.unwrap_or_else(|| query(&candidate));
-                let mut cache = cache.lock().unwrap();
-                if cache.paths.len() >= NAME_MAX_CACHE_CAP {
-                    cache.paths.clear();
-                }
-                cache.devices.entry(dev).or_insert(limit);
-                cache.paths.insert(candidate, limit);
-                cache.paths.insert(key, limit);
-                return limit;
-            }
-        }
-        if !candidate.pop() {
-            return COMMON_NAME_MAX;
-        }
+    if let Some(limit) = cache.lock().unwrap().paths.get(&key).copied() {
+        return limit;
     }
+
+    // Resolve from a retained root one component at a time. A pathname lstat
+    // would still follow symlinks in intermediate components when a descendant
+    // exists. Planning replaces such a symlink instead, so descendants inherit
+    // the containing real directory's filesystem limit.
+    let Ok(root) = Root::open(Path::new("/")) else {
+        return COMMON_NAME_MAX;
+    };
+    let Ok(relative) = key.strip_prefix(Path::new("/")) else {
+        return COMMON_NAME_MAX;
+    };
+    let Ok(relative) = RelativePath::new(relative.as_os_str().as_bytes()) else {
+        return COMMON_NAME_MAX;
+    };
+    let Ok((directory, consumed)) = root.open_nearest_directory(&relative) else {
+        return COMMON_NAME_MAX;
+    };
+    let mut candidate = PathBuf::from("/");
+    for component in key
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(component) => Some(component),
+            _ => None,
+        })
+        .take(consumed)
+    {
+        candidate.push(component);
+    }
+    let Ok(metadata) = directory.metadata() else {
+        return COMMON_NAME_MAX;
+    };
+    let dev = metadata.dev();
+    let cached = cache.lock().unwrap().devices.get(&dev).copied();
+    let limit = cached.unwrap_or_else(|| query(&candidate, &directory));
+    let mut cache = cache.lock().unwrap();
+    if cache.paths.len() >= NAME_MAX_CACHE_CAP {
+        cache.paths.clear();
+    }
+    cache.devices.entry(dev).or_insert(limit);
+    cache.paths.insert(candidate, limit);
+    cache.paths.insert(key, limit);
+    limit
 }
 
 fn lexical_absolute(path: &Path) -> PathBuf {
@@ -4955,20 +4968,50 @@ mod tests {
     }
 
     #[test]
-    fn name_limit_discovery_does_not_follow_in_tree_symlinks() {
+    fn name_limit_discovery_does_not_follow_an_intermediate_symlink() {
         let dir = test_dir();
         fs::create_dir(&dir).unwrap();
         let target = dir.join("symlink-target");
+        let existing = target.join("existing");
         let link = dir.join("in-tree-link");
-        fs::create_dir(&target).unwrap();
+        fs::create_dir_all(&existing).unwrap();
         symlink(&target, &link).unwrap();
         let cache = Mutex::new(NameMaxCache::default());
         let queried = Mutex::new(Vec::new());
+        let expected = fs::metadata(&dir).unwrap();
 
-        let limit = name_max_cached(&link.join("deeper"), &cache, |candidate| {
-            queried.lock().unwrap().push(candidate.to_path_buf());
+        let limit = name_max_cached(&link.join("existing"), &cache, |candidate, directory| {
+            let metadata = directory.metadata().unwrap();
+            queried
+                .lock()
+                .unwrap()
+                .push((candidate.to_path_buf(), metadata.dev(), metadata.ino()));
             143
         });
+
+        assert_eq!(limit, 143);
+        assert_eq!(
+            *queried.lock().unwrap(),
+            vec![(lexical_absolute(&dir), expected.dev(), expected.ino())]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn name_limit_discovery_uses_the_nearest_existing_directory() {
+        let dir = test_dir();
+        fs::create_dir(&dir).unwrap();
+        let cache = Mutex::new(NameMaxCache::default());
+        let queried = Mutex::new(Vec::new());
+
+        let limit = name_max_cached(
+            &dir.join("not-yet-created/deeper"),
+            &cache,
+            |candidate, _directory| {
+                queried.lock().unwrap().push(candidate.to_path_buf());
+                143
+            },
+        );
 
         assert_eq!(limit, 143);
         assert_eq!(*queried.lock().unwrap(), vec![lexical_absolute(&dir)]);
