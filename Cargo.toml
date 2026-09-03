@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "filesystem"]
 include = [
     "/build.rs",
     "/src/**",
+    "/schemas/**",
     "/tests/**",
     "/Cargo.toml",
     "/Cargo.lock",
@@ -66,3 +67,4 @@ strip = "symbols"
 [dev-dependencies]
 libc = "0.2"
 serde_json = "1"
+jsonschema = { version = "0.33", default-features = false }

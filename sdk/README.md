@@ -1,18 +1,22 @@
 # syq language SDKs
 
-This directory contains preview subprocess adapters for syq. They are small,
-real packages that establish the canonical language names without inventing a
-second transfer implementation.
+This directory contains language clients for syq. They invoke the syq
+executable rather than inventing a second transfer implementation.
 
-The initial packages deliberately expose only two operations:
+The JavaScript and Go previews currently expose two operations:
 
 - run the `syq` executable with an argument array, never through a shell;
 - query and validate `syq --version`.
 
-They do not parse human output or yet offer a structured copy API. That surface
-will be added after syq's versioned NDJSON automation interface is released.
-The executable remains authoritative for argument semantics, filesystem
-behavior, exit status, and safety checks.
+The Python package also implements synchronous and asyncio clients for typed
+`cp` (including `prune=True`) and `map` against syq's versioned machine
+interfaces. Commands without an automation result stream, currently including
+`rm`, remain available through raw `run`. The executable remains authoritative
+for argument semantics,
+filesystem behavior, exit status, and safety checks.
+
+The Python-native surface is documented in
+[`python/NATIVE_API.md`](python/NATIVE_API.md).
 
 | Ecosystem | Package/module | Source |
 |---|---|---|

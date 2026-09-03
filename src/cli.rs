@@ -101,6 +101,10 @@ pub struct Args {
     /// `--results` NDJSON outcome stream for native cp (`-` writes stdout).
     #[arg(skip)]
     pub native_results: Option<Vec<u8>>,
+    /// `--results-fd`: an inherited descriptor the caller opened for the
+    /// stream; validated and wrapped at startup.
+    #[arg(skip)]
+    pub native_results_fd: Option<i32>,
     /// Native coordinator placement.
     #[arg(skip)]
     pub run_at: RunAt,
@@ -863,11 +867,14 @@ struct NativeCopyFields {
     /// dst paths are relative to the --into container
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     mapping: Option<OsString>,
-    /// Write machine-readable NDJSON operation results to FILE (`-` writes
-    /// to stdout; combine with -q). A named file requires a local coordinator.
-    /// Automation schema version 0, an unstable preview
+    /// Write the machine-readable NDJSON result stream to FILE (created
+    /// fresh; an existing file is refused). Automation schema version 1
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     results: Option<OsString>,
+    /// Write the result stream to an inherited file descriptor the caller
+    /// opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2
+    #[arg(long, value_name = "FD", conflicts_with = "results")]
+    results_fd: Option<i32>,
     #[command(flatten)]
     operational: NativeCopyOperationalArgs,
 }
@@ -902,7 +909,7 @@ struct NativeCopyCommand {
     pscope: Option<PathBuf>,
     /// After copying, remove target-only objects in mapped directory scopes;
     /// ignored and size-excluded source paths remain protected
-    #[arg(long, conflicts_with_all = ["mapping", "results"])]
+    #[arg(long, conflicts_with = "mapping")]
     prune: bool,
     /// With --prune, refuse all removals if more than N are planned
     #[arg(long, value_name = "N", requires = "prune")]
@@ -971,11 +978,11 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     }
     let mapping = copy.mapping.take();
     let results = copy.results.take();
-    if results.is_some() && copy.operational.common.dry_run {
-        // Dry-run trace output is a deliberately deferred automation
-        // feature; a version-0 results stream reusing the live counters
-        // would claim planned work as transferred.
-        bail!("--results does not support --dry-run yet");
+    let results_fd = copy.results_fd.take();
+    if results_fd.is_some_and(|fd| fd <= 2) {
+        bail!(
+            "--results-fd needs a descriptor above 2 (0-2 are stdin, stdout, and stderr); open one in the caller, e.g. --results-fd 3 3>run.ndjson"
+        );
     }
     let mut locations = if mapping.is_some() {
         let source = &copy.selection.source;
@@ -1071,6 +1078,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.min_size = size_selection.min_size;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
+    args.native_results_fd = results_fd;
     args.pscope = pscope;
     args.native_follow = copy.selection.source.follow;
     if args.native_mapping.is_some() {
@@ -1102,6 +1110,28 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         }
     }
     apply_internal_native_direct(&mut args)?;
+    if args.native_results.is_some() || args.native_results_fd.is_some() {
+        // Usage-lane refusals (exit 2, no stream): the contract promises a
+        // terminal record for every run that gets past argument parsing, so
+        // combinations that could never settle a stream stop here.
+        if args.detach {
+            bail!(
+                "--results cannot be used with --detach because the result stream would not remain attached"
+            );
+        }
+        // The stream is written by the transfer coordinator. For a
+        // remote-to-remote copy that requires the local (relay) topology,
+        // which is never chosen implicitly on the stream's behalf: the
+        // operator opts in with an explicit --run-at local, even where
+        // auto placement would have relayed anyway.
+        let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
+        let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
+        if src_remote && dst_remote && args.run_at != RunAt::Local {
+            bail!(
+                "--results with a remote-to-remote copy needs the local coordinator; pass --run-at local explicitly to route the transfer through this machine"
+            );
+        }
+    }
     Ok(args)
 }
 
@@ -1347,6 +1377,82 @@ fn apply_native_operational(args: &mut Args, operational: NativeOperationalArgs)
     args.progress = operational.progress;
     args.no_progress = operational.no_progress;
     args.progress_json = operational.progress_json;
+}
+
+#[cfg(test)]
+mod native_sdk_inventory_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(serde::Deserialize)]
+    struct Inventory {
+        schema: u64,
+        commands: BTreeMap<String, CommandInventory>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CommandInventory {
+        sdk: String,
+        python: Vec<String>,
+        internal: Vec<String>,
+        aliases: BTreeMap<String, String>,
+        raw_only: Vec<String>,
+        follow_up: Vec<String>,
+    }
+
+    fn long_options(command: clap::Command) -> BTreeSet<String> {
+        command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn every_native_option_has_an_sdk_disposition() {
+        let inventory: Inventory =
+            serde_json::from_str(include_str!("../sdk/python/native-api.json"))
+                .expect("Python native API inventory is valid JSON");
+        assert_eq!(inventory.schema, 1);
+        let commands = [
+            ("cp", NativeCopyCommand::command()),
+            ("rm", NativeRmCommand::command()),
+            ("map", NativeMapCommand::command()),
+        ];
+        assert_eq!(
+            inventory.commands.keys().cloned().collect::<BTreeSet<_>>(),
+            commands
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect(),
+            "classify every native command in sdk/python/native-api.json"
+        );
+        for (name, command) in commands {
+            let classified = inventory.commands.get(name).unwrap();
+            assert!(
+                matches!(classified.sdk.as_str(), "python" | "raw_only" | "follow_up"),
+                "{name} has an invalid SDK disposition"
+            );
+            let mut declared = BTreeSet::new();
+            for option in classified
+                .python
+                .iter()
+                .chain(&classified.internal)
+                .chain(classified.aliases.keys())
+                .chain(&classified.raw_only)
+                .chain(&classified.follow_up)
+            {
+                assert!(
+                    declared.insert(option.clone()),
+                    "{name} option --{option} has more than one SDK disposition"
+                );
+            }
+            assert_eq!(
+                declared,
+                long_options(command),
+                "update sdk/python/native-api.json whenever the native CLI changes"
+            );
+        }
+    }
 }
 
 fn apply_native_copy_operational(

@@ -1224,6 +1224,8 @@ fn run_remote(
         // its errors are already printed. Other statuses receive source-host
         // connectivity or constrained-authentication context here.
         Some(c @ (23 | 25)) => Ok(c),
+        // These arms build Err values rather than bailing: every failure
+        // must pass through the held-terminal settlement below.
         Some(c) => {
             if args.rsh.is_none()
                 && !args.no_forward_agent
@@ -1234,7 +1236,9 @@ fn run_remote(
             }
             bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); {coordinator_host} may not be able to reach the peer endpoint")
         }
-        None => bail!("remote syq on {coordinator_host} killed by signal"),
+        None => Err(anyhow::anyhow!(
+            "remote syq on {coordinator_host} killed by signal"
+        )),
     };
     let code = outcome?;
     if let Some(expectation) = &receipt_expectation {

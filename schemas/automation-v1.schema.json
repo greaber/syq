@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/greaber/syq/blob/master/schemas/automation-v1.schema.json",
+  "title": "syq automation results stream, schema version 1",
+  "description": "One record per NDJSON line of a `syq cp --results` stream. This schema is strict (additionalProperties: false) so that any change to syq's output shape fails the repository's validation tests and gets reviewed as an API change; consumers should instead ignore unknown record types and unknown optional fields, per docs/automation-v1.md.",
+  "oneOf": [
+    { "$ref": "#/$defs/run" },
+    { "$ref": "#/$defs/progress" },
+    { "$ref": "#/$defs/trace" },
+    { "$ref": "#/$defs/operation_result" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/result" }
+  ],
+  "$defs": {
+    "envelope": {
+      "type": "object",
+      "properties": {
+        "schema": { "const": "syq.automation" },
+        "schema_version": { "const": 1 },
+        "seq": { "$ref": "#/$defs/u64" }
+      },
+      "required": ["schema", "schema_version", "seq", "type"]
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "taggedPath": {
+      "type": "object",
+      "description": "Lossless path: value is the path itself when it is valid UTF-8, otherwise the standard base64 encoding of its raw bytes.",
+      "properties": {
+        "encoding": { "enum": ["utf-8", "base64"] },
+        "value": { "type": "string" }
+      },
+      "required": ["encoding", "value"],
+      "additionalProperties": false
+    },
+    "action": {
+      "enum": [
+        "transfer_file",
+        "create_directory",
+        "create_symlink",
+        "create_special",
+        "delete"
+      ]
+    },
+    "objectKind": {
+      "enum": ["file", "dir", "symlink", "special"]
+    },
+    "reason": {
+      "enum": [
+        "destination_missing",
+        "type_differs",
+        "content_differs",
+        "metadata_differs",
+        "destination_only"
+      ]
+    },
+    "errorClass": {
+      "enum": [
+        "io",
+        "transport",
+        "conflict",
+        "integrity",
+        "safety_limit",
+        "usage",
+        "internal"
+      ]
+    },
+    "osKind": {
+      "enum": [
+        "not_found",
+        "permission_denied",
+        "already_exists",
+        "invalid_input",
+        "no_space",
+        "read_only",
+        "other"
+      ]
+    },
+    "run": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": { "const": "run" },
+        "run_id": { "type": "string" },
+        "started_at": { "type": "integer" },
+        "syq_version": { "type": "string" },
+        "mode": { "const": "cp" },
+        "prune": { "type": "boolean" },
+        "mapping": { "type": "boolean" },
+        "dry_run": { "type": "boolean" },
+        "endpoints": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": { "enum": ["source", "destination"] },
+              "kind": { "enum": ["local", "ssh"] },
+              "host": { "type": "string" },
+              "user": { "type": "string" }
+            },
+            "required": ["role", "kind"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "run_id",
+        "started_at",
+        "syq_version",
+        "mode",
+        "prune",
+        "mapping",
+        "dry_run",
+        "endpoints"
+      ],
+      "additionalProperties": false
+    },
+    "progress": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": { "const": "progress" },
+        "bytes_done": { "$ref": "#/$defs/u64" },
+        "bytes_total": { "$ref": "#/$defs/u64" },
+        "bytes_unchanged": { "$ref": "#/$defs/u64" },
+        "files_done": { "$ref": "#/$defs/u64" },
+        "files_total": { "$ref": "#/$defs/u64" },
+        "files_unchanged": { "$ref": "#/$defs/u64" },
+        "files_excluded": { "$ref": "#/$defs/u64" },
+        "scanned": { "$ref": "#/$defs/u64" },
+        "scan_done": { "type": "boolean" },
+        "elapsed_ms": { "$ref": "#/$defs/u64" }
+      },
+      "required": [
+        "bytes_done",
+        "bytes_total",
+        "bytes_unchanged",
+        "files_done",
+        "files_total",
+        "files_unchanged",
+        "files_excluded",
+        "scanned",
+        "scan_done",
+        "elapsed_ms"
+      ],
+      "additionalProperties": false
+    },
+    "trace": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": { "const": "trace" },
+        "action": { "$ref": "#/$defs/action" },
+        "dst": { "$ref": "#/$defs/taggedPath" },
+        "src": { "$ref": "#/$defs/taggedPath" },
+        "kind": { "$ref": "#/$defs/objectKind" },
+        "bytes": { "$ref": "#/$defs/u64" },
+        "reason": { "$ref": "#/$defs/reason" }
+      },
+      "required": ["action", "dst", "kind", "reason"],
+      "additionalProperties": false
+    },
+    "operation_result": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": { "const": "operation_result" },
+        "action": { "$ref": "#/$defs/action" },
+        "dst": { "$ref": "#/$defs/taggedPath" },
+        "src": { "$ref": "#/$defs/taggedPath" },
+        "kind": { "$ref": "#/$defs/objectKind" },
+        "disposition": { "enum": ["succeeded", "failed", "blocked"] },
+        "bytes": { "$ref": "#/$defs/u64" },
+        "attempts": { "$ref": "#/$defs/u64" },
+        "retryable": { "enum": ["yes", "no", "unknown"] },
+        "class": { "$ref": "#/$defs/errorClass" },
+        "os_kind": { "$ref": "#/$defs/osKind" },
+        "message": { "type": "string" }
+      },
+      "required": ["action", "dst", "kind", "disposition"],
+      "additionalProperties": false
+    },
+    "error": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": { "const": "error" },
+        "message": { "type": "string" },
+        "class": { "$ref": "#/$defs/errorClass" },
+        "os_kind": { "$ref": "#/$defs/osKind" }
+      },
+      "required": ["message"],
+      "additionalProperties": false
+    },
+    "result": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": { "const": "result" },
+        "status": {
+          "enum": ["success", "partial", "refused", "aborted", "failed"]
+        },
+        "exit_code": { "type": "integer" },
+        "dry_run": { "type": "boolean" },
+        "files_transferred": { "$ref": "#/$defs/u64" },
+        "files_unchanged": { "$ref": "#/$defs/u64" },
+        "files_excluded": { "$ref": "#/$defs/u64" },
+        "directories_created": { "$ref": "#/$defs/u64" },
+        "symlinks_created": { "$ref": "#/$defs/u64" },
+        "specials_created": { "$ref": "#/$defs/u64" },
+        "errors": { "$ref": "#/$defs/u64" },
+        "bytes_transferred": { "$ref": "#/$defs/u64" },
+        "bytes_unchanged": { "$ref": "#/$defs/u64" },
+        "elapsed_ms": { "$ref": "#/$defs/u64" },
+        "deletions_planned": { "$ref": "#/$defs/u64" },
+        "deletions_completed": { "$ref": "#/$defs/u64" },
+        "deletions_blocked": { "$ref": "#/$defs/u64" }
+      },
+      "required": [
+        "status",
+        "exit_code",
+        "dry_run",
+        "files_transferred",
+        "files_unchanged",
+        "files_excluded",
+        "directories_created",
+        "symlinks_created",
+        "specials_created",
+        "errors",
+        "bytes_transferred",
+        "bytes_unchanged",
+        "elapsed_ms"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

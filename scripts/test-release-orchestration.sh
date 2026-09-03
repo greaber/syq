@@ -140,7 +140,12 @@ expect_failure 'timed out waiting for native pull-request workflow runs' env \
 # response from fixtures. The preflight must not create a tag or publication.
 preflight_repo="$work/preflight-repo"
 preflight_bin="$work/preflight-bin"
-mkdir -p "$preflight_repo/.github/workflows" "$preflight_bin"
+mkdir -p "$preflight_repo/.github/workflows" "$preflight_repo/scripts" \
+  "$preflight_repo/sdk/python" "$preflight_bin"
+cp "$script_dir/check-python-api-sync.py" "$preflight_repo/scripts/"
+cat >"$preflight_repo/sdk/python/native-api.json" <<'EOF'
+{"schema":1,"commands":{}}
+EOF
 cat >"$preflight_repo/Cargo.toml" <<'EOF'
 [package]
 name = "syq"

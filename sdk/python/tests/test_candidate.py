@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import syq
 
@@ -17,7 +19,7 @@ EXPECTED_VERSION = os.environ.get("SYQ_CANDIDATE_VERSION")
     "candidate compatibility requires SYQ_CANDIDATE_EXECUTABLE and version",
 )
 class CandidateCompatibilityTests(unittest.TestCase):
-    def test_candidate_version_and_local_copy(self) -> None:
+    def test_candidate_version_and_typed_native_surface(self) -> None:
         assert EXECUTABLE is not None
         assert EXPECTED_VERSION is not None
         executable = Path(EXECUTABLE)
@@ -29,13 +31,131 @@ class CandidateCompatibilityTests(unittest.TestCase):
             destination = root / "destination"
             source.write_bytes(b"candidate compatibility\n")
 
-            result = syq.run(
-                ["cp", source, "--as-new", destination, "--quiet"],
-                executable=executable,
+            client = syq.Client(executable=executable, process_cwd=root)
+            events: list[syq.AutomationEvent] = []
+            preview = client.cp(
+                source.name,
+                as_new=destination.name,
+                dry_run=True,
+                on_event=events.append,
+            )
+            self.assertTrue(preview.dry_run)
+            self.assertEqual(preview.files_transferred, 1)
+            self.assertEqual(
+                preview.bytes_transferred, len(b"candidate compatibility\n")
+            )
+            self.assertFalse(destination.exists())
+            self.assertTrue(
+                any(
+                    isinstance(event, syq.TraceEvent)
+                    and event.reason is syq.TraceReason.DESTINATION_MISSING
+                    for event in events
+                )
             )
 
-            self.assertEqual(result.returncode, 0)
+            result = client.cp(source.name, as_new=destination.name)
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.files_transferred, 1)
             self.assertEqual(destination.read_bytes(), source.read_bytes())
+
+            mapping_source = root / "mapping-source"
+            mapping_source.mkdir()
+            (mapping_source / "mapped.txt").write_bytes(b"mapped")
+            mapping_alias = root / "mapping-source-link"
+            mapping_alias.symlink_to(mapping_source, target_is_directory=True)
+            with client.map(src_src=mapping_alias.name, follow=True) as mapping:
+                entries = list(mapping)
+            self.assertEqual(entries[0].src, syq.RelativePath("mapped.txt"))
+            physical_temp = root / "physical-temp"
+            physical_temp.mkdir()
+            temporary_alias = root / "temporary-alias"
+            temporary_alias.symlink_to(physical_temp, target_is_directory=True)
+            named_temporary_file = tempfile.NamedTemporaryFile
+
+            def create_through_alias(**kwargs):
+                return named_temporary_file(dir=temporary_alias, **kwargs)
+
+            with mock.patch(
+                "syq.client.tempfile.NamedTemporaryFile",
+                side_effect=create_through_alias,
+            ):
+                mapped = client.cp(
+                    mapping=entries,
+                    cwd=mapping.cwd,
+                    follow=True,
+                    into="mapped",
+                )
+            self.assertEqual(mapped.files_transferred, 1)
+            self.assertEqual((root / "mapped" / "mapped.txt").read_bytes(), b"mapped")
+
+            generated_source = root / "generated-source"
+            generated_source.mkdir()
+            (generated_source / "generated.txt").write_bytes(b"generated")
+            with mock.patch(
+                "syq.client.tempfile.NamedTemporaryFile",
+                side_effect=create_through_alias,
+            ):
+                generated = client.cp(
+                    mapping=[syq.MappingEntry("generated.txt", "generated.txt")],
+                    cwd=generated_source.name,
+                    into="generated-target",
+                )
+            self.assertEqual(generated.files_transferred, 1)
+            self.assertEqual(
+                (root / "generated-target" / "generated.txt").read_bytes(),
+                b"generated",
+            )
+
+            ignore_source = root / "ignore-source"
+            ignore_source.mkdir()
+            (ignore_source / "keep.tmp").write_bytes(b"keep")
+            ignore_rules = root / "ignore.rules"
+            ignore_rules.write_text("*.tmp\n", encoding="utf-8")
+            ordered = client.cp(
+                src_src=ignore_source.name,
+                into="ignore-target",
+                ignore=[syq.IgnoreFrom(ignore_rules.name), "!keep.tmp"],
+            )
+            self.assertEqual(ordered.files_transferred, 1)
+            self.assertEqual(
+                (root / "ignore-target" / "keep.tmp").read_bytes(), b"keep"
+            )
+
+            prune_source = root / "prune-source"
+            prune_target = root / "prune-target"
+            prune_source.mkdir()
+            prune_target.mkdir()
+            (prune_source / "keep").write_bytes(b"keep")
+            (prune_target / "extra").write_bytes(b"extra")
+            pruned = client.cp(
+                src_src=prune_source.name,
+                into_existing=prune_target.name,
+                prune=True,
+                max_delete=1,
+            )
+            self.assertEqual(pruned.deletions_completed, 1)
+            self.assertFalse((prune_target / "extra").exists())
+
+            raw_name = b"raw-\xff"
+            raw_source = os.fsencode(root) + b"/" + raw_name
+            descriptor = os.open(raw_source, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                os.write(descriptor, b"raw")
+            finally:
+                os.close(descriptor)
+            raw_events: list[syq.AutomationEvent] = []
+            raw_result = client.cp(
+                src=raw_name,
+                into=b"raw-target",
+                on_event=raw_events.append,
+            )
+            self.assertEqual(raw_result.files_transferred, 1)
+            raw_operation = next(
+                event
+                for event in raw_events
+                if isinstance(event, syq.OperationResult) and event.kind == "file"
+            )
+            self.assertEqual(raw_operation.dst.raw, raw_name)
 
     def test_candidate_failure_is_retained(self) -> None:
         assert EXECUTABLE is not None
@@ -47,6 +167,122 @@ class CandidateCompatibilityTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(result.stderr)
+
+    def test_candidate_remote_coordinator_returns_one_valid_stream(self) -> None:
+        assert EXECUTABLE is not None
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"remote coordinator")
+            remote_home = root / "remote-home"
+            remote_home.mkdir()
+            rsh_log = root / "rsh.log"
+            rsh = root / "fake-rsh"
+            rsh.write_text(
+                """#!/bin/sh
+shift
+HOME="$FAKE_REMOTE_HOME"
+PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
+export HOME PATH
+printf '%s\\n' "$1" >> "$FAKE_RSH_LOG"
+exec /bin/sh -c "$1"
+""",
+                encoding="utf-8",
+            )
+            rsh.chmod(0o755)
+            client = syq.Client(
+                executable=EXECUTABLE,
+                process_cwd=root,
+                env={
+                    **os.environ,
+                    "FAKE_REMOTE_HOME": os.fspath(remote_home),
+                    "FAKE_REMOTE_BIN": os.fspath(root / "remote-bin"),
+                    "FAKE_RSH_LOG": os.fspath(rsh_log),
+                },
+            )
+
+            # Remote coordinators cannot write the local stream: the typed
+            # surface refuses source/target placement before spawning.
+            with self.assertRaises(syq.SyqInvocationError):
+                client.cp(
+                    src=source,
+                    from_="hostA",
+                    to="hostB",
+                    run_at="target",
+                    as_=destination,
+                    rsh=os.fspath(rsh),
+                    syq_path=EXECUTABLE,
+                    no_tcp=True,
+                    connections=1,
+                )
+
+            result = client.cp(
+                src=source,
+                from_="hostA",
+                to="hostB",
+                run_at="local",
+                as_=destination,
+                rsh=os.fspath(rsh),
+                syq_path=EXECUTABLE,
+                no_tcp=True,
+                connections=1,
+            )
+
+            self.assertEqual(result.status, syq.OperationStatus.SUCCESS)
+            self.assertEqual(destination.read_bytes(), b"remote coordinator")
+
+
+@unittest.skipUnless(
+    EXECUTABLE and EXPECTED_VERSION,
+    "candidate compatibility requires SYQ_CANDIDATE_EXECUTABLE and version",
+)
+class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_client_uses_the_candidate_native_surface(self) -> None:
+        assert EXECUTABLE is not None
+        assert EXPECTED_VERSION is not None
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "source").mkdir()
+            (root / "source" / "a").write_bytes(b"async")
+            client = syq.AsyncClient(executable=EXECUTABLE, process_cwd=root)
+
+            self.assertEqual(await client.version(), EXPECTED_VERSION)
+            preview = await client.cp(
+                src_src="source", into="destination", dry_run=True
+            )
+            self.assertEqual(preview.files_transferred, 1)
+            self.assertEqual(preview.bytes_transferred, len(b"async"))
+
+            physical_temp = root / "async-physical-temp"
+            physical_temp.mkdir()
+            temporary_alias = root / "async-temporary-alias"
+            temporary_alias.symlink_to(physical_temp, target_is_directory=True)
+            named_temporary_file = tempfile.NamedTemporaryFile
+
+            def create_through_alias(**kwargs):
+                return named_temporary_file(dir=temporary_alias, **kwargs)
+
+            async with client.map(src_src="source") as mapping:
+                with mock.patch(
+                    "syq.async_client.tempfile.NamedTemporaryFile",
+                    side_effect=create_through_alias,
+                ):
+                    copied = await client.cp(
+                        mapping=mapping, cwd=mapping.cwd, into="destination"
+                    )
+            self.assertEqual(copied.files_transferred, 1)
+            self.assertEqual((root / "destination" / "a").read_bytes(), b"async")
+
+            (root / "destination" / "extra").write_bytes(b"remove")
+            pruned = await client.cp(
+                src_src="source",
+                into_existing="destination",
+                prune=True,
+                max_delete=1,
+            )
+            self.assertEqual(pruned.deletions_completed, 1)
+            self.assertFalse((root / "destination" / "extra").exists())
 
 
 if __name__ == "__main__":

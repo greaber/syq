@@ -271,32 +271,36 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   fail entries individually. `syq map` streams its output. Exit codes
   and output are the ordinary `syq cp` ones.
 
-## Machine-readable results (preview)
+## Machine-readable results
 
-`syq cp --results FILE` (also `-` for stdout; combine that with `-q`)
-writes an NDJSON outcome stream beside the ordinary human output:
-a `run` record, one `operation_result` per settled mutation and per
-failed mapping entry, an `error` record per counted error, and exactly
-one terminal `result` with the exit code and aggregate counts. The
-records carry `schema_version: 0` — an unstable preview of the planned
-automation interface; unchanged and excluded entries appear only in
-the terminal aggregates, and metadata-only updates are not yet
-reported per operation. A missing terminal record means the run did
-not finish.
+`syq cp --results FILE` (with or without `--prune`) writes an NDJSON
+outcome stream to a freshly created file, alongside the ordinary human
+output; `--results-fd N` writes to a caller-opened descriptor instead
+(`--results-fd 3 3>r.ndjson`, or a pipe). The
+full contract — every record type and field, the exit-code table,
+the JSON Schema, and example streams — is
+[docs/automation-v1.md](docs/automation-v1.md). In brief: the
+stream carries `schema_version: 1`: a `run` record (run id, mode,
+endpoints), sampled `progress` records, one `operation_result` per
+settled mutation and per failed mapping entry (with `retryable`, and
+`class`/`os_kind` where known), `trace` records instead of results
+under `--dry-run` (each with the reason a mutation is planned), an
+`error` record per counted error, and exactly one flushed terminal
+`result` whose numbers also render the human summary. Unchanged and
+excluded entries appear only in the terminal aggregates, and
+metadata-only updates are not yet reported per operation. A missing
+terminal record means the run did not finish; a terminal status other
+than `success` or `partial` means entries may be unsettled.
 
-Normally the results writer lives with the transfer coordinator. For an
-attached direct remote-to-remote copy through a command-restricted receiver,
-however, `--results -` is written by the invoking machine only after it has
-verified and decrypted hostB's receipt. Those records have
-`"provenance":"receiver_attested"`, omit unauthenticated source claims, and
-add a `receiver_final_state` record for every path the transfer could have
-changed; `scope` identifies the signed mutation scope and `dst` is relative to
-it. Other direct remote coordinators stream their NDJSON back over the
-coordinator connection. A named results file is accepted only when the
-coordinator is local, including `--run-at local`; this avoids interpreting a
-local-looking pathname on a remote host. `--results` cannot be combined with
-`--detach`, because the caller would no longer be attached for the complete
-stream and its terminal record.
+The results writer lives with the transfer coordinator, so a stream
+requires a local coordinator (an explicit `--run-at local` for a
+remote-to-remote copy). `--results` cannot be combined with `--detach`,
+because the caller would no longer be attached for the complete stream
+and its terminal record. Receiver-attested streams for attached direct
+copies through a command-restricted receiver — records verified and
+decrypted from hostB's receipt, marked `"provenance":"receiver_attested"`
+— exist in the engine and return once wired to the file/descriptor
+targets.
 
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:

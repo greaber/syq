@@ -39,6 +39,16 @@ pub struct Progress {
     pub scanned: AtomicU64,
     pub scan_done: AtomicBool,
     pub errors: AtomicU64,
+    /// --prune bookkeeping mirrored here so the fatal-error terminal record
+    /// can report what the deletion pass did before the run died.
+    pub deletions_planned: AtomicU64,
+    pub deletions_completed: AtomicU64,
+    pub deletions_blocked: AtomicU64,
+    /// Settled creations, mirrored here (like the deletion counters) so a
+    /// fatal-error terminal record reports what the run actually did.
+    pub dirs_created: AtomicU64,
+    pub links_created: AtomicU64,
+    pub specials_created: AtomicU64,
     /// Workers currently allowed to take work (0 = fixed -j, not shown).
     pub active_workers: AtomicU64,
     pub start: Instant,
@@ -54,6 +64,7 @@ struct TermState {
     lines_drawn: usize,
     samples: VecDeque<(Instant, u64)>,
     last_json: Option<Instant>,
+    last_results: Option<Instant>,
 }
 
 impl Progress {
@@ -81,6 +92,12 @@ impl Progress {
             scanned: AtomicU64::new(0),
             scan_done: AtomicBool::new(false),
             errors: AtomicU64::new(0),
+            deletions_planned: AtomicU64::new(0),
+            deletions_completed: AtomicU64::new(0),
+            deletions_blocked: AtomicU64::new(0),
+            dirs_created: AtomicU64::new(0),
+            links_created: AtomicU64::new(0),
+            specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             start: Instant::now(),
             workers: Mutex::new(vec![None; n_workers]),
@@ -88,6 +105,7 @@ impl Progress {
                 lines_drawn: 0,
                 samples: VecDeque::new(),
                 last_json: None,
+                last_results: None,
             }),
             stop: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
@@ -132,10 +150,19 @@ impl Progress {
     }
 
     pub fn error(&self, line: &str) {
+        self.error_classified(line, None, None);
+    }
+
+    pub fn error_classified(
+        &self,
+        line: &str,
+        class: Option<&'static str>,
+        os_kind: Option<&'static str>,
+    ) {
         self.errors.fetch_add(1, Relaxed);
         self.eprintln(line);
         if let Some(results) = self.results.get() {
-            results.emit_error(line);
+            results.emit_error_classified(line, class, os_kind);
         }
     }
 
@@ -203,6 +230,26 @@ impl Progress {
             None
         };
 
+        if let Some(results) = self.results.get() {
+            let now = Instant::now();
+            if t.last_results
+                .is_none_or(|last| now - last >= Duration::from_secs(1))
+            {
+                t.last_results = Some(now);
+                results.emit_progress(&crate::results::ProgressRecord {
+                    bytes_done: done,
+                    bytes_total: total,
+                    bytes_unchanged: skipped,
+                    files_done: fdone,
+                    files_total: ftotal,
+                    files_unchanged: self.files_skipped.load(Relaxed),
+                    files_excluded: self.files_excluded.load(Relaxed),
+                    scanned: self.scanned.load(Relaxed),
+                    scan_done,
+                    elapsed_ms: self.start.elapsed().as_millis() as u64,
+                });
+            }
+        }
         if self.json {
             let now = Instant::now();
             if t.last_json
@@ -288,7 +335,9 @@ impl Progress {
     }
 
     pub fn spawn_ticker(self: &Arc<Self>) -> Option<std::thread::JoinHandle<()>> {
-        if !self.enabled && !self.json {
+        // A results stream needs the ticker too: sampled progress records
+        // are emitted from render() even when stderr is not a terminal.
+        if !self.enabled && !self.json && self.results.get().is_none() {
             return None;
         }
         let p = self.clone();

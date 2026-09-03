@@ -134,7 +134,10 @@ connection, so enable it only for a trusted release host rather than globally.
    `Cargo.lock`, then run the normal locked checks to validate it. Update
    release notes and merge through the protected branch. Peer compatibility is
    the immutable release identity, so there is no separate protocol number to
-   maintain.
+   maintain. Native command changes must also be classified in
+   `sdk/python/native-api.json`. A feature may use the `follow_up` disposition
+   so its merge is not blocked on SDK work, but `scripts/check-python-api-sync.py`
+   and the tag workflow refuse a release until every follow-up is resolved.
 2. Wait for the post-merge `ci` run on `master` to succeed for the release
    commit. Pull requests are checked against their own head rather than the
    merged result, and the release workflow refuses a commit whose `rust`,
@@ -153,8 +156,8 @@ connection, so enable it only for a trusted release host rather than globally.
    scripts/release-preflight.sh v0.1.9
    ```
 
-   It requires the exact clean, synchronized `master` tip; matching Cargo
-   metadata; successful required checks on that SHA; an SSH tag-signing key
+   It requires the exact clean, synchronized `master` tip; no pending Python
+   API follow-ups; matching Cargo metadata; successful required checks on that SHA; an SSH tag-signing key
    registered with GitHub; the selected-Actions allowlist; the protected
    `release` environment, tag policy, variables, and secret names; and absence
    of the tag or version from GitHub, crates.io, and the Homebrew tap. It makes

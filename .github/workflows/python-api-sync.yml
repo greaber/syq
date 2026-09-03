@@ -1,0 +1,53 @@
+name: Python API synchronization
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - src/cli.rs
+      - sdk/python/native-api.json
+      - sdk/python/src/syq/**
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  track-follow-ups:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create, update, or close the Python API follow-up
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title='Update Python API for pending native surface'
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          pending=$(jq -r '
+            .commands | to_entries[]
+            | select(.value.sdk == "follow_up" or (.value.follow_up | length > 0))
+            | "- `syq \(.key)`: "
+              + (if .value.sdk == "follow_up" then "new command"
+                 else (.value.follow_up | map("`--" + . + "`") | join(", ")) end)
+          ' sdk/python/native-api.json)
+          if [ -z "$pending" ]; then
+            if [ -n "$issue" ]; then
+              gh issue close "$issue" --repo "$GITHUB_REPOSITORY" \
+                --comment "All entries in \`sdk/python/native-api.json\` are synchronized at $GITHUB_SHA."
+            fi
+            exit 0
+          fi
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            "Native changes on \`master\` have Python SDK work classified as \`follow_up\`:" \
+            "$pending" \
+            "Tracked from commit \`$GITHUB_SHA\`. The syq release gate remains closed until these entries are resolved or deliberately reclassified.")
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

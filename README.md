@@ -350,20 +350,25 @@ receiver to record a closure-time BLAKE3 digest for every regular file whose
 path the transfer could have changed. They are signed into the grant and
 enforced or honored by hostB, and are refused anywhere else because nothing
 would act on them.
-`cp` additionally accepts `--mapping` and `--results`
-(see [MAPPINGS.md](MAPPINGS.md)). For an attached direct remote-to-remote copy
-through a command-restricted receiver, `--results -` is derived locally from
-the verified receipt and marks its records `"provenance":"receiver_attested"`;
-it includes receiver operation outcomes and closure-time final states. Other
-remote coordinators stream their own NDJSON back to the invoking terminal. A
-named results file requires `--run-at local`; direct remote
-coordinators reject it rather than creating a surprising remote file.
-`--results` is also rejected with `--detach`, because its stream would no
-longer remain attached. Neither `--mapping` nor `--results` can be combined
-with `--prune`: mapping manifests define no deletion region, and the preview
-results schema does not yet represent deletions. `--max-delete` requires
-`--prune`; `rm` additionally accepts `--root` plus its endpoint-side removal
-semantics.
+`cp` additionally accepts `--mapping` (see [MAPPINGS.md](MAPPINGS.md))
+and a machine-readable NDJSON outcome stream: `--results FILE` creates
+the file fresh (an existing file is refused — one file, one run), and
+`--results-fd N` writes to a descriptor the caller opened, e.g.
+`--results-fd 3 3>run.ndjson` (see
+[docs/automation-v1.md](docs/automation-v1.md)). The stream is written
+by the transfer coordinator, so both forms require it to be local; a
+remote-to-remote copy is refused unless `--run-at local` is passed
+explicitly — routing through this machine is never chosen implicitly
+on the stream's behalf. (Receiver-attested streams for restricted
+direct copies, derived locally from the verified receipt, exist in the
+engine and return once wired to these targets.) Both forms are
+rejected with `--detach`. Choose a results path outside the source and
+destination trees; one inside them can make the run's own accounting
+unpredictable. `--mapping` cannot be combined with `--prune` because
+mapping manifests define no deletion region; `--results` covers
+`--prune` runs, including their removals. `--max-delete` requires
+`--prune`; `rm` additionally accepts `--root` plus its endpoint-side
+removal semantics.
 
 Native `cp` exposes the remote runtime and transport controls
 directly: `--rsh COMMAND`, `--syq-path PATH`, `--no-bootstrap`, `--no-tcp`,
@@ -374,12 +379,13 @@ the default SSH command or an explicit command whose executable is `ssh`; an
 arbitrary remote-shell wrapper must carry its own port option.
 
 For two remote endpoints, `--run-at auto` (the default) places the coordinator
-at the source when the paths can be represented in a remote command and
-otherwise relays raw path bytes locally. `--run-at source` explicitly selects
-a direct push, `--run-at target` selects a direct pull with the SSH edge
-reversed, and `--run-at local` selects a relay. Explicit source or target
-placement therefore requires UTF-8 paths. `--run-at` is rejected for copies
-that do not have two remote endpoints.
+at the source when the paths can be represented in a remote command, and
+refuses otherwise: data is never routed through this machine implicitly.
+`--run-at source` explicitly selects a direct push, `--run-at target` selects
+a direct pull with the SSH edge reversed, and `--run-at local` explicitly
+selects a relay through this machine. Direct placement therefore requires
+UTF-8 paths today. `--run-at` is rejected for copies that do not have two
+remote endpoints.
 
 The default push uses destination-bound agent authentication plus the
 command-restricted write receiver. Default pull fails closed until the

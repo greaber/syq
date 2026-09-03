@@ -1001,30 +1001,6 @@ fn native_copy_control_file_paths_use_the_common_follow_policy() {
         &t.s("mapping-output"),
     ]);
     assert_eq!(read(&t.path("mapping-output/renamed")), b"data");
-
-    symlink("real-results", t.path("results-link")).unwrap();
-    let refused = native_syq(&[
-        "cp",
-        "--results",
-        &t.s("results-link"),
-        &t.s("src/keep"),
-        "--as",
-        &t.s("results-output"),
-    ]);
-    assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
-    assert!(!t.path("real-results").exists());
-
-    run_native_ok(&[
-        "cp",
-        "--follow",
-        "--results",
-        &t.s("results-link"),
-        &t.s("src/keep"),
-        "--as",
-        &t.s("results-output"),
-    ]);
-    assert!(!read(&t.path("real-results")).is_empty());
 }
 
 #[test]
@@ -5192,12 +5168,13 @@ fn delete_never_removes_paths_the_source_has_but_skips() {
     // The hardlinked file is "the same file" and skipped, and stays.
     let so = run_ok(&["-rt", "--delete", &t.s("src/"), &t.s("dst")]);
     assert_eq!(listing(&t.path("dst")), ["hard", "link", "plain"]);
-    // Skipped files are not reported as directories.
-    assert!(so.contains(", 1 dirs"), "{so}");
+    // Skipped files are not reported as directories; the existing
+    // destination root means nothing was created.
+    assert!(so.contains(", 0 dirs created"), "{so}");
     write(&t.path("src2/big"), b"bb");
     let so = run_ok(&["-a", "--max-size", "1", &t.s("src2/"), &t.s("dst2")]);
     assert!(
-        so.contains("transferred 0 files") && so.contains(", 1 dirs"),
+        so.contains("transferred 0 files") && so.contains(", 1 dirs created"),
         "{so}"
     );
 }
@@ -7964,134 +7941,6 @@ fn native_auto_raw_path_relay_rejects_direct_only_controls() {
 }
 
 #[test]
-fn native_remote_coordinator_streams_results_to_the_invoker() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    write(&t.path("src"), b"result stream");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["cp", "--rsh"])
-        .arg(&rsh)
-        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args([
-            "--no-tcp",
-            "-j",
-            "1",
-            "--from",
-            "hostA",
-            "--src",
-            &t.s("src"),
-            "--to",
-            "hostB",
-            "--run-at",
-            "target",
-            "--as",
-            &t.s("dst"),
-            "--results",
-            "-",
-            "-q",
-        ])
-        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_RSH_LOG", t.path("rsh.log"))
-        .run()
-        .expect("stream target-coordinator results");
-
-    assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), b"result stream");
-    let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("results line is JSON"))
-        .collect();
-    assert_eq!(records.first().unwrap()["type"], "run");
-    let terminal = records.last().unwrap();
-    assert_eq!(terminal["type"], "result");
-    assert_eq!(terminal["status"], "success");
-    assert_eq!(terminal["exit_code"], 0);
-}
-
-#[test]
-fn native_named_results_require_a_local_coordinator() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    write(&t.path("src"), b"local results");
-
-    for placement in ["source", "target"] {
-        let destination = t.s(&format!("dst-{placement}"));
-        let results = t.s(&format!("results-{placement}.ndjson"));
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args(["cp", "--rsh"])
-            .arg(&rsh)
-            .args([
-                "--from",
-                "hostA",
-                "--src",
-                &t.s("src"),
-                "--to",
-                "hostB",
-                "--run-at",
-                placement,
-                "--as",
-                &destination,
-                "--results",
-                &results,
-                "-q",
-            ])
-            .run()
-            .expect("reject a remote named results file");
-
-        assert!(!out.status.success(), "{placement} unexpectedly succeeded");
-        let stderr = stderr_of(&out);
-        assert!(stderr.contains("transfer coordinator"), "{stderr}");
-        assert!(stderr.contains("--results -"), "{stderr}");
-        assert!(stderr.contains("--run-at local"), "{stderr}");
-        assert!(!Path::new(&destination).exists());
-        assert!(!Path::new(&results).exists());
-    }
-
-    let results = t.s("results-local.ndjson");
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["cp", "--rsh"])
-        .arg(&rsh)
-        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args([
-            "--no-tcp",
-            "-j",
-            "1",
-            "--from",
-            "hostA",
-            "--src",
-            &t.s("src"),
-            "--to",
-            "hostB",
-            "--run-at",
-            "local",
-            "--as",
-            &t.s("dst-local"),
-            "--results",
-            &results,
-            "-q",
-        ])
-        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_RSH_LOG", t.path("rsh.log"))
-        .run()
-        .expect("write local-coordinator results");
-
-    assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst-local")), b"local results");
-    let terminal: serde_json::Value = fs::read_to_string(results)
-        .unwrap()
-        .lines()
-        .last()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .unwrap();
-    assert_eq!(terminal["type"], "result");
-    assert_eq!(terminal["status"], "success");
-}
-
-#[test]
 fn native_detach_rejects_an_unattached_results_stream() {
     let t = Tmp::new();
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -8109,7 +7958,7 @@ fn native_detach_rejects_an_unattached_results_stream() {
             "--as",
             &t.s("dst"),
             "--results",
-            "-",
+            "r1.ndjson",
             "-q",
         ])
         .run()
@@ -8871,25 +8720,34 @@ fn native_cp_results_stream_success_and_partial() {
             "--into",
             "dst",
             "--results",
-            "r.ndjson",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
     );
     assert_eq!(out.status.code(), Some(23));
-    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).expect("results line is JSON"))
         .collect();
-    // Envelope: schema v0, strictly increasing seq, run first, result last.
+    // Envelope: schema v1, strictly increasing seq, run first, result last.
     for (i, v) in lines.iter().enumerate() {
         assert_eq!(v["schema"], "syq.automation");
-        assert_eq!(v["schema_version"], 0);
+        assert_eq!(v["schema_version"], 1);
         assert_eq!(v["seq"], i as u64);
     }
     assert_eq!(lines[0]["type"], "run");
     assert_eq!(lines[0]["mapping"], true);
+    assert_eq!(lines[0]["mode"], "cp");
+    assert_eq!(lines[0]["dry_run"], false);
+    assert_eq!(lines[0]["run_id"].as_str().unwrap().len(), 32);
+    assert!(lines[0]["started_at"].as_i64().unwrap() > 0);
+    let endpoints = lines[0]["endpoints"].as_array().unwrap();
+    assert_eq!(endpoints.len(), 2);
+    assert_eq!(endpoints[0]["role"], "source");
+    assert_eq!(endpoints[0]["kind"], "local");
+    assert_eq!(endpoints[1]["role"], "destination");
     let last = lines.last().unwrap();
     assert_eq!(last["type"], "result");
     assert_eq!(last["status"], "partial");
@@ -8958,13 +8816,14 @@ fn native_cp_results_stream_success_and_partial() {
         .unwrap();
     assert_eq!(last["status"], "success");
     assert_eq!(last["exit_code"], 0);
-    // An error record accompanied the failure in the first run.
-    assert!(
-        lines
-            .iter()
-            .any(|v| v["type"] == "error"
-                && v["message"].as_str().unwrap().contains("does not exist"))
-    );
+    // An error record accompanied the failure in the first run, classified
+    // like its adjacent operation record.
+    let error = lines
+        .iter()
+        .find(|v| v["type"] == "error" && v["message"].as_str().unwrap().contains("does not exist"))
+        .expect("classified error record");
+    assert_eq!(error["class"], "io");
+    assert_eq!(error["os_kind"], "not_found");
 }
 
 #[test]
@@ -8979,7 +8838,7 @@ fn native_cp_results_without_mapping_and_refusals() {
             "--into",
             "out",
             "--results",
-            "r.ndjson",
+            "r1.ndjson",
             "-q",
         ],
         None,
@@ -8989,7 +8848,7 @@ fn native_cp_results_without_mapping_and_refusals() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9002,7 +8861,8 @@ fn native_cp_results_without_mapping_and_refusals() {
     assert_eq!(op["disposition"], "succeeded");
     assert!(op.get("src").is_none(), "non-mapping records carry no src");
     assert_eq!(lines.last().unwrap()["status"], "success");
-    // map does not expose --results, and pruning copies refuse it.
+    // map does not expose --results; pruning copies accept it (schema v1
+    // covers deletions) and mark the run record.
     let out = syq_map_in(&t.path(""), &["--src-src", "src", "--results", "r.ndjson"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--results'"));
@@ -9015,14 +8875,23 @@ fn native_cp_results_without_mapping_and_refusals() {
             "--into",
             "pruned",
             "--results",
-            "r.ndjson",
+            "r2.ndjson",
         ],
         None,
     );
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("cannot be used with"), "{stderr}");
-    assert!(stderr.contains("--prune"), "{stderr}");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r2.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["mode"], "cp");
+    assert_eq!(lines[0]["prune"], true);
+    assert_eq!(lines.last().unwrap()["status"], "success");
 }
 
 // ---- review-round fixes ----
@@ -9041,9 +8910,11 @@ fn native_map_normalizes_dot_components_and_rejects_dotdot() {
 }
 
 #[test]
-fn native_cp_results_refuses_dry_run() {
+fn native_cp_results_dry_run_emits_traces() {
     let t = Tmp::new();
-    write(&t.path("src/f.txt"), b"x");
+    write(&t.path("src/f.txt"), b"data");
+    write(&t.path("src/sub/g.txt"), b"gg");
+    std::os::unix::fs::symlink("f.txt", t.path("src/l")).unwrap();
     let out = syq_cp_in(
         &t.path(""),
         &[
@@ -9052,13 +8923,327 @@ fn native_cp_results_refuses_dry_run() {
             "--into",
             "dst",
             "--results",
-            "r.ndjson",
+            "r1.ndjson",
             "-n",
+            "-q",
         ],
         None,
     );
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("does not support --dry-run"));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.path("dst/f.txt").exists(), "dry run must not write");
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["type"], "run");
+    assert_eq!(lines[0]["dry_run"], true);
+    let trace = lines
+        .iter()
+        .find(|v| v["type"] == "trace" && v["dst"]["value"] == "f.txt")
+        .expect("trace record for the planned file");
+    assert_eq!(trace["action"], "transfer_file");
+    assert_eq!(trace["kind"], "file");
+    assert_eq!(trace["reason"], "destination_missing");
+    assert_eq!(trace["bytes"], 4);
+    assert!(
+        !lines.iter().any(|v| v["type"] == "operation_result"),
+        "dry runs settle nothing"
+    );
+    let last = lines.last().unwrap();
+    assert_eq!(last["type"], "result");
+    assert_eq!(last["dry_run"], true);
+    assert_eq!(last["status"], "success");
+    assert_eq!(last["files_transferred"], 2, "planned, per dry_run: true");
+    // Planned non-file work comes from the traced changes, not the live
+    // mutation counters (which a dry run never moves).
+    assert!(last["directories_created"].as_u64().unwrap() >= 1);
+    assert_eq!(last["symlinks_created"], 1);
+}
+
+#[test]
+fn native_cp_mapping_dry_run_implicit_ancestor_trace_has_no_src() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    let manifest = entry_line("a.txt", "sub/a.txt", None);
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r1.ndjson",
+            "-n",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert!(out.status.success());
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let dir_trace = lines
+        .iter()
+        .find(|v| v["type"] == "trace" && v["dst"]["value"] == "sub")
+        .expect("implicit ancestor trace");
+    assert!(
+        dir_trace.get("src").is_none(),
+        "implicit ancestors have no source: {dir_trace}"
+    );
+    let file_trace = lines
+        .iter()
+        .find(|v| v["type"] == "trace" && v["dst"]["value"] == "sub/a.txt")
+        .expect("file trace");
+    assert_eq!(file_trace["src"]["value"], "a.txt");
+}
+
+#[test]
+fn native_cp_mapping_ancestor_conflict_gets_failed_record() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    write(&t.path("src/b.txt"), b"b");
+    // x resolves to a file at execution; x/y then conflicts at runtime.
+    let manifest = format!(
+        "{}{}",
+        entry_line("a.txt", "x", None),
+        entry_line("b.txt", "x/y", None),
+    );
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r1.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_eq!(out.status.code(), Some(23));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failed = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["dst"]["value"] == "x/y")
+        .expect("failed record for the conflicting entry");
+    assert_eq!(failed["disposition"], "failed");
+    assert_eq!(failed["retryable"], "no");
+    assert_eq!(failed["class"], "conflict");
+}
+
+#[test]
+fn native_cp_results_preexisting_directory_is_not_reported_created() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f.txt"), b"f");
+    fs::create_dir_all(t.path("dst/sub")).unwrap();
+    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r1.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&t.path("dst/sub/f.txt")), b"f");
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        !lines
+            .iter()
+            .any(|v| v["type"] == "operation_result" && v["action"] == "create_directory"),
+        "reopening an existing directory for writability is not a creation"
+    );
+    assert_eq!(lines.last().unwrap()["directories_created"], 0);
+}
+
+#[test]
+fn native_cp_results_fatal_failure_emits_terminal_record() {
+    let t = Tmp::new();
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "absent",
+            "--into",
+            "dst",
+            "--results",
+            "r1.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["type"], "run");
+    let last = lines.last().unwrap();
+    assert_eq!(last["type"], "result");
+    assert_eq!(last["status"], "failed");
+    assert_eq!(last["exit_code"], 1);
+}
+
+#[test]
+fn native_cp_prune_results_cover_deletions() {
+    let t = Tmp::new();
+    write(&t.path("src/keep.txt"), b"k");
+    write(&t.path("dst/keep.txt"), b"k");
+    write(&t.path("dst/extra.txt"), b"x");
+    std::os::unix::fs::symlink("keep.txt", t.path("dst/extra-link")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--prune",
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r1.ndjson",
+            "-q",
+        ])
+        .current_dir(t.path(""))
+        .run()
+        .expect("run cp --prune");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.path("dst/extra.txt").exists());
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["mode"], "cp");
+    assert_eq!(lines[0]["prune"], true);
+    let delete = lines
+        .iter()
+        .find(|v| {
+            v["type"] == "operation_result"
+                && v["action"] == "delete"
+                && v["dst"]["value"] == "extra.txt"
+        })
+        .expect("delete record");
+    assert_eq!(delete["disposition"], "succeeded");
+    assert_eq!(delete["kind"], "file");
+    let link_delete = lines
+        .iter()
+        .find(|v| {
+            v["type"] == "operation_result"
+                && v["action"] == "delete"
+                && v["dst"]["value"] == "extra-link"
+        })
+        .expect("symlink delete record");
+    assert_eq!(link_delete["kind"], "symlink", "leaf kinds are preserved");
+    let last = lines.last().unwrap();
+    assert_eq!(last["deletions_planned"], 2);
+    assert_eq!(last["deletions_completed"], 2);
+    assert_eq!(last["deletions_blocked"], 0);
+    // --max-delete 0 refuses: blocked records, refused status, exit 25.
+    write(&t.path("dst/extra2.txt"), b"x");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--prune",
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r2.ndjson",
+            "--max-delete",
+            "0",
+            "-q",
+        ])
+        .current_dir(t.path(""))
+        .run()
+        .expect("run cp --prune");
+    assert_eq!(out.status.code(), Some(25));
+    assert!(t.path("dst/extra2.txt").exists());
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r2.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let blocked = lines
+        .iter()
+        .find(|v| v["type"] == "operation_result" && v["disposition"] == "blocked")
+        .expect("blocked record");
+    assert_eq!(blocked["action"], "delete");
+    assert_eq!(blocked["class"], "safety_limit");
+    let last = lines.last().unwrap();
+    assert_eq!(last["status"], "refused");
+    assert_eq!(last["exit_code"], 25);
+    assert_eq!(last["deletions_blocked"], 1);
+    // A dry run stays trace-only even when --max-delete blocks: the fact
+    // lives in the aggregates.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--prune",
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r3.ndjson",
+            "--max-delete",
+            "0",
+            "-n",
+            "-q",
+        ])
+        .current_dir(t.path(""))
+        .run()
+        .expect("run cp --prune");
+    assert_eq!(out.status.code(), Some(25));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r3.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        !lines.iter().any(|v| v["type"] == "operation_result"),
+        "dry runs emit no operation records"
+    );
+    let last = lines.last().unwrap();
+    assert_eq!(last["status"], "refused");
+    assert_eq!(last["dry_run"], true);
+    assert_eq!(last["deletions_blocked"], 1);
 }
 
 #[test]
@@ -9078,7 +9263,7 @@ fn native_cp_results_implicit_dir_failure_is_not_a_retry_entry() {
             "--into",
             "dst",
             "--results",
-            "r.ndjson",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
@@ -9089,7 +9274,7 @@ fn native_cp_results_implicit_dir_failure_is_not_a_retry_entry() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9140,7 +9325,7 @@ fn native_cp_mapping_specials_are_visible_skips_not_failures() {
             "--into",
             "dst",
             "--results",
-            "r.ndjson",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
@@ -9152,7 +9337,7 @@ fn native_cp_mapping_specials_are_visible_skips_not_failures() {
     );
     assert!(!t.path("dst/pipe").exists());
     assert_eq!(read(&t.path("dst/a.txt")), b"abc");
-    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r.ndjson")))
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -9375,13 +9560,13 @@ fn mappings_md_retry_gate_example_works_verbatim() {
             "--into",
             "dst",
             "--results",
-            "r.ndjson",
+            "r1.ndjson",
             "-q",
         ],
         Some(manifest.as_bytes()),
     );
     assert_eq!(cp.status.code(), Some(23));
-    let results = read(&t.path("r.ndjson"));
+    let results = read(&t.path("r1.ndjson"));
     assert_documented(&["-cs"], DOC_JQ_RETRY_GATE);
     // Complete partial stream: the gate passes and emits the retry entry.
     let out = jq(DOC_JQ_RETRY_GATE, &["-cs"], &results);
@@ -9849,4 +10034,610 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
     let stderr = stderr_of(&out);
     assert!(stderr.contains("remote transfer coordinator"), "{stderr}");
     assert!(stderr.contains("--run-at local"), "{stderr}");
+}
+
+#[test]
+fn native_cp_mapping_child_before_explicit_directory_is_order_independent() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    fs::create_dir_all(t.path("src/x")).unwrap();
+    // Child listed before its explicit directory: exactly one directory
+    // record and one counted creation, same as the reversed order.
+    for (name, manifest) in [
+        (
+            "child-first",
+            format!(
+                "{}{}",
+                entry_line("a.txt", "x/a.txt", None),
+                entry_line("x", "x", Some("dir"))
+            ),
+        ),
+        (
+            "dir-first",
+            format!(
+                "{}{}",
+                entry_line("x", "x", Some("dir")),
+                entry_line("a.txt", "x/a.txt", None)
+            ),
+        ),
+    ] {
+        let dst = format!("dst-{name}");
+        let results = format!("r-{name}.ndjson");
+        let out = syq_cp_in(
+            &t.path(""),
+            &[
+                "--mapping",
+                "-",
+                "-C",
+                "src",
+                "--into",
+                &dst,
+                "--results",
+                &results,
+                "-q",
+            ],
+            Some(manifest.as_bytes()),
+        );
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path(&results)))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let dir_records = lines
+            .iter()
+            .filter(|v| v["type"] == "operation_result" && v["action"] == "create_directory")
+            .count();
+        assert_eq!(dir_records, 1, "{name}: one record for x");
+        assert_eq!(lines.last().unwrap()["directories_created"], 1, "{name}");
+    }
+}
+
+#[test]
+fn native_cp_results_dry_and_live_directory_totals_agree() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f.txt"), b"f");
+    for (mode, extra) in [("dry", vec!["-n"]), ("live", vec![])] {
+        let dst = format!("dst-{mode}");
+        let results = format!("r-{mode}.ndjson");
+        let mut args = vec![
+            "--src-src",
+            "src",
+            "--into",
+            &dst,
+            "--results",
+            &results,
+            "-q",
+        ];
+        args.extend(extra);
+        let out = syq_cp_in(&t.path(""), &args, None);
+        assert!(
+            out.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let last: serde_json::Value = String::from_utf8(read(&t.path(&results)))
+            .unwrap()
+            .lines()
+            .last()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .unwrap();
+        // The missing container is outside per-entry accounting on both
+        // sides; sub is the one counted directory either way, and dry
+        // aggregates mean planned work — bytes included.
+        assert_eq!(last["directories_created"], 1, "{mode}");
+        assert_eq!(last["files_transferred"], 1, "{mode}");
+        assert_eq!(last["bytes_transferred"], 1, "{mode}");
+    }
+}
+
+#[test]
+fn native_cp_results_non_tty_run_emits_progress_records() {
+    let t = Tmp::new();
+    write(&t.path("src/big.bin"), &vec![7u8; 64 * 1024]);
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst",
+            "--bwlimit",
+            "32",
+            "--results",
+            "r1.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let progress_records = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|v| v["type"] == "progress")
+        .count();
+    // ~2s at the rate limit: the ticker samples once immediately and then
+    // at least once more at the one-second throttle, TTY or not.
+    assert!(progress_records >= 2, "saw {progress_records}");
+}
+
+#[test]
+fn native_cp_mapping_cross_chunk_directory_upgrade_emits_one_trace() {
+    let t = Tmp::new();
+    write(&t.path("src/a.txt"), b"a");
+    std::fs::create_dir(t.path("src/d")).unwrap();
+    std::fs::create_dir(t.path("src/xdir")).unwrap();
+    // Entry 1 synthesizes ancestor `x`; filler pushes the explicit `x`
+    // entry past the 4096-entry scan batch so the upgrade crosses chunks.
+    let mut manifest = entry_line("a.txt", "x/a.txt", Some("file"));
+    for i in 0..4095 {
+        manifest.push_str(&entry_line("d", &format!("d{i:04}"), Some("dir")));
+    }
+    manifest.push_str(&entry_line("xdir", "x", Some("dir")));
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "-C",
+            "src",
+            "--mapping",
+            "-",
+            "--into",
+            "dst",
+            "-n",
+            "--results",
+            "r1.ndjson",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let x_traces: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|v| {
+            v["type"] == "trace" && v["action"] == "create_directory" && v["dst"]["value"] == "x"
+        })
+        .collect();
+    assert_eq!(x_traces.len(), 1);
+    // The explicit entry claimed the directory, so the (deferred) trace
+    // carries its src even though an earlier chunk synthesized the path.
+    assert_eq!(x_traces[0]["src"]["value"], "xdir");
+}
+
+#[test]
+fn native_cp_prune_fatal_failure_reports_deletion_aggregates() {
+    let t = Tmp::new();
+    write(&t.path("dst/keep.txt"), b"k");
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--prune",
+            "--src-src",
+            "missing",
+            "--into",
+            "dst",
+            "--results",
+            "r1.ndjson",
+            "-q",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    let terminal: serde_json::Value = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .unwrap();
+    assert_eq!(terminal["status"], "failed");
+    // The run record says prune: true, so the terminal record carries the
+    // deletion aggregates even on a fatal failure: zeros, because the run
+    // died before the deletion pass.
+    assert_eq!(terminal["deletions_planned"], 0);
+    assert_eq!(terminal["deletions_completed"], 0);
+    assert_eq!(terminal["deletions_blocked"], 0);
+}
+
+fn automation_v1_validator() -> jsonschema::Validator {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/automation-v1.schema.json"))
+            .expect("schema file is JSON");
+    jsonschema::validator_for(&schema).expect("schema compiles")
+}
+
+/// Every line validates against the committed schema, seq is contiguous
+/// from 0, the first record is `run`, and the last is `result`.
+fn assert_automation_v1_stream(validator: &jsonschema::Validator, content: &str, context: &str) {
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("{context} line {}: not JSON: {e}", i + 1))
+        })
+        .collect();
+    assert!(!records.is_empty(), "{context}: empty stream");
+    for (i, record) in records.iter().enumerate() {
+        if let Err(error) = validator.validate(record) {
+            panic!("{context} line {}: {error}\nrecord: {record}", i + 1);
+        }
+        assert_eq!(record["seq"], i as u64, "{context} line {}", i + 1);
+    }
+    assert_eq!(records[0]["type"], "run", "{context}");
+    assert_eq!(records.last().unwrap()["type"], "result", "{context}");
+}
+
+#[test]
+fn automation_v1_fixtures_validate_against_schema() {
+    let validator = automation_v1_validator();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/automation-v1");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("fixture dir")
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "dry-run.ndjson",
+            "failed.ndjson",
+            "partial.ndjson",
+            "refused.ndjson",
+            "success.ndjson"
+        ]
+    );
+    for name in names {
+        let content = String::from_utf8(read(&dir.join(&name))).unwrap();
+        assert_automation_v1_stream(&validator, &content, &name);
+    }
+    // The strictness is the point: a shape change must fail, not slide by.
+    let mut record: serde_json::Value = serde_json::from_str(
+        String::from_utf8(read(&dir.join("success.ndjson")))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(validator.validate(&record).is_ok());
+    record["surprise"] = serde_json::json!(true);
+    assert!(
+        validator.validate(&record).is_err(),
+        "an unknown field must fail validation"
+    );
+    assert!(
+        validator
+            .validate(&serde_json::json!({
+                "schema": "syq.automation", "schema_version": 1, "seq": 0, "type": "run"
+            }))
+            .is_err(),
+        "missing required fields must fail validation"
+    );
+}
+
+#[test]
+fn automation_v1_live_streams_validate_against_schema() {
+    let validator = automation_v1_validator();
+    let manifest = format!(
+        "{}{}",
+        entry_line("Berlin/IMG.JPG", "berlin/2024/img.jpg", Some("file")),
+        entry_line("Notes.TXT", "notes.txt", None),
+    );
+
+    // success (mapping) and its dry run.
+    for (name, extra) in [("success", &[][..]), ("dry-run", &["-n"][..])] {
+        let t = Tmp::new();
+        write(&t.path("src/Berlin/IMG.JPG"), b"img");
+        write(&t.path("src/Notes.TXT"), b"hello");
+        let mut args = vec!["-C", "src", "--mapping", "-", "--into", "dst"];
+        args.extend_from_slice(extra);
+        let results = format!("r-{name}.ndjson");
+        args.extend_from_slice(&["--results", &results, "-q"]);
+        let out = syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes()));
+        assert!(out.status.success(), "{name}: {}", stderr_of(&out));
+        let content = String::from_utf8(read(&t.path(&results))).unwrap();
+        assert_automation_v1_stream(&validator, &content, name);
+    }
+
+    // partial: one mapping entry fails. Exit 23.
+    {
+        let t = Tmp::new();
+        write(&t.path("src/Notes.TXT"), b"hello");
+        let out = syq_cp_in(
+            &t.path(""),
+            &[
+                "-C",
+                "src",
+                "--mapping",
+                "-",
+                "--into",
+                "dst",
+                "--results",
+                "r.ndjson",
+                "-q",
+            ],
+            Some(manifest.as_bytes()),
+        );
+        assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
+        assert_automation_v1_stream(&validator, &content, "partial");
+    }
+
+    // refused: --max-delete blocks the deletion pass. Exit 25.
+    {
+        let t = Tmp::new();
+        write(&t.path("src/keep.txt"), b"k");
+        write(&t.path("dst/keep.txt"), b"k");
+        write(&t.path("dst/extra-1.txt"), b"x");
+        write(&t.path("dst/extra-2.txt"), b"x");
+        let out = syq_cp_in(
+            &t.path(""),
+            &[
+                "--prune",
+                "--max-delete",
+                "1",
+                "--src-src",
+                "src",
+                "--into",
+                "dst",
+                "--results",
+                "r.ndjson",
+                "-q",
+            ],
+            None,
+        );
+        assert_eq!(out.status.code(), Some(25), "{}", stderr_of(&out));
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
+        assert_automation_v1_stream(&validator, &content, "refused");
+    }
+
+    // failed: fatal setup failure still yields a valid stream. Exit 1.
+    {
+        let t = Tmp::new();
+        let out = syq_cp_in(
+            &t.path(""),
+            &[
+                "--src-src",
+                "missing",
+                "--into",
+                "dst",
+                "--results",
+                "r.ndjson",
+                "-q",
+            ],
+            None,
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
+        assert_automation_v1_stream(&validator, &content, "failed");
+    }
+}
+
+#[test]
+fn native_cp_mapping_symlinked_manifest_failure_still_settles_the_stream() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    write(
+        &t.path("manifest"),
+        entry_line("f.txt", "f.txt", None).as_bytes(),
+    );
+    std::os::unix::fs::symlink("manifest", t.path("manifest-link")).unwrap();
+    // Post-parse validation failures still owe the consumer a terminal
+    // record: only a real crash leaves the stream unsettled.
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "manifest-link",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "r1.ndjson",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("pass --follow"));
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.first().unwrap()["type"], "run");
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "failed");
+}
+
+#[test]
+fn native_cp_dry_summary_and_terminal_record_count_the_same_directories() {
+    let t = Tmp::new();
+    write(&t.path("src/sub/f.txt"), b"f");
+    // Human summary (no --results): the missing destination container is
+    // outside per-entry accounting, so one directory, matching the record.
+    let human = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst", "-n"],
+        None,
+    );
+    assert!(human.status.success(), "{}", stderr_of(&human));
+    let stdout = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        stdout.contains("1 directory"),
+        "summary should count one directory: {stdout}"
+    );
+    let machine = syq_cp_in(
+        &t.path(""),
+        &[
+            "--src-src",
+            "src",
+            "--into",
+            "dst2",
+            "-n",
+            "--results",
+            "r1.ndjson",
+        ],
+        None,
+    );
+    assert!(machine.status.success(), "{}", stderr_of(&machine));
+    let terminal: serde_json::Value = String::from_utf8(read(&t.path("r1.ndjson")))
+        .unwrap()
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .unwrap();
+    assert_eq!(terminal["directories_created"], 1);
+}
+
+#[test]
+fn native_cp_results_refuses_an_existing_file() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    write(&t.path("r.ndjson"), b"yesterday's run");
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst", "--results", "r.ndjson"],
+        None,
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("already exists"), "{stderr}");
+    // Refused before anything ran: yesterday's stream and the destination
+    // are untouched.
+    assert_eq!(read(&t.path("r.ndjson")), b"yesterday's run");
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn native_cp_results_fd_streams_to_a_caller_opened_descriptor() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    // The caller opens fd 3 (`3>fd.ndjson`); syq only ever writes to it.
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec \"$1\" cp --src-src src --into dst --results-fd 3 -q 3>fd.ndjson")
+        .arg("sh")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let lines: Vec<serde_json::Value> = String::from_utf8(read(&t.path("fd.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.first().unwrap()["type"], "run");
+    assert_eq!(lines.last().unwrap()["status"], "success");
+    // Human stdout is untouched by the stream.
+    assert!(out.stdout.is_empty() || !String::from_utf8_lossy(&out.stdout).contains("schema"));
+}
+
+#[test]
+fn native_cp_results_fd_refusals() {
+    let t = Tmp::new();
+    write(&t.path("src/f.txt"), b"data");
+    // A descriptor nobody connected fails loudly at startup.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst", "--results-fd", "37"],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("not open"), "{}", stderr_of(&out));
+    assert!(!t.path("dst").exists());
+    // A read-only descriptor would swallow every record silently.
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec \"$1\" cp --src-src src --into dst --results-fd 3 3</dev/null")
+        .arg("sh")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("read-only"), "{}", stderr_of(&out));
+    assert!(!t.path("dst").exists());
+    // Slots 0-2 belong to stdin/stdout/stderr.
+    let out = syq_cp_in(
+        &t.path(""),
+        &["--src-src", "src", "--into", "dst", "--results-fd", "1"],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("above 2"), "{}", stderr_of(&out));
+}
+
+#[test]
+fn native_results_require_a_local_coordinator() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"local results");
+    // Every placement except an explicit --run-at local is refused: the
+    // local (relay) topology is never chosen implicitly on the stream's
+    // behalf, auto included.
+    for run_at in [
+        &["--run-at", "target"][..],
+        &["--run-at", "source"][..],
+        &[][..],
+    ] {
+        for flag in [
+            &["--results", "r-remote.ndjson"][..],
+            &["--results-fd", "3"][..],
+        ] {
+            let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args(["cp", "--rsh"])
+                .arg(&rsh)
+                .args(["--from", "hostA", "--src", &t.s("src")])
+                .args(["--to", "hostB"])
+                .args(run_at)
+                .args(["--as", &t.s("dst-remote")])
+                .args(flag)
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .run()
+                .expect("reject results with a remote coordinator");
+            // Usage lane: exit 2, no stream ever existed.
+            assert_eq!(out.status.code(), Some(2));
+            let stderr = stderr_of(&out);
+            assert!(stderr.contains("--run-at local"), "{stderr}");
+            assert!(!t.path("dst-remote").exists());
+            assert!(!t.path("r-remote.ndjson").exists());
+        }
+    }
+}
+
+#[test]
+fn native_remote_to_remote_never_relays_implicitly() {
+    use std::os::unix::ffi::OsStrExt;
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    // A source path with non-UTF-8 bytes cannot ride the delegated remote
+    // command line, so the direct topology is unavailable — and the relay
+    // is never chosen on the operator's behalf.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--from", "hostA"])
+        .arg("--src")
+        .arg(std::ffi::OsStr::from_bytes(b"src-\xff"))
+        .args(["--to", "hostB", "--as", &t.s("dst")])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("--run-at local"), "{stderr}");
+    assert!(!stderr.contains("relaying"), "no implicit relay: {stderr}");
 }
