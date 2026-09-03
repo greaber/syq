@@ -258,6 +258,28 @@ fn interface_option<'a>(args: &Args, native: &'a str, rsync: &'a str) -> &'a str
     }
 }
 
+fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
+    if spec.auto_helper {
+        if *spec.helper_install.lock().unwrap() {
+            "managed; installed now"
+        } else {
+            "managed helper cache"
+        }
+    } else if spec.restricted_grant.is_some() {
+        "restricted grant"
+    } else if spec.syq_path.is_some() {
+        match interface {
+            Interface::Rsync => "--rsync-path",
+            _ => "--syq-path",
+        }
+    } else {
+        match interface {
+            Interface::Rsync => "remote PATH (--syq-no-bootstrap)",
+            _ => "remote PATH (--no-bootstrap)",
+        }
+    }
+}
+
 fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
     let diagnostics = spec.diagnostics();
     eprintln!("syq: {}:", spec.label());
@@ -267,21 +289,7 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
             spec.remote_shell_name(),
             peer.platform
         );
-        let helper_mode = if spec.auto_helper {
-            if *spec.helper_install.lock().unwrap() {
-                "managed; installed now"
-            } else {
-                "managed helper cache"
-            }
-        } else if spec.syq_path.is_some() {
-            interface_option(args, "--syq-path", "--rsync-path")
-        } else {
-            interface_option(
-                args,
-                "remote PATH (--no-bootstrap)",
-                "remote PATH (--syq-no-bootstrap)",
-            )
-        };
+        let helper_mode = remote_helper_mode(spec, args.interface);
         eprintln!("  helper: {} ({helper_mode})", peer.identity);
     }
 
@@ -7654,6 +7662,17 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restricted_remote_diagnostics_name_the_grant_helper() {
+        let mut spec = RemoteSpec::local_receiver(false);
+        spec.restricted_grant = Some("signed-grant".into());
+
+        assert_eq!(
+            remote_helper_mode(&spec, Interface::NativeCp),
+            "restricted grant"
+        );
+    }
 
     #[test]
     fn endpoint_semantic_error_kind_wins_over_numeric_errno() {

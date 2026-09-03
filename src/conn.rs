@@ -128,6 +128,22 @@ pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<WorkerInitializationError>())
 }
 
+fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    is_worker_initialization_error(error)
+        || message.contains("build identity mismatch")
+        || message.contains("unexpected handshake response")
+        || message.contains("exit status: 127")
+        || message.contains(&format!(
+            "exit status: {}",
+            remote_helper::HELPER_MISSING_EXIT
+        ))
+        || message.contains(&format!(
+            "exit status: {}",
+            remote_helper::HELPER_NOT_EXECUTABLE_EXIT
+        ))
+}
+
 /// OpenSSH accepted the control connection but rejected a multiplexed worker
 /// session. Independent SSH connections may still be permitted (for example,
 /// with `MaxSessions 1`), so callers can safely disable reuse and retry.
@@ -1197,24 +1213,9 @@ impl RemoteSpec {
                     last = Some(e);
                     continue;
                 }
-                // Don't retry what won't change: a missing binary (127) or a
-                // build identity mismatch.
-                Err(e)
-                    if attempt == 5
-                        || format!("{e:#}").contains("build identity mismatch")
-                        || is_worker_initialization_error(&e)
-                        || format!("{e:#}").contains("exit status: 127")
-                        || format!("{e:#}").contains(&format!(
-                            "exit status: {}",
-                            remote_helper::HELPER_MISSING_EXIT
-                        ))
-                        || format!("{e:#}").contains(&format!(
-                            "exit status: {}",
-                            remote_helper::HELPER_NOT_EXECUTABLE_EXIT
-                        )) =>
-                {
-                    return Err(e)
-                }
+                // Don't retry what won't change: a missing binary or an
+                // incompatible protocol/build identity.
+                Err(e) if attempt == 5 || is_non_retryable_connect_error(&e) => return Err(e),
                 Err(e) => {
                     let limit = if limited {
                         Some(tighten_connect_limit())
@@ -1727,12 +1728,15 @@ fn hello(
         Ok(Response::Err(error)) => bail!("{}: {error}", conn.label),
         Ok(other) if worker => {
             return Err(WorkerInitializationError(format!(
-                "{}: unexpected handshake response {other:?}",
-                conn.label
-            ))
+            "{}: unexpected handshake response {other:?}; remote syq may be a different version",
+            conn.label
+        ))
             .into())
         }
-        Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
+        Ok(other) => bail!(
+            "{}: unexpected handshake response {other:?}; remote syq may be a different version",
+            conn.label
+        ),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("could not start the remote syq on {}", conn.label))
@@ -2654,6 +2658,51 @@ mod tests {
         drop(conn);
         server.join().unwrap();
         descriptor_session.close();
+    }
+
+    #[test]
+    fn unexpected_hello_response_reports_version_skew_without_retry() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut reader = FrameReader::new(socket.try_clone().unwrap());
+            assert!(matches!(
+                reader.read_msg::<Request>().unwrap(),
+                Request::Hello { .. }
+            ));
+            FrameWriter::new(socket, false)
+                .write_msg(&Response::Ok)
+                .unwrap();
+        });
+
+        let socket = TcpStream::connect(address).unwrap();
+        let (rx, reader) = spawn_reader(Box::new(socket.try_clone().unwrap()));
+        let conn = RemoteConn {
+            child: None,
+            w: FrameWriter::new(Box::new(socket), false),
+            rx: Some(rx),
+            reader: Some(reader),
+            label: "version-skew test".into(),
+            dead: false,
+            peer: None,
+            tcp_socket: None,
+            multiplexed_ssh: false,
+        };
+        let error = hello(conn, false, Vec::new(), ConnectionRole::Control)
+            .err()
+            .expect("an operation response is not a valid handshake");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unexpected handshake response"),
+            "{message}"
+        );
+        assert!(
+            message.contains("remote syq may be a different version"),
+            "{message}"
+        );
+        assert!(is_non_retryable_connect_error(&error));
+        server.join().unwrap();
     }
 
     #[test]
