@@ -30,6 +30,13 @@ endpoint() {
     fi
     seed_helper
     /usr/sbin/sshd -t -f /etc/ssh/sshd_config
+    if [ -n "${SYQ_REAL_SSH_EXPECT_MAX_SESSIONS:-}" ]; then
+        effective_max_sessions=$(
+            /usr/sbin/sshd -T -f /etc/ssh/sshd_config |
+                awk '$1 == "maxsessions" { print $2 }'
+        )
+        test "$effective_max_sessions" = "$SYQ_REAL_SSH_EXPECT_MAX_SESSIONS"
+    fi
     exec /usr/sbin/sshd -D -e -f /etc/ssh/sshd_config
 }
 

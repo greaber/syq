@@ -89,7 +89,7 @@ root=$1
 marker=$2
 install -d -m 0750 "$root/subdir"
 printf '%s\n' "$marker" >"$root/message.txt"
-dd if=/dev/zero of="$root/subdir/chunks.bin" bs=1M count=6 status=none
+dd if=/dev/zero of="$root/subdir/chunks.bin" bs=1M count=3 status=none
 chmod 0640 "$root/message.txt" "$root/subdir/chunks.bin"
 ln -s message.txt "$root/link"
 EOF
@@ -144,10 +144,44 @@ assert_same_tree \
 
 printf 'case: local coordinator relaying between two SSH endpoints\n'
 make_tree source /tmp/syq-real-ssh/relay-source relay
+trace=/tmp/syq-real-ssh-ssh.trace
+rm -f "$trace"
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
     --coordinate-at local \
     --from source --src-src /tmp/syq-real-ssh/relay-source \
     --to destination --into /tmp/syq-real-ssh/relay-destination
+
+if [ "${SYQ_REAL_SSH_PROFILE:-default}" = max-sessions-1 ]; then
+    test -s "$trace"
+    rejected_multiplexed_attempts=$(awk -F '\t' '
+        $1 == "phase=end" &&
+        $3 == "host=destination" &&
+        $4 == "control_master=no" &&
+        $5 != "control_path=none" &&
+        $5 != "control_path=unset" &&
+        $6 == "control_socket=present" &&
+        $7 == "strict_mux=yes" &&
+        $8 == "status=255" { count++ }
+        END { print count + 0 }
+    ' "$trace")
+    successful_independent_retries=$(awk -F '\t' '
+        $1 == "phase=end" &&
+        $3 == "host=destination" &&
+        $4 == "control_master=no" &&
+        $5 == "control_path=none" &&
+        $7 == "strict_mux=no" &&
+        $8 == "status=0" { count++ }
+        END { print count + 0 }
+    ' "$trace")
+    if [ "$rejected_multiplexed_attempts" -lt 1 ] || [ "$successful_independent_retries" -lt 1 ]; then
+        echo 'MaxSessions profile did not expose a multiplexed rejection and a successful independent retry:' >&2
+        cat "$trace" >&2
+        exit 1
+    fi
+    printf 'MaxSessions evidence: %s rejected multiplexed attempts, %s successful independent retries\n' \
+        "$rejected_multiplexed_attempts" "$successful_independent_retries"
+fi
+
 assert_same_tree \
     source /tmp/syq-real-ssh/relay-source \
     destination /tmp/syq-real-ssh/relay-destination \

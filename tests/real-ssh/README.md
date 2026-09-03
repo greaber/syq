@@ -24,12 +24,26 @@ Run the suite from any syq checkout:
 scripts/test-real-ssh.sh
 ```
 
+The host runner requires Bash 4 or newer. In particular, the Bash 3.2 shipped
+with macOS is not supported; install a current Bash and invoke the script with
+it when running the lab on macOS.
+
 Use the alternate destination sshd profile to exercise syq's fallback from a
-rejected multiplexed worker channel to independent SSH connections:
+rejected multiplexed worker channel to independent SSH connections. The
+profile keeps every fixture file below syq's 4 MiB multiplexing threshold and
+requires evidence of both a rejected real OpenSSH multiplexed attempt and a
+successful `ControlPath=none` retry:
 
 ```sh
 scripts/test-real-ssh.sh --profile max-sessions-1
 ```
+
+OpenSSH normally hides this condition by opening an independent connection
+inside the original client process. In this profile, the test's thin `ssh`
+wrapper gives only multiplexed destination workers a failing `ProxyCommand`.
+The live control socket is still tried over real SSH, but OpenSSH's internal
+fallback returns 255 so syq must issue the independently authenticated retry.
+All successful connections continue to run through `/usr/bin/ssh`.
 
 The first build downloads the pinned Rust toolchain image, Debian packages, and
 Cargo dependencies. Test execution itself uses only the Compose project's

@@ -31,6 +31,7 @@ RUN apt-get update \
     && install -d -m 0755 /run/sshd
 
 COPY --from=builder /tmp/syq /usr/local/bin/syq
+COPY --chmod=0755 tests/real-ssh/ssh-wrapper.sh /usr/local/bin/ssh
 COPY --chmod=0755 tests/real-ssh/entrypoint.sh /usr/local/libexec/syq-real-ssh-entrypoint
 COPY --chmod=0755 tests/real-ssh/scenarios.sh /usr/local/libexec/syq-real-ssh-scenarios
 COPY tests/real-ssh/sshd_config /etc/ssh/sshd_config

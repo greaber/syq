@@ -7,6 +7,8 @@ die() {
   exit 1
 }
 
+[ "${BASH_VERSINFO[0]}" -ge 4 ] || die 'real-SSH tests require Bash 4 or newer'
+
 for command in docker git ssh-keygen; do
   command -v "$command" >/dev/null || die "real-SSH tests need $command"
 done
