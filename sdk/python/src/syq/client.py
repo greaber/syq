@@ -348,6 +348,14 @@ def _append_remote_arguments(
             raise SyqInvocationError(
                 "--run-at must be auto, local, source, or target"
             )
+        if run_at in {"source", "target"}:
+            # The results stream this library relies on is written by the
+            # transfer coordinator, which these placements move to a remote
+            # host; syq refuses the combination at argument parsing.
+            raise SyqInvocationError(
+                "the results stream needs a local transfer coordinator; "
+                "use run_at='local' (or run() for a raw invocation)"
+            )
         argv.extend(("--run-at", run_at))
     if rsh is not None:
         argv.extend(("--rsh", _text_arg(rsh, label="rsh")))

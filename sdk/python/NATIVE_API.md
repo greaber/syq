@@ -292,7 +292,10 @@ recover the order in which separately named keyword arguments appeared in a
 call, so `IgnoreFrom` is the native `--ignore-from` occurrence used inside the
 single ordered stream rather than a new filtering concept.
 
-Native remote controls keep their command names mechanically: `run_at`, `rsh`,
+Native remote controls keep their command names mechanically (`run_at`
+accepts only `auto` and `local` on the typed surface: the results stream
+is written by the transfer coordinator, and `source`/`target` placement
+would move it to a remote host): `run_at`, `rsh`,
 `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
 `tcp_congestion`, `no_forward_agent`, `unrestricted_agent_forwarding`, and
 `agent_broker_only`. Endpoint strings passed through `from_` and `to` include

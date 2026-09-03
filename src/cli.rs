@@ -1211,6 +1211,23 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         }
     }
     apply_internal_native_direct(&mut args)?;
+    if args.native_results.is_some() || args.native_results_fd.is_some() {
+        // Usage-lane refusals (exit 2, no stream): the contract promises a
+        // terminal record for every run that gets past argument parsing, so
+        // combinations that could never settle a stream stop here.
+        if args.detach {
+            bail!(
+                "--results cannot be used with --detach because the result stream would not remain attached"
+            );
+        }
+        if args.locations.split_last().is_some_and(|(dst, sources)| {
+            crate::transfer::uses_remote_coordinator(&args, sources, dst)
+        }) {
+            bail!(
+                "--results is written by the transfer coordinator, which is remote for this copy; use --run-at local to keep it on this machine"
+            );
+        }
+    }
     Ok(args)
 }
 

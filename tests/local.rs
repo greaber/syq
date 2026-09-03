@@ -10888,7 +10888,8 @@ fn native_results_require_a_local_coordinator() {
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
             .run()
             .expect("reject results with a remote coordinator");
-        assert!(!out.status.success());
+        // Usage lane: exit 2, no stream ever existed.
+        assert_eq!(out.status.code(), Some(2));
         let stderr = stderr_of(&out);
         assert!(stderr.contains("--run-at local"), "{stderr}");
         assert!(!t.path("dst-remote").exists());

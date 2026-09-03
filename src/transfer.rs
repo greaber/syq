@@ -756,25 +756,10 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
+    // The detach and remote-coordinator combinations were refused at
+    // argument parsing (exit 2, no stream); every request that reaches this
+    // point settles with a terminal record.
     let results_requested = args.native_results.is_some() || args.native_results_fd.is_some();
-    if results_requested {
-        if args.detach {
-            bail!(
-                "--results cannot be used with --detach because the result stream would not remain attached"
-            );
-        }
-        // The stream writer lives with the transfer coordinator; a local
-        // file or descriptor cannot be written by a remote one.
-        if args
-            .locations
-            .split_last()
-            .is_some_and(|(dst, sources)| uses_remote_coordinator(&args, sources, dst))
-        {
-            bail!(
-                "--results is written by the transfer coordinator, which is remote for this copy; use --run-at local to keep it on this machine"
-            );
-        }
-    }
     if results_requested {
         let out: Box<dyn std::io::Write + Send> = if let Some(fd) = args.native_results_fd {
             // The caller opened this descriptor (e.g. `3>run.ndjson`)
@@ -785,6 +770,12 @@ pub fn run(args: Args) -> Result<i32> {
                 bail!(
                     "--results-fd {fd}: descriptor is not open; connect it in the caller, e.g. --results-fd {fd} {fd}>run.ndjson"
                 );
+            }
+            // Children (ssh, helpers) must not inherit the stream's write
+            // end: a persistent child would hold a pipe open past syq's
+            // exit and its reader would never see EOF.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                bail!("--results-fd {fd}: {}", std::io::Error::last_os_error());
             }
             // Safety: the fd is inherited, open, and named by the operator
             // for exactly this purpose; syq owns it for the run.
@@ -902,7 +893,7 @@ fn run_endpoints(locations: &[Location]) -> Vec<crate::results::EndpointRecord> 
     endpoints
 }
 
-fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &Location) -> bool {
+pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &Location) -> bool {
     let Some(source) = sources.first() else {
         return false;
     };
