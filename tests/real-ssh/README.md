@@ -75,6 +75,3 @@ under `target/real-ssh.*`; the ephemeral private key is always removed.
   currently rejected because root creation requests a receiver-managed mode
   that the grant does not authorize. The passing restricted case pre-creates
   its root and uses `--into-existing`; descendant modes are still compared.
-- The first signed TCP worker can currently receive a connection reset and
-  recover on its built-in retry. The suite requires final success and leaves
-  this diagnostic visible rather than treating the recovered run as clean.

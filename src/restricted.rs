@@ -636,10 +636,6 @@ impl RestrictedAuthority {
         Ok(())
     }
 
-    pub(crate) fn maximum_connections(&self) -> u16 {
-        self.copy.limits.max_connections
-    }
-
     pub(crate) fn control_is_open(&self) -> bool {
         self.control_open.load(Ordering::Acquire) && Instant::now() <= self.deadline
     }
@@ -4191,7 +4187,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use clap::Parser;
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -4314,6 +4310,16 @@ mod tests {
         maximum_bytes: u64,
     ) -> RestrictedAuthority {
         test_authority_with_rate(root, deletion, maximum_bytes, 0)
+    }
+
+    /// Maximum authenticated worker connections granted by the test
+    /// authorities above.
+    pub(crate) const TEST_AUTHORITY_MAX_CONNECTIONS: u16 = 2;
+
+    /// A signed-grant authority for exercising the TCP data listener from
+    /// other modules' tests.
+    pub(crate) fn tcp_test_authority(root: &Path) -> RestrictedAuthority {
+        test_authority(root, DeletionPolicy::Forbid, 1024)
     }
 
     fn test_authority_with_rate(
@@ -4462,7 +4468,7 @@ mod tests {
                     max_total_bytes: maximum_bytes,
                     max_file_bytes: maximum_bytes,
                     hash_block_bytes: 4 << 20,
-                    max_connections: 2,
+                    max_connections: TEST_AUTHORITY_MAX_CONNECTIONS,
                     max_deletions: u64::from(deletion != DeletionPolicy::Forbid) * 2,
                     max_runtime_seconds: 60,
                 },
