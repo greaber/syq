@@ -12002,6 +12002,375 @@ fn persistence_command(t: &Tmp, args: &[&str]) -> Command {
     command
 }
 
+fn completion_command(t: &Tmp, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .arg("completion")
+        .args(args)
+        .env("HOME", t.path("home"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"));
+    command
+}
+
+fn completion_values(output: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| (record[0], record[1..].to_vec()))
+        .collect()
+}
+
+#[test]
+fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
+    let t = Tmp::new();
+    write(&t.path("alpha file"), b"file");
+    fs::create_dir(t.path("alpine")).unwrap();
+    fs::create_dir(t.path("source-base")).unwrap();
+    write(&t.path("source-base/beta"), b"based source");
+    let raw_name = std::ffi::OsString::from_vec(b"raw-\xff".to_vec());
+    write(&t.path("").join(&raw_name), b"raw");
+
+    let bash = completion_command(&t, &["bash"]).run().unwrap();
+    assert_output_ok(&bash);
+    let mut syntax = Command::new("bash")
+        .args(["-n"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    syntax
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&bash.stdout)
+        .unwrap();
+    let syntax = syntax.wait_with_output().unwrap();
+    assert_output_ok(&syntax);
+
+    let registered = Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"source <("$SYQ" completion bash)
+COMP_LINE='syq c'
+COMP_POINT=${#COMP_LINE}
+_syq_complete
+printf '%s\n' "${COMPREPLY[@]}"
+complete -p syq"#,
+        )
+        .env("SYQ", env!("CARGO_BIN_EXE_syq"))
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin",
+                Path::new(env!("CARGO_BIN_EXE_syq"))
+                    .parent()
+                    .unwrap()
+                    .display()
+            ),
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&registered);
+    let registered = String::from_utf8(registered.stdout).unwrap();
+    assert!(registered.lines().any(|line| line == "cp"), "{registered}");
+    assert!(
+        registered.lines().any(|line| line == "completion"),
+        "{registered}"
+    );
+    assert!(registered.contains("complete -F _syq_complete syq"));
+
+    let prefix = t.s("al");
+    let output = completion_command(&t, &["__complete", "bash", "2", "--", "syq", "cp", &prefix])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(
+        completion_values(&output.stdout),
+        vec![
+            (
+                b'f',
+                t.path("alpha file").as_os_str().as_encoded_bytes().to_vec(),
+            ),
+            (
+                b'p',
+                t.path("alpine/").as_os_str().as_encoded_bytes().to_vec(),
+            ),
+        ]
+    );
+
+    let raw_prefix = t.path("raw-");
+    let raw = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "2",
+            "--",
+            "syq",
+            "cp",
+            raw_prefix.to_str().unwrap(),
+        ],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&raw);
+    assert_eq!(
+        completion_values(&raw.stdout),
+        vec![(
+            b'f',
+            t.path("")
+                .join(raw_name)
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+        )]
+    );
+
+    let based = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "4",
+            "--",
+            "syq",
+            "cp",
+            "--cwd",
+            &t.s("source-base"),
+            "b",
+        ],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&based);
+    assert_eq!(
+        completion_values(&based.stdout),
+        vec![(b'f', b"beta".to_vec())]
+    );
+}
+
+#[test]
+fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("runtime")).unwrap();
+    fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
+    write(&t.path("remote-home/data/name with spaces"), b"remote");
+    let ssh = fake_ssh(&t);
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let executable = env!("CARGO_BIN_EXE_syq");
+    let output = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "6",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            executable,
+            "--from",
+            "fake.example",
+            &path,
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(
+        completion_values(&output.stdout),
+        vec![
+            (
+                b'f',
+                t.path("remote-home/data/name with spaces")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+            (
+                b'p',
+                t.path("remote-home/data/nested/")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+        ]
+    );
+    let ssh_log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(ssh_log.contains("BatchMode=yes"), "{ssh_log}");
+    assert!(ssh_log.contains("ConnectTimeout=3"), "{ssh_log}");
+
+    let based = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "8",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            executable,
+            "--from",
+            "fake.example",
+            "--cwd",
+            &t.s("remote-home/data"),
+            "n",
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&based);
+    assert_eq!(
+        completion_values(&based.stdout),
+        vec![
+            (b'f', b"name with spaces".to_vec()),
+            (b'p', b"nested/".to_vec()),
+        ]
+    );
+
+    let destination = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "7",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            executable,
+            "--to",
+            "fake.example",
+            "--into",
+            &path,
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&destination);
+    assert_eq!(
+        completion_values(&destination.stdout),
+        vec![
+            (
+                b'f',
+                t.path("remote-home/data/name with spaces")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+            (
+                b'p',
+                t.path("remote-home/data/nested/")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+        ]
+    );
+
+    let remote_operand = format!("fake.example:{path}");
+    let rsync = completion_command(
+        &t,
+        &[
+            "__complete",
+            "fish",
+            "4",
+            "--",
+            "syq",
+            "rsync",
+            "--rsync-path",
+            executable,
+            &remote_operand,
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&rsync);
+    assert_eq!(
+        rsync
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|candidate| !candidate.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>(),
+        vec![
+            format!("fake.example:{}/name with spaces", t.s("remote-home/data")).into_bytes(),
+            format!("fake.example:{}/nested/", t.s("remote-home/data")).into_bytes(),
+        ]
+    );
+
+    let listed = completion_command(&t, &["cache", "list"]).run().unwrap();
+    assert_output_ok(&listed);
+    assert_eq!(listed.stdout, b"fake.example\n");
+    let metadata = fs::metadata(t.path("cache/syq/completion-endpoints-v1.json")).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+    let suggested = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "3",
+            "--",
+            "syq",
+            "cp",
+            "--from",
+            "fake",
+        ],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&suggested);
+    assert!(completion_values(&suggested.stdout)
+        .iter()
+        .any(|candidate| candidate == &(b'f', b"fake.example".to_vec())));
+
+    let forgotten = completion_command(&t, &["cache", "forget", "fake.example"])
+        .run()
+        .unwrap();
+    assert_output_ok(&forgotten);
+    assert_eq!(forgotten.stdout, b"forgot fake.example\n");
+    let listed = completion_command(&t, &["cache", "list"]).run().unwrap();
+    assert_output_ok(&listed);
+    assert_eq!(listed.stdout, b"completion endpoint cache is empty\n");
+
+    let cleared = completion_command(&t, &["cache", "clear"]).run().unwrap();
+    assert_output_ok(&cleared);
+    assert!(!t.path("cache/syq/completion-endpoints-v1.json").exists());
+}
+
 fn ephemeral_scope(t: &Tmp) -> PathBuf {
     let output = persistence_command(t, &["on", "--ephemeral"])
         .run()

@@ -430,6 +430,60 @@ when the requested topology cannot honor it. Use `--coordinate-at local` to keep
 native remote-to-remote copy's reusable connections on the invoking machine;
 `syq rsync` does not accept remote-to-remote copies.
 
+## Shell completion
+
+`syq completion bash`, `syq completion zsh`, and `syq completion fish` print a
+small adapter for the named shell. See [Installing](install.md#shell-completion)
+for the startup-file lines. The adapter asks syq for each set of candidates, so
+the command parser, endpoint rules, and path handling do not have to be
+reimplemented in shell code.
+
+Completion covers command and option names, fixed values such as
+`--coordinate-at`, native `--from` and `--to` endpoints, local filenames, and
+remote filenames. In native commands, source path options are listed at the
+`--from` endpoint and placement paths at the `--to` endpoint. In `syq rsync`,
+an operand such as `host:dir/fi` is listed on `host`. Files named with spaces,
+newlines, or non-UTF-8 bytes remain single candidates in shells that support
+those names.
+
+Remote completion uses an ordinary SSH login in batch mode: it never opens a
+password prompt, starts TCP data listeners, or uses a command-restricted
+receiver credential. This means a destination used by a restricted
+remote-to-remote transfer can still be browsed when your normal SSH key can log
+in to the same endpoint. An explicit `--rsh` gets no remote path completion,
+because syq cannot safely infer how an arbitrary wrapper should be invoked.
+Connection and listing failures simply produce no candidates; set
+`SYQ_COMPLETION_DEBUG=1` to show their diagnostics.
+
+The remote helper serves one bounded, read-only directory listing. If the
+matching helper is absent, the first completion may install it through the
+same signed, verified bootstrap used by a transfer. With persistence enabled,
+completion uses the same per-endpoint SSH control connection as later
+transfers, which removes the repeated login latency. Without persistence, the
+completion process uses a private connection that ends with that request.
+
+After a successful ordinary SSH connection, syq remembers the endpoint as a
+future suggestion. It also suggests literal aliases from SSH configuration,
+unhashed names from `known_hosts`, and endpoints in the applicable persistence
+scope. Port-specific entries are offered in native endpoint syntax only;
+`host:2222` is a remote path, not a port, in rsync syntax.
+
+The learned suggestions are a disposable local cache at
+`$XDG_CACHE_HOME/syq/completion-endpoints-v1.json`, normally
+`~/.cache/syq/completion-endpoints-v1.json`. It contains at most 100 recently
+successful endpoint names, users, ports, and timestamps. It contains no paths,
+credentials, keys, or transfer history. Manage it with:
+
+```sh
+syq completion cache list
+syq completion cache forget user@host:2222
+syq completion cache clear
+```
+
+Clearing the file does not affect remote data, credentials, helpers, or
+persistent SSH sessions. An endpoint can still be suggested afterward when it
+comes from SSH configuration, `known_hosts`, or a current persistence scope.
+
 ## Mappings
 
 Placement can also be data instead of flags: `syq map` prints a local source

@@ -98,6 +98,39 @@ EOF
 printf 'real-SSH environment: profile %s; %s; %s\n' \
     "${SYQ_REAL_SSH_PROFILE:-default}" "$(syq --build-identity)" "$(ssh -V 2>&1)"
 
+printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
+ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'
+rm -f /tmp/syq-real-ssh-ssh.trace
+syq persist on >/dev/null
+completion_output=/tmp/syq-real-ssh-completion.out
+completion_expected=/tmp/syq-real-ssh-completion.expected
+for attempt in 1 2; do
+    syq completion __complete fish 6 -- \
+        syq cp --syq-path /usr/local/bin/syq --from source \
+        /tmp/syq-real-ssh/completion/al >"$completion_output"
+    {
+        printf '%s\000' '/tmp/syq-real-ssh/completion/alpha file'
+        printf '%s\000' '/tmp/syq-real-ssh/completion/alpine/'
+    } >"$completion_expected"
+    cmp "$completion_expected" "$completion_output"
+done
+test "$(syq completion cache list)" = source
+reused_completion=$(awk -F '\t' '
+    $1 == "phase=end" &&
+    $3 == "host=source" &&
+    $4 == "control_master=auto" &&
+    $6 == "control_socket=present" &&
+    $8 == "status=0" { count++ }
+    END { print count + 0 }
+' /tmp/syq-real-ssh-ssh.trace)
+if [ "$reused_completion" -lt 1 ]; then
+    echo 'second remote completion did not reuse the persistent SSH socket:' >&2
+    cat /tmp/syq-real-ssh-ssh.trace >&2
+    exit 1
+fi
+syq completion cache clear >/dev/null
+syq persist off >/dev/null
+
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
 syq cp --no-progress -j 2 --preserve=permissions \

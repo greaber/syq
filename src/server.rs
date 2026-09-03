@@ -293,6 +293,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             && matches!(
                 &req,
                 Request::TcpListen { .. }
+                    | Request::ListDir { .. }
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }

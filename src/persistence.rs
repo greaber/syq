@@ -64,11 +64,11 @@ struct PersistenceConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EndpointRecord {
+pub(crate) struct EndpointRecord {
     version: u8,
-    user: Option<String>,
-    host: String,
-    port: Option<u16>,
+    pub(crate) user: Option<String>,
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
 }
 
 impl EndpointRecord {
@@ -81,7 +81,7 @@ impl EndpointRecord {
         }
     }
 
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         let host = if self.host.contains(':') {
             format!("[{}]", self.host)
         } else {
@@ -95,6 +95,33 @@ impl EndpointRecord {
             Some(port) => format!("{endpoint}:{port}"),
             None => endpoint,
         }
+    }
+}
+
+/// Endpoint records in the persistence scope relevant to the command being
+/// completed. Completion is advisory, so an absent global runtime scope is an
+/// empty source rather than a reason to create one.
+pub(crate) fn completion_endpoints(explicit_scope: Option<&Path>) -> Result<Vec<EndpointRecord>> {
+    let scope = match explicit_scope {
+        Some(scope) => {
+            validate_scope(scope)?;
+            scope.to_path_buf()
+        }
+        None if global_enabled()? => global_scope_path()?,
+        None => return Ok(Vec::new()),
+    };
+    match scope.symlink_metadata() {
+        Ok(_) => Ok(scope_records(&scope)?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "inspect persistence scope for completion {}",
+                scope.display()
+            )
+        }),
     }
 }
 

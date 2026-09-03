@@ -2249,6 +2249,9 @@ impl RestrictedAuthority {
             Request::CopyLocal { .. } | Request::ReadRange { .. } | Request::ReadSmallBatch(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
+            Request::ListDir { .. } => {
+                bail!("directory completion is not valid on a command-restricted destination")
+            }
             Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::RegisterSourceRoots { .. }

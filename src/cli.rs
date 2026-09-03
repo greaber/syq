@@ -450,7 +450,7 @@ impl Args {
             // helper switches are handled in main.
             "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv, true),
             _ => bail!(
-                "expected a command (`cp`, `rm`, `map`, `rsync`, or `persist`); rsync-shaped syntax now starts with `syq rsync`"
+                "expected a command (`cp`, `rm`, `map`, `rsync`, `persist`, `completion`, or `enrollment`); rsync-shaped syntax now starts with `syq rsync`"
             ),
         }
     }
@@ -612,8 +612,21 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  completion   Generate shell completion and manage its disposable local cache\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
+}
+
+/// Clap metadata for the public filesystem command surfaces. The dynamic
+/// completion engine uses the same declarations as the parser, keeping option
+/// spelling and hidden flags in one place.
+pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
+    match name {
+        "rsync" => Some(Args::command()),
+        "cp" => Some(NativeCopyCommand::command()),
+        "rm" => Some(NativeRmCommand::command()),
+        "map" => Some(NativeMapCommand::command()),
+        _ => None,
+    }
 }
 
 #[derive(clap::Args, Debug)]

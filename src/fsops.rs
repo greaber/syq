@@ -2133,6 +2133,7 @@ impl FsOps {
             }
             Request::Hello { .. }
             | Request::TcpListen { .. }
+            | Request::ListDir { .. }
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
@@ -2149,6 +2150,48 @@ impl FsOps {
 
     pub fn scan_root(&self, root: &[u8]) -> Result<PathBytes> {
         self.destination_relative(root)
+    }
+
+    fn completion_entries(
+        &self,
+        directory: &[u8],
+        prefix: &[u8],
+        requested_limit: u16,
+    ) -> Result<Response> {
+        const MAX_COMPLETION_ENTRIES: usize = 1_000;
+        if directory.contains(&0) || prefix.contains(&0) || prefix.contains(&b'/') {
+            bail!("invalid completion directory or prefix");
+        }
+        let limit = usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES);
+        if limit == 0 {
+            return Ok(Response::DirectoryEntries {
+                entries: Vec::new(),
+                truncated: false,
+            });
+        }
+        let mut entries = Vec::new();
+        let mut truncated = false;
+        for item in std::fs::read_dir(resolve(directory))? {
+            let item = item?;
+            let name = item.file_name().into_vec();
+            if name == b"." || name == b".." || !name.starts_with(prefix) {
+                continue;
+            }
+            if !prefix.starts_with(b".") && name.starts_with(b".") {
+                continue;
+            }
+            if entries.len() == limit {
+                truncated = true;
+                break;
+            }
+            let file_type = item.file_type()?;
+            let directory = file_type.is_dir()
+                || (file_type.is_symlink()
+                    && std::fs::metadata(item.path()).is_ok_and(|metadata| metadata.is_dir()));
+            entries.push(CompletionEntry { name, directory });
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(Response::DirectoryEntries { entries, truncated })
     }
 
     /// Return the retained destination capability and a strict path beneath it
@@ -4888,6 +4931,11 @@ impl FsOps {
         // Any other request means the controller abandoned that comparison
         // (for example because the source hash failed), so release it here.
         let r: Result<Response> = match &req {
+            Request::ListDir {
+                directory,
+                prefix,
+                limit,
+            } => self.completion_entries(directory, prefix, *limit),
             Request::StatMany {
                 paths,
                 sources,
