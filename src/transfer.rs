@@ -3524,7 +3524,7 @@ impl FreshCapacityAssessment {
 
     fn inode_shortage(self) -> bool {
         self.available_inodes
-            .is_some_and(|available| self.objects > available)
+            .is_some_and(|available| self.objects.saturating_add(64) > available)
     }
 
     fn sufficient(self) -> bool {
@@ -7717,6 +7717,20 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_capacity_keeps_a_sixty_four_inode_margin() {
+        let assessment = |objects, available_inodes| FreshCapacityAssessment {
+            logical_bytes: 0,
+            objects,
+            available_bytes: 0,
+            available_inodes: Some(available_inodes),
+        };
+
+        assert!(assessment(1, 64).inode_shortage());
+        assert!(!assessment(1, 65).inode_shortage());
+        assert!(!assessment(u64::MAX, u64::MAX).inode_shortage());
+    }
 
     #[test]
     fn restricted_remote_diagnostics_name_the_grant_helper() {

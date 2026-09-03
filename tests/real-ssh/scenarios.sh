@@ -98,6 +98,28 @@ EOF
 printf 'real-SSH environment: profile %s; %s; %s\n' \
     "${SYQ_REAL_SSH_PROFILE:-default}" "$(syq --build-identity)" "$(ssh -V 2>&1)"
 
+printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
+make_tree source /tmp/syq-real-ssh/protected-source protected
+if protected_output=$(syq cp --no-progress -j 2 --preserve=permissions \
+    --from source --src-src /tmp/syq-real-ssh/protected-source \
+    --to destination --into /home/syq/.ssh/sender-controlled 2>&1); then
+    echo 'copy into the restricted receiver control plane unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$protected_output" in
+    *"protected SSH configuration directory"*) ;;
+    *)
+        echo 'control-plane refusal did not report the protected SSH directory:' >&2
+        printf '%s\n' "$protected_output" >&2
+        exit 1
+        ;;
+esac
+ssh destination '
+    test ! -e ~/.ssh/sender-controlled
+    test ! -e ~/.local/share/syq/restricted
+    test ! -e ~/.local/libexec/syq-receiver
+'
+
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
 syq cp --no-progress -j 2 --preserve=permissions \

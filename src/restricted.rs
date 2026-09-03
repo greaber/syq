@@ -288,6 +288,46 @@ struct ReceiverModeDecision {
     identity: Option<(u64, u64, i64, u32)>,
 }
 
+#[derive(Clone, Debug)]
+struct ReceiverControlPath {
+    path: Vec<u8>,
+    label: &'static str,
+}
+
+fn path_is_at_or_below(path: &[u8], prefix: &[u8]) -> bool {
+    path == prefix
+        || (path.starts_with(prefix) && (prefix == b"/" || path.get(prefix.len()) == Some(&b'/')))
+}
+
+fn paths_overlap(left: &[u8], right: &[u8]) -> bool {
+    path_is_at_or_below(left, right) || path_is_at_or_below(right, left)
+}
+
+fn reject_control_plane_path(path: &[u8], protected: &[ReceiverControlPath]) -> Result<()> {
+    if let Some(control) = protected
+        .iter()
+        .find(|control| paths_overlap(path, &control.path))
+    {
+        bail!(
+            "command-restricted destination {} overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
+            Path::new(OsStr::from_bytes(path)).display(),
+            control.label,
+            Path::new(OsStr::from_bytes(&control.path)).display()
+        );
+    }
+    Ok(())
+}
+
+fn reject_control_plane_scopes(
+    copy: &CopyOperation,
+    protected: &[ReceiverControlPath],
+) -> Result<()> {
+    for scope in &copy.mutation_scopes {
+        reject_control_plane_path(&scope.path, protected)?;
+    }
+    Ok(())
+}
+
 #[cfg(not(test))]
 fn read_process_umask() -> u32 {
     // RestrictedAuthority is constructed by the forced receiver before it
@@ -339,6 +379,7 @@ impl RestrictedAuthority {
         grant_digest: [u8; 32],
         receipt_key: PrivateKey,
         deadline: Instant,
+        protected: &[ReceiverControlPath],
     ) -> Result<Self> {
         let GrantConstraints {
             max_file_data_bytes_per_second,
@@ -349,6 +390,7 @@ impl RestrictedAuthority {
         let enrollment_id = grant.enrollment_id;
         let request_id = grant.request_id;
         let GrantOperation::Copy(copy) = grant.operation;
+        reject_control_plane_scopes(&copy, protected)?;
         if copy.policy.existing == ExistingDestinationPolicy::UpdateIfOlder {
             // The comparison depends on a source mtime only the remote
             // coordinator reports, so the receiver cannot enforce it.
@@ -2516,15 +2558,6 @@ fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 bail!("{} is not a real directory", path.display());
             }
-            if metadata.uid() != unsafe { libc::geteuid() } {
-                bail!(
-                    "{} is not a target-owned directory (mode {:04o}, uid {}, gid {})",
-                    path.display(),
-                    metadata.mode() & 0o7777,
-                    metadata.uid(),
-                    metadata.gid()
-                );
-            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::DirBuilder::new()
@@ -2536,38 +2569,20 @@ fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
             return Err(error).with_context(|| format!("inspect directory {}", path.display()))
         }
     }
-    delegation::validate_trusted_directory_path(path)
+    Ok(())
 }
 
-fn ensure_private_chain(home: &Path, components: &[&str]) -> Result<PathBuf> {
-    let mut deepest_existing = home.to_path_buf();
-    for component in components {
-        let candidate = deepest_existing.join(component);
-        match fs::symlink_metadata(&candidate) {
-            Ok(metadata) => {
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    bail!("{} is not a real directory", candidate.display());
-                }
-                deepest_existing = candidate;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect directory {}", candidate.display()))
-            }
-        }
-    }
-    delegation::validate_trusted_directory_path(&deepest_existing).with_context(|| {
-        format!(
-            "validate existing account directory chain through {}",
-            deepest_existing.display()
-        )
-    })?;
+fn ensure_directory_chain(home: &Path, components: &[&str]) -> Result<PathBuf> {
     let mut path = home.to_path_buf();
     for component in components {
         path.push(component);
         ensure_directory(&path, 0o700)?;
     }
+    Ok(path)
+}
+
+fn ensure_private_chain(home: &Path, components: &[&str]) -> Result<PathBuf> {
+    let path = ensure_directory_chain(home, components)?;
     delegation::validate_private_directory_path(&path)?;
     Ok(path)
 }
@@ -2631,13 +2646,13 @@ fn read_leaf(
     };
     let mut file = unsafe { File::from_raw_fd(fd) };
     let metadata = file.metadata()?;
-    let unsafe_mode = if private {
-        metadata.mode() & 0o7777 != 0o600
-    } else {
-        metadata.mode() & 0o022 != 0
-    };
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || unsafe_mode {
-        bail!("private state file has unsafe type, owner, or permissions");
+    if !metadata.is_file() {
+        bail!("state file must be a regular file");
+    }
+    if private
+        && (metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o600)
+    {
+        bail!("private state file must be target-owned with mode 0600");
     }
     let mut contents = Vec::new();
     std::io::Read::by_ref(&mut file)
@@ -2858,7 +2873,7 @@ fn ensure_receipt_key(state: &Path, id: EnrollmentId) -> Result<PrivateKey> {
 /// The receipt signing key installed for this enrollment.
 fn load_receipt_key(state: &Path) -> Result<PrivateKey> {
     let path = state.join(RECEIPT_KEY_FILE);
-    let encoded = delegation::read_secure_regular(&path, "receipt signing key", 128 * 1024)?;
+    let encoded = delegation::read_private_regular(&path, "receipt signing key", 128 * 1024)?;
     PrivateKey::from_openssh(&encoded).context("parse receipt signing key")
 }
 
@@ -2914,12 +2929,47 @@ fn receiver_install_path(home: &Path) -> PathBuf {
     home.join(".local/libexec/syq-receiver")
 }
 
+fn receiver_control_paths(
+    home: &Path,
+    receiver: &Path,
+    ssh_keygen: Option<&Path>,
+) -> Result<Vec<ReceiverControlPath>> {
+    let receiver_directory = receiver
+        .parent()
+        .context("restricted receiver path has no parent directory")?;
+    let mut protected = vec![
+        ReceiverControlPath {
+            path: home.join(".ssh").as_os_str().as_bytes().to_vec(),
+            label: "SSH configuration directory",
+        },
+        ReceiverControlPath {
+            path: receiver_directory.as_os_str().as_bytes().to_vec(),
+            label: "receiver executable directory",
+        },
+        ReceiverControlPath {
+            path: home
+                .join(".local/share/syq/restricted")
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+            label: "enrollment state directory",
+        },
+    ];
+    if let Some(ssh_keygen) = ssh_keygen {
+        protected.push(ReceiverControlPath {
+            path: ssh_keygen.as_os_str().as_bytes().to_vec(),
+            label: "signature verifier executable",
+        });
+    }
+    Ok(protected)
+}
+
 fn materialize_receiver(home: &Path, contents: &[u8]) -> Result<PathBuf> {
-    let directory_path = ensure_private_chain(home, &[".local", "libexec"])?;
+    let directory_path = ensure_directory_chain(home, &[".local", "libexec"])?;
     let directory = open_directory(&directory_path)?;
     atomic_replace_executable_locked(&directory, "syq-receiver", contents)?;
     let receiver = receiver_install_path(home);
-    delegation::validate_secure_executable(&receiver, "restricted receiver")?;
+    delegation::validate_regular_executable(&receiver, "restricted receiver")?;
     Ok(receiver)
 }
 
@@ -3027,6 +3077,13 @@ pub(crate) fn remote_install() -> Result<()> {
             "command-restricted enrollment does not follow a destination-root symlink; enroll its explicit referent instead"
         );
     }
+    let canonical_home = fs::canonicalize(&home)
+        .with_context(|| format!("resolve receiver home {}", home.display()))?;
+    let ssh_keygen = resolve_ssh_keygen()?;
+    let bootstrap_receiver = receiver_install_path(&canonical_home);
+    let protected =
+        receiver_control_paths(&canonical_home, &bootstrap_receiver, Some(&ssh_keygen))?;
+    reject_control_plane_path(canonical_destination.as_os_str().as_bytes(), &protected)?;
     let root = crate::rooted::Root::open(&canonical_root)?;
     let root_identity = root.identity();
     let transport = TransportPublicKey::parse(&request.public_key)?;
@@ -3036,10 +3093,10 @@ pub(crate) fn remote_install() -> Result<()> {
         bail!("transport public key is malformed");
     }
     let running_receiver = std::env::current_exe().context("resolve restricted receiver path")?;
-    delegation::validate_secure_executable(&running_receiver, "restricted receiver")?;
+    delegation::validate_regular_executable(&running_receiver, "restricted receiver")?;
     let receiver_contents = fs::read(&running_receiver)
         .with_context(|| format!("read restricted receiver {}", running_receiver.display()))?;
-    let ssh = ensure_private_chain(&home, &[".ssh"])?;
+    let ssh = ensure_directory_chain(&home, &[".ssh"])?;
     let directory = open_directory(&ssh)?;
     lock_directory(&directory)?;
     // The authorized-keys directory lock is the receiver lifecycle lock too.
@@ -3074,7 +3131,7 @@ pub(crate) fn remote_install() -> Result<()> {
             .to_owned(),
         root_dev: root_identity.dev,
         root_ino: root_identity.ino,
-        ssh_keygen: resolve_ssh_keygen()?
+        ssh_keygen: ssh_keygen
             .to_str()
             .context("ssh-keygen path is not UTF-8")?
             .to_owned(),
@@ -3172,7 +3229,7 @@ fn revoke_for_account(request: &RevokeRequest, account: &str, home: &Path) -> Re
     // Validate the shared state chain before removing the credential. The
     // second check below determines whether the now-updated state is empty.
     let _ = directory_is_empty(&state_base)?;
-    let ssh = ensure_private_chain(home, &[".ssh"])?;
+    let ssh = ensure_directory_chain(home, &[".ssh"])?;
     let directory = open_directory(&ssh)?;
     lock_directory(&directory)?;
     let original =
@@ -3197,7 +3254,10 @@ fn revoke_for_account(request: &RevokeRequest, account: &str, home: &Path) -> Re
         remove_final_enrollment_state_directories(home)?;
         match fs::symlink_metadata(&installed_receiver) {
             Ok(_) => {
-                delegation::validate_secure_executable(&installed_receiver, "restricted receiver")?;
+                delegation::validate_regular_executable(
+                    &installed_receiver,
+                    "restricted receiver",
+                )?;
                 fs::remove_file(&installed_receiver).with_context(|| {
                     format!(
                         "remove final restricted receiver {}",
@@ -3302,7 +3362,7 @@ fn load_local_enrollments() -> Result<Vec<(LocalEnrollment, PathBuf)>> {
             continue;
         }
         let metadata_path = directory.join("metadata.json");
-        let Ok(encoded) = delegation::read_secure_regular(
+        let Ok(encoded) = delegation::read_private_regular(
             &metadata_path,
             "local enrollment metadata",
             MAX_STATE_FILE,
@@ -3334,7 +3394,7 @@ fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathBuf)>> {
             continue;
         }
         let metadata_path = directory.join("pending.json");
-        let Ok(encoded) = delegation::read_secure_regular(
+        let Ok(encoded) = delegation::read_private_regular(
             &metadata_path,
             "pending local enrollment metadata",
             MAX_STATE_FILE,
@@ -3355,7 +3415,7 @@ fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathBuf)>> {
 }
 
 fn load_private_key(directory: &Path) -> Result<PrivateKey> {
-    let encoded = delegation::read_secure_regular(
+    let encoded = delegation::read_private_regular(
         &directory.join("transport"),
         "restricted transport private key",
         128 * 1024,
@@ -3482,12 +3542,7 @@ fn run_management_over_route(
     input: &[u8],
 ) -> Result<Vec<u8>> {
     let executable = std::env::current_exe().context("resolve local syq executable")?;
-    delegation::validate_secure_executable(&executable, "local syq executable")
-        .context("validate syq executable on the invoking machine")?;
-    let mut binary = File::open(&executable)
-        .with_context(|| format!("open local syq executable {}", executable.display()))?;
-    let mut bytes = Vec::new();
-    binary.read_to_end(&mut bytes)?;
+    let bytes = read_local_management_executable(&executable)?;
     let mut nonce = [0u8; 8];
     getrandom::fill(&mut nonce).context("generate receiver staging filename")?;
     let stage = format!(".syq-receiver-{}-{:016x}", id, u64::from_le_bytes(nonce));
@@ -3497,6 +3552,27 @@ fn run_management_over_route(
     // management helper exits, so there is no inter-session orphan window or
     // cleanup request that depends on a route which has already failed.
     run_ssh(target, route, &command, &bytes)
+}
+
+fn read_local_management_executable(path: &Path) -> Result<Vec<u8>> {
+    let executable = fs::canonicalize(path)
+        .with_context(|| format!("canonicalize local syq executable {}", path.display()))?;
+    let mut binary = File::open(&executable)
+        .with_context(|| format!("open local syq executable {}", executable.display()))?;
+    let metadata = binary
+        .metadata()
+        .with_context(|| format!("inspect local syq executable {}", executable.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "local syq executable {} must be a regular file",
+            executable.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    binary
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read local syq executable {}", executable.display()))?;
+    Ok(bytes)
 }
 
 fn install_over_route(
@@ -4018,6 +4094,13 @@ pub(crate) fn prepare_transfer(
         destination_login,
         &canonical_destination,
     )?;
+    let protected = receiver_control_paths(
+        Path::new(&metadata.remote_home),
+        Path::new(&metadata.receiver_path),
+        None,
+    )?;
+    let GrantOperation::Copy(copy) = &grant.operation;
+    reject_control_plane_scopes(copy, &protected)?;
     let request_id = grant.request_id;
     let (receipt_recipient_secret, receipt_delivery) = if args.detach {
         (
@@ -4074,7 +4157,7 @@ pub(crate) fn receiver_config(id: EnrollmentId) -> Result<(ReceiverEnrollment, P
     let state = home
         .join(".local/share/syq/restricted")
         .join(id.to_string());
-    let encoded = delegation::read_secure_regular(
+    let encoded = delegation::read_private_regular(
         &state.join("config.json"),
         "restricted receiver configuration",
         MAX_STATE_FILE,
@@ -4092,6 +4175,26 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         .context("restricted receiver requires SSH_ORIGINAL_COMMAND from sshd")?;
     let envelope = decode_receiver_command(&original)?;
     let (config, allowed_signers, replay_path) = receiver_config(enrollment)?;
+    let (_, home) = current_account()?;
+    let canonical_home = fs::canonicalize(&home)
+        .with_context(|| format!("resolve receiver home {}", home.display()))?;
+    let canonical_receiver = fs::canonicalize(&config.receiver_path).with_context(|| {
+        format!(
+            "resolve restricted receiver {}",
+            Path::new(&config.receiver_path).display()
+        )
+    })?;
+    let canonical_ssh_keygen = fs::canonicalize(&config.ssh_keygen).with_context(|| {
+        format!(
+            "resolve signature verifier {}",
+            Path::new(&config.ssh_keygen).display()
+        )
+    })?;
+    let protected = receiver_control_paths(
+        &canonical_home,
+        &canonical_receiver,
+        Some(&canonical_ssh_keygen),
+    )?;
     let replay = delegation::ReplayStore::open(&replay_path)?;
     let observed_at = Instant::now();
     let context = delegation::ReceiverContext {
@@ -4119,6 +4222,7 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         grant_digest,
         receipt_key,
         deadline,
+        &protected,
     )?);
     crate::server::run_restricted(authority)
 }
@@ -4435,6 +4539,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn local_management_executable_check_is_scoped_to_the_open_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("syq");
+        fs::write(&executable, b"test executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            read_local_management_executable(&executable).unwrap(),
+            b"test executable"
+        );
+
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            read_local_management_executable(&executable).unwrap(),
+            b"test executable"
+        );
+
+        let error = read_local_management_executable(temporary.path()).unwrap_err();
+        assert!(error.to_string().contains("must be a regular file"));
+    }
+
+    #[test]
     fn management_stage_is_scoped_to_one_shell_session() {
         fn invoke(home: &Path, stage: &str, script: &[u8], request: &[u8]) -> std::process::Output {
             let remote = management_remote_command(stage, ManagementAction::Install, request)
@@ -4671,7 +4796,50 @@ pub(crate) mod tests {
             [0; 32],
             receipt_key,
             Instant::now() + std::time::Duration::from_secs(60),
+            &[],
         )
+    }
+
+    #[test]
+    fn restricted_destinations_cannot_overlap_receiver_control_paths() {
+        let protected = receiver_control_paths(
+            Path::new("/home/receiver"),
+            Path::new("/home/receiver/.local/libexec/syq-receiver"),
+            Some(Path::new("/usr/bin/ssh-keygen")),
+        )
+        .unwrap();
+
+        reject_control_plane_path(b"/home/receiver/archive", &protected)
+            .expect("an unrelated destination remains available");
+        reject_control_plane_path(b"/home/receiver/.ssh-backup", &protected)
+            .expect("component boundaries distinguish similar names");
+
+        for path in [
+            b"/home/receiver".as_slice(),
+            b"/home/receiver/.ssh".as_slice(),
+            b"/home/receiver/.ssh/incoming".as_slice(),
+        ] {
+            let error = reject_control_plane_path(path, &protected).unwrap_err();
+            assert!(error.to_string().contains("protected SSH configuration"));
+        }
+
+        for (path, label) in [
+            (
+                b"/home/receiver/.local/libexec/syq-receiver".as_slice(),
+                "receiver executable directory",
+            ),
+            (
+                b"/home/receiver/.local/share/syq/restricted/enrollment".as_slice(),
+                "enrollment state directory",
+            ),
+            (
+                b"/usr/bin/ssh-keygen".as_slice(),
+                "signature verifier executable",
+            ),
+        ] {
+            let error = reject_control_plane_path(path, &protected).unwrap_err();
+            assert!(error.to_string().contains(label));
+        }
     }
 
     #[test]

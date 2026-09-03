@@ -5238,7 +5238,7 @@ fn fresh_destination_dry_run_reports_capacity_sanity_check() {
     let output = compat_command()
         .args(["-an", &t.s("src/"), &t.s("dst"), "--no-progress"])
         .env("SYQ_TEST_AVAILABLE_BYTES", "1048576")
-        .env("SYQ_TEST_AVAILABLE_INODES", "10")
+        .env("SYQ_TEST_AVAILABLE_INODES", "100")
         .run()
         .unwrap();
 
@@ -5248,7 +5248,7 @@ fn fresh_destination_dry_run_reports_capacity_sanity_check() {
         stdout.contains("capacity: 7 B logical data required"),
         "{stdout}"
     );
-    assert!(stdout.contains("10 inodes available"), "{stdout}");
+    assert!(stdout.contains("100 inodes available"), "{stdout}");
     assert!(stdout.contains("appears sufficient"), "{stdout}");
     assert!(!t.path("dst").exists());
 }
