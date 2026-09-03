@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -129,6 +129,58 @@ fn read(p: &Path) -> Vec<u8> {
     let mut v = Vec::new();
     File::open(p).unwrap().read_to_end(&mut v).unwrap();
     v
+}
+
+#[cfg(debug_assertions)]
+fn start_held_control_path(
+    command: &mut Command,
+    selected: &Path,
+    ready: &Path,
+) -> std::process::Child {
+    command
+        .env("SYQ_TEST_CONTROL_PATH", selected)
+        .env("SYQ_TEST_CONTROL_PATH_READY_FILE", ready)
+        .env("SYQ_TEST_HOLD_CONTROL_PATH_MS", "2000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap()
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_control_path_selection(child: &mut std::process::Child, ready: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before retaining the selected control path"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "control path was not retained before timeout"
+    );
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_control_path_output(mut child: std::process::Child) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "syq did not finish after the control-path race\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn partial_files(dir: &Path) -> Vec<PathBuf> {
@@ -1025,6 +1077,403 @@ fn native_copy_control_file_paths_use_the_common_follow_policy() {
         &t.s("results-output"),
     ]);
     assert!(!read(&t.path("real-results")).is_empty());
+
+    run_native_ok(&[
+        "cp",
+        "--ignore-from",
+        "/dev/null",
+        "--src-src",
+        &t.s("src"),
+        "--into",
+        &t.s("device-input-output"),
+    ]);
+    assert_eq!(read(&t.path("device-input-output/keep")), b"data");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn control_input_replacement_symlinks_cannot_redirect_reads() {
+    use std::os::unix::fs::symlink;
+
+    for family in ["native-ignore", "rsync-ignore", "files-from", "mapping"] {
+        let t = Tmp::new();
+        write(&t.path("src/keep"), b"data");
+        let selected = t.path("selected-control");
+        let outside = t.path("outside-control");
+        let control_contents = if family == "mapping" {
+            entry_line("keep", "keep", None)
+        } else if family == "files-from" {
+            "keep\n".to_string()
+        } else {
+            "# no exclusions\n".to_string()
+        };
+        write(&selected, control_contents.as_bytes());
+        write(&outside, control_contents.as_bytes());
+        let destination = t.path("dst");
+        let ready = t.path("control-ready");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        match family {
+            "native-ignore" => {
+                command
+                    .args(["cp", "--ignore-from"])
+                    .arg(&selected)
+                    .arg("--src-src")
+                    .arg(t.path("src"))
+                    .arg("--into")
+                    .arg(&destination)
+                    .arg("-q");
+            }
+            "rsync-ignore" => {
+                command
+                    .args(["rsync", "-a", "--syq-ignore-from"])
+                    .arg(&selected)
+                    .arg(t.s("src/"))
+                    .arg(&destination)
+                    .arg("--no-progress");
+            }
+            "files-from" => {
+                command
+                    .args(["rsync", "-a", "--files-from"])
+                    .arg(&selected)
+                    .arg(t.path("src"))
+                    .arg(&destination)
+                    .arg("--no-progress");
+            }
+            "mapping" => {
+                command
+                    .args(["cp", "--mapping"])
+                    .arg(&selected)
+                    .arg("-C")
+                    .arg(t.path("src"))
+                    .arg("--into")
+                    .arg(&destination)
+                    .arg("-q");
+            }
+            _ => unreachable!(),
+        }
+        let mut child = start_held_control_path(&mut command, &selected, &ready);
+        wait_for_control_path_selection(&mut child, &ready);
+
+        fs::rename(&selected, t.path("original-control")).unwrap();
+        symlink(&outside, &selected).unwrap();
+
+        let output = wait_for_control_path_output(child);
+        assert!(
+            !output.status.success(),
+            "{family} followed a replacement symlink"
+        );
+        assert!(
+            stderr_of(&output).contains("operator file"),
+            "{family}: {}",
+            stderr_of(&output)
+        );
+        assert!(
+            !destination.exists(),
+            "{family} mutated its destination after the control-path race"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn regular_control_input_raced_to_fifo_fails_without_blocking() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"data");
+    let selected = t.path("selected-control");
+    write(&selected, b"# no exclusions\n");
+    let destination = t.path("dst");
+    let ready = t.path("control-ready");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args(["cp", "--ignore-from"])
+        .arg(&selected)
+        .arg("--src-src")
+        .arg(t.path("src"))
+        .arg("--into")
+        .arg(&destination)
+        .arg("-q");
+    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    wait_for_control_path_selection(&mut child, &ready);
+
+    fs::rename(&selected, t.path("original-control")).unwrap();
+    mkfifo(&selected);
+
+    let output = wait_for_control_path_output(child);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("changed identity"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!destination.exists());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn selected_fifo_replacement_reads_the_retained_fifo() {
+    use std::sync::mpsc;
+
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"data");
+    let selected = t.path("selected-control");
+    mkfifo(&selected);
+    let destination = t.path("dst");
+    let ready = t.path("control-ready");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args(["cp", "--ignore-from"])
+        .arg(&selected)
+        .arg("--src-src")
+        .arg(t.path("src"))
+        .arg("--into")
+        .arg(&destination)
+        .arg("-q");
+    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    wait_for_control_path_selection(&mut child, &ready);
+
+    let original = t.path("original-control");
+    fs::rename(&selected, &original).unwrap();
+    mkfifo(&selected);
+    let (writer_tx, writer_rx) = mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let result = File::options()
+            .write(true)
+            .open(original)
+            .and_then(|mut file| file.write_all(b"# no exclusions\n"));
+        writer_tx.send(result).unwrap();
+    });
+
+    let output = wait_for_control_path_output(child);
+    let used_retained_fifo = match writer_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(result) => {
+            result.expect("retained FIFO writer failed");
+            true
+        }
+        Err(_) => {
+            // Unblock the owned writer so a failed assertion never leaks a thread.
+            let _rescue = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(t.path("original-control"))
+                .unwrap();
+            writer_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("FIFO writer did not finish after rescue")
+                .unwrap();
+            false
+        }
+    };
+    writer.join().unwrap();
+    assert!(
+        used_retained_fifo,
+        "syq opened the replacement FIFO instead of its retained selection"
+    );
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/keep")), b"data");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn named_fifo_control_input_fails_before_destination_mutation() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"data");
+    let selected = t.path("selected-control");
+    mkfifo(&selected);
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--ignore-from"])
+        .arg(&selected)
+        .arg("--src-src")
+        .arg(t.path("src"))
+        .arg("--into")
+        .arg(t.path("dst"))
+        .arg("-q")
+        .run()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("exact descriptor"));
+    assert!(!t.path("dst").exists());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn trusted_control_symlink_target_is_read_from_the_opened_link() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"keep");
+    write(&t.path("src/drop"), b"drop");
+    write(&t.path("original-rules"), b"drop\n");
+    write(&t.path("replacement-rules"), b"keep\n");
+    let selected = t.path("selected-control-link");
+    symlink("original-rules", &selected).unwrap();
+    let destination = t.path("dst");
+    let ready = t.path("symlink-ready");
+    let release = t.path("symlink-release");
+
+    let mut child = compat_command()
+        .args(["-a", "--syq-ignore-from"])
+        .arg(&selected)
+        .arg(t.s("src/"))
+        .arg(&destination)
+        .arg("--no-progress")
+        .env(
+            "SYQ_TEST_OPERATOR_SYMLINK_COMPONENT",
+            "selected-control-link",
+        )
+        .env("SYQ_TEST_OPERATOR_SYMLINK_READY_FILE", &ready)
+        .env("SYQ_TEST_OPERATOR_SYMLINK_RELEASE_FILE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_control_path_selection(&mut child, &ready);
+
+    fs::rename(&selected, t.path("moved-control-link")).unwrap();
+    symlink("replacement-rules", &selected).unwrap();
+    write(&release, b"continue");
+
+    let output = wait_for_control_path_output(child);
+    assert_output_ok(&output);
+    assert_eq!(listing(&destination), ["keep"]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn results_replacement_symlinks_cannot_redirect_creation_or_truncation() {
+    use std::os::unix::fs::symlink;
+
+    for initially_exists in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src"), b"data");
+        let selected = t.path("results.ndjson");
+        let outside = t.path("outside-results");
+        write(&outside, b"do not replace");
+        if initially_exists {
+            write(&selected, b"old results");
+        }
+        let destination = t.path("dst");
+        let ready = t.path("control-ready");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--results"])
+            .arg(&selected)
+            .arg(t.path("src"))
+            .arg("--as")
+            .arg(&destination)
+            .arg("-q");
+        let mut child = start_held_control_path(&mut command, &selected, &ready);
+        wait_for_control_path_selection(&mut child, &ready);
+
+        if initially_exists {
+            fs::rename(&selected, t.path("original-results")).unwrap();
+        }
+        symlink(&outside, &selected).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !output.status.success(),
+            "results {} followed a replacement symlink",
+            if initially_exists {
+                "truncation"
+            } else {
+                "creation"
+            }
+        );
+        assert!(stderr_of(&output).contains("--results"));
+        assert_eq!(read(&outside), b"do not replace");
+        assert!(!destination.exists());
+        if initially_exists {
+            assert_eq!(read(&t.path("original-results")), b"old results");
+        }
+    }
+}
+
+#[test]
+fn named_results_refuse_fifos_devices_and_trailing_slashes() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    let fifo = t.path("results-fifo");
+    mkfifo(&fifo);
+    let mut fifo_reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+
+    for (label, selected) in [("fifo", fifo), ("device", PathBuf::from("/dev/null"))] {
+        let destination = t.path(&format!("{label}-destination"));
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--results"])
+            .arg(&selected)
+            .arg(t.path("src"))
+            .arg("--as")
+            .arg(&destination)
+            .arg("-q")
+            .run()
+            .unwrap();
+        assert!(!output.status.success(), "named results accepted {label}");
+        assert!(
+            stderr_of(&output).contains("regular file"),
+            "{label}: {}",
+            stderr_of(&output)
+        );
+        assert!(!destination.exists());
+    }
+    let mut fifo_bytes = Vec::new();
+    fifo_reader.read_to_end(&mut fifo_bytes).unwrap();
+    assert!(fifo_bytes.is_empty(), "the refused FIFO was written");
+
+    let trailing = format!("{}/", t.s("missing-results"));
+    let output = native_syq(&[
+        "cp",
+        "--results",
+        &trailing,
+        &t.s("src"),
+        "--as",
+        &t.s("trailing-destination"),
+    ]);
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("trailing slash"));
+    assert!(!t.path("missing-results").exists());
+    assert!(!t.path("trailing-destination").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    write(&t.path("intended-results"), b"old results");
+    write(&t.path("outside-results"), b"do not replace");
+    let selected = t.path("results-link");
+    symlink("intended-results", &selected).unwrap();
+    let ready = t.path("control-ready");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args(["cp", "--follow", "--results"])
+        .arg(&selected)
+        .arg(t.path("src"))
+        .arg("--as")
+        .arg(t.path("dst"))
+        .arg("-q");
+    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    wait_for_control_path_selection(&mut child, &ready);
+
+    fs::remove_file(&selected).unwrap();
+    symlink(t.path("outside-results"), &selected).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("outside-results")), b"do not replace");
+    let intended = read(&t.path("intended-results"));
+    assert!(
+        String::from_utf8_lossy(&intended).contains("\"type\":\"result\""),
+        "{}",
+        String::from_utf8_lossy(&intended)
+    );
+    assert_eq!(read(&t.path("dst")), b"data");
 }
 
 #[test]
@@ -4751,6 +5200,114 @@ fn ignore_from_file_and_later_negation_wins() {
     ]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--syq-ignore-from"));
+}
+
+#[test]
+fn rsync_control_inputs_follow_links_owned_by_the_effective_user() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"keep");
+    write(&t.path("src/drop"), b"drop");
+    write(&t.path("patterns"), b"drop\n");
+    write(&t.path("list"), b"keep\n");
+    symlink("patterns", t.path("patterns-link")).unwrap();
+    symlink("list", t.path("list-link")).unwrap();
+
+    run_ok(&[
+        "-a",
+        "--syq-ignore-from",
+        &t.s("patterns-link"),
+        &t.s("src/"),
+        &t.s("ignored"),
+    ]);
+    assert_eq!(listing(&t.path("ignored")), ["keep"]);
+
+    run_ok(&[
+        "-a",
+        "--files-from",
+        &t.s("list-link"),
+        &t.s("src"),
+        &t.s("listed"),
+    ]);
+    assert_eq!(listing(&t.path("listed")), ["keep"]);
+}
+
+#[test]
+fn control_file_names_preserve_non_utf8_bytes() {
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"keep");
+    write(&t.path("src/drop"), b"drop");
+    let rules = t
+        .path("")
+        .join(std::ffi::OsString::from_vec(b"rules-\xff".to_vec()));
+    let list = t
+        .path("")
+        .join(std::ffi::OsString::from_vec(b"list-\xfe".to_vec()));
+    write(&rules, b"drop\n");
+    write(&list, b"keep\n");
+
+    let native = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--ignore-from"])
+        .arg(&rules)
+        .arg("--src-src")
+        .arg(t.path("src"))
+        .arg("--into")
+        .arg(t.path("native"))
+        .arg("-q")
+        .run()
+        .unwrap();
+    assert_output_ok(&native);
+    assert_eq!(listing(&t.path("native")), ["keep"]);
+
+    let compatible = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", "-a", "--syq-ignore-from"])
+        .arg(&rules)
+        .arg(t.s("src/"))
+        .arg(t.path("compatible"))
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&compatible);
+    assert_eq!(listing(&t.path("compatible")), ["keep"]);
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", "-a", "--files-from"])
+        .arg(&list)
+        .arg(t.path("src"))
+        .arg(t.path("listed"))
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&listed);
+    assert_eq!(listing(&t.path("listed")), ["keep"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rsync_control_input_accepts_an_inherited_procfs_pipe() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let t = Tmp::new();
+    write(&t.path("src/keep"), b"keep");
+    write(&t.path("src/drop"), b"drop");
+    let mut descriptors = [0; 2];
+    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+    let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+    let mut writer = unsafe { File::from_raw_fd(descriptors[1]) };
+    writer.write_all(b"drop\n").unwrap();
+    drop(writer);
+    let rules = format!("/proc/self/fd/{}", reader.as_raw_fd());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", "-a", "--syq-ignore-from", &rules])
+        .arg(t.s("src/"))
+        .arg(t.path("dst"))
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(listing(&t.path("dst")), ["keep"]);
 }
 
 #[test]

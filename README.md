@@ -240,10 +240,37 @@ This is the native selection policy, not yet a complete hostile-namespace
 containment guarantee for copy. Native `rm` retains the resolved directories
 and selected identities through mutation, and copy retains its selected
 destination directory, but ordinary copy source walks and descendant
-operations have not all moved to descriptor-relative access. The default
-therefore rejects links present during preflight; the planned containment work
-must additionally prevent a concurrent rename or link substitution from
-changing an identity after that check.
+operations have not all moved to descriptor-relative access. Local control
+inputs are already identity-safe: `--ignore-from`, `--syq-ignore-from`,
+`--files-from`, and a named `--mapping` are read from the file selected by the
+component walk, so replacing their pathname afterward cannot redirect the
+read. Their filenames retain raw Unix path bytes even though ignore-pattern
+contents must be UTF-8. Mapping bytes are acquired before destination mutation.
+On Linux, a selected FIFO input is reopened from its retained `O_PATH`
+descriptor through a verified procfs `/proc/self/fd`; it therefore waits for a
+writer like an ordinary blocking open and still reads the originally selected
+FIFO after a rename. A final Linux procfs descriptor link is opened relative to
+its retained procfs parent, so shell process substitution remains usable
+without a general pathname fallback. A Linux system without procfs, and macOS,
+refuse named FIFO control inputs before destination mutation because they lack
+a safe exact blocking reopen. Use `--files-from -` or `--mapping -` for those
+stdin-capable inputs, or materialize ignore rules in a regular file. A named
+`--results` file is likewise created through its retained parent, or an
+existing selected regular file is identity-checked before truncation. With
+`--follow`, that retained selection is the resolved referent. Replacing the
+link afterward does not redirect the output. Named `--results` deliberately
+refuses an existing FIFO, device, or other non-regular object; use
+`--results -` and redirect stdout when a stream or device sink is intended.
+The remaining planned containment work must provide the same property for
+ordinary source walks and all descendant operations.
+
+Rsync-compatible control paths retain rsync's implicit policy of following a
+symlink owned by root or the endpoint's effective user. Ownership and target
+bytes are taken from the same opened symlink object on Linux and macOS 13 or
+newer. On platforms without a descriptor-bound link-read API (including older
+macOS releases), this implicit trusted-owner traversal fails closed instead of
+re-reading the link by name. Native `--follow` remains the explicit
+ownership-independent convenience policy.
 
 Placement is always explicit in this initial native surface:
 
@@ -441,6 +468,12 @@ the masters still leave after their five-minute idle limit; the inert scope
 can be inspected or removed later with the printed path. Scope paths beginning
 with a literal `~` or containing `${...}` are refused because OpenSSH expands
 those forms before opening a control socket.
+
+`--pscope` is intentionally not an ordinary control-file selection. It names a
+private directory created and permission-checked by the persistence subsystem;
+OpenSSH derives socket names beneath that directory. Its confinement therefore
+comes from that private-directory model, not from the retained single-file
+descriptors used for filters, mappings, file lists, and results.
 
 During either persistence window, anything able to act as the same local user
 can open sessions through the socket without touching the key or agent. This

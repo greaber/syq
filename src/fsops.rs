@@ -249,18 +249,19 @@ fn select_operator_directory(
             ))
         }
         PinnedPath::Leaf(_) => bail!("destination path is not a directory"),
+        PinnedPath::OpenFile(_) => {
+            unreachable!("directory selection never opens a procfs input")
+        }
     }
 }
 
-/// Check the current spelling of an operator-supplied local path without
-/// traversing a symlink. This is semantic preflight for orchestrator-local
-/// control files; retaining their opened identity belongs to the broader
-/// descriptor-root migration.
-pub(crate) fn check_operator_path_no_symlinks(
+fn resolve_operator_entry(
     path: &[u8],
-    allow_final_symlink: bool,
+    symlink_policy: OperatorSymlinkPolicy,
     allow_missing_final: bool,
-) -> Result<()> {
+    follow_final_symlink: bool,
+    readable_final: bool,
+) -> Result<(PathBuf, PinnedPath)> {
     let path = resolve(path);
     let path = if path.is_absolute() {
         path
@@ -272,15 +273,112 @@ pub(crate) fn check_operator_path_no_symlinks(
         bail!("operator path contains NUL");
     }
     let mut hops = Vec::new();
-    match OperatorResolver::resolve_process(
+    let selected = OperatorResolver::resolve_process(
         raw,
-        OperatorSymlinkPolicy::Refuse,
-        OperatorFinalComponent::Entry {
-            follow_symlink: false,
+        symlink_policy,
+        if readable_final {
+            OperatorFinalComponent::ReadableEntry {
+                follow_symlink: follow_final_symlink,
+            }
+        } else {
+            OperatorFinalComponent::Entry {
+                follow_symlink: follow_final_symlink,
+            }
         },
         allow_missing_final,
         &mut hops,
-    )? {
+    )?;
+    Ok((path, selected))
+}
+
+#[cfg(debug_assertions)]
+fn hold_operator_control_path_for_test(path: &Path) -> Result<()> {
+    let Some(expected) = std::env::var_os("SYQ_TEST_CONTROL_PATH") else {
+        return Ok(());
+    };
+    if expected.as_bytes() != path.as_os_str().as_bytes() {
+        return Ok(());
+    }
+    if let Some(ready) = std::env::var_os("SYQ_TEST_CONTROL_PATH_READY_FILE") {
+        fs::write(&ready, b"ready").with_context(|| {
+            format!(
+                "write control-path-ready signal {}",
+                Path::new(&ready).display()
+            )
+        })?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_CONTROL_PATH_MS") {
+        let ms = ms
+            .to_string_lossy()
+            .parse::<u64>()
+            .context("parse SYQ_TEST_HOLD_CONTROL_PATH_MS")?;
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_operator_control_path_for_test(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Open an existing operator-supplied input and retain the identity
+/// selected by the component walk. A namespace replacement after resolution
+/// is reported rather than followed.
+pub(crate) fn open_operator_file_read(
+    path: &[u8],
+    symlink_policy: OperatorSymlinkPolicy,
+) -> Result<File> {
+    if path.ends_with(b"/") {
+        bail!("operator file path has a trailing slash");
+    }
+    let (path, selected) = resolve_operator_entry(path, symlink_policy, false, true, true)?;
+    hold_operator_control_path_for_test(&path)?;
+    match selected {
+        PinnedPath::Leaf(leaf) => leaf.open_read(),
+        PinnedPath::OpenFile(file) => Ok(file),
+        PinnedPath::Directory(_) => bail!("operator path selects a directory, not a regular file"),
+        PinnedPath::Missing(_) => Err(io::Error::from_raw_os_error(libc::ENOENT).into()),
+    }
+}
+
+/// Select an operator-supplied ordinary output and open it through retained
+/// descriptors. Existing files are identity-checked before truncation; a
+/// missing last component is created exclusively beneath its pinned parent.
+pub(crate) fn open_operator_file_replace(
+    path: &[u8],
+    symlink_policy: OperatorSymlinkPolicy,
+) -> Result<File> {
+    if path.ends_with(b"/") {
+        bail!("operator file path has a trailing slash");
+    }
+    let (path, selected) = resolve_operator_entry(path, symlink_policy, true, true, false)?;
+    hold_operator_control_path_for_test(&path)?;
+    match selected {
+        PinnedPath::Leaf(leaf) => leaf.open_regular_write(true),
+        PinnedPath::Directory(_) => bail!("operator path selects a directory, not a regular file"),
+        PinnedPath::Missing(missing) => missing.create_regular(0o666),
+        PinnedPath::OpenFile(_) => unreachable!("output resolution never opens a procfs input"),
+    }
+}
+
+/// Check the current spelling of an operator-supplied local path without
+/// traversing a symlink. Source walkers that have not yet moved to retained
+/// descriptors use this only as semantic preflight.
+pub(crate) fn check_operator_path_no_symlinks(
+    path: &[u8],
+    allow_final_symlink: bool,
+    allow_missing_final: bool,
+) -> Result<()> {
+    match resolve_operator_entry(
+        path,
+        OperatorSymlinkPolicy::Refuse,
+        allow_missing_final,
+        false,
+        false,
+    )?
+    .1
+    {
         PinnedPath::Directory(_) => Ok(()),
         PinnedPath::Leaf(leaf) if !leaf.metadata().is_symlink() || allow_final_symlink => Ok(()),
         PinnedPath::Leaf(_) => bail!(
@@ -293,6 +391,9 @@ pub(crate) fn check_operator_path_no_symlinks(
             } else {
                 Err(io::Error::from_raw_os_error(libc::ENOENT).into())
             }
+        }
+        PinnedPath::OpenFile(_) => {
+            unreachable!("semantic preflight never opens a procfs input")
         }
     }
 }
