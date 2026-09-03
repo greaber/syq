@@ -138,6 +138,10 @@ connection, so enable it only for a trusted release host rather than globally.
    `sdk/python/native-api.json`. A feature may use the `follow_up` disposition
    so its merge is not blocked on SDK work, but `scripts/check-python-api-sync.py`
    and the tag workflow refuse a release until every follow-up is resolved.
+   Run `scripts/test-real-ssh.sh` as the local live-OpenSSH release check. It
+   exercises all three coordinator placements across isolated source and
+   destination containers and does not contact real remote hosts.
+
 2. Once the release commit is the exact `master` tip, explicitly dispatch both
    full validation workflows on it. Selective push checks are insufficient for
    a release candidate because an unaffected job may have completed with a

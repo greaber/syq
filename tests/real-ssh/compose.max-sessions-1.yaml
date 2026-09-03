@@ -1,0 +1,10 @@
+services:
+  destination:
+    volumes:
+      - type: bind
+        source: ./sshd/max-sessions-1.conf
+        target: /etc/ssh/sshd_config.d/99-syq-test-profile.conf
+        read_only: true
+  runner:
+    environment:
+      SYQ_REAL_SSH_PROFILE: max-sessions-1
