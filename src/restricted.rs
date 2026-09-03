@@ -146,9 +146,12 @@ struct AuthorityState {
     /// destination path and the partial this grant declared for it:
     /// preallocation and basis seeding are charged against the aggregate
     /// ceiling here, once per file at its largest declared size, and every
-    /// write or publication must name a declared partial.
-    reserved: HashMap<(Vec<u8>, proto::PartialId), u64>,
+    /// write or publication must name a declared partial. Observation-only
+    /// preparations own separate provisional claims so an older absent
+    /// observation cannot roll back a newer preparation for the same key.
+    reserved: HashMap<(Vec<u8>, proto::PartialId), ByteReservation>,
     reserved_bytes: u64,
+    next_reservation_claim: u64,
     transferred_bytes: u64,
     deletions: u64,
     live_connections: u16,
@@ -186,6 +189,28 @@ enum ReceiverModeState {
     /// A new object's already-constrained mode. Pin it for the remainder of
     /// the grant so repeated requests cannot act as repeated chmod calls.
     Selected { mode: u32, kind: ReceiverModeKind },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ReservationClaimId(u64);
+
+#[derive(Debug, Default)]
+struct ByteReservation {
+    /// Capacity retained by a preparation that may have created, resized, or
+    /// reused the write target.
+    retained: Option<u64>,
+    /// Capacity provisionally claimed by observation-only preparations until
+    /// their individual outcomes are settled.
+    observations: HashMap<ReservationClaimId, u64>,
+}
+
+impl ByteReservation {
+    fn effective_size(&self) -> Option<u64> {
+        self.retained
+            .into_iter()
+            .chain(self.observations.values().copied())
+            .max()
+    }
 }
 
 impl ReceiverModeState {
@@ -394,6 +419,7 @@ impl RestrictedAuthority {
                 provisional: HashSet::new(),
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
+                next_reservation_claim: 0,
                 transferred_bytes: 0,
                 deletions: 0,
                 live_connections: 0,
@@ -729,25 +755,81 @@ impl RestrictedAuthority {
         path: &[u8],
         partial_id: proto::PartialId,
         size: u64,
-    ) -> Result<Option<u64>> {
+        observation_only: bool,
+    ) -> Result<Option<ReservationClaimId>> {
         let mut state = self.state.lock().unwrap();
         let key = (path.to_vec(), partial_id);
-        // An existing declaration only grows; a new one is registered even
-        // at zero length, so an empty file can still be published.
-        let previous = state.reserved.get(&key).copied();
-        if previous.is_some_and(|previous| size <= previous) {
-            return Ok(previous);
-        }
+        let previous = state
+            .reserved
+            .get(&key)
+            .and_then(ByteReservation::effective_size);
+        // An existing declaration only grows; a new one is registered even at
+        // zero length, so an empty file can still be published.
+        let effective = previous.map_or(size, |previous| previous.max(size));
         let total = state
             .reserved_bytes
-            .checked_add(size - previous.unwrap_or(0))
+            .checked_add(effective - previous.unwrap_or(0))
             .context("signed reservation byte counter overflow")?;
         if total > self.copy.limits.max_total_bytes {
             bail!("signed grant total-byte limit exceeded by file preparation");
         }
+        let claim = if observation_only {
+            let claim = ReservationClaimId(state.next_reservation_claim);
+            state.next_reservation_claim = state
+                .next_reservation_claim
+                .checked_add(1)
+                .context("reservation claim counter overflow")?;
+            Some(claim)
+        } else {
+            None
+        };
+        let reservation = state.reserved.entry(key).or_default();
+        if let Some(claim) = claim {
+            reservation.observations.insert(claim, size);
+        } else {
+            reservation.retained = Some(
+                reservation
+                    .retained
+                    .map_or(size, |retained| retained.max(size)),
+            );
+        }
         state.reserved_bytes = total;
-        state.reserved.insert(key, size);
-        Ok(previous)
+        Ok(claim)
+    }
+
+    /// Settle one observation's provisional reservation without disturbing
+    /// claims installed by requests that ran before or after it.
+    fn settle_observation_reservation(
+        state: &mut AuthorityState,
+        key: &(Vec<u8>, proto::PartialId),
+        claim: ReservationClaimId,
+        retain: bool,
+    ) {
+        let Some(reservation) = state.reserved.get_mut(key) else {
+            return;
+        };
+        let before = reservation
+            .effective_size()
+            .expect("a stored reservation has at least one claim");
+        let Some(size) = reservation.observations.remove(&claim) else {
+            return;
+        };
+        if retain {
+            reservation.retained = Some(
+                reservation
+                    .retained
+                    .map_or(size, |retained| retained.max(size)),
+            );
+        }
+        let after = reservation.effective_size();
+        let released = before - after.unwrap_or(0);
+        state.reserved_bytes = state
+            .reserved_bytes
+            .checked_sub(released)
+            .expect("reservation settlement cannot underflow");
+        if after.is_none() {
+            state.reserved.remove(key);
+        }
     }
 
     /// The size this grant declared for a partial, which bounds what may be
@@ -759,7 +841,7 @@ impl RestrictedAuthority {
             .unwrap()
             .reserved
             .get(&(path.to_vec(), partial_id))
-            .copied()
+            .and_then(ByteReservation::effective_size)
             .with_context(|| {
                 format!(
                     "staged file {} was not declared under this grant",
@@ -1032,28 +1114,22 @@ impl RestrictedAuthority {
                     inplace,
                     stage,
                     skip_if_absent,
-                    reservation_before,
+                    observation_claim,
                 } => {
                     // Observation-only Prepare replaces the old partial probe.
-                    // If no sidecar existed, it performed no file-lifecycle
-                    // mutation. Restore the aggregate reservation to its state
-                    // before this request and do not create an incomplete
-                    // receipt entry.
-                    if skip_if_absent && matches!(response, proto::Response::PartialSize(None)) {
+                    // Settle only this request's provisional claim: concurrent
+                    // preparations for the same partial retain their own
+                    // capacity regardless of response ordering.
+                    let absent =
+                        skip_if_absent && matches!(response, proto::Response::PartialSize(None));
+                    if let Some(claim) = observation_claim {
                         let key = (path.clone(), partial_id);
-                        let installed = reservation_before.map_or(size, |before| before.max(size));
-                        if state.reserved.get(&key) == Some(&installed) {
-                            let released = installed - reservation_before.unwrap_or(0);
-                            state.reserved_bytes = state
-                                .reserved_bytes
-                                .checked_sub(released)
-                                .expect("reservation rollback cannot underflow");
-                            if let Some(before) = reservation_before {
-                                state.reserved.insert(key, before);
-                            } else {
-                                state.reserved.remove(&key);
-                            }
-                        }
+                        Self::settle_observation_reservation(&mut state, &key, claim, !absent);
+                    }
+                    // If no sidecar existed, the observation performed no
+                    // file-lifecycle mutation and must not create an
+                    // incomplete receipt entry.
+                    if absent {
                         continue;
                     }
                     if state.ledger_v2.is_none() {
@@ -2104,7 +2180,7 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, false, None, pending)?;
-                let reservation_before = self.reserve_bytes(path, *partial_id, *len)?;
+                self.reserve_bytes(path, *partial_id, *len, false)?;
                 outcomes.push(PendingOutcome::FileStageV2 {
                     index: 0,
                     path: path.clone(),
@@ -2113,7 +2189,7 @@ impl RestrictedAuthority {
                     inplace: false,
                     stage: FileStageV2::Prepare,
                     skip_if_absent: false,
-                    reservation_before,
+                    observation_claim: None,
                 });
                 *guard = Some(self.guard.clone());
             }
@@ -2159,7 +2235,8 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_prepare(path)?;
-                let reservation_before = self.reserve_bytes(path, *partial_id, *size)?;
+                let observation_claim =
+                    self.reserve_bytes(path, *partial_id, *size, !*create_if_missing)?;
                 outcomes.push(PendingOutcome::FileStageV2 {
                     index: 0,
                     path: path.clone(),
@@ -2168,7 +2245,7 @@ impl RestrictedAuthority {
                     inplace: *inplace,
                     stage: FileStageV2::Prepare,
                     skip_if_absent: !*create_if_missing,
-                    reservation_before,
+                    observation_claim,
                 });
                 if *inplace {
                     // In-place preparation resizes the final file itself:
@@ -2207,7 +2284,7 @@ impl RestrictedAuthority {
                     inplace: *inplace,
                     stage: FileStageV2::Write,
                     skip_if_absent: false,
-                    reservation_before: None,
+                    observation_claim: None,
                 });
                 self.charge_bytes(path, *off, data.len())?;
                 *guard = Some(self.guard.clone());
@@ -2236,7 +2313,7 @@ impl RestrictedAuthority {
                     inplace: *inplace,
                     stage: FileStageV2::Finalize,
                     skip_if_absent: false,
-                    reservation_before: None,
+                    observation_claim: None,
                 });
                 touched_v2.push(path.clone());
                 self.constrain_receiver_mode(
@@ -2381,10 +2458,10 @@ enum PendingOutcome {
         /// Ignore a successful observation-only Prepare when it found no
         /// resumable sidecar and therefore performed no lifecycle mutation.
         skip_if_absent: bool,
-        /// Aggregate reservation state before a Prepare request. An
-        /// observation-only Prepare restores this value when no sidecar was
-        /// present, while a real preparation retains the enlarged reservation.
-        reservation_before: Option<u64>,
+        /// This observation-only Prepare's provisional reservation. Settlement
+        /// releases or retains precisely this claim without affecting a
+        /// concurrent preparation for the same partial.
+        observation_claim: Option<ReservationClaimId>,
     },
 }
 
@@ -5926,8 +6003,12 @@ pub(crate) mod tests {
         };
 
         let mut absent = prepare(&target.join("absent"));
-        let settlement = authority.authorize(&mut absent, false).unwrap();
-        authority.settle(settlement, &proto::Response::PartialSize(None));
+        let first = authority.authorize(&mut absent, false).unwrap();
+        let mut same_absent = prepare(&target.join("absent"));
+        let second = authority.authorize(&mut same_absent, false).unwrap();
+        authority.settle(first, &proto::Response::PartialSize(None));
+        assert_eq!(authority.state.lock().unwrap().reserved_bytes, 4);
+        authority.settle(second, &proto::Response::PartialSize(None));
         {
             let state = authority.state.lock().unwrap();
             assert!(state.file_lifecycles_v2.is_empty());
@@ -5944,6 +6025,58 @@ pub(crate) mod tests {
             .file_lifecycles_v2
             .contains_key(&(path_bytes(&present_path), [1; 16])));
         assert_eq!(state.reserved_bytes, 4);
+    }
+
+    #[test]
+    fn older_observation_does_not_release_newer_real_reservation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let authority = test_authority_with_receipt(
+            &root,
+            DeletionPolicy::Forbid,
+            4,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((
+                generate_receipt_key(EnrollmentId::random()).unwrap(),
+                test_receipt_policy(),
+            )),
+        )
+        .unwrap();
+        let path = target.join("shared");
+        let mut observation = prepare_request(&path);
+        let Request::Prepare {
+            create_if_missing, ..
+        } = &mut observation
+        else {
+            unreachable!()
+        };
+        *create_if_missing = false;
+
+        let older = authority.authorize(&mut observation, false).unwrap();
+        let mut real = prepare_request(&path);
+        let newer = authority.authorize(&mut real, false).unwrap();
+        authority.settle(older, &proto::Response::PartialSize(None));
+
+        {
+            let state = authority.state.lock().unwrap();
+            let reservation = state.reserved.get(&(path_bytes(&path), [1; 16])).unwrap();
+            assert_eq!(reservation.retained, Some(4));
+            assert!(reservation.observations.is_empty());
+            assert_eq!(state.reserved_bytes, 4);
+        }
+        let mut another = prepare_request(&target.join("another"));
+        let error = authority.authorize(&mut another, false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("signed grant total-byte limit exceeded"));
+        authority.settle(newer, &proto::Response::PartialSize(None));
     }
 
     #[test]
