@@ -200,6 +200,13 @@ in that admission check. If the endpoint's open-file limit cannot hold that
 set, the copy fails before destination mutation with guidance to reduce
 selectors or `--connections`.
 
+The integration suite also exercises successful constrained runs rather than
+only the refusal calculation: one worker copies an 80-component tree with a
+96-descriptor hard limit, and copies ten distinct exact source selections with
+a 128-descriptor hard limit. These are regression ceilings for those workloads,
+not promised minimum limits; endpoint transports and the descriptors already
+open in the invoking environment remain part of admission.
+
 Placement is always explicit:
 
 | Placement | Mapping | Target precondition |

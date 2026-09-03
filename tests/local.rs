@@ -80,6 +80,92 @@ fn native_syq(args: &[&str]) -> Output {
         .expect("run native syq command")
 }
 
+fn set_child_nofile_limit(command: &mut Command, requested: libc::rlim_t) {
+    let mut inherited = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) } != 0 {
+        panic!(
+            "read inherited descriptor limit: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    assert!(
+        inherited.rlim_max >= requested,
+        "inherited hard descriptor limit {} is below the test limit {requested}",
+        inherited.rlim_max
+    );
+    let limit = libc::rlimit {
+        rlim_cur: requested,
+        rlim_max: requested,
+    };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn source_fd_budget_handles_deep_tree_with_96_slots() {
+    let t = Tmp::new();
+    let mut deepest = t.path("source");
+    let mut destination_leaf = t.path("destination");
+    for index in 0..80 {
+        let component = format!("d{index:02}");
+        deepest.push(&component);
+        destination_leaf.push(component);
+    }
+    write(&deepest.join("leaf"), b"deep");
+    destination_leaf.push("leaf");
+
+    let mut command = compat_command();
+    command.args([
+        "-a",
+        "--syq-connections",
+        "1",
+        "--no-progress",
+        &t.s("source/"),
+        &t.s("destination/"),
+    ]);
+    command.env("SYQ_DEBUG", "1");
+    set_child_nofile_limit(&mut command, 96);
+    let output = command.run().unwrap();
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(read(&destination_leaf), b"deep");
+}
+
+#[test]
+fn source_fd_budget_handles_ten_exact_sources_with_128_slots() {
+    let t = Tmp::new();
+    let mut sources = Vec::new();
+    for index in 0..10 {
+        let relative = format!("source-{index:02}");
+        write(&t.path(&relative), relative.as_bytes());
+        sources.push(t.s(&relative));
+    }
+
+    let mut command = compat_command();
+    command.args(["-a", "--syq-connections", "1", "--no-progress"]);
+    command.args(&sources);
+    command.arg(t.s("destination/"));
+    command.env("SYQ_DEBUG", "1");
+    set_child_nofile_limit(&mut command, 128);
+    let output = command.run().unwrap();
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    for index in 0..sources.len() {
+        let name = format!("source-{index:02}");
+        assert_eq!(
+            read(&t.path(&format!("destination/{name}"))),
+            name.as_bytes()
+        );
+    }
+}
+
 #[test]
 fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creation() {
     let t = Tmp::new();
