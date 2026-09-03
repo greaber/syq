@@ -383,13 +383,13 @@ the default SSH command or an explicit command whose executable is `ssh`; an
 arbitrary remote-shell wrapper must carry its own port option.
 
 For two remote endpoints, `--run-at auto` (the default) places the coordinator
-at the source when the paths can be represented in a remote command and
-otherwise relays raw path bytes locally. `--run-at source` explicitly selects
-a direct push, `--run-at target` selects a direct pull with the SSH edge
-reversed, and `--run-at local` selects a relay without exposing the rsync-only
-`--relay` spelling. Explicit source or target placement therefore requires
-UTF-8 paths. `--run-at` is rejected for copies that do not have two remote
-endpoints.
+at the source when the paths can be represented in a remote command, and
+refuses otherwise: data is never routed through this machine implicitly.
+`--run-at source` explicitly selects a direct push, `--run-at target` selects
+a direct pull with the SSH edge reversed, and `--run-at local` explicitly
+selects a relay through this machine without exposing the rsync-only
+`--relay` spelling. Direct placement therefore requires UTF-8 paths today.
+`--run-at` is rejected for copies that do not have two remote endpoints.
 
 The default push uses destination-bound agent authentication plus the
 command-restricted write receiver. Default pull fails closed until the

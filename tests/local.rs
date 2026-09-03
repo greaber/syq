@@ -10906,3 +10906,29 @@ fn native_results_require_a_local_coordinator() {
         }
     }
 }
+
+#[test]
+fn native_remote_to_remote_never_relays_implicitly() {
+    use std::os::unix::ffi::OsStrExt;
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    // A source path with non-UTF-8 bytes cannot ride the delegated remote
+    // command line, so the direct topology is unavailable — and the relay
+    // is never chosen on the operator's behalf.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--from", "hostA"])
+        .arg("--src")
+        .arg(std::ffi::OsStr::from_bytes(b"src-\xff"))
+        .args(["--to", "hostB", "--as", &t.s("dst")])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("--run-at local"), "{stderr}");
+    assert!(!stderr.contains("relaying"), "no implicit relay: {stderr}");
+}

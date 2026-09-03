@@ -1103,14 +1103,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
             args.relay = true;
         }
+        if !args.relay {
+            // Data is never routed through this machine implicitly. Path
+            // bytes that cannot travel in a remote command line make the
+            // direct topology unavailable today (encoded delegation
+            // operands are the planned fix); until then, relaying is the
+            // operator's explicit choice.
+            bail!(
+                "remote-to-remote copy: these path bytes cannot be carried in a remote command line, so a direct transfer is not possible; pass --run-at local to route the transfer through this machine instead"
+            );
+        }
         if !args.quiet {
-            if args.relay {
-                eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
-            } else {
-                eprintln!(
-                    "syq: remote-to-remote transfer: relaying raw path bytes through this machine"
-                );
-            }
+            eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
     } else if args.interface != Interface::Rsync && args.run_at != RunAt::Auto {
         bail!("--run-at currently applies only to copies between two remote endpoints");
