@@ -449,6 +449,8 @@ class NativeClientTests(unittest.TestCase):
             self.client.map("source", cwd="a", root="b")
         with self.assertRaisesRegex(syq.SyqInvocationError, "--coordinate-at"):
             self.client.cp("source", into="target", coordinate_at="elsewhere")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "dry run"):
+            self.client.cp(from_="alpha:src", to="beta:dst", dry_run=True)
         with self.assertRaisesRegex(ValueError, "relative"):
             syq.RelativePath("/absolute")
         with self.assertRaisesRegex(ValueError, "NUL"):
@@ -473,3 +475,384 @@ class NativeClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReceiverAttestedDecodingTests(unittest.TestCase):
+    @staticmethod
+    def _final_state_decoder():
+        from syq.protocol import AutomationDecoder
+
+        decoder = AutomationDecoder(prune=False, mapping=False, dry_run=False)
+        decoder.feed(
+            json.dumps(
+                {
+                    "schema": "syq.automation",
+                    "schema_version": 1,
+                    "seq": 0,
+                    "type": "run",
+                    "run_id": "attested",
+                    "started_at": 1,
+                    "syq_version": "0.0.0",
+                    "mode": "cp",
+                    "prune": False,
+                    "mapping": False,
+                    "dry_run": False,
+                    "endpoints": [
+                        {"role": "source", "kind": "ssh", "host": "a"},
+                        {"role": "destination", "kind": "ssh", "host": "b"},
+                    ],
+                }
+            ).encode()
+        )
+        return decoder
+
+    @staticmethod
+    def _final_state(metadata=None, digest=None):
+        record = {
+            "schema": "syq.automation",
+            "schema_version": 1,
+            "seq": 1,
+            "type": "final_state",
+            "provenance": "receiver_attested",
+            "scope": 0,
+            "dst": {"encoding": "utf-8", "value": "tree/file"},
+            "object": {
+                "state": "present",
+                "kind": "file",
+                "size": 3,
+                "metadata": metadata
+                or {
+                    "mode": 0o644,
+                    "uid": 0,
+                    "gid": 0,
+                    "mtime": 1,
+                    "mtime_nsec": 0,
+                    "rdev": 0,
+                },
+            },
+        }
+        if digest is not None:
+            record["object"]["digest"] = digest
+        return json.dumps(record).encode()
+
+    def test_signed_mtimes_decode_and_bad_digests_are_rejected(self) -> None:
+        # A pre-1970 mtime is schema-valid signed data.
+        decoder = self._final_state_decoder()
+        event = decoder.feed(
+            self._final_state(
+                metadata={
+                    "mode": 0o644,
+                    "uid": 0,
+                    "gid": 0,
+                    "mtime": -1,
+                    "mtime_nsec": 0,
+                    "rdev": 0,
+                }
+            )
+        )
+        assert event.metadata is not None
+        self.assertEqual(event.metadata.mtime, -1)
+
+        for digest in (
+            {"algorithm": "sha256", "value": "ab" * 32},
+            {"algorithm": "blake3", "value": "not-hex"},
+            {"algorithm": "blake3", "value": "AB" * 32},
+        ):
+            decoder = self._final_state_decoder()
+            with self.assertRaises(syq.SyqProtocolError):
+                decoder.feed(self._final_state(digest=digest))
+
+    @staticmethod
+    def _terminal(seq=1, **overrides):
+        record = {
+            "schema": "syq.automation",
+            "schema_version": 1,
+            "seq": seq,
+            "type": "result",
+            "status": "success",
+            "exit_code": 0,
+            "dry_run": False,
+            "files_transferred": 0,
+            "files_unchanged": 0,
+            "files_excluded": 0,
+            "directories_created": 0,
+            "symlinks_created": 0,
+            "specials_created": 0,
+            "errors": 0,
+            "bytes_transferred": 0,
+            "bytes_unchanged": 0,
+            "elapsed_ms": 1,
+        }
+        record.update(overrides)
+        return json.dumps({k: v for k, v in record.items() if v is not ...}).encode()
+
+    def test_final_state_variants_are_enforced(self) -> None:
+        metadata = {
+            "mode": 0o644,
+            "uid": 0,
+            "gid": 0,
+            "mtime": 1,
+            "mtime_nsec": 0,
+            "rdev": 0,
+        }
+        base = {
+            "schema": "syq.automation",
+            "schema_version": 1,
+            "seq": 1,
+            "type": "final_state",
+            "provenance": "receiver_attested",
+            "scope": 0,
+            "dst": {"encoding": "utf-8", "value": "tree/file"},
+        }
+        bad_objects = [
+            # present without its required attestation fields
+            {"state": "present", "kind": "file", "size": 3},
+            # absent smuggling present-only fields
+            {"state": "absent", "size": 3},
+            # observation_failed without its code
+            {"state": "observation_failed", "message": "hash failed"},
+            # a kind outside the receiver vocabulary
+            {
+                "state": "present",
+                "kind": "wormhole",
+                "size": 3,
+                "metadata": metadata,
+            },
+        ]
+        for bad in bad_objects:
+            decoder = self._final_state_decoder()
+            with self.assertRaises(syq.SyqProtocolError):
+                decoder.feed(json.dumps({**base, "object": bad}).encode())
+
+        # The full receiver vocabulary of kinds decodes.
+        decoder = self._final_state_decoder()
+        event = decoder.feed(
+            json.dumps(
+                {
+                    **base,
+                    "object": {
+                        "state": "present",
+                        "kind": "character_device",
+                        "size": 0,
+                        "metadata": metadata,
+                    },
+                }
+            ).encode()
+        )
+        self.assertIs(event.kind, syq.FinalObjectKind.CHARACTER_DEVICE)
+
+    def test_unknown_final_state_fields_stay_additive(self) -> None:
+        # Additive optional fields from a future minor version are ignored;
+        # only known fields on the wrong variant are protocol errors.
+        decoder = self._final_state_decoder()
+        record = json.loads(self._final_state())
+        record["object"]["future_attestation"] = {"v": 2}
+        event = decoder.feed(json.dumps(record).encode())
+        self.assertIs(event.state, syq.FinalObjectState.PRESENT)
+
+    def test_attested_operation_and_error_fields_are_discriminated(self) -> None:
+        base = {
+            "schema": "syq.automation",
+            "schema_version": 1,
+            "seq": 1,
+        }
+        operation = {
+            **base,
+            "type": "operation_result",
+            "action": "transfer_file",
+            "dst": {"encoding": "utf-8", "value": "tree/file"},
+            "kind": "file",
+            "disposition": "succeeded",
+        }
+        bad_records = [
+            # provenance from nowhere
+            {**operation, "provenance": "self_reported", "scope": 0},
+            # receipt fields without attested provenance
+            {**operation, "scope": 0},
+            {**operation, "code": "execution_failed"},
+            # attested operations always carry their scope
+            {**operation, "provenance": "receiver_attested"},
+            # receipt code on an ordinary error record
+            {
+                **base,
+                "type": "error",
+                "message": "boom",
+                "code": "execution_failed",
+            },
+            {
+                **base,
+                "type": "error",
+                "message": "boom",
+                "provenance": "self_reported",
+            },
+        ]
+        for bad in bad_records:
+            decoder = self._final_state_decoder()
+            with self.assertRaises(syq.SyqProtocolError):
+                decoder.feed(json.dumps(bad).encode())
+
+        # An attested error's code is optional: a partial observation has none.
+        decoder = self._final_state_decoder()
+        event = decoder.feed(
+            json.dumps(
+                {
+                    **base,
+                    "type": "error",
+                    "message": "partly observed",
+                    "class": "io",
+                    "provenance": "receiver_attested",
+                }
+            ).encode()
+        )
+        self.assertEqual(event.provenance, "receiver_attested")
+        self.assertIsNone(event.code)
+
+    def test_attested_terminals_are_discriminated(self) -> None:
+        attested = {
+            "provenance": "receiver_attested",
+            "receipt_status": "clean",
+            "operations": 0,
+            "final_states": 0,
+            "receipt_records": 1,
+            "deletions_completed": 0,
+        }
+        bad_terminals = [
+            # receipt_status outside the verified vocabulary
+            {**attested, "receipt_status": "garbage"},
+            # attested without its bookkeeping
+            {"provenance": "receiver_attested", "receipt_status": "clean"},
+            # attested without its settled-deletion total
+            {**attested, "deletions_completed": ...},
+            # provenance from nowhere
+            {**attested, "provenance": "self_reported"},
+            # ordinary result smuggling receipt bookkeeping
+            {"receipt_status": "clean"},
+            {"operations": 3},
+        ]
+        for bad in bad_terminals:
+            decoder = self._final_state_decoder()
+            with self.assertRaises(syq.SyqProtocolError):
+                decoder.feed(self._terminal(**bad))
+
+        decoder = self._final_state_decoder()
+        result = decoder.feed(self._terminal(**attested))
+        self.assertIs(result.receipt_status, syq.ReceiptStatus.CLEAN)
+        self.assertEqual(result.receipt_records, 1)
+
+    def test_attested_records_decode_with_the_receiver_vocabulary(self) -> None:
+        from syq.protocol import AutomationDecoder
+
+        decoder = AutomationDecoder(prune=True, mapping=False, dry_run=False)
+        envelope = {"schema": "syq.automation", "schema_version": 1}
+        records = [
+            {
+                **envelope,
+                "seq": 0,
+                "type": "run",
+                "run_id": "attested",
+                "started_at": 1,
+                "syq_version": "0.0.0",
+                "mode": "cp",
+                "prune": True,
+                "mapping": False,
+                "dry_run": False,
+                "endpoints": [
+                    {"role": "source", "kind": "ssh", "host": "a"},
+                    {"role": "destination", "kind": "ssh", "host": "b"},
+                ],
+            },
+            {
+                **envelope,
+                "seq": 1,
+                "type": "operation_result",
+                "provenance": "receiver_attested",
+                "action": "set_metadata",
+                "scope": 0,
+                "dst": {"encoding": "utf-8", "value": "tree"},
+                "disposition": "succeeded",
+            },
+            {
+                **envelope,
+                "seq": 2,
+                "type": "operation_result",
+                "provenance": "receiver_attested",
+                "action": "observe_hash",
+                "kind": "file",
+                "scope": 0,
+                "dst": {"encoding": "utf-8", "value": "tree/a"},
+                "disposition": "observed",
+            },
+            {
+                **envelope,
+                "seq": 3,
+                "type": "final_state",
+                "provenance": "receiver_attested",
+                "scope": 0,
+                "dst": {"encoding": "utf-8", "value": "tree/a"},
+                "object": {
+                    "state": "present",
+                    "kind": "file",
+                    "size": 3,
+                    "metadata": {
+                        "mode": 0o644,
+                        "uid": 0,
+                        "gid": 0,
+                        "mtime": 1,
+                        "mtime_nsec": 0,
+                        "rdev": 0,
+                    },
+                    "digest": {"algorithm": "blake3", "value": "ab" * 32},
+                },
+            },
+            {
+                **envelope,
+                "seq": 4,
+                "type": "result",
+                "provenance": "receiver_attested",
+                "receipt_status": "clean",
+                "status": "success",
+                "exit_code": 0,
+                "dry_run": False,
+                "files_transferred": 1,
+                "files_unchanged": 0,
+                "files_excluded": 0,
+                "directories_created": 0,
+                "symlinks_created": 0,
+                "specials_created": 0,
+                "errors": 0,
+                "bytes_transferred": 3,
+                "bytes_unchanged": 0,
+                "elapsed_ms": 5,
+                "deletions_completed": 0,
+                "operations": 3,
+                "final_states": 1,
+                "receipt_records": 4,
+            },
+        ]
+        events = [
+            decoder.feed(json.dumps(record).encode()) for record in records
+        ]
+        metadata = events[1]
+        self.assertIsInstance(metadata, syq.OperationResult)
+        self.assertIs(metadata.action, syq.OperationAction.SET_METADATA)
+        self.assertIsNone(metadata.kind)
+        self.assertEqual(metadata.provenance, "receiver_attested")
+        observed = events[2]
+        self.assertIs(observed.disposition, syq.Disposition.OBSERVED)
+        final = events[3]
+        self.assertIsInstance(final, syq.FinalStateEvent)
+        self.assertIs(final.state, syq.FinalObjectState.PRESENT)
+        assert final.digest is not None
+        self.assertEqual(final.digest.algorithm, "blake3")
+        self.assertEqual(final.digest.value, "ab" * 32)
+        assert final.metadata is not None
+        self.assertEqual(final.metadata.mode, 0o644)
+        result = decoder.finish(0)
+        # Attested terminals carry only the settled-deletion total.
+        self.assertIsNone(result.deletions_planned)
+        self.assertIsNone(result.deletions_blocked)
+        self.assertEqual(result.deletions_completed, 0)
+        self.assertEqual(result.receipt_status, "clean")
+        self.assertEqual(result.operations, 3)
+        self.assertEqual(result.final_states, 1)
+        self.assertEqual(result.receipt_records, 4)

@@ -44,8 +44,9 @@ pub enum SourceSelection {
 /// Endpoint that owns the transfer coordinator for a native copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum CoordinateAt {
-    /// Run locally unless both endpoints are remote, then use the source when
-    /// possible and otherwise refuse the transfer.
+    /// Run locally unless both endpoints are remote, then use the source
+    /// endpoint (delegated path operands travel encoded, so any filename
+    /// works).
     #[default]
     Auto,
     /// Run the coordinator at the source endpoint.
@@ -78,7 +79,7 @@ pub struct Args {
     #[arg(skip)]
     pub locations: Vec<Location>,
     /// Endpoint-side base for native removal. Unlike copy's `--cwd`, this is
-    /// not joined into selector strings by the coordinator.
+    /// not joined into selector strings by the orchestrator.
     #[arg(skip)]
     pub native_rm_cwd: Option<Vec<u8>>,
     /// Endpoint-side containment boundary for native removal.
@@ -107,7 +108,7 @@ pub struct Args {
     /// Confined source-side base for `syq map` selectors.
     #[arg(skip)]
     pub native_map_root: Option<Vec<u8>>,
-    /// The placement destination for `syq map`, kept only for `--as` renaming;
+    /// The placement target for `syq map`, kept only for `--as` renaming;
     /// `syq map` never contacts a destination.
     #[arg(skip)]
     pub native_map_target: Option<Vec<u8>>,
@@ -122,6 +123,10 @@ pub struct Args {
     /// stream; validated and wrapped at startup.
     #[arg(skip)]
     pub native_results_fd: Option<i32>,
+    /// Internal delegated-run marker: skip the final human summary (the
+    /// invoking machine renders it from the verified attested terminal).
+    #[arg(skip)]
+    pub suppress_summary: bool,
     /// Native coordinator placement.
     #[arg(skip)]
     pub coordinate_at: CoordinateAt,
@@ -295,7 +300,7 @@ pub struct Args {
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
     #[arg(skip)]
     pub pscope_explicit: bool,
-    /// Signed receiver grant forwarded to a native source-host coordinator
+    /// Signed receiver grant forwarded to a native source-host orchestrator
     #[arg(skip)]
     pub restricted_grant: Option<String>,
     /// Terminal width for a native remote coordinator's progress display
@@ -607,7 +612,7 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning destination-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -854,9 +859,18 @@ enum NativePreserve {
 
 #[derive(clap::Args, Debug)]
 struct NativeCopyFields {
+    /// Internal: this argv was delegated by a remote-to-remote coordinator,
+    /// and every path-valued operand is standard unpadded base64 of its raw
+    /// bytes, so any filename survives the remote shell.
+    #[arg(long, hide = true)]
+    delegated_operands_b64: bool,
+    /// Internal: skip the final human summary — the invoking machine
+    /// renders it from the verified attested terminal instead.
+    #[arg(long, hide = true)]
+    suppress_summary: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Destination endpoint ([USER@]HOST[:PORT]); omitted means local
+    /// Target endpoint ([USER@]HOST[:PORT]); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
     /// Follow symlinks in directly supplied destination paths
@@ -955,7 +969,7 @@ struct NativeCopyCommand {
     /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
-    /// After copying, remove destination-only objects in mapped directory scopes;
+    /// After copying, remove target-only objects in mapped directory scopes;
     /// ignored and size-excluded source paths remain protected
     #[arg(long, conflicts_with = "mapping")]
     prune: bool,
@@ -969,7 +983,7 @@ struct NativeCopyCommand {
     name = "syq map",
     version,
     about = "Print a local source selection as an NDJSON mapping",
-    long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future destination container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8.",
+    long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8.",
     override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeMapCommand {
@@ -1006,6 +1020,52 @@ fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
     }
 }
 
+/// Decode the base64 path operands of a delegated remote-to-remote argv
+/// back into raw bytes (see --delegated-operands-b64).
+fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
+    fn decode_one(value: &mut OsString) -> Result<()> {
+        use anyhow::Context as _;
+        use base64::Engine as _;
+        let encoded = value.to_str().context("delegated operand is not base64")?;
+        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(encoded)
+            .context("decode delegated operand")?;
+        *value = OsString::from_vec(bytes);
+        Ok(())
+    }
+    let source = &mut copy.selection.source;
+    for list in [
+        &mut source.src,
+        &mut source.src_src,
+        &mut source.src_file,
+        &mut source.src_dir,
+        &mut source.src_files,
+        &mut source.src_dirs,
+        &mut source.srcs,
+        &mut source.src_srcs,
+        &mut source.sources,
+    ] {
+        for value in list.iter_mut() {
+            decode_one(value)?;
+        }
+    }
+    for value in [
+        source.cwd.as_mut(),
+        copy.into.as_mut(),
+        copy.into_new.as_mut(),
+        copy.into_existing.as_mut(),
+        copy.r#as.as_mut(),
+        copy.as_new.as_mut(),
+        copy.as_existing.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        decode_one(value)?;
+    }
+    Ok(())
+}
+
 fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
@@ -1023,6 +1083,9 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     } = parsed;
     if pscope.is_some() && remote.rsh.is_some() {
         bail!("--pscope cannot be used with --rsh");
+    }
+    if copy.delegated_operands_b64 {
+        decode_delegated_operands(&mut copy)?;
     }
     let mapping = copy.mapping.take();
     let results = copy.results.take();
@@ -1084,7 +1147,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         for source in locations.iter().filter(|source| !source.copies_contents()) {
             if native_basename(&source.path).is_none() {
                 bail!(
-                    "named source {:?} has no destination basename; use --src-src to select directory contents",
+                    "named source {:?} has no target basename; use --src-src to select directory contents",
                     String::from_utf8_lossy(&source.path)
                 );
             }
@@ -1094,7 +1157,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         Some(target) => {
             let target = trim_native_trailing_slashes(target.into_vec());
             if target.is_empty() {
-                bail!("destination paths may not be empty");
+                bail!("target paths may not be empty");
             }
             Some(target)
         }
@@ -1120,6 +1183,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
     args.native_results_fd = results_fd;
+    args.suppress_summary = copy.suppress_summary;
     args.pscope = pscope;
     args.native_source_cwd = copy.selection.source.cwd.clone().map(OsStringExt::into_vec);
     args.native_source_root = copy
@@ -1169,15 +1233,15 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
                 "--results cannot be used with --detach because the result stream would not remain attached"
             );
         }
-        // The stream is written by the transfer coordinator. For a
-        // remote-to-remote copy that requires the local (relay) topology,
-        // which is never chosen implicitly on the stream's behalf: the
-        // operator opts in with an explicit --coordinate-at local.
+        // A dry run's traces and planned totals exist only on the
+        // coordinator, and a receiver receipt cannot attest a plan; until
+        // the coordinator's own stream can be relayed home (recorded
+        // follow-up), remote dry-run streams are refused up front.
         let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
-        if src_remote && dst_remote && args.coordinate_at != CoordinateAt::Local {
+        if args.dry_run && src_remote && dst_remote && args.coordinate_at != CoordinateAt::Local {
             bail!(
-                "--results with a remote-to-remote copy needs the local coordinator; pass --coordinate-at local explicitly to route the transfer through this machine"
+                "--dry-run with --results needs a local coordinator for a remote-to-remote copy; pass --coordinate-at local to preview with the full trace stream"
             );
         }
     }
@@ -1225,11 +1289,11 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
             }
             let target = trim_native_trailing_slashes(target.into_vec());
             if target.is_empty() {
-                bail!("--as destination may not be empty");
+                bail!("--as target may not be empty");
             }
             if native_basename(&target).is_none() {
                 bail!(
-                    "--as destination {:?} has no basename",
+                    "--as target {:?} has no basename",
                     String::from_utf8_lossy(&target)
                 );
             }
@@ -1239,7 +1303,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
             for source in locations.iter().filter(|source| !source.copies_contents()) {
                 if native_basename(&source.path).is_none() {
                     bail!(
-                        "named source {:?} has no destination basename; use --src-src to select directory contents",
+                        "named source {:?} has no target basename; use --src-src to select directory contents",
                         String::from_utf8_lossy(&source.path)
                     );
                 }
@@ -1852,7 +1916,7 @@ fn reject_unsupported_rsync_flags(argv: &[OsString]) -> Result<()> {
 fn parse_tcp_congestion(value: &str) -> std::result::Result<String, String> {
     // Linux's TCP_CA_NAME_MAX is 16 including the terminating NUL. Keep this
     // validation platform-independent so a forwarded command fails the same
-    // way on every coordinator. The kernel otherwise looks up the registered
+    // way on every orchestrator. The kernel otherwise looks up the registered
     // name exactly, without imposing a character whitelist.
     if value.is_empty() {
         return Err("congestion-control algorithm cannot be empty".into());

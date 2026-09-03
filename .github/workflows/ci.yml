@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -18,6 +22,11 @@ jobs:
     outputs:
       native: ${{ steps.changes.outputs.native }}
       sdks: ${{ steps.changes.outputs.sdks }}
+      tooling: ${{ steps.changes.outputs.tooling }}
+      mapping_docs: ${{ steps.changes.outputs.mapping_docs }}
+      macos: ${{ steps.changes.outputs.macos }}
+      linux_arm64: ${{ steps.changes.outputs.linux_arm64 }}
+      full_suite: ${{ steps.changes.outputs.full_suite }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,14 +44,21 @@ jobs:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
         run: echo 'Path classification failed.' >&2; exit 1
-      - name: Complete the required check for documentation and SDK-only changes
-        if: needs.scope.outputs.native != 'true'
-        run: echo 'Full Rust validation is not needed for this change set.'
+      - name: Complete the required check when Rust and tooling are unaffected
+        if: >-
+          needs.scope.outputs.native != 'true' &&
+          needs.scope.outputs.tooling != 'true' &&
+          needs.scope.outputs.mapping_docs != 'true'
+        run: echo 'Rust, executable documentation, and repository tooling are unaffected.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.scope.outputs.native == 'true'
+        if: >-
+          needs.scope.outputs.native == 'true' ||
+          needs.scope.outputs.tooling == 'true' ||
+          needs.scope.outputs.mapping_docs == 'true'
         with:
           persist-credentials: false
-      - if: needs.scope.outputs.native == 'true'
+      - name: Install Rust check components
+        if: needs.scope.outputs.native == 'true'
         run: rustup component add rustfmt clippy
       - name: Check dependency policy
         if: needs.scope.outputs.native == 'true'
@@ -61,26 +77,70 @@ jobs:
           test "$("$RUNNER_TEMP/$directory/cargo-deny" --version)" = \
             "cargo-deny $CARGO_DENY_VERSION"
           "$RUNNER_TEMP/$directory/cargo-deny" --locked check
-      - if: needs.scope.outputs.native == 'true'
+      - name: Check Rust formatting
+        if: needs.scope.outputs.native == 'true'
         run: cargo fmt --all -- --check
-      - if: needs.scope.outputs.native == 'true'
+      - name: Lint every Rust target
+        if: needs.scope.outputs.native == 'true'
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - if: needs.scope.outputs.native == 'true'
+      - name: Test native units before merge
+        if: >-
+          needs.scope.outputs.native == 'true' &&
+          needs.scope.outputs.full_suite != 'true'
+        run: cargo test --locked --bin syq
+      - name: Test every native target after merge
+        if: >-
+          needs.scope.outputs.native == 'true' &&
+          needs.scope.outputs.full_suite == 'true'
         run: cargo test --locked --all-targets
-      - if: needs.scope.outputs.native == 'true'
+      - name: Test executable mapping documentation
+        if: >-
+          needs.scope.outputs.mapping_docs == 'true' &&
+          (needs.scope.outputs.native != 'true' ||
+           needs.scope.outputs.full_suite != 'true')
+        run: cargo test --locked --test local mappings_md_
+      - name: Test Cargo package identity
+        if: >-
+          needs.scope.outputs.tooling == 'true' ||
+          (needs.scope.outputs.native == 'true' &&
+           needs.scope.outputs.full_suite == 'true')
         run: scripts/test-cargo-package.sh
-      - if: needs.scope.outputs.native == 'true'
+      - name: Test installer tooling
+        if: >-
+          needs.scope.outputs.tooling == 'true' ||
+          (needs.scope.outputs.native == 'true' &&
+           needs.scope.outputs.full_suite == 'true')
         run: scripts/test-installer.sh
-      - if: needs.scope.outputs.native == 'true'
+      - name: Test release tooling
+        if: >-
+          needs.scope.outputs.tooling == 'true' ||
+          (needs.scope.outputs.native == 'true' &&
+           needs.scope.outputs.full_suite == 'true')
         run: scripts/test-release-tools.sh
-      - if: needs.scope.outputs.native == 'true'
+      - name: Test release orchestration
+        if: >-
+          needs.scope.outputs.tooling == 'true' ||
+          (needs.scope.outputs.native == 'true' &&
+           needs.scope.outputs.full_suite == 'true')
         run: scripts/test-release-orchestration.sh
-      - if: needs.scope.outputs.native == 'true'
+      - name: Validate workflow syntax
+        if: >-
+          needs.scope.outputs.tooling == 'true' ||
+          (needs.scope.outputs.native == 'true' &&
+           needs.scope.outputs.full_suite == 'true')
         run: scripts/check-workflows.sh
-      - if: needs.scope.outputs.native == 'true'
+      - name: Test release-secret tooling
+        if: >-
+          needs.scope.outputs.tooling == 'true' ||
+          (needs.scope.outputs.native == 'true' &&
+           needs.scope.outputs.full_suite == 'true')
         run: scripts/test-secret-tools.sh
-      - if: needs.scope.outputs.native == 'true'
-        run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/ci-scope.sh scripts/approve-generated-pr-runs.sh scripts/release-preflight.sh scripts/release-status.sh scripts/check-workflows.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-release-orchestration.sh scripts/test-homebrew-formula.sh scripts/test-python-sdk-release-tools.sh scripts/test-secret-tools.sh
+      - name: Lint shell tooling
+        if: >-
+          needs.scope.outputs.tooling == 'true' ||
+          (needs.scope.outputs.native == 'true' &&
+           needs.scope.outputs.full_suite == 'true')
+        run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-ci.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/ci-scope.sh scripts/approve-generated-pr-runs.sh scripts/release-preflight.sh scripts/release-status.sh scripts/check-workflows.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-release-orchestration.sh scripts/test-homebrew-formula.sh scripts/test-python-sdk-release-tools.sh scripts/test-secret-tools.sh
 
   sdks:
     needs: scope
@@ -90,9 +150,9 @@ jobs:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
         run: echo 'Path classification failed.' >&2; exit 1
-      - name: Complete the required check for documentation-only changes
+      - name: Complete the required check when SDKs are unaffected
         if: needs.scope.outputs.sdks != 'true'
-        run: echo 'Full SDK validation is not needed for this change set.'
+        run: echo 'SDK validation is not needed for this change set.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.scope.outputs.sdks == 'true'
         with:
@@ -104,7 +164,7 @@ jobs:
       - name: Install pinned Python tooling
         if: needs.scope.outputs.sdks == 'true'
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
-      - name: Require the SDK mapping for the latest syq release
+      - name: Require the matching Python SDK for the latest syq release
         if: needs.scope.outputs.sdks == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,6 +173,13 @@ jobs:
           pinned_tag=$(jq -er .tag sdk/python/src/syq/syq-release-manifest.json)
           test "$pinned_tag" = "$latest_tag" || {
             echo "Python SDK pins $pinned_tag, but the latest syq release is $latest_tag" >&2
+            exit 1
+          }
+          pinned_version=${pinned_tag#v}
+          python_version=$(sed -n 's/^version = "\(.*\)"/\1/p' \
+            sdk/python/pyproject.toml)
+          test "$python_version" = "$pinned_version" || {
+            echo "Python SDK $python_version pins syq $pinned_version; versions must match" >&2
             exit 1
           }
       - name: Build the candidate syq executable
@@ -182,14 +249,14 @@ jobs:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
         run: echo 'Path classification failed.' >&2; exit 1
-      - name: Complete the required check for documentation and SDK-only changes
-        if: needs.scope.outputs.native != 'true'
-        run: echo 'The ARM build is not affected by this change set.'
+      - name: Complete the required check when ARM validation is deferred
+        if: needs.scope.outputs.linux_arm64 != 'true'
+        run: echo 'ARM validation is deferred to the cumulative post-merge suite.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.scope.outputs.native == 'true'
+        if: needs.scope.outputs.linux_arm64 == 'true'
         with:
           persist-credentials: false
-      - if: needs.scope.outputs.native == 'true'
+      - if: needs.scope.outputs.linux_arm64 == 'true'
         run: cargo check --locked --all-targets
 
   macos:
@@ -200,28 +267,28 @@ jobs:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
         run: echo 'Path classification failed.' >&2; exit 1
-      - name: Complete the required check for documentation and SDK-only changes
-        if: needs.scope.outputs.native != 'true'
-        run: echo 'The macOS build and installer are not affected by this change set.'
+      - name: Complete the required check when macOS validation is deferred
+        if: needs.scope.outputs.macos != 'true'
+        run: echo 'macOS validation is deferred to the cumulative post-merge suite.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.scope.outputs.native == 'true'
+        if: needs.scope.outputs.macos == 'true'
         with:
           persist-credentials: false
-      - if: needs.scope.outputs.native == 'true'
+      - if: needs.scope.outputs.macos == 'true'
         run: cargo check --locked --all-targets
       - name: Exercise macOS symlink descriptor pinning
-        if: needs.scope.outputs.native == 'true'
+        if: needs.scope.outputs.macos == 'true'
         run: >-
           cargo test --locked
           rooted::tests::operator_resolver_selects_a_last_component_symlink_without_following_it
           -- --exact
       - name: Exercise macOS cross-process descriptor handoff
-        if: needs.scope.outputs.native == 'true'
+        if: needs.scope.outputs.macos == 'true'
         run: >-
           cargo test --locked
           descriptor_broker::tests::independent_process_receives_exact_registered_descriptor
           -- --exact
-      - if: needs.scope.outputs.native == 'true'
+      - if: needs.scope.outputs.macos == 'true'
         run: scripts/test-installer.sh
-      - if: needs.scope.outputs.native == 'true'
+      - if: needs.scope.outputs.macos == 'true'
         run: scripts/test-homebrew-formula.sh
