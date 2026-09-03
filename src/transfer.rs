@@ -144,10 +144,20 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     })
 }
 
-fn operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+fn source_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
     if args.interface == Interface::Rsync {
         OperatorSymlinkPolicy::TrustedOwner
-    } else if args.native_follow {
+    } else if args.follows_native_source_paths() {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    }
+}
+
+fn destination_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+    if args.interface == Interface::Rsync {
+        OperatorSymlinkPolicy::TrustedOwner
+    } else if args.follows_native_destination_paths() {
         OperatorSymlinkPolicy::FollowAll
     } else {
         OperatorSymlinkPolicy::Refuse
@@ -636,7 +646,7 @@ pub(crate) fn validate_native_source_type(
 ) -> Result<()> {
     match selection {
         SourceSelection::Contents | SourceSelection::Directory if kind == Kind::Symlink => bail!(
-            "selector {} is a symlink; pass --follow to resolve symlinks",
+            "selector {} is a symlink; pass --follow-src (or --follow) to resolve source symlinks",
             display(path)
         ),
         SourceSelection::Contents if kind != Kind::Dir => {
@@ -1196,7 +1206,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         update: args.update,
         ignore_existing: args.ignore_existing,
         existing: args.existing,
-        operator_symlink_policy: operator_symlink_policy(&args),
+        operator_symlink_policy: destination_operator_symlink_policy(&args),
         max_size,
         min_size,
     });
@@ -1490,20 +1500,23 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     // Rsync retains its destination-directory compatibility rule. Native
     // container placement keeps the named symlink by default or resolves its
-    // complete chain under --follow. Exact native placement always selects
-    // the final directory entry; --follow applies only to its parent path.
+    // complete chain under the destination follow policy. Exact native
+    // placement always selects the final directory entry; destination
+    // following applies only to its parent path.
     let (dst_root, mut dst_root_entry) = match args.interface {
         Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?,
         _ if expand_exact_home => (
             dst_canonical.as_os_str().as_bytes().to_vec(),
             dst_root_entry,
         ),
-        _ if args.native_follow && args.placement == Placement::Into => follow_container_symlink(
-            &mut *dst_ctl,
-            &operator_dst_root,
-            dst_root_entry,
-            args.target_existence != Existence::Existing,
-        )?,
+        _ if args.follows_native_destination_paths() && args.placement == Placement::Into => {
+            follow_container_symlink(
+                &mut *dst_ctl,
+                &operator_dst_root,
+                dst_root_entry,
+                args.target_existence != Existence::Existing,
+            )?
+        }
         _ => (operator_dst_root.clone(), dst_root_entry),
     };
     if debug() {
@@ -1532,13 +1545,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let dst_is_dir = match args.placement {
         Placement::Into => {
             if args.interface != Interface::Rsync
-                && !args.native_follow
+                && !args.follows_native_destination_paths()
                 && dst_root_entry
                     .as_ref()
                     .is_some_and(|entry| entry.kind == Kind::Symlink)
             {
                 bail!(
-                    "--into destination {} is a symlink; pass --follow to resolve symlinks",
+                    "--into destination {} is a symlink; pass --follow-dest (or --follow) to resolve destination symlinks",
                     display(&dst_root)
                 );
             }
@@ -1588,17 +1601,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 &mut *src_ctl,
                 &parent_path(&source.path),
                 false,
-                operator_symlink_policy(&args),
+                source_operator_symlink_policy(&args),
             )?;
         }
         // Native selectors are structural: validate every selected root before
         // a missing --into target can be created. Contents selectors require
-        // a directory and resolve a selected link only under --follow.
+        // a directory and resolve a selected link only under the source
+        // follow policy.
         for source in srcs {
             match stat_one(
                 &mut *src_ctl,
                 &source.path,
-                source.follows_root(args.native_follow),
+                source.follows_root(args.follows_native_source_paths()),
             )? {
                 Some(entry) => {
                     validate_native_source_type(&source.path, source.selection, entry.kind)?
@@ -1623,8 +1637,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         operator_dst_root.clone()
     } else {
         // Exact placement always retains the parent of the command-line leaf.
-        // Under --follow that walk may traverse parent symlinks, but it never
-        // changes which final directory entry the command addresses.
+        // Under destination following that walk may traverse parent symlinks,
+        // but it never changes which final directory entry the command addresses.
         parent_path(&operator_dst_root)
     };
     let request_prefix = if expand_exact_home || dst_is_dir {
@@ -1706,7 +1720,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             // Only a directory source can trigger the recurse-into-itself trap.
             // Judge the source the way the scan will, including the interface's
             // explicit selected-root link policy.
-            let follow_root = args.files_from.is_some() || s.follows_root(args.native_follow);
+            let follow_root =
+                args.files_from.is_some() || s.follows_root(args.follows_native_source_paths());
             let src_is_dir = matches!(stat_one(&mut *src_ctl, &s.path, follow_root)?, Some(ref e) if e.kind == Kind::Dir);
             if !src_is_dir {
                 continue;
@@ -2033,7 +2048,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     {
         let src_root = src.path.clone();
         let contents = src.copies_contents();
-        let follow_root = src.follows_root(args.native_follow);
+        let follow_root = src.follows_root(args.follows_native_source_paths());
         // A bare directory source goes to dest/basename even when dest doesn't
         // exist yet; a non-directory source only does so when dest is a directory
         // (decided once the root entry is seen).
@@ -2879,7 +2894,7 @@ fn follow_dir_symlink(
 }
 
 /// Resolve a symlink used as a directly supplied native container. Explicit
-/// `--follow` selects the referent regardless of its type; the caller then
+/// Destination following selects the referent regardless of its type; the caller then
 /// requires the result to be a directory. Placement forms that allow a
 /// missing target may create the referent of a dangling chain.
 fn follow_container_symlink(

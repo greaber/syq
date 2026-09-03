@@ -41,9 +41,10 @@ pub fn run(args: &Args) -> Result<i32> {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     let mut top_level_dst: HashSet<Vec<u8>> = HashSet::new();
+    let follow_src = args.follows_native_source_paths();
     for location in &args.locations {
         let full = full_path(args, &location.path);
-        if !args.native_follow {
+        if !follow_src {
             crate::fsops::check_operator_path_no_symlinks(
                 full.as_os_str().as_bytes(),
                 location.selection != SourceSelection::Contents,
@@ -51,21 +52,21 @@ pub fn run(args: &Args) -> Result<i32> {
             )?;
         }
         if location.selection == SourceSelection::Contents {
-            let md = metadata(&full, args.native_follow)
+            let md = metadata(&full, follow_src)
                 .with_context(|| format!("--src-src {}", full.display()))?;
             if !md.is_dir() {
                 bail!("--src-src {} is not a directory", full.display());
             }
             walk_children(&full, &location.path, b"", b"", &mut out)?;
         } else {
-            let md = metadata(&full, args.native_follow)
+            let md = metadata(&full, follow_src)
                 .with_context(|| format!("source {}", full.display()))?;
             crate::transfer::validate_native_source_type(
                 &location.path,
                 location.selection,
                 metadata_kind(&md),
             )?;
-            let src_name = if args.native_follow {
+            let src_name = if follow_src {
                 resolved_named_source(args, &full)?
             } else {
                 location.path.clone()

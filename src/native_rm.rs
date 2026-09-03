@@ -4,8 +4,8 @@
 //! is a component walk rooted at an already-open directory; it never produces
 //! a canonical pathname that is reopened later. The selected object and its
 //! parent directory remain pinned while an endpoint-local worker pool removes
-//! descendants relative to directory descriptors. Without `--follow`, a
-//! selected symlink and symlinks encountered below a selected directory are
+//! descendants relative to directory descriptors. Without source following,
+//! a selected symlink and symlinks encountered below a selected directory are
 //! unlinked as entries; neither is followed.
 
 use crate::proto::{

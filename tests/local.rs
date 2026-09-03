@@ -783,8 +783,93 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
         &t.s("never-created"),
     ]);
     assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
+    let stderr = stderr_of(&refused);
+    assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
+    assert!(
+        stderr.contains("--follow-dest for destination paths"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--follow for all directly supplied filesystem paths"),
+        "{stderr}"
+    );
     assert!(!t.path("never-created").exists());
+}
+
+#[test]
+fn native_directional_follow_keeps_source_destination_and_control_authority_separate() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real-source/file"), b"data");
+    symlink("real-source", t.path("source-link")).unwrap();
+    fs::create_dir(t.path("real-destination")).unwrap();
+    symlink("real-destination", t.path("destination-link")).unwrap();
+
+    run_native_ok(&[
+        "cp",
+        "--follow-src",
+        "--src-src",
+        &t.s("source-link"),
+        "--into",
+        &t.s("source-followed"),
+    ]);
+    assert_eq!(read(&t.path("source-followed/file")), b"data");
+
+    let destination_refused = native_syq(&[
+        "cp",
+        "--follow-src",
+        "--src-src",
+        &t.s("real-source"),
+        "--into-existing",
+        &t.s("destination-link"),
+    ]);
+    assert!(!destination_refused.status.success());
+    assert!(stderr_of(&destination_refused).contains("--follow-dest"));
+    assert!(!t.path("real-destination/file").exists());
+
+    let source_refused = native_syq(&[
+        "cp",
+        "--follow-dest",
+        "--src-src",
+        &t.s("source-link"),
+        "--into",
+        &t.s("source-refused"),
+    ]);
+    assert!(!source_refused.status.success());
+    assert!(stderr_of(&source_refused).contains("--follow-src"));
+    assert!(!t.path("source-refused").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--follow-dest",
+        "--src-src",
+        &t.s("real-source"),
+        "--into-existing",
+        &t.s("destination-link"),
+    ]);
+    assert_eq!(read(&t.path("real-destination/file")), b"data");
+
+    write(&t.path("rules"), b"*.tmp\n");
+    symlink("rules", t.path("rules-link")).unwrap();
+    let control_refused = native_syq(&[
+        "cp",
+        "--follow-src",
+        "--follow-dest",
+        "--ignore-from",
+        &t.s("rules-link"),
+        "--src-src",
+        &t.s("real-source"),
+        "--into",
+        &t.s("control-refused"),
+    ]);
+    assert!(!control_refused.status.success());
+    let stderr = stderr_of(&control_refused);
+    assert!(
+        stderr.contains("--follow for all directly supplied filesystem paths"),
+        "{stderr}"
+    );
+    assert!(!t.path("control-refused").exists());
 }
 
 #[test]
@@ -894,11 +979,15 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     symlink("real-parent", t.path("parent-link")).unwrap();
     let refused = native_syq(&["cp", &t.s("source"), "--as", &t.s("parent-link/exact-name")]);
     assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("--follow-dest for destination paths"),
+        "{stderr}"
+    );
     assert!(!t.path("real-parent/exact-name").exists());
     run_native_ok(&[
         "cp",
-        "--follow",
+        "--follow-dest",
         &t.s("source"),
         "--as",
         &t.s("parent-link/exact-name"),
@@ -1219,7 +1308,8 @@ fn native_rm_refuses_an_intermediate_symlink_before_mutating_any_selector() {
         "link/file",
     ]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("pass --follow"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
     assert_eq!(read(&t.path("victim")), b"keep");
     assert_eq!(read(&t.path("real/file")), b"keep");
     assert!(t.path("link").is_symlink());
@@ -1288,7 +1378,7 @@ fn native_rm_follow_removes_the_referent_and_leaves_the_link() {
     write(&t.path("real/file"), b"remove");
     symlink("real", t.path("link")).unwrap();
 
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--src-dir", "link"]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow-src", "--src-dir", "link"]);
 
     assert!(t.path("link").is_symlink());
     assert!(!t.path("real").exists());
@@ -7800,7 +7890,8 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         .args([
             "--from",
             "fake",
-            "--follow",
+            "--follow-src",
+            "--follow-dest",
             "--src-src",
             &t.s("src"),
             "--to",
@@ -7833,7 +7924,8 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     assert!(!t.path("dst/extra").exists());
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     for option in [
-        "--follow",
+        "--follow-src",
+        "--follow-dest",
         "--ignore=*.tmp",
         "--preserve=permissions",
         "--inplace",
@@ -8376,9 +8468,17 @@ fn native_map_uses_the_common_source_follow_policy() {
 
     let refused = syq_map_in(&t.path(""), &["--src-src", "link"]);
     assert!(!refused.status.success());
-    assert!(stderr_of(&refused).contains("pass --follow"));
+    assert!(stderr_of(&refused).contains("--follow-src"));
 
-    let lines = map_lines(&syq_map_in(&t.path(""), &["--follow", "--src-src", "link"]));
+    let intermediate = syq_map_in(&t.path(""), &["--src", "link/file"]);
+    assert!(!intermediate.status.success());
+    let stderr = stderr_of(&intermediate);
+    assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
+
+    let lines = map_lines(&syq_map_in(
+        &t.path(""),
+        &["--follow-src", "--src-src", "link"],
+    ));
     assert_eq!(lines.len(), 1);
     assert_eq!(map_path(&lines[0], "src"), "file");
     assert_eq!(lines[0]["kind"], "file");

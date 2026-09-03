@@ -165,7 +165,8 @@ class NativeClientTests(unittest.TestCase):
             src=["a", "b"],
             src_dir="assets",
             from_="source",
-            follow=True,
+            follow_src=True,
+            follow_dest=True,
             to="target",
             coordinate_at="local",
             into_existing="out",
@@ -205,7 +206,8 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(trace.reason, syq.TraceReason.DESTINATION_MISSING)
         argv = self.argv()
         for expected in (
-            "cp", "--src", "--src-dir", "--from", "--follow", "--to",
+            "cp", "--src", "--src-dir", "--from", "--follow-src",
+            "--follow-dest", "--to",
             "--into-existing", "--prune", "--max-delete", "--dry-run",
             "--hash", "--no-compress", "--bwlimit", "--connections",
             "--max-entries", "--max-total-bytes",
@@ -417,13 +419,13 @@ class NativeClientTests(unittest.TestCase):
         )
 
     def test_map_is_streaming_typed_and_context_managed(self) -> None:
-        with self.client.map(src_src="source", follow=True) as stream:
+        with self.client.map(src_src="source", follow_src=True) as stream:
             entries = list(stream)
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].src, syq.RelativePath("a.txt"))
         self.assertEqual(entries[0].kind, syq.EntryKind.FILE)
         self.assertEqual(self.argv()[0], "map")
-        self.assertIn("--follow", self.argv())
+        self.assertIn("--follow-src", self.argv())
 
     def test_structural_validation_happens_before_launch(self) -> None:
         with self.assertRaisesRegex(syq.SyqInvocationError, "exactly one"):
