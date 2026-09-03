@@ -9,9 +9,10 @@ file transfer tool. Call `syq.cp(...)` (including `cp --prune`) and
 python -m pip install syq
 ```
 
-Installing the package does not install syq itself. The first call downloads
-the syq release this package was tested with into your user cache, checks it
-against the signed release manifest, and uses that binary from then on.
+Installing the package does not install syq itself. The first default call that
+needs syq downloads the syq release this package was tested with if it is not
+already cached, checks it against the signed release manifest, and uses that
+managed binary for subsequent default calls.
 For Python package `0.0.3`, that release is syq `0.1.8`. syq always runs as a
 subprocess with an argument list, never through a shell.
 
