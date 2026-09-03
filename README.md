@@ -236,56 +236,89 @@ A relative value printed by `readlink` is relative to the directory containing
 the link, not necessarily the shell's current directory. `realpath` is usually
 the safer way to turn a link chain into an explicit operand.
 
-This is the native selection policy, not yet a complete hostile-namespace
-containment guarantee for copy. Native `rm` retains the resolved directories
-and selected identities through mutation. Copy resolves and registers every
+These rules form the hostile-namespace containment model for native copy and
+removal. Native `rm` retains the resolved directories and selected identities
+through mutation. Copy resolves and registers every
 selected source before destination mutation, and every source worker claims
 those exact directory or parent descriptors during authenticated startup,
 before it reports readiness. Source discovery and metadata stats, including
-retry checks, source content hashes, and range/small reads use the resulting opaque
-root ID plus strict relative bytes as their authority. They do not reopen the
-operator spelling or follow descendant symlinks; a selected file authorizes
-only the exact leaf observed at registration, not siblings beneath its retained
-parent. The endpoint registry and every initialized worker also keep that
-selected object open, so the pin remains valid even if the control connection
-exits first, and every content open verifies its identity. Exact-symlink target
-bytes are snapshotted through the opened symlink object and never reread through
-its mutable directory name. Replacing an exact selected leaf is an error, while
-changed-source retry remains available for entries beneath a selected
-directory. On macOS this descriptor-bound symlink operation requires macOS 13
-or newer; older releases fail source registration rather than fall back to a
-name-based read. On Linux, the same-machine `CopyLocal` optimization gives its
-destination worker both endpoints' exact capabilities during authenticated
-startup, then opens the source and destination relative to those descriptors.
-Rsync-mode `--insecure-links` skips that optimization because its explicitly
-unconfined source names cannot be represented by the capability-only request.
-Directory self-copy preflight also uses capabilities: on a confined
-same-machine copy, the destination endpoint claims the exact opened source
-directory and walks parents from its retained destination selection. Renaming
-either command-line spelling cannot redirect that decision. Copy also gives
-every destination worker the selected directory descriptor; destination
-observation, directory and special-file creation, metadata changes, and planned
-non-recursive deletion are relative to that descriptor. Destination scanning,
-including the walk that plans `--delete`, is relative to it too and never
-follows descendant symlinks.
+retry checks, source content hashes, and range/small reads, use the resulting
+opaque root ID plus strict relative bytes as their authority. They do not
+reopen the operator spelling or follow descendant symlinks; a selected file
+authorizes only the exact leaf observed at registration, not siblings beneath
+its retained parent. The endpoint registry and every initialized worker also
+keep that selected object open, so the pin remains valid even if the control
+connection exits first, and every content open verifies its identity.
+Exact-symlink target bytes are snapshotted through the opened symlink object and
+never reread through its mutable directory name. Replacing an exact selected
+leaf is an error, while changed-source retry remains available for entries
+beneath a selected directory. On macOS this descriptor-bound symlink operation
+requires macOS 13 or newer; older releases fail source registration rather than
+fall back to a name-based read.
+
+Copy gives every destination worker the selected directory descriptor.
+Destination observation, scanning and prune planning, directory and special-
+file creation, metadata changes, and planned non-recursive deletion are
+relative to it. Regular-file probing, preparation, basis holding and seeding,
+destination block hashing, ranged and small writes, finalization, sidecar
+cleanup, and publication also stay beneath that retained descriptor and never
+follow descendant symlinks. Activating that capability does not change the
+worker process's current directory; destination operations have no process-cwd
+dependency.
+
+Local control inputs are identity-safe too: `--ignore-from`,
+`--syq-ignore-from`, `--files-from`, and a named `--mapping` are read from the
+file selected by the component walk, so replacing their pathname afterward
+cannot redirect the read. Their filenames retain raw Unix path bytes even
+though ignore-pattern contents must be UTF-8. Mapping bytes are acquired before
+destination mutation. On Linux, a selected FIFO input is reopened from its
+retained `O_PATH` descriptor through a verified procfs `/proc/self/fd`; it
+therefore waits for a writer like an ordinary blocking open and still reads the
+originally selected FIFO after a rename. A final Linux procfs descriptor link
+is opened relative to its retained procfs parent, so shell process substitution
+remains usable without a general pathname fallback. A Linux system without
+procfs, and macOS, refuse named FIFO control inputs before destination mutation
+because they lack a safe exact blocking reopen. Use `--files-from -` or
+`--mapping -` for those stdin-capable inputs, or materialize ignore rules in a
+regular file. A named `--results` file is likewise created through its retained
+parent, or an existing selected regular file is identity-checked before
+truncation. With `--follow`, that retained selection is the resolved referent.
+Replacing the link afterward does not redirect the output. Named `--results`
+deliberately refuses an existing FIFO, device, or other non-regular object; use
+`--results -` and redirect stdout when a stream or device sink is intended.
+
+On Linux, the same-machine `CopyLocal` optimization gives its destination
+worker both endpoints' exact capabilities during authenticated startup, then
+opens the source and destination relative to those descriptors. Rsync-mode
+`--insecure-links` skips that optimization because its explicitly unconfined
+source names cannot be represented by the capability-only request. Directory
+self-copy preflight also uses capabilities: on a confined same-machine copy,
+the destination endpoint claims the exact opened source directory and walks
+parents from its retained destination selection. Renaming either command-line
+spelling cannot redirect that decision.
+
 Rsync-mode `--insecure-links` is the explicit compatibility opt-out: that
 session uses the legacy unconfined pathname discovery and content-read paths,
 including traversal through symlinked `--files-from` ancestors. Native
 mapping/generated names never inherit native `--follow`; they remain strict
-descendants of the registered source root.
-Registration also budgets the process's currently open descriptors, one
-retained parent descriptor per source root and one object descriptor per exact
-leaf for the registry, control connection, and every worker that may share its
-process, plus conservative per-worker file-cache, transport, and concurrent
-independent-worker broker-claim overhead. Same-machine Linux copies include
-the destination workers' cross-session claims in that admission check. If the
-endpoint's open-file limit cannot hold that set, the copy fails before
-destination mutation with guidance to reduce selectors or `--connections`.
-Regular-file destination transfer state has not all moved to
-descriptor-relative access yet either. The default therefore rejects
-links present during preflight, while the remaining containment work must also
-prevent a concurrent rename or link substitution from redirecting those
-unmigrated operation families.
+descendants of the registered source root. Rsync-compatible operator control
+paths retain rsync's implicit policy of following a symlink owned by root or
+the endpoint's effective user. Ownership and target bytes are taken from the
+same opened symlink object on Linux and macOS 13 or newer. On platforms without
+a descriptor-bound link-read API (including older macOS releases), this
+implicit trusted-owner traversal fails closed instead of re-reading the link by
+name. Native `--follow` remains the explicit ownership-independent convenience
+policy.
+
+Registration budgets the process's
+currently open descriptors, one retained parent descriptor per source root and
+one object descriptor per exact leaf for the registry, control connection, and
+every worker that may share its process, plus conservative per-worker
+file-cache, transport, and concurrent independent-worker broker-claim overhead.
+Same-machine Linux copies include the destination workers' cross-session claims
+in that admission check. If the endpoint's open-file limit cannot hold that
+set, the copy fails before destination mutation with guidance to reduce
+selectors or `--connections`.
 
 Placement is always explicit in this initial native surface:
 
@@ -298,12 +331,14 @@ Placement is always explicit in this initial native surface:
 | `--as-new PATH` | Map one named source exactly to `PATH` | Must not exist |
 | `--as-existing PATH` | Map one named source exactly to `PATH` | Must exist |
 
-The `new` and `existing` forms are lightweight placement-root pathname checks
-during the ordinary initial destination inspection. A mismatch fails before
-transfer mutation begins. After a successful check, the current engine's
-ordinary pathname and publication behavior applies: these forms do not pin an
-inode or provide compare-and-swap behavior against a concurrent namespace
-writer. Changed regular files continue to use staged atomic publication.
+The `new` and `existing` forms are checked during the ordinary initial
+destination inspection. A mismatch fails before transfer mutation begins, and
+the selected destination directory remains pinned while workers operate on
+strict relative names. Conditional regular-file updates and staged publication
+then verify the observed target identity instead of following a replaced name.
+This is not a namespace snapshot: an unconditional placement may still replace
+the non-directory entry present when it publishes. Changed regular files
+continue to use staged atomic publication.
 Mapping a non-directory source exactly onto an existing directory is rejected
 during the source's first scan batch, in both dry-run and execution. On the
 command-restricted remote-to-remote path the precondition is also signed: the
@@ -483,6 +518,12 @@ the masters still leave after their five-minute idle limit; the inert scope
 can be inspected or removed later with the printed path. Scope paths beginning
 with a literal `~` or containing `${...}` are refused because OpenSSH expands
 those forms before opening a control socket.
+
+`--pscope` is intentionally not an ordinary control-file selection. It names a
+private directory created and permission-checked by the persistence subsystem;
+OpenSSH derives socket names beneath that directory. Its confinement therefore
+comes from that private-directory model, not from the retained single-file
+descriptors used for filters, mappings, file lists, and results.
 
 During either persistence window, anything able to act as the same local user
 can open sessions through the socket without touching the key or agent. This

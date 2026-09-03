@@ -16,6 +16,7 @@ use crate::sched::{FileJob, Item, RangeHandle, Sched};
 use crate::tune::{self, Gate};
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -1026,26 +1027,32 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
-    if let Some(mapping) = args
-        .native_mapping
-        .as_deref()
-        .filter(|mapping| *mapping != b"-")
-        .filter(|_| !args.native_follow)
-    {
-        crate::fsops::check_operator_path_no_symlinks(mapping, false, false)
-            .map_err(|error| anyhow::anyhow!("--mapping: {error}"))?;
-    }
+    // Acquire the entire mapping through its retained selection before any
+    // destination root can be created. The planner already consumes the whole
+    // manifest; retaining these bytes also makes later namespace replacement
+    // irrelevant.
+    let mapping_contents = if let Some(mapping) = args.native_mapping.as_deref() {
+        let mut contents = Vec::new();
+        if mapping == b"-" {
+            std::io::stdin()
+                .read_to_end(&mut contents)
+                .context("--mapping -: read stdin")?;
+        } else {
+            crate::fsops::open_operator_file_read(mapping, operator_symlink_policy(&args))
+                .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
+                .map_err(|error| anyhow::anyhow!("--mapping {}: {error}", display(mapping)))?;
+        }
+        Some(contents)
+    } else {
+        None
+    };
     if let Some(results) = args.native_results.as_deref() {
         let out: Box<dyn std::io::Write + Send> = if results == b"-" {
             Box::new(std::io::stdout())
         } else {
-            if !args.native_follow {
-                crate::fsops::check_operator_path_no_symlinks(results, false, true)
-                    .map_err(|error| anyhow::anyhow!("--results: {error}"))?;
-            }
             let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
             Box::new(std::io::BufWriter::new(
-                std::fs::File::create(&path)
+                crate::fsops::open_operator_file_replace(results, operator_symlink_policy(&args))
                     .map_err(|e| anyhow::anyhow!("--results {}: {e}", path.display()))?,
             ))
         };
@@ -1922,26 +1929,15 @@ pub fn run(args: Args) -> Result<i32> {
 
     let mut scan_err = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
-    if let Some(mapping) = args.native_mapping.as_deref() {
+    if let Some(mapping_contents) = mapping_contents.as_deref() {
         let src = &srcs[0];
         st.active_source = Some(
             source_roots.get().expect("source roots registered")[0]
                 .selection
                 .clone(),
         );
-        let open = || -> Result<Box<dyn std::io::BufRead>> {
-            if mapping == b"-" {
-                return Ok(Box::new(std::io::stdin().lock()));
-            }
-            let path = std::path::PathBuf::from(OsStr::from_bytes(mapping).to_os_string());
-            Ok(Box::new(std::io::BufReader::new(
-                std::fs::File::open(&path)
-                    .map_err(|e| anyhow::anyhow!("--mapping {}: {e}", path.display()))?,
-            )))
-        };
-        match open().and_then(|mut reader| {
-            st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, &mut *reader)
-        }) {
+        let mut reader = std::io::Cursor::new(mapping_contents);
+        match st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, &mut reader) {
             Ok(()) => dry_run_mappings.push(DryRunMapping {
                 target: dst_root.clone(),
                 semantics: "entries selected by --mapping",
@@ -3651,12 +3647,13 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// Consume an NDJSON mapping manifest: each entry claims exactly one
-    /// source object (relative to `src_root`) at an explicit destination
-    /// (relative to `dst_root`). Entries stream: chunks are planned and
-    /// applied before the manifest ends, so `--mapping -` starts work long
-    /// before stdin closes. Destination ancestors no entry names are
-    /// synthesized as implicit directories with default metadata.
+    /// Consume an already-acquired NDJSON mapping manifest: each entry claims
+    /// exactly one source object (relative to `src_root`) at an explicit
+    /// destination (relative to `dst_root`). The caller buffers the complete
+    /// input before opening the destination, and this planner validates the
+    /// complete manifest before applying any entry. Destination ancestors with
+    /// no entries are synthesized as implicit directories with default
+    /// metadata.
     fn scan_mapping(
         &mut self,
         src: &mut dyn Conn,

@@ -199,6 +199,9 @@ impl Resolver {
                     remove_root,
                 }))
             }
+            PinnedPath::OpenFile(_) => {
+                unreachable!("removal selection never opens a procfs input")
+            }
         }
     }
 }
