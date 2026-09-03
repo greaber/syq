@@ -1,5 +1,5 @@
-//! `syq map`: print the resolved selection and placement of a native copy
-//! invocation as an NDJSON mapping, one JSON object per line.
+//! `syq map`: print a local source selection as an NDJSON mapping, one JSON
+//! object per line.
 //!
 //! Emission is local and read-only, and destination-independent by design:
 //! `dst` values are relative to the target container, so the same manifest

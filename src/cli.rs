@@ -573,16 +573,13 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a copy's resolved selection and placement as NDJSON\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
 #[derive(clap::Args, Debug)]
-struct NativeSelectionArgs {
-    /// Source endpoint ([USER@]HOST[:PORT]); omitted means local
-    #[arg(long, value_name = "ENDPOINT")]
-    from: Option<String>,
-    /// Resolve relative source selectors from DIR at the source endpoint
+struct NativeSourceArgs {
+    /// Resolve relative source selectors from DIR
     #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
     cwd: Option<OsString>,
     /// Follow symlinks that must be traversed in directly supplied endpoint paths
@@ -615,6 +612,15 @@ struct NativeSelectionArgs {
     /// Named source objects (shorthand for --src)
     #[arg(value_name = "PATH")]
     sources: Vec<OsString>,
+}
+
+#[derive(clap::Args, Debug)]
+struct NativeSelectionArgs {
+    /// Source endpoint ([USER@]HOST[:PORT]); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    from: Option<String>,
+    #[command(flatten)]
+    source: NativeSourceArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -907,13 +913,16 @@ struct NativeCopyCommand {
 #[command(
     name = "syq map",
     version,
-    about = "Print the resolved selection and placement of a copy as an NDJSON mapping",
-    long_about = "Print the resolved selection and placement of a copy as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to the target container), the object kind, and size/mtime for regular files. Emission is local and read-only; it never contacts a destination. Names must be valid UTF-8.",
-    override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... [PLACEMENT]"
+    about = "Print a local source selection as an NDJSON mapping",
+    long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8.",
+    override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeMapCommand {
     #[command(flatten)]
-    copy: NativeCopyFields,
+    source: NativeSourceArgs,
+    /// Rename the single selected root in the emitted mapping
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    r#as: Option<OsString>,
 }
 
 #[derive(Parser, Debug)]
@@ -935,86 +944,57 @@ struct NativeRmCommand {
 
 fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
     match interface {
-        Interface::NativeCp | Interface::NativeMap => parse_native_copy(argv, interface),
+        Interface::NativeCp => parse_native_copy(argv),
+        Interface::NativeMap => parse_native_map(argv),
         Interface::NativeRm => parse_native_rm(argv),
         Interface::Rsync => unreachable!(),
     }
 }
 
-fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
-    let mut full_argv = vec![OsString::from(command_label(interface))];
+fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
+    let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
-    let (mut parsed, remote, pscope, matches, prune, max_delete, size_selection) =
-        if interface == Interface::NativeMap {
-            let matches = NativeMapCommand::command()
-                .try_get_matches_from(full_argv)
-                .unwrap_or_else(|error| error.exit());
-            let parsed = NativeMapCommand::from_arg_matches(&matches)?;
-            (
-                parsed.copy,
-                NativeRemoteArgs::default(),
-                None,
-                matches,
-                false,
-                None,
-                NativeSizeSelectionArgs::default(),
-            )
-        } else {
-            let matches = NativeCopyCommand::command()
-                .try_get_matches_from(full_argv)
-                .unwrap_or_else(|error| error.exit());
-            let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
-            (
-                parsed.copy,
-                parsed.remote,
-                parsed.pscope,
-                matches,
-                parsed.prune,
-                parsed.max_delete,
-                parsed.size_selection,
-            )
-        };
+    let matches = NativeCopyCommand::command()
+        .try_get_matches_from(full_argv)
+        .unwrap_or_else(|error| error.exit());
+    let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
+    let NativeCopyCommand {
+        mut copy,
+        size_selection,
+        remote,
+        pscope,
+        prune,
+        max_delete,
+    } = parsed;
     if pscope.is_some() && remote.rsh.is_some() {
         bail!("--pscope cannot be used with --rsh");
     }
-    // `syq map` keeps `-C` out of selector paths so emitted `src` values stay
-    // relative to it; the walk joins it back.
-    let map_cwd = if interface == Interface::NativeMap {
-        parsed.selection.cwd.take().map(OsStringExt::into_vec)
-    } else {
-        None
-    };
-    let mapping = parsed.mapping.take();
-    if mapping.is_some() && interface != Interface::NativeCp {
-        bail!("--mapping is only available on syq cp");
-    }
-    let results = parsed.results.take();
-    if results.is_some() && interface != Interface::NativeCp {
-        bail!("--results is only available on syq cp");
-    }
-    if results.is_some() && parsed.operational.common.dry_run {
+    let mapping = copy.mapping.take();
+    let results = copy.results.take();
+    if results.is_some() && copy.operational.common.dry_run {
         // Dry-run trace output is a deliberately deferred automation
         // feature; a version-0 results stream reusing the live counters
         // would claim planned work as transferred.
         bail!("--results does not support --dry-run yet");
     }
     let mut locations = if mapping.is_some() {
-        let has_selectors = !(parsed.selection.src.is_empty()
-            && parsed.selection.src_src.is_empty()
-            && parsed.selection.srcs.is_empty()
-            && parsed.selection.src_srcs.is_empty()
-            && parsed.selection.src_file.is_empty()
-            && parsed.selection.src_dir.is_empty()
-            && parsed.selection.src_files.is_empty()
-            && parsed.selection.src_dirs.is_empty()
-            && parsed.selection.sources.is_empty());
+        let source = &copy.selection.source;
+        let has_selectors = !(source.src.is_empty()
+            && source.src_src.is_empty()
+            && source.srcs.is_empty()
+            && source.src_srcs.is_empty()
+            && source.src_file.is_empty()
+            && source.src_dir.is_empty()
+            && source.src_files.is_empty()
+            && source.src_dirs.is_empty()
+            && source.sources.is_empty());
         if has_selectors {
             bail!("--mapping replaces source selectors; do not combine them");
         }
-        let endpoint = parse_native_endpoint(parsed.selection.from.as_deref())?;
+        let endpoint = parse_native_endpoint(copy.selection.from.as_deref())?;
         let base = trim_native_trailing_slashes(
-            parsed
-                .selection
+            copy.selection
+                .source
                 .cwd
                 .clone()
                 .map(OsStringExt::into_vec)
@@ -1026,72 +1006,24 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         // The manifest is the selection; its entries resolve against this root.
         vec![Location::native(endpoint, base, SourceSelection::Contents)]
     } else {
-        lower_native_selection(&parsed.selection, &matches)?
+        lower_native_selection(&copy.selection, &matches)?
     };
-    if interface == Interface::NativeMap {
-        if parsed.selection.from.is_some() {
-            bail!("syq map with a remote source (--from) is not yet supported");
-        }
-        for source in &mut locations {
-            if source.path.starts_with(b"/")
-                || source.path == b"~"
-                || source.path.starts_with(b"~/")
-            {
-                bail!(
-                    "syq map selector {:?} is absolute; mapping entries are root-relative (use -C to set the base)",
-                    String::from_utf8_lossy(&source.path)
-                );
-            }
-            // Normalize the way --files-from does — drop `.` and empty
-            // components, reject `..` — so emitted paths are always valid
-            // manifest paths.
-            let mut parts: Vec<&[u8]> = Vec::new();
-            for component in source.path.split(|&byte| byte == b'/') {
-                match component {
-                    b"" | b"." => {}
-                    b".." => bail!(
-                        "syq map selector {:?} contains a `..` component",
-                        String::from_utf8_lossy(&source.path)
-                    ),
-                    other => parts.push(other),
-                }
-            }
-            let normalized = parts.join(&b"/"[..]);
-            source.path = if normalized.is_empty() {
-                b".".to_vec()
-            } else {
-                normalized
-            };
-        }
-        if locations
-            .iter()
-            .any(|location| location.selection == SourceSelection::Contents)
-            && locations.len() > 1
-        {
-            bail!(
-                "syq map takes --src-src DIR as the only selector, or any number of named selectors"
-            );
-        }
-    }
 
     let placements = [
-        (parsed.into, Placement::Into, Existence::Any),
-        (parsed.into_new, Placement::Into, Existence::New),
-        (parsed.into_existing, Placement::Into, Existence::Existing),
-        (parsed.r#as, Placement::As, Existence::Any),
-        (parsed.as_new, Placement::As, Existence::New),
-        (parsed.as_existing, Placement::As, Existence::Existing),
+        (copy.into, Placement::Into, Existence::Any),
+        (copy.into_new, Placement::Into, Existence::New),
+        (copy.into_existing, Placement::Into, Existence::Existing),
+        (copy.r#as, Placement::As, Existence::Any),
+        (copy.as_new, Placement::As, Existence::New),
+        (copy.as_existing, Placement::As, Existence::Existing),
     ];
     let (target, placement, existence) = match placements
         .into_iter()
         .find_map(|(path, placement, existence)| path.map(|path| (path, placement, existence)))
     {
         Some((path, placement, existence)) => (Some(path), placement, existence),
-        // `syq map` without placement emits the container-relative identity.
-        None if interface == Interface::NativeMap => (None, Placement::Into, Existence::Any),
         None => bail!(
-            "{} requires one of --into, --into-new, --into-existing, --as, --as-new, or --as-existing",
-            command_label(interface)
+            "syq cp requires one of --into, --into-new, --into-existing, --as, --as-new, or --as-existing"
         ),
     };
     if placement == Placement::As && mapping.is_some() {
@@ -1120,35 +1052,16 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         }
         None => None,
     };
-    let mut native_map_target = None;
-    if interface == Interface::NativeMap {
-        if existence != Existence::Any {
-            bail!(
-                "syq map never contacts a destination and cannot check --into-new, --into-existing, --as-new, or --as-existing preconditions"
-            );
-        }
-        if placement == Placement::As {
-            let target = target.as_ref().expect("--as parsed with a target");
-            if native_basename(target).is_none() {
-                bail!(
-                    "--as target {:?} has no basename",
-                    String::from_utf8_lossy(target)
-                );
-            }
-        }
-        native_map_target = target;
-    } else {
-        let target = target.expect("copy placement parsed with a target");
-        let target_endpoint = parse_native_endpoint(parsed.to.as_deref())?;
-        locations.push(Location::native(
-            target_endpoint,
-            target,
-            SourceSelection::Named,
-        ));
-    }
+    let target = target.expect("copy placement parsed with a target");
+    let target_endpoint = parse_native_endpoint(copy.to.as_deref())?;
+    locations.push(Location::native(
+        target_endpoint,
+        target,
+        SourceSelection::Named,
+    ));
 
     let mut args = native_engine_defaults();
-    args.interface = interface;
+    args.interface = Interface::NativeCp;
     args.placement = placement;
     args.target_existence = existence;
     args.locations = locations;
@@ -1156,12 +1069,10 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.max_delete = max_delete;
     args.max_size = size_selection.max_size;
     args.min_size = size_selection.min_size;
-    args.native_map_cwd = map_cwd;
-    args.native_map_target = native_map_target;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
     args.pscope = pscope;
-    args.native_follow = parsed.selection.follow;
+    args.native_follow = copy.selection.source.follow;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
         // through the source connection; a direct remote-to-remote copy has
@@ -1172,10 +1083,8 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             bail!("--mapping with a remote-to-remote copy is not supported; one end must be local");
         }
     }
-    apply_native_copy_operational(&mut args, parsed.operational, &matches)?;
-    if interface != Interface::NativeMap {
-        apply_native_remote(&mut args, remote)?;
-    }
+    apply_native_copy_operational(&mut args, copy.operational, &matches)?;
+    apply_native_remote(&mut args, remote)?;
     if args.max_entries.is_some()
         || args.max_total_bytes.is_some()
         || args.max_runtime_secs.is_some()
@@ -1193,6 +1102,94 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         }
     }
     apply_internal_native_direct(&mut args)?;
+    Ok(args)
+}
+
+fn parse_native_map(argv: &[OsString]) -> Result<Args> {
+    let mut full_argv = vec![OsString::from("syq map")];
+    full_argv.extend_from_slice(argv);
+    let matches = NativeMapCommand::command()
+        .try_get_matches_from(full_argv)
+        .unwrap_or_else(|error| error.exit());
+    let mut parsed = NativeMapCommand::from_arg_matches(&matches)?;
+
+    // Keep `-C` out of selector paths so emitted `src` values stay relative
+    // to it; the walk joins it back.
+    let map_cwd = parsed.source.cwd.take().map(OsStringExt::into_vec);
+    let mut locations = lower_native_sources(&parsed.source, &matches, None)?;
+    for source in &mut locations {
+        if source.path.starts_with(b"/") || source.path == b"~" || source.path.starts_with(b"~/") {
+            bail!(
+                "syq map selector {:?} is absolute; mapping entries are root-relative (use -C to set the base)",
+                String::from_utf8_lossy(&source.path)
+            );
+        }
+        // Normalize the way --files-from does — drop `.` and empty
+        // components, reject `..` — so emitted paths are always valid
+        // manifest paths.
+        let mut parts: Vec<&[u8]> = Vec::new();
+        for component in source.path.split(|&byte| byte == b'/') {
+            match component {
+                b"" | b"." => {}
+                b".." => bail!(
+                    "syq map selector {:?} contains a `..` component",
+                    String::from_utf8_lossy(&source.path)
+                ),
+                other => parts.push(other),
+            }
+        }
+        let normalized = parts.join(&b"/"[..]);
+        source.path = if normalized.is_empty() {
+            b".".to_vec()
+        } else {
+            normalized
+        };
+    }
+    if locations
+        .iter()
+        .any(|location| location.selection == SourceSelection::Contents)
+        && locations.len() > 1
+    {
+        bail!("syq map takes --src-src DIR as the only selector, or any number of named selectors");
+    }
+
+    let (placement, target) = match parsed.r#as {
+        Some(target) => {
+            if locations.len() != 1 || locations[0].copies_contents() {
+                bail!("--as requires exactly one ordinary source object");
+            }
+            let target = trim_native_trailing_slashes(target.into_vec());
+            if target.is_empty() {
+                bail!("--as target may not be empty");
+            }
+            if native_basename(&target).is_none() {
+                bail!(
+                    "--as target {:?} has no basename",
+                    String::from_utf8_lossy(&target)
+                );
+            }
+            (Placement::As, Some(target))
+        }
+        None => {
+            for source in locations.iter().filter(|source| !source.copies_contents()) {
+                if native_basename(&source.path).is_none() {
+                    bail!(
+                        "named source {:?} has no target basename; use --src-src to select directory contents",
+                        String::from_utf8_lossy(&source.path)
+                    );
+                }
+            }
+            (Placement::Into, None)
+        }
+    };
+
+    let mut args = native_engine_defaults();
+    args.interface = Interface::NativeMap;
+    args.placement = placement;
+    args.locations = locations;
+    args.native_map_cwd = map_cwd;
+    args.native_map_target = target;
+    args.native_follow = parsed.source.follow;
     Ok(args)
 }
 
@@ -1284,6 +1281,15 @@ fn lower_native_selection(
     parsed: &NativeSelectionArgs,
     matches: &clap::ArgMatches,
 ) -> Result<Vec<Location>> {
+    let endpoint = parse_native_endpoint(parsed.from.as_deref())?;
+    lower_native_sources(&parsed.source, matches, endpoint)
+}
+
+fn lower_native_sources(
+    parsed: &NativeSourceArgs,
+    matches: &clap::ArgMatches,
+    endpoint: Option<NativeEndpoint>,
+) -> Result<Vec<Location>> {
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
     for (id, selection, paths) in [
         ("sources", SourceSelection::NamedNoFollow, &parsed.sources),
@@ -1309,7 +1315,6 @@ fn lower_native_selection(
         bail!("native operations need at least one source selector");
     }
 
-    let endpoint = parse_native_endpoint(parsed.from.as_deref())?;
     let cwd = parsed.cwd.as_deref().map(OsStrExt::as_bytes);
     ordered
         .into_iter()
@@ -1453,15 +1458,6 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
         args.progress = true;
     }
     Ok(())
-}
-
-fn command_label(interface: Interface) -> &'static str {
-    match interface {
-        Interface::Rsync => "syq rsync",
-        Interface::NativeCp => "syq cp",
-        Interface::NativeRm => "syq rm",
-        Interface::NativeMap => "syq map",
-    }
 }
 
 fn qualify_source(cwd: Option<&[u8]>, path: Vec<u8>) -> Vec<u8> {
@@ -1840,7 +1836,7 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
-        parse_size, Args, Interface, Placement, SourceSelection,
+        parse_size, Args, Placement, SourceSelection,
     };
     use clap::Parser;
 
@@ -1928,7 +1924,7 @@ mod tests {
     #[test]
     fn native_hash_selects_content_comparison() {
         let argv = ["--hash", "source", "--into", "destination"].map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert!(args.checksum);
     }
 
@@ -1949,7 +1945,7 @@ mod tests {
             "destination",
         ]
         .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert!(args.native_follow);
         assert_eq!(args.ignore_lines, ["*.tmp", "!keep.tmp"]);
         assert!(args.perms);
@@ -1971,7 +1967,7 @@ mod tests {
             "destination",
         ]
         .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert!(args.delete);
         assert_eq!(args.max_delete, Some(3));
     }
@@ -1991,7 +1987,7 @@ mod tests {
             "destination",
         ]
         .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert_eq!(args.run_at, super::RunAt::Target);
         assert_eq!(args.rsh.as_deref(), Some("ssh -J jump"));
         assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
@@ -2011,7 +2007,7 @@ mod tests {
             "destination",
         ]
         .map(std::ffi::OsString::from);
-        let error = parse_native_copy(&argv, Interface::NativeCp).unwrap_err();
+        let error = parse_native_copy(&argv).unwrap_err();
         assert!(error
             .to_string()
             .contains("--pscope cannot be used with --rsh"));
@@ -2073,7 +2069,7 @@ mod tests {
             "dest",
         ]
         .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert_eq!(args.placement, Placement::Into);
         assert_eq!(args.locations.len(), 2);
         assert_eq!(args.locations[0].host.as_deref(), Some("source.test"));

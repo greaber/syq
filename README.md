@@ -322,10 +322,10 @@ receiver-side rules as archive mode: owner is set only when the receiver runs
 as root, while group changes that fail with `EPERM` are skipped. Hard links,
 ACLs, and xattrs are not preserved.
 
-All native commands accept `--follow`, `-n`/`--dry-run`, `-v`/`--verbose`,
+Native `cp` and `rm` accept `--follow`, `-n`/`--dry-run`, `-v`/`--verbose`,
 `-q`/`--quiet`, `-j`/`--connections`, `--progress`/`--no-progress`, and
-`--progress-json` in addition to their endpoint and selector options. `cp` also
-accepts `--hash`, `--no-compress`, `--bwlimit RATE`, `--stats`,
+`--progress-json` in addition to their endpoint and selector options. `cp`
+also accepts `--hash`, `--no-compress`, `--bwlimit RATE`, `--stats`,
 repeatable `--ignore PATTERN`/`--ignore-from FILE`, `--preserve`, and
 `--inplace`. Native `cp` and `rm` also accept an isolated SSH persistence
 scope through `--pscope PATH`. Filters
@@ -456,11 +456,11 @@ native remote-to-remote copy's reusable connections on the invoking machine;
 
 ## Mappings
 
-Placement can also be data instead of flags: `syq map` prints the resolved
-selection and placement of a command as JSON lines, and `syq cp --mapping`
+Placement can also be data instead of flags: `syq map` prints a local source
+selection and optional root rename as JSON lines, and `syq cp --mapping`
 executes such a manifest — a generalized `--as` covering many entries, each
-with its own destination. Between the two, any tool that edits JSON can
-reshape a transfer:
+with its own destination. Between the two, any tool that edits JSON can reshape
+a transfer:
 
 ```bash
 set -o pipefail
@@ -468,6 +468,12 @@ syq map --src-src photos \
   | jq -c '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C photos --to nas --into /pub
 ```
+
+`syq map` is local and destination-independent. Its options are `-C`,
+`--follow`, the source-selector family, and `--as` for renaming one selected
+root. Copy destinations, filtering, transfer policy, execution controls,
+results, receiver ceilings, and receipts belong to the downstream `cp`
+invocation or the manifest transform.
 
 Conflicting destinations are refused before any byte moves. See
 [MAPPINGS.md](MAPPINGS.md) for the format, more one-line transforms, and
