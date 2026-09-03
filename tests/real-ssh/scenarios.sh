@@ -100,10 +100,9 @@ printf 'real-SSH environment: profile %s; %s; %s\n' \
 
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
-ssh destination 'install -d -m 0755 /tmp/syq-real-ssh/direct-destination'
 syq cp --no-progress -j 2 --preserve=permissions \
     --from source --src-src /tmp/syq-real-ssh/direct-source \
-    --to destination --into-existing /tmp/syq-real-ssh/direct-destination
+    --to destination --into /tmp/syq-real-ssh/direct-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/direct-source \
     destination /tmp/syq-real-ssh/direct-destination \

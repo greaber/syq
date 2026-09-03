@@ -1,0 +1,14 @@
+[book]
+title = "syq"
+description = "Fast, safe, programmable file motion"
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+create-missing = false
+
+[output.html]
+site-url = "/syq/"
+git-repository-url = "https://github.com/greaber/syq"
+edit-url-template = "https://github.com/greaber/syq/edit/master/{path}"
