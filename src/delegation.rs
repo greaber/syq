@@ -30,9 +30,11 @@
 //! Every path component including `/` must be root/effective-user owned and
 //! not writable by another principal. Linux user-private-group write bits are
 //! accepted only after the account database proves that the owner is the
-//! group's sole non-root member. Linux and macOS both reject extended ACLs on
-//! trusted directories, verifier inputs, the verifier binary, and replay
-//! files; enrollment must therefore provision an ACL-free chain.
+//! group's sole non-root member. Linux accepts access ACLs only when their
+//! effective write grants are confined to those same trusted principals;
+//! default ACLs do not authorize changes to an existing ancestor, and every
+//! newly created component is revalidated before use. macOS conservatively
+//! rejects extended ACLs on trusted paths.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -1412,7 +1414,16 @@ fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
             mode
         );
     }
-    reject_extended_acl(directory, &format!("private directory {}", path.display()))?;
+    if !file_has_trusted_writers(
+        directory,
+        &metadata,
+        &format!("private directory {}", path.display()),
+    )? {
+        bail!(
+            "private directory {} must not grant write access to another principal",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1599,16 +1610,6 @@ fn private_group() -> Option<libc::gid_t> {
     *PRIVATE_GROUP.get_or_init(|| discover_private_group().unwrap_or(None))
 }
 
-pub(crate) fn metadata_has_trusted_writers(metadata: &std::fs::Metadata) -> bool {
-    trusted_owner_mode(
-        metadata.uid(),
-        metadata.gid(),
-        metadata.permissions().mode(),
-        unsafe { libc::geteuid() },
-        private_group(),
-    )
-}
-
 fn collect_trusted_directory_violation(
     directory: &File,
     label: &str,
@@ -1618,7 +1619,19 @@ fn collect_trusted_directory_violation(
     let metadata = directory
         .metadata()
         .with_context(|| format!("inspect {label}"))?;
-    if !metadata.is_dir() || !metadata_has_trusted_writers(&metadata) {
+    let trusted_writers = if metadata.is_dir() {
+        match file_has_trusted_writers(directory, &metadata, &format!("{label} {}", path.display()))
+        {
+            Ok(trusted) => trusted,
+            Err(error) => {
+                violations.push(format!("{}: {error:#}", path.display()));
+                true
+            }
+        }
+    } else {
+        false
+    };
+    if !metadata.is_dir() || !trusted_writers {
         violations.push(format!(
             "{}: must be a root/target-owned directory not writable by another principal (mode {:04o}, uid {}, gid {})",
             path.display(),
@@ -1626,9 +1639,6 @@ fn collect_trusted_directory_violation(
             metadata.uid(),
             metadata.gid()
         ));
-    }
-    if let Err(error) = reject_extended_acl(directory, &format!("{label} {}", path.display())) {
-        violations.push(format!("{}: {error:#}", path.display()));
     }
     Ok(())
 }
@@ -1643,7 +1653,9 @@ fn validate_private_file(file: &File, label: &str) -> Result<()> {
     {
         bail!("{label} must be a target-owned private regular file");
     }
-    reject_extended_acl(file, label)?;
+    if !file_has_trusted_writers(file, &metadata, label)? {
+        bail!("{label} must not grant write access to another principal");
+    }
     Ok(())
 }
 
@@ -1697,10 +1709,18 @@ pub(crate) fn validate_secure_executable(path: &Path, label: &str) -> Result<()>
         )
         .with_context(|| format!("open trusted {label} {}", path.display()))?;
         let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || !metadata_has_trusted_writers(&metadata)
-            || metadata.permissions().mode() & 0o111 == 0
-        {
+        let trusted_writers = match file_has_trusted_writers(
+            &file,
+            &metadata,
+            &format!("{label} {}", current.display()),
+        ) {
+            Ok(trusted) => trusted,
+            Err(error) => {
+                violations.push(format!("{}: {error:#}", current.display()));
+                true
+            }
+        };
+        if !metadata.is_file() || !trusted_writers || metadata.permissions().mode() & 0o111 == 0 {
             violations.push(format!(
                 "{}: {label} must be a trusted executable not writable by another principal (mode {:04o}, uid {}, gid {})",
                 current.display(),
@@ -1708,9 +1728,6 @@ pub(crate) fn validate_secure_executable(path: &Path, label: &str) -> Result<()>
                 metadata.uid(),
                 metadata.gid()
             ));
-        }
-        if let Err(error) = reject_extended_acl(&file, &format!("{label} {}", current.display())) {
-            violations.push(format!("{}: {error:#}", current.display()));
         }
         if !violations.is_empty() {
             bail!(
@@ -1782,10 +1799,19 @@ pub(crate) fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> R
         .with_context(|| format!("open trusted {label} {}", path.display()))?;
     };
     let metadata = file.metadata()?;
+    let trusted_writers =
+        match file_has_trusted_writers(&file, &metadata, &format!("{label} {}", current.display()))
+        {
+            Ok(trusted) => trusted,
+            Err(error) => {
+                violations.push(format!("{}: {error:#}", current.display()));
+                true
+            }
+        };
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
         || metadata.file_type().is_socket()
-        || !metadata_has_trusted_writers(&metadata)
+        || !trusted_writers
     {
         violations.push(format!(
             "{}: {label} must be a trusted regular file not writable by another principal (mode {:04o}, uid {}, gid {})",
@@ -1794,9 +1820,6 @@ pub(crate) fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> R
             metadata.uid(),
             metadata.gid()
         ));
-    }
-    if let Err(error) = reject_extended_acl(&file, &format!("{label} {}", current.display())) {
-        violations.push(format!("{}: {error:#}", current.display()));
     }
     if !violations.is_empty() {
         bail!(
@@ -1832,40 +1855,192 @@ fn validate_canonical_trusted_path(path: &Path, label: &str) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn reject_extended_acl(_file: &File, _label: &str) -> Result<()> {
-    Ok(())
+fn file_has_trusted_writers(
+    _file: &File,
+    metadata: &std::fs::Metadata,
+    _label: &str,
+) -> Result<bool> {
+    Ok(trusted_owner_mode(
+        metadata.uid(),
+        metadata.gid(),
+        metadata.permissions().mode(),
+        unsafe { libc::geteuid() },
+        private_group(),
+    ))
 }
 
 #[cfg(target_os = "linux")]
-fn reject_extended_acl(file: &File, label: &str) -> Result<()> {
-    for (name, description) in [
-        (
-            b"system.posix_acl_access\0".as_slice(),
-            "an extended access ACL",
-        ),
-        (b"system.posix_acl_default\0".as_slice(), "a default ACL"),
-    ] {
-        let result = unsafe {
+fn read_fd_xattr(file: &File, name: &CStr, label: &str) -> Result<Option<Vec<u8>>> {
+    const MAX_ACL_XATTR: usize = 1024 * 1024;
+    for _ in 0..3 {
+        let size =
+            unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENODATA) {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| format!("inspect {label} ACL"));
+        }
+        let size = usize::try_from(size).context("ACL size is not representable")?;
+        if size > MAX_ACL_XATTR {
+            bail!("{label} ACL exceeds the supported size");
+        }
+        let mut encoded = vec![0u8; size];
+        let read = unsafe {
             libc::fgetxattr(
                 file.as_raw_fd(),
-                name.as_ptr().cast(),
-                std::ptr::null_mut(),
-                0,
+                name.as_ptr(),
+                encoded.as_mut_ptr().cast(),
+                encoded.len(),
             )
         };
-        if result >= 0 {
-            bail!("{label} must not have {description}");
+        if read >= 0 {
+            encoded.truncate(usize::try_from(read).context("ACL size is not representable")?);
+            return Ok(Some(encoded));
         }
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENODATA) {
-            return Err(error).with_context(|| format!("inspect {label} ACLs"));
+        if error.raw_os_error() == Some(libc::ENODATA) {
+            return Ok(None);
+        }
+        if error.raw_os_error() != Some(libc::ERANGE) {
+            return Err(error).with_context(|| format!("read {label} ACL"));
         }
     }
-    Ok(())
+    bail!("{label} ACL changed repeatedly while it was inspected")
+}
+
+#[cfg(target_os = "linux")]
+fn posix_acl_has_only_trusted_writers(
+    encoded: &[u8],
+    metadata: &std::fs::Metadata,
+    effective_uid: libc::uid_t,
+    private_group: Option<libc::gid_t>,
+    label: &str,
+) -> Result<bool> {
+    const VERSION: u32 = 2;
+    const USER_OBJ: u16 = 0x01;
+    const USER: u16 = 0x02;
+    const GROUP_OBJ: u16 = 0x04;
+    const GROUP: u16 = 0x08;
+    const MASK: u16 = 0x10;
+    const OTHER: u16 = 0x20;
+    const WRITE: u16 = 0x02;
+    const UNDEFINED_ID: u32 = u32::MAX;
+
+    if encoded.len() < 4 || !(encoded.len() - 4).is_multiple_of(8) {
+        bail!("{label} has a malformed POSIX access ACL");
+    }
+    let version = u32::from_le_bytes(encoded[..4].try_into().unwrap());
+    if version != VERSION {
+        bail!("{label} has an unsupported POSIX access ACL version {version}");
+    }
+    let entries = encoded[4..]
+        .chunks_exact(8)
+        .map(|entry| {
+            (
+                u16::from_le_bytes(entry[..2].try_into().unwrap()),
+                u16::from_le_bytes(entry[2..4].try_into().unwrap()),
+                u32::from_le_bytes(entry[4..].try_into().unwrap()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let masks = entries
+        .iter()
+        .filter(|(tag, _, _)| *tag == MASK)
+        .map(|(_, permissions, _)| *permissions)
+        .collect::<Vec<_>>();
+    if masks.len() != 1 {
+        bail!("{label} has a malformed POSIX access ACL mask");
+    }
+    let mask = masks[0];
+    let mut user_objects = 0;
+    let mut group_objects = 0;
+    let mut others = 0;
+    for &(tag, permissions, id) in &entries {
+        if permissions & !0o7 != 0 {
+            bail!("{label} has malformed POSIX access ACL permissions");
+        }
+        let (effective_permissions, trusted) = match tag {
+            USER_OBJ => {
+                user_objects += 1;
+                if id != UNDEFINED_ID {
+                    bail!("{label} has a malformed POSIX owner ACL entry");
+                }
+                (permissions, true)
+            }
+            USER => {
+                if id == UNDEFINED_ID {
+                    bail!("{label} has a malformed POSIX named-user ACL entry");
+                }
+                (permissions & mask, id == effective_uid || id == 0)
+            }
+            GROUP_OBJ => {
+                group_objects += 1;
+                if id != UNDEFINED_ID {
+                    bail!("{label} has a malformed POSIX owner-group ACL entry");
+                }
+                (permissions & mask, private_group == Some(metadata.gid()))
+            }
+            GROUP => {
+                if id == UNDEFINED_ID {
+                    bail!("{label} has a malformed POSIX named-group ACL entry");
+                }
+                (permissions & mask, private_group == Some(id))
+            }
+            MASK => {
+                if id != UNDEFINED_ID {
+                    bail!("{label} has a malformed POSIX mask ACL entry");
+                }
+                (0, true)
+            }
+            OTHER => {
+                others += 1;
+                if id != UNDEFINED_ID {
+                    bail!("{label} has a malformed POSIX other ACL entry");
+                }
+                (permissions, false)
+            }
+            _ => bail!("{label} has an unknown POSIX access ACL entry"),
+        };
+        if effective_permissions & WRITE != 0 && !trusted {
+            return Ok(false);
+        }
+    }
+    if user_objects != 1 || group_objects != 1 || others != 1 {
+        bail!("{label} has malformed POSIX access ACL base entries");
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn file_has_trusted_writers(
+    file: &File,
+    metadata: &std::fs::Metadata,
+    label: &str,
+) -> Result<bool> {
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != 0 && metadata.uid() != effective_uid {
+        return Ok(false);
+    }
+    let Some(acl) = read_fd_xattr(file, c"system.posix_acl_access", label)? else {
+        return Ok(trusted_owner_mode(
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode(),
+            effective_uid,
+            private_group(),
+        ));
+    };
+    posix_acl_has_only_trusted_writers(&acl, metadata, effective_uid, private_group(), label)
 }
 
 #[cfg(target_os = "macos")]
-fn reject_extended_acl(file: &File, label: &str) -> Result<()> {
+fn file_has_trusted_writers(
+    file: &File,
+    metadata: &std::fs::Metadata,
+    label: &str,
+) -> Result<bool> {
     const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
 
     unsafe extern "C" {
@@ -1882,7 +2057,13 @@ fn reject_extended_acl(file: &File, label: &str) -> Result<()> {
     if acl.is_null() {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(());
+            return Ok(trusted_owner_mode(
+                metadata.uid(),
+                metadata.gid(),
+                metadata.permissions().mode(),
+                unsafe { libc::geteuid() },
+                private_group(),
+            ));
         }
         return Err(error).with_context(|| format!("inspect {label} extended ACL"));
     }
@@ -3096,7 +3277,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_trusted_paths_reject_extended_posix_acls() {
+    fn linux_trusted_paths_reject_only_effective_untrusted_acl_writers() {
         fn entry(encoded: &mut Vec<u8>, tag: u16, permissions: u16, id: u32) {
             encoded.extend_from_slice(&tag.to_le_bytes());
             encoded.extend_from_slice(&permissions.to_le_bytes());
@@ -3104,35 +3285,66 @@ mod tests {
         }
 
         let directory = TestDir::new("posix-acl");
-        let guarded = directory.join("guarded");
-        fs::DirBuilder::new().mode(0o700).create(&guarded).unwrap();
-        let opened = File::open(&guarded).unwrap();
-        let mut acl = 2u32.to_le_bytes().to_vec();
-        entry(&mut acl, 0x01, 0o7, u32::MAX); // ACL_USER_OBJ
-        entry(
-            &mut acl,
-            0x02,
-            0o4,
-            unsafe { libc::geteuid() }.saturating_add(1),
-        ); // ACL_USER
-        entry(&mut acl, 0x04, 0, u32::MAX); // ACL_GROUP_OBJ
-        entry(&mut acl, 0x10, 0o4, u32::MAX); // ACL_MASK
-        entry(&mut acl, 0x20, 0, u32::MAX); // ACL_OTHER
-        let result = unsafe {
-            libc::fsetxattr(
-                opened.as_raw_fd(),
-                c"system.posix_acl_access".as_ptr().cast(),
-                acl.as_ptr().cast(),
-                acl.len(),
-                0,
-            )
+        let set_acl = |path: &Path, name: &CStr, named_uid, permissions| {
+            let opened = File::open(path).unwrap();
+            let mut acl = 2u32.to_le_bytes().to_vec();
+            entry(&mut acl, 0x01, 0o7, u32::MAX); // ACL_USER_OBJ
+            entry(&mut acl, 0x02, permissions, named_uid); // ACL_USER
+            entry(&mut acl, 0x04, 0, u32::MAX); // ACL_GROUP_OBJ
+            entry(&mut acl, 0x10, permissions, u32::MAX); // ACL_MASK
+            entry(&mut acl, 0x20, 0, u32::MAX); // ACL_OTHER
+            let result = unsafe {
+                libc::fsetxattr(
+                    opened.as_raw_fd(),
+                    name.as_ptr(),
+                    acl.as_ptr().cast(),
+                    acl.len(),
+                    0,
+                )
+            };
+            assert_eq!(result, 0, "set test ACL: {}", io::Error::last_os_error());
         };
-        assert_eq!(result, 0, "set test ACL: {}", io::Error::last_os_error());
+        let make_directory = |name| {
+            let path = directory.join(name);
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            path
+        };
+        let effective_uid = unsafe { libc::geteuid() };
+        let other_uid = effective_uid.saturating_add(1);
 
-        let error = validate_trusted_directory_path(&guarded).unwrap_err();
+        let default_parent = make_directory("default-parent");
+        let guarded = default_parent.join("guarded");
+        fs::DirBuilder::new().mode(0o700).create(&guarded).unwrap();
+        set_acl(&default_parent, c"system.posix_acl_default", other_uid, 0o7);
+        validate_trusted_directory_path(&guarded)
+            .expect("a default ACL does not authorize writes to its existing directory");
+        let inherited_private = default_parent.join("inherited-private");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&inherited_private)
+            .unwrap();
+        validate_private_directory_path(&inherited_private)
+            .expect("a mode-0700 child masks inherited access grants before validation");
+
+        let named_reader = make_directory("named-reader");
+        set_acl(&named_reader, c"system.posix_acl_access", other_uid, 0o4);
+        validate_trusted_directory_path(&named_reader)
+            .expect("a named read-only ACL entry is not a writer");
+
+        let owner_alias = make_directory("owner-alias");
+        set_acl(&owner_alias, c"system.posix_acl_access", effective_uid, 0o7);
+        validate_trusted_directory_path(&owner_alias)
+            .expect("an ACL entry naming the effective user is not another writer");
+
+        let named_writer = make_directory("named-writer");
+        set_acl(&named_writer, c"system.posix_acl_access", other_uid, 0o6);
+        let error = validate_trusted_directory_path(&named_writer).unwrap_err();
         let diagnostic = error.to_string();
-        assert!(diagnostic.contains("extended access ACL"), "{diagnostic}");
-        assert!(diagnostic.contains(&guarded.display().to_string()));
+        assert!(
+            diagnostic.contains("not writable by another principal"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains(&named_writer.display().to_string()));
     }
 
     #[cfg(target_os = "macos")]

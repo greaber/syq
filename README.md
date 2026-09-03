@@ -618,13 +618,17 @@ under `~/.local/share/syq/restricted/`; the receipt key's public half is
 returned to the local machine and recorded with the enrollment. Before
 publishing the forced key, syq verifies that the installed receiver is a
 regular executable and that it and every path ancestor are trusted-owner- or
-root-owned, non-writable by other users, and free of extended ACLs. On Linux,
-group-write from the conventional umask 002 is accepted only when account and
-group database lookups prove that the group is user-private (same name and no
-other member or non-root primary-group user). Otherwise group-write still
-fails closed. Private enrollment directories and secret files remain exactly
-0700 and 0600. A failure names the machine and reports every unsafe component
-of the path that syq could securely inspect.
+root-owned and non-writable by other users. On Linux, access ACLs are evaluated
+by their effective permissions: named entries are accepted when they are
+read-only or identify root, the target user, or its verified user-private
+group. A default ACL does not make its existing directory writable, and every
+new directory or file syq creates is validated before use. Group-write from the
+conventional umask 002 is accepted only when account and group database lookups
+prove that the group is user-private (same name and no other member or non-root
+primary-group user). Otherwise group-write still fails closed. Private
+enrollment directories and secret files remain exactly 0700 and 0600. A
+failure names the machine and reports every unsafe component of the path that
+syq could securely inspect.
 
 Enrollment first tries local→hostB directly. If SSH reports a transport
 failure, it retries through hostA with OpenSSH `ProxyJump`; a remote validation
@@ -811,9 +815,13 @@ of the enrollment, so a refresh, or a retry after a lost reply, never leaves
 the two sides holding different keys. To rotate it, revoke and enroll again.
 Revocation keeps the shared receiver while another enrollment or managed
 forced-key entry may use it. The final revoke removes the shared receiver and
-empty syq-owned state directories on hostB. Install and revoke serialize that
-lifecycle, so a concurrent enrollment recreates the receiver before publishing
-its forced key. Revocation prevents new receiver sessions. A
+empty `syq/restricted` state namespace on hostB. General account directories
+such as `.local`, `share`, and `libexec` are preserved even when empty because
+syq does not assume it created them. Each installer or revoker uploads and runs
+its temporary management helper within one SSH session whose cleanup trap owns
+the stage. Install and revoke serialize the shared receiver lifecycle, so a
+concurrent enrollment recreates the receiver before publishing its forced key.
+Revocation prevents new receiver sessions. A
 session that already claimed its signed request can finish an operation already
 in progress; later protocol requests are rejected once the signed execution
 deadline expires rather than forcibly interrupting a filesystem syscall.

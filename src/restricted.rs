@@ -2374,11 +2374,9 @@ fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 bail!("{} is not a real directory", path.display());
             }
-            if metadata.uid() != unsafe { libc::geteuid() }
-                || !delegation::metadata_has_trusted_writers(&metadata)
-            {
+            if metadata.uid() != unsafe { libc::geteuid() } {
                 bail!(
-                    "{} is not an owner-controlled directory (mode {:04o}, uid {}, gid {})",
+                    "{} is not a target-owned directory (mode {:04o}, uid {}, gid {})",
                     path.display(),
                     metadata.mode() & 0o7777,
                     metadata.uid(),
@@ -2811,6 +2809,11 @@ fn remove_empty_directory(path: &Path) -> Result<()> {
     }
 }
 
+fn remove_final_enrollment_state_directories(home: &Path) -> Result<()> {
+    remove_empty_directory(&home.join(".local/share/syq/restricted"))?;
+    remove_empty_directory(&home.join(".local/share/syq"))
+}
+
 fn contains_managed_enrollment(contents: &[u8]) -> bool {
     const MARKER: &[u8] = b"syq-enrollment:";
     contents.split(|byte| *byte == b'\n').any(|line| {
@@ -3042,9 +3045,7 @@ pub(crate) fn remote_revoke() -> Result<()> {
                 receiver_path.display()
             );
         }
-        remove_empty_directory(&state_base)?;
-        remove_empty_directory(&home.join(".local/share/syq"))?;
-        remove_empty_directory(&home.join(".local/share"))?;
+        remove_final_enrollment_state_directories(&home)?;
         match fs::symlink_metadata(&installed_receiver) {
             Ok(_) => {
                 delegation::validate_secure_executable(&installed_receiver, "restricted receiver")?;
@@ -3061,11 +3062,9 @@ pub(crate) fn remote_revoke() -> Result<()> {
                     .with_context(|| format!("inspect {}", installed_receiver.display()))
             }
         }
-        // These are cleanup-only ancestors. Once the receiver and state are
-        // gone, a non-empty directory is legitimate and any other failure
-        // does not make the revocation incomplete.
-        let _ = remove_empty_directory(&home.join(".local/libexec"));
-        let _ = remove_empty_directory(&home.join(".local"));
+        // `.local`, `share`, and `libexec` are general account directories.
+        // Without a durable record proving syq created them, preserve them
+        // even when the final enrollment leaves them empty.
     }
     drop(directory);
     println!("revoked {}", request.id);
@@ -3313,6 +3312,19 @@ impl ManagementAction {
     }
 }
 
+fn management_remote_command(
+    stage: &str,
+    action: ManagementAction,
+    request: &[u8],
+) -> Result<String> {
+    let request = std::str::from_utf8(request).context("management request is not UTF-8")?;
+    Ok(format!(
+        "set -eu; d=\"$HOME/.local/libexec\"; p=\"$d/{stage}\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; cat >\"$p\"; chmod 700 \"$p\"; printf '%s' {} | \"$p\" {}",
+        shell_words::quote(request),
+        action.argument()
+    ))
+}
+
 fn run_management_over_route(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
@@ -3330,29 +3342,12 @@ fn run_management_over_route(
     let mut nonce = [0u8; 8];
     getrandom::fill(&mut nonce).context("generate receiver staging filename")?;
     let stage = format!(".syq-receiver-{}-{:016x}", id, u64::from_le_bytes(nonce));
-    let upload = format!(
-        "set -eu; d=\"$HOME/.local/libexec\"; p=\"$d/{stage}\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT HUP INT TERM; cat >\"$p\"; chmod 700 \"$p\"; trap - EXIT HUP INT TERM"
-    );
-    run_ssh(target, route.clone(), &upload, &bytes)?;
-    let cleanup_ancestors = match action {
-        ManagementAction::Install => "",
-        ManagementAction::Revoke => {
-            "; rmdir -- \"$HOME/.local/libexec\" \"$HOME/.local\" 2>/dev/null || :"
-        }
-    };
-    let invoke = format!(
-        "p=\"$HOME/.local/libexec/{stage}\"; \"$p\" {}; s=$?; rm -f -- \"$p\"{cleanup_ancestors}; exit \"$s\"",
-        action.argument()
-    );
-    let output = match run_ssh(target, route.clone(), &invoke, input) {
-        Ok(output) => output,
-        Err(error) => {
-            let cleanup = format!("rm -f -- \"$HOME/.local/libexec/{stage}\"{cleanup_ancestors}");
-            let _ = run_ssh(target, route, &cleanup, &[]);
-            return Err(error);
-        }
-    };
-    Ok(output)
+    let command = management_remote_command(&stage, action, input)?;
+    // Upload and invocation share one SSH session. The remote shell installs
+    // its cleanup trap before reading the binary and retains it until the
+    // management helper exits, so there is no inter-session orphan window or
+    // cleanup request that depends on a route which has already failed.
+    run_ssh(target, route, &command, &bytes)
 }
 
 fn install_over_route(
@@ -4214,6 +4209,81 @@ mod tests {
         assert!(contains_managed_enrollment(
             b"restrict,command=\"syq\" ssh-ed25519 key syq-enrollment:id\n"
         ));
+    }
+
+    #[test]
+    fn final_enrollment_cleanup_preserves_general_account_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let local = home.join(".local");
+        let share = local.join("share");
+        let syq = share.join("syq");
+        let restricted = syq.join("restricted");
+        let libexec = local.join("libexec");
+        fs::create_dir_all(&restricted).unwrap();
+        fs::create_dir(&libexec).unwrap();
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o751)).unwrap();
+        fs::set_permissions(&libexec, fs::Permissions::from_mode(0o710)).unwrap();
+
+        remove_final_enrollment_state_directories(home).unwrap();
+
+        assert!(!restricted.exists());
+        assert!(!syq.exists());
+        assert_eq!(fs::metadata(&local).unwrap().mode() & 0o7777, 0o750);
+        assert_eq!(fs::metadata(&share).unwrap().mode() & 0o7777, 0o751);
+        assert_eq!(fs::metadata(&libexec).unwrap().mode() & 0o7777, 0o710);
+    }
+
+    #[test]
+    fn management_stage_is_scoped_to_one_shell_session() {
+        fn invoke(home: &Path, stage: &str, script: &[u8], request: &[u8]) -> std::process::Output {
+            let remote = management_remote_command(stage, ManagementAction::Install, request)
+                .expect("build management command");
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(remote)
+                .env("HOME", home)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(script).unwrap();
+            child.wait_with_output().unwrap()
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let request = br#"{"value":"' ; exit 91; #"}"#;
+        let output = invoke(
+            temporary.path(),
+            ".syq-receiver-test-success",
+            b"#!/bin/sh\ncat\n",
+            request,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, request);
+        assert!(!temporary
+            .path()
+            .join(".local/libexec/.syq-receiver-test-success")
+            .exists());
+        assert!(temporary.path().join(".local/libexec").is_dir());
+
+        let output = invoke(
+            temporary.path(),
+            ".syq-receiver-test-failure",
+            b"#!/bin/sh\nexit 23\n",
+            b"failure request",
+        );
+        assert_eq!(output.status.code(), Some(23));
+        assert!(!temporary
+            .path()
+            .join(".local/libexec/.syq-receiver-test-failure")
+            .exists());
     }
 
     fn test_authority(
