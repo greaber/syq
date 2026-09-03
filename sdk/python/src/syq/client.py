@@ -912,7 +912,6 @@ class Client:
         )
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
-        argv.append("--quiet")
         command = (self._executable_value(), *argv)
         process_base = Path(
             os.fsdecode(
