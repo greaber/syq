@@ -259,12 +259,15 @@ destination worker both endpoints' exact capabilities during authenticated
 startup, then opens the source and destination relative to those descriptors.
 Rsync-mode `--insecure-links` skips that optimization because its explicitly
 unconfined source names cannot be represented by the capability-only request.
-The canonical-path directory self-copy preflight remains source-confinement
-work. Copy also gives every destination worker the selected directory
-descriptor; destination observation, directory and special-file creation,
-metadata changes, and planned non-recursive deletion are relative to that
-descriptor. Destination scanning, including the walk that plans `--delete`, is
-relative to it too and never follows descendant symlinks.
+Directory self-copy preflight also uses capabilities: on a confined
+same-machine copy, the destination endpoint claims the exact opened source
+directory and walks parents from its retained destination selection. Renaming
+either command-line spelling cannot redirect that decision. Copy also gives
+every destination worker the selected directory descriptor; destination
+observation, directory and special-file creation, metadata changes, and planned
+non-recursive deletion are relative to that descriptor. Destination scanning,
+including the walk that plans `--delete`, is relative to it too and never
+follows descendant symlinks.
 Rsync-mode `--insecure-links` is the explicit compatibility opt-out: that
 session uses the legacy unconfined pathname discovery and content-read paths,
 including traversal through symlinked `--files-from` ancestors. Native

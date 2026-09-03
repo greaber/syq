@@ -403,6 +403,7 @@ impl Conn for LocalConn {
                 Request::TcpListen { .. }
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
+                    | Request::CheckOperatorDirectoryAncestry { .. }
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }

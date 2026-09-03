@@ -271,6 +271,97 @@ fn source_scan_uses_registered_root_after_operator_path_replacement() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn self_copy_guard_does_not_reject_a_destination_outside_the_moved_source() {
+    let t = Tmp::new();
+    write(&t.path("src/original"), b"original");
+    let ready = t.path("source-ready");
+    let source = format!("{}/", t.s("src"));
+    let destination = format!("{}/", t.s("src/out"));
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &source,
+            &destination,
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the source root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "source registration timed out");
+
+    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+    fs::create_dir(t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("src/out/original")), b"original");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn self_copy_guard_rejects_a_destination_inside_the_moved_source() {
+    let t = Tmp::new();
+    write(&t.path("src/original"), b"original");
+    let ready = t.path("source-ready");
+    let source = format!("{}/", t.s("src"));
+    let destination = format!("{}/", t.s("selected-and-moved/out"));
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &source,
+            &destination,
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the source root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "source registration timed out");
+
+    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+    fs::create_dir(t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    assert!(
+        stderr_of(&output).contains("maps inside source"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("selected-and-moved/out").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn exact_regular_source_replacement_is_rejected_after_registration() {
     let t = Tmp::new();
     write(&t.path("selected"), b"original");

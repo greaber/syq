@@ -479,8 +479,7 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
 
 /// The canonical form of a path (symlinks and `..` resolved the way the kernel
 /// does), normalized by the endpoint that holds it. Used for the job identity —
-/// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job — and for
-/// the copy-into-itself check.
+/// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job.
 fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::path::PathBuf> {
     if !remote {
         return Ok(crate::fsops::normalize(&crate::fsops::resolve(path)));
@@ -1595,61 +1594,81 @@ pub fn run(args: Args) -> Result<i32> {
     let guard_containers = false;
     let mut container_guard = None;
 
-    // Reject copying a directory into itself: if the effective destination
-    // resolves to (or inside) a source directory, the scanner would discover
-    // the freshly-created destination and recurse. Now that both control
-    // connections exist we can check the real source type and destination-dir
-    // status, so a file copied onto itself is not misdiagnosed.
+    // Reject copying a directory into itself: if the effective destination is
+    // (or is beneath) a source directory, the scanner would discover the
+    // freshly-created destination and recurse. Compare the exact source and
+    // retained destination descriptors; never re-resolve either operator
+    // pathname for this decision.
     let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
         || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
     if same_machine {
-        // Both ends are one machine, so either control connection resolves
-        // paths the way that machine's kernel does (symlinks included).
-        let remote = dst.is_remote();
-        for (source_index, s) in srcs.iter().enumerate() {
-            // Only a directory source can trigger the recurse-into-itself trap.
-            // Judge the source the way the scan will, including the interface's
-            // explicit selected-root link policy.
-            let follow_root = args.files_from.is_some() || s.follows_root(args.native_follow);
-            let src_is_dir = matches!(
-                stat_one_registered(
-                    &mut *src_ctl,
-                    &s.path,
-                    &source_roots.get().expect("source roots registered")[source_index]
-                        .selection,
-                    follow_root,
-                )?,
-                Some(ref e) if e.kind == Kind::Dir
-            );
-            if !src_is_dir {
+        let roots = source_roots.get().expect("source roots registered");
+        let mut source_checks = Vec::new();
+        let mut ancestry_checks = Vec::new();
+        for (source_index, (source, root)) in srcs.iter().zip(roots).enumerate() {
+            // Registration represents every selected directory as an empty
+            // path beneath that directory descriptor. Exact files and
+            // symlinks retain a non-empty leaf and cannot recurse.
+            if !root.selection.relative.is_empty() {
                 continue;
             }
-            let sn = canonical_path(&mut *src_ctl, &s.path, remote)?;
-            // Effective destination(s): the destination itself, plus
-            // destination/basename when placement uses it as a container.
-            let mut effs = vec![if exact_native_destination {
-                dst_canonical.clone()
+            let primary_suffix = if expand_exact_home || dst_is_dir {
+                Vec::new()
             } else {
-                canonical_path(&mut *src_ctl, &dst.path, remote)?
-            }];
-            if dst_is_dir && !s.copies_contents() && args.files_from.is_none() {
-                let base = s.basename();
-                if !base.is_empty() {
-                    let joined = join(dst.path.strip_suffix(b"/").unwrap_or(&dst.path), &base);
-                    effs.push(canonical_path(&mut *src_ctl, &joined, remote)?);
+                operator_dst_root
+                    .rsplit(|byte| *byte == b'/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_vec()
+            };
+            let mut suffixes = vec![primary_suffix];
+            if dst_is_dir && !source.copies_contents() && args.files_from.is_none() {
+                let basename = source.basename();
+                if !basename.is_empty() {
+                    suffixes.push(basename);
                 }
             }
-            for eff in effs {
-                if eff == sn {
-                    bail!(
+            source_checks.push((source_index, suffixes.len()));
+            ancestry_checks.push(DirectoryAncestryCheck {
+                source_root: root.ticket.clone(),
+                suffixes,
+            });
+        }
+
+        let relations = if ancestry_checks.is_empty() {
+            Vec::new()
+        } else {
+            check_operator_directory_ancestry(&mut *dst_ctl, ancestry_checks)?
+        };
+        if relations.len() != source_checks.len() {
+            bail!(
+                "destination returned {} ancestry results for {} directory sources",
+                relations.len(),
+                source_checks.len()
+            );
+        }
+        for ((source_index, expected_relations), relations) in
+            source_checks.into_iter().zip(relations)
+        {
+            if relations.len() != expected_relations {
+                bail!(
+                    "destination returned {} ancestry results for {} effective paths",
+                    relations.len(),
+                    expected_relations
+                );
+            }
+            let source = &srcs[source_index];
+            for relation in relations {
+                match relation {
+                    DirectoryRelation::Separate => {}
+                    DirectoryRelation::Same => bail!(
                         "source and destination are the same directory {:?}",
-                        display(&s.path)
-                    );
-                } else if eff.starts_with(&sn) {
-                    bail!(
+                        display(&source.path)
+                    ),
+                    DirectoryRelation::Descendant => bail!(
                         "destination {:?} maps inside source {:?} — that would copy the directory into itself",
-                        display(&dst.path), display(&s.path)
-                    );
+                        display(&dst.path), display(&source.path)
+                    ),
                 }
             }
         }
@@ -2564,6 +2583,19 @@ fn check_operator_directory(
         "operator path",
     )? {
         Response::DirectorySelection(selection) => Ok(selection),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn check_operator_directory_ancestry(
+    conn: &mut dyn Conn,
+    checks: Vec<DirectoryAncestryCheck>,
+) -> Result<Vec<Vec<DirectoryRelation>>> {
+    match ok(
+        conn.call(Request::CheckOperatorDirectoryAncestry { checks })?,
+        "destination ancestry",
+    )? {
+        Response::DirectoryRelations(relations) => Ok(relations),
         other => bail!("unexpected response {other:?}"),
     }
 }

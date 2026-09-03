@@ -429,6 +429,25 @@ pub struct SourceRootSelection {
     pub follow_root: bool,
 }
 
+/// Compare effective destination directories beneath the receiver's retained
+/// operator selection with one exact source-directory capability. `suffixes`
+/// are operator-relative spellings rather than transfer paths: an empty value
+/// names the selected destination directory, and `.` or `..` retain their
+/// ordinary component semantics.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DirectoryAncestryCheck {
+    pub source_root: DescriptorTicket,
+    pub suffixes: Vec<PathBytes>,
+}
+
+/// Relationship of one effective destination directory to its source root.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryRelation {
+    Separate,
+    Same,
+    Descendant,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ConnectionRole {
     /// The one connection allowed to create endpoint-session capabilities and
@@ -511,6 +530,12 @@ pub enum Request {
         path: PathBytes,
         allow_missing: bool,
         symlink_policy: OperatorSymlinkPolicy,
+    },
+    /// Compare candidate directories beneath the retained operator selection
+    /// with exact source-directory descriptors. This is a control-only safety
+    /// query and never reopens either operator pathname.
+    CheckOperatorDirectoryAncestry {
+        checks: Vec<DirectoryAncestryCheck>,
     },
     /// Resolve every operator source selection, then atomically register its
     /// opened directory or parent descriptor. Only a control connection may
@@ -739,6 +764,7 @@ pub enum Response {
     /// Absolute operator spelling plus device/inode of the securely opened
     /// directory, or None when an allowed missing suffix was reached.
     DirectorySelection(Option<DirectoryAnchor>),
+    DirectoryRelations(Vec<Vec<DirectoryRelation>>),
     DestinationRegistered(DescriptorTicket),
     SourceRootsRegistered(Vec<RegisteredSourceRoot>),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
