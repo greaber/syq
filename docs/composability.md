@@ -104,23 +104,20 @@ or a stream can express too:
   line per second on stderr for progress
   displays and monitoring; `--stats` prints the summary counts, where the
   auto-tuner settled, and the kernel's TCP counters.
-- `--results FILE` (or `-` for stdout, together with `-q`) on native `cp`
-  writes an NDJSON outcome stream: a `run` record, one `operation_result` per
-  settled mutation and per failed mapping entry, an `error` record per counted
-  error, and exactly one terminal `result` with the exit code and aggregate
-  counts. Failed operation records carry `src`, `dst`, and `kind`, so a retry
-  manifest is one filter away:
-
-  ```sh
-  syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
-  jq -c 'select(.type == "operation_result" and .disposition == "failed"
-                and .retryable != "no") | {src, dst, kind}' r.ndjson \
-    | syq cp --mapping - -C src --to nas --into /data
-  ```
-
-  This is what an exit code cannot express: which entries failed, and whether
-  a retry could help. The records carry `schema_version: 0`: the format is an
-  explicitly unstable preview and may change between releases.
+- `--results FILE` on native `cp` (with or without `--prune`) writes an NDJSON
+  outcome stream to a freshly created file; `--results-fd N` writes to a
+  descriptor you opened instead. The stream carries a `run` record, sampled
+  `progress` records, one `operation_result` per settled mutation and per
+  failed mapping entry (with `retryable`, and an error `class` where known),
+  `trace` records instead of results under `--dry-run`, an `error` record per
+  counted error, and exactly one terminal `result` whose numbers also render
+  the human summary. It is schema version 1, with a stated compatibility
+  policy; [Automation results](automation-v1.md) is the contract. Failed
+  operation records carry `src`, `dst`, and `kind`, so once the terminal
+  record says the run settled, a retry manifest is one filter away. The
+  [mappings guide](mappings.md#machine-readable-results) has that filter,
+  including the terminal-record check. This is what an exit code cannot
+  express: which entries failed, and whether a retry could help.
 
 ## Reruns converge
 

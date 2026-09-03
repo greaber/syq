@@ -1,6 +1,6 @@
 # Mappings: placement as data
 
-A mapping is a file (or stream) of explicit source→target claims that
+A mapping is a file (or stream) of explicit source→destination claims that
 `syq cp` can execute: a generalized `--as` covering many entries at
 once, or a `--files-from` whose entries can also *re-place* each file.
 You author selection and placement — with a script, or by transforming
@@ -32,7 +32,7 @@ One JSON object per line (NDJSON):
 ```
 
 - `src`, `dst` (required): paths relative to the source root (`-C DIR`,
-  default the working directory) and the target container (`--into
+  default the working directory) and the destination container (`--into
   DIR`). Absolute paths, empty paths, and any `.` or `..` component are
   rejected. Paths are tagged: `encoding` is `utf-8`, or `base64` for a
   name that is not valid UTF-8 (`value` is then standard base64 of the
@@ -55,8 +55,8 @@ directories no entry names are created implicitly, as with
 
 ## Emitting a mapping
 
-`syq map` takes the same selectors as `syq cp` and prints the resolved
-selection and placement as a mapping instead of copying:
+`syq map` takes the same local selectors as `syq cp` and prints the resolved
+selection as a mapping instead of copying:
 
 ```sh
 syq map --src-src photos          # contents of photos/, dst == src
@@ -67,13 +67,13 @@ Emission refuses names that are not valid UTF-8 (so published
 one-line transforms are safe by construction); mappings you author
 yourself may use the base64 form for such names.
 
-`syq map` reads a local source (`--from` is
-refused), and takes either `--src-src DIR` as the only selector or any
-number of relative named selectors. It never contacts a destination,
-so `--to` and `--into` do not change what is emitted and the
-`--into-new`/`--into-existing`/`--as-new`/`--as-existing` existence
-preconditions are refused; only `--as` changes the output, by renaming
-the single selected root.
+`syq map` deliberately has a destination-independent surface: `-C`,
+`--follow-src`/`--follow`, the source-selector family, and `--as`. It takes
+either `--src-src DIR` as the only selector or any number of relative named
+selectors. `--as` renames the single selected root. Destination, filtering,
+transfer, execution, result, receiver-ceiling, and receipt options belong to
+the later `syq cp --mapping` invocation or to a manifest transform, not to
+`syq map`.
 
 ## Transform in the middle
 
@@ -227,28 +227,30 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
   an exact single-path placement cannot host a manifest — each entry's
   `dst` already is its own `--as`. It is part of the native surface
   only; `syq rsync` is unchanged.
-- `syq map` accepts the `syq cp` grammar, including `--as PATH` (which
-  emits the single selected root under the target's basename) and the
-  typed selectors `--src-file`/`--src-dir`, validated exactly as native
-  cp validates them; see "Emitting a mapping" for this version's
-  restrictions.
+- `syq map` accepts the local selector grammar, including the typed selectors
+  `--src-file`/`--src-dir`, plus `--as PATH` (which emits the single selected
+  root under the destination's basename). Those selectors are validated exactly as
+  native `cp` validates them; see "Emitting a mapping" for the complete
+  surface.
 - Fidelity is the native default (`-rlt`). There is no per-entry
   policy: preservation and comparison behavior stay global.
 - An entry claims exactly one object. A `dir` entry claims the
   directory itself, without its contents.
 - The command-line path naming a manifest, the `-C` source base, and the
-  `--into` placement are directly supplied paths: native mode refuses to
-  traverse symlinks in them by default, while `--follow` resolves them. Paths
-  inside the manifest are data and are not changed by `--follow`.
-- When `syq map --follow` resolves a named selector, it emits the referent's
-  source-base-relative path so the manifest remains executable without link
-  traversal. It refuses a referent outside that base; pass the real path with a
-  matching `-C` base instead. A followed contents selector keeps ordinary
-  contents-relative entries and requires the consumer to select the same base
-  with `--follow`.
+  `--into` placement are directly supplied paths. Native mode refuses to
+  traverse symlinks in them by default. `--follow-src` controls the source
+  base, `--follow-dest` controls placement, and only the `--follow` umbrella
+  also controls the coordinator-local manifest path. Paths inside the manifest
+  are data and are not changed by any follow option.
+- When `syq map --follow-src` (or `--follow`) resolves a named selector, it
+  emits the referent's source-base-relative path so the manifest remains
+  executable without link traversal. It refuses a referent outside that base;
+  pass the real path with a matching `-C` base instead. A followed contents
+  selector keeps ordinary contents-relative entries and requires the consumer
+  to select the same base with the same source follow option.
 - Symlinks selected by mapping entries are never resolved by mapping handling:
   a symlink maps as a symlink, and a destination path that would traverse a
-  symlink inside the target container fails that entry. Resolve links before
+  symlink inside the destination container fails that entry. Resolve links before
   emitting the manifest if you want targets instead.
 - `kind: "special"` asserts the source's type; it does not override the
   fixed `-rlt` fidelity, which copies no special files. Such an entry is
@@ -271,25 +273,36 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
   fail entries individually. `syq map` streams its output. Exit codes
   and output are the ordinary `syq cp` ones.
 
-## Machine-readable results (preview)
+## Machine-readable results
 
-`syq cp --results FILE` (also `-` for stdout; combine that with `-q`)
-writes an NDJSON outcome stream beside the ordinary human output:
-a `run` record, one `operation_result` per settled mutation and per
-failed mapping entry, an `error` record per counted error, and exactly
-one terminal `result` with the exit code and aggregate counts. The
-records carry `schema_version: 0` — an unstable preview format; unchanged and excluded entries appear only in
-the terminal aggregates, and metadata-only updates are not
-reported per operation. A missing terminal record means the run did
-not finish.
+`syq cp --results FILE` (with or without `--prune`) writes an NDJSON
+outcome stream to a freshly created file, alongside the ordinary human
+output; `--results-fd N` writes to a caller-opened descriptor instead
+(`--results-fd 3 3>r.ndjson`, or a pipe). The
+full contract — every record type and field, the exit-code table,
+the JSON Schema, and example streams — is
+[Automation results](automation-v1.md). In brief: the
+stream carries `schema_version: 1`: a `run` record (run id, mode,
+endpoints), sampled `progress` records, one `operation_result` per
+settled mutation and per failed mapping entry (with `retryable`, and
+`class`/`os_kind` where known), `trace` records instead of results
+under `--dry-run` (each with the reason a mutation is planned), an
+`error` record per counted error, and exactly one flushed terminal
+`result` whose numbers also render the human summary. Unchanged and
+excluded entries appear only in the terminal aggregates, and
+metadata-only updates are not reported per operation. A missing
+terminal record means the run did not finish; a terminal status other
+than `success` or `partial` means entries may be unsettled.
 
-The results writer lives with the transfer coordinator. For a direct
-remote-to-remote copy, use `--results -` to stream its NDJSON back over the
-coordinator connection. A named results file is accepted only when the
-coordinator is local, including `--run-at local`; this avoids interpreting a
-local-looking pathname on a remote host. `--results` cannot be combined with
-`--detach`, because the caller would no longer be attached for the complete
-stream and its terminal record.
+The results writer lives with the transfer coordinator, so a stream
+requires a local coordinator (an explicit `--coordinate-at local` for a
+remote-to-remote copy). `--results` cannot be combined with `--detach`,
+because the caller would no longer be attached for the complete stream
+and its terminal record. Receiver-attested streams for attached direct
+copies through a command-restricted receiver — records verified and
+decrypted from hostB's receipt, marked `"provenance":"receiver_attested"`
+— exist in the engine and return once wired to the file/descriptor
+outputs.
 
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:
@@ -310,9 +323,10 @@ jq -cs 'if (.[-1].type? // "") != "result"
 
 The jq program first checks the stream's terminal record: a results
 file without one is from a run that did not finish (a crash, a kill),
-and a terminal status other than `success` or `partial` (an aborted
-run, say) means queued entries were never settled — in both cases
-entries may have no records at all, so a retry manifest built from
+and a terminal status other than `success` or `partial` (an `aborted`
+incomplete receipt or a `refused` run) means queued entries were never
+settled or their receipt records may be missing. In both cases, entries
+may have no records at all, so a retry manifest built from
 what is there would look complete while it is not. With the
 terminal record present, the filter is what an exit code cannot
 express: which entries failed, and whether a retry could help.

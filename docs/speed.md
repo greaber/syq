@@ -157,11 +157,17 @@ The rest of this document describes each mechanism in detail.
 Without an explicit connection count, syq tunes the number of workers while a
 copy runs instead of guessing. On a data path it has measured before, it starts at that path's last
 settled count; otherwise it starts with 16 when every remote endpoint has a
-reachable TCP data path, 8 over ssh, or 32 when both ends are local (threads
-are free, connections are not). Remembered results are keyed only by the
-directional endpoint path and transport (TCP and ssh learn separately), not by
-RTT, workload, filesystem or other volatile telemetry. A stale hint only costs
-the tuner a probe or two. The cache is
+reachable TCP data path, 8 over ssh, or — when both ends are local — 16 if the
+process has at most two CPUs available and 32 otherwise. This uses the CPU
+affinity or container limit reported by the OS; the lower count remains large
+enough to overlap filesystem latency. A single same-machine file eligible for
+the whole-file or receiver-side direct-copy path starts with one worker because
+extra loopback connections cannot help; finding a partial or an unsupported
+kernel offload immediately restores the ordinary local starting count.
+Remembered results are keyed only by the directional endpoint path and
+transport (TCP and ssh learn separately), not by RTT, workload, filesystem or
+other volatile telemetry. A stale hint only costs the tuner a probe or two. The
+cache is
 `$XDG_CACHE_HOME/syq/tuning-v1.json` (normally
 `~/.cache/syq/tuning-v1.json`; set `SYQ_TUNING_CACHE` to override it or to an
 empty value to disable it). An explicit connection count, dry runs, verification, short runs
@@ -289,7 +295,7 @@ sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specif
 ```
 
 Use `-vv` to see the route planned for the real transfer. For each remote
-endpoint seen by the active orchestrator it reports the authenticated helper
+endpoint seen by the active coordinator it reports the authenticated helper
 identity and platform, every TCP address syq considered, reachability and
 advertised link speed, why a reachable address was or was not selected by the
 preflight, the resulting planned TCP/ssh transport, and the initial connection
@@ -304,9 +310,9 @@ or start transfer workers, and verbosity does not change dry-run's success or
 failure. The reported route is therefore a plan for a real transfer, not a
 claim that a worker data connection was completed.
 
-Native remote-to-remote copies work the same way: the orchestrator on hostA
+Native remote-to-remote copies work the same way: the coordinator on hostA
 connects to hostB's listener. Diagnostics are relative to that active
-orchestrator. If both endpoints name hostA, `-vv` reports a local filesystem
+coordinator. If both endpoints name hostA, `-vv` reports a local filesystem
 route there.
 
 No special server setup is required. For a measurement-first checklist of
@@ -317,9 +323,10 @@ tuning](server-tuning.md).
 ## Defaults chosen for network filesystems
 
 Small files are read and written in pipelined batches, but every non-`--inplace`
-write still finishes with an atomic rename. When both ends are local, 32 workers
-are used. This costs one rename per file on NFS, but avoids exposing incomplete
-final-named files. `--inplace` is the explicit space/safety tradeoff.
+write still finishes with an atomic rename. When both ends are local, auto-tuning
+starts with 16 workers on a process limited to one or two CPUs, and 32 otherwise.
+This costs one rename per file on NFS, but avoids exposing incomplete final-named
+files. `--inplace` is the explicit space/safety tradeoff.
 
 ## Same-machine copies (copy_file_range and NFS)
 

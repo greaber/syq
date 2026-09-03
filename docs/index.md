@@ -123,7 +123,7 @@ hosts from your laptop. You download and re-upload, at your laptop's bandwidth,
 or you ssh to one server with agent forwarding and run rsync there. Syq starts
 the transfer on hostA and streams data to hostB while progress comes back to
 you, and hostA never holds your credentials. When hostA cannot reach hostB,
-`--run-at local` routes the bytes through your machine instead. See
+`--coordinate-at local` routes the bytes through your machine instead. See
 [Remote-to-remote transfers](remote-to-remote.md).
 
 ## Composability
@@ -209,15 +209,16 @@ does not. Report vulnerabilities as described in
    preservation as ordinary options, mappings. Native mode is experimental,
    and its grammar may change between releases.
 3. **Programmatic.** `--progress-json` streams progress, `--results` writes a
-   machine-readable outcome per operation (an unstable, versioned preview
-   format), and mappings let a program supply selection and placement as
-   data. See [Composability](composability.md).
+   machine-readable NDJSON outcome stream with a versioned contract
+   ([Automation results](automation-v1.md)), and mappings let a program
+   supply selection and placement as data. See
+   [Composability](composability.md).
 
 ## Status and limitations
 
 Syq is 0.1.x software with release binaries for Linux (x86-64, ARM64) and
 macOS (Apple Silicon, Intel). `syq rsync` is the most stable surface; native
-commands and the `--results` format are experimental. Not implemented: rsync
+commands are experimental. Not implemented: rsync
 filter rules, `--link-dest`, hard links (`-H`), ACLs and xattrs, sparse files,
 rolling-checksum delta transfer, and rsync daemon mode. The
 [compatibility record](rsync-compat.md) has the complete list with reasons.

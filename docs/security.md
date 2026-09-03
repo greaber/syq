@@ -49,7 +49,7 @@ Compared with rsync 3.5:
   filesystem: absolute names, NUL, empty components, `.` and `..` are rejected.
 - The operator-named destination root is resolved with rsync's ownership rule
   (a symlink component is followed only when root or the receiving user owns
-  it; `--insecure-links` is the explicit legacy opt-out), then retained as an
+  it), then retained as an
   opened directory whose device and inode every worker verifies, so changing
   the external spelling afterward cannot redirect the copy.
 - Regular files are opened with `O_NOFOLLOW` and the opened type is checked;
@@ -221,21 +221,29 @@ signed port range and closes it when the control session ends or the grant
 expires. There is no second ssh authentication and no silent fallback to an ssh
 data path that would need one.
 
-### Layer 6: signed receipts
+### Layer 6: signed, encrypted receipts
 
 HostA carries the transfer, so on its own it could report success while having
-written nothing. Every command-restricted transfer therefore ends with hostB
-issuing a signed receipt: the files it published with their sizes (and BLAKE3
-digests with `--receipt hashed`), in-place files marked complete only once
-their final step ran, what it deleted, the hashes it computed for
-verification, how many requests it refused, and its entry and byte totals,
-bound to the enrollment and the one-time request ID and signed with a key only
-hostB holds. HostA relays the receipt as one line of its output; the local
-machine verifies it against the public key recorded at enrollment and fails
-the transfer if the receipt is missing, does not verify, names a different
-grant, records refused requests, or lists an incomplete in-place file while
-hostA reported success. The receipt is hostB's view of hostB: it says what
-landed, not what hostA omitted or invented.
+written nothing. Every attached command-restricted transfer therefore ends
+with hostB issuing a receipt: a stream with one outcome for every pathname
+mutation the receiver saw (each file's lifecycle, each directory, symlink, or
+metadata operation, each individual prune deletion, and every failed,
+abandoned, or refused request), followed by the final type, size, and, with
+`--receipt hashed`, BLAKE3 digest of every path an admitted mutation could have
+changed. A small signed terminal record binds the stream to the complete
+signed grant, the enrollment and one-time request IDs, and a clean or
+non-clean status. HostB encrypts the stream and terminal to a fresh
+per-transfer key; hostA relays opaque frames; your machine decrypts them and
+checks the encryption's authentication, the enrolled Ed25519 signature, the
+grant binding, the sequence, and the stream commitment before printing trusted
+results. Missing, altered, reordered, replayed, or suppressed frames cannot
+become a valid clean receipt, though suppression remains a denial of service.
+
+The receipt is hostB's closure-time account of hostB: it says what landed, not
+what hostA omitted or invented, and it is neither a transaction nor a rollback.
+A detached restricted transfer is weaker: the receipt lands in hostA's log in
+plaintext, the launcher warns about that even under `-q`, and `--follow`
+displays completion without verifying it locally.
 
 ### Putting the layers together
 
@@ -243,7 +251,7 @@ landed, not what hostA omitted or invented.
 |---|---|---|---|
 | Default (enrolled receiver + broker + receipt) | A signed single-use grant; broker signs with the enrollment key for this path only | Yes: cannot escape the destination, widen semantics, exceed limits, replay, or misreport what landed | A → B directly |
 | `--agent-broker-only` | Broker access to your ambient agent, valid only for hostA→user@hostB | Partially: cannot reach other hosts or users, but has that account's full authority during the session | A → B directly |
-| `--run-at local` | Nothing | Yes, by never involving hostA in authentication | A → you → B, at your bandwidth |
+| `--coordinate-at local` | Nothing | Yes, by never involving hostA in authentication | A → you → B, at your bandwidth |
 | `--no-forward-agent` | Nothing; hostA must already hold its own hostB credential | Out of syq's hands | A → B directly |
 | `--unrestricted-agent-forwarding` | Your whole agent, as `ssh -A` would | No; compatibility escape hatch with a warning `-q` cannot silence | A → B directly |
 | `--rsh CMD` | Whatever the command does | Whatever the command does | A → B directly |

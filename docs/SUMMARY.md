@@ -7,6 +7,7 @@
 - [Installing](install.md)
 - [Command reference](reference.md)
 - [Mappings](mappings.md)
+- [Automation results](automation-v1.md)
 - [Composability](composability.md)
 
 # Performance

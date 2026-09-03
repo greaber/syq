@@ -7,8 +7,8 @@ describes the topology, the default least-privilege authentication path, what
 it does and does not protect, the signed policies and the options that fail
 closed under it, enrollment lifecycle, and the escape hatches. The design
 rationale and threat model are in [Security](security.md); the native
-topology and transport options (`--run-at`, ports, `--rsh`, receiver ceilings,
-receipts) are in the [command reference](reference.md#native-commands).
+topology and transport options are in the
+[command reference](reference.md#native-commands).
 
 ## Topology
 
@@ -20,12 +20,12 @@ syq cp --from hostA --src-src big --to hostB --into big
 syq cp --prune --from hostA --src-src tree --to hostB --into-existing tree
 ```
 
-For paths representable in a remote command, syq starts the orchestrator on
+For paths representable in a remote command, syq starts the coordinator on
 hostA and pushes directly to hostB, so file data does not traverse the invoking
 machine. Matching helpers are installed automatically on both hosts and output
 is streamed back. Raw path bytes that cannot be represented safely in the
-remote command are relayed through the invoking machine. When both endpoints
-name the same host and user, syq runs a local copy on that host.
+remote command require an explicit `--coordinate-at local` relay. When both
+endpoints name the same host and user, syq runs a local copy on that host.
 
 ## The default path: enrolled receiver plus constrained broker
 
@@ -116,23 +116,51 @@ key.
 
 ## Signed receipts
 
-HostA also cannot misreport what landed. Every command-restricted transfer
-ends with hostB issuing a signed receipt: the files it published with their
-sizes (and BLAKE3 digests with `--receipt hashed`), in-place files from the
-moment their bytes change and marked complete only once their final step ran,
-what it deleted, the hashes
-it computed for `--verify-only` and `--hash`, how many requests it refused, and
-its entry and byte totals, bound to the enrollment and the one-time request ID
-and signed with a key only hostB holds. HostA relays the receipt as one line
-of its output; the local machine verifies it against the public key recorded
-at enrollment and fails the transfer if the receipt is missing, does not
-verify, names a different grant, records refused requests, or lists an
-incomplete in-place file while hostA reported success. `-v` prints the verified
-totals. The receipt is hostB's view of hostB: it says nothing about what hostA
-omitted or invented. The boundary runs between the two hosts, not inside hostB: the receiver
-runs as the enrolled account and remembers what it created by pathname, so a
-local writer who can already modify the destination tree is outside its
-guarantee, exactly as for the ordinary engine.
+HostA also cannot forge a clean account of what hostB's restricted receiver
+did. Every attached command-restricted transfer ends with a v2 receipt. Its
+canonical stream records one outcome for every receiver-visible logical
+pathname mutation: one file lifecycle, each directory/symlink/special or
+metadata operation, and each individual `--prune` unlink or rmdir. Failed and
+abandoned operations and bounded refusal records remain visible. After closing
+the grant and waiting for admitted requests to settle, hostB records the final
+type, size, symlink target, applicable metadata, and optional BLAKE3 digest of
+every path an admitted mutation could have changed. Paths are raw bytes
+relative to numbered signed mutation scopes, never ambient absolute hostB
+paths.
+
+The small signed terminal binds the complete signed grant, enrollment and
+one-time request IDs, stream digest/count/size, policy, summary, and clean or
+non-clean status. HostB then encrypts the stream and signed terminal to a fresh
+per-transfer X25519 recipient key using HPKE (X25519/HKDF-SHA-256/
+ChaCha20-Poly1305). HostA relays bounded opaque frames. The invoking machine
+spools them outside the heap, decrypts them, and checks HPKE authentication,
+the enrolled Ed25519 signature, grant binding, sequence, complete stream
+commitment, summary, and terminal status before printing trusted results.
+Missing, altered, reordered, replayed, or suppressed frames cannot become a
+valid clean receipt; suppression remains a denial of service. `-v` prints the
+verified totals. Enrollments made by an older syq must be refreshed with
+`syq enrollment add` first (eligible ordinary copies can do this
+automatically). The initial signed policy caps the stream at 4,000,000 records
+and 512 MiB of plaintext. Reaching either cap closes further mutation authority
+and produces an explicit non-clean terminal instead of a truncated clean
+receipt. Encryption does not pad or conceal frame count, ciphertext length, or
+timing.
+
+This is hostB's closure-time account, not a transaction or a source manifest.
+It does not prove that hostA supplied every intended path or the intended
+bytes, roll back a failed transfer, inventory source scans, blocks, syscalls,
+or descendants of one logical recursive operation, protect a compromised
+hostB or receipt key, protect against a hostB-local writer already authorized
+to modify the tree, or make the observed state immutable after issuance.
+Diagnostic text is bounded context rather than a stable interface; structured
+codes and dispositions are authoritative. An authenticated expected manifest
+is required for source completeness and byte authenticity.
+
+Restricted `--detach` deliberately has a weaker boundary until durable local
+job state exists. The launcher prints a security warning even under `-q` and
+reports only that the job started. HostB's signed v2 stream is plaintext in
+hostA's detached log, so hostA can read or suppress it, and `--follow` displays
+but does not locally authenticate completion.
 
 ## Signed policies and options that fail closed
 
