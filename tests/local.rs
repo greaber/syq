@@ -3796,6 +3796,28 @@ fn fresh_existing_empty_destination_refuses_clear_byte_shortage_automatically() 
 
 #[cfg(debug_assertions)]
 #[test]
+fn fresh_exact_existing_empty_directory_refuses_clear_byte_shortage() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+    fs::create_dir(t.path("dst")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", &t.s("src"), "--as-existing", &t.s("dst"), "-q"])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fresh destination capacity preflight failed"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn nonempty_destination_skips_the_whole_copy_capacity_estimate() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"payload");

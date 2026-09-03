@@ -1734,20 +1734,49 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // sanity check. Inspect the retained selection before anchoring or
     // creating the target; if the endpoint cannot expose reliable counters or
     // emptiness, simply retain the normal allocation-time checks.
+    let exact_capacity_target = if dst_entry_is_dir
+        && !dst_is_dir
+        && !expand_exact_home
+        && operator_directory != operator_dst_root
+    {
+        let entry = dst_root_entry
+            .as_ref()
+            .expect("known existing exact directory has metadata");
+        let relative_path = operator_dst_root
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .unwrap_or_default()
+            .to_vec();
+        (!matches!(relative_path.as_slice(), b"" | b"." | b"..")).then_some(
+            DestinationFilesystemTarget {
+                relative_path,
+                dev: entry.dev,
+                ino: entry.ino,
+            },
+        )
+    } else {
+        None
+    };
+    let can_inspect_existing_destination = dst_is_dir
+        || expand_exact_home
+        || operator_directory == operator_dst_root
+        || exact_capacity_target.is_some();
     let initial_destination_filesystem = if use_operator_anchor
         && !args.verify_only
         && !args.existing
-        && (dst_root_entry.is_none() || dst_is_dir)
+        && (dst_root_entry.is_none() || (dst_entry_is_dir && can_inspect_existing_destination))
     {
-        destination_filesystem_info(&mut *dst_ctl, dst_root_entry.is_some() && dst_is_dir)?
+        let check_empty = dst_root_entry.is_some() && dst_entry_is_dir;
+        destination_filesystem_info(&mut *dst_ctl, check_empty, exact_capacity_target.clone())?
     } else {
         None
     };
     let fresh_capacity = initial_destination_filesystem.and_then(|info| {
         let fresh = dst_root_entry.is_none()
-            || (dst_is_dir && dst_root_entry.is_some() && info.empty == Some(true));
+            || (dst_entry_is_dir && dst_root_entry.is_some() && info.empty == Some(true));
         fresh.then_some(FreshCapacityPlan {
             device: info.device,
+            target: exact_capacity_target,
             root_existed: dst_root_entry.is_some(),
             logical_bytes: 0,
             objects: 0,
@@ -2835,8 +2864,12 @@ fn create_operator_directory(
 fn destination_filesystem_info(
     conn: &mut dyn Conn,
     check_empty: bool,
+    target: Option<DestinationFilesystemTarget>,
 ) -> Result<Option<DestinationFilesystemInfo>> {
-    match conn.call(Request::DestinationFilesystemInfo { check_empty })? {
+    match conn.call(Request::DestinationFilesystemInfo {
+        check_empty,
+        target,
+    })? {
         Response::DestinationFilesystemInfo(info) => Ok(Some(info)),
         // Not every filesystem or receiver topology can expose meaningful
         // capacity. Absence of the optimization must not block the copy.
@@ -3211,9 +3244,10 @@ struct DryRunMapping {
     semantics: &'static str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FreshCapacityPlan {
     device: u64,
+    target: Option<DestinationFilesystemTarget>,
     root_existed: bool,
     logical_bytes: u64,
     objects: u64,
@@ -3654,7 +3688,7 @@ impl Planner<'_> {
     }
 
     fn assess_fresh_capacity(&mut self) -> Result<Option<FreshCapacityAssessment>> {
-        let Some(plan) = self.fresh_capacity else {
+        let Some(plan) = self.fresh_capacity.clone() else {
             return Ok(None);
         };
         if plan.overflowed {
@@ -3662,9 +3696,10 @@ impl Planner<'_> {
                 "fresh destination logical size or object count exceeds supported limits",
             );
         }
-        let response = self
-            .dst
-            .call(Request::DestinationFilesystemInfo { check_empty: false })?;
+        let response = self.dst.call(Request::DestinationFilesystemInfo {
+            check_empty: false,
+            target: plan.target.clone(),
+        })?;
         let info = match response {
             Response::DestinationFilesystemInfo(info) if info.device == plan.device => info,
             Response::DestinationFilesystemInfo(_) => return Ok(None),

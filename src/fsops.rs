@@ -923,8 +923,43 @@ impl FsOps {
         Ok(())
     }
 
-    fn destination_filesystem_info(&self, check_empty: bool) -> Result<DestinationFilesystemInfo> {
-        let (directory, selected_path) = if let Some(directory) = &self.destination_root {
+    fn destination_filesystem_info(
+        &self,
+        check_empty: bool,
+        target: Option<&DestinationFilesystemTarget>,
+    ) -> Result<DestinationFilesystemInfo> {
+        let target_directory = if let Some(target) = target {
+            if target.relative_path.is_empty()
+                || target.relative_path.contains(&0)
+                || target.relative_path.contains(&b'/')
+                || matches!(target.relative_path.as_slice(), b"." | b"..")
+            {
+                bail!("destination filesystem target is not one relative path component");
+            }
+            let (base, full_path) = if let Some(base) = &self.destination_root {
+                (base, self.destination_full(&target.relative_path))
+            } else {
+                let selection = self
+                    .operator_selection
+                    .as_ref()
+                    .context("destination directory has not been selected")?;
+                (
+                    &selection.directory,
+                    join(&selection.path, &target.relative_path),
+                )
+            };
+            let directory = open_operator_directory_at(base, &target.relative_path)?;
+            let metadata = directory.metadata()?;
+            if (metadata.dev(), metadata.ino()) != (target.dev, target.ino) {
+                bail!("destination filesystem target changed while inspecting capacity");
+            }
+            Some((directory, full_path))
+        } else {
+            None
+        };
+        let (directory, selected_path) = if let Some((directory, path)) = &target_directory {
+            (directory, Some(path.as_slice()))
+        } else if let Some(directory) = &self.destination_root {
             (directory, None)
         } else {
             let selection = self
@@ -3350,8 +3385,11 @@ impl FsOps {
                     *symlink_policy,
                 )
                 .map(|_| Response::Ok),
-            Request::DestinationFilesystemInfo { check_empty } => self
-                .destination_filesystem_info(*check_empty)
+            Request::DestinationFilesystemInfo {
+                check_empty,
+                target,
+            } => self
+                .destination_filesystem_info(*check_empty, target.as_ref())
                 .map(Response::DestinationFilesystemInfo),
             Request::PartialPaths {
                 paths,

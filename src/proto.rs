@@ -336,12 +336,13 @@ pub enum Request {
         symlink_policy: OperatorSymlinkPolicy,
     },
     /// Inspect the filesystem containing the receiver's retained destination
-    /// directory. Before anchoring this is the exact selected directory, or
-    /// the nearest existing ancestor of a missing destination.
+    /// directory. `target` selects an observed descendant directory when
+    /// exact placement retains its parent rather than the directory itself.
     DestinationFilesystemInfo {
         /// Only meaningful for an existing selected destination directory.
         /// Failure to prove emptiness is reported as None, not as an error.
         check_empty: bool,
+        target: Option<DestinationFilesystemTarget>,
     },
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {
@@ -557,6 +558,14 @@ pub struct DestinationFilesystemInfo {
     /// None rather than a misleading zero.
     pub available_inodes: Option<u64>,
     pub empty: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct DestinationFilesystemTarget {
+    /// Directory path relative to the retained destination root.
+    pub relative_path: PathBytes,
+    pub dev: u64,
+    pub ino: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
