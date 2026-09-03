@@ -238,12 +238,15 @@ the safer way to turn a link chain into an explicit operand.
 
 This is the native selection policy, not yet a complete hostile-namespace
 containment guarantee for copy. Native `rm` retains the resolved directories
-and selected identities through mutation, and copy retains its selected
-destination directory, but ordinary copy source walks and descendant
-operations have not all moved to descriptor-relative access. The default
-therefore rejects links present during preflight; the planned containment work
-must additionally prevent a concurrent rename or link substitution from
-changing an identity after that check.
+and selected identities through mutation. Copy gives every destination worker
+the selected directory descriptor; destination observation, directory and
+special-file creation, metadata changes, and planned non-recursive deletion
+are relative to that descriptor. Destination scanning and regular-file
+transfer state, along with ordinary source walks and reads, have not all moved
+to descriptor-relative access yet. The default therefore rejects links present
+during preflight, while the remaining containment work must also prevent a
+concurrent rename or link substitution from redirecting those unmigrated
+operation families.
 
 Placement is always explicit in this initial native surface:
 

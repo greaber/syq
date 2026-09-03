@@ -1245,9 +1245,14 @@ impl FsOps {
             .filter(|&i| !is_meta(&ops[i]) && !is_guarded_create(&ops[i]))
             .collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
+        let destination_root = self.destination_root.clone();
+        let destination_prefix = self.destination_prefix.as_deref();
         let mut out: Vec<Option<String>> = vec![None; ops.len()];
         let gres = parallel_map(&guarded_idx, |&i| {
-            apply_one(&ops[i], guard).err().as_ref().map(errstr)
+            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
+                .err()
+                .as_ref()
+                .map(errstr)
         });
         for (i, r) in guarded_idx.iter().zip(gres) {
             out[*i] = r;
@@ -1260,13 +1265,19 @@ impl FsOps {
             return out;
         }
         let cres = parallel_map(&create_idx, |&i| {
-            apply_one(&ops[i], guard).err().as_ref().map(errstr)
+            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
+                .err()
+                .as_ref()
+                .map(errstr)
         });
         for (i, r) in create_idx.iter().zip(cres) {
             out[*i] = r;
         }
         let mres = parallel_map(&meta_idx, |&i| {
-            apply_one(&ops[i], guard).err().as_ref().map(errstr)
+            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
+                .err()
+                .as_ref()
+                .map(errstr)
         });
         for (i, r) in meta_idx.iter().zip(mres) {
             out[*i] = r;
@@ -1275,7 +1286,7 @@ impl FsOps {
     }
 
     fn _unused_apply_one(&mut self, op: &Op) -> Result<()> {
-        apply_one(op, None)
+        apply_one(op, None, None, None)
     }
 }
 
@@ -1292,13 +1303,44 @@ fn op_path(op: &Op) -> &[u8] {
     }
 }
 
-fn apply_one(op: &Op, guard: Option<&ContainerGuard>) -> Result<()> {
+fn apply_one(
+    op: &Op,
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> Result<()> {
+    let registered_target = if let Some(root) = destination_root {
+        let path = op_path(op);
+        let relative = RelativePath::new(path)?;
+        let label = PathBuf::from(OsStr::from_bytes(
+            &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+        ));
+        Some(RootedTarget {
+            root,
+            relative,
+            label,
+            create_missing_parents: true,
+        })
+    } else {
+        None
+    };
     #[cfg(debug_assertions)]
     if matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. }) {
-        fail_set_meta_for_test(&resolve(op_path(op)))?;
+        fail_set_meta_for_test(
+            registered_target
+                .as_ref()
+                .map_or_else(|| resolve(op_path(op)), |target| target.label.clone())
+                .as_path(),
+        )?;
+    }
+    if matches!(op, Op::SetFileMetaIfSame { .. }) {
+        hold_before_quick_metadata_for_test()?;
     }
     if let Some(guard) = guard {
         let target = guarded_target(op_path(op), guard)?;
+        return apply_one_rooted(op, &target.as_rooted());
+    }
+    if let Some(target) = registered_target {
         return apply_one_rooted(op, &target);
     }
     apply_one_unrooted(op)
@@ -1445,21 +1487,6 @@ fn apply_one_unrooted(op: &Op) -> Result<()> {
                 flags,
             } => {
                 let p = resolve(path);
-                #[cfg(debug_assertions)]
-                if let Some(ready) = std::env::var_os("SYQ_TEST_QUICK_META_READY_FILE") {
-                    fs::write(&ready, b"ready").with_context(|| {
-                        format!(
-                            "write quick-metadata-ready signal {}",
-                            Path::new(&ready).display()
-                        )
-                    })?;
-                }
-                #[cfg(debug_assertions)]
-                if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_QUICK_META_MS") {
-                    if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                        std::thread::sleep(std::time::Duration::from_millis(ms));
-                    }
-                }
                 let file = match open_metadata_handle(&p) {
                     Ok(file) => file,
                     Err(open_error) => {
@@ -1518,10 +1545,28 @@ fn apply_one_unrooted(op: &Op) -> Result<()> {
 }
 
 struct GuardedTarget {
-    root: Root,
+    root: Arc<Root>,
     root_path: PathBuf,
     relative: RelativePath,
     label: PathBuf,
+}
+
+struct RootedTarget {
+    root: Arc<Root>,
+    relative: RelativePath,
+    label: PathBuf,
+    create_missing_parents: bool,
+}
+
+impl GuardedTarget {
+    fn as_rooted(&self) -> RootedTarget {
+        RootedTarget {
+            root: self.root.clone(),
+            relative: self.relative.clone(),
+            label: self.label.clone(),
+            create_missing_parents: false,
+        }
+    }
 }
 
 fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
@@ -1529,13 +1574,13 @@ fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> 
     let root_path = resolve(&guard.root);
     let target = resolve(path);
     let relative = relative_under(&root_path, &target)?;
-    let root = Root::open_verified(
+    let root = Arc::new(Root::open_verified(
         &root_path,
         RootIdentity {
             dev: guard.dev,
             ino: guard.ino,
         },
-    )?;
+    )?);
     Ok(GuardedTarget {
         root,
         root_path,
@@ -1560,7 +1605,7 @@ fn relative_under(root: &Path, target: &Path) -> Result<RelativePath> {
 /// then fails atomically if something appears); the matching conditions
 /// require the observed identity. `Any` accepts whatever is found.
 fn observe_rooted_condition(
-    target: &GuardedTarget,
+    target: &RootedTarget,
     condition: TargetCondition,
 ) -> Result<Option<crate::rooted::RootMetadata>> {
     let observed = target.root.metadata_optional(&target.relative)?;
@@ -1603,7 +1648,7 @@ fn observe_rooted_condition(
     }
 }
 
-fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
+fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
@@ -1612,15 +1657,19 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
         } => {
             if path.is_empty() {
                 if *condition == TargetCondition::Absent {
-                    bail!("guarded root {} already exists", target.label.display());
+                    bail!("destination root {} already exists", target.label.display());
                 }
-                let directory = root.open_directory(path)?;
-                let metadata = directory.metadata()?;
-                if metadata.mode() & 0o700 != 0o700 {
-                    directory
-                        .set_permissions(fs::Permissions::from_mode(metadata.mode() | 0o700))?;
+                let metadata = root.metadata(path)?;
+                require_rooted_condition(metadata, *condition, &target.label)?;
+                if metadata.mode & 0o700 != 0o700 {
+                    let directory = root.open_metadata(path)?;
+                    require_rooted_metadata(&directory, metadata, &target.label)?;
+                    set_mode_handle(&directory, metadata.mode | 0o700)?;
                 }
                 return Ok(());
+            }
+            if target.create_missing_parents {
+                root.create_missing_parents(path, 0o777)?;
             }
             match observe_rooted_condition(target, *condition)? {
                 Some(metadata) if metadata.is_dir() => {
@@ -1637,9 +1686,9 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
                 ),
                 Some(_) => {
                     root.unlink(path)?;
-                    root.create_directory(path, (*mode & 0o7777) | 0o700)
+                    create_rooted_directory_or_existing(target, *mode)
                 }
-                None => root.create_directory(path, (*mode & 0o7777) | 0o700),
+                None => create_rooted_directory_or_existing(target, *mode),
             }
         }
         Op::Symlink {
@@ -1715,7 +1764,13 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
             }
             require_open_target(&file, &target.label, *condition)?;
             set_meta_handle(&file, meta, *flags)?;
-            require_rooted_named_identity(target, &file, *condition)
+            require_rooted_named_identity(
+                &target.root,
+                &target.relative,
+                &target.label,
+                &file,
+                *condition,
+            )
         }
         Op::Rmdir { .. } => match root.metadata_optional(path)? {
             None => Ok(()),
@@ -1731,21 +1786,37 @@ fn apply_one_rooted(op: &Op, target: &GuardedTarget) -> Result<()> {
             }
             Some(_) => root.unlink(path),
         },
-        Op::Remove { .. } => bail!("recursive remove cannot use a container guard"),
+        Op::Remove { .. } => bail!("recursive remove cannot use a confined destination root"),
     }
 }
 
 fn set_meta_rooted(
-    target: &GuardedTarget,
+    target: &RootedTarget,
     meta: &Meta,
     flags: u8,
     condition: TargetCondition,
 ) -> Result<()> {
     if target.relative.is_empty() {
-        let directory = target.root.open_directory(&target.relative)?;
-        require_open_target(&directory, &target.label, condition)?;
-        set_meta_file(&directory, meta, flags)?;
-        return require_rooted_named_identity(target, &directory, condition);
+        let metadata = target.root.metadata(&target.relative)?;
+        require_rooted_condition(metadata, condition, &target.label)?;
+        let handle = target.root.open_metadata(&target.relative)?;
+        require_rooted_metadata(&handle, metadata, &target.label)?;
+        require_open_target(&handle, &target.label, condition)?;
+        set_meta_handle(&handle, meta, flags & !flags::TIMES)?;
+        if flags & flags::TIMES != 0 {
+            let times = [
+                timespec(0, libc::UTIME_OMIT as u32),
+                timespec(meta.mtime, meta.mtime_nsec),
+            ];
+            target.root.set_times(&target.relative, &times)?;
+        }
+        return require_rooted_named_identity(
+            &target.root,
+            &target.relative,
+            &target.label,
+            &handle,
+            condition,
+        );
     }
     let metadata = target.root.metadata(&target.relative)?;
     if metadata.is_symlink() {
@@ -1774,9 +1845,47 @@ fn set_meta_rooted(
         require_rooted_identity(after, condition, &target.label)?;
     } else {
         let handle = target.root.open_metadata(&target.relative)?;
-        require_rooted_named_identity(target, &handle, condition)?;
+        require_rooted_named_identity(
+            &target.root,
+            &target.relative,
+            &target.label,
+            &handle,
+            condition,
+        )?;
     }
     Ok(())
+}
+
+/// `TargetCondition::Any` mkdir operations can race each other because apply
+/// batches are parallel and deeper paths create implicit parents. Accept the
+/// winner only when the conflicting name is a real directory beneath the
+/// retained root; a symlink or any other type remains an error.
+fn create_rooted_directory_or_existing(target: &RootedTarget, mode: u32) -> Result<()> {
+    match target
+        .root
+        .create_directory(&target.relative, (mode & 0o7777) | 0o700)
+    {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists)
+            }) =>
+        {
+            let metadata = target.root.metadata(&target.relative)?;
+            if !metadata.is_dir() {
+                return Err(error);
+            }
+            if metadata.mode & 0o700 != 0o700 {
+                let directory = target.root.open_metadata(&target.relative)?;
+                require_rooted_metadata(&directory, metadata, &target.label)?;
+                set_mode_handle(&directory, metadata.mode | 0o700)?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn require_rooted_identity(
@@ -1846,7 +1955,9 @@ fn require_rooted_metadata(file: &File, expected: RootMetadata, label: &Path) ->
 }
 
 fn require_rooted_named_identity(
-    target: &GuardedTarget,
+    root: &Root,
+    relative: &RelativePath,
+    label: &Path,
     file: &File,
     condition: TargetCondition,
 ) -> Result<()> {
@@ -1860,9 +1971,9 @@ fn require_rooted_named_identity(
         | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
     };
     let opened = file.metadata()?;
-    let named = target.root.metadata(&target.relative)?;
+    let named = root.metadata(relative)?;
     if opened.dev() != dev || opened.ino() != ino || named.dev != dev || named.ino != ino {
-        bail!("target {} changed during update", target.label.display());
+        bail!("target {} changed during update", label.display());
     }
     Ok(())
 }
@@ -1931,6 +2042,29 @@ fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
 
 #[cfg(not(debug_assertions))]
 fn hold_before_guarded_mutation_for_test(_path: &[u8]) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn hold_before_quick_metadata_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_QUICK_META_READY_FILE") {
+        fs::write(&ready, b"ready").with_context(|| {
+            format!(
+                "write quick-metadata-ready signal {}",
+                Path::new(&ready).display()
+            )
+        })?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_QUICK_META_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_before_quick_metadata_for_test() -> Result<()> {
     Ok(())
 }
 
@@ -2608,7 +2742,13 @@ impl FsOps {
             .with_context(|| format!("set metadata on basis {}", held.path.display()))?;
         if let Some(guard) = guard {
             let target = guarded_target(path, guard)?;
-            require_rooted_named_identity(&target, &held.file, condition)?;
+            require_rooted_named_identity(
+                &target.root,
+                &target.relative,
+                &target.label,
+                &held.file,
+                condition,
+            )?;
         } else {
             require_named_target_identity(&held.file, &held.path, condition)?;
         }
@@ -3104,7 +3244,13 @@ impl FsOps {
                 .unwrap_or_else(|| target.root.open_regular_write(&target.relative, false))?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", target.label.display()))?;
-            require_rooted_named_identity(&target, &file, condition)?;
+            require_rooted_named_identity(
+                &target.root,
+                &target.relative,
+                &target.label,
+                &file,
+                condition,
+            )?;
             return Ok(());
         }
         let src = partial_path(&target.label, partial_id)?;
@@ -4218,6 +4364,173 @@ mod tests {
         assert!(operations.partial_paths(&[b"../outside".to_vec()], &[12; 16], None)[0].is_err());
         assert!(operations.file_hash(b"../outside", None).is_err());
         assert!(operations.stat_many(&[b"../outside".to_vec()], false, None)[0].is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn destination_apply_uses_the_adopted_root_not_its_old_name() {
+        let dir = test_dir();
+        let selected = dir.join("selected");
+        fs::create_dir_all(selected.join("empty")).unwrap();
+        fs::write(selected.join("remove"), b"remove").unwrap();
+        fs::write(selected.join("repair"), b"repair").unwrap();
+        let repair_before = fs::symlink_metadata(selected.join("repair")).unwrap();
+        let (selection, anchor) = select_operator_directory(
+            selected.as_os_str().as_bytes(),
+            false,
+            OperatorSymlinkPolicy::Refuse,
+        )
+        .unwrap();
+        assert!(anchor.is_some());
+        let root = Arc::new(Root::from_directory(selection.directory).unwrap());
+        let mut operations = FsOps::new();
+        operations.destination_root = Some(root);
+        operations.destination_prefix = Some(path_bytes(&selected));
+
+        let moved = dir.join("moved");
+        fs::rename(&selected, &moved).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("sentinel"), b"replacement").unwrap();
+
+        let meta = |mode| Meta {
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: 1_700_000_000,
+            mtime_nsec: 123_456_789,
+        };
+        let errors = operations.apply(
+            &[
+                Op::Mkdir {
+                    path: b"created".to_vec(),
+                    mode: 0o755,
+                    condition: TargetCondition::Any,
+                },
+                Op::Mkdir {
+                    path: b"nested/parent/created".to_vec(),
+                    mode: 0o755,
+                    condition: TargetCondition::Any,
+                },
+                Op::Symlink {
+                    path: b"link".to_vec(),
+                    target: b"target".to_vec(),
+                    condition: TargetCondition::Any,
+                },
+                Op::Mknod {
+                    path: b"pipe".to_vec(),
+                    mode: MODE_FIFO | 0o600,
+                    rdev: 0,
+                    condition: TargetCondition::Any,
+                },
+                Op::Unlink {
+                    path: b"remove".to_vec(),
+                },
+                Op::Rmdir {
+                    path: b"empty".to_vec(),
+                },
+                Op::SetFileMetaIfSame {
+                    path: b"repair".to_vec(),
+                    condition: TargetCondition::MatchesFingerprint {
+                        dev: repair_before.dev(),
+                        ino: repair_before.ino(),
+                        ctime: repair_before.ctime(),
+                        ctime_nsec: repair_before.ctime_nsec() as u32,
+                    },
+                    meta: meta(0o640),
+                    flags: flags::MODE,
+                },
+                Op::SetMeta {
+                    path: b"link".to_vec(),
+                    meta: meta(0),
+                    flags: flags::TIMES,
+                    condition: TargetCondition::Any,
+                },
+                Op::SetMeta {
+                    path: Vec::new(),
+                    meta: meta(0o701),
+                    flags: flags::MODE | flags::TIMES,
+                    condition: TargetCondition::Any,
+                },
+            ],
+            None,
+        );
+        assert_eq!(errors, vec![None; 9]);
+
+        assert!(moved.join("created").is_dir());
+        assert!(moved.join("nested/parent/created").is_dir());
+        assert_eq!(
+            fs::read_link(moved.join("link")).unwrap(),
+            Path::new("target")
+        );
+        assert!(fs::symlink_metadata(moved.join("pipe"))
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        assert!(!moved.join("remove").exists());
+        assert!(!moved.join("empty").exists());
+        assert_eq!(
+            fs::symlink_metadata(moved.join("repair")).unwrap().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(fs::symlink_metadata(&moved).unwrap().mode() & 0o777, 0o701);
+        assert_eq!(fs::read(selected.join("sentinel")).unwrap(), b"replacement");
+        assert_eq!(fs::read_dir(&selected).unwrap().count(), 1);
+
+        let outside = dir.join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let errors = operations.apply(
+            &[
+                Op::Unlink {
+                    path: b"../outside".to_vec(),
+                },
+                Op::Remove {
+                    path: b"created".to_vec(),
+                },
+            ],
+            None,
+        );
+        assert!(errors.iter().all(Option::is_some));
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(moved.join("created").is_dir());
+
+        let outside_directory = dir.join("outside-directory");
+        fs::create_dir(&outside_directory).unwrap();
+        symlink(&outside_directory, moved.join("redirect")).unwrap();
+        let errors = operations.apply(
+            &[Op::Mkdir {
+                path: b"redirect/escaped".to_vec(),
+                mode: 0o755,
+                condition: TargetCondition::Any,
+            }],
+            None,
+        );
+        assert!(errors[0].is_some());
+        assert!(!outside_directory.join("escaped").exists());
+
+        fs::set_permissions(&moved, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rooted_mkdir_race_accepts_only_an_existing_real_directory() {
+        let dir = test_dir();
+        let selected = dir.join("selected");
+        let outside = dir.join("outside");
+        fs::create_dir_all(selected.join("winner")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, selected.join("link")).unwrap();
+        let root = Arc::new(Root::from_directory(File::open(&selected).unwrap()).unwrap());
+        let target = |path: &[u8]| RootedTarget {
+            root: root.clone(),
+            relative: RelativePath::new(path).unwrap(),
+            label: PathBuf::from(OsStr::from_bytes(path)),
+            create_missing_parents: true,
+        };
+
+        assert!(create_rooted_directory_or_existing(&target(b"winner"), 0o755).is_ok());
+        assert!(create_rooted_directory_or_existing(&target(b"link"), 0o755).is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
 
         fs::remove_dir_all(&dir).unwrap();
     }

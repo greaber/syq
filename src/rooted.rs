@@ -596,7 +596,15 @@ impl Root {
     }
 
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
-        let parent = self.resolve_parent(path)?;
+        let (parent, leaf) = if path.is_empty() {
+            (
+                self.directory.try_clone().context("duplicate root fd")?,
+                component_cstring(b"."),
+            )
+        } else {
+            let parent = self.resolve_parent(path)?;
+            (parent.directory, parent.leaf)
+        };
         #[cfg(target_os = "linux")]
         let flags =
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
@@ -609,7 +617,7 @@ impl Root {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let flags =
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-        open_at(parent.directory.as_raw_fd(), &parent.leaf, flags, 0)
+        open_at(parent.as_raw_fd(), &leaf, flags, 0)
             .with_context(|| format!("open confined metadata handle {}", path.label()))
     }
 
@@ -672,6 +680,52 @@ impl Root {
             )
         })
         .with_context(|| format!("create confined directory {}", path.label()))
+    }
+
+    /// Create any missing parents of `path`, walking only through real
+    /// directories retained beneath this root. Concurrent creators are
+    /// accepted only when the resulting component opens as a directory.
+    pub(crate) fn create_missing_parents(&self, path: &RelativePath, mode: u32) -> Result<()> {
+        let (parents, _) = path.leaf()?;
+        let mut directory = self.directory.try_clone().context("duplicate root fd")?;
+        for component in parents {
+            match open_directory_at(&directory, component) {
+                Ok(child) => {
+                    directory = child;
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("resolve confined parent for {}", path.label()));
+                }
+            }
+            let component = component_cstring(component);
+            loop {
+                let result = unsafe {
+                    libc::mkdirat(
+                        directory.as_raw_fd(),
+                        component.as_ptr(),
+                        (mode & 0o777) as libc::mode_t,
+                    )
+                };
+                if result == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error)
+                        .with_context(|| format!("create confined parent for {}", path.label()));
+                }
+                break;
+            }
+            directory = open_directory_at(&directory, component.as_bytes())
+                .with_context(|| format!("open created confined parent for {}", path.label()))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn metadata(&self, path: &RelativePath) -> Result<RootMetadata> {
@@ -853,11 +907,19 @@ impl Root {
     }
 
     pub(crate) fn set_times(&self, path: &RelativePath, times: &[libc::timespec; 2]) -> Result<()> {
-        let parent = self.resolve_parent(path)?;
+        let (parent, leaf) = if path.is_empty() {
+            (
+                self.directory.try_clone().context("duplicate root fd")?,
+                component_cstring(b"."),
+            )
+        } else {
+            let parent = self.resolve_parent(path)?;
+            (parent.directory, parent.leaf)
+        };
         retry_zero(|| unsafe {
             libc::utimensat(
-                parent.directory.as_raw_fd(),
-                parent.leaf.as_ptr(),
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
                 times.as_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
             )
