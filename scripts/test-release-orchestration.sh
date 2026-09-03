@@ -4,6 +4,8 @@
 set -euo pipefail
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+grep -F 'rust,sdks,macos,linux-arm64,conformance' \
+  "$script_dir/../.github/workflows/release.yml" >/dev/null
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-release-orchestration-test.XXXXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
@@ -78,7 +80,9 @@ assert_scope "$scope" native false
 printf '.github/workflows/ci.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
+assert_scope "$scope" native true
 assert_scope "$scope" sdks true
+assert_scope "$scope" mapping_docs true
 assert_scope "$scope" conformance true
 assert_scope "$scope" macos true
 assert_scope "$scope" linux_arm64 true
@@ -298,6 +302,7 @@ case "$1:$2" in
   api:*)
     case " $* " in
       *'/commits/'*'/check-runs'*) printf '%s\n' "$SYQ_TEST_CHECKS_JSON" ;;
+      *'/actions/workflows/'*'/runs?'*) printf '%s\n' "$SYQ_TEST_WORKFLOW_RUNS_JSON" ;;
       *'/actions/permissions/selected-actions '*) printf '%s\n' "$SYQ_TEST_SELECTED_ACTIONS_JSON" ;;
       *'/actions/permissions '*) printf '{"enabled":true,"allowed_actions":"selected","sha_pinning_required":true}\n' ;;
       *'/deployment-branch-policies '*) printf '{"branch_policies":[{"name":"v*","type":"tag"}]}\n' ;;
@@ -317,7 +322,10 @@ jq -cn --arg version "${SYQ_TEST_EXISTING_CRATE_VERSION:-}" '
   {versions:(if $version == "" then [] else [{num:$version}] end)}'
 EOF
 chmod 755 "$preflight_bin/git" "$preflight_bin/gh" "$preflight_bin/curl"
-checks_json=$(jq -cn '{check_runs:["rust","sdks","macos","linux-arm64"] | map({name:.,conclusion:"success"})}')
+checks_json=$(jq -cn '{check_runs:["rust","sdks","macos","linux-arm64","conformance"] | map({name:.,conclusion:"success"})}')
+workflow_runs_json=$(jq -cn --arg head "$preflight_head" '{workflow_runs:[{
+  id:601,event:"workflow_dispatch",head_sha:$head,status:"completed",
+  conclusion:"success",run_number:1,run_attempt:1}]}')
 selected_json=$(jq -cn '{github_owned_allowed:true,verified_allowed:false,
   patterns_allowed:["rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18"]}')
 formula_b64=$(printf 'url "https://github.com/greaber/syq/releases/download/v9.9.8/syq"\n' | openssl base64 -A)
@@ -325,6 +333,7 @@ preflight_env=(
   SYQ_TEST_PREFLIGHT_HEAD="$preflight_head"
   SYQ_TEST_REAL_GIT="$real_git"
   SYQ_TEST_CHECKS_JSON="$checks_json"
+  SYQ_TEST_WORKFLOW_RUNS_JSON="$workflow_runs_json"
   SYQ_TEST_SELECTED_ACTIONS_JSON="$selected_json"
   SYQ_TEST_SIGNING_KEY="$signing_key"
   SYQ_TEST_FORMULA_B64="$formula_b64"
@@ -333,6 +342,21 @@ preflight_env=(
 (cd "$preflight_repo" && env "${preflight_env[@]}" \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/preflight.out"
 grep -F "Release preflight passed for v9.9.9 at $preflight_head" "$work/preflight.out" >/dev/null
+checks_without_conformance=$(jq -cn '{check_runs:["rust","sdks","macos","linux-arm64"] | map({name:.,conclusion:"success"})}')
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_CHECKS_JSON="$checks_without_conformance" \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted a missing conformance check' >&2
+  exit 1
+fi
+grep -F 'required check conformance is missing' "$work/failure.out" >/dev/null
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_WORKFLOW_RUNS_JSON='{"workflow_runs":[]}' \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted missing full release CI' >&2
+  exit 1
+fi
+grep -F 'has no workflow_dispatch run' "$work/failure.out" >/dev/null
 if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   SYQ_TEST_EXISTING_CRATE_VERSION=9.9.9 \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then

@@ -97,8 +97,10 @@ while IFS= read -r path; do
       native=true
       ;;
     .github/workflows/ci.yml)
+      native=true
       tooling=true
       sdks=true
+      mapping_docs=true
       conformance=true
       macos=true
       linux_arm64=true

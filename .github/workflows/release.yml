@@ -8,6 +8,8 @@ on:
     tags: ["v*"]
 
 permissions:
+  actions: read
+  checks: read
   contents: read
 
 concurrency:
@@ -34,7 +36,8 @@ jobs:
         run: |
           scripts/verify-release-tag.sh \
             "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master \
-            rust,sdks,macos,linux-arm64
+            rust,sdks,macos,linux-arm64,conformance
+          scripts/verify-release-ci.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA"
 
   build:
     name: build (${{ matrix.name }})
