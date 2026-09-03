@@ -39,13 +39,20 @@ from .models import (
     ProgressEvent,
     RelativePath,
     Retryability,
+    RmResult,
     RunEvent,
+    SelectionResult,
+    SelectionStatus,
+    RemovalDisposition,
+    RemovalResult,
+    RemovalTrace,
     TraceEvent,
     TraceReason,
 )
 
 _default_client = Client()
 cp = _default_client.cp
+rm = _default_client.rm
 map = _default_client.map
 
 __all__ = [
@@ -81,7 +88,13 @@ __all__ = [
     "RelativePath",
     "Result",
     "Retryability",
+    "RmResult",
     "RunEvent",
+    "SelectionResult",
+    "SelectionStatus",
+    "RemovalDisposition",
+    "RemovalResult",
+    "RemovalTrace",
     "SyqInstallError",
     "SyqInvocationError",
     "SyqOperationError",
@@ -93,6 +106,7 @@ __all__ = [
     "cp",
     "managed_executable",
     "map",
+    "rm",
     "run",
     "version",
 ]

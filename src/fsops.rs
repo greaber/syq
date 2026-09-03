@@ -1133,7 +1133,7 @@ fn errstr(e: &anyhow::Error) -> String {
     format!("{e:#}")
 }
 
-fn wire_error(error: &anyhow::Error) -> WireError {
+pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
     let io_error = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<io::Error>());
