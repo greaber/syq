@@ -1,4 +1,4 @@
-//! The coordinator: scan, diff, schedule, and the per-worker transfer loop.
+//! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{
@@ -6,8 +6,8 @@ use crate::cli::{
     SourceSelection,
 };
 use crate::conn::{
-    ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
-    TcpPairStats,
+    endpoint_error, ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec,
+    SshMultiplexer, TcpCandidate, TcpPairStats,
 };
 use crate::fsops::{content_digest, is_partial_name, join};
 use crate::progress::{commas, human, Progress, WorkerStatus};
@@ -956,20 +956,19 @@ pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &L
     let Some(source) = sources.first() else {
         return false;
     };
-    let direct_paths_are_utf8 = sources
-        .iter()
-        .chain(std::iter::once(dst))
-        .all(|location| std::str::from_utf8(&location.path).is_ok());
     source.is_remote()
         && dst.is_remote()
         && !args.relay
         && (args.interface == Interface::Rsync || args.coordinate_at != CoordinateAt::Local)
-        && (args.interface == Interface::Rsync
-            || args.coordinate_at != CoordinateAt::Auto
-            || direct_paths_are_utf8)
 }
 
 fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WireError>())
+    {
+        return wire_os_kind(error);
+    }
     let io = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())?;
@@ -980,10 +979,36 @@ fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
         std::io::ErrorKind::InvalidInput => "invalid_input",
         _ => match io.raw_os_error() {
             Some(libc::ENOSPC) => "no_space",
+            Some(libc::EDQUOT) => "quota_exceeded",
             Some(libc::EROFS) => "read_only",
             _ => "other",
         },
     })
+}
+
+fn wire_os_kind(error: &WireError) -> Option<&'static str> {
+    Some(match error.io_kind? {
+        WireIoKind::NotFound => "not_found",
+        WireIoKind::PermissionDenied => "permission_denied",
+        WireIoKind::AlreadyExists => "already_exists",
+        WireIoKind::InvalidInput => "invalid_input",
+        WireIoKind::NoSpace => "no_space",
+        WireIoKind::QuotaExceeded => "quota_exceeded",
+        WireIoKind::ReadOnly => "read_only",
+        WireIoKind::Other => "other",
+    })
+}
+
+fn capacity_os_kind(kind: Option<&str>) -> bool {
+    matches!(kind, Some("no_space" | "quota_exceeded"))
+}
+
+fn first_capacity_error(errors: &[Option<WireError>]) -> Option<WireError> {
+    errors
+        .iter()
+        .flatten()
+        .find(|error| capacity_os_kind(wire_os_kind(error)))
+        .cloned()
 }
 
 fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
@@ -1019,20 +1044,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if args.interface == Interface::Rsync && original_srcs[0].is_remote() && dst.is_remote() {
         bail!("syq rsync does not support remote-to-remote transfers");
     }
-    let direct_paths_are_utf8 = original_srcs
-        .iter()
-        .chain(std::iter::once(dst))
-        .all(|location| std::str::from_utf8(&location.path).is_ok());
     let coordinator_is_remote = uses_remote_coordinator(&args, original_srcs, dst);
     let direct_remote_to_remote = original_srcs[0].is_remote()
         && dst.is_remote()
         && !original_srcs[0].same_host(dst)
         && !args.relay
-        && args.coordinate_at != CoordinateAt::Local
-        // Native auto placement cannot delegate raw path bytes because they
-        // cannot be represented in the remote coordinator's argv. Validate
-        // direct-only controls against the topology that will actually run.
-        && (args.coordinate_at != CoordinateAt::Auto || direct_paths_are_utf8);
+        && args.coordinate_at != CoordinateAt::Local;
     if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
     {
         bail!(
@@ -1048,7 +1065,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && (args.no_tcp || args.tcp_plain || original_srcs[0].is_remote() || !dst.is_remote())
     {
         bail!(
-            "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted TCP data connections"
+            "a signed receiver grant is valid only for a local-to-remote orchestrator using encrypted TCP data connections"
         );
     }
     for source in original_srcs {
@@ -1130,24 +1147,23 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_SSH;
         }
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dest {
-            return crate::direct::coordinate_at_dest(&args, srcs, dst);
+            return crate::direct::coordinate_at_dest(
+                &args,
+                srcs,
+                dst,
+                progress.results_writer().cloned(),
+            );
         }
-        return crate::direct::run(&args, srcs, dst);
+        return crate::direct::run(&args, srcs, dst, progress.results_writer().cloned());
     }
     if srcs[0].is_remote() && dst.is_remote() {
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Local {
             args.relay = true;
         }
-        if !args.relay {
-            // Data is never routed through this machine implicitly. Path
-            // bytes that cannot travel in a remote command line make the
-            // direct topology unavailable today (encoded delegation
-            // operands are the planned fix); until then, relaying is the
-            // operator's explicit choice.
-            bail!(
-                "remote-to-remote copy: these path bytes cannot be carried in a remote command line, so a direct transfer is not possible; pass --coordinate-at local to route the transfer through this machine instead"
-            );
-        }
+        // Delegated operands are base64 in the remote argv, so every
+        // non-relay remote-to-remote copy took the direct return above; the
+        // only way here is the operator's explicit --coordinate-at local.
+        debug_assert!(args.relay);
         if !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
@@ -1170,7 +1186,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // option forces SSH data.
     // A local receiver uses one child process and a loopback data listener so
     // every worker shares its retained destination cwd without changing the
-    // coordinator process's cwd.
+    // orchestrator process's cwd.
     let use_tcp = !args.no_tcp && (src_ep.has_data_server() || dst_ep.has_data_server());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
     // start conservatively until TCP reachability has been established below.
@@ -1185,7 +1201,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {
         bail!(
-            "{} {algorithm} requires a Linux transfer coordinator and Linux remote endpoints",
+            "{} {algorithm} requires a Linux transfer orchestrator and Linux remote endpoints",
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
@@ -1624,11 +1640,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     match args.target_existence {
         Existence::Any => {}
         Existence::New if dst_existed => bail!(
-            "destination {} already exists, but the selected placement requires a new path",
+            "target {} already exists, but the selected placement requires a new path",
             display(&dst_root)
         ),
         Existence::Existing if !dst_existed => bail!(
-            "destination {} does not exist, but the selected placement requires an existing path",
+            "target {} does not exist, but the selected placement requires an existing path",
             display(&dst_root)
         ),
         Existence::New | Existence::Existing => {}
@@ -1648,7 +1664,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
             if dst_existed && !dst_entry_is_dir {
                 bail!(
-                    "--into destination {} exists but is not a directory",
+                    "--into target {} exists but is not a directory",
                     display(&dst_root)
                 );
             }
@@ -1669,7 +1685,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !dst_entry_is_dir
     {
         bail!(
-            "--into-existing destination {} is not an existing directory",
+            "--into-existing target {} is not an existing directory",
             display(&dst_root)
         );
     }
@@ -1775,6 +1791,63 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             dst_entry_is_dir = true;
         }
     }
+    // A missing target, or an existing empty container, has no destination
+    // payload whose replacement could release space during this copy. That
+    // makes its selected source population a useful whole-copy capacity
+    // sanity check. Inspect the retained selection before anchoring or
+    // creating the target; if the endpoint cannot expose reliable counters or
+    // emptiness, simply retain the normal allocation-time checks.
+    let exact_capacity_target = if dst_entry_is_dir
+        && !dst_is_dir
+        && !expand_exact_home
+        && operator_directory != operator_dst_root
+    {
+        let entry = dst_root_entry
+            .as_ref()
+            .expect("known existing exact directory has metadata");
+        let relative_path = operator_dst_root
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .unwrap_or_default()
+            .to_vec();
+        (!matches!(relative_path.as_slice(), b"" | b"." | b"..")).then_some(
+            DestinationFilesystemTarget {
+                relative_path,
+                dev: entry.dev,
+                ino: entry.ino,
+            },
+        )
+    } else {
+        None
+    };
+    let can_inspect_existing_destination = dst_is_dir
+        || expand_exact_home
+        || operator_directory == operator_dst_root
+        || exact_capacity_target.is_some();
+    let initial_destination_filesystem = if use_operator_anchor
+        && !args.verify_only
+        && !args.existing
+        && (dst_root_entry.is_none() || (dst_entry_is_dir && can_inspect_existing_destination))
+    {
+        let check_empty = dst_root_entry.is_some() && dst_entry_is_dir;
+        destination_filesystem_info(&mut *dst_ctl, check_empty, exact_capacity_target.clone())?
+    } else {
+        None
+    };
+    let fresh_capacity = initial_destination_filesystem.and_then(|info| {
+        let fresh = dst_root_entry.is_none()
+            || (dst_entry_is_dir && dst_root_entry.is_some() && info.empty == Some(true));
+        fresh.then_some(FreshCapacityPlan {
+            device: info.device,
+            target: exact_capacity_target,
+            root_existed: dst_root_entry.is_some(),
+            logical_bytes: 0,
+            objects: 0,
+            overflowed: false,
+        })
+    });
+    let defer_destination_mutations = multiple_distinct_sources
+        || (fresh_capacity.is_some() && !args.dry_run && !args.verify_only);
     // Native new/existing forms are intentionally only the lightweight
     // pathname checks above. Once they pass, use the ordinary engine's target
     // conditions and publication behavior; this adapter does not add an
@@ -1906,9 +1979,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     // Create a missing directory destination — never in the read-only modes,
-    // and never under --existing. With several sources this waits until
-    // their scans have been checked against each other, so a conflicting
-    // command leaves nothing behind.
+    // and never under --existing. With several sources, or while a fresh-target
+    // capacity check is pending, this waits until the complete scan has passed
+    // its namespace and capacity preflights.
     let create_root = dst_root_entry.is_none()
         && dst_is_dir
         && !args.dry_run
@@ -1917,12 +1990,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let dry_run_creates_root =
         args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let root_create_condition = TargetCondition::Any;
+    let defer_operator_directory_creation = use_operator_anchor
+        && directory_selection.is_none()
+        && !args.dry_run
+        && !args.verify_only
+        && !args.existing
+        && defer_destination_mutations;
     if use_operator_anchor {
         let create_operator_directory_now = directory_selection.is_none()
             && !args.dry_run
             && !args.verify_only
             && !args.existing
-            && (!dst_is_dir || !multiple_distinct_sources);
+            && !defer_operator_directory_creation;
         if create_operator_directory_now {
             let condition = if dst_is_dir {
                 root_create_condition
@@ -1951,7 +2030,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 .set(anchor)
                 .expect("destination anchor set once");
         }
-    } else if create_root && !multiple_distinct_sources {
+    } else if create_root && !defer_destination_mutations {
         let created = mkdir_root(
             &mut *dst_ctl,
             &dst_root,
@@ -2079,16 +2158,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         mutation_root_condition,
         container_guard,
         guard_containers,
-        buffer: if multiple_distinct_sources {
+        buffer: if defer_destination_mutations {
             Some(Vec::new())
         } else {
             None
         },
+        fresh_capacity,
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
         mapping_mode: false,
-        create_root: if create_root && multiple_distinct_sources {
-            Some((dst_root.clone(), root_create_condition))
+        create_root: if defer_operator_directory_creation {
+            Some((
+                request_prefix.clone(),
+                if dst_is_dir {
+                    root_create_condition
+                } else {
+                    TargetCondition::Any
+                },
+                dst_is_dir,
+            ))
+        } else if !use_operator_anchor && create_root && defer_destination_mutations {
+            Some((dst_root.clone(), root_create_condition, true))
         } else {
             None
         },
@@ -2108,6 +2198,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
 
     let mut scan_err = None;
+    let mut fresh_capacity_assessment = None;
+    let mut fresh_capacity_shortage = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
     if let Some(mapping_contents) = mapping_contents.as_deref() {
         let src = &srcs[0];
@@ -2195,6 +2287,31 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             scan_err = Some(e);
         }
     }
+    if scan_err.is_none() && !st.collision {
+        match st.assess_fresh_capacity() {
+            Ok(assessment) => {
+                fresh_capacity_assessment = assessment;
+                fresh_capacity_shortage = assessment.filter(|value| !value.sufficient());
+                if let Some(assessment) = fresh_capacity_shortage.filter(|_| !args.dry_run) {
+                    scan_err = Some(fresh_capacity_error(assessment));
+                }
+            }
+            Err(error) => scan_err = Some(error),
+        }
+    }
+    if scan_err.is_none() && !st.collision {
+        if let Err(error) = st.replay_buffered() {
+            scan_err = Some(error);
+        }
+    }
+    // A dry run still completes its virtual replay so the summary remains a
+    // truthful plan, then reports the same capacity refusal a real run would
+    // hit. No destination operation occurs during that replay.
+    if scan_err.is_none() && args.dry_run {
+        if let Some(assessment) = fresh_capacity_shortage {
+            scan_err = Some(fresh_capacity_error(assessment));
+        }
+    }
     if debug() {
         eprintln!(
             "syq: payload planning complete at {:.2}s",
@@ -2216,7 +2333,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let collision = st.collision;
     progress.scan_done.store(true, Relaxed);
     if let Some(e) = &scan_err {
-        progress.error(&format!("syq: {e:#}"));
+        let os_kind = os_kind_of(e);
+        progress.error_classified(&format!("syq: {e:#}"), os_kind.map(|_| "io"), os_kind);
         sched.abort();
     } else if collision {
         sched.abort();
@@ -2382,7 +2500,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     // With a command-restricted receiver, ask for its signed receipt now that
     // every mutation is settled, and hand its bounded frames to the invoking
-    // machine as marked lines. That machine verifies it; this coordinator's
+    // machine as marked lines. That machine verifies it; this orchestrator's
     // own report is not trusted for what landed.
     if args.restricted_grant.is_some() {
         use base64::Engine as _;
@@ -2519,7 +2637,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
-    if !args.quiet && !aborted {
+    let capacity_only_dry_run_abort = opts.dry_run && fresh_capacity_shortage.is_some();
+    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
                 println!(
@@ -2538,6 +2657,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 &progress,
                 delete_plan,
                 &dry_run_changes,
+                fresh_capacity_assessment,
             );
         } else if opts.verify_only {
             println!(
@@ -2568,14 +2688,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 }
             );
         }
-        if args.stats {
-            let (
-                files_label,
-                unchanged_files_label,
-                bytes_label,
-                unchanged_bytes_label,
-                bytes_work,
-            ) = if opts.dry_run {
+    }
+    // --stats is additional human output, not the summary line the local
+    // attested settlement re-renders; a delegated coordinator keeps it.
+    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && args.stats {
+        let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
+            if opts.dry_run {
                 (
                     "files needing content work",
                     "files with unchanged content",
@@ -2592,11 +2710,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     done,
                 )
             };
-            let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
+        let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
                 matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
             });
-            let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-            println!(
+        let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
+        println!(
                 "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
@@ -2620,7 +2738,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 },
                 tcp_stats,
             );
-        }
     }
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
@@ -2724,12 +2841,7 @@ fn mkdir_root(
     }
     stat_one(conn, dst_root, false)?
         .filter(|entry| entry.kind == Kind::Dir)
-        .with_context(|| {
-            format!(
-                "created destination {} is not a directory",
-                display(dst_root)
-            )
-        })
+        .with_context(|| format!("created target {} is not a directory", display(dst_root)))
 }
 
 fn mkdir_root_batches(
@@ -2912,6 +3024,23 @@ fn create_operator_directory(
         "create destination directory",
     )? {
         Response::DirectorySelection(Some(selection)) => Ok(selection),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn destination_filesystem_info(
+    conn: &mut dyn Conn,
+    check_empty: bool,
+    target: Option<DestinationFilesystemTarget>,
+) -> Result<Option<DestinationFilesystemInfo>> {
+    match conn.call(Request::DestinationFilesystemInfo {
+        check_empty,
+        target,
+    })? {
+        Response::DestinationFilesystemInfo(info) => Ok(Some(info)),
+        // Not every filesystem or receiver topology can expose meaningful
+        // capacity. Absence of the optimization must not block the copy.
+        Response::EndpointError(_) | Response::Err(_) => Ok(None),
         other => bail!("unexpected response {other:?}"),
     }
 }
@@ -3272,6 +3401,61 @@ struct DryRunMapping {
     semantics: &'static str,
 }
 
+#[derive(Clone)]
+struct FreshCapacityPlan {
+    device: u64,
+    target: Option<DestinationFilesystemTarget>,
+    root_existed: bool,
+    logical_bytes: u64,
+    objects: u64,
+    overflowed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FreshCapacityAssessment {
+    logical_bytes: u64,
+    objects: u64,
+    available_bytes: u64,
+    available_inodes: Option<u64>,
+}
+
+impl FreshCapacityAssessment {
+    fn byte_shortage(self) -> bool {
+        self.logical_bytes > self.available_bytes
+    }
+
+    fn inode_shortage(self) -> bool {
+        self.available_inodes
+            .is_some_and(|available| self.objects > available)
+    }
+
+    fn sufficient(self) -> bool {
+        !self.byte_shortage() && !self.inode_shortage()
+    }
+}
+
+fn fresh_capacity_error(capacity: FreshCapacityAssessment) -> anyhow::Error {
+    let mut shortages = Vec::new();
+    if capacity.byte_shortage() {
+        shortages.push(format!(
+            "{} of logical file data is required but only {} is available",
+            human(capacity.logical_bytes),
+            human(capacity.available_bytes)
+        ));
+    }
+    if capacity.inode_shortage() {
+        shortages.push(format!(
+            "{} destination objects are required but only {} inodes are available",
+            commas(capacity.objects),
+            commas(capacity.available_inodes.unwrap_or_default())
+        ));
+    }
+    anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC)).context(format!(
+        "fresh destination capacity preflight failed: {}",
+        shortages.join("; ")
+    ))
+}
+
 /// A typed summary of final-state mutations found during a dry run. Type
 /// replacements overlap the primary categories; all others are disjoint.
 #[derive(Default)]
@@ -3365,6 +3549,7 @@ fn print_dry_run_summary(
     progress: &Progress,
     deletes: DeletePlan,
     changes: &DryRunChanges,
+    capacity: Option<FreshCapacityAssessment>,
 ) {
     println!("syq: dry-run summary");
     for (source, mapping) in srcs.iter().zip(mappings) {
@@ -3401,6 +3586,33 @@ fn print_dry_run_summary(
         human(progress.bytes_skipped.load(Relaxed)),
         count_label(progress.files_skipped.load(Relaxed), "file", "files")
     );
+    if let Some(capacity) = capacity {
+        let inode_detail = capacity.available_inodes.map_or_else(
+            || {
+                format!(
+                    "{} destination objects; free inode count unavailable",
+                    commas(capacity.objects)
+                )
+            },
+            |available| {
+                format!(
+                    "{} destination objects; {} inodes available",
+                    commas(capacity.objects),
+                    commas(available)
+                )
+            },
+        );
+        println!(
+            "  capacity: {} logical data required; {} available; {inode_detail} ({})",
+            human(capacity.logical_bytes),
+            human(capacity.available_bytes),
+            if capacity.sufficient() {
+                "appears sufficient"
+            } else {
+                "insufficient"
+            }
+        );
+    }
 
     let ignored = progress.paths_ignored.load(Relaxed);
     let other = progress.files_excluded.load(Relaxed);
@@ -3486,6 +3698,10 @@ struct Planner<'a> {
     /// Several sources: mapped batches waiting for all scans to finish
     /// (see `Mapped`). None with a single source, where batches stream.
     buffer: Option<Vec<Mapped>>,
+    /// A missing or observed-empty target has no old payload to release and
+    /// cannot contain descendant mounts. Its selected source population gives
+    /// us one useful whole-copy capacity sanity check.
+    fresh_capacity: Option<FreshCapacityPlan>,
     /// --mapping: per-destination source override. A manifest entry's `path`
     /// carries the destination-relative path so claims, ordering, and job
     /// naming work unchanged; the read side looks the actual source up here.
@@ -3501,9 +3717,11 @@ struct Planner<'a> {
     mutation_root_condition: TargetCondition,
     container_guard: Option<ContainerGuard>,
     guard_containers: bool,
-    /// Several sources into a destination that doesn't exist yet: create it
-    /// only once the scans have been validated against each other.
-    create_root: Option<(PathBytes, TargetCondition)>,
+    /// A missing retained operator directory: (request prefix, creation
+    /// condition, whether it is the destination root). Create it only after
+    /// namespace and fresh-capacity preflight. Restricted transfers use the
+    /// same slot only for their missing destination root.
+    create_root: Option<(PathBytes, TargetCondition, bool)>,
     destination_anchor: &'a DestinationAnchorSlot,
     use_operator_anchor: bool,
     /// --files-from: listed directories are created even without -r (which
@@ -3588,6 +3806,78 @@ impl Deletes {
 }
 
 impl Planner<'_> {
+    fn record_fresh_entry(&mut self, dst: &[u8], entry: &Entry, new_object: bool) {
+        if !new_object {
+            return;
+        }
+        let included = match entry.kind {
+            Kind::Dir => true,
+            Kind::File => {
+                self.opts
+                    .max_size
+                    .is_none_or(|maximum| entry.size <= maximum)
+                    && self
+                        .opts
+                        .min_size
+                        .is_none_or(|minimum| entry.size >= minimum)
+            }
+            Kind::Symlink => self.opts.links,
+            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => self.opts.devices,
+            Kind::Other => false,
+        };
+        if !included {
+            return;
+        }
+        let reuses_existing_root = dst == self.root_path && entry.kind == Kind::Dir;
+        let Some(plan) = &mut self.fresh_capacity else {
+            return;
+        };
+        // When source contents map directly into an existing empty container,
+        // the source's root directory reuses that one existing inode.
+        if !(plan.root_existed && reuses_existing_root) {
+            match plan.objects.checked_add(1) {
+                Some(objects) => plan.objects = objects,
+                None => plan.overflowed = true,
+            }
+        }
+        if entry.kind == Kind::File {
+            match plan.logical_bytes.checked_add(entry.size) {
+                Some(bytes) => plan.logical_bytes = bytes,
+                None => plan.overflowed = true,
+            }
+        }
+    }
+
+    fn assess_fresh_capacity(&mut self) -> Result<Option<FreshCapacityAssessment>> {
+        let Some(plan) = self.fresh_capacity.clone() else {
+            return Ok(None);
+        };
+        if plan.overflowed {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOSPC)).context(
+                "fresh destination logical size or object count exceeds supported limits",
+            );
+        }
+        let response = self.dst.call(Request::DestinationFilesystemInfo {
+            check_empty: false,
+            target: plan.target.clone(),
+        })?;
+        let info = match response {
+            Response::DestinationFilesystemInfo(info) if info.device == plan.device => info,
+            Response::DestinationFilesystemInfo(_) => return Ok(None),
+            // Capacity inspection is a best-effort optimization. Actual
+            // allocations remain authoritative when a filesystem cannot
+            // expose useful counters.
+            Response::EndpointError(_) | Response::Err(_) => return Ok(None),
+            other => bail!("unexpected response {other:?}"),
+        };
+        Ok(Some(FreshCapacityAssessment {
+            logical_bytes: plan.logical_bytes,
+            objects: plan.objects,
+            available_bytes: info.available_bytes,
+            available_inodes: info.available_inodes,
+        }))
+    }
+
     fn exact_condition_for(&self, path: &[u8]) -> TargetCondition {
         if path == self.root_path {
             self.exact_condition
@@ -3618,7 +3908,7 @@ impl Planner<'_> {
         match current {
             Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
             _ => bail!(
-                "destination {} changed after the placement precondition was checked",
+                "target {} changed after the placement precondition was checked",
                 display(&self.root_path)
             ),
         }
@@ -4206,10 +4496,24 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// All sources scanned and the sidecar namespace preflight passed: apply
-    /// what was held back. With several sources that is every batch, after
-    /// the cross-source claim check; otherwise only the deferred payloads.
+    /// All sources scanned and the sidecar namespace preflight passed: add
+    /// deferred payloads to the buffer. The caller runs the fresh-target
+    /// capacity check before replaying that buffer. Planning maps remain live
+    /// until replay because applying buffered entries still consults them.
     fn finish_planning(&mut self) -> Result<()> {
+        let deferred = std::mem::take(&mut self.deferred_payloads);
+        if let Some(buf) = &mut self.buffer {
+            buf.extend(deferred);
+        } else {
+            for m in deferred {
+                self.apply_mapped(m)?;
+            }
+            self.retire_planning_state();
+        }
+        Ok(())
+    }
+
+    fn retire_planning_state(&mut self) {
         // The preflight maps are dead now — except the sidecar set, which
         // --delete needs (only its keys) to tell a live sidecar from an
         // orphan. On multi-million-file trees these are the difference
@@ -4221,16 +4525,6 @@ impl Planner<'_> {
             keys.sort_unstable();
             self.live_sidecars = keys;
         }
-        let deferred = std::mem::take(&mut self.deferred_payloads);
-        if let Some(buf) = &mut self.buffer {
-            buf.extend(deferred);
-            self.replay_buffered()?;
-        } else {
-            for m in deferred {
-                self.apply_mapped(m)?;
-            }
-        }
-
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
         // alone still needs the destination claims and live sidecar names.
@@ -4249,7 +4543,6 @@ impl Planner<'_> {
             self.live_sidecars = Vec::new();
             self.delete_roots = Vec::new();
         }
-        Ok(())
     }
 
     /// The mapping loop: decide and claim everything about each entry.
@@ -4287,9 +4580,18 @@ impl Planner<'_> {
                 }
                 _ => Claim::Weak,
             };
+            // A later real claim can replace a weak claim from an entry that
+            // is not copied. In that case it is the first capacity-relevant
+            // object at this path even though the namespace was already seen.
+            let new_capacity_object = match self.dst_seen.get(&dst) {
+                None => true,
+                Some(Claim::Weak) if claim != Claim::Weak => true,
+                Some(_) => false,
+            };
             let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
                 continue;
             };
+            self.record_fresh_entry(&dst, &e, new_capacity_object);
             let src = match self.src_overrides.get(&e.path) {
                 Some(actual) => join(src_root, actual),
                 None => join(src_root, &e.path),
@@ -4389,27 +4691,31 @@ impl Planner<'_> {
             }
         }
         if self.collision {
+            self.retire_planning_state();
             return Ok(());
         }
-        if let Some((root, condition)) = self.create_root.take() {
+        if let Some((root, condition, is_destination_root)) = self.create_root.take() {
             if self.use_operator_anchor {
                 let selection = create_operator_directory(self.dst, condition)?;
                 let anchor = activate_control_destination(self.dst, selection, root.clone())?;
-                self.mutation_root_condition = TargetCondition::Matches {
-                    dev: anchor.dev,
-                    ino: anchor.ino,
-                };
-                if self.guard_containers {
-                    self.container_guard = Some(ContainerGuard {
-                        root,
+                if is_destination_root {
+                    self.mutation_root_condition = TargetCondition::Matches {
                         dev: anchor.dev,
                         ino: anchor.ino,
-                    });
+                    };
+                    if self.guard_containers {
+                        self.container_guard = Some(ContainerGuard {
+                            root,
+                            dev: anchor.dev,
+                            ino: anchor.ino,
+                        });
+                    }
                 }
                 self.destination_anchor
                     .set(anchor)
                     .expect("destination anchor set once");
             } else {
+                debug_assert!(is_destination_root);
                 let created =
                     mkdir_root(self.dst, &root, condition, self.opts.restricted_receiver)?;
                 self.mutation_root_condition = target_identity(&created);
@@ -4428,6 +4734,7 @@ impl Planner<'_> {
         for m in buffered {
             self.apply_mapped(m)?;
         }
+        self.retire_planning_state();
         Ok(())
     }
 
@@ -4613,7 +4920,15 @@ impl Planner<'_> {
                     let root_op = new_dirs.remove(root_index);
                     let error = self.apply(vec![root_op])?.into_iter().next().flatten();
                     if let Some(error) = error {
-                        self.progress.error(&format!("syq: {error}"));
+                        let os_kind = wire_os_kind(&error);
+                        self.progress.error_classified(
+                            &format!("syq: {error}"),
+                            Some("io"),
+                            os_kind,
+                        );
+                        if capacity_os_kind(os_kind) {
+                            return Err(endpoint_error(error)).context("apply destination changes");
+                        }
                         self.collision = true;
                         return Ok(());
                     }
@@ -4626,7 +4941,7 @@ impl Planner<'_> {
                         .pop()
                         .flatten()
                         .filter(|entry| entry.kind == Kind::Dir)
-                        .context("new exact destination was not a directory after creation")?;
+                        .context("new exact target was not a directory after creation")?;
                     self.exact_condition = target_identity(&created);
                     self.mutation_root_condition = target_identity(&created);
                     if self.guard_containers {
@@ -4645,18 +4960,20 @@ impl Planner<'_> {
                         })
                         .collect();
                     let errs = self.apply(new_dirs)?;
+                    let capacity_error = first_capacity_error(&errs);
                     let mut failed = 0;
                     let mut reopened = 0;
                     for ((name, condition), err) in op_info.iter().zip(errs) {
                         let preexisting = existing_dirs.contains(name);
                         let succeeded = err.is_none();
                         let created = succeeded && !preexisting;
-                        if let Some(err) = err {
+                        let os_kind = err.as_ref().and_then(wire_os_kind);
+                        if let Some(err) = &err {
                             failed += 1;
                             self.progress.error_classified(
                                 &format!("syq: {err}"),
                                 Some("io"),
-                                None,
+                                os_kind,
                             );
                             if name == &self.root_path && *condition != TargetCondition::Any {
                                 self.collision = true;
@@ -4696,14 +5013,17 @@ impl Planner<'_> {
                                     "unknown"
                                 }),
                                 class: (!created).then_some("io"),
-                                os_kind: None,
-                                message: None,
+                                os_kind,
+                                message: err.as_ref().map(WireError::as_str),
                             });
                         }
                     }
                     self.progress
                         .dirs_created
                         .fetch_add((n - failed - reopened) as u64, Relaxed);
+                    if let Some(error) = capacity_error {
+                        return Err(endpoint_error(error)).context("apply destination changes");
+                    }
                 }
                 let mut flags = opts.flags;
                 if !opts.perms {
@@ -4807,7 +5127,7 @@ impl Planner<'_> {
             };
             if !target_condition_holds {
                 self.progress.error(&format!(
-                    "syq: destination {} changed after the placement precondition was checked",
+                    "syq: target {} changed after the placement precondition was checked",
                     display(&dst_path)
                 ));
                 self.collision = true;
@@ -5164,20 +5484,27 @@ impl Planner<'_> {
             }
         }
         if !meta_fixes.is_empty() {
-            for err in self.apply(meta_fixes)?.into_iter().flatten() {
+            let errors = self.apply(meta_fixes)?;
+            let capacity_error = first_capacity_error(&errors);
+            for err in errors.into_iter().flatten() {
                 self.progress.error(&format!("syq: {err}"));
+            }
+            if let Some(error) = capacity_error {
+                return Err(endpoint_error(error)).context("apply destination changes");
             }
         }
         if !ops.is_empty() {
             let errs = self.apply(ops)?;
+            let capacity_error = first_capacity_error(&errs);
             // Two ops per item: creation then metadata.
             for (i, queued) in op_names.iter().enumerate() {
                 let e1 = errs.get(2 * i).cloned().flatten();
                 let e2 = errs.get(2 * i + 1).cloned().flatten();
                 let error = e1.or(e2);
+                let os_kind = error.as_ref().and_then(wire_os_kind);
                 if let Some(e) = &error {
                     self.progress
-                        .error_classified(&format!("syq: {e}"), Some("io"), None);
+                        .error_classified(&format!("syq: {e}"), Some("io"), os_kind);
                 } else {
                     // Counted only once the operation settles: a fatal
                     // unwind between queueing and applying must not leave
@@ -5209,10 +5536,13 @@ impl Planner<'_> {
                         attempts: None,
                         retryable: error.is_some().then_some("unknown"),
                         class: error.is_some().then_some("io"),
-                        os_kind: None,
-                        message: error.as_deref(),
+                        os_kind,
+                        message: error.as_ref().map(WireError::as_str),
                     });
                 }
+            }
+            if let Some(error) = capacity_error {
+                return Err(endpoint_error(error)).context("apply destination changes");
             }
         }
         Ok(())
@@ -5991,7 +6321,7 @@ impl Planner<'_> {
         }
     }
 
-    fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<String>>> {
+    fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
         match ok(
             self.dst.call(Request::Apply {
                 ops,
@@ -6018,8 +6348,13 @@ impl Planner<'_> {
                     condition: *condition,
                 })
                 .collect();
-            for err in self.apply(ops)?.into_iter().flatten() {
+            let errors = self.apply(ops)?;
+            let capacity_error = first_capacity_error(&errors);
+            for err in errors.into_iter().flatten() {
                 self.progress.error(&format!("syq: {err}"));
+            }
+            if let Some(error) = capacity_error {
+                return Err(endpoint_error(error)).context("apply destination changes");
             }
         }
         Ok(())
@@ -6367,7 +6702,7 @@ impl Worker {
             } else {
                 match applied.next().flatten() {
                     None => Ok(()),
-                    Some(error) => Err(anyhow::anyhow!("put: {error}")),
+                    Some(error) => Err(endpoint_error(error)).context("put"),
                 }
             };
             results.push(res);
@@ -6399,6 +6734,9 @@ impl Worker {
                 );
                 self.emit_file_result_failed(j, "unknown", os_kind, &message);
                 self.sched.fail_file(*idx);
+                if capacity_os_kind(os_kind) {
+                    self.sched.abort();
+                }
                 continue;
             }
             let changed = match &now {
@@ -6490,6 +6828,9 @@ impl Worker {
             );
             self.emit_file_result_failed(&job, "unknown", os_kind, &message);
             self.sched.fail_file(idx);
+            if capacity_os_kind(os_kind) {
+                self.sched.abort();
+            }
         }
         Ok(())
     }
@@ -6815,6 +7156,7 @@ impl Worker {
                 Ok(true)
             }
             Response::CopyLocalUnsupported => Ok(false),
+            Response::EndpointError(error) => Err(endpoint_error(error)),
             Response::Err(e) => bail!("{e}"),
             other => bail!("unexpected response {other:?}"),
         }
@@ -7312,6 +7654,21 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_semantic_error_kind_wins_over_numeric_errno() {
+        let error = WireError {
+            message: "receiver quota exhausted".into(),
+            io_kind: Some(WireIoKind::QuotaExceeded),
+            // Deliberately contradict the semantic kind. Numeric errno values
+            // belong to the receiver ABI and must never drive coordinator
+            // policy.
+            raw_os_error: Some(libc::ENOSPC),
+        };
+        assert_eq!(wire_os_kind(&error), Some("quota_exceeded"));
+        assert!(capacity_os_kind(wire_os_kind(&error)));
+        assert_eq!(os_kind_of(&endpoint_error(error)), Some("quota_exceeded"));
+    }
 
     #[test]
     fn raw_path_identity_is_lossless_without_changing_utf8_identity() {

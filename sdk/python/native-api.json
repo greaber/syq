@@ -50,8 +50,10 @@
         "min-size"
       ],
       "internal": [
+        "delegated-operands-b64",
         "results",
-        "results-fd"
+        "results-fd",
+        "suppress-summary"
       ],
       "aliases": {
         "srcs": "src",

@@ -8,9 +8,13 @@ repo_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_dir/Cargo.toml" | head -1)
 target_dir=$(cargo metadata --no-deps --format-version 1 \
   --manifest-path "$repo_dir/Cargo.toml" | jq -r .target_directory)
-
-cargo package --locked --manifest-path "$repo_dir/Cargo.toml"
 package="$target_dir/package/syq-$version.crate"
+
+# Cargo can leave trailing bytes when replacing a same-version archive with a
+# shorter one. Remove only this generated package so extraction verifies the
+# newly written archive rather than stale local target state.
+rm -f -- "$package"
+cargo package --locked --manifest-path "$repo_dir/Cargo.toml"
 if [ ! -f "$package" ] || [ -L "$package" ]; then
   echo "cargo did not create $package" >&2
   exit 1

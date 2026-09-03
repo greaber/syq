@@ -1261,6 +1261,17 @@ impl Root {
             );
         }
         let temporary = create_temporary(&parent, create)?;
+        let replacement = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+        if replacement.file_type() != expected_type || replacement.nlink != 1 {
+            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
+            bail!("confined replacement for {} is not safe", path.label());
+        }
+        #[cfg(test)]
+        run_publication_test_hook(
+            self.identity,
+            path,
+            PublicationTestPoint::BeforeMatchedExchange,
+        );
         if let Err(error) = rename_exchange(
             parent.directory.as_raw_fd(),
             &temporary,
@@ -1271,19 +1282,35 @@ impl Root {
             return Err(error)
                 .with_context(|| format!("atomically replace confined path {}", path.label()));
         }
+        #[cfg(test)]
+        run_publication_test_hook(
+            self.identity,
+            path,
+            PublicationTestPoint::AfterMatchedExchange,
+        );
+        let published = metadata_at(parent.directory.as_raw_fd(), &parent.leaf)?;
         let swapped = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+        if published.dev != replacement.dev
+            || published.ino != replacement.ino
+            || published.file_type() != expected_type
+            || published.nlink != 1
+        {
+            // The replacement name was raced before the exchange, or another
+            // writer has already updated the target. Either way, the target
+            // name must not be touched again.
+            bail!(
+                "confined replacement for {} changed during replacement",
+                path.label()
+            );
+        }
         if swapped.dev != expected_dev
             || swapped.ino != expected_ino
             || swapped.file_type() != expected_type
         {
-            rename_exchange(
-                parent.directory.as_raw_fd(),
-                &temporary,
-                parent.directory.as_raw_fd(),
-                &parent.leaf,
-            )
-            .with_context(|| format!("restore raced destination {}", path.label()))?;
-            unlink_at(parent.directory.as_raw_fd(), &temporary, 0)?;
+            // Another writer may already have replaced `path` after our
+            // exchange. Never mutate that name again: a compensating exchange
+            // could remove the later writer's result. Preserve the displaced
+            // entry under the temporary name and report the race.
             bail!(
                 "confined destination {} changed during replacement",
                 path.label()
@@ -1396,24 +1423,21 @@ impl Root {
 
     /// Atomically replace exactly one previously observed regular-file inode.
     /// The exchange retains the displaced inode under the staged name long
-    /// enough to verify it. A raced target is exchanged back and left intact.
+    /// enough to verify it. After the exchange, mismatch handling never
+    /// touches the target name again, so a later writer cannot be rolled back.
     pub(crate) fn replace_regular_if_same(
         &self,
         source: &RelativePath,
         target: &RelativePath,
+        staged_identity: (u64, u64),
         expected_dev: u64,
         expected_ino: u64,
         expected_ctime: Option<(i64, u32)>,
     ) -> Result<()> {
-        let source_parent = self.resolve_parent(source)?;
-        let target_parent = self.resolve_parent(target)?;
+        let (staged_dev, staged_ino) = staged_identity;
+        let (source_parent, target_parent) = self.resolve_publish_parents(source, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
-        if !staged.is_file() {
-            bail!(
-                "confined staged path {} is not a regular file",
-                source.label()
-            );
-        }
+        require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
         let before = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
         let has_expected_identity = |metadata: RootMetadata| {
             metadata.is_file() && metadata.dev == expected_dev && metadata.ino == expected_ino
@@ -1428,6 +1452,12 @@ impl Root {
                 target.label()
             );
         }
+        #[cfg(test)]
+        run_publication_test_hook(
+            self.identity,
+            target,
+            PublicationTestPoint::BeforeMatchedExchange,
+        );
         rename_exchange(
             source_parent.directory.as_raw_fd(),
             &source_parent.leaf,
@@ -1435,18 +1465,27 @@ impl Root {
             &target_parent.leaf,
         )
         .with_context(|| format!("atomically publish confined path {}", target.label()))?;
+        #[cfg(test)]
+        run_publication_test_hook(
+            self.identity,
+            target,
+            PublicationTestPoint::AfterMatchedExchange,
+        );
+        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
         let displaced = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+        if !is_safe_staged_identity(published, staged_dev, staged_ino) {
+            bail!(
+                "confined staged path {} changed during publication",
+                source.label()
+            );
+        }
         // The exchange itself may update the displaced inode's ctime. Its
         // dev/inode identity cannot be recycled while the link still exists,
         // so the pre-exchange fingerprint plus this identity check is enough.
         if !has_expected_identity(displaced) {
-            rename_exchange(
-                source_parent.directory.as_raw_fd(),
-                &source_parent.leaf,
-                target_parent.directory.as_raw_fd(),
-                &target_parent.leaf,
-            )
-            .with_context(|| format!("restore raced destination {}", target.label()))?;
+            // The target may already contain a still-later writer's result.
+            // Never exchange it again after publication; retain the displaced
+            // entry under the staged name and report the race.
             bail!(
                 "confined destination {} changed during publication",
                 target.label()
@@ -2133,6 +2172,8 @@ fn require_safe_staged_identity(
 enum PublicationTestPoint {
     AfterAnyRename,
     AfterAbsentLink,
+    BeforeMatchedExchange,
+    AfterMatchedExchange,
 }
 
 #[cfg(test)]
@@ -3000,6 +3041,194 @@ mod tests {
         assert!(format!("{error:#}").contains("changed during publication"));
         assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
         assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"staged");
+    }
+
+    #[test]
+    fn matched_publication_authenticates_the_held_staged_inode() {
+        let tree = TestDir::new("matched-publication-staged-identity");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_file = File::open(tree.path().join("staged")).unwrap();
+        let staged_metadata = staged_file.metadata().unwrap();
+        let target_metadata = root.metadata(&target).unwrap();
+
+        fs::rename(tree.path().join("staged"), tree.path().join("held-staged")).unwrap();
+        fs::write(tree.path().join("staged"), b"impostor").unwrap();
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                target_metadata.dev,
+                target_metadata.ino,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("not the expected singly-linked regular file"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"old");
+        assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"impostor");
+        assert_eq!(
+            staged_metadata.ino(),
+            fs::metadata(tree.path().join("held-staged")).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn matched_publication_detects_a_staged_race_during_exchange() {
+        let tree = TestDir::new("matched-publication-staged-race");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_file = File::open(tree.path().join("staged")).unwrap();
+        let staged_metadata = staged_file.metadata().unwrap();
+        let target_metadata = root.metadata(&target).unwrap();
+
+        let staged_path = tree.path().join("staged");
+        let held_staged_path = tree.path().join("held-staged");
+        let _before_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::BeforeMatchedExchange,
+            move || {
+                fs::rename(&staged_path, &held_staged_path).unwrap();
+                fs::write(&staged_path, b"impostor").unwrap();
+            },
+        );
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                target_metadata.dev,
+                target_metadata.ino,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("staged path staged changed during publication"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"impostor");
+        assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"old");
+        assert_eq!(
+            fs::read(tree.path().join("held-staged")).unwrap(),
+            b"staged"
+        );
+    }
+
+    #[test]
+    fn matched_publication_never_rolls_back_a_later_writer() {
+        let tree = TestDir::new("matched-publication-race");
+        let root = Root::open(tree.path()).unwrap();
+        let staged = relative(b"staged");
+        let target = relative(b"target");
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let target_metadata = root.metadata(&target).unwrap();
+
+        let target_path = tree.path().join("target");
+        let old_target_path = tree.path().join("old-target");
+        let _before_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::BeforeMatchedExchange,
+            move || {
+                fs::rename(&target_path, &old_target_path).unwrap();
+                fs::write(&target_path, b"raced-before-exchange").unwrap();
+            },
+        );
+        let target_path = tree.path().join("target");
+        let published_staged_path = tree.path().join("published-staged");
+        let _after_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::AfterMatchedExchange,
+            move || {
+                fs::rename(&target_path, &published_staged_path).unwrap();
+                fs::write(&target_path, b"later").unwrap();
+            },
+        );
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                target_metadata.dev,
+                target_metadata.ino,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed during publication"));
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
+        assert_eq!(
+            fs::read(tree.path().join("staged")).unwrap(),
+            b"raced-before-exchange"
+        );
+        assert_eq!(fs::read(tree.path().join("old-target")).unwrap(), b"old");
+        assert_eq!(
+            fs::read(tree.path().join("published-staged")).unwrap(),
+            b"staged"
+        );
+    }
+
+    #[test]
+    fn matched_leaf_replacement_never_rolls_back_a_later_writer() {
+        let tree = TestDir::new("matched-leaf-race");
+        let root = Root::open(tree.path()).unwrap();
+        let target = relative(b"target");
+        root.create_symlink(&target, b"old").unwrap();
+        let target_metadata = root.metadata(&target).unwrap();
+
+        let target_path = tree.path().join("target");
+        let old_target_path = tree.path().join("old-target");
+        let _before_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::BeforeMatchedExchange,
+            move || {
+                fs::rename(&target_path, &old_target_path).unwrap();
+                symlink("raced-before-exchange", &target_path).unwrap();
+            },
+        );
+        let target_path = tree.path().join("target");
+        let published_replacement_path = tree.path().join("published-replacement");
+        let _after_exchange = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::AfterMatchedExchange,
+            move || {
+                fs::rename(&target_path, &published_replacement_path).unwrap();
+                symlink("later", &target_path).unwrap();
+            },
+        );
+        let error = root
+            .replace_symlink_if_same(
+                &target,
+                b"replacement",
+                target_metadata.dev,
+                target_metadata.ino,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed during replacement"));
+        assert_eq!(
+            fs::read_link(tree.path().join("target")).unwrap(),
+            Path::new("later")
+        );
+        assert_eq!(
+            fs::read_link(tree.path().join("old-target")).unwrap(),
+            Path::new("old")
+        );
+        assert_eq!(
+            fs::read_link(tree.path().join("published-replacement")).unwrap(),
+            Path::new("replacement")
+        );
     }
 
     #[test]

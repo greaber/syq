@@ -361,8 +361,13 @@ pub(crate) fn tcp_socket_stats(_stream: &TcpStream) -> Option<TcpSocketStats> {
 pub fn ok(resp: Response, what: &str) -> Result<Response> {
     match resp {
         Response::Err(e) => Err(anyhow!("{what}: {e}")),
+        Response::EndpointError(error) => Err(endpoint_error(error)).context(what.to_owned()),
         r => Ok(r),
     }
+}
+
+pub fn endpoint_error(error: WireError) -> anyhow::Error {
+    anyhow::Error::new(error)
 }
 
 pub struct LocalConn {

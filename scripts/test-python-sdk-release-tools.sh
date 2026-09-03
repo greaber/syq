@@ -8,7 +8,6 @@ cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$work/sdk/python/src/syq"
-cp "$repo_dir/sdk/README.md" "$work/sdk/README.md"
 cp "$repo_dir/sdk/python/README.md" "$work/sdk/python/README.md"
 cp "$repo_dir/sdk/python/pyproject.toml" "$work/sdk/python/pyproject.toml"
 cp "$repo_dir/sdk/python/src/syq/syq-release-manifest.json" \
@@ -18,10 +17,12 @@ current_manifest="$repo_dir/sdk/python/src/syq/syq-release-manifest.json"
 current_syq_version=$(jq -er .version "$current_manifest")
 current_python_version=$(sed -n 's/^version = "\(.*\)"/\1/p' \
   "$repo_dir/sdk/python/pyproject.toml")
-IFS=. read -r syq_major syq_minor syq_patch <<<"$current_syq_version"
-IFS=. read -r python_major python_minor python_patch <<<"$current_python_version"
-next_syq_version="$syq_major.$syq_minor.$((syq_patch + 1))"
-next_python_version="$python_major.$python_minor.$((python_patch + 1))"
+test "$current_python_version" = "$current_syq_version"
+IFS=. read -r syq_major syq_minor _ <<<"$current_syq_version"
+# Use a non-patch increment so the test proves that the incoming syq version is
+# copied instead of independently incrementing the Python patch component.
+next_syq_version="$syq_major.$((syq_minor + 1)).0"
+next_python_version=$next_syq_version
 candidate="$work/candidate.json"
 jq --arg version "$next_syq_version" \
   '{
@@ -41,12 +42,12 @@ python3 "$script_dir/prepare-python-sdk-release.py" \
 
 grep -Fx "version = \"$next_python_version\"" \
   "$work/sdk/python/pyproject.toml" >/dev/null
-grep -F "For Python package \`$next_python_version\`, that release is syq \`$next_syq_version\`." \
+grep -F "package \`$next_python_version\`" \
+  "$work/sdk/python/README.md" >/dev/null
+grep -F "manages syq \`$next_syq_version\`." \
   "$work/sdk/python/README.md" >/dev/null
 test "$(grep -Fc "syq/sdk/python/v$next_syq_version/" \
   "$work/sdk/python/README.md")" -eq 2
-grep -Fx "| \`$next_python_version\` | \`$next_syq_version\` |" \
-  "$work/sdk/README.md" >/dev/null
 cmp "$candidate" "$work/sdk/python/src/syq/syq-release-manifest.json"
 
 before=$(find "$work/sdk" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)
@@ -54,6 +55,23 @@ python3 "$script_dir/prepare-python-sdk-release.py" \
   --root "$work" --manifest "$candidate"
 after=$(find "$work/sdk" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)
 test "$before" = "$after"
+
+misaligned="$work/misaligned"
+mkdir -p "$misaligned/sdk/python/src/syq"
+cp "$repo_dir/sdk/python/README.md" "$misaligned/sdk/python/README.md"
+cp "$repo_dir/sdk/python/pyproject.toml" "$misaligned/sdk/python/pyproject.toml"
+cp "$repo_dir/sdk/python/src/syq/syq-release-manifest.json" \
+  "$misaligned/sdk/python/src/syq/syq-release-manifest.json"
+sed -i 's/^version = ".*"/version = "0.0.0"/' \
+  "$misaligned/sdk/python/pyproject.toml"
+if python3 "$script_dir/prepare-python-sdk-release.py" \
+  --root "$misaligned" --manifest "$candidate" \
+  > "$work/misaligned.out" 2>&1; then
+  echo 'misaligned Python and syq versions unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -F "current Python SDK 0.0.0 does not match pinned syq $current_syq_version" \
+  "$work/misaligned.out" >/dev/null
 
 invalid="$work/invalid.json"
 jq 'del(.signature)' "$candidate" > "$invalid"

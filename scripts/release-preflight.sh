@@ -2,10 +2,11 @@
 # Read-only validation of every locally auditable prerequisite before a tag is pushed.
 set -euo pipefail
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 CANONICAL_REPOSITORY=greaber/syq
 HOMEBREW_REPOSITORY=greaber/homebrew-tap
 RELEASE_ENVIRONMENT=release
-REQUIRED_CHECKS=rust,sdks,macos,linux-arm64
+REQUIRED_CHECKS=rust,sdks,macos,linux-arm64,conformance
 CRATES_AUTH_ACTION=rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -76,12 +77,13 @@ IFS=, read -ra check_names <<<"$REQUIRED_CHECKS"
 for check_name in "${check_names[@]}"; do
   conclusion=$(jq -r --arg name "$check_name" '
     [.check_runs[] | select(.name == $name)] |
-    if length == 0 then "missing" elif length > 1 then "ambiguous"
-    else .[0].conclusion // "pending" end
+    sort_by([(.started_at // .completed_at // ""), (.id // 0)]) |
+    if length == 0 then "missing" else last.conclusion // "pending" end
   ' <<<"$checks")
   [ "$conclusion" = success ] \
     || die "required check $check_name is $conclusion on $head"
 done
+"$script_dir/verify-release-ci.sh" "$CANONICAL_REPOSITORY" "$head"
 
 signing_key=$(git config --get user.signingkey 2>/dev/null || true)
 signing_key=${signing_key#key::}

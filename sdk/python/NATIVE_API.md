@@ -297,12 +297,11 @@ recover the order in which separately named keyword arguments appeared in a
 call, so `IgnoreFrom` is the native `--ignore-from` occurrence used inside the
 single ordered stream rather than a new filtering concept.
 
-Native remote controls keep their command names mechanically (on the
-typed surface `coordinate_at` accepts only `auto` and `local`, and a
-remote-to-remote copy requires an explicit `coordinate_at="local"`: the
-results stream is written by the transfer coordinator, remote
-placement would move it off this machine, and the local relay is
-never chosen implicitly): `coordinate_at`, `rsh`,
+Native remote controls keep their command names mechanically (a
+remote-to-remote copy needs either a command-restricted receiver
+enrollment — its verified receipt becomes the receiver-attested
+results stream — or an explicit `coordinate_at="local"`; syq refuses the
+combination at runtime otherwise): `coordinate_at`, `rsh`,
 `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
 `tcp_congestion`, `no_forward_agent`, `unrestricted_agent_forwarding`, and
 `agent_broker_only`. Endpoint strings passed through `from_` and `to` include
@@ -481,8 +480,9 @@ shared execution trace and terminal result.
 Typed operations consume the stable automation stream. `on_event` receives
 frozen dataclasses corresponding to its known records: `RunEvent`, sampled
 `ProgressEvent`, dry-run `TraceEvent` or live `OperationResult`, `ErrorEvent`,
-and the terminal `CpResult`. Additive unknown record types are validated for a
-well-formed envelope and sequence position, then ignored.
+receiver-attested `FinalStateEvent`, and the terminal `CpResult`. Additive
+unknown record types are validated for a well-formed envelope and sequence
+position, then ignored.
 
 The product's [automation-v1 contract](../../docs/automation-v1.md) and
 [JSON Schema](../../schemas/automation-v1.schema.json), not this document, own
@@ -496,6 +496,9 @@ The client validates at least these stream invariants:
 - strictly increasing sequence numbers starting at zero;
 - path tags and unsigned 64-bit integer ranges;
 - required fields and documented enum values;
+- the final-state object's per-state field variants and the
+  receiver-attested terminal shape (receipt status vocabulary, required
+  bookkeeping, and `deletions_completed`);
 - agreement between the invocation and the run's `prune`, `mapping`, and
   `dry_run` flags;
 - exactly one terminal result, with nothing after it; and
@@ -507,8 +510,10 @@ operation succeeded or the process status is zero.
 Successful operation events are not retained by default. A copy may contain
 millions of entries; callers that need a ledger consume `on_event` and write
 one. Terminal aggregates are retained in the returned `CpResult`. Prune-only
-deletion totals are optional fields on that same type and are required exactly
-when the run has `prune=True`.
+deletion totals are optional fields on that same type. An ordinary terminal
+carries all three exactly when the run has `prune=True`; a receiver-attested
+terminal carries only `deletions_completed` (planning and `--max-delete`
+blocking are coordinator concepts a receipt cannot attest).
 
 ## Failure model
 
@@ -622,9 +627,10 @@ file.
 
 ## Compatibility and versioning
 
-Every published Python package pins one exact syq release. That is the tested
-default pairing. Several Python releases may pin the same syq release, but one
-published Python version never changes its pin.
+Every published Python package has the same version as the exact syq release it
+pins. That is the tested default pairing, and a published Python version never
+changes its pin. Python-only changes ship with the next syq release rather than
+creating an independently numbered package.
 
 The automation schema has its own version. The Python package supports stated
 schema major versions rather than guessing compatibility from the executable's
@@ -634,8 +640,10 @@ schema's compatibility policy.
 Mapping entries are supported at the exact SDK/binary pairing. A separately
 versioned mapping schema can broaden that compatibility boundary later.
 
-Python API changes follow Python package semantic versioning. Adding support
-for a new syq release does not by itself justify a breaking Python API change.
+The Python package does not maintain a compatibility version separate from the
+syq product release. Python API and native changes still follow their documented
+compatibility contracts; sharing a release number does not make the executable
+version a substitute for the automation schema version.
 
 The naming rule is part of compatibility. A new native command `foo-bar`
 reserves `foo_bar`; a new semantic `--some-option` reserves `some_option`.
