@@ -11,11 +11,13 @@ use crate::conn::{
 };
 use crate::fsops::{content_digest, is_partial_name, join};
 use crate::progress::{commas, human, Progress, WorkerStatus};
+use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
 use crate::tune::{self, Gate};
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -91,6 +93,9 @@ pub struct Opts {
     pub ignore_existing: bool,
     /// --existing: never create a destination path that doesn't exist.
     pub existing: bool,
+    /// Explicit rsync compatibility escape hatch for unconfined source
+    /// discovery through symlinked descendant components.
+    pub insecure_links: bool,
     /// Symlink policy for the operator-selected destination path.
     pub operator_symlink_policy: OperatorSymlinkPolicy,
     /// --max-size / --min-size: regular files outside the range are not transferred.
@@ -100,7 +105,7 @@ pub struct Opts {
 
 pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     Ok(match &loc.host {
-        None => Endpoint::Local,
+        None => Endpoint::local(),
         Some(h) => {
             let rsh = parse_rsh(&args.rsh)?;
             if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
@@ -164,11 +169,21 @@ fn destination_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
     }
 }
 
+fn control_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+    if args.interface == Interface::Rsync {
+        OperatorSymlinkPolicy::TrustedOwner
+    } else if args.native_follow {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    }
+}
+
 /// Open a control connection. It bypasses the data-connection connect
 /// limiter: the scan, and therefore every worker, waits on it.
 pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
     match ep {
-        Endpoint::Local => ep.connect(args.compress),
+        Endpoint::Local { .. } => ep.connect_control(args.compress),
         Endpoint::Remote(spec) => spec
             .connect_with(args.compress, false)
             .map(|c| Box::new(c) as Box<dyn Conn>),
@@ -486,8 +501,7 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
 
 /// The canonical form of a path (symlinks and `..` resolved the way the kernel
 /// does), normalized by the endpoint that holds it. Used for the job identity —
-/// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job — and for
-/// the copy-into-itself check.
+/// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job.
 fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::path::PathBuf> {
     if !remote {
         return Ok(crate::fsops::normalize(&crate::fsops::resolve(path)));
@@ -579,6 +593,9 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
         .any(|source| source.selection != crate::cli::SourceSelection::Rsync)
     {
         flags["source_modes"] = serde_json::json!(source_modes);
+    }
+    if opts.insecure_links {
+        flags["insecure_links"] = serde_json::json!(true);
     }
     flags.to_string()
 }
@@ -697,13 +714,12 @@ fn copy_identity(
 
 #[derive(Clone, Debug)]
 struct DestinationAnchor {
-    operator_path: PathBytes,
-    request_prefix: PathBytes,
+    destination: RegisteredDestinationRoot,
     dev: u64,
     ino: u64,
-    symlink_policy: OperatorSymlinkPolicy,
 }
 type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
+type SourceRootsSlot = std::sync::Arc<std::sync::OnceLock<Vec<RegisteredSourceRoot>>>;
 
 pub fn debug() -> bool {
     std::env::var_os("SYQ_DEBUG").is_some()
@@ -822,10 +838,6 @@ pub fn run(args: Args) -> Result<i32> {
             Box::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) })
         } else {
             let results = args.native_results.as_deref().expect("results requested");
-            if !args.native_follow {
-                crate::fsops::check_operator_path_no_symlinks(results, false, true)
-                    .map_err(|error| anyhow::anyhow!("--results: {error}"))?;
-            }
             let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
             // A results file is one run: created fresh, never truncated or
             // appended. Refusal keeps yesterday's stream (and anything a
@@ -833,17 +845,24 @@ pub fn run(args: Args) -> Result<i32> {
             // names. Placement is the operator's job — a path inside the
             // source or destination trees is documented as unpredictable,
             // not policed.
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
+            let file = crate::fsops::create_operator_file(
+                results,
+                control_operator_symlink_policy(&args),
+            )
+            .map_err(|error| {
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+                }) {
+                    anyhow::anyhow!(
                         "--results {}: the file already exists; a results file holds exactly one run — remove it or choose a new name (recurring jobs can timestamp: run-$(date +%s).ndjson)",
                         path.display()
-                    ),
-                    _ => anyhow::anyhow!("--results {}: {e}", path.display()),
-                })?;
+                    )
+                } else {
+                    anyhow::anyhow!("--results {}: {error}", path.display())
+                }
+            })?;
             Box::new(file)
         };
         let writer = Arc::new(crate::results::ResultsWriter::new(out));
@@ -995,15 +1014,6 @@ fn first_capacity_error(errors: &[Option<WireError>]) -> Option<WireError> {
 fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Post-parse validation lives inside the wrapper's error coverage, so
     // its failures still settle the stream with a failed terminal record.
-    if let Some(mapping) = args
-        .native_mapping
-        .as_deref()
-        .filter(|mapping| *mapping != b"-")
-        .filter(|_| !args.native_follow)
-    {
-        crate::fsops::check_operator_path_no_symlinks(mapping, false, false)
-            .map_err(|error| anyhow::anyhow!("--mapping: {error}"))?;
-    }
     let mut args = args;
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
     let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
@@ -1168,7 +1178,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
-    if matches!(dst_ep, Endpoint::Local) {
+    if matches!(dst_ep, Endpoint::Local { .. }) {
         dst_ep = Endpoint::Remote(RemoteSpec::local_receiver(args.quiet));
     }
     // TCP data connections are the default (auto-selecting the fastest reachable
@@ -1222,11 +1232,30 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         update: args.update,
         ignore_existing: args.ignore_existing,
         existing: args.existing,
+        insecure_links: args.interface == Interface::Rsync && args.insecure_links,
         operator_symlink_policy: destination_operator_symlink_policy(&args),
         max_size,
         min_size,
     });
-
+    // Acquire the entire mapping through its retained selection before any
+    // destination root can be created. The planner already consumes the whole
+    // manifest; retaining these bytes also makes later namespace replacement
+    // irrelevant.
+    let mapping_contents = if let Some(mapping) = args.native_mapping.as_deref() {
+        let mut contents = Vec::new();
+        if mapping == b"-" {
+            std::io::stdin()
+                .read_to_end(&mut contents)
+                .context("--mapping -: read stdin")?;
+        } else {
+            crate::fsops::open_operator_file_read(mapping, control_operator_symlink_policy(&args))
+                .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
+                .map_err(|error| anyhow::anyhow!("--mapping {}: {error}", display(mapping)))?;
+        }
+        Some(contents)
+    } else {
+        None
+    };
     let sched = Arc::new(Sched::new(block, DEFAULT_MIN_SPLIT_BYTES));
 
     // Workers connect on their own threads once the control connections are
@@ -1235,6 +1264,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // may spawn more workers later, so the handles live behind a mutex.
     let gate = Gate::new(args.connections);
     let destination_anchor: DestinationAnchorSlot = std::sync::Arc::new(std::sync::OnceLock::new());
+    let source_roots: SourceRootsSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let destination_anchor_required = args.restricted_grant.is_none();
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
         Arc::new(Mutex::new(Vec::new()));
@@ -1250,6 +1280,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             gate,
             workers,
             destination_anchor,
+            source_roots,
             bwlimit,
             transport_stats,
             connect_after_file_plan,
@@ -1262,6 +1293,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             gate.clone(),
             workers.clone(),
             destination_anchor.clone(),
+            source_roots.clone(),
             bwlimit.clone(),
             transport_stats.clone(),
             connect_after_file_plan.clone(),
@@ -1277,6 +1309,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 opts,
                 gate,
                 destination_anchor,
+                source_roots,
                 bwlimit,
                 transport_stats,
                 connect_after_file_plan,
@@ -1288,6 +1321,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 opts.clone(),
                 gate.clone(),
                 destination_anchor.clone(),
+                source_roots.clone(),
                 bwlimit.clone(),
                 transport_stats.clone(),
                 connect_after_file_plan.clone(),
@@ -1299,14 +1333,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     return Ok(());
                 }
                 let initial_destination = if destination_anchor_required {
-                    Some(worker_destination_request(
+                    Some(
                         destination_anchor
                             .get()
-                            .context("destination root was not anchored before workers started")?,
-                    ))
+                            .context("destination root was not anchored before workers started")?
+                            .destination
+                            .clone(),
+                    )
                 } else {
                     None
                 };
+                let initial_sources = source_roots
+                    .get()
+                    .context("source roots were not registered before workers started")?
+                    .clone();
                 let mut failures = 0u32;
                 loop {
                     if !gate.retained(id) {
@@ -1314,12 +1354,26 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         return Ok(());
                     }
                     let t0 = std::time::Instant::now();
-                    let conns = src_ep.connect(compress).and_then(|src| {
-                        Ok((
-                            src,
-                            dst_ep.connect_with_request(compress, initial_destination.clone())?,
-                        ))
-                    });
+                    let conns = src_ep
+                        .connect_with_sources(compress, initial_sources.clone())
+                        .and_then(|src| {
+                            let copy_sources = if cfg!(target_os = "linux")
+                                && opts.same_host
+                                && !opts.insecure_links
+                            {
+                                initial_sources.clone()
+                            } else {
+                                Vec::new()
+                            };
+                            Ok((
+                                src,
+                                dst_ep.connect_with_copy_capabilities(
+                                    compress,
+                                    initial_destination.clone(),
+                                    copy_sources,
+                                )?,
+                            ))
+                        });
                     let (src, dst) = match conns {
                         Ok(conns) => conns,
                         Err(error)
@@ -1476,6 +1530,43 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
+    let maximum_workers = if autotune {
+        tune::MAX
+    } else {
+        args.connections
+    };
+    let source_shared_workers = match &src_ep {
+        Endpoint::Local { .. } => maximum_workers,
+        Endpoint::Remote(_) if use_tcp => maximum_workers,
+        Endpoint::Remote(_) => 0,
+    };
+    let source_independent_claim_workers = match &src_ep {
+        Endpoint::Local { .. } => 0,
+        Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
+    };
+    // On Linux, each same-machine destination worker also claims the exact
+    // source capabilities from the source endpoint's broker before reporting
+    // ready. These are foreign-session claims even when both logical endpoints
+    // are local to the coordinator process.
+    let copy_local_claim_workers =
+        if cfg!(target_os = "linux") && opts.same_host && !opts.insecure_links {
+            maximum_workers
+        } else {
+            0
+        };
+    let source_independent_claim_workers = source_independent_claim_workers
+        .checked_add(copy_local_claim_workers)
+        .context("source worker count overflow")?;
+    let registered_sources = register_source_roots(
+        &mut *src_ctl,
+        srcs,
+        &args,
+        source_shared_workers,
+        source_independent_claim_workers,
+    )?;
+    source_roots
+        .set(registered_sources)
+        .expect("source roots set once");
     // One spelling for the destination root: every derived key — claims,
     // delete roots, destination-walk paths, receiver-computed sidecar names —
     // flows from this, and the receiver rebuilds paths through `Path`, which
@@ -1608,26 +1699,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     if args.interface != Interface::Rsync {
-        // This semantic preflight rejects a static symlink in every parent
-        // component of a directly supplied source path. The broader rooted
-        // copy migration will make the retained identity survive scanning and
-        // content opens in the presence of concurrent namespace mutation.
-        for source in srcs {
-            check_operator_directory(
-                &mut *src_ctl,
-                &parent_path(&source.path),
-                false,
-                source_operator_symlink_policy(&args),
-            )?;
-        }
         // Native selectors are structural: validate every selected root before
-        // a missing --into target can be created. Contents selectors require
-        // a directory and resolve a selected link only under the source
-        // follow policy.
-        for source in srcs {
-            match stat_one(
+        // a missing --into target can be created. The registered selection is
+        // authoritative here, so its operator path is not resolved again.
+        for (source_index, source) in srcs.iter().enumerate() {
+            match stat_one_registered(
                 &mut *src_ctl,
                 &source.path,
+                &source_roots.get().expect("source roots registered")[source_index].selection,
                 source.follows_root(args.follows_native_source_paths()),
             )? {
                 Some(entry) => {
@@ -1778,53 +1857,81 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let guard_containers = false;
     let mut container_guard = None;
 
-    // Reject copying a directory into itself: if the effective destination
-    // resolves to (or inside) a source directory, the scanner would discover
-    // the freshly-created destination and recurse. Now that both control
-    // connections exist we can check the real source type and destination-dir
-    // status, so a file copied onto itself is not misdiagnosed.
+    // Reject copying a directory into itself: if the effective destination is
+    // (or is beneath) a source directory, the scanner would discover the
+    // freshly-created destination and recurse. Compare the exact source and
+    // retained destination descriptors; never re-resolve either operator
+    // pathname for this decision.
     let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
         || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
     if same_machine {
-        // Both ends are one machine, so either control connection resolves
-        // paths the way that machine's kernel does (symlinks included).
-        let remote = dst.is_remote();
-        for s in srcs {
-            // Only a directory source can trigger the recurse-into-itself trap.
-            // Judge the source the way the scan will, including the interface's
-            // explicit selected-root link policy.
-            let follow_root =
-                args.files_from.is_some() || s.follows_root(args.follows_native_source_paths());
-            let src_is_dir = matches!(stat_one(&mut *src_ctl, &s.path, follow_root)?, Some(ref e) if e.kind == Kind::Dir);
-            if !src_is_dir {
+        let roots = source_roots.get().expect("source roots registered");
+        let mut source_checks = Vec::new();
+        let mut ancestry_checks = Vec::new();
+        for (source_index, (source, root)) in srcs.iter().zip(roots).enumerate() {
+            // Registration represents every selected directory as an empty
+            // path beneath that directory descriptor. Exact files and
+            // symlinks retain a non-empty leaf and cannot recurse.
+            if !root.selection.relative.is_empty() {
                 continue;
             }
-            let sn = canonical_path(&mut *src_ctl, &s.path, remote)?;
-            // Effective destination(s): the destination itself, plus
-            // destination/basename when placement uses it as a container.
-            let mut effs = vec![if exact_native_destination {
-                dst_canonical.clone()
+            let primary_suffix = if expand_exact_home || dst_is_dir {
+                Vec::new()
             } else {
-                canonical_path(&mut *src_ctl, &dst.path, remote)?
-            }];
-            if dst_is_dir && !s.copies_contents() && args.files_from.is_none() {
-                let base = s.basename();
-                if !base.is_empty() {
-                    let joined = join(dst.path.strip_suffix(b"/").unwrap_or(&dst.path), &base);
-                    effs.push(canonical_path(&mut *src_ctl, &joined, remote)?);
+                operator_dst_root
+                    .rsplit(|byte| *byte == b'/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_vec()
+            };
+            let mut suffixes = vec![primary_suffix];
+            if dst_is_dir && !source.copies_contents() && args.files_from.is_none() {
+                let basename = source.basename();
+                if !basename.is_empty() {
+                    suffixes.push(basename);
                 }
             }
-            for eff in effs {
-                if eff == sn {
-                    bail!(
+            source_checks.push((source_index, suffixes.len()));
+            ancestry_checks.push(DirectoryAncestryCheck {
+                source_root: root.ticket.clone(),
+                suffixes,
+            });
+        }
+
+        let relations = if ancestry_checks.is_empty() {
+            Vec::new()
+        } else {
+            check_operator_directory_ancestry(&mut *dst_ctl, ancestry_checks)?
+        };
+        if relations.len() != source_checks.len() {
+            bail!(
+                "destination returned {} ancestry results for {} directory sources",
+                relations.len(),
+                source_checks.len()
+            );
+        }
+        for ((source_index, expected_relations), relations) in
+            source_checks.into_iter().zip(relations)
+        {
+            if relations.len() != expected_relations {
+                bail!(
+                    "destination returned {} ancestry results for {} effective paths",
+                    relations.len(),
+                    expected_relations
+                );
+            }
+            let source = &srcs[source_index];
+            for relation in relations {
+                match relation {
+                    DirectoryRelation::Separate => {}
+                    DirectoryRelation::Same => bail!(
                         "source and destination are the same directory {:?}",
-                        display(&s.path)
-                    );
-                } else if eff.starts_with(&sn) {
-                    bail!(
+                        display(&source.path)
+                    ),
+                    DirectoryRelation::Descendant => bail!(
                         "destination {:?} maps inside source {:?} — that would copy the directory into itself",
-                        display(&dst.path), display(&s.path)
-                    );
+                        display(&dst.path), display(&source.path)
+                    ),
                 }
             }
         }
@@ -1904,12 +2011,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             directory_selection = Some(create_operator_directory(&mut *dst_ctl, condition)?);
         }
         if let Some(selection) = directory_selection.take() {
-            let anchor = activate_control_destination(
-                &mut *dst_ctl,
-                selection,
-                request_prefix.clone(),
-                opts.operator_symlink_policy,
-            )?;
+            let anchor =
+                activate_control_destination(&mut *dst_ctl, selection, request_prefix.clone())?;
             if create_root {
                 mutation_root_condition = TargetCondition::Matches {
                     dev: anchor.dev,
@@ -1980,7 +2083,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && [&src_ep, &dst_ep]
             .into_iter()
             .all(|endpoint| match endpoint {
-                Endpoint::Local => true,
+                Endpoint::Local { .. } => true,
                 Endpoint::Remote(spec) => spec
                     .tcp
                     .lock()
@@ -2091,27 +2194,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
             changes
         },
+        active_source: None,
     };
 
     let mut scan_err = None;
     let mut fresh_capacity_assessment = None;
     let mut fresh_capacity_shortage = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
-    if let Some(mapping) = args.native_mapping.as_deref() {
+    if let Some(mapping_contents) = mapping_contents.as_deref() {
         let src = &srcs[0];
-        let open = || -> Result<Box<dyn std::io::BufRead>> {
-            if mapping == b"-" {
-                return Ok(Box::new(std::io::stdin().lock()));
-            }
-            let path = std::path::PathBuf::from(OsStr::from_bytes(mapping).to_os_string());
-            Ok(Box::new(std::io::BufReader::new(
-                std::fs::File::open(&path)
-                    .map_err(|e| anyhow::anyhow!("--mapping {}: {e}", path.display()))?,
-            )))
-        };
-        match open().and_then(|mut reader| {
-            st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, &mut *reader)
-        }) {
+        st.active_source = Some(
+            source_roots.get().expect("source roots registered")[0]
+                .selection
+                .clone(),
+        );
+        let mut reader = std::io::Cursor::new(mapping_contents);
+        match st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, &mut reader) {
             Ok(()) => dry_run_mappings.push(DryRunMapping {
                 target: dst_root.clone(),
                 semantics: "entries selected by --mapping",
@@ -2120,6 +2218,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     } else if args.files_from.is_some() {
         let src = &srcs[0];
+        st.active_source = Some(
+            source_roots.get().expect("source roots registered")[0]
+                .selection
+                .clone(),
+        );
         match st.scan_files_from(
             &mut *src_ctl,
             &src.path,
@@ -2134,10 +2237,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             Err(e) => scan_err = Some(e),
         }
     }
-    for src in srcs
+    for (source_index, src) in srcs
         .iter()
         .filter(|_| args.files_from.is_none() && args.native_mapping.is_none())
+        .enumerate()
     {
+        st.active_source = Some(
+            source_roots.get().expect("source roots registered")[source_index]
+                .selection
+                .clone(),
+        );
         let src_root = src.path.clone();
         let contents = src.copies_contents();
         let follow_root = src.follows_root(args.follows_native_source_paths());
@@ -2642,12 +2751,27 @@ fn stat_many(
     paths: Vec<PathBytes>,
     follow: bool,
 ) -> Result<Vec<Option<Entry>>> {
+    stat_many_registered(conn, paths, None, follow)
+}
+
+fn stat_many_registered(
+    conn: &mut dyn Conn,
+    paths: Vec<PathBytes>,
+    sources: Option<Vec<RegisteredPath>>,
+    follow: bool,
+) -> Result<Vec<Option<Entry>>> {
     if paths.is_empty() {
         return Ok(Vec::new());
+    }
+    if let Some(sources) = &sources {
+        if sources.len() != paths.len() {
+            bail!("source stat capability count does not match path count");
+        }
     }
     match ok(
         conn.call(Request::StatMany {
             paths,
+            sources,
             follow,
             guard: None,
         })?,
@@ -2802,6 +2926,22 @@ fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Ent
         .flatten())
 }
 
+fn stat_one_registered(
+    conn: &mut dyn Conn,
+    path: &[u8],
+    source: &RegisteredPath,
+    follow: bool,
+) -> Result<Option<Entry>> {
+    Ok(stat_many_registered(
+        conn,
+        vec![path.to_vec()],
+        Some(vec![source.clone()]),
+        follow,
+    )?
+    .pop()
+    .flatten())
+}
+
 fn check_operator_directory(
     conn: &mut dyn Conn,
     path: &[u8],
@@ -2817,6 +2957,57 @@ fn check_operator_directory(
         "operator path",
     )? {
         Response::DirectorySelection(selection) => Ok(selection),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn check_operator_directory_ancestry(
+    conn: &mut dyn Conn,
+    checks: Vec<DirectoryAncestryCheck>,
+) -> Result<Vec<Vec<DirectoryRelation>>> {
+    match ok(
+        conn.call(Request::CheckOperatorDirectoryAncestry { checks })?,
+        "destination ancestry",
+    )? {
+        Response::DirectoryRelations(relations) => Ok(relations),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn register_source_roots(
+    conn: &mut dyn Conn,
+    sources: &[Location],
+    args: &Args,
+    shared_workers: usize,
+    independent_claim_workers: usize,
+) -> Result<Vec<RegisteredSourceRoot>> {
+    let selections = sources
+        .iter()
+        .map(|source| SourceRootSelection {
+            path: source.path.clone(),
+            // --files-from has always required its source operand to resolve
+            // to a directory. Descendant-link policy remains unchanged and is
+            // deliberately not encoded by this selected-root flag.
+            follow_root: args.files_from.is_some()
+                || source.follows_root(args.follows_native_source_paths()),
+        })
+        .collect();
+    match ok(
+        conn.call(Request::RegisterSourceRoots {
+            selections,
+            symlink_policy: source_operator_symlink_policy(args),
+            allow_unconfined_paths: args.interface == Interface::Rsync && args.insecure_links,
+            shared_workers,
+            independent_claim_workers,
+        })?,
+        "register source roots",
+    )? {
+        Response::SourceRootsRegistered(roots) if roots.len() == sources.len() => Ok(roots),
+        Response::SourceRootsRegistered(roots) => bail!(
+            "source endpoint registered {} roots for {} selections",
+            roots.len(),
+            sources.len()
+        ),
         other => bail!("unexpected response {other:?}"),
     }
 }
@@ -2858,37 +3049,24 @@ fn activate_control_destination(
     conn: &mut dyn Conn,
     selection: DirectoryAnchor,
     request_prefix: PathBytes,
-    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<DestinationAnchor> {
-    let anchor = DestinationAnchor {
-        operator_path: selection.path,
-        request_prefix,
-        dev: selection.dev,
-        ino: selection.ino,
-        symlink_policy,
-    };
     match ok(
         conn.call(Request::AnchorDestination {
-            path: None,
-            expected_dev: anchor.dev,
-            expected_ino: anchor.ino,
-            request_prefix: anchor.request_prefix.clone(),
-            symlink_policy,
+            expected_dev: selection.dev,
+            expected_ino: selection.ino,
+            request_prefix: request_prefix.clone(),
         })?,
         "anchor destination root",
     )? {
-        Response::Ok => Ok(anchor),
+        Response::DestinationRegistered(ticket) => Ok(DestinationAnchor {
+            destination: RegisteredDestinationRoot {
+                ticket,
+                request_prefix,
+            },
+            dev: selection.dev,
+            ino: selection.ino,
+        }),
         other => bail!("unexpected response {other:?}"),
-    }
-}
-
-fn worker_destination_request(anchor: &DestinationAnchor) -> Request {
-    Request::AnchorDestination {
-        path: Some(anchor.operator_path.clone()),
-        expected_dev: anchor.dev,
-        expected_ino: anchor.ino,
-        request_prefix: anchor.request_prefix.clone(),
-        symlink_policy: anchor.symlink_policy,
     }
 }
 
@@ -2930,6 +3108,7 @@ fn stat_and_canonicalize(
     }
     conn.send(Request::StatMany {
         paths: vec![stat_path.to_vec()],
+        sources: None,
         follow: false,
         guard: None,
     })?;
@@ -2959,6 +3138,7 @@ fn scan_into_planner(
     pl: &mut Planner<'_>,
     src: &mut dyn Conn,
     root: &[u8],
+    source: Option<&RegisteredPath>,
     follow_root: bool,
     ignore: &[String],
     mut f: impl FnMut(&mut Planner<'_>, Vec<Entry>) -> Result<()>,
@@ -2969,6 +3149,7 @@ fn scan_into_planner(
     let warned = std::cell::Cell::new(false);
     let res = src.scan(
         root,
+        source,
         follow_root,
         ignore,
         report_ignored,
@@ -3167,7 +3348,7 @@ fn remote_data_transport(spec: &RemoteSpec) -> &'static str {
 fn real_remote_spec(endpoint: &Endpoint) -> Option<&RemoteSpec> {
     match endpoint {
         Endpoint::Remote(spec) if !spec.local_process => Some(spec),
-        Endpoint::Local | Endpoint::Remote(_) => None,
+        Endpoint::Local { .. } | Endpoint::Remote(_) => None,
     }
 }
 
@@ -3551,6 +3732,9 @@ struct Planner<'a> {
     delete_roots: Vec<(PathBytes, PathBytes)>,
     deletes: Deletes,
     dry_run_changes: DryRunChanges,
+    /// Descriptor-session capability for the source currently feeding
+    /// planner batches. Buffered jobs retain their own derived path.
+    active_source: Option<RegisteredPath>,
 }
 
 /// What a source entry asserts about its destination path. Two dirs merge;
@@ -3577,6 +3761,7 @@ enum Claim {
 /// mapping loop so the directory pass and the per-kind arms can't disagree.
 struct Planned {
     src: PathBytes,
+    source: RegisteredPath,
     dst: PathBytes,
     dst_rel: PathBytes,
     rel: String,
@@ -3750,78 +3935,93 @@ impl Planner<'_> {
         let mut skip_all = false;
         let mut mapping = None;
         let ignore = self.opts.ignore.clone();
-        scan_into_planner(self, src, src_root, follow_root, &ignore, |pl, batch| {
-            if skip_all {
-                return Ok(());
-            }
-            if first {
-                first = false;
-                if let Some(root) = batch.first() {
-                    validate_native_source_type(src_root, selection, root.kind)?;
-                    if destination.exact && destination.entry_is_dir && root.kind != Kind::Dir {
-                        bail!(
+        let source = self
+            .active_source
+            .clone()
+            .context("registered source reference was not initialized")?;
+        scan_into_planner(
+            self,
+            src,
+            src_root,
+            if self.opts.insecure_links {
+                None
+            } else {
+                Some(&source)
+            },
+            follow_root,
+            &ignore,
+            |pl, batch| {
+                if skip_all {
+                    return Ok(());
+                }
+                if first {
+                    first = false;
+                    if let Some(root) = batch.first() {
+                        validate_native_source_type(src_root, selection, root.kind)?;
+                        if destination.exact && destination.entry_is_dir && root.kind != Kind::Dir {
+                            bail!(
                             "destination {} is an existing directory; cannot replace it with non-directory source {}",
                             display(dst_root),
                             display(src_root)
                         );
-                    }
-                    if pl.opts.dry_run
-                        && root.kind == Kind::Dir
-                        && !contents
-                        && pl.opts.recursive
-                        && dst_existed
-                        && !destination.entry_is_dir
-                        && !destination.exact
-                        && !pl.opts.existing
-                    {
-                        bail!(
+                        }
+                        if pl.opts.dry_run
+                            && root.kind == Kind::Dir
+                            && !contents
+                            && pl.opts.recursive
+                            && dst_existed
+                            && !destination.entry_is_dir
+                            && !destination.exact
+                            && !pl.opts.existing
+                        {
+                            bail!(
                             "destination {} is not a directory; cannot place directory {} inside it",
                             display(dst_root),
                             display(src_root)
                         );
-                    }
-                    if root.kind != Kind::Dir && !dst_is_dir {
-                        sub.clear();
-                    }
-                    mapping = Some(DryRunMapping {
-                        target: join(dst_root, &sub),
-                        semantics: if destination.exact {
-                            "exact destination path"
-                        } else {
-                            match (root.kind, contents, dst_is_dir) {
-                                (Kind::Dir, true, _) => "directory contents",
-                                (Kind::Dir, false, _) => "directory as child",
-                                (_, _, true) => "entry inside destination directory",
-                                _ => "exact destination path",
-                            }
-                        },
-                    });
-                    if root.kind == Kind::Dir && !pl.opts.recursive {
-                        if !pl.opts.quiet {
-                            pl.progress
-                                .eprintln(&format!("skipping directory {}", display(src_root)));
                         }
-                        skip_all = true;
-                        return Ok(());
-                    }
-                    if root.kind == Kind::Dir {
-                        pl.delete_roots.push((join(dst_root, &sub), sub.clone()));
+                        if root.kind != Kind::Dir && !dst_is_dir {
+                            sub.clear();
+                        }
+                        mapping = Some(DryRunMapping {
+                            target: join(dst_root, &sub),
+                            semantics: if destination.exact {
+                                "exact destination path"
+                            } else {
+                                match (root.kind, contents, dst_is_dir) {
+                                    (Kind::Dir, true, _) => "directory contents",
+                                    (Kind::Dir, false, _) => "directory as child",
+                                    (_, _, true) => "entry inside destination directory",
+                                    _ => "exact destination path",
+                                }
+                            },
+                        });
+                        if root.kind == Kind::Dir && !pl.opts.recursive {
+                            if !pl.opts.quiet {
+                                pl.progress
+                                    .eprintln(&format!("skipping directory {}", display(src_root)));
+                            }
+                            skip_all = true;
+                            return Ok(());
+                        }
+                        if root.kind == Kind::Dir {
+                            pl.delete_roots.push((join(dst_root, &sub), sub.clone()));
+                        }
                     }
                 }
-            }
-            pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            pl.handle_batch(batch, src_root, &sub, dst_root)
-        })?;
+                pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                pl.handle_batch(batch, src_root, &sub, dst_root)
+            },
+        )?;
         mapping.ok_or_else(|| anyhow::anyhow!("source scan returned no root entry"))
     }
 
     /// --files-from: instead of walking the source, stat each listed path (and
     /// the directories leading to it) and feed them to the planner as if a scan
-    /// had produced them. Implied parents are stat'ed through symlinks and must
-    /// resolve to directories; they become real directories on the destination,
-    /// so nothing is ever written through a destination symlink. Listed
-    /// directories — only those, not implied parents — are walked with an
-    /// explicit -r.
+    /// had produced them. By default, implied parents are descriptor-relative
+    /// and never traversed through symlinks. `--insecure-links` selects the
+    /// legacy unconfined pathname behavior explicitly. Listed directories —
+    /// only those, not implied parents — are walked with an explicit -r.
     fn scan_files_from(
         &mut self,
         src: &mut dyn Conn,
@@ -3831,11 +4031,23 @@ impl Planner<'_> {
         recurse: bool,
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
-        // Through a symlink: `syq --files-from L link dst` should work like `link/`.
+        let source_base = self
+            .active_source
+            .clone()
+            .context("registered source reference was not initialized")?;
         // Validate the root but never plan it: it isn't in the list, so an
-        // existing destination is not stamped with source-root metadata
-        // (creation-when-missing happened in run()).
-        match stat_one(src, src_root, true)? {
+        // existing destination is not stamped with source-root metadata.
+        let mut source_root_stat = if self.opts.insecure_links {
+            stat_many(src, vec![src_root.to_vec()], true)?
+        } else {
+            stat_many_registered(
+                src,
+                vec![src_root.to_vec()],
+                Some(vec![source_base.clone()]),
+                true,
+            )?
+        };
+        match source_root_stat.pop().flatten() {
             Some(e) if e.kind == Kind::Dir => {}
             Some(_) => bail!(
                 "--files-from: source {} is not a directory",
@@ -3846,12 +4058,10 @@ impl Planner<'_> {
         self.progress.scanned.fetch_add(1, Relaxed);
 
         // Listed paths are lstat'ed (a listed symlink copies as a symlink).
-        // Implied ancestors are stat'ed *through* symlinks and must resolve to
-        // directories: the user named a path through them, and on the
-        // destination they become real directories, so nothing is ever
-        // written through a symlink there. Results are kept for the whole
-        // list, since a later line may repeat a path or name one first seen
-        // as a parent.
+        // Implied ancestors must be directories. Registered stats never follow
+        // descendant symlinks; only --insecure-links uses legacy followed
+        // pathname stats. Results are kept for the whole list, since a later
+        // line may repeat a path or name one first seen as a parent.
         let mut leaves: HashMap<PathBytes, Option<Entry>> = HashMap::new();
         let mut parents: HashMap<PathBytes, Option<Entry>> = HashMap::new();
         // What the planner has been given for each path (Dir or not).
@@ -3864,12 +4074,16 @@ impl Planner<'_> {
                 .map(|(i, _)| line[..i].to_vec())
                 .collect()
         };
-        let stat = |src: &mut dyn Conn, paths: Vec<PathBytes>, follow: bool| {
-            stat_many(
-                src,
-                paths.iter().map(|r| join(src_root, r)).collect(),
-                follow,
-            )
+        let stat = |src: &mut dyn Conn, paths: Vec<PathBytes>, follow: bool| -> Result<_> {
+            let legacy_paths = paths.iter().map(|r| join(src_root, r)).collect();
+            if self.opts.insecure_links {
+                return stat_many(src, legacy_paths, follow);
+            }
+            let registered = paths
+                .iter()
+                .map(|relative| source_base.join(relative))
+                .collect::<Result<Vec<_>>>()?;
+            stat_many_registered(src, legacy_paths, Some(registered), follow)
         };
         for chunk in lines.chunks(crate::scan::BATCH) {
             let mut want_parents: Vec<PathBytes> = Vec::new();
@@ -3993,12 +4207,13 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// Consume an NDJSON mapping manifest: each entry claims exactly one
-    /// source object (relative to `src_root`) at an explicit destination
-    /// (relative to `dst_root`). Entries stream: chunks are planned and
-    /// applied before the manifest ends, so `--mapping -` starts work long
-    /// before stdin closes. Destination ancestors no entry names are
-    /// synthesized as implicit directories with default metadata.
+    /// Consume an already-acquired NDJSON mapping manifest: each entry claims
+    /// exactly one source object (relative to `src_root`) at an explicit
+    /// destination (relative to `dst_root`). The caller buffers the complete
+    /// input before opening the destination, and this planner validates the
+    /// complete manifest before applying any entry. Destination ancestors with
+    /// no entries are synthesized as implicit directories with default
+    /// metadata.
     fn scan_mapping(
         &mut self,
         src: &mut dyn Conn,
@@ -4008,7 +4223,19 @@ impl Planner<'_> {
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
         self.mapping_mode = true;
-        match stat_one(src, src_root, true)? {
+        let source_base = self
+            .active_source
+            .clone()
+            .context("registered source reference was not initialized")?;
+        match stat_many_registered(
+            src,
+            vec![src_root.to_vec()],
+            Some(vec![source_base.clone()]),
+            true,
+        )?
+        .pop()
+        .flatten()
+        {
             Some(e) if e.kind == Kind::Dir => {}
             Some(_) => bail!(
                 "--mapping: source base {} is not a directory",
@@ -4042,9 +4269,14 @@ impl Planner<'_> {
         while remaining.peek().is_some() {
             let chunk: Vec<(u64, ManifestEntry)> =
                 remaining.by_ref().take(crate::scan::BATCH).collect();
-            let stats = stat_many(
+            let source_paths = chunk
+                .iter()
+                .map(|(_, manifest)| source_base.join(&manifest.src))
+                .collect::<Result<Vec<_>>>()?;
+            let stats = stat_many_registered(
                 src,
                 chunk.iter().map(|(_, m)| join(src_root, &m.src)).collect(),
+                Some(source_paths),
                 false,
             )?;
             let mut batch: Vec<Entry> = Vec::new();
@@ -4176,26 +4408,43 @@ impl Planner<'_> {
         dst_root: &[u8],
         emitted: &mut std::collections::HashMap<PathBytes, Kind>,
     ) -> Result<()> {
-        scan_into_planner(self, src, &join(src_root, rel), false, &[], |pl, batch| {
-            let batch: Vec<Entry> = batch
-                .into_iter()
-                .filter(|e| !e.path.is_empty())
-                .map(|mut e| {
-                    e.path = join(rel, &e.path);
-                    e
-                })
-                .filter(|e| {
-                    if emitted.contains_key(&e.path) {
-                        false
-                    } else {
-                        emitted.insert(e.path.clone(), e.kind);
-                        true
-                    }
-                })
-                .collect();
-            pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            pl.handle_batch(batch, src_root, b"", dst_root)
-        })
+        let source = self
+            .active_source
+            .as_ref()
+            .context("registered source reference was not initialized")?
+            .join(rel)?;
+        scan_into_planner(
+            self,
+            src,
+            &join(src_root, rel),
+            if self.opts.insecure_links {
+                None
+            } else {
+                Some(&source)
+            },
+            false,
+            &[],
+            |pl, batch| {
+                let batch: Vec<Entry> = batch
+                    .into_iter()
+                    .filter(|e| !e.path.is_empty())
+                    .map(|mut e| {
+                        e.path = join(rel, &e.path);
+                        e
+                    })
+                    .filter(|e| {
+                        if emitted.contains_key(&e.path) {
+                            false
+                        } else {
+                            emitted.insert(e.path.clone(), e.kind);
+                            true
+                        }
+                    })
+                    .collect();
+                pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                pl.handle_batch(batch, src_root, b"", dst_root)
+            },
+        )
     }
 
     fn handle_batch(
@@ -4347,6 +4596,17 @@ impl Planner<'_> {
                 Some(actual) => join(src_root, actual),
                 None => join(src_root, &e.path),
             };
+            let source_relative = self
+                .src_overrides
+                .get(&e.path)
+                .map(Vec::as_slice)
+                .unwrap_or(&e.path);
+            let source = self
+                .active_source
+                .as_ref()
+                .expect("planner source reference initialized")
+                .join(source_relative)
+                .expect("scanner and manifest paths are strict relative paths");
             match claim {
                 Claim::Dir => dirs.push((dst, dst_rel, e)),
                 Claim::Weak if e.kind == Kind::Other => {
@@ -4363,6 +4623,7 @@ impl Planner<'_> {
                 }
                 Claim::File { .. } | Claim::Leaf => others.push(Planned {
                     src,
+                    source,
                     dst,
                     dst_rel,
                     rel,
@@ -4436,12 +4697,7 @@ impl Planner<'_> {
         if let Some((root, condition, is_destination_root)) = self.create_root.take() {
             if self.use_operator_anchor {
                 let selection = create_operator_directory(self.dst, condition)?;
-                let anchor = activate_control_destination(
-                    self.dst,
-                    selection,
-                    root.clone(),
-                    self.opts.operator_symlink_policy,
-                )?;
+                let anchor = activate_control_destination(self.dst, selection, root.clone())?;
                 if is_destination_root {
                     self.mutation_root_condition = TargetCondition::Matches {
                         dev: anchor.dev,
@@ -4838,6 +5094,7 @@ impl Planner<'_> {
         for (p, dst_entry) in others.into_iter().zip(stats) {
             let Planned {
                 src: src_path,
+                source,
                 dst: dst_path,
                 dst_rel,
                 rel,
@@ -4945,7 +5202,7 @@ impl Planner<'_> {
                     if opts.verify_only {
                         if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
                             self.enqueue(
-                                src_path.clone(),
+                                (src_path.clone(), source.clone()),
                                 dst_path.clone(),
                                 rel.clone(),
                                 dst_rel.clone(),
@@ -5055,7 +5312,7 @@ impl Planner<'_> {
                         }
                     } else {
                         self.enqueue(
-                            src_path,
+                            (src_path, source),
                             dst_path,
                             rel,
                             dst_rel.clone(),
@@ -5623,19 +5880,21 @@ impl Planner<'_> {
 
     fn enqueue(
         &mut self,
-        src: PathBytes,
+        source_path: (PathBytes, RegisteredPath),
         dst: PathBytes,
         rel: String,
         rel_bytes: PathBytes,
         entry: Entry,
         dst_entry: Option<Entry>,
     ) {
+        let (src, source) = source_path;
         let target_condition = self.exact_condition_for(&dst);
         let src_rel = self.mapping_source_rel(&rel_bytes);
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
             src,
+            source,
             dst,
             rel,
             rel_bytes,
@@ -5704,6 +5963,7 @@ impl Planner<'_> {
                 std::collections::HashSet::new();
             let res = self.dst.scan(
                 &root,
+                None,
                 false,
                 &ignore,
                 true,
@@ -6133,6 +6393,13 @@ struct BlockDiff {
 }
 
 impl Worker {
+    /// Confined source sessions carry the registered capability on every
+    /// content request. Only rsync's explicit --insecure-links compatibility
+    /// mode intentionally asks the endpoint to use its legacy pathname.
+    fn source_reference(&self, job: &FileJob) -> Option<RegisteredPath> {
+        (!self.opts.insecure_links).then(|| job.source.clone())
+    }
+
     fn run(&mut self) -> Result<()> {
         let r = self.run_inner();
         if r.is_err() && !self.transport_dead() {
@@ -6340,6 +6607,7 @@ impl Worker {
             .filter(|job| job.entry.size > 0)
             .map(|job| SmallRead {
                 path: job.src.clone(),
+                source: self.source_reference(job),
                 attempt: job.attempts,
                 len: job.entry.size as u32,
             })
@@ -6443,7 +6711,12 @@ impl Worker {
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
         let phase = std::time::Instant::now();
-        let now = stat_many(&mut *self.src, paths, false)?;
+        let now = if self.opts.insecure_links {
+            stat_many(&mut *self.src, paths, false)?
+        } else {
+            let registered = jobs.iter().map(|job| job.source.clone()).collect();
+            stat_many_registered(&mut *self.src, paths, Some(registered), false)?
+        };
         self.fast.restat += phase.elapsed().as_secs_f64();
         let phase = std::time::Instant::now();
         for ((idx, j), (res, now)) in batch
@@ -6649,6 +6922,7 @@ impl Worker {
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
         if self.opts.same_host
+            && !self.opts.insecure_links
             && !self.opts.checksum
             && self.bwlimit.is_none()
             && job.entry.size > 0
@@ -6853,7 +7127,7 @@ impl Worker {
         self.set_inplace(idx, inplace);
         let mode = self.create_mode(job);
         let resp = self.dst.call(Request::CopyLocal {
-            src: job.src.clone(),
+            source: job.source.clone(),
             dst: job.dst.clone(),
             inplace,
             allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
@@ -6881,9 +7155,8 @@ impl Worker {
                 }
                 Ok(true)
             }
-            Response::EndpointError(error) if error.message.contains("EXDEV") => Ok(false),
+            Response::CopyLocalUnsupported => Ok(false),
             Response::EndpointError(error) => Err(endpoint_error(error)),
-            Response::Err(e) if e.contains("EXDEV") => Ok(false),
             Response::Err(e) => bail!("{e}"),
             other => bail!("unexpected response {other:?}"),
         }
@@ -6927,6 +7200,7 @@ impl Worker {
             job,
             Request::HashBlocks {
                 path: job.dst.clone(),
+                source: None,
                 which,
                 partial_id: self.partial_id(),
                 block: self.opts.block,
@@ -6970,6 +7244,7 @@ impl Worker {
         let size = job.entry.size;
         self.src.send(Request::HashBlocks {
             path: job.src.clone(),
+            source: self.source_reference(job),
             which: Which::Final,
             partial_id: self.partial_id(),
             block,
@@ -7080,6 +7355,7 @@ impl Worker {
                 self.limit(n);
                 self.src.send(Request::ReadRange {
                     path: job.src.clone(),
+                    source: self.source_reference(&job),
                     attempt: job.attempts,
                     off,
                     len: n as u32,
@@ -7204,10 +7480,12 @@ impl Worker {
     fn contents_match(&mut self, job: &FileJob) -> Result<bool> {
         self.src.send(Request::FileHash {
             path: job.src.clone(),
+            source: self.source_reference(job),
             guard: None,
         })?;
         self.dst.send(Request::FileHash {
             path: job.dst.clone(),
+            source: None,
             guard: None,
         })?;
         let source = self.src.recv();
@@ -7243,7 +7521,11 @@ impl Worker {
     /// the source changed during that work.
     fn complete_file(&mut self, idx: usize, job: FileJob, matched: bool) -> Result<()> {
         // Did the source change under us?
-        let now = stat_one(&mut *self.src, &job.src, false)?;
+        let now = if self.opts.insecure_links {
+            stat_one(&mut *self.src, &job.src, false)?
+        } else {
+            stat_one_registered(&mut *self.src, &job.src, &job.source, false)?
+        };
         let changed = match &now {
             Some(e) => {
                 e.kind != Kind::File
@@ -7320,10 +7602,12 @@ impl Worker {
         let r = (|| -> Result<bool> {
             self.src.send(Request::FileHash {
                 path: job.src.clone(),
+                source: self.source_reference(&job),
                 guard: None,
             })?;
             self.dst.send(Request::FileHash {
                 path: job.dst.clone(),
+                source: None,
                 guard: None,
             })?;
             // Keep both reusable connections aligned even if one endpoint

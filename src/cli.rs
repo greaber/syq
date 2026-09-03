@@ -1,6 +1,7 @@
+use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -101,8 +102,8 @@ pub struct Args {
     /// `syq map` never contacts a destination.
     #[arg(skip)]
     pub native_map_target: Option<Vec<u8>>,
-    /// NDJSON mapping manifest consumed by native cp instead of selectors
-    /// (`-` reads stdin, streamed).
+    /// NDJSON mapping manifest consumed by native cp instead of selectors;
+    /// `-` reads stdin and the complete input is acquired before mutation.
     #[arg(skip)]
     pub native_mapping: Option<Vec<u8>>,
     /// `--results` NDJSON outcome stream for native cp (`-` writes stdout).
@@ -155,6 +156,9 @@ pub struct Args {
     /// Copy symlinks as symlinks
     #[arg(short = 'l', long)]
     pub links: bool,
+    /// Permit unconfined traversal through symlinked source ancestors
+    #[arg(long)]
+    pub insecure_links: bool,
     /// Preserve permissions
     #[arg(short = 'p', long)]
     pub perms: bool,
@@ -307,9 +311,9 @@ pub struct Args {
         allow_hyphen_values = true
     )]
     pub ignore: Vec<String>,
-    /// SYQ extension: read ignore patterns from FILE (one per line, # comments); repeatable
+    /// SYQ extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable
     #[arg(long = "syq-ignore-from", value_name = "FILE")]
-    pub ignore_from: Vec<String>,
+    pub ignore_from: Vec<OsString>,
     /// All ignore patterns, in command-line order (filled by parse_args)
     #[arg(skip)]
     pub ignore_lines: Vec<String>,
@@ -368,11 +372,12 @@ pub struct Args {
     /// Don't transfer regular files smaller than SIZE
     #[arg(long, value_name = "SIZE")]
     pub min_size: Option<String>,
-    /// Copy only the paths listed in FILE (one per line, relative to the single source
-    /// directory; `-` reads stdin). Listed directories are copied without their contents
-    /// unless -r is given explicitly; missing parent directories are created
+    /// Copy only the paths listed in raw-byte FILE, securely opened before transfer (one per line,
+    /// relative to the single source directory; `-` reads stdin). Listed directories are
+    /// copied without their contents unless -r is given explicitly; missing parent
+    /// directories are created
     #[arg(long, value_name = "FILE", conflicts_with_all = ["ignore", "ignore_from"])]
-    pub files_from: Option<String>,
+    pub files_from: Option<OsString>,
     /// --files-from entries are NUL-separated instead of one per line
     #[arg(long, requires = "files_from")]
     pub from0: bool,
@@ -441,27 +446,19 @@ impl Args {
     }
 
     fn parse_rsync(argv: &[OsString], allow_lifecycle: bool) -> Result<Args> {
-        let utf8_argv: Vec<String> = argv
-            .iter()
-            .map(|arg| {
-                arg.clone()
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("rsync-compatible arguments must be valid UTF-8"))
-            })
-            .collect::<Result<_>>()?;
         if !allow_lifecycle
-            && utf8_argv.iter().any(|argument| {
-                matches!(
-                    argument.as_str(),
-                    "--self-update" | "--register-standalone-install"
-                )
-            })
+            && argv
+                .iter()
+                .filter_map(|argument| argument.to_str())
+                .any(|argument| {
+                    matches!(argument, "--self-update" | "--register-standalone-install")
+                })
         {
             bail!("installation lifecycle options are top-level syq options, not rsync options");
         }
-        reject_unsupported_rsync_flags(&utf8_argv)?;
-        let mut full_argv = vec!["syq rsync".to_string()];
-        full_argv.extend(utf8_argv);
+        reject_unsupported_rsync_flags(argv)?;
+        let mut full_argv = vec![OsString::from("syq rsync")];
+        full_argv.extend(argv.iter().cloned());
         let matches = Args::command()
             .try_get_matches_from(full_argv)
             .unwrap_or_else(|error| error.exit());
@@ -522,11 +519,12 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
         &args.ignore,
         &args.ignore_from,
         matches,
-        true,
+        OperatorSymlinkPolicy::TrustedOwner,
         "--syq-ignore-from",
     )?;
     if let Some(f) = &args.files_from {
-        args.files_from_lines = read_files_from(f, args.from0)?;
+        args.files_from_lines =
+            read_files_from(f, args.from0, OperatorSymlinkPolicy::TrustedOwner)?;
     }
     Ok(args)
 }
@@ -552,44 +550,51 @@ fn reject_remote_to_remote(args: &Args) -> Result<()> {
 
 fn ordered_ignore_lines(
     ignore: &[String],
-    ignore_from: &[String],
+    ignore_from: &[OsString],
     matches: &clap::ArgMatches,
-    follow_paths: bool,
+    symlink_policy: OperatorSymlinkPolicy,
     ignore_from_name: &str,
 ) -> Result<Vec<String>> {
-    let mut items: Vec<(usize, bool, String)> = Vec::new();
+    enum Item {
+        Pattern(String),
+        File(OsString),
+    }
+    let mut items: Vec<(usize, Item)> = Vec::new();
     if let Some(indices) = matches.indices_of("ignore") {
         items.extend(
             indices
                 .zip(ignore)
-                .map(|(index, value)| (index, false, value.clone())),
+                .map(|(index, value)| (index, Item::Pattern(value.clone()))),
         );
     }
     if let Some(indices) = matches.indices_of("ignore_from") {
         items.extend(
             indices
                 .zip(ignore_from)
-                .map(|(index, value)| (index, true, value.clone())),
+                .map(|(index, value)| (index, Item::File(value.clone()))),
         );
     }
-    items.sort_by_key(|(index, _, _)| *index);
+    items.sort_by_key(|(index, _)| *index);
 
     let mut lines = Vec::new();
-    for (_, from_file, value) in items {
-        if from_file {
-            if !follow_paths {
-                crate::fsops::check_operator_path_no_symlinks(value.as_bytes(), false, false)
-                    .map_err(|error| anyhow::anyhow!("{ignore_from_name} {value}: {error}"))?;
+    for (_, item) in items {
+        match item {
+            Item::Pattern(value) => lines.push(value),
+            Item::File(value) => {
+                use std::io::Read;
+                let shown = std::path::Path::new(&value).display();
+                let mut file =
+                    crate::fsops::open_operator_file_read(value.as_bytes(), symlink_policy)
+                        .map_err(|error| anyhow::anyhow!("{ignore_from_name} {shown}: {error}"))?;
+                let mut text = String::new();
+                file.read_to_string(&mut text)
+                    .map_err(|error| anyhow::anyhow!("{ignore_from_name} {shown}: {error}"))?;
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+                lines.extend(
+                    text.lines()
+                        .map(|line| line.trim_end_matches('\r').to_string()),
+                );
             }
-            let text = std::fs::read_to_string(&value)
-                .map_err(|error| anyhow::anyhow!("{ignore_from_name} {value}: {error}"))?;
-            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-            lines.extend(
-                text.lines()
-                    .map(|line| line.trim_end_matches('\r').to_string()),
-            );
-        } else {
-            lines.push(value);
         }
     }
     Ok(lines)
@@ -746,9 +751,9 @@ struct NativeCopyOperationalArgs {
     /// Skip paths matching a gitignore-style pattern (repeatable)
     #[arg(long = "ignore", value_name = "PATTERN", allow_hyphen_values = true)]
     ignore: Vec<String>,
-    /// Read gitignore-style patterns from FILE (repeatable; stacks in command-line order)
+    /// Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order)
     #[arg(long, value_name = "FILE")]
-    ignore_from: Vec<String>,
+    ignore_from: Vec<OsString>,
     /// Preserve additional metadata (permissions, ownership, or specials; repeatable/comma-separated)
     #[arg(long, value_name = "ATTRIBUTE", value_delimiter = ',')]
     preserve: Vec<NativePreserve>,
@@ -900,9 +905,9 @@ struct NativeCopyFields {
         allow_hyphen_values = true
     )]
     as_existing: Option<OsString>,
-    /// Copy the entries of an NDJSON mapping manifest (`-` reads stdin)
-    /// instead of selecting sources; entry src paths are relative to -C and
-    /// dst paths are relative to the --into container
+    /// Copy the entries of an NDJSON mapping manifest (`-` reads stdin), acquired before
+    /// destination changes, instead of selecting sources; entry src paths are relative to
+    /// -C and dst paths are relative to the --into container
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     mapping: Option<OsString>,
     /// Write the machine-readable NDJSON result stream to FILE (created
@@ -1590,7 +1595,11 @@ fn apply_native_copy_operational(
         &ignore,
         &ignore_from,
         matches,
-        args.native_follow,
+        if args.native_follow {
+            OperatorSymlinkPolicy::FollowAll
+        } else {
+            OperatorSymlinkPolicy::Refuse
+        },
         "--ignore-from",
     )?;
     args.ignore = ignore;
@@ -1782,14 +1791,23 @@ pub(crate) fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<NativeE
 /// `;` are dropped; `.` and empty components (so leading `/`, `./`, trailing
 /// `/`, `a//b`) are removed; `..` components and entries naming the root itself
 /// are rejected.
-fn read_files_from(file: &str, nul: bool) -> Result<Vec<Vec<u8>>> {
+fn read_files_from(
+    file: &OsStr,
+    nul: bool,
+    symlink_policy: OperatorSymlinkPolicy,
+) -> Result<Vec<Vec<u8>>> {
     use std::io::BufReader;
-    if file == "-" {
+    if file.as_bytes() == b"-" {
         read_files_from_reader(BufReader::new(std::io::stdin()), nul)
     } else {
-        let input = std::fs::File::open(file)
-            .map_err(|error| anyhow::anyhow!("--files-from {file}: {error}"))?;
-        read_files_from_reader_named(BufReader::new(input), nul, Some(file))
+        let input = crate::fsops::open_operator_file_read(file.as_bytes(), symlink_policy)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "--files-from {}: {error}",
+                    std::path::Path::new(file).display()
+                )
+            })?;
+        read_files_from_reader_named(BufReader::new(input), nul, Some(std::path::Path::new(file)))
     }
 }
 
@@ -1800,7 +1818,7 @@ fn read_files_from_reader(input: impl std::io::BufRead, nul: bool) -> Result<Vec
 fn read_files_from_reader_named(
     mut input: impl std::io::BufRead,
     nul: bool,
-    file: Option<&str>,
+    file: Option<&std::path::Path>,
 ) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     let mut item = Vec::new();
@@ -1810,7 +1828,7 @@ fn read_files_from_reader_named(
         let read = input
             .read_until(separator, &mut item)
             .map_err(|error| match file {
-                Some(file) => anyhow::anyhow!("--files-from {file}: {error}"),
+                Some(file) => anyhow::anyhow!("--files-from {}: {error}", file.display()),
                 None => anyhow::anyhow!(error),
             })?;
         if read == 0 {
@@ -1868,7 +1886,7 @@ fn read_files_from_reader_named(
 /// rsync command tells you exactly what to change. Flags syq *does* accept
 /// (including the compatibility no-ops) are not listed here; genuinely unknown
 /// flags fall through to clap. No translation is performed.
-fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
+fn reject_unsupported_rsync_flags(argv: &[OsString]) -> Result<()> {
     // Options that consume a following, separate token as their value — skip
     // that token so a value like `-e 'ssh ...'` is never mistaken for a flag.
     let value_long = [
@@ -1887,15 +1905,20 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         "--rsync-path",
     ];
     let mut skip_next = false;
-    for tok in argv {
+    for raw in argv {
         if skip_next {
             skip_next = false;
             continue;
         }
+        let Some(tok) = raw.to_str() else {
+            // Raw-byte values for local control-file options are accepted;
+            // clap still rejects a non-UTF-8 value for every String field.
+            continue;
+        };
         if tok == "--" {
             break; // end of options; the rest are paths
         }
-        if value_long.contains(&tok.as_str()) || matches!(tok.as_str(), "-e" | "-B") {
+        if value_long.contains(&tok) || matches!(tok, "-e" | "-B") {
             skip_next = true;
             continue;
         }
