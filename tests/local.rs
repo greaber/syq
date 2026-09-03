@@ -92,11 +92,12 @@ fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creatio
         &t.s("destination"),
     ]);
     // Local and remote-TCP sources feed the same shared-worker count into FD
-    // admission. At 64 workers the conservative exact-leaf model requires
-    // current_open + 1572 slots. Use a portable low limit here to verify that
-    // admission fails before destination creation; the exact per-worker
-    // arithmetic, including the uncached hash descriptor, is asserted in the
-    // FsOps unit test. The child must retain the lowered hard limit because syq
+    // admission. At 64 workers the conservative exact-leaf model plus the 64
+    // cross-session destination claims requires current_open + 1764 slots. Use
+    // a portable low limit here to verify that admission fails before
+    // destination creation; the exact per-worker arithmetic, including the
+    // uncached hash descriptor, is asserted in the FsOps unit test. The child
+    // must retain the lowered hard limit because syq
     // normally raises a
     // low soft limit to the inherited hard limit during startup. Never try to
     // raise an inherited hard limit: supported environments commonly cap it
@@ -141,7 +142,7 @@ fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creatio
         .unwrap();
     // Conservatively budget every selector as parent + exact object for the
     // registry, control, and all 64 shared workers, plus worker/cache reserve.
-    assert_eq!(required, current_open + 1572, "{stderr}");
+    assert_eq!(required, current_open + 1764, "{stderr}");
     assert!(
         !t.path("destination").exists(),
         "source FD admission failed after destination creation"
@@ -410,6 +411,181 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
     assert_output_ok(&output);
     assert_eq!(read(&t.path("dst/small")), b"original");
     assert_eq!(read(&t.path("dst/large")), original_large);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_uses_registered_source_after_path_replacement() {
+    let t = Tmp::new();
+    let original = vec![b'o'; 8 << 20];
+    write(&t.path("src/file"), &original);
+    write(&t.path("outside/file"), &vec![b'r'; original.len()]);
+    let ready = t.path("source-capability-ready");
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        // A pathname fallback would read through the replacement below. A
+        // streaming fallback fails instead of hiding that CopyLocal was not
+        // exercised.
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before registering the source root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "source root was not registered before timeout"
+    );
+
+    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/file")), original);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_refuses_a_replaced_destination_parent() {
+    let t = Tmp::new();
+    write(&t.path("src/tree/file"), &vec![b's'; 8 << 20]);
+    fs::create_dir_all(t.path("dst/tree")).unwrap();
+    write(&t.path("outside/sentinel"), b"unchanged");
+    let ready = t.path("copy-local-ready");
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            &t.s("src/"),
+            &t.s("dst/"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before reaching the local-copy destination open"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "local copy did not reach the test hook");
+
+    fs::rename(t.path("dst/tree"), t.path("dst/tree-original")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("dst/tree")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    assert_eq!(read(&t.path("outside/sentinel")), b"unchanged");
+    assert!(!t.path("outside/file").exists());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn inplace_copy_local_replaces_a_raced_destination_symlink() {
+    let t = Tmp::new();
+    let contents = vec![b's'; 8 << 20];
+    write(&t.path("src"), &contents);
+    write(&t.path("dst"), &vec![b'd'; contents.len()]);
+    write(&t.path("outside"), b"unchanged");
+    set_mtime(&t.path("src"), 1_700_000_000);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+    let ready = t.path("copy-local-ready");
+
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--inplace",
+            "--syq-connections",
+            "1",
+            &t.s("src"),
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "syq exited before reaching the local-copy destination open"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "local copy did not reach the test hook");
+
+    fs::remove_file(t.path("dst")).unwrap();
+    std::os::unix::fs::symlink("outside", t.path("dst")).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("outside")), b"unchanged");
+    assert!(fs::symlink_metadata(t.path("dst")).unwrap().is_file());
+    assert_eq!(read(&t.path("dst")), contents);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn insecure_links_does_not_delegate_unconfined_names_to_copy_local() {
+    let t = Tmp::new();
+    let contents = vec![b'u'; 8 << 20];
+    fs::create_dir_all(t.path("src")).unwrap();
+    write(&t.path("outside/secret"), &contents);
+    std::os::unix::fs::symlink("../outside", t.path("src/link")).unwrap();
+    write(&t.path("list"), b"link/secret\n");
+    let copy_local_ready = t.path("copy-local-ready");
+
+    let output = compat_command()
+        .args([
+            "-a",
+            "-r",
+            "--insecure-links",
+            "--files-from",
+            &t.s("list"),
+            &t.s("src"),
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &copy_local_ready)
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    assert!(!copy_local_ready.exists());
+    assert_eq!(read(&t.path("dst/link/secret")), contents);
 }
 
 fn run_native_ok(args: &[&str]) -> String {

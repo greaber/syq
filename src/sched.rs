@@ -9,8 +9,9 @@ use std::sync::{Arc, Condvar, Mutex};
 #[derive(Clone, Debug)]
 pub struct FileJob {
     pub src: PathBytes,
-    /// Descriptor-session authority corresponding to `src`. Source workers
-    /// claim its root during Hello; reads switch to it in the next slice.
+    /// Descriptor-session authority corresponding to `src`. Source workers,
+    /// and Linux destination workers using CopyLocal, claim its root during
+    /// authenticated initialization and use it for content opens.
     pub source: RegisteredPath,
     pub dst: PathBytes,
     pub rel: String,

@@ -447,8 +447,11 @@ pub enum ConnectionRole {
     /// A data connection used to mutate a destination endpoint. Unrestricted
     /// receivers require an exact registered root; restricted receivers derive
     /// their confinement from the signed grant and reject a supplied ticket.
+    /// A same-machine worker may additionally receive source capabilities for
+    /// `CopyLocal`; no other destination request may use them.
     DestinationWorker {
         destination: Option<DestinationRoot>,
+        copy_sources: Vec<RegisteredSourceRoot>,
     },
 }
 
@@ -612,7 +615,7 @@ pub enum Request {
     /// source and asynchronous NFS destination). Err("EXDEV") tells the
     /// caller to use the normal streaming path.
     CopyLocal {
-        src: PathBytes,
+        source: RegisteredPath,
         dst: PathBytes,
         inplace: bool,
         allow_sequential_nfs_fallback: bool,

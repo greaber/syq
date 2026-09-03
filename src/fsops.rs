@@ -2,7 +2,7 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::descriptor_broker::{
-    DescriptorSessionSlot, DescriptorTicket, RegisteredRootId, DEFAULT_MAX_ROOTS,
+    claim_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId, DEFAULT_MAX_ROOTS,
 };
 use crate::proto::*;
 use crate::rooted::{
@@ -56,6 +56,46 @@ struct FileSystemTraits {
 struct CopyLocalPolicy {
     inplace: bool,
     allow_sequential_nfs_fallback: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn discard_rooted_copy_partial(
+    root: &Root,
+    relative: &RelativePath,
+    label: &Path,
+    expected_dev: u64,
+    expected_ino: u64,
+) -> Result<()> {
+    match root.metadata_optional(relative)? {
+        Some(current)
+            if is_safe_rooted_partial(current)
+                && current.dev == expected_dev
+                && current.ino == expected_ino =>
+        {
+            root.unlink(relative)
+                .with_context(|| format!("remove {}", label.display()))?;
+        }
+        Some(_) | None => {}
+    }
+    Ok(())
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn hold_copy_local_before_destination_open_for_test() -> Result<()> {
+    if let Some(ready) = std::env::var_os("SYQ_TEST_COPY_LOCAL_READY_FILE") {
+        fs::write(&ready, b"ready").with_context(|| {
+            format!(
+                "write local-copy-ready signal {}",
+                Path::new(&ready).display()
+            )
+        })?;
+    }
+    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_COPY_LOCAL_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1262,6 +1302,40 @@ impl FsOps {
     /// Build the new table off to the side so a bad ticket cannot leave a
     /// partially initialized worker.
     pub(crate) fn initialize_sources(&mut self, sources: &[RegisteredSourceRoot]) -> Result<()> {
+        self.initialize_source_capabilities(sources, false)
+    }
+
+    /// Install the source half of a same-machine copy worker. These tickets
+    /// intentionally belong to the source endpoint session rather than this
+    /// destination endpoint, so claim their exact descriptors from that
+    /// session's private broker during worker initialization.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn initialize_copy_sources(
+        &mut self,
+        sources: &[RegisteredSourceRoot],
+    ) -> Result<()> {
+        if self.destination_root.is_none() {
+            bail!("local copy sources require a registered destination root");
+        }
+        if sources.iter().any(|source| source.allow_unconfined_paths) {
+            bail!("local copy sources must be confined registered capabilities");
+        }
+        self.initialize_source_capabilities(sources, true)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn initialize_copy_sources(
+        &mut self,
+        _sources: &[RegisteredSourceRoot],
+    ) -> Result<()> {
+        bail!("same-machine local copy capabilities require Linux")
+    }
+
+    fn initialize_source_capabilities(
+        &mut self,
+        sources: &[RegisteredSourceRoot],
+        claim_foreign_session: bool,
+    ) -> Result<()> {
         if sources.is_empty() {
             bail!("source worker requires at least one registered root");
         }
@@ -1289,10 +1363,17 @@ impl FsOps {
                     id.get()
                 );
             }
-            let directory = self.descriptor_session.acquire(&source.ticket)?;
+            let acquire = |ticket: &DescriptorTicket| {
+                if claim_foreign_session {
+                    claim_descriptor(ticket)
+                } else {
+                    self.descriptor_session.acquire(ticket)
+                }
+            };
+            let directory = acquire(&source.ticket)?;
             let leaf_object = match (&source.leaf_ticket, &source.expected_leaf) {
                 (Some(ticket), Some(expected)) => {
-                    let object = self.descriptor_session.acquire(ticket)?;
+                    let object = acquire(ticket)?;
                     let metadata = root_metadata_from_std(
                         &object
                             .metadata()
@@ -1366,6 +1447,12 @@ impl FsOps {
         &self,
         source: Option<&RegisteredPath>,
     ) -> Result<Option<SourceScanRoot>> {
+        if self.destination_root.is_some() {
+            if source.is_some() {
+                bail!("source scan is not valid on a destination worker");
+            }
+            return Ok(None);
+        }
         if let Some(source) = source {
             let target = self.registered_source_target(source)?;
             return Ok(Some(SourceScanRoot {
@@ -1388,7 +1475,7 @@ impl FsOps {
     /// endpoint-session source capabilities, even on request variants whose
     /// source-reference cutover has not landed yet.
     pub(crate) fn validate_source_session_request(&self, request: &Request) -> Result<()> {
-        if self.source_roots.is_empty() {
+        if self.source_roots.is_empty() || self.destination_root.is_some() {
             return Ok(());
         }
         let has_guard = match request {
@@ -1532,16 +1619,6 @@ impl FsOps {
         }
     }
 
-    fn initial_absolute(&self, path: &[u8]) -> PathBytes {
-        let path = resolve(path);
-        let absolute = if path.is_absolute() {
-            path
-        } else {
-            self.initial_cwd.join(path)
-        };
-        path_bytes(&absolute)
-    }
-
     fn map_request(&self, req: &Request) -> Result<Request> {
         if self.destination_prefix.is_none() {
             return Ok(req.clone());
@@ -1609,10 +1686,7 @@ impl FsOps {
                 }
             }
             Request::ReadRange { path, .. } => map(path)?,
-            Request::CopyLocal { src, dst, .. } => {
-                *src = self.initial_absolute(src);
-                map(dst)?;
-            }
+            Request::CopyLocal { dst, .. } => map(dst)?,
             Request::ReadSmallBatch(reads) => {
                 for read in reads {
                     map(&mut read.path)?;
@@ -1829,6 +1903,9 @@ impl FsOps {
             bail!("a guarded destination stat cannot carry source references");
         }
         if let Some(sources) = sources {
+            if self.destination_root.is_some() {
+                bail!("source stat is not valid on a destination worker");
+            }
             if sources.len() != paths.len() {
                 bail!("source stat capability count does not match path count");
             }
@@ -1870,7 +1947,10 @@ impl FsOps {
             .into_iter()
             .collect();
         }
-        if !self.source_roots.is_empty() && !self.allow_unconfined_source_paths {
+        if self.destination_root.is_none()
+            && !self.source_roots.is_empty()
+            && !self.allow_unconfined_source_paths
+        {
             bail!("source stat omitted its registered source references");
         }
         Ok(self.stat_many(paths, follow, guard))
@@ -3468,7 +3548,7 @@ impl FsOps {
     #[cfg(target_os = "linux")]
     fn copy_local(
         &mut self,
-        src: &[u8],
+        source: &RegisteredPath,
         dst: &[u8],
         policy: CopyLocalPolicy,
         partial_id: &PartialId,
@@ -3479,8 +3559,12 @@ impl FsOps {
             inplace,
             allow_sequential_nfs_fallback,
         } = policy;
-        let sp = resolve(src);
-        let s = open_existing_regular(&sp, false)?;
+        let source_target = self
+            .registered_source_target(source)
+            .context("resolve registered local-copy source")?;
+        let source_label = PathBuf::from(OsStr::from_bytes(&source.relative));
+        let s = open_registered_source(&source_target)
+            .with_context(|| format!("open registered source {}", source_label.display()))?;
         // The kernel copy reads the source through the page cache, so the
         // larger readahead window this hint enables is what keeps a cold
         // source disk streaming (cp does the same; measured 10-20 % faster
@@ -3488,30 +3572,94 @@ impl FsOps {
         unsafe {
             libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         }
-        let dp = resolve(dst);
-        // Never truncate the source: if the destination resolves to the same
-        // file (same path, a hardlink, or a symlink pointing back), refuse.
-        if let (Ok(sm), Ok(dm)) = (s.metadata(), fs::metadata(&dp)) {
-            if sm.dev() == dm.dev() && sm.ino() == dm.ino() {
-                bail!("source and destination are the same file: {}", dp.display());
-            }
+        let destination_root = self
+            .destination_root
+            .clone()
+            .context("local copy requires a registered destination root")?;
+        let dp = PathBuf::from(OsStr::from_bytes(dst));
+        let destination_relative = RelativePath::new(dst)?;
+        let destination_label = self.logical_destination_path(&dp);
+        #[cfg(debug_assertions)]
+        hold_copy_local_before_destination_open_for_test()?;
+        let source_metadata = s.metadata()?;
+        // A staged copy could safely replace a hard-linked destination, but a
+        // command that names the same file is still a self-copy and should not
+        // silently replace its own selected source. The in-place open repeats
+        // this check against the exact descriptor before truncation.
+        if destination_root
+            .metadata_optional(&destination_relative)?
+            .is_some_and(|metadata| {
+                metadata.is_file()
+                    && metadata.dev == source_metadata.dev()
+                    && metadata.ino == source_metadata.ino()
+            })
+        {
+            bail!(
+                "source and destination are the same file: {}",
+                destination_label.display()
+            );
         }
         self.uncache(&dp);
-        let target = if inplace {
-            dp.clone()
+        let (target_relative, target_path, target_label) = if inplace {
+            (destination_relative, dp.clone(), destination_label)
         } else {
-            self.partial_path(&dp, partial_id)?
+            let partial = self.partial_path(&dp, partial_id)?;
+            let relative = RelativePath::new(partial.as_os_str().as_bytes())?;
+            let label = self.logical_destination_path(&partial);
+            (relative, partial, label)
         };
-        self.uncache(&target);
-        if let Some(parent) = target.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::create_dir_all(parent).ok();
-            }
-        }
+        self.uncache(&target_path);
         let d = if inplace {
-            open_regular_write(&target, mode, true)?
+            let mut opened = None;
+            for _ in 0..8 {
+                match destination_root.metadata_optional(&target_relative)? {
+                    Some(metadata) if metadata.is_file() => {
+                        let file = destination_root.open_regular_write(&target_relative, false)?;
+                        require_rooted_metadata(&file, metadata, &target_label)?;
+                        let metadata = file.metadata()?;
+                        if metadata.dev() == source_metadata.dev()
+                            && metadata.ino() == source_metadata.ino()
+                        {
+                            bail!(
+                                "source and destination are the same file: {}",
+                                target_label.display()
+                            );
+                        }
+                        file.set_len(0).with_context(|| {
+                            format!("truncate confined file {}", target_label.display())
+                        })?;
+                        opened = Some(file);
+                        break;
+                    }
+                    Some(metadata) if metadata.is_dir() => {
+                        bail!("destination {} is a directory", target_label.display())
+                    }
+                    Some(_) => destination_root.unlink(&target_relative)?,
+                    None => match destination_root.create_file(&target_relative, mode) {
+                        Ok(file) => {
+                            opened = Some(file);
+                            break;
+                        }
+                        Err(error)
+                            if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                                error.kind() == io::ErrorKind::AlreadyExists
+                            }) => {}
+                        Err(error) => return Err(error),
+                    },
+                }
+            }
+            opened.with_context(|| {
+                format!(
+                    "destination {} changed repeatedly while opening it",
+                    target_label.display()
+                )
+            })?
         } else {
-            let (d, _) = self.open_private_partial(&target)?;
+            let (d, _) = self.open_private_partial_rooted(
+                &destination_root,
+                &target_relative,
+                &target_label,
+            )?;
             // Only discard stale content. ext4 treats any truncate to zero,
             // even of an empty file, as "replace via truncate" and then
             // flushes every dirty page of the file on close (auto_da_alloc),
@@ -3554,10 +3702,16 @@ impl FsOps {
             if use_sequential_nfs_fallback {
                 userspace_fallback = true;
             } else {
+                let partial_metadata = d.metadata()?;
                 drop(d);
                 if !inplace {
-                    fs::remove_file(&target)
-                        .with_context(|| format!("remove {}", target.display()))?;
+                    discard_rooted_copy_partial(
+                        &destination_root,
+                        &target_relative,
+                        &target_label,
+                        partial_metadata.dev(),
+                        partial_metadata.ino(),
+                    )?;
                 }
                 bail!("EXDEV");
             }
@@ -3589,13 +3743,19 @@ impl FsOps {
                         userspace_fallback = true;
                         continue;
                     }
+                    let partial_metadata = d.metadata()?;
                     drop(d);
                     if !inplace {
                         // The planner probed before this empty sidecar existed.
                         // A content-identical fallback completes through its
                         // retained basis fd and would otherwise orphan it.
-                        fs::remove_file(&target)
-                            .with_context(|| format!("remove {}", target.display()))?;
+                        discard_rooted_copy_partial(
+                            &destination_root,
+                            &target_relative,
+                            &target_label,
+                            partial_metadata.dev(),
+                            partial_metadata.ino(),
+                        )?;
                     }
                     bail!("EXDEV");
                 }
@@ -3603,7 +3763,11 @@ impl FsOps {
                     continue;
                 }
                 return Err(e).with_context(|| {
-                    format!("copy_file_range {} -> {}", sp.display(), target.display())
+                    format!(
+                        "copy_file_range {} -> {}",
+                        source_label.display(),
+                        target_label.display()
+                    )
                 });
             }
             if n == 0 {
@@ -3622,13 +3786,13 @@ impl FsOps {
                 let want = remaining.min(buffer.len() as u64) as usize;
                 let n = source
                     .read(&mut buffer[..want])
-                    .with_context(|| format!("read {}", sp.display()))?;
+                    .with_context(|| format!("read {}", source_label.display()))?;
                 if n == 0 {
-                    bail!("source shortened while copying {}", sp.display());
+                    bail!("source shortened while copying {}", source_label.display());
                 }
                 destination
                     .write_all(&buffer[..n])
-                    .with_context(|| format!("write {}", target.display()))?;
+                    .with_context(|| format!("write {}", target_label.display()))?;
                 remaining -= n as u64;
             }
             d.set_len(size)?;
@@ -3639,7 +3803,7 @@ impl FsOps {
     #[cfg(not(target_os = "linux"))]
     fn copy_local(
         &mut self,
-        _src: &[u8],
+        _source: &RegisteredPath,
         _dst: &[u8],
         _policy: CopyLocalPolicy,
         _partial_id: &PartialId,
@@ -3724,7 +3888,9 @@ impl FsOps {
         block: u64,
         len: u64,
     ) -> Result<Vec<ContentDigest>> {
-        if target.source.is_some() || !self.source_roots.is_empty() {
+        if target.source.is_some()
+            || (self.destination_root.is_none() && !self.source_roots.is_empty())
+        {
             if target.guard.is_some() {
                 bail!("source block hash cannot carry a destination guard");
             }
@@ -3987,7 +4153,9 @@ impl FsOps {
         source: Option<&RegisteredPath>,
         guard: Option<&ContainerGuard>,
     ) -> Result<Response> {
-        let mut f = if source.is_some() || !self.source_roots.is_empty() {
+        let mut f = if source.is_some()
+            || (self.destination_root.is_none() && !self.source_roots.is_empty())
+        {
             if guard.is_some() {
                 bail!("source file hash cannot carry a destination guard");
             }
@@ -4161,7 +4329,7 @@ impl FsOps {
                 .seed_basis(path, partial_id, *len, guard.as_ref())
                 .map(|_| Response::Ok),
             Request::CopyLocal {
-                src,
+                source,
                 dst,
                 inplace,
                 allow_sequential_nfs_fallback,
@@ -4170,7 +4338,7 @@ impl FsOps {
                 mode,
             } => self
                 .copy_local(
-                    src,
+                    source,
                     dst,
                     CopyLocalPolicy {
                         inplace: *inplace,
@@ -5449,6 +5617,59 @@ mod tests {
                 fs::metadata(&replacement).unwrap().ino()
             ),
             (identity.dev(), identity.ino())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn destination_worker_claims_copy_sources_from_the_foreign_session() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("file"), b"source").unwrap();
+        fs::write(destination.join("file"), b"destination").unwrap();
+
+        let source_session = DescriptorSessionSlot::default();
+        let mut source_control = FsOps::with_descriptor_session(source_session);
+        let response = source_control.handle(&Request::RegisterSourceRoots {
+            selections: vec![SourceRootSelection {
+                path: source.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
+            shared_workers: 0,
+            independent_claim_workers: 1,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+
+        // Initialize an unrelated endpoint session so the copy worker cannot
+        // accidentally clone the source root from its own registry.
+        let destination_session = DescriptorSessionSlot::default();
+        destination_session
+            .register(File::open(&destination).unwrap())
+            .unwrap();
+        let mut worker = FsOps::with_descriptor_session(destination_session);
+        worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+        worker.destination_prefix = Some(b".".to_vec());
+        worker.initialize_copy_sources(&roots).unwrap();
+
+        assert_eq!(worker.source_roots.len(), 1);
+        assert_eq!(
+            worker.source_root_identity(roots[0].selection.root()),
+            source_control.source_root_identity(roots[0].selection.root())
+        );
+        let response = worker.handle(&Request::FileHash {
+            path: b"file".to_vec(),
+            source: None,
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::FileHash { size: 11, hash } if hash == content_digest(b"destination"))
         );
     }
 

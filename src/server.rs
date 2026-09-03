@@ -190,15 +190,26 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 return Err(error).context("initialize source worker");
             }
         }
+        ConnectionRole::DestinationWorker { copy_sources, .. }
+            if authority.is_some() && !copy_sources.is_empty() =>
+        {
+            w.write_msg(&Response::Err(
+                "a command-restricted receiver does not accept caller-supplied copy sources".into(),
+            ))?;
+            bail!("command-restricted receiver rejected supplied copy sources");
+        }
         ConnectionRole::DestinationWorker {
             destination: Some(_),
+            ..
         } if authority.is_some() => {
             w.write_msg(&Response::Err(
                 "a command-restricted destination derives its root from the signed grant".into(),
             ))?;
             bail!("command-restricted receiver rejected a supplied destination root");
         }
-        ConnectionRole::DestinationWorker { destination: None } if authority.is_none() => {
+        ConnectionRole::DestinationWorker {
+            destination: None, ..
+        } if authority.is_none() => {
             w.write_msg(&Response::Err(
                 "unrestricted destination worker requires a registered root".into(),
             ))?;
@@ -206,6 +217,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         }
         ConnectionRole::DestinationWorker {
             destination: Some(destination),
+            copy_sources,
         } => {
             if let Err(error) = ops.initialize_destination(destination) {
                 w.write_msg(&Response::Err(format!(
@@ -213,8 +225,19 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 )))?;
                 return Err(error).context("initialize destination worker");
             }
+            if !copy_sources.is_empty() {
+                if let Err(error) = ops.initialize_copy_sources(copy_sources) {
+                    w.write_msg(&Response::Err(format!(
+                        "initialize local copy sources: {error:#}"
+                    )))?;
+                    return Err(error).context("initialize local copy sources");
+                }
+            }
         }
-        ConnectionRole::Control | ConnectionRole::DestinationWorker { destination: None } => {}
+        ConnectionRole::Control
+        | ConnectionRole::DestinationWorker {
+            destination: None, ..
+        } => {}
     }
     w.write_msg(&Response::HelloOk {
         identity: crate::identity::build().to_string(),
@@ -1039,6 +1062,7 @@ mod tests {
                         ticket,
                         request_prefix: b"destination".to_vec(),
                     }),
+                    copy_sources: Vec::new(),
                 },
             })
             .unwrap();
