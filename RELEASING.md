@@ -6,8 +6,9 @@ before a tag can publish anything. The workflow uses a draft until every file
 is uploaded and checked, then publishes it once. Enable GitHub's immutable
 releases setting so published assets and tags cannot be changed afterward.
 
-Python, JavaScript, and Go SDKs have independent versions and tag conventions.
-Their registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.md).
+The Python SDK shares the version of the syq release it pins. JavaScript and Go
+SDKs have independent versions, and every SDK has its own tag convention. Their
+registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.md).
 
 ## One-time repository setup
 
@@ -191,7 +192,7 @@ connection, so enable it only for a trusted release host rather than globally.
    every uploaded byte, publishes it, publishes the matching source package to
    crates.io with a short-lived OIDC credential, and finally updates the tap.
    Once the entire release workflow succeeds, the Python SDK preparation
-   workflow opens a pull request for the next SDK patch release using this
+   workflow opens a pull request for the matching SDK release using this
    immutable syq manifest. PyPI publication remains a separate signed-tag and
    protected-environment action, so a registry outage cannot block syq.
    Track the complete state at any time with:
@@ -202,7 +203,7 @@ connection, so enable it only for a trusted release host rather than globally.
    ```
 
    The report correlates the exact tag commit, release runs and pending
-   environments, GitHub release state, crates.io, the mapped PyPI SDK version,
+   environments, GitHub release state, crates.io, the matching PyPI SDK version,
    and the Homebrew formula without modifying any of them.
 4. Verify one or more downloaded artifacts and exercise all install paths:
 

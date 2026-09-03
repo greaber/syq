@@ -164,7 +164,7 @@ jobs:
       - name: Install pinned Python tooling
         if: needs.scope.outputs.sdks == 'true'
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
-      - name: Require the SDK mapping for the latest syq release
+      - name: Require the matching Python SDK for the latest syq release
         if: needs.scope.outputs.sdks == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -173,6 +173,13 @@ jobs:
           pinned_tag=$(jq -er .tag sdk/python/src/syq/syq-release-manifest.json)
           test "$pinned_tag" = "$latest_tag" || {
             echo "Python SDK pins $pinned_tag, but the latest syq release is $latest_tag" >&2
+            exit 1
+          }
+          pinned_version=${pinned_tag#v}
+          python_version=$(sed -n 's/^version = "\(.*\)"/\1/p' \
+            sdk/python/pyproject.toml)
+          test "$python_version" = "$pinned_version" || {
+            echo "Python SDK $python_version pins syq $pinned_version; versions must match" >&2
             exit 1
           }
       - name: Build the candidate syq executable

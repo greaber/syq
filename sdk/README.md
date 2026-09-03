@@ -31,20 +31,12 @@ verifies its archive and decompressed bytes against the release manifest
 embedded in the package, checks its version and release identity, and then
 always invokes that cached binary.
 
-The current mapping is:
-
-| Python SDK | syq executable |
-|---|---|
-| `0.0.1` | `0.1.5` |
-| `0.0.2` | `0.1.7` |
-| `0.0.3` | `0.1.8` |
-
-The two version numbers do not need to match, but the mapping is immutable for
-a published SDK release. Multiple SDK releases may pin the same syq release.
-Moving to another syq release requires a new SDK release and its compatibility
-tests. Every successful official syq release automatically prepares a Python
-SDK patch-release pull request that pins its exact signed manifest. Maintainers
-review and merge that mapping before creating the signed Python SDK tag.
+The Python package uses the same version as the syq release it manages. Its
+package version, `syq.__version__`, and `syq.PINNED_SYQ_VERSION` therefore agree.
+The embedded mapping remains immutable for a published package. Every
+successful official syq release automatically prepares the matching Python SDK
+release pull request with its exact signed manifest. Maintainers review and
+merge that release before creating the signed Python SDK tag.
 
 Callers that need a local build, a newer syq, or an offline-provisioned binary
 may pass `executable=` explicitly. That opts out of the tested pairing; the
@@ -52,9 +44,8 @@ caller owns compatibility and provenance for the override.
 
 This makes the supported SDK/runtime combination hermetic. SDK consumers can
 pin the Python package version in their own lockfile and choose when to adopt a
-new SDK-plus-syq pair. The SDK still versions changes to its Python API normally,
-but its supported subprocess behavior is never exposed to untested executable
-drift.
+new SDK-plus-syq release. The supported subprocess behavior is never exposed
+to untested executable drift.
 
 The Python package implements this model. The JavaScript and Go preview
 packages must adopt it before their first registry releases.

@@ -51,6 +51,12 @@ jobs:
           version=$(python -c \
             'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
           test "$GITHUB_REF_NAME" = "sdk-python-v$version"
+          pinned_version=$(jq -er .version \
+            sdk/python/src/syq/syq-release-manifest.json)
+          test "$version" = "$pinned_version" || {
+            echo "Python SDK $version pins syq $pinned_version; versions must match" >&2
+            exit 1
+          }
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
       - name: Build distributions with pinned tooling
         env:

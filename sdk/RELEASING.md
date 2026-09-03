@@ -1,11 +1,12 @@
 # Releasing the language SDKs
 
-SDK releases use independent versions and tags. Published versions are
-immutable: never move or delete their release tags or attempt to replace an
-uploaded package. A Python or JavaScript tag whose publication is abandoned
-before any permanent release or registry state exists remains provisional;
-audit all destinations, clean any recoverable draft, and delete that tag rather
-than burning an unpublished SDK version.
+The Python SDK shares the version of the exact syq release it pins. JavaScript
+and Go SDKs use independent versions, and every SDK uses its own tag convention.
+Published versions are immutable: never move or delete their release tags or
+attempt to replace an uploaded package. A Python or JavaScript tag whose
+publication is abandoned before any permanent release or registry state exists
+remains provisional; audit all destinations, clean any recoverable draft, and
+delete that tag rather than burning an unpublished SDK version.
 
 A Go module tag such as `sdk/go/v*` is permanent as soon as it is pushed. The
 tag itself publishes the version: a client or arbitrary module proxy may fetch
@@ -81,26 +82,24 @@ branch workflow, and run all SDK checks. Create a signed annotated tag that
 directly targets the commit on `master`.
 
 For a Python release, first choose the exact immutable syq release the SDK will
-use. Replace `python/src/syq/syq-release-manifest.json` with that release's
-complete signed manifest; do not edit its artifact hashes by hand. Update the
-mapping table in `README.md`. The packaged manifest is the SDK's immutable
-executable-version mapping and runtime trust root for downloaded bytes. Tests
-and the release workflow must build the wheel in a clean cache, perform its
-managed first-use download, and require `syq.version()` to equal
-`syq.PINNED_SYQ_VERSION`.
+use. Set `python/pyproject.toml` to that syq version and replace
+`python/src/syq/syq-release-manifest.json` with the release's complete signed
+manifest; do not edit its artifact hashes by hand. The packaged manifest is the
+SDK's immutable executable-version mapping and runtime trust root for downloaded
+bytes. Tests and the release workflow must build the wheel in a clean cache,
+perform its managed first-use download, and require the package version,
+`syq.PINNED_SYQ_VERSION`, and `syq.version()` to agree.
 
 Python tags use the version in `python/pyproject.toml`:
 
 ```sh
-git tag -s sdk-python-v0.0.1 -m 'Python SDK 0.0.1'
-git push origin sdk-python-v0.0.1
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' python/pyproject.toml)
+git tag -s "sdk-python-v$version" -m "Python SDK $version"
+git push origin "sdk-python-v$version"
 ```
 
-The first Python tag uses the pending trusted publisher configured above; do
-not upload `0.0.1` locally. The protected workflow creates the PyPI project and
-publishes the already-tested distributions with OIDC. PyPI does not reserve the
-name until that workflow successfully publishes, so create the pending
-publisher immediately before the tag.
+Do not upload the package locally. The protected workflow publishes the
+already-tested distributions through PyPI trusted publishing with OIDC.
 
 JavaScript `0.0.1` is the package that requires the manual bootstrap publish.
 After those exact bytes are verified and its trusted publisher is configured,
@@ -123,16 +122,16 @@ the Python adapter's candidate compatibility tests against it. These exercise
 the reported version, a real disposable local copy, argument boundaries, and
 failure retention. The syq release tag verifier requires `sdks` alongside the
 Rust and platform checks, so a failing adapter blocks publication of the syq
-release itself. The same job requires the packaged Python manifest to match the
-latest immutable syq release. Until the generated mapping pull request lands,
-subsequent development therefore cannot acquire a green release-eligible
-`sdks` check or consume the same next Python patch version.
+release itself. The same job requires the Python package version and packaged
+manifest to match the latest immutable syq release. Until the generated release
+pull request lands, subsequent development therefore cannot acquire a green
+release-eligible `sdks` check or consume the matching Python version.
 
 After `.github/workflows/release.yml` completes successfully and the GitHub
 release is immutable, `.github/workflows/prepare-python-sdk.yml` downloads its
-exact signed manifest and prepares the next Python patch version. It opens an
+exact signed manifest and prepares the same Python package version. It opens an
 `automation/python-sdk-vX.Y.Z` pull request containing the version, manifest,
-cache-path documentation, lockfile, and mapping-table updates. GitHub places
+cache-path documentation, and lockfile updates. GitHub places
 pull-request workflow runs caused by its own token into an approval-required
 state. The preparation workflow waits until GitHub has registered both native
 runs for the exact generated commit, verifies that the pull request and native
