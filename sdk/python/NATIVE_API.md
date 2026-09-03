@@ -496,6 +496,9 @@ The client validates at least these stream invariants:
 - strictly increasing sequence numbers starting at zero;
 - path tags and unsigned 64-bit integer ranges;
 - required fields and documented enum values;
+- the final-state object's per-state field variants and the
+  receiver-attested terminal shape (receipt status vocabulary, required
+  bookkeeping, and `deletions_completed`);
 - agreement between the invocation and the run's `prune`, `mapping`, and
   `dry_run` flags;
 - exactly one terminal result, with nothing after it; and

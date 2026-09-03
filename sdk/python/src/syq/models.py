@@ -63,6 +63,25 @@ class FinalObjectState(_StringEnum):
     OBSERVATION_FAILED = "observation_failed"
 
 
+class FinalObjectKind(_StringEnum):
+    """The receiver's final-state vocabulary for what an object is."""
+
+    DIR = "dir"
+    FILE = "file"
+    SYMLINK = "symlink"
+    FIFO = "fifo"
+    SOCKET = "socket"
+    CHARACTER_DEVICE = "character_device"
+    BLOCK_DEVICE = "block_device"
+    OTHER = "other"
+
+
+class ReceiptStatus(_StringEnum):
+    CLEAN = "clean"
+    FAILED = "failed"
+    INCOMPLETE = "incomplete"
+
+
 class Retryability(_StringEnum):
     YES = "yes"
     NO = "no"
@@ -351,7 +370,7 @@ class FinalStateEvent:
     scope: int
     dst: PathValue
     state: FinalObjectState
-    kind: str | None
+    kind: FinalObjectKind | None
     size: int | None
     metadata: ObjectMetadata | None
     digest: AttestedDigest | None
@@ -384,7 +403,7 @@ class OperationSummary:
     deletions_completed: int | None
     deletions_blocked: int | None
     provenance: str | None = None
-    receipt_status: str | None = None
+    receipt_status: ReceiptStatus | None = None
     operations: int | None = None
     final_states: int | None = None
     receipt_records: int | None = None

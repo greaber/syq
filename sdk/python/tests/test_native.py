@@ -553,6 +553,117 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
             with self.assertRaises(syq.SyqProtocolError):
                 decoder.feed(self._final_state(digest=digest))
 
+    @staticmethod
+    def _terminal(seq=1, **overrides):
+        record = {
+            "schema": "syq.automation",
+            "schema_version": 1,
+            "seq": seq,
+            "type": "result",
+            "status": "success",
+            "exit_code": 0,
+            "dry_run": False,
+            "files_transferred": 0,
+            "files_unchanged": 0,
+            "files_excluded": 0,
+            "directories_created": 0,
+            "symlinks_created": 0,
+            "specials_created": 0,
+            "errors": 0,
+            "bytes_transferred": 0,
+            "bytes_unchanged": 0,
+            "elapsed_ms": 1,
+        }
+        record.update(overrides)
+        return json.dumps({k: v for k, v in record.items() if v is not ...}).encode()
+
+    def test_final_state_variants_are_enforced(self) -> None:
+        metadata = {
+            "mode": 0o644,
+            "uid": 0,
+            "gid": 0,
+            "mtime": 1,
+            "mtime_nsec": 0,
+            "rdev": 0,
+        }
+        base = {
+            "schema": "syq.automation",
+            "schema_version": 1,
+            "seq": 1,
+            "type": "final_state",
+            "provenance": "receiver_attested",
+            "scope": 0,
+            "dst": {"encoding": "utf-8", "value": "tree/file"},
+        }
+        bad_objects = [
+            # present without its required attestation fields
+            {"state": "present", "kind": "file", "size": 3},
+            # absent smuggling present-only fields
+            {"state": "absent", "size": 3},
+            # observation_failed without its code
+            {"state": "observation_failed", "message": "hash failed"},
+            # a kind outside the receiver vocabulary
+            {
+                "state": "present",
+                "kind": "wormhole",
+                "size": 3,
+                "metadata": metadata,
+            },
+        ]
+        for bad in bad_objects:
+            decoder = self._final_state_decoder()
+            with self.assertRaises(syq.SyqProtocolError):
+                decoder.feed(json.dumps({**base, "object": bad}).encode())
+
+        # The full receiver vocabulary of kinds decodes.
+        decoder = self._final_state_decoder()
+        event = decoder.feed(
+            json.dumps(
+                {
+                    **base,
+                    "object": {
+                        "state": "present",
+                        "kind": "character_device",
+                        "size": 0,
+                        "metadata": metadata,
+                    },
+                }
+            ).encode()
+        )
+        self.assertIs(event.kind, syq.FinalObjectKind.CHARACTER_DEVICE)
+
+    def test_attested_terminals_are_discriminated(self) -> None:
+        attested = {
+            "provenance": "receiver_attested",
+            "receipt_status": "clean",
+            "operations": 0,
+            "final_states": 0,
+            "receipt_records": 1,
+            "deletions_completed": 0,
+        }
+        bad_terminals = [
+            # receipt_status outside the verified vocabulary
+            {**attested, "receipt_status": "garbage"},
+            # attested without its bookkeeping
+            {"provenance": "receiver_attested", "receipt_status": "clean"},
+            # attested without its settled-deletion total
+            {**attested, "deletions_completed": ...},
+            # provenance from nowhere
+            {**attested, "provenance": "self_reported"},
+            # ordinary result smuggling receipt bookkeeping
+            {"receipt_status": "clean"},
+            {"operations": 3},
+        ]
+        for bad in bad_terminals:
+            decoder = self._final_state_decoder()
+            with self.assertRaises(syq.SyqProtocolError):
+                decoder.feed(self._terminal(**bad))
+
+        decoder = self._final_state_decoder()
+        result = decoder.feed(self._terminal(**attested))
+        self.assertIs(result.receipt_status, syq.ReceiptStatus.CLEAN)
+        self.assertEqual(result.receipt_records, 1)
+
     def test_attested_records_decode_with_the_receiver_vocabulary(self) -> None:
         from syq.protocol import AutomationDecoder
 

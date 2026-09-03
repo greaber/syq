@@ -414,6 +414,63 @@
       "allOf": [
         {
           "$ref": "#/$defs/envelope"
+        },
+        {
+          "if": {
+            "required": [
+              "provenance"
+            ]
+          },
+          "then": {
+            "required": [
+              "provenance",
+              "receipt_status",
+              "operations",
+              "final_states",
+              "receipt_records",
+              "deletions_completed"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "deletions_planned"
+                  ]
+                },
+                {
+                  "required": [
+                    "deletions_blocked"
+                  ]
+                }
+              ]
+            }
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "receipt_status"
+                  ]
+                },
+                {
+                  "required": [
+                    "operations"
+                  ]
+                },
+                {
+                  "required": [
+                    "final_states"
+                  ]
+                },
+                {
+                  "required": [
+                    "receipt_records"
+                  ]
+                }
+              ]
+            }
+          }
         }
       ],
       "type": "object",

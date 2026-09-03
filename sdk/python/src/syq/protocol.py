@@ -19,6 +19,7 @@ from .models import (
     ErrorClass,
     ErrorEvent,
     AttestedDigest,
+    FinalObjectKind,
     FinalObjectState,
     FinalStateEvent,
     ObjectMetadata,
@@ -29,6 +30,7 @@ from .models import (
     OperationSummary,
     OsKind,
     ReceiptCode,
+    ReceiptStatus,
     PathValue,
     ProgressEvent,
     Retryability,
@@ -315,6 +317,39 @@ class AutomationDecoder:
             state = record.get("object")
             if not isinstance(state, dict):
                 raise SyqProtocolError("final_state record has no object")
+            variant = _enum(state, "state", FinalObjectState)
+            # Each state admits exactly its own fields (spec: automation v1).
+            allowed, required = {
+                FinalObjectState.PRESENT: (
+                    {
+                        "state",
+                        "kind",
+                        "size",
+                        "metadata",
+                        "digest",
+                        "symlink_target",
+                        "observation_error",
+                    },
+                    {"kind", "size", "metadata"},
+                ),
+                FinalObjectState.ABSENT: ({"state"}, set()),
+                FinalObjectState.OBSERVATION_FAILED: (
+                    {"state", "code", "message"},
+                    {"code"},
+                ),
+            }[variant]
+            extra = set(state) - allowed
+            if extra:
+                raise SyqProtocolError(
+                    f"final_state object carries fields outside its "
+                    f"{variant.value!r} variant: {sorted(extra)}"
+                )
+            missing = required - set(state)
+            if missing:
+                raise SyqProtocolError(
+                    f"final_state {variant.value!r} object is missing "
+                    f"{sorted(missing)}"
+                )
             digest_record = state.get("digest")
             digest = None
             if digest_record is not None:
@@ -344,13 +379,18 @@ class AutomationDecoder:
                     mtime_nsec=_integer(metadata_record, "mtime_nsec"),
                     rdev=_integer(metadata_record, "rdev"),
                 )
+            provenance = _string(record, "provenance")
+            if provenance != "receiver_attested":
+                raise SyqProtocolError(
+                    "final_state records carry receiver_attested provenance"
+                )
             return FinalStateEvent(
                 **common,
-                provenance=_string(record, "provenance"),
+                provenance=provenance,
                 scope=_integer(record, "scope"),
                 dst=_tagged(record.get("dst"), label="dst"),
-                state=_enum(state, "state", FinalObjectState),
-                kind=_optional_string(state, "kind"),
+                state=variant,
+                kind=_optional_enum(state, "kind", FinalObjectKind),
                 size=_optional_integer(state, "size"),
                 metadata=metadata,
                 digest=digest,
@@ -390,7 +430,12 @@ class AutomationDecoder:
                     "deletions_blocked",
                 )
             )
-            attested = record.get("provenance") == "receiver_attested"
+            provenance = _optional_string(record, "provenance")
+            if provenance is not None and provenance != "receiver_attested":
+                raise SyqProtocolError(
+                    "a result's provenance can only be receiver_attested"
+                )
+            attested = provenance is not None
             if attested:
                 # A receipt attests settled deletions (deletions_completed);
                 # it cannot vouch for planning or --max-delete blocking, so
@@ -398,6 +443,10 @@ class AutomationDecoder:
                 if deletion_values[0] is not None or deletion_values[2] is not None:
                     raise SyqProtocolError(
                         "a receiver-attested result may only contain deletions_completed"
+                    )
+                if deletion_values[1] is None:
+                    raise SyqProtocolError(
+                        "a receiver-attested result must contain deletions_completed"
                     )
             elif self.run.prune and any(value is None for value in deletion_values):
                 raise SyqProtocolError(
@@ -409,6 +458,22 @@ class AutomationDecoder:
                 raise SyqProtocolError(
                     "a non-prune result may not contain deletion totals"
                 )
+            if not attested:
+                stray = [
+                    field
+                    for field in (
+                        "receipt_status",
+                        "operations",
+                        "final_states",
+                        "receipt_records",
+                    )
+                    if field in record
+                ]
+                if stray:
+                    raise SyqProtocolError(
+                        "receipt bookkeeping appears on a result without "
+                        f"receiver_attested provenance: {stray}"
+                    )
             result = CpResult(
                 **common,
                 status=status,
@@ -427,11 +492,17 @@ class AutomationDecoder:
                 deletions_planned=deletion_values[0],
                 deletions_completed=deletion_values[1],
                 deletions_blocked=deletion_values[2],
-                provenance=_optional_string(record, "provenance"),
-                receipt_status=_optional_string(record, "receipt_status"),
-                operations=_optional_integer(record, "operations"),
-                final_states=_optional_integer(record, "final_states"),
-                receipt_records=_optional_integer(record, "receipt_records"),
+                provenance=provenance,
+                receipt_status=(
+                    _enum(record, "receipt_status", ReceiptStatus)
+                    if attested
+                    else None
+                ),
+                operations=_integer(record, "operations") if attested else None,
+                final_states=_integer(record, "final_states") if attested else None,
+                receipt_records=(
+                    _integer(record, "receipt_records") if attested else None
+                ),
             )
             self.result = result
             return result
