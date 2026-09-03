@@ -1,9 +1,9 @@
 # rsync compatibility
 
-`syq rsync` is syq's retained rsync-shaped command surface. This file is the
+`syq rsync` is syq's rsync-shaped command surface. This file is the
 tracked record of how far that goes: what behaves the same, what differs and
-why, what rsync has that syq doesn't, and the open issues. `README.md` is the user-facing
-contract; when the two disagree, fix one of them.
+why, what rsync has that syq doesn't, and the open issues. `README.md` and the documents under `docs/`
+are the user-facing contract; when they and this record disagree, fix one of them.
 
 Each entry says whether it was **measured** (run against upstream rsync —
 3.5.0 at `7c20b077`, cross-checked with 3.2.7 where version-sensitive) or is
@@ -37,7 +37,7 @@ python3 scripts/rsync-compat.py
 ```
 
 The manifest pins rsync commit `7c20b077` and defines one target representing
-SYQ's retained `syq rsync` compatibility surface. Its configured `rsync`
+SYQ's `syq rsync` compatibility surface. Its configured `rsync`
 argument routes every upstream invocation through that subcommand without
 changing upstream test calls. `inventory.tsv` names all 351 tests at that
 commit; changing the pin without classifying every added or removed test is an
@@ -227,7 +227,7 @@ command says what to change.
 - `-H`/`--hard-links` — needs cross-file ordering in a scheduler that has
   none today.
 - `-L`/`--copy-links`, `-k`/`--copy-dirlinks`, `-K`/`--keep-dirlinks`.
-- `--backup`/`--backup-dir`/`--suffix` — cheap given partial+rename; not yet.
+- `--backup`/`--backup-dir`/`--suffix`.
 - `--link-dest`/`--compare-dest`/`--copy-dest`.
 - `--relative` (`-R`), `--partial-dir`.
 - `-A`/`--acls`, `-X`/`--xattrs`, `-S`/`--sparse`, `-x`/`--one-file-system`.

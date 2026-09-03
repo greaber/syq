@@ -22,6 +22,7 @@
         "as-new",
         "as-existing",
         "mapping",
+        "results",
         "prune",
         "max-delete",
         "dry-run",
@@ -52,7 +53,6 @@
       ],
       "internal": [
         "delegated-operands-b64",
-        "results",
         "results-fd",
         "suppress-summary"
       ],
@@ -102,7 +102,9 @@
         "connections",
         "progress",
         "no-progress",
-        "progress-json"
+        "progress-json",
+        "syq-path",
+        "no-bootstrap"
       ],
       "follow_up": [
         "pscope"

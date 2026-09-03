@@ -262,7 +262,7 @@ drops with `ip -s link` and the vendor's tools.
   writer to avoid per-inode contention. Other source types and synchronous NFS
   destinations keep the adaptive parallel path. NFS mount choices such as
   `nconnect` are client and server policy; see the
-  [NFS notes](README.md#nfs) and test with disposable data.
+  [NFS notes](speed.md#nfs) and test with disposable data.
 - Compression trades network bytes for CPU. Compare with and without `-z` when
   either the link or CPU is near saturation.
 - `--bwlimit` is the appropriate control when the goal is coexistence with

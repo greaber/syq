@@ -612,7 +612,7 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -800,6 +800,16 @@ enum ReceiptMode {
 }
 
 #[derive(clap::Args, Debug, Default)]
+struct NativeRemoteHelperArgs {
+    /// Use this exact syq executable for ordinary remote helpers, including an r2r coordinator
+    #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
+    syq_path: Option<String>,
+    /// Require ordinary remote helpers on PATH instead of installing a versioned helper
+    #[arg(long)]
+    no_bootstrap: bool,
+}
+
+#[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
     /// Choose the endpoint that runs the coordinator
     #[arg(long, value_enum, default_value_t = CoordinateAt::Auto)]
@@ -807,12 +817,8 @@ struct NativeRemoteArgs {
     /// Remote shell command (default: ssh); the command owns SSH and agent policy when set
     #[arg(long = "rsh", value_name = "COMMAND")]
     rsh: Option<String>,
-    /// Use this exact syq executable on remote endpoints instead of the managed helper
-    #[arg(long, value_name = "PATH")]
-    syq_path: Option<String>,
-    /// Require syq on each remote PATH instead of installing a versioned helper
-    #[arg(long)]
-    no_bootstrap: bool,
+    #[command(flatten)]
+    helper: NativeRemoteHelperArgs,
     /// Use TCP data connections without encryption (trusted networks only)
     #[arg(long)]
     tcp_plain: bool,
@@ -1006,6 +1012,8 @@ struct NativeRmCommand {
     selection: NativeRmSelectionArgs,
     #[command(flatten)]
     operational: NativeOperationalArgs,
+    #[command(flatten)]
+    helper: NativeRemoteHelperArgs,
     /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
@@ -1389,6 +1397,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         bail!("syq rm needs at least one source selector");
     }
     let endpoint = parse_native_endpoint(parsed.selection.from.as_deref())?;
+    if endpoint.is_none() && (parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap) {
+        bail!("--syq-path and --no-bootstrap apply only to a remote removal endpoint");
+    }
     let locations = ordered
         .into_iter()
         .map(|(_, selection, path)| {
@@ -1405,6 +1416,8 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     args.native_follow = parsed.selection.follow;
     args.native_follow_src = parsed.selection.follow_src;
     args.pscope = parsed.pscope;
+    args.syq_path = parsed.helper.syq_path;
+    args.no_bootstrap = parsed.helper.no_bootstrap;
     args.rm = true;
     apply_native_operational(&mut args, parsed.operational);
     Ok(args)
@@ -1626,8 +1639,8 @@ fn apply_native_copy_operational(
 fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> {
     args.coordinate_at = remote.coordinate_at;
     args.rsh = remote.rsh;
-    args.syq_path = remote.syq_path;
-    args.no_bootstrap = remote.no_bootstrap;
+    args.syq_path = remote.helper.syq_path;
+    args.no_bootstrap = remote.helper.no_bootstrap;
     args.tcp_plain = remote.tcp_plain;
     args.no_tcp = remote.no_tcp;
     crate::transfer::parse_ports(&remote.tcp_ports)?;
@@ -1947,7 +1960,7 @@ fn unsupported_message(tok: &str) -> Option<String> {
     None
 }
 
-const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The SYQ extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See the README's \"Ignoring paths\" section.";
+const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The SYQ extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See \"Ignoring paths\" in docs/reference.md.";
 const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. --syq-verify-only can compare contents without mutation, but it does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 
@@ -2069,7 +2082,7 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
-        parse_size, read_files_from_reader, Args, Placement, SourceSelection,
+        parse_native_rm, parse_size, read_files_from_reader, Args, Placement, SourceSelection,
     };
     use anyhow::{bail, Result};
     use clap::Parser;
@@ -2312,7 +2325,6 @@ mod tests {
             "--coordinate-at=dest",
             "--rsh=ssh -J jump",
             "--syq-path=/opt/syq",
-            "--no-bootstrap",
             "--no-tcp",
             "--tcp-ports=49000-49010",
             "--detach",
@@ -2325,10 +2337,32 @@ mod tests {
         assert_eq!(args.coordinate_at, super::CoordinateAt::Dest);
         assert_eq!(args.rsh.as_deref(), Some("ssh -J jump"));
         assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
-        assert!(args.no_bootstrap);
+        assert!(!args.no_bootstrap);
         assert!(args.no_tcp);
         assert_eq!(args.tcp_ports, "49000-49010");
         assert!(args.detach);
+    }
+
+    #[test]
+    fn native_rm_lowers_remote_helper_selection() {
+        let argv = ["--from=backup", "--syq-path=/opt/syq", "old"].map(std::ffi::OsString::from);
+        let args = parse_native_rm(&argv).unwrap();
+        assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
+        assert!(!args.no_bootstrap);
+
+        let argv = ["--from=backup", "--no-bootstrap", "old"].map(std::ffi::OsString::from);
+        let args = parse_native_rm(&argv).unwrap();
+        assert!(args.syq_path.is_none());
+        assert!(args.no_bootstrap);
+    }
+
+    #[test]
+    fn native_rm_rejects_remote_helper_selection_for_local_removal() {
+        let argv = ["--syq-path=/opt/syq", "old"].map(std::ffi::OsString::from);
+        let error = parse_native_rm(&argv).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("apply only to a remote removal endpoint"));
     }
 
     #[test]

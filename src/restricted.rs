@@ -19,11 +19,12 @@ use ssh_key::private::Ed25519Keypair;
 use ssh_key::{LineEnding, PrivateKey};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2395,10 +2396,13 @@ fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 bail!("{} is not a real directory", path.display());
             }
-            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+            if metadata.uid() != unsafe { libc::geteuid() } {
                 bail!(
-                    "{} is not a private owner-controlled directory",
-                    path.display()
+                    "{} is not a target-owned directory (mode {:04o}, uid {}, gid {})",
+                    path.display(),
+                    metadata.mode() & 0o7777,
+                    metadata.uid(),
+                    metadata.gid()
                 );
             }
         }
@@ -2416,8 +2420,29 @@ fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
 }
 
 fn ensure_private_chain(home: &Path, components: &[&str]) -> Result<PathBuf> {
-    delegation::validate_trusted_directory_path(home)
-        .with_context(|| format!("validate account home {}", home.display()))?;
+    let mut deepest_existing = home.to_path_buf();
+    for component in components {
+        let candidate = deepest_existing.join(component);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    bail!("{} is not a real directory", candidate.display());
+                }
+                deepest_existing = candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect directory {}", candidate.display()))
+            }
+        }
+    }
+    delegation::validate_trusted_directory_path(&deepest_existing).with_context(|| {
+        format!(
+            "validate existing account directory chain through {}",
+            deepest_existing.display()
+        )
+    })?;
     let mut path = home.to_path_buf();
     for component in components {
         path.push(component);
@@ -2486,10 +2511,12 @@ fn read_leaf(
     };
     let mut file = unsafe { File::from_raw_fd(fd) };
     let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & if private { 0o077 } else { 0o022 } != 0
-    {
+    let unsafe_mode = if private {
+        metadata.mode() & 0o7777 != 0o600
+    } else {
+        metadata.mode() & 0o022 != 0
+    };
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || unsafe_mode {
         bail!("private state file has unsafe type, owner, or permissions");
     }
     let mut contents = Vec::new();
@@ -2569,6 +2596,69 @@ fn atomic_write_locked(
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {
                 return Err(error).context("publish atomic private state file");
+            }
+        }
+        directory.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+    }
+    write_result
+}
+
+fn atomic_replace_executable_locked(directory: &File, name: &str, contents: &[u8]) -> Result<()> {
+    let destination = leaf_name(name)?;
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).context("generate atomic receiver filename")?;
+    let temporary_name = format!(
+        ".syq-receiver-write-{}-{}",
+        std::process::id(),
+        u64::from_le_bytes(random)
+    );
+    let temporary = leaf_name(&temporary_name)?;
+    let fd = loop {
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_NOCTTY
+                    | libc::O_CLOEXEC,
+                0o700,
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("create atomic restricted receiver");
+        }
+    };
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let write_result = (|| -> Result<()> {
+        file.set_permissions(fs::Permissions::from_mode(0o700))?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        loop {
+            let result = unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    directory.as_raw_fd(),
+                    destination.as_ptr(),
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error).context("publish restricted receiver");
             }
         }
         directory.sync_all()?;
@@ -2700,6 +2790,68 @@ fn install_state_paths(home: &Path, id: EnrollmentId) -> Result<(PathBuf, PathBu
     ))
 }
 
+fn receiver_install_path(home: &Path) -> PathBuf {
+    home.join(".local/libexec/syq-receiver")
+}
+
+fn materialize_receiver(home: &Path, contents: &[u8]) -> Result<PathBuf> {
+    let directory_path = ensure_private_chain(home, &[".local", "libexec"])?;
+    let directory = open_directory(&directory_path)?;
+    atomic_replace_executable_locked(&directory, "syq-receiver", contents)?;
+    let receiver = receiver_install_path(home);
+    delegation::validate_secure_executable(&receiver, "restricted receiver")?;
+    Ok(receiver)
+}
+
+fn directory_is_empty(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => delegation::validate_private_directory_path(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+    Ok(fs::read_dir(path)
+        .with_context(|| format!("list {}", path.display()))?
+        .next()
+        .transpose()?
+        .is_none())
+}
+
+fn remove_empty_directory(path: &Path) -> Result<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("remove empty {}", path.display())),
+    }
+}
+
+fn remove_final_enrollment_state_directories(home: &Path) -> Result<()> {
+    remove_empty_directory(&home.join(".local/share/syq/restricted"))?;
+    remove_empty_directory(&home.join(".local/share/syq"))
+}
+
+fn contains_managed_enrollment(contents: &[u8]) -> bool {
+    const MARKER: &[u8] = b"syq-enrollment:";
+    contents.split(|byte| *byte == b'\n').any(|line| {
+        let trimmed = line
+            .iter()
+            .copied()
+            .skip_while(u8::is_ascii_whitespace)
+            .collect::<Vec<_>>();
+        !trimmed.starts_with(b"#")
+            && line
+                .rsplit(|byte| byte.is_ascii_whitespace())
+                .find(|word| !word.is_empty())
+                .is_some_and(|word| word.starts_with(MARKER))
+    })
+}
+
 fn resolve_ssh_keygen() -> Result<PathBuf> {
     let candidates = std::iter::once(PathBuf::from("/usr/bin/ssh-keygen")).chain(
         std::env::var_os("PATH")
@@ -2763,12 +2915,19 @@ pub(crate) fn remote_install() -> Result<()> {
     if public_words.len() < 2 {
         bail!("transport public key is malformed");
     }
-    let receiver_path = std::env::current_exe().context("resolve restricted receiver path")?;
-    delegation::validate_secure_executable(&receiver_path, "restricted receiver")?;
-    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &transport)?;
+    let running_receiver = std::env::current_exe().context("resolve restricted receiver path")?;
+    delegation::validate_secure_executable(&running_receiver, "restricted receiver")?;
+    let receiver_contents = fs::read(&running_receiver)
+        .with_context(|| format!("read restricted receiver {}", running_receiver.display()))?;
     let ssh = ensure_private_chain(&home, &[".ssh"])?;
     let directory = open_directory(&ssh)?;
     lock_directory(&directory)?;
+    // The authorized-keys directory lock is the receiver lifecycle lock too.
+    // A concurrent final revoke may unlink the shared executable, but an
+    // installer that already started has its bytes and recreates it before
+    // publishing the new forced authorization.
+    let receiver_path = materialize_receiver(&home, &receiver_contents)?;
+    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &transport)?;
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
@@ -2862,9 +3021,8 @@ pub(crate) fn remote_revoke() -> Result<()> {
     if account != request.target_login {
         bail!("revocation target login does not match the remote account");
     }
-    let state = home
-        .join(".local/share/syq/restricted")
-        .join(request.id.to_string());
+    let state_base = home.join(".local/share/syq/restricted");
+    let state = state_base.join(request.id.to_string());
     let (receiver_path, remove_state) = match fs::symlink_metadata(&state) {
         Ok(_) => {
             let (config, allowed_signers, _) = receiver_config(request.id)?;
@@ -2879,10 +3037,9 @@ pub(crate) fn remote_revoke() -> Result<()> {
                 Some(state.to_path_buf()),
             )
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-            std::env::current_exe().context("resolve restricted receiver path")?,
-            None,
-        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (receiver_install_path(&home), None)
+        }
         Err(error) => return Err(error).context("inspect restricted receiver state"),
     };
     let transport = TransportPublicKey::parse(&request.public_key)?;
@@ -2895,12 +3052,43 @@ pub(crate) fn remote_revoke() -> Result<()> {
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
     let (updated, _) = enrollment::revoke_authorized_key(&normalized, &entry)?;
     atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
-    drop(directory);
     if let Some(state) = remove_state {
         delegation::validate_private_directory_path(&state)?;
         fs::remove_dir_all(&state)
             .with_context(|| format!("remove revoked receiver state {}", state.display()))?;
     }
+    let last_enrollment =
+        !contains_managed_enrollment(&updated) && directory_is_empty(&state_base)?;
+    if last_enrollment {
+        let installed_receiver = receiver_install_path(&home);
+        if receiver_path != installed_receiver {
+            bail!(
+                "refusing to remove unexpected restricted receiver path {}",
+                receiver_path.display()
+            );
+        }
+        remove_final_enrollment_state_directories(&home)?;
+        match fs::symlink_metadata(&installed_receiver) {
+            Ok(_) => {
+                delegation::validate_secure_executable(&installed_receiver, "restricted receiver")?;
+                fs::remove_file(&installed_receiver).with_context(|| {
+                    format!(
+                        "remove final restricted receiver {}",
+                        installed_receiver.display()
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect {}", installed_receiver.display()))
+            }
+        }
+        // `.local`, `share`, and `libexec` are general account directories.
+        // Without a durable record proving syq created them, preserve them
+        // even when the final enrollment leaves them empty.
+    }
+    drop(directory);
     println!("revoked {}", request.id);
     Ok(())
 }
@@ -2931,6 +3119,7 @@ fn normalize_managed_authorized_keys(original: &[u8], marker: &str) -> Vec<u8> {
 fn local_state_base() -> Result<PathBuf> {
     let (_, home) = current_account()?;
     ensure_private_chain(&home, &[".local", "state", "syq", "restricted"])
+        .context("validate restricted enrollment state on the invoking machine")
 }
 
 fn store_pending_enrollment(
@@ -3047,6 +3236,42 @@ fn load_private_key(directory: &Path) -> Result<PrivateKey> {
     PrivateKey::from_openssh(&encoded).context("parse restricted transport private key")
 }
 
+#[derive(Debug)]
+struct EnrollmentSshError {
+    message: String,
+    transport: bool,
+}
+
+impl fmt::Display for EnrollmentSshError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EnrollmentSshError {}
+
+fn enrollment_ssh_error(
+    target: &SshEndpoint,
+    transport: bool,
+    message: impl fmt::Display,
+) -> anyhow::Error {
+    anyhow::Error::new(EnrollmentSshError {
+        message: format!(
+            "restricted enrollment SSH to {} failed: {message}",
+            target.label()
+        ),
+        transport,
+    })
+}
+
+fn is_enrollment_transport_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<EnrollmentSshError>()
+            .is_some_and(|failure| failure.transport)
+    })
+}
+
 fn run_ssh(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
@@ -3060,27 +3285,91 @@ fn run_ssh(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().context("start restricted enrollment SSH")?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| enrollment_ssh_error(target, true, error))?;
     let mut stdin = child
         .stdin
         .take()
-        .context("enrollment SSH stdin unavailable")?;
-    stdin.write_all(input)?;
+        .ok_or_else(|| enrollment_ssh_error(target, true, "stdin unavailable"))?;
+    let write_error = stdin.write_all(input).err();
     drop(stdin);
-    let output = child.wait_with_output()?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| enrollment_ssh_error(target, true, error))?;
     if !output.status.success() {
         let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!(
-            "restricted enrollment SSH failed ({}): {}",
-            output.status,
-            if diagnostic.is_empty() {
-                "no diagnostic"
-            } else {
-                &diagnostic
-            }
-        );
+        return Err(enrollment_ssh_error(
+            target,
+            output.status.code() == Some(255),
+            format_args!(
+                "{}: {}",
+                output.status,
+                if diagnostic.is_empty() {
+                    "no diagnostic"
+                } else {
+                    &diagnostic
+                }
+            ),
+        ));
+    }
+    if let Some(error) = write_error {
+        return Err(enrollment_ssh_error(target, true, error));
     }
     Ok(output.stdout)
+}
+
+#[derive(Clone, Copy)]
+enum ManagementAction {
+    Install,
+    Revoke,
+}
+
+impl ManagementAction {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Install => "--restricted-install",
+            Self::Revoke => "--restricted-revoke",
+        }
+    }
+}
+
+fn management_remote_command(
+    stage: &str,
+    action: ManagementAction,
+    request: &[u8],
+) -> Result<String> {
+    let request = std::str::from_utf8(request).context("management request is not UTF-8")?;
+    Ok(format!(
+        "set -eu; d=\"$HOME/.local/libexec\"; p=\"$d/{stage}\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; cat >\"$p\"; chmod 700 \"$p\"; printf '%s' {} | \"$p\" {}",
+        shell_words::quote(request),
+        action.argument()
+    ))
+}
+
+fn run_management_over_route(
+    target: &SshEndpoint,
+    route: EnrollmentRoute<'_>,
+    id: EnrollmentId,
+    action: ManagementAction,
+    input: &[u8],
+) -> Result<Vec<u8>> {
+    let executable = std::env::current_exe().context("resolve local syq executable")?;
+    delegation::validate_secure_executable(&executable, "local syq executable")
+        .context("validate syq executable on the invoking machine")?;
+    let mut binary = File::open(&executable)
+        .with_context(|| format!("open local syq executable {}", executable.display()))?;
+    let mut bytes = Vec::new();
+    binary.read_to_end(&mut bytes)?;
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).context("generate receiver staging filename")?;
+    let stage = format!(".syq-receiver-{}-{:016x}", id, u64::from_le_bytes(nonce));
+    let command = management_remote_command(&stage, action, input)?;
+    // Upload and invocation share one SSH session. The remote shell installs
+    // its cleanup trap before reading the binary and retains it until the
+    // management helper exits, so there is no inter-session orphan window or
+    // cleanup request that depends on a route which has already failed.
+    run_ssh(target, route, &command, &bytes)
 }
 
 fn install_over_route(
@@ -3088,24 +3377,14 @@ fn install_over_route(
     route: EnrollmentRoute<'_>,
     request: &InstallRequest,
 ) -> Result<InstallResponse> {
-    let executable = std::env::current_exe().context("resolve local syq executable")?;
-    let mut binary = File::open(&executable)
-        .with_context(|| format!("open local syq executable {}", executable.display()))?;
-    let metadata = binary.metadata()?;
-    if !metadata.is_file() || metadata.mode() & 0o022 != 0 {
-        bail!("local syq executable is not a trusted regular file");
-    }
-    let mut bytes = Vec::new();
-    binary.read_to_end(&mut bytes)?;
-    let upload = "set -eu; d=\"$HOME/.local/libexec\"; umask 077; mkdir -p -- \"$d\"; t=\"$d/.syq-receiver.$$\"; trap 'rm -f -- \"$t\"' EXIT HUP INT TERM; cat >\"$t\"; chmod 700 \"$t\"; mv -f -- \"$t\" \"$d/syq-receiver\"; trap - EXIT HUP INT TERM";
-    run_ssh(target, route.clone(), upload, &bytes)?;
     let expected_id = request.id;
     let expected_login = request.target_login.clone();
     let request = serde_json::to_vec(request)?;
-    let output = run_ssh(
+    let output = run_management_over_route(
         target,
         route,
-        "exec \"$HOME/.local/libexec/syq-receiver\" --restricted-install",
+        expected_id,
+        ManagementAction::Install,
         &request,
     )?;
     let response: InstallResponse =
@@ -3213,7 +3492,7 @@ fn enroll(
     let direct = install_over_route(&target, EnrollmentRoute::Direct, &request);
     let response = match (direct, jump) {
         (Ok(response), _) => response,
-        (Err(direct_error), Some(jump)) => {
+        (Err(direct_error), Some(jump)) if is_enrollment_transport_failure(&direct_error) => {
             install_over_route(&target, EnrollmentRoute::ProxyJump { jump }, &request)
                 .with_context(|| {
                     format!(
@@ -3222,7 +3501,7 @@ fn enroll(
             )
                 })?
         }
-        (Err(error), None) => {
+        (Err(error), _) => {
             return Err(error).with_context(|| format!("enrollment {} {retry_state}", pending.id,))
         }
     };
@@ -3348,11 +3627,6 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     {
         bail!(
             "--files-from, --mapping, and --min-size are not yet independently enforceable by the command-restricted receiver"
-        );
-    }
-    if args.syq_path.is_some() || args.no_bootstrap {
-        bail!(
-            "--syq-path and --no-bootstrap cannot select the pre-enrolled command-restricted receiver"
         );
     }
     if args.pscope_explicit {
@@ -3857,32 +4131,19 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             let active = load_local_enrollments()?
                 .into_iter()
                 .find(|(metadata, _)| metadata.id == id);
-            let (target_login, host, port, remote_command, directory) = match active {
-                Some((metadata, directory)) => {
-                    let command = enrollment::EnrollmentRemoteCommand::new(
-                        Path::new(&metadata.receiver_path),
-                        &["--restricted-revoke".into()],
-                    )?;
-                    (
-                        metadata.target_login,
-                        metadata.host,
-                        metadata.port,
-                        command.as_str().to_owned(),
-                        directory,
-                    )
-                }
+            let (target_login, host, port, directory) = match active {
+                Some((metadata, directory)) => (
+                    metadata.target_login,
+                    metadata.host,
+                    metadata.port,
+                    directory,
+                ),
                 None => {
                     let (pending, directory) = load_pending_enrollments()?
                         .into_iter()
                         .find(|(pending, _)| pending.id == id)
                         .context("no local enrollment has that ID")?;
-                    (
-                        pending.target_login,
-                        pending.host,
-                        pending.port,
-                        "exec \"$HOME/.local/libexec/syq-receiver\" --restricted-revoke".to_owned(),
-                        directory,
-                    )
+                    (pending.target_login, pending.host, pending.port, directory)
                 }
             };
             let private_key = load_private_key(&directory)?;
@@ -3894,19 +4155,28 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             };
             let target = endpoint(&target_login, &host, port)?;
             let encoded = serde_json::to_vec(&request)?;
-            let direct = run_ssh(&target, EnrollmentRoute::Direct, &remote_command, &encoded);
+            let direct = run_management_over_route(
+                &target,
+                EnrollmentRoute::Direct,
+                id,
+                ManagementAction::Revoke,
+                &encoded,
+            );
             match (direct, via.as_ref()) {
                 (Ok(_), _) => {}
-                (Err(direct_error), Some(via)) => {
-                    run_ssh(
+                (Err(direct_error), Some(via))
+                    if is_enrollment_transport_failure(&direct_error) =>
+                {
+                    run_management_over_route(
                         &target,
                         EnrollmentRoute::ProxyJump { jump: via },
-                        &remote_command,
+                        id,
+                        ManagementAction::Revoke,
                         &encoded,
                     )
                     .with_context(|| format!("direct revocation also failed: {direct_error:#}"))?;
                 }
-                (Err(error), None) => return Err(error),
+                (Err(error), _) => return Err(error),
             }
             delegation::validate_private_directory_path(&directory)?;
             fs::remove_dir_all(&directory)
@@ -3925,6 +4195,118 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn enrollment_ssh_failures_distinguish_transport_from_remote_rejection() {
+        let target = SshEndpoint::from_parts("backup", "host-b", Some(2222)).unwrap();
+        let transport = enrollment_ssh_error(&target, true, "connection refused");
+        assert!(is_enrollment_transport_failure(&transport));
+        assert!(transport.to_string().contains("backup@host-b:2222"));
+
+        let rejection = enrollment_ssh_error(&target, false, "remote exit status: 1");
+        assert!(!is_enrollment_transport_failure(&rejection));
+        assert!(rejection.to_string().contains("backup@host-b:2222"));
+    }
+
+    #[test]
+    fn receiver_publication_is_atomic_private_and_executable() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = open_directory(temporary.path()).unwrap();
+        atomic_replace_executable_locked(&directory, "syq-receiver", b"receiver-v1").unwrap();
+        atomic_replace_executable_locked(&directory, "syq-receiver", b"receiver-v2").unwrap();
+
+        let path = temporary.path().join("syq-receiver");
+        assert_eq!(fs::read(&path).unwrap(), b"receiver-v2");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn receiver_gc_detects_any_remaining_managed_enrollment() {
+        assert!(!contains_managed_enrollment(b"ssh-ed25519 unrelated\n"));
+        assert!(!contains_managed_enrollment(
+            b"  # revoked key syq-enrollment:old\n"
+        ));
+        assert!(contains_managed_enrollment(
+            b"restrict,command=\"syq\" ssh-ed25519 key syq-enrollment:id\n"
+        ));
+    }
+
+    #[test]
+    fn final_enrollment_cleanup_preserves_general_account_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let local = home.join(".local");
+        let share = local.join("share");
+        let syq = share.join("syq");
+        let restricted = syq.join("restricted");
+        let libexec = local.join("libexec");
+        fs::create_dir_all(&restricted).unwrap();
+        fs::create_dir(&libexec).unwrap();
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o751)).unwrap();
+        fs::set_permissions(&libexec, fs::Permissions::from_mode(0o710)).unwrap();
+
+        remove_final_enrollment_state_directories(home).unwrap();
+
+        assert!(!restricted.exists());
+        assert!(!syq.exists());
+        assert_eq!(fs::metadata(&local).unwrap().mode() & 0o7777, 0o750);
+        assert_eq!(fs::metadata(&share).unwrap().mode() & 0o7777, 0o751);
+        assert_eq!(fs::metadata(&libexec).unwrap().mode() & 0o7777, 0o710);
+    }
+
+    #[test]
+    fn management_stage_is_scoped_to_one_shell_session() {
+        fn invoke(home: &Path, stage: &str, script: &[u8], request: &[u8]) -> std::process::Output {
+            let remote = management_remote_command(stage, ManagementAction::Install, request)
+                .expect("build management command");
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(remote)
+                .env("HOME", home)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(script).unwrap();
+            child.wait_with_output().unwrap()
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let request = br#"{"value":"' ; exit 91; #"}"#;
+        let output = invoke(
+            temporary.path(),
+            ".syq-receiver-test-success",
+            b"#!/bin/sh\ncat\n",
+            request,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, request);
+        assert!(!temporary
+            .path()
+            .join(".local/libexec/.syq-receiver-test-success")
+            .exists());
+        assert!(temporary.path().join(".local/libexec").is_dir());
+
+        let output = invoke(
+            temporary.path(),
+            ".syq-receiver-test-failure",
+            b"#!/bin/sh\nexit 23\n",
+            b"failure request",
+        );
+        assert_eq!(output.status.code(), Some(23));
+        assert!(!temporary
+            .path()
+            .join(".local/libexec/.syq-receiver-test-failure")
+            .exists());
+    }
 
     fn test_authority(
         root: &Path,
@@ -5948,6 +6330,19 @@ mod tests {
         let mut source_modes = test_authority(&root, DeletionPolicy::Forbid, 1024);
         source_modes.copy.options.preserve_permissions = true;
         source_modes.copy.options.receiver_managed_modes = false;
+        let mut source_mkdir = Request::Apply {
+            ops: vec![Op::Mkdir {
+                path: target.clone(),
+                mode: 0o750,
+                condition: proto::TargetCondition::Any,
+            }],
+            guard: None,
+        };
+        source_modes.authorize(&mut source_mkdir, false).unwrap();
+        let Request::Apply { ops, .. } = source_mkdir else {
+            unreachable!()
+        };
+        assert!(matches!(ops[0], Op::Mkdir { mode: 0o750, .. }));
         let mut source_mode = metadata(proto::flags::MODE);
         source_modes.authorize(&mut source_mode, false).unwrap();
         let mut receiver_mode = metadata(proto::flags::RECEIVER_MODE);
@@ -6192,19 +6587,18 @@ mod tests {
     }
 
     #[test]
-    fn receiver_managed_new_directory_preserves_receiver_inherited_setgid() {
+    fn receiver_managed_missing_root_preserves_receiver_umask_and_inherited_setgid() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
-        let parent = root.join("target/inheriting-parent");
-        let child = parent.join("child");
-        fs::create_dir_all(&parent).unwrap();
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o2755)).unwrap();
+        let target = root.join("target");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o2755)).unwrap();
         let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         authority.receiver_umask = 0o022;
 
         let mut mkdir = Request::Apply {
             ops: vec![Op::Mkdir {
-                path: child.as_os_str().as_bytes().to_vec(),
+                path: target.as_os_str().as_bytes().to_vec(),
                 mode: 0o7777,
                 condition: proto::TargetCondition::Any,
             }],
@@ -6223,11 +6617,11 @@ mod tests {
             .apply(ops, Some(guard))
             .into_iter()
             .all(|error| error.is_none()));
-        assert_eq!(fs::metadata(&child).unwrap().mode() & 0o7777, 0o2700);
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o2700);
 
         let mut metadata = Request::Apply {
             ops: vec![Op::SetMeta {
-                path: child.as_os_str().as_bytes().to_vec(),
+                path: target.as_os_str().as_bytes().to_vec(),
                 meta: proto::Meta {
                     // None of these source-proposed special bits are trusted.
                     mode: 0o7777,
@@ -6262,7 +6656,7 @@ mod tests {
             .apply(ops, Some(guard))
             .into_iter()
             .all(|error| error.is_none()));
-        assert_eq!(fs::metadata(&child).unwrap().mode() & 0o7777, 0o2755);
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o2755);
     }
 
     #[test]
@@ -6360,6 +6754,17 @@ mod tests {
         let mut args = Args::try_parse_from(["syq", "source", "destination"]).unwrap();
         args.normalize();
         args.bwlimit_bytes = 1024;
+        validate_restricted_args(&args).unwrap();
+    }
+
+    #[test]
+    fn ordinary_helper_selection_does_not_change_the_restricted_grant() {
+        let mut args = Args::try_parse_from(["syq", "source", "destination"]).unwrap();
+        args.normalize();
+        args.syq_path = Some("/tmp/development-syq".to_owned());
+        validate_restricted_args(&args).unwrap();
+        args.syq_path = None;
+        args.no_bootstrap = true;
         validate_restricted_args(&args).unwrap();
     }
 

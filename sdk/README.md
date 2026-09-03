@@ -1,14 +1,8 @@
 # syq language SDKs
 
-This directory contains language clients for syq. They invoke the syq
-executable rather than inventing a second transfer implementation.
-
-The JavaScript and Go previews currently expose two operations:
-
-- run the `syq` executable with an argument array, never through a shell;
-- query and validate `syq --version`.
-
-The Python package also implements synchronous and asyncio clients for typed
+This directory contains the Python client for syq. It invokes the syq
+executable rather than inventing a second transfer implementation, and it
+implements synchronous and asyncio clients for typed
 `cp` (including `prune=True`) and `map` against syq's versioned machine
 interfaces. Commands without an automation result stream, currently including
 `rm`, remain available through raw `run`. The executable remains authoritative
@@ -21,8 +15,6 @@ The Python-native surface is documented in
 | Ecosystem | Package/module | Source |
 |---|---|---|
 | Python | `syq` | [`python/`](python/) |
-| JavaScript and TypeScript | `@syq/sdk` | [`js/`](js/) |
-| Go | `github.com/greaber/syq/sdk/go` | [`go/`](go/) |
 
 Every SDK release pins one exact, tested syq release. The default client does
 not search `PATH` or adopt a separately installed syq. On first use it downloads
@@ -47,8 +39,7 @@ pin the Python package version in their own lockfile and choose when to adopt a
 new SDK-plus-syq release. The supported subprocess behavior is never exposed
 to untested executable drift.
 
-The Python package implements this model. The JavaScript and Go preview
-packages must adopt it before their first registry releases.
+The Python package implements this model.
 
 See [`RELEASING.md`](RELEASING.md) for the one-time registry setup and exact
 tag conventions.

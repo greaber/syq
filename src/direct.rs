@@ -599,6 +599,8 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
         "-o".to_owned(),
         "StrictHostKeyChecking=no".to_owned(),
         "-o".to_owned(),
+        "LogLevel=ERROR".to_owned(),
+        "-o".to_owned(),
         "UserKnownHostsFile=/dev/null".to_owned(),
         "-o".to_owned(),
         "GlobalKnownHostsFile=/dev/null".to_owned(),
@@ -627,6 +629,23 @@ fn broker_connection_limit(connections_opt: Option<usize>, connections: usize) -
 
 fn automatic_enrollment_allowed(dry_run: bool, verify_only: bool) -> bool {
     !(dry_run || verify_only)
+}
+
+fn append_delegated_helper_selection(
+    command: &mut Vec<String>,
+    syq_path: Option<&str>,
+    no_bootstrap: bool,
+    restricted_receiver: bool,
+) {
+    if restricted_receiver {
+        return;
+    }
+    if no_bootstrap {
+        command.push("--no-bootstrap".into());
+    }
+    if let Some(path) = syq_path {
+        command.push(format!("--syq-path={path}"));
+    }
 }
 
 /// Encode a delegated path operand: standard unpadded base64 of the raw
@@ -942,9 +961,15 @@ fn run_remote(
             "--results with a direct remote-to-remote copy needs a command-restricted receiver enrollment (its verified receipt is the stream) or --coordinate-at local to route the transfer through this machine"
         );
     }
-    if args.no_bootstrap {
-        remote.push("--no-bootstrap".into());
-    }
+    // Helper selection applies to ordinary remote syq processes. The local
+    // launcher already used it for this coordinator; an enrolled destination
+    // is selected by its forced authorized_keys command instead.
+    append_delegated_helper_selection(
+        &mut remote,
+        args.syq_path.as_deref(),
+        args.no_bootstrap,
+        receipt_expectation.is_some(),
+    );
     if args.no_tcp {
         remote.push("--no-tcp".into());
     }
@@ -955,9 +980,6 @@ fn run_remote(
         remote.push(format!("--tcp-congestion={algorithm}"));
     }
     remote.push(format!("--tcp-ports={}", args.tcp_ports));
-    if let Some(path) = &args.syq_path {
-        remote.push(format!("--syq-path={path}"));
-    }
     if let Some(remote_shell) = destination_rsh(
         args.rsh.as_deref(),
         same_host,
@@ -1243,6 +1265,20 @@ mod tests {
         command.get_args().collect()
     }
 
+    #[test]
+    fn helper_selection_stops_at_a_command_restricted_receiver() {
+        let mut ordinary = Vec::new();
+        append_delegated_helper_selection(&mut ordinary, Some("/opt/syq-dev"), false, false);
+        assert_eq!(ordinary, ["--syq-path=/opt/syq-dev"]);
+
+        let mut restricted = Vec::new();
+        append_delegated_helper_selection(&mut restricted, Some("/opt/syq-dev"), false, true);
+        assert!(restricted.is_empty());
+
+        append_delegated_helper_selection(&mut restricted, None, true, true);
+        assert!(restricted.is_empty());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn detached_timeout_terminates_the_complete_process_group() {
@@ -1362,6 +1398,7 @@ mod tests {
             "BatchMode=yes",
             "ProxyJump=none",
             "ProxyCommand=none",
+            "LogLevel=ERROR",
             "HostKeyAlgorithms=ssh-ed25519",
             "2222",
         ] {

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import os
 import tempfile
 import unittest
@@ -33,11 +35,13 @@ class CandidateCompatibilityTests(unittest.TestCase):
 
             client = syq.Client(executable=executable, process_cwd=root)
             events: list[syq.AutomationEvent] = []
+            saved_results = io.BytesIO()
             preview = client.cp(
                 source.name,
                 as_new=destination.name,
                 dry_run=True,
                 on_event=events.append,
+                results=saved_results,
             )
             self.assertTrue(preview.dry_run)
             self.assertEqual(preview.files_transferred, 1)
@@ -52,6 +56,11 @@ class CandidateCompatibilityTests(unittest.TestCase):
                     for event in events
                 )
             )
+            saved_records = [
+                json.loads(line) for line in saved_results.getvalue().splitlines()
+            ]
+            self.assertEqual(saved_records[-1]["type"], "result")
+            self.assertTrue(saved_records[-1]["dry_run"])
 
             result = client.cp(source.name, as_new=destination.name)
             self.assertEqual(result.exit_code, 0)
@@ -198,7 +207,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(result.stderr)
 
-    def test_candidate_remote_coordinator_returns_one_valid_stream(self) -> None:
+    def test_candidate_remote_to_remote_copy_can_keep_results_local(self) -> None:
         assert EXECUTABLE is not None
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -263,11 +272,19 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             client = syq.AsyncClient(executable=EXECUTABLE, process_cwd=root)
 
             self.assertEqual(await client.version(), EXPECTED_VERSION)
+            saved_results = io.BytesIO()
             preview = await client.cp(
-                src_src="source", into="destination", dry_run=True
+                src_src="source",
+                into="destination",
+                dry_run=True,
+                results=saved_results,
             )
             self.assertEqual(preview.files_transferred, 1)
             self.assertEqual(preview.bytes_transferred, len(b"async"))
+            self.assertEqual(
+                json.loads(saved_results.getvalue().splitlines()[-1])["type"],
+                "result",
+            )
 
             physical_temp = root / "async-physical-temp"
             physical_temp.mkdir()

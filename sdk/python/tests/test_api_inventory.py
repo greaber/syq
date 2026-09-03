@@ -57,6 +57,47 @@ class NativeApiInventoryTests(unittest.TestCase):
                     ],
                 )
 
+    def test_sync_and_async_clients_have_matching_public_methods(self) -> None:
+        def public_methods(client: type) -> dict[str, object]:
+            return {
+                name: value
+                for name, value in inspect.getmembers(client, inspect.isfunction)
+                if not name.startswith("_")
+            }
+
+        sync = public_methods(syq.Client)
+        async_ = public_methods(syq.AsyncClient)
+        self.assertEqual(set(sync), {"cp", "map", "run", "version"})
+        self.assertEqual(set(async_), set(sync))
+        for name in sync:
+            with self.subTest(method=name):
+                sync_parameters = inspect.signature(sync[name]).parameters.values()
+                async_parameters = inspect.signature(async_[name]).parameters.values()
+                self.assertEqual(
+                    [
+                        (parameter.name, parameter.kind, parameter.default)
+                        for parameter in async_parameters
+                    ],
+                    [
+                        (parameter.name, parameter.kind, parameter.default)
+                        for parameter in sync_parameters
+                    ],
+                )
+
+    def test_sync_and_async_client_constructors_match(self) -> None:
+        sync_parameters = inspect.signature(syq.Client).parameters.values()
+        async_parameters = inspect.signature(syq.AsyncClient).parameters.values()
+        self.assertEqual(
+            [
+                (parameter.name, parameter.kind, parameter.default)
+                for parameter in async_parameters
+            ],
+            [
+                (parameter.name, parameter.kind, parameter.default)
+                for parameter in sync_parameters
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
