@@ -379,13 +379,13 @@ the default SSH command or an explicit command whose executable is `ssh`; an
 arbitrary remote-shell wrapper must carry its own port option.
 
 For two remote endpoints, `--run-at auto` (the default) places the coordinator
-at the source when the paths can be represented in a remote command, and
-refuses otherwise: data is never routed through this machine implicitly.
-`--run-at source` explicitly selects a direct push, `--run-at target` selects
-a direct pull with the SSH edge reversed, and `--run-at local` explicitly
-selects a relay through this machine. Direct placement therefore requires
-UTF-8 paths today. `--run-at` is rejected for copies that do not have two
-remote endpoints.
+at the source. Path operands travel base64-encoded inside the delegated
+command line, so direct placement works for every filename and data is never
+routed through this machine implicitly. `--run-at source` explicitly selects a
+direct push, `--run-at target` selects a direct pull with the SSH edge
+reversed, and `--run-at local` explicitly selects a relay through this
+machine. `--run-at` is rejected for copies that do not have two remote
+endpoints.
 
 The default push uses destination-bound agent authentication plus the
 command-restricted write receiver. Default pull fails closed until the
@@ -586,11 +586,10 @@ syq cp --from hostA --src-src big --to hostB --into big
 syq cp --prune --from hostA --src-src tree --to hostB --into-existing tree
 ```
 
-For paths representable in a remote command, syq starts the orchestrator on
-hostA and pushes directly to hostB, so file data does not traverse the invoking
-machine. Matching helpers are installed automatically on both hosts and output
-is streamed back. Raw path bytes that cannot be represented safely in the
-remote command are relayed through the invoking machine. When both endpoints
+syq starts the orchestrator on hostA and pushes directly to hostB, so file
+data does not traverse the invoking machine; path operands travel encoded in
+the delegated command, so any filename works. Matching helpers are installed
+automatically on both hosts and output is streamed back. When both endpoints
 name the same host and user, syq runs a local copy on that host.
 
 With implicit OpenSSH, the default combines a pre-enrolled forced receiver on

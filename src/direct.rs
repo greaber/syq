@@ -967,10 +967,7 @@ fn run_remote(
     }
     remote.push(native_placement_arg(args)?.into());
     remote.push(delegated_operand(
-        restricted_destination_path
-            .as_deref()
-            .map(str::as_bytes)
-            .unwrap_or(&dst.path),
+        restricted_destination_path.as_deref().unwrap_or(&dst.path),
     ));
 
     if args.detach {

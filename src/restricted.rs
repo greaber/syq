@@ -117,7 +117,7 @@ struct PendingEnrollment {
 
 pub(crate) struct PreparedTransfer {
     pub(crate) private_key: PrivateKey,
-    pub(crate) canonical_destination: String,
+    pub(crate) canonical_destination: Vec<u8>,
     pub(crate) grant: String,
     pub(crate) enrollment_id: EnrollmentId,
     /// The nonce the grant was signed with; the receipt must name it.
@@ -2686,12 +2686,14 @@ fn signer_name(id: EnrollmentId) -> String {
     format!("syq-enrollment-{id}")
 }
 
-fn normalize_absolute(path: &str, home: &Path) -> Result<PathBuf> {
-    let raw = if path == "~" {
+fn normalize_absolute(path: &std::ffi::OsStr, home: &Path) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = path.as_bytes();
+    let raw = if bytes == b"~" {
         home.to_path_buf()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        home.join(rest)
-    } else if path.starts_with('/') {
+    } else if let Some(rest) = bytes.strip_prefix(b"~/") {
+        home.join(std::ffi::OsStr::from_bytes(rest))
+    } else if bytes.starts_with(b"/") {
         PathBuf::from(path)
     } else {
         home.join(path)
@@ -2766,7 +2768,8 @@ pub(crate) fn remote_install() -> Result<()> {
     if account != request.target_login {
         bail!("enrollment target login does not match the remote account");
     }
-    let destination = normalize_absolute(&request.requested_destination, &home)?;
+    let destination =
+        normalize_absolute(std::ffi::OsStr::new(&request.requested_destination), &home)?;
     let parent = requested_parent(&destination);
     let canonical_root = fs::canonicalize(parent)
         .with_context(|| format!("resolve restricted destination parent {}", parent.display()))?;
@@ -3157,7 +3160,7 @@ fn enroll(
     requested_destination: &str,
     jump: Option<&SshEndpoint>,
     refresh_existing: bool,
-) -> Result<(LocalEnrollment, PathBuf, String)> {
+) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
     let base = local_state_base()?;
     let base_lock = open_directory(&base)?;
     lock_directory(&base_lock)?;
@@ -3165,7 +3168,8 @@ fn enroll(
     let mut active = None;
     for (metadata, directory) in load_local_enrollments()? {
         if metadata.host == host && metadata.port == port && metadata.target_login == login {
-            if let Some(canonical_destination) = destination_for(&metadata, requested_destination)?
+            if let Some(canonical_destination) =
+                destination_for(&metadata, requested_destination.as_bytes())?
             {
                 active = Some((metadata, directory, canonical_destination));
                 break;
@@ -3265,23 +3269,33 @@ fn enroll(
         receipt_public_key: response.receipt_public_key,
     };
     complete_local_enrollment(&directory, &metadata)?;
-    Ok((metadata, directory, response.canonical_destination))
+    Ok((
+        metadata,
+        directory,
+        response.canonical_destination.into_bytes(),
+    ))
 }
 
-fn destination_for(metadata: &LocalEnrollment, requested: &str) -> Result<Option<String>> {
-    let normalized = normalize_absolute(requested, Path::new(&metadata.remote_home))?;
+fn destination_for(metadata: &LocalEnrollment, requested: &[u8]) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let normalized = normalize_absolute(
+        std::ffi::OsStr::from_bytes(requested),
+        Path::new(&metadata.remote_home),
+    )?;
     if requested_parent(&normalized) != Path::new(&metadata.requested_parent) {
         return Ok(None);
     }
     let leaf = normalized
         .file_name()
         .context("restricted destination / is not supported")?;
+    // The enrollment's canonical root is UTF-8 (it is administrative,
+    // declared at enrollment time); the leaf may be any bytes.
     Ok(Some(
         Path::new(&metadata.canonical_root)
             .join(leaf)
-            .to_str()
-            .context("canonical restricted destination is not UTF-8")?
-            .to_owned(),
+            .as_os_str()
+            .as_bytes()
+            .to_vec(),
     ))
 }
 
@@ -3399,7 +3413,7 @@ fn grant_for(
     sources: &[Location],
     id: EnrollmentId,
     login: &str,
-    destination: &str,
+    destination: &[u8],
 ) -> Result<Grant> {
     validate_restricted_args(args)?;
     let issued_at = now()?;
@@ -3449,7 +3463,7 @@ fn grant_for(
         }
         Placement::Into | Placement::Rsync => DestinationPlacement::DirectoryAsChild,
     };
-    let destination_bytes = destination.as_bytes().to_vec();
+    let destination_bytes = destination.to_vec();
     let mut mutation_scopes = match placement {
         DestinationPlacement::ExactPath | DestinationPlacement::DirectoryContents => {
             vec![MutationScope {
@@ -3583,8 +3597,7 @@ pub(crate) fn prepare_transfer(
         .host
         .as_deref()
         .context("destination host missing")?;
-    let requested = std::str::from_utf8(&destination.path)
-        .context("restricted destination path is not UTF-8")?;
+    let requested = destination.path.as_slice();
     let mut selected = None;
     for (metadata, directory) in load_local_enrollments()? {
         if metadata.host == host
@@ -3614,7 +3627,12 @@ pub(crate) fn prepare_transfer(
                 host,
                 destination.port,
                 destination_login,
-                requested,
+                // Automatic enrollment declares a new administrative scope,
+                // which stays UTF-8; transfers against an existing
+                // enrollment accept any destination bytes above.
+                std::str::from_utf8(requested).context(
+                    "automatic enrollment requires a UTF-8 destination; pre-enroll a scope with `syq enrollment add` to copy to this path",
+                )?,
                 Some(&jump),
                 false,
             )?
@@ -3658,11 +3676,7 @@ pub(crate) fn prepare_transfer(
             max_file_data_bytes_per_second: args.bwlimit_bytes,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
-                destination_roots: filter_destination_roots(
-                    args,
-                    sources,
-                    canonical_destination.as_bytes(),
-                )?,
+                destination_roots: filter_destination_roots(args, sources, &canonical_destination)?,
                 delete_excluded: args.delete_excluded,
             },
             root_existence: root_existence_for(args.target_existence),
@@ -3854,7 +3868,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                 "enrolled {} for {}:{}",
                 metadata.id,
                 endpoint(&metadata.target_login, &metadata.host, metadata.port)?.label(),
-                destination
+                String::from_utf8_lossy(&destination)
             );
             Ok(0)
         })()),
@@ -4127,12 +4141,55 @@ mod tests {
     }
 
     #[test]
+    fn enrolled_destinations_accept_any_leaf_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let metadata = LocalEnrollment {
+            version: 1,
+            id: EnrollmentId::random(),
+            host: "hostB".into(),
+            port: None,
+            target_login: "backup".into(),
+            remote_home: "/home/backup".into(),
+            requested_parent: "/home/backup/archive".into(),
+            canonical_root: "/srv/archive".into(),
+            receiver_path: "/usr/bin/syq".into(),
+            receipt_public_key: String::new(),
+        };
+        // A destination whose leaf is not UTF-8 still resolves inside the
+        // enrollment's (UTF-8, administrative) scope.
+        let mut requested = b"archive/leaf-".to_vec();
+        requested.push(0xff);
+        let canonical = destination_for(&metadata, &requested).unwrap().unwrap();
+        let mut expected = b"/srv/archive/leaf-".to_vec();
+        expected.push(0xff);
+        assert_eq!(canonical, expected);
+        assert_eq!(
+            std::ffi::OsStr::from_bytes(&canonical),
+            Path::new("/srv/archive")
+                .join(std::ffi::OsStr::from_bytes(b"leaf-\xff"))
+                .as_os_str()
+        );
+        // Outside the enrolled parent, no match.
+        assert!(destination_for(&metadata, b"elsewhere/leaf")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn relative_destination_resolution_rejects_parent_components() {
         assert_eq!(
-            normalize_absolute("archive/file", Path::new("/home/backup")).unwrap(),
+            normalize_absolute(
+                std::ffi::OsStr::new("archive/file"),
+                Path::new("/home/backup")
+            )
+            .unwrap(),
             Path::new("/home/backup/archive/file")
         );
-        assert!(normalize_absolute("archive/../escape", Path::new("/home/backup")).is_err());
+        assert!(normalize_absolute(
+            std::ffi::OsStr::new("archive/../escape"),
+            Path::new("/home/backup")
+        )
+        .is_err());
     }
 
     #[test]
@@ -6678,7 +6735,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup",
+            b"/backup",
         )
         .unwrap();
         let GrantOperation::Copy(copy) = &grant.operation;
@@ -6706,7 +6763,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup",
+            b"/backup",
         )
         .unwrap();
         let GrantOperation::Copy(default_copy) = &default_grant.operation;
@@ -6733,7 +6790,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup",
+            b"/backup",
         )
         .unwrap();
         let GrantOperation::Copy(copy) = &grant.operation;
@@ -6751,7 +6808,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup"
+            b"/backup"
         )
         .is_err());
 
@@ -6763,7 +6820,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup"
+            b"/backup"
         )
         .is_err());
         let mut bounded = parse(&["--delete", "--max-delete", "40"]);
@@ -6773,7 +6830,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup",
+            b"/backup",
         )
         .unwrap();
         let GrantOperation::Copy(copy) = &grant.operation;
@@ -6781,7 +6838,7 @@ mod tests {
         assert_eq!(copy.limits.max_deletions, 30);
         // A read-only run plans no deletion, so it needs no budget.
         let preview = parse(&["--delete", "--dry-run"]);
-        let grant = grant_for(&preview, &[source], id, "backup", "/backup").unwrap();
+        let grant = grant_for(&preview, &[source], id, "backup", b"/backup").unwrap();
         let GrantOperation::Copy(copy) = &grant.operation;
         assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
     }
@@ -6793,7 +6850,7 @@ mod tests {
             Args::try_parse_from(["syq rsync", "-r", "host-a:source", "host-b:/backup"]).unwrap();
         named_args.normalize();
         let named_source = Location::parse("host-a:source").unwrap();
-        let named = grant_for(&named_args, &[named_source], id, "backup", "/backup").unwrap();
+        let named = grant_for(&named_args, &[named_source], id, "backup", b"/backup").unwrap();
         let GrantOperation::Copy(named) = named.operation;
         assert_eq!(
             named.mutation_scopes,
@@ -6814,7 +6871,7 @@ mod tests {
         contents_args.normalize();
         let contents_source = Location::parse("host-a:source/").unwrap();
         let contents =
-            grant_for(&contents_args, &[contents_source], id, "backup", "/backup").unwrap();
+            grant_for(&contents_args, &[contents_source], id, "backup", b"/backup").unwrap();
         let GrantOperation::Copy(contents) = contents.operation;
         assert_eq!(
             contents.mutation_scopes,
@@ -6828,7 +6885,8 @@ mod tests {
             Args::try_parse_from(["syq rsync", "host-a:file", "host-b:/backup"]).unwrap();
         nonrecursive_args.normalize();
         let file = Location::parse("host-a:file").unwrap();
-        let nonrecursive = grant_for(&nonrecursive_args, &[file], id, "backup", "/backup").unwrap();
+        let nonrecursive =
+            grant_for(&nonrecursive_args, &[file], id, "backup", b"/backup").unwrap();
         let GrantOperation::Copy(nonrecursive) = nonrecursive.operation;
         assert!(nonrecursive
             .mutation_scopes
@@ -6838,7 +6896,7 @@ mod tests {
         let mut unsupported = nonrecursive_args;
         unsupported.min_size = Some("1".into());
         let file = Location::parse("host-a:file").unwrap();
-        assert!(grant_for(&unsupported, &[file], id, "backup", "/backup").is_err());
+        assert!(grant_for(&unsupported, &[file], id, "backup", b"/backup").is_err());
     }
 
     #[test]
