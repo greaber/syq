@@ -32,6 +32,7 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const RELEASE_PUBLIC_KEY: Option<&str> = option_env!("SYQ_RELEASE_PUBLIC_KEY");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct InstallReceipt {
     schema: u32,
     provider: String,
@@ -47,9 +48,6 @@ struct ReleaseManifest {
     repository: String,
     version: String,
     tag: String,
-    /// Required so updaters through 0.1.1 can consume future manifests. New code
-    /// does not use this legacy field as a compatibility decision.
-    helper_id: String,
     artifacts: BTreeMap<String, ReleaseArtifact>,
     installer: ReleaseFile,
     homebrew_formula: ReleaseFile,
@@ -392,16 +390,6 @@ fn validate_manifest(manifest: &ReleaseManifest) -> Result<Version> {
     let version = Version::parse(&manifest.version).context("invalid release version")?;
     if manifest.tag != format!("v{version}") {
         bail!("release tag does not match its version");
-    }
-    // Versions through 0.1.1 require this shape before accepting an update.
-    // The numeric suffix is retained as manifest compatibility data only.
-    let helper_prefix = format!("{}-p", manifest.tag);
-    let legacy_suffix = manifest
-        .helper_id
-        .strip_prefix(&helper_prefix)
-        .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()));
-    if legacy_suffix.is_none() {
-        bail!("release helper identity is malformed");
     }
     for (target, artifact) in &manifest.artifacts {
         validate_release_file(target, &artifact.binary)?;
@@ -894,7 +882,6 @@ mod tests {
             repository: REPOSITORY.into(),
             version: "1.2.3".into(),
             tag: "v1.2.3".into(),
-            helper_id: "v1.2.3-p0".into(),
             artifacts: BTreeMap::from([(
                 "linux-x86_64".into(),
                 ReleaseArtifact {
@@ -962,14 +949,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_tag_or_legacy_helper_id_from_another_release() {
+    fn rejects_a_tag_or_signature_scheme_from_another_release() {
         let mut value = manifest();
         value.tag = "v1.2.4".into();
         assert!(validate_manifest(&value).is_err());
         value.tag = "v1.2.3".into();
-        value.helper_id = "v1.2.2-p0".into();
-        assert!(validate_manifest(&value).is_err());
-        value.helper_id = "v1.2.3-p0".into();
         value.signature_scheme = "unknown".into();
         assert!(validate_manifest(&value).is_err());
     }

@@ -105,55 +105,23 @@
     "map": {
       "sdk": "python",
       "python": [
+        "as",
         "cwd",
         "follow",
         "src",
-        "src-src",
-        "src-file",
         "src-dir",
-        "to",
-        "into",
-        "as"
+        "src-file",
+        "src-src"
       ],
-      "internal": [
-        "quiet"
-      ],
+      "internal": [],
       "aliases": {
         "srcs": "src",
         "src-srcs": "src-src",
         "src-files": "src-file",
         "src-dirs": "src-dir"
       },
-      "raw_only": [
-        "as-existing",
-        "as-new",
-        "bwlimit",
-        "connections",
-        "dry-run",
-        "from",
-        "hash",
-        "ignore",
-        "ignore-from",
-        "inplace",
-        "into-existing",
-        "into-new",
-        "mapping",
-        "max-entries",
-        "max-runtime",
-        "max-total-bytes",
-        "no-compress",
-        "no-progress",
-        "preserve",
-        "progress",
-        "progress-json",
-        "results",
-        "results-fd",
-        "stats",
-        "verbose"
-      ],
-      "follow_up": [
-        "receipt"
-      ]
+      "raw_only": [],
+      "follow_up": []
     }
   }
 }

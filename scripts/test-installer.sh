@@ -34,7 +34,6 @@ write_program() {
 case "\$1" in
   --version) echo 'syq $version' ;;
   --build-identity) echo '$identity' ;;
-  --remote-helper-id) echo 'v$version-p0' ;;
   --register-standalone-install) exit 0 ;;
   --test-target) echo '$target' ;;
   *) exit 2 ;;
@@ -72,7 +71,7 @@ write_manifest() {
   done
   jq -n --sort-keys --argjson artifacts "$artifacts" '
     {schema:1,repository:"https://github.com/greaber/syq",version:"0.1.0",
-     tag:"v0.1.0",helper_id:"v0.1.0-p0",artifacts:$artifacts,
+     tag:"v0.1.0",artifacts:$artifacts,
      installer:{name:"install.sh",sha256:("1"*64),size:1},
      homebrew_formula:{name:"syq.rb",sha256:("2"*64),size:1}}' > "$output"
 }

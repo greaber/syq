@@ -55,8 +55,8 @@ directories no entry names are created implicitly, as with
 
 ## Emitting a mapping
 
-`syq map` takes the same selectors as `syq cp` and prints the resolved
-selection and placement as a mapping instead of copying:
+`syq map` takes the same local selectors as `syq cp` and prints the resolved
+selection as a mapping instead of copying:
 
 ```sh
 syq map --src-src photos          # contents of photos/, dst == src
@@ -67,13 +67,13 @@ Emission refuses names that are not valid UTF-8 (so published
 one-line transforms are safe by construction); mappings you author
 yourself may use the base64 form for such names.
 
-In this first version `syq map` reads a local source (`--from` is
-refused), and takes either `--src-src DIR` as the only selector or any
-number of relative named selectors. It never contacts a destination,
-so `--to` and `--into` do not change what is emitted and the
-`--into-new`/`--into-existing`/`--as-new`/`--as-existing` existence
-preconditions are refused; only `--as` changes the output, by renaming
-the single selected root.
+`syq map` deliberately has a destination-independent surface: `-C`,
+`--follow`, the source-selector family, and `--as`. It takes either
+`--src-src DIR` as the only selector or any number of relative named
+selectors. `--as` renames the single selected root. Destination, filtering,
+transfer, execution, result, receiver-ceiling, and receipt options belong to
+the later `syq cp --mapping` invocation or to a manifest transform, not to
+`syq map`.
 
 ## Transform in the middle
 
@@ -227,11 +227,11 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   an exact single-path placement cannot host a manifest — each entry's
   `dst` already is its own `--as`. It is part of the native surface
   only; `syq rsync` is unchanged.
-- `syq map` accepts the `syq cp` grammar, including `--as PATH` (which
-  emits the single selected root under the target's basename) and the
-  typed selectors `--src-file`/`--src-dir`, validated exactly as native
-  cp validates them; see "Emitting a mapping" for this version's
-  restrictions.
+- `syq map` accepts the local selector grammar, including the typed selectors
+  `--src-file`/`--src-dir`, plus `--as PATH` (which emits the single selected
+  root under the target's basename). Those selectors are validated exactly as
+  native `cp` validates them; see "Emitting a mapping" for the complete
+  surface.
 - Fidelity is the native default (`-rlt`). There is no per-entry
   policy: preservation and comparison behavior stay global.
 - An entry claims exactly one object. A `dir` entry claims the
@@ -292,11 +292,15 @@ metadata-only updates are not yet reported per operation. A missing
 terminal record means the run did not finish; a terminal status other
 than `success` or `partial` means entries may be unsettled.
 
-The results writer lives with the transfer coordinator; for a direct
-remote-to-remote copy the stream rides the coordinator connection back to
-the invoking terminal. `--results` cannot be combined with `--detach`,
-because the caller would no longer be attached for the complete stream and
-its terminal record.
+The results writer lives with the transfer coordinator, so a stream
+requires a local coordinator (an explicit `--run-at local` for a
+remote-to-remote copy). `--results` cannot be combined with `--detach`,
+because the caller would no longer be attached for the complete stream
+and its terminal record. Receiver-attested streams for attached direct
+copies through a command-restricted receiver — records verified and
+decrypted from hostB's receipt, marked `"provenance":"receiver_attested"`
+— exist in the engine and return once wired to the file/descriptor
+targets.
 
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:
@@ -317,9 +321,10 @@ jq -cs 'if (.[-1].type? // "") != "result"
 
 The jq program first checks the stream's terminal record: a results
 file without one is from a run that did not finish (a crash, a kill),
-and a terminal status other than `success` or `partial` (an aborted
-run, say) means queued entries were never settled — in both cases
-entries may have no records at all, so a retry manifest built from
+and a terminal status other than `success` or `partial` (an `aborted`
+incomplete receipt or a `refused` run) means queued entries were never
+settled or their receipt records may be missing. In both cases, entries
+may have no records at all, so a retry manifest built from
 what is there would look complete while it is not. With the
 terminal record present, the filter is what an exit code cannot
 express: which entries failed, and whether a retry could help.

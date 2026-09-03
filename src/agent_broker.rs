@@ -1,84 +1,47 @@
-//! A fail-closed SSH-agent proxy for live direct remote-to-remote transfers.
+//! A fail-closed SSH-agent proxy for native remote-to-remote transfers.
 //!
-//! The source host sees public identities from the caller's ambient agent, but
-//! signatures are released only for one hostA -> user@hostB SSH authentication
-//! path. OpenSSH's session-bind messages prove the two SSH sessions and the
-//! host-bound userauth request binds the signature to B's host key and login
-//! user. The broker never accepts key-management or opaque signing requests.
+//! The default mode exposes only the transfer's enrolled transport key. Native
+//! `--agent-broker-only` instead advertises supported ambient-agent identities,
+//! while applying the same signature restrictions. OpenSSH's session-bind
+//! messages prove the delegate and destination sessions, and the host-bound
+//! userauth request binds each signature to the destination host key and login
+//! user.
 
+use crate::private_broker::{
+    ConnectionRegistry, PrivateBroker, PrivateBrokerConfig, TrackedStream,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use signature::{Signer, Verifier};
 use ssh_agent_lib::proto::extension::{MessageExtension, SessionBind};
 use ssh_agent_lib::proto::{Extension, Identity, PublicCredential, Request, Response, SignRequest};
 use ssh_agent_lib::ssh_encoding::{Decode, Encode};
-use ssh_agent_lib::ssh_key::{
-    certificate::{CertType, Certificate},
-    public::KeyData,
-    Algorithm, PrivateKey, PublicKey,
-};
-use std::collections::{HashMap, HashSet};
+use ssh_agent_lib::ssh_key::{public::KeyData, Algorithm, PrivateKey, PublicKey};
 use std::ffi::{CStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::FileTypeExt;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+#[cfg(test)]
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 /// Agent messages are normally only a few KiB. This accommodates large
 /// identity lists without allowing a peer to force an unbounded allocation.
 const MAX_AGENT_FRAME: usize = 256 * 1024;
-/// Bound stalled forwarded clients and ambient-agent operations while leaving
-/// enough time for hardware-token touch/PIN/confirmation prompts.
+/// Bound stalled forwarded clients while leaving enough time for SSH setup.
 const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SSH_CONFIG_FILES: usize = 256;
 const MAX_SSH_CONFIG_BYTES: usize = 1024 * 1024;
 const SSH_AGENT_FAILURE: &[u8] = &[5];
 const SSH_AGENT_SUCCESS: &[u8] = &[6];
 const SSH_AGENT_EXTENSION_FAILURE: &[u8] = &[28];
-
-static SIGNAL_CLEANUP_PATHS: OnceLock<Arc<Mutex<HashSet<PathBuf>>>> = OnceLock::new();
-static SIGNAL_CLEANUP_THREAD: OnceLock<()> = OnceLock::new();
-
-fn register_signal_cleanup(path: &Path) -> Result<()> {
-    let paths = SIGNAL_CLEANUP_PATHS
-        .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
-        .clone();
-    if SIGNAL_CLEANUP_THREAD.get().is_none() {
-        let mut signals = signal_hook::iterator::Signals::new([
-            signal_hook::consts::SIGINT,
-            signal_hook::consts::SIGTERM,
-        ])
-        .context("register constrained-agent signal cleanup")?;
-        let cleanup_paths = paths.clone();
-        thread::Builder::new()
-            .name("syq-agent-signal-cleanup".into())
-            .spawn(move || {
-                if let Some(signal) = signals.forever().next() {
-                    let paths: Vec<_> = cleanup_paths.lock().unwrap().iter().cloned().collect();
-                    for path in paths {
-                        let _ = std::fs::remove_dir_all(path);
-                    }
-                    let _ = signal_hook::low_level::emulate_default_handler(signal);
-                }
-            })
-            .context("start constrained-agent signal cleanup")?;
-        let _ = SIGNAL_CLEANUP_THREAD.set(());
-    }
-    paths.lock().unwrap().insert(path.to_path_buf());
-    Ok(())
-}
-
-fn unregister_signal_cleanup(path: &Path) {
-    if let Some(paths) = SIGNAL_CLEANUP_PATHS.get() {
-        paths.lock().unwrap().remove(path);
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct HostPolicy {
@@ -89,7 +52,6 @@ pub struct HostPolicy {
     known_hosts_name: String,
     host_key_algorithms: Vec<String>,
     required_rsa_size: usize,
-    user_certificates: Vec<Certificate>,
 }
 
 impl HostPolicy {
@@ -148,15 +110,8 @@ pub fn resolve_host_policy(
     ssh_program: &str,
     explicit_user: Option<&str>,
     host: &str,
-    load_user_certificates: bool,
 ) -> Result<HostPolicy> {
-    resolve_host_policy_at(
-        ssh_program,
-        explicit_user,
-        host,
-        None,
-        load_user_certificates,
-    )
+    resolve_host_policy_at(ssh_program, explicit_user, host, None)
 }
 
 /// Resolve host policy after applying an explicit endpoint port. Keeping the
@@ -167,7 +122,6 @@ pub fn resolve_host_policy_at(
     explicit_user: Option<&str>,
     host: &str,
     explicit_port: Option<u16>,
-    load_user_certificates: bool,
 ) -> Result<HostPolicy> {
     let inspection =
         inspect_ssh_configuration_at(ssh_program, explicit_user, host, explicit_port, false)?;
@@ -190,16 +144,10 @@ pub fn resolve_host_policy_at(
             );
         }
         bail!(
-            "no exact trusted host key for {host} ({}) allowed by HostKeyAlgorithms and RequiredRSASize and supported by syq's cryptographic verifier was found in the configured known_hosts files; connect once with ssh to record it, use --relay, or use --no-forward-agent with credentials on the source host",
+            "no exact trusted host key for {host} ({}) allowed by HostKeyAlgorithms and RequiredRSASize and supported by syq's cryptographic verifier was found in the configured known_hosts files; connect once with ssh to record it before retrying the direct transfer",
             config.lookup
         );
     }
-    let user_certificates = if load_user_certificates {
-        let certificate_paths = certificate_paths(&config, host)?;
-        read_user_certificates(&certificate_paths)?
-    } else {
-        Vec::new()
-    };
     Ok(HostPolicy {
         login_user: config.user,
         connection_host: config.hostname,
@@ -208,7 +156,6 @@ pub fn resolve_host_policy_at(
         known_hosts_name: config.lookup,
         host_key_algorithms: config.host_key_algorithms,
         required_rsa_size: config.required_rsa_size,
-        user_certificates,
     })
 }
 
@@ -371,15 +318,10 @@ struct EffectiveSshConfig {
     user: String,
     hostname: String,
     port: u16,
-    host_key_alias: Option<String>,
-    proxy_jump: Option<String>,
     lookup: String,
     files: Vec<PathBuf>,
     host_key_algorithms: Vec<String>,
     required_rsa_size: usize,
-    certificate_files: Vec<String>,
-    certificate_files_configured: bool,
-    identity_files: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -441,13 +383,9 @@ fn parse_ssh_config_with_defaults(
     let mut hostname = None;
     let mut port = None;
     let mut hostkey_alias = None;
-    let mut proxy_jump = None;
     let mut files = Vec::new();
     let mut host_key_algorithms = None;
     let mut required_rsa_size = None;
-    let mut certificate_files = Vec::new();
-    let mut certificate_files_configured = false;
-    let mut identity_files = Vec::new();
     for line in output.lines() {
         let Some((name, value)) = line.split_once(' ') else {
             continue;
@@ -458,7 +396,6 @@ fn parse_ssh_config_with_defaults(
             "hostname" => hostname = Some(value.to_string()),
             "port" => port = Some(value.parse::<u16>().context("invalid SSH port")?),
             "hostkeyalias" if value != "none" => hostkey_alias = Some(value.to_string()),
-            "proxyjump" if value != "none" => proxy_jump = Some(value.to_string()),
             "hostkeyalgorithms" => {
                 let algorithms: Vec<_> = value
                     .split(',')
@@ -484,13 +421,6 @@ fn parse_ssh_config_with_defaults(
                     "RevokedHostKeys is configured as {value:?}; constrained agent forwarding does not yet query OpenSSH KRL revocations"
                 );
             }
-            "certificatefile" => {
-                certificate_files_configured = true;
-                if value != "none" {
-                    certificate_files.push(value.to_string());
-                }
-            }
-            "identityfile" if value != "none" => identity_files.push(value.to_string()),
             "userknownhostsfile" => {
                 append_known_hosts_files(
                     &mut files,
@@ -528,17 +458,12 @@ fn parse_ssh_config_with_defaults(
         user,
         hostname,
         port,
-        host_key_alias: hostkey_alias,
-        proxy_jump,
         lookup,
         files,
         host_key_algorithms: host_key_algorithms.context("missing SSH HostKeyAlgorithms")?,
         // RequiredRSASize was added after the OpenSSH 8.9 functional floor.
         // Before the directive existed, OpenSSH's minimum was 1024 bits.
         required_rsa_size: required_rsa_size.unwrap_or(1024),
-        certificate_files,
-        certificate_files_configured,
-        identity_files,
     })
 }
 
@@ -649,6 +574,14 @@ fn key_is_cryptographically_verifiable(key: &KeyData) -> bool {
     )
 }
 
+fn credential_is_cryptographically_verifiable(credential: &PublicCredential) -> bool {
+    key_is_cryptographically_verifiable(credential.key_data())
+        && match credential {
+            PublicCredential::Key(_) => true,
+            PublicCredential::Cert(certificate) => certificate.verify_signature().is_ok(),
+        }
+}
+
 fn signature_algorithm_is_cryptographically_verifiable(algorithm: &Algorithm) -> bool {
     matches!(
         algorithm,
@@ -660,148 +593,8 @@ fn signature_algorithm_is_cryptographically_verifiable(algorithm: &Algorithm) ->
     )
 }
 
-fn credential_is_cryptographically_verifiable(credential: &PublicCredential) -> bool {
-    key_is_cryptographically_verifiable(credential.key_data())
-        && match credential {
-            PublicCredential::Key(_) => true,
-            PublicCredential::Cert(certificate) => certificate.verify_signature().is_ok(),
-        }
-}
-
-fn certificate_paths(config: &EffectiveSshConfig, original_host: &str) -> Result<Vec<PathBuf>> {
-    let candidates: Vec<(String, &str)> = if config.certificate_files_configured {
-        config
-            .certificate_files
-            .iter()
-            .cloned()
-            .map(|path| (path, "CertificateFile"))
-            .collect()
-    } else {
-        config
-            .identity_files
-            .iter()
-            .map(|path| {
-                (
-                    format!("{path}-cert.pub"),
-                    "implicit IdentityFile certificate",
-                )
-            })
-            .collect()
-    };
-    let mut paths = Vec::new();
-    for (configured, source) in candidates {
-        let expanded = expand_credential_path(&configured, config, original_host)
-            .with_context(|| format!("expand {source} {configured:?}"))?;
-        if !paths.contains(&expanded) {
-            paths.push(expanded);
-        }
-    }
-    Ok(paths)
-}
-
-fn expand_credential_path(
-    configured: &str,
-    config: &EffectiveSshConfig,
-    original_host: &str,
-) -> Result<PathBuf> {
-    expand_credential_path_with_env(configured, config, original_host, |name| {
-        std::env::var(name)
-            .with_context(|| format!("SSH credential path environment variable {name} is unset"))
-    })
-}
-
-fn expand_credential_path_with_env(
-    configured: &str,
-    config: &EffectiveSshConfig,
-    original_host: &str,
-    environment: impl Fn(&str) -> Result<String>,
-) -> Result<PathBuf> {
-    let needs_account = configured == "~"
-        || configured.starts_with("~/")
-        || configured.contains("%d")
-        || configured.contains("%u");
-    let account = needs_account
-        .then(local_account)
-        .transpose()?
-        .unwrap_or_default();
-    let home = account.home;
-    let configured = if configured == "~" {
-        home.clone()
-    } else if let Some(rest) = configured.strip_prefix("~/") {
-        format!("{home}/{rest}")
-    } else if configured.starts_with('~') {
-        bail!("SSH credential path uses an unsupported named-user tilde");
-    } else {
-        configured.to_owned()
-    };
-
-    let host_key_name = config.host_key_alias.as_deref().unwrap_or(original_host);
-    let mut expanded = String::with_capacity(configured.len());
-    let mut chars = configured.chars().peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            '%' => {
-                let token = chars
-                    .next()
-                    .context("trailing '%' in SSH credential path")?;
-                match token {
-                    '%' => expanded.push('%'),
-                    'd' => expanded.push_str(&home),
-                    'h' => expanded.push_str(&config.hostname),
-                    'i' => expanded.push_str(&unsafe { libc::getuid() }.to_string()),
-                    'j' => expanded.push_str(config.proxy_jump.as_deref().unwrap_or("")),
-                    'k' => expanded.push_str(host_key_name),
-                    'L' => {
-                        let hostname = local_hostname()?;
-                        expanded.push_str(
-                            hostname
-                                .split_once('.')
-                                .map_or(hostname.as_str(), |(short, _)| short),
-                        );
-                    }
-                    'l' => expanded.push_str(&local_hostname()?),
-                    'n' => expanded.push_str(original_host),
-                    'p' => expanded.push_str(&config.port.to_string()),
-                    'r' => expanded.push_str(&config.user),
-                    'u' => expanded.push_str(&account.username),
-                    'C' => bail!(
-                        "SSH credential path uses OpenSSH's %C connection hash, which syq cannot reproduce safely"
-                    ),
-                    other => bail!("unsupported SSH credential path token %{other}"),
-                }
-            }
-            '$' if chars.peek() == Some(&'{') => {
-                chars.next();
-                let mut name = String::new();
-                loop {
-                    match chars.next() {
-                        Some('}') => break,
-                        Some(character) => name.push(character),
-                        None => {
-                            bail!("unterminated environment variable in SSH credential path")
-                        }
-                    }
-                }
-                if name.is_empty()
-                    || !name
-                        .bytes()
-                        .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-                {
-                    bail!("invalid environment variable in SSH credential path");
-                }
-                // OpenSSH expands percent tokens and environment variables in
-                // one pass. Do not reinterpret '%' or '${...}' in this value.
-                expanded.push_str(&environment(&name)?);
-            }
-            _ => expanded.push(character),
-        }
-    }
-    Ok(PathBuf::from(expanded))
-}
-
 #[derive(Default)]
 struct LocalAccount {
-    username: String,
     home: String,
 }
 
@@ -839,65 +632,15 @@ fn local_account() -> Result<LocalAccount> {
         if result.is_null() {
             bail!("local SSH user for uid {uid} was not found");
         }
-        if entry.pw_name.is_null() || entry.pw_dir.is_null() {
+        if entry.pw_dir.is_null() {
             bail!("local SSH account record for uid {uid} was incomplete");
         }
-        let username = unsafe { CStr::from_ptr(entry.pw_name) }
-            .to_str()
-            .context("local SSH username was not UTF-8")?
-            .to_string();
         let home = unsafe { CStr::from_ptr(entry.pw_dir) }
             .to_str()
             .context("local SSH home directory was not UTF-8")?
             .to_string();
-        return Ok(LocalAccount { username, home });
+        return Ok(LocalAccount { home });
     }
-}
-
-fn local_hostname() -> Result<String> {
-    let mut bytes = [0u8; 256];
-    if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
-        return Err(io::Error::last_os_error()).context("read local hostname");
-    }
-    let length = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .context("local hostname exceeded 255 bytes")?;
-    String::from_utf8(bytes[..length].to_vec()).context("local hostname was not UTF-8")
-}
-
-fn read_user_certificates(paths: &[PathBuf]) -> Result<Vec<Certificate>> {
-    let mut certificates = Vec::new();
-    for path in paths {
-        if !path.exists() {
-            continue;
-        }
-        let certificate = Certificate::read_file(path)
-            .with_context(|| format!("read user CertificateFile {}", path.display()))?;
-        if certificate.cert_type() != CertType::User {
-            bail!(
-                "CertificateFile {} is not a user certificate",
-                path.display()
-            );
-        }
-        if !key_is_cryptographically_verifiable(certificate.public_key()) {
-            bail!(
-                "user certificate {} uses unsupported authentication algorithm {}",
-                path.display(),
-                certificate.public_key().algorithm()
-            );
-        }
-        certificate
-            .verify_signature()
-            .with_context(|| format!("verify CertificateFile {}", path.display()))?;
-        if !certificates
-            .iter()
-            .any(|existing| certificates_equal_on_wire(existing, &certificate))
-        {
-            certificates.push(certificate);
-        }
-    }
-    Ok(certificates)
 }
 
 fn ssh_keygen_for(ssh_program: &str) -> OsString {
@@ -998,35 +741,53 @@ fn parse_known_host_output(
     Ok(())
 }
 
-/// A running broker. Dropping it closes every active client/upstream socket,
-/// joins the listener and workers, and removes the private socket directory.
+/// A running broker. Dropping it closes every active client socket, joins the
+/// listener and workers, and removes the private socket directory.
 pub struct ConstrainedAgentBroker {
     ambient_socket: PathBuf,
-    socket_path: PathBuf,
-    shutdown: Arc<AtomicBool>,
-    connections: Arc<ConnectionRegistry>,
-    listener_thread: Option<JoinHandle<()>>,
-    _socket_dir: tempfile::TempDir,
+    broker: PrivateBroker,
 }
 
 impl std::fmt::Debug for ConstrainedAgentBroker {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ConstrainedAgentBroker")
-            .field("socket_path", &self.socket_path)
+            .field("socket_path", &self.broker.socket_path())
             .finish_non_exhaustive()
     }
 }
 
 impl ConstrainedAgentBroker {
+    /// Start a destination-bound broker backed by the current SSH agent. This
+    /// is the native `--agent-broker-only` mode: signatures remain limited to
+    /// the validated delegate-to-destination session and login user.
     pub fn start(policy: BrokerPolicy, max_connections: usize) -> Result<Self> {
         let ambient = std::env::var_os("SSH_AUTH_SOCK")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .context(
-                "SSH_AUTH_SOCK is not set; constrained direct remote-to-remote authentication needs a local SSH agent (or use --relay/--no-forward-agent)",
+                "SSH_AUTH_SOCK is not set; constrained direct remote-to-remote authentication needs a local SSH agent",
             )?;
-        Self::start_with_socket(ambient, policy, max_connections)
+        Self::start_with_backend(
+            ambient.clone(),
+            SigningBackend::Ambient(ambient),
+            policy,
+            max_connections,
+        )
+    }
+
+    #[cfg(test)]
+    fn start_with_ambient_socket(
+        ambient_socket: PathBuf,
+        policy: BrokerPolicy,
+        max_connections: usize,
+    ) -> Result<Self> {
+        Self::start_with_backend(
+            ambient_socket.clone(),
+            SigningBackend::Ambient(ambient_socket),
+            policy,
+            max_connections,
+        )
     }
 
     /// Start a destination-bound broker which advertises and signs only with
@@ -1054,13 +815,19 @@ impl ConstrainedAgentBroker {
         )
     }
 
-    fn start_with_socket(
+    #[cfg(test)]
+    fn start_with_private_key_and_socket(
         ambient_socket: PathBuf,
         policy: BrokerPolicy,
         max_connections: usize,
+        private_key: PrivateKey,
     ) -> Result<Self> {
-        let backend = SigningBackend::Ambient(ambient_socket.clone());
-        Self::start_with_backend(ambient_socket, backend, policy, max_connections)
+        Self::start_with_backend(
+            ambient_socket,
+            SigningBackend::Private(Arc::new(private_key)),
+            policy,
+            max_connections,
+        )
     }
 
     fn start_with_backend(
@@ -1085,56 +852,31 @@ impl ConstrainedAgentBroker {
                 ambient_socket.display()
             );
         }
-        let socket_dir = tempfile::Builder::new()
-            .prefix("syq-agent-")
-            .tempdir()
-            .context("create private constrained-agent directory")?;
-        let socket_path = socket_dir.path().join("agent.sock");
-        validate_openssh_option_path(&socket_path, "temporary constrained-agent path")?;
-        let listener = UnixListener::bind(&socket_path)
-            .with_context(|| format!("bind constrained agent at {}", socket_path.display()))?;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        register_signal_cleanup(socket_dir.path())?;
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let connections = Arc::new(ConnectionRegistry::default());
-        let thread_shutdown = Arc::clone(&shutdown);
-        let thread_connections = Arc::clone(&connections);
         let backend = Arc::new(backend);
         let policy = Arc::new(policy);
-        let listener_thread = thread::Builder::new()
-            .name("syq-agent-listener".into())
-            .spawn(move || {
-                accept_connections(
-                    listener,
-                    backend,
-                    policy,
-                    max_connections,
-                    thread_shutdown,
-                    thread_connections,
-                )
-            });
-        let listener_thread = match listener_thread {
-            Ok(thread) => thread,
-            Err(error) => {
-                unregister_signal_cleanup(socket_dir.path());
-                return Err(error).context("start constrained-agent listener");
-            }
-        };
+        let broker = PrivateBroker::start(
+            PrivateBrokerConfig {
+                directory_prefix: "syq-agent-",
+                socket_name: "agent.sock",
+                listener_thread: "syq-agent-listener",
+                client_thread: "syq-agent-client",
+                max_connections,
+                io_timeout: BROKER_IO_TIMEOUT,
+            },
+            move |stream, connections| {
+                let _ = serve_client(stream, &backend, &policy, connections);
+            },
+        )?;
+        validate_openssh_option_path(broker.socket_path(), "temporary constrained-agent path")?;
 
         Ok(Self {
             ambient_socket,
-            socket_path,
-            shutdown,
-            connections,
-            listener_thread: Some(listener_thread),
-            _socket_dir: socket_dir,
+            broker,
         })
     }
 
     pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+        self.broker.socket_path()
     }
 
     pub fn ambient_socket(&self) -> &Path {
@@ -1156,146 +898,6 @@ fn validate_openssh_option_path(path: &Path, label: &str) -> Result<()> {
         bail!("{label} contains characters that are unsafe in an OpenSSH command-line option");
     }
     Ok(())
-}
-
-impl Drop for ConstrainedAgentBroker {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-        self.connections.shutdown_all();
-        // Wake accept immediately instead of waiting for the nonblocking poll.
-        let _ = UnixStream::connect(&self.socket_path);
-        if let Some(listener) = self.listener_thread.take() {
-            let _ = listener.join();
-        }
-        unregister_signal_cleanup(self._socket_dir.path());
-    }
-}
-
-fn accept_connections(
-    listener: UnixListener,
-    backend: Arc<SigningBackend>,
-    policy: Arc<BrokerPolicy>,
-    max_connections: usize,
-    shutdown: Arc<AtomicBool>,
-    connections: Arc<ConnectionRegistry>,
-) {
-    let mut workers: Vec<JoinHandle<()>> = Vec::new();
-    while !shutdown.load(Ordering::Acquire) {
-        reap_workers(&mut workers);
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if workers.len() >= max_connections {
-                    let _ = stream.shutdown(Shutdown::Both);
-                    continue;
-                }
-                let Ok(stream) = connections.track(stream) else {
-                    continue;
-                };
-                let worker_backend = Arc::clone(&backend);
-                let worker_policy = Arc::clone(&policy);
-                let worker_connections = Arc::clone(&connections);
-                match thread::Builder::new()
-                    .name("syq-agent-client".into())
-                    .spawn(move || {
-                        let _ = serve_client(
-                            stream,
-                            &worker_backend,
-                            &worker_policy,
-                            worker_connections,
-                        );
-                    }) {
-                    Ok(worker) => workers.push(worker),
-                    Err(_) => continue,
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => break,
-        }
-    }
-    connections.shutdown_all();
-    for worker in workers {
-        let _ = worker.join();
-    }
-}
-
-fn reap_workers(workers: &mut Vec<JoinHandle<()>>) {
-    let mut index = 0;
-    while index < workers.len() {
-        if workers[index].is_finished() {
-            let worker = workers.swap_remove(index);
-            let _ = worker.join();
-        } else {
-            index += 1;
-        }
-    }
-}
-
-#[derive(Default)]
-struct ConnectionRegistry {
-    next_id: AtomicU64,
-    streams: Mutex<HashMap<u64, UnixStream>>,
-}
-
-impl ConnectionRegistry {
-    fn track(self: &Arc<Self>, stream: UnixStream) -> io::Result<TrackedStream> {
-        stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
-        let registered = stream.try_clone()?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id, registered);
-        Ok(TrackedStream {
-            stream,
-            id,
-            registry: Arc::clone(self),
-        })
-    }
-
-    fn shutdown_all(&self) {
-        let streams = self
-            .streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for stream in streams.values() {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-    }
-}
-
-struct TrackedStream {
-    stream: UnixStream,
-    id: u64,
-    registry: Arc<ConnectionRegistry>,
-}
-
-impl Drop for TrackedStream {
-    fn drop(&mut self) {
-        self.registry
-            .streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.id);
-    }
-}
-
-impl Read for TrackedStream {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buffer)
-    }
-}
-
-impl Write for TrackedStream {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
-    }
 }
 
 #[derive(Default)]
@@ -1355,7 +957,7 @@ impl BindState {
             bail!("userauth service was not ssh-connection");
         }
         if parsed.method != b"publickey-hostbound-v00@openssh.com" {
-            bail!("legacy or non-host-bound userauth request");
+            bail!("unsupported or non-host-bound userauth request");
         }
         let mut credential = Vec::new();
         request
@@ -1386,19 +988,23 @@ fn serve_client(
 ) -> Result<()> {
     let mut state = BindState::default();
     let mut upstream: Option<TrackedStream> = None;
-    let mut sanitized_identities: Option<SanitizedIdentities> = None;
+    let mut advertised_identities: Option<Vec<Identity>> = None;
     while let Some(frame) = read_frame(&mut downstream)? {
         let Some(message_id) = frame.first().copied() else {
             break;
         };
         match message_id {
             11 if frame.len() == 1 && !state.bindings.is_empty() => {
-                let identities =
+                let mut identities =
                     backend.identities(&mut upstream, &connections, &state.bindings, &frame)?;
-                let identities =
-                    sanitize_identities(identities, &policy.destination.user_certificates);
-                let response = encode_identities_response(&identities.advertised)?;
-                sanitized_identities = Some(identities);
+                identities.retain(|identity| {
+                    credential_is_cryptographically_verifiable(&identity.credential)
+                });
+                for identity in &mut identities {
+                    identity.comment.clear();
+                }
+                let response = encode_identities_response(&identities)?;
+                advertised_identities = Some(identities);
                 write_frame(&mut downstream, &response)?;
             }
             13 => {
@@ -1407,12 +1013,13 @@ fn serve_client(
                     write_frame(&mut downstream, SSH_AGENT_FAILURE)?;
                     break;
                 };
-                let Some(identities) = sanitized_identities.as_ref() else {
+                let Some(identities) = advertised_identities.as_ref() else {
                     write_frame(&mut downstream, SSH_AGENT_FAILURE)?;
                     break;
                 };
-                if !identities.advertises(&request.credential)
-                    || state.authorize(policy, &request).is_err()
+                if !identities.iter().any(|identity| {
+                    credentials_equal_on_wire(&identity.credential, &request.credential)
+                }) || state.authorize(policy, &request).is_err()
                 {
                     write_frame(&mut downstream, SSH_AGENT_FAILURE)?;
                     break;
@@ -1422,8 +1029,7 @@ fn serve_client(
                     &connections,
                     &state.bindings,
                     &request,
-                    &identities.ambient,
-                    &policy.destination.user_certificates,
+                    &frame,
                 )?;
                 if verify_agent_sign_response(
                     &response,
@@ -1462,7 +1068,7 @@ fn serve_client(
                 }
             }
             _ => {
-                // Mutations, query/unknown extensions, legacy protocol
+                // Mutations, query/unknown extensions, unsupported protocol
                 // operations and malformed identity requests all fail closed.
                 write_frame(&mut downstream, SSH_AGENT_FAILURE)?;
                 break;
@@ -1686,11 +1292,6 @@ fn validate_public_credential_wire(encoded: &[u8]) -> Result<()> {
     Ok(())
 }
 
-enum UpstreamResponse {
-    Identities,
-    Signature,
-}
-
 enum SigningBackend {
     Ambient(PathBuf),
     Private(Arc<PrivateKey>),
@@ -1706,14 +1307,7 @@ impl SigningBackend {
     ) -> Result<Vec<Identity>> {
         match self {
             Self::Ambient(socket) => {
-                let response = upstream_request(
-                    upstream,
-                    socket,
-                    connections,
-                    bindings,
-                    request,
-                    UpstreamResponse::Identities,
-                )?;
+                let response = upstream_request(upstream, socket, connections, bindings, request)?;
                 decode_identities_response(&response)
             }
             Self::Private(private) => Ok(vec![Identity {
@@ -1729,20 +1323,11 @@ impl SigningBackend {
         connections: &Arc<ConnectionRegistry>,
         bindings: &[SessionBind],
         request: &SignRequest,
-        ambient_identities: &[Identity],
-        certificates: &[Certificate],
+        frame: &[u8],
     ) -> Result<Vec<u8>> {
         match self {
             Self::Ambient(socket) => {
-                let frame = translated_sign_request(request, ambient_identities, certificates)?;
-                upstream_request(
-                    upstream,
-                    socket,
-                    connections,
-                    bindings,
-                    &frame,
-                    UpstreamResponse::Signature,
-                )
+                upstream_request(upstream, socket, connections, bindings, frame)
             }
             Self::Private(private) => {
                 let expected = PublicCredential::Key(private.public_key().key_data().clone());
@@ -1767,7 +1352,6 @@ fn upstream_request(
     connections: &Arc<ConnectionRegistry>,
     bindings: &[SessionBind],
     request: &[u8],
-    expected: UpstreamResponse,
 ) -> Result<Vec<u8>> {
     if upstream.is_none() {
         let stream = UnixStream::connect(ambient_socket).with_context(|| {
@@ -1784,9 +1368,7 @@ fn upstream_request(
     }
     let stream = upstream.as_mut().context("ambient SSH agent unavailable")?;
     write_frame(stream, request)?;
-    let response = read_frame(stream)?.context("ambient SSH agent closed without a response")?;
-    validate_upstream_response(&response, expected)?;
-    Ok(response)
+    read_frame(stream)?.context("ambient SSH agent closed without a response")
 }
 
 fn replay_session_bind(stream: &mut TrackedStream, binding: &SessionBind) -> Result<()> {
@@ -1801,9 +1383,8 @@ fn replay_session_bind(stream: &mut TrackedStream, binding: &SessionBind) -> Res
         bail!("trailing bytes in ambient session-bind response");
     }
     match response {
-        // OpenSSH accepts and enforces the binding. Agents that do not
-        // implement session-bind commonly reject it but remain usable; syq's
-        // own broker policy is still mandatory for every downstream request.
+        // OpenSSH enforces the binding when supported. The broker's own exact
+        // path checks remain mandatory if an agent rejects the extension.
         Response::Success | Response::Failure | Response::ExtensionFailure => Ok(()),
         _ => bail!("ambient agent returned an unexpected session-bind response"),
     }
@@ -1822,128 +1403,6 @@ fn decode_identities_response(frame: &[u8]) -> Result<Vec<Identity>> {
     }
 }
 
-struct SanitizedIdentities {
-    ambient: Vec<Identity>,
-    advertised: Vec<Identity>,
-}
-
-impl SanitizedIdentities {
-    fn advertises(&self, credential: &PublicCredential) -> bool {
-        self.advertised
-            .iter()
-            .any(|identity| credentials_equal_on_wire(&identity.credential, credential))
-    }
-}
-
-fn credentials_equal_on_wire(left: &PublicCredential, right: &PublicCredential) -> bool {
-    let mut left_encoded = Vec::new();
-    let mut right_encoded = Vec::new();
-    left.encode(&mut left_encoded).is_ok()
-        && right.encode(&mut right_encoded).is_ok()
-        && left_encoded == right_encoded
-}
-
-fn certificates_equal_on_wire(left: &Certificate, right: &Certificate) -> bool {
-    credentials_equal_on_wire(
-        &PublicCredential::Cert(Box::new(left.clone())),
-        &PublicCredential::Cert(Box::new(right.clone())),
-    )
-}
-
-fn sanitize_identities(
-    identities: Vec<Identity>,
-    certificates: &[Certificate],
-) -> SanitizedIdentities {
-    let ambient: Vec<_> = identities
-        .into_iter()
-        .filter(|identity| credential_is_cryptographically_verifiable(&identity.credential))
-        .collect();
-    let ambient_raw_keys: Vec<_> = ambient
-        .iter()
-        .filter_map(|identity| match &identity.credential {
-            PublicCredential::Key(key) => Some(key.clone()),
-            PublicCredential::Cert(_) => None,
-        })
-        .collect();
-    let mut advertised: Vec<_> = ambient
-        .iter()
-        .filter(|identity| {
-            let covered = certificates
-                .iter()
-                .any(|certificate| certificate.public_key() == identity.credential.key_data());
-            !covered
-                || certificates.iter().any(|certificate| {
-                    matches!(
-                        &identity.credential,
-                        PublicCredential::Cert(advertised)
-                            if certificates_equal_on_wire(advertised, certificate)
-                    )
-                })
-        })
-        .cloned()
-        .map(|mut identity| {
-            identity.comment.clear();
-            identity
-        })
-        .collect();
-    for certificate in certificates {
-        let credential = PublicCredential::Cert(Box::new(certificate.clone()));
-        if !credential_is_cryptographically_verifiable(&credential) {
-            continue;
-        }
-        if advertised
-            .iter()
-            .any(|identity| credentials_equal_on_wire(&identity.credential, &credential))
-        {
-            continue;
-        }
-        if ambient_raw_keys.contains(certificate.public_key()) {
-            advertised.push(Identity {
-                credential,
-                comment: String::new(),
-            });
-        }
-    }
-    SanitizedIdentities {
-        ambient,
-        advertised,
-    }
-}
-
-fn encode_identities_response(identities: &[Identity]) -> Result<Vec<u8>> {
-    let mut frame = Vec::new();
-    Response::IdentitiesAnswer(identities.to_vec()).encode(&mut frame)?;
-    Ok(frame)
-}
-
-fn translated_sign_request(
-    request: &SignRequest,
-    ambient_identities: &[Identity],
-    certificates: &[Certificate],
-) -> Result<Vec<u8>> {
-    let mut translated = request.clone();
-    if let PublicCredential::Cert(certificate) = &request.credential {
-        let ambient_has_exact_certificate = ambient_identities
-            .iter()
-            .any(|identity| credentials_equal_on_wire(&identity.credential, &request.credential));
-        let configured_locally = certificates
-            .iter()
-            .any(|configured| certificates_equal_on_wire(configured, certificate));
-        let ambient_has_raw_key = ambient_identities.iter().any(|identity| {
-            matches!(
-                &identity.credential,
-                PublicCredential::Key(key) if key == certificate.public_key()
-            )
-        });
-        if !ambient_has_exact_certificate && configured_locally && ambient_has_raw_key {
-            translated.credential = PublicCredential::Key(certificate.public_key().clone());
-        }
-    }
-    let mut frame = Vec::new();
-    Request::SignRequest(translated).encode(&mut frame)?;
-    Ok(frame)
-}
-
 fn verify_agent_sign_response(frame: &[u8], key: &KeyData, data: &[u8]) -> Result<()> {
     let mut input = frame;
     let response = Response::decode(&mut input).context("decode ambient signature response")?;
@@ -1959,18 +1418,18 @@ fn verify_agent_sign_response(frame: &[u8], key: &KeyData, data: &[u8]) -> Resul
     }
 }
 
-fn validate_upstream_response(frame: &[u8], expected: UpstreamResponse) -> Result<()> {
-    let mut input = frame;
-    let response = Response::decode(&mut input).context("decode ambient agent response")?;
-    if !input.is_empty() {
-        bail!("trailing bytes in ambient agent response");
-    }
-    match (expected, response) {
-        (_, Response::Failure)
-        | (UpstreamResponse::Identities, Response::IdentitiesAnswer(_))
-        | (UpstreamResponse::Signature, Response::SignResponse(_)) => Ok(()),
-        _ => bail!("ambient agent returned an unexpected response"),
-    }
+fn credentials_equal_on_wire(left: &PublicCredential, right: &PublicCredential) -> bool {
+    let mut left_encoded = Vec::new();
+    let mut right_encoded = Vec::new();
+    left.encode(&mut left_encoded).is_ok()
+        && right.encode(&mut right_encoded).is_ok()
+        && left_encoded == right_encoded
+}
+
+fn encode_identities_response(identities: &[Identity]) -> Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    Response::IdentitiesAnswer(identities.to_vec()).encode(&mut frame)?;
+    Ok(frame)
 }
 
 fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
@@ -2132,8 +1591,8 @@ impl<'a> SshCursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use signature::Signer;
-    use ssh_agent_lib::proto::{Extension, Identity};
+    use signature::{Signer, Verifier};
+    use ssh_agent_lib::proto::{Extension, Request};
     use ssh_agent_lib::ssh_key::private::Ed25519Keypair;
     use std::sync::mpsc;
     use std::time::Instant;
@@ -2156,7 +1615,6 @@ mod tests {
             known_hosts_name: name.into(),
             host_key_algorithms: vec![algorithm],
             required_rsa_size: 1024,
-            user_certificates: Vec::new(),
         }
     }
 
@@ -2243,21 +1701,6 @@ mod tests {
         }
     }
 
-    fn user_certificate(subject: &KeyData, ca_seed: u8, key_id: &str) -> Certificate {
-        let ca =
-            ssh_agent_lib::ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[ca_seed; 32]));
-        let mut builder = ssh_agent_lib::ssh_key::certificate::Builder::new(
-            vec![ca_seed; 16],
-            subject.clone(),
-            0,
-            4_000_000_000,
-        )
-        .unwrap();
-        builder.key_id(key_id).unwrap();
-        builder.valid_principal("backup").unwrap();
-        builder.sign(&ca).unwrap()
-    }
-
     fn read_response(stream: &mut UnixStream) -> Response {
         let frame = read_frame(stream).unwrap().unwrap();
         let mut input = frame.as_slice();
@@ -2293,7 +1736,7 @@ mod tests {
                     Some(27) => Response::ExtensionFailure,
                     Some(11) => Response::IdentitiesAnswer(vec![Identity {
                         credential: KeyData::Ed25519(identity.public).into(),
-                        comment: "hardware-backed test key".into(),
+                        comment: "ambient comment stays local".into(),
                     }]),
                     Some(13) => {
                         let request = parse_sign_request(&frame).unwrap();
@@ -2494,146 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_paths_expand_effective_remote_tokens() {
-        let config = parse_ssh_config(
-            b"user backup\nhostname vault.internal\nport 2222\nhostkeyalias stable-vault\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\nrequiredrsasize 1024\nidentityfile /tmp/ignored-identity\ncertificatefile /tmp/%r@%h:%p-%k-%n-cert.pub\n",
-        )
-        .unwrap();
-        assert_eq!(
-            certificate_paths(&config, "vault-alias").unwrap(),
-            [PathBuf::from(
-                "/tmp/backup@vault.internal:2222-stable-vault-vault-alias-cert.pub"
-            )]
-        );
-    }
-
-    #[test]
-    fn credential_path_environment_values_are_not_recursively_expanded() {
-        let config = parse_ssh_config(
-            b"user backup\nhostname vault.internal\nport 2222\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\nrequiredrsasize 1024\n",
-        )
-        .unwrap();
-        let expanded = expand_credential_path_with_env(
-            "${CERT_ROOT}/%r-cert.pub",
-            &config,
-            "vault-alias",
-            |name| {
-                assert_eq!(name, "CERT_ROOT");
-                Ok("/tmp/%n-${OTHER}".to_owned())
-            },
-        )
-        .unwrap();
-        assert_eq!(expanded, PathBuf::from("/tmp/%n-${OTHER}/backup-cert.pub"));
-    }
-
-    #[test]
-    fn identity_file_implicitly_loads_certificate_only_without_certificate_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let configured_identity_path = temp.path().join("%r-id_ed25519");
-        let expanded_identity_path = temp.path().join("backup-id_ed25519");
-        let implicit_path = PathBuf::from(format!("{}-cert.pub", expanded_identity_path.display()));
-        let (_, raw_key) = key(58);
-        let certificate = user_certificate(&raw_key, 59, "implicit-central-cert");
-        certificate.write_file(&implicit_path).unwrap();
-        let base = format!(
-            "user backup\nhostname vault.internal\nport 22\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\nidentityfile {}\n",
-            configured_identity_path.display()
-        );
-        let config = parse_ssh_config(base.as_bytes()).unwrap();
-        assert_eq!(
-            certificate_paths(&config, "vault").unwrap(),
-            [implicit_path]
-        );
-        let certificates =
-            read_user_certificates(&certificate_paths(&config, "vault").unwrap()).unwrap();
-        assert_eq!(certificates.as_slice(), std::slice::from_ref(&certificate));
-
-        let identities = sanitize_identities(
-            vec![Identity {
-                credential: PublicCredential::Key(raw_key.clone()),
-                comment: "YubiKey raw key".into(),
-            }],
-            &certificates,
-        );
-        assert!(!identities.advertises(&PublicCredential::Key(raw_key)));
-        assert!(identities.advertises(&PublicCredential::Cert(Box::new(certificate))));
-
-        let explicit_none =
-            parse_ssh_config(format!("{base}certificatefile none\n").as_bytes()).unwrap();
-        assert!(certificate_paths(&explicit_none, "vault")
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn openssh_certificate_comments_do_not_break_translation() {
-        let temp = tempfile::tempdir().unwrap();
-        let ca = temp.path().join("ca");
-        let subject = temp.path().join("subject");
-        for (path, comment) in [
-            (&ca, "test certificate authority"),
-            (&subject, "raw key comment"),
-        ] {
-            let status = Command::new("ssh-keygen")
-                .args(["-q", "-t", "ed25519", "-N", "", "-C", comment, "-f"])
-                .arg(path)
-                .status()
-                .expect("run ssh-keygen key generation");
-            assert!(status.success(), "ssh-keygen key generation failed");
-        }
-        let status = Command::new("ssh-keygen")
-            .args(["-q", "-s"])
-            .arg(&ca)
-            .args(["-I", "central-cert", "-n", "backup", "-V", "+1h"])
-            .arg(subject.with_extension("pub"))
-            .status()
-            .expect("run ssh-keygen certificate signing");
-        assert!(status.success(), "ssh-keygen certificate signing failed");
-
-        let certificate_path = temp.path().join("subject-cert.pub");
-        let configured = read_user_certificates(std::slice::from_ref(&certificate_path)).unwrap();
-        assert_eq!(configured.len(), 1);
-        assert!(!configured[0].comment().is_empty());
-        let raw_key = PublicKey::read_openssh_file(&subject.with_extension("pub"))
-            .unwrap()
-            .key_data()
-            .clone();
-        let ambient = vec![Identity {
-            credential: PublicCredential::Key(raw_key.clone()),
-            comment: "ambient comment must stay private".into(),
-        }];
-        let identities = sanitize_identities(ambient.clone(), &configured);
-        assert_eq!(identities.advertised.len(), 1);
-        assert!(identities.advertised[0].comment.is_empty());
-
-        let mut encoded = Vec::new();
-        identities.advertised[0]
-            .credential
-            .encode(&mut encoded)
-            .unwrap();
-        let mut input = encoded.as_slice();
-        let echoed = PublicCredential::decode(&mut input).unwrap();
-        assert!(input.is_empty());
-        let PublicCredential::Cert(echoed_certificate) = &echoed else {
-            panic!("expected echoed user certificate")
-        };
-        assert!(echoed_certificate.comment().is_empty());
-        assert!(identities.advertises(&echoed));
-
-        let request = SignRequest {
-            credential: echoed,
-            data: b"host-bound certificate request".to_vec(),
-            flags: 0,
-        };
-        let translated = translated_sign_request(&request, &ambient, &configured).unwrap();
-        assert_eq!(
-            parse_sign_request(&translated).unwrap().credential,
-            PublicCredential::Key(raw_key)
-        );
-    }
-
-    #[test]
-    fn unsupported_opaque_algorithms_are_not_trusted_or_advertised() {
+    fn unsupported_opaque_algorithms_are_not_trusted() {
         use ssh_agent_lib::ssh_key::public::{OpaquePublicKey, SkEd25519};
 
         let unsupported = KeyData::Other(OpaquePublicKey::new(
@@ -2646,15 +1950,6 @@ mod tests {
         )
         .unwrap();
         assert!(!configured_host_key_allowed(&config, &unsupported));
-        let identities = sanitize_identities(
-            vec![Identity {
-                credential: PublicCredential::Key(unsupported),
-                comment: "unsupported experimental key".into(),
-            }],
-            &[],
-        );
-        assert!(identities.ambient.is_empty());
-        assert!(identities.advertised.is_empty());
         let (supported_private, supported) = key(60);
         assert!(key_is_cryptographically_verifiable(&supported));
         assert!(signature_algorithm_is_cryptographically_verifiable(
@@ -2665,113 +1960,6 @@ mod tests {
         ));
         let fido = KeyData::SkEd25519(SkEd25519::new(supported_private.public, "ssh:".to_string()));
         assert!(key_is_cryptographically_verifiable(&fido));
-    }
-
-    #[test]
-    fn configured_certificate_is_advertised_and_translated_only_for_its_raw_key() {
-        let (raw_private, raw_key) = key(61);
-        let certificate = user_certificate(&raw_key, 62, "central-cert");
-        let ambient = vec![Identity {
-            credential: PublicCredential::Key(raw_key.clone()),
-            comment: "YubiKey raw key".into(),
-        }];
-        let identities = sanitize_identities(ambient.clone(), std::slice::from_ref(&certificate));
-        let advertised = &identities.advertised;
-        assert_eq!(advertised.len(), 1);
-        assert_eq!(
-            advertised[0].credential,
-            PublicCredential::Cert(Box::new(certificate.clone()))
-        );
-        assert!(!identities.advertises(&PublicCredential::Key(raw_key.clone())));
-
-        let request = SignRequest {
-            credential: PublicCredential::Cert(Box::new(certificate.clone())),
-            data: b"host-bound request containing the exact certificate".to_vec(),
-            flags: 0,
-        };
-        let translated =
-            translated_sign_request(&request, &ambient, std::slice::from_ref(&certificate))
-                .unwrap();
-        let translated = parse_sign_request(&translated).unwrap();
-        assert_eq!(
-            translated.credential,
-            PublicCredential::Key(raw_key.clone())
-        );
-        assert_eq!(translated.data, request.data);
-        assert!(identities.advertises(&request.credential));
-        let mut valid_response = Vec::new();
-        Response::SignResponse(raw_private.try_sign(&request.data).unwrap())
-            .encode(&mut valid_response)
-            .unwrap();
-        verify_agent_sign_response(&valid_response, &raw_key, &request.data).unwrap();
-        let (wrong_private, _) = key(64);
-        let mut invalid_response = Vec::new();
-        Response::SignResponse(wrong_private.try_sign(&request.data).unwrap())
-            .encode(&mut invalid_response)
-            .unwrap();
-        assert!(verify_agent_sign_response(&invalid_response, &raw_key, &request.data).is_err());
-
-        let (source_private, source) = key(65);
-        let (destination_private, destination) = key(66);
-        let mut broker_policy = policy(source.clone(), destination.clone());
-        broker_policy.destination.user_certificates = vec![certificate.clone()];
-        let mut state = BindState::default();
-        state
-            .add(
-                &broker_policy,
-                binding(&source_private, source, b"source-cert-session", true),
-            )
-            .unwrap();
-        state
-            .add(
-                &broker_policy,
-                binding(
-                    &destination_private,
-                    destination.clone(),
-                    b"destination-cert-session",
-                    false,
-                ),
-            )
-            .unwrap();
-        let certificate_request = sign_request_for_credential(
-            b"destination-cert-session",
-            b"backup",
-            b"publickey-hostbound-v00@openssh.com",
-            PublicCredential::Cert(Box::new(certificate.clone())),
-            &destination,
-        );
-        state
-            .authorize(&broker_policy, &certificate_request)
-            .unwrap();
-        let mut mismatched_outer = certificate_request.clone();
-        mismatched_outer.credential = PublicCredential::Key(raw_key.clone());
-        assert!(state.authorize(&broker_policy, &mismatched_outer).is_err());
-
-        let unrelated = user_certificate(&raw_key, 63, "not-configured");
-        let request = SignRequest {
-            credential: PublicCredential::Cert(Box::new(unrelated.clone())),
-            data: Vec::new(),
-            flags: 0,
-        };
-        assert!(!identities.advertises(&request.credential));
-        let untranslated = translated_sign_request(&request, &ambient, &[]).unwrap();
-        assert_eq!(
-            parse_sign_request(&untranslated).unwrap().credential,
-            request.credential
-        );
-    }
-
-    #[test]
-    fn failure_or_empty_identity_list_advertises_no_signing_credential() {
-        let mut failure = Vec::new();
-        Response::Failure.encode(&mut failure).unwrap();
-        let identities = sanitize_identities(decode_identities_response(&failure).unwrap(), &[]);
-        assert!(identities.advertised.is_empty());
-        let (_, key) = key(67);
-        assert!(!identities.advertises(&PublicCredential::Key(key)));
-
-        let identities = sanitize_identities(Vec::new(), &[]);
-        assert!(identities.advertised.is_empty());
     }
 
     #[test]
@@ -2873,17 +2061,14 @@ mod tests {
             std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
 
-        let resolved = resolve_host_policy(ssh.to_str().unwrap(), None, "vault", false).unwrap();
+        let resolved = resolve_host_policy(ssh.to_str().unwrap(), None, "vault").unwrap();
         assert_eq!(resolved.login_user, "backup");
         assert_eq!(resolved.connection_host(), "vault.internal");
         assert_eq!(resolved.port(), 2222);
         assert_eq!(resolved.known_hosts_name, "stable-vault");
         assert_eq!(resolved.host_keys, [host_key]);
-        assert!(resolved.user_certificates.is_empty());
-
         let overridden =
-            resolve_host_policy_at(ssh.to_str().unwrap(), None, "vault", Some(2200), false)
-                .unwrap();
+            resolve_host_policy_at(ssh.to_str().unwrap(), None, "vault", Some(2200)).unwrap();
         assert_eq!(overridden.port(), 2200);
         assert_eq!(overridden.known_hosts_name, "stable-vault");
     }
@@ -2900,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn hostbound_parser_rejects_trailing_or_legacy_data() {
+    fn hostbound_parser_rejects_trailing_or_obsolete_data() {
         let mut data = Vec::new();
         b"session".as_slice().encode(&mut data).unwrap();
         data.push(50);
@@ -3056,34 +2241,24 @@ mod tests {
     }
 
     #[test]
-    fn broker_forwards_only_list_and_fully_bound_sign_requests() {
+    fn ambient_backend_forwards_only_advertised_fully_bound_signatures() {
         let temp = tempfile::tempdir().unwrap();
         let ambient_socket = temp.path().join("ambient.sock");
         let (identity_private, identity) = key(23);
         let (ambient, requests) = fake_ambient(&ambient_socket, identity_private.clone());
         let (source_private, source) = key(21);
         let (destination_private, destination) = key(22);
-        let broker = ConstrainedAgentBroker::start_with_socket(
+        let broker = ConstrainedAgentBroker::start_with_ambient_socket(
             ambient_socket,
             policy(source.clone(), destination.clone()),
             TEST_BROKER_CONNECTIONS,
         )
         .unwrap();
-        let broker_path = broker.socket_path().to_path_buf();
-        assert_eq!(
-            std::fs::metadata(&broker_path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        let mut client = UnixStream::connect(&broker_path).unwrap();
+        let mut client = UnixStream::connect(broker.socket_path()).unwrap();
 
         let source_bind = bind_request(binding(&source_private, source, b"source-session", true));
         write_frame(&mut client, &source_bind).unwrap();
         assert!(matches!(read_response(&mut client), Response::Success));
-
         write_frame(&mut client, &[11]).unwrap();
         let Response::IdentitiesAnswer(identities) = read_response(&mut client) else {
             panic!("expected identities response")
@@ -3102,6 +2277,7 @@ mod tests {
         write_frame(&mut client, &destination_bind).unwrap();
         assert!(matches!(read_response(&mut client), Response::Success));
         assert_eq!(requests.recv().unwrap(), destination_bind);
+
         let request = sign_request(
             b"destination-session",
             b"backup",
@@ -3133,94 +2309,22 @@ mod tests {
         drop(client);
         drop(broker);
         ambient.join().unwrap();
-        assert!(!broker_path.exists());
     }
 
     #[test]
-    fn failed_identity_list_cannot_be_followed_by_signing() {
-        let temp = tempfile::tempdir().unwrap();
-        let ambient_socket = temp.path().join("ambient.sock");
-        let listener = UnixListener::bind(&ambient_socket).unwrap();
-        let (sent, requests) = mpsc::channel();
-        let ambient = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            while let Some(frame) = read_frame(&mut stream).unwrap() {
-                sent.send(frame.clone()).unwrap();
-                let response = match frame.first() {
-                    Some(27) => Response::ExtensionFailure,
-                    Some(11) => Response::Failure,
-                    other => panic!("unexpected upstream request {other:?}"),
-                };
-                let mut response_frame = Vec::new();
-                response.encode(&mut response_frame).unwrap();
-                write_frame(&mut stream, &response_frame).unwrap();
-            }
-        });
-        let (source_private, source) = key(25);
-        let (destination_private, destination) = key(26);
-        let (_, identity) = key(27);
-        let broker = ConstrainedAgentBroker::start_with_socket(
-            ambient_socket,
-            policy(source.clone(), destination.clone()),
-            TEST_BROKER_CONNECTIONS,
-        )
-        .unwrap();
-        let mut client = UnixStream::connect(broker.socket_path()).unwrap();
-
-        let source_bind = bind_request(binding(
-            &source_private,
-            source,
-            b"source-failed-list",
-            true,
-        ));
-        write_frame(&mut client, &source_bind).unwrap();
-        assert!(matches!(read_response(&mut client), Response::Success));
-        write_frame(&mut client, &[11]).unwrap();
-        let Response::IdentitiesAnswer(identities) = read_response(&mut client) else {
-            panic!("expected sanitized empty identities response")
-        };
-        assert!(identities.is_empty());
-        assert_eq!(requests.recv().unwrap(), source_bind);
-        assert_eq!(requests.recv().unwrap(), vec![11]);
-
-        let destination_bind = bind_request(binding(
-            &destination_private,
-            destination.clone(),
-            b"destination-failed-list",
-            false,
-        ));
-        write_frame(&mut client, &destination_bind).unwrap();
-        assert!(matches!(read_response(&mut client), Response::Success));
-        assert_eq!(requests.recv().unwrap(), destination_bind);
-        let request = sign_request(
-            b"destination-failed-list",
-            b"backup",
-            b"publickey-hostbound-v00@openssh.com",
-            identity,
-            &destination,
-        );
-        write_frame(&mut client, &encode_request(Request::SignRequest(request))).unwrap();
-        assert!(matches!(read_response(&mut client), Response::Failure));
-        assert_closed(&mut client);
-        assert!(requests.try_recv().is_err());
-
-        drop(client);
-        drop(broker);
-        ambient.join().unwrap();
-    }
-
-    #[test]
-    fn unbound_sign_mutation_unknown_extension_and_oversize_never_reach_ambient() {
+    fn unbound_sign_mutation_unknown_extension_and_oversize_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let ambient_socket = temp.path().join("ambient.sock");
         let _ambient = UnixListener::bind(&ambient_socket).unwrap();
         let (_, source) = key(31);
         let (_, destination) = key(32);
         let (_, identity) = key(33);
-        let broker = ConstrainedAgentBroker::start_with_socket(
+        let (transport, _) = key(34);
+        let broker = ConstrainedAgentBroker::start_with_private_key_and_socket(
             ambient_socket,
             policy(source, destination.clone()),
             TEST_BROKER_CONNECTIONS,
+            PrivateKey::from(transport),
         )
         .unwrap();
 
@@ -3306,10 +2410,12 @@ mod tests {
         let _ambient = UnixListener::bind(&ambient_socket).unwrap();
         let (_, source) = key(41);
         let (_, destination) = key(42);
-        let broker = ConstrainedAgentBroker::start_with_socket(
+        let (transport, _) = key(43);
+        let broker = ConstrainedAgentBroker::start_with_private_key_and_socket(
             ambient_socket,
             policy(source, destination),
             TEST_BROKER_CONNECTIONS,
+            PrivateKey::from(transport),
         )
         .unwrap();
         let path = broker.socket_path().to_path_buf();
@@ -3320,26 +2426,12 @@ mod tests {
             clients.push(client);
         }
         let deadline = Instant::now() + Duration::from_secs(2);
-        while broker
-            .connections
-            .streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
-            < TEST_BROKER_CONNECTIONS
+        while broker.broker.active_connections() < TEST_BROKER_CONNECTIONS
             && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(
-            broker
-                .connections
-                .streams
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len(),
-            TEST_BROKER_CONNECTIONS
-        );
+        assert_eq!(broker.broker.active_connections(), TEST_BROKER_CONNECTIONS);
         let mut excess = UnixStream::connect(&path).unwrap();
         excess
             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -3360,20 +2452,14 @@ mod tests {
     #[test]
     fn tracked_broker_connections_have_bounded_io() {
         let (stream, _peer) = UnixStream::pair().unwrap();
-        let registry = Arc::new(ConnectionRegistry::default());
+        let registry = Arc::new(ConnectionRegistry::new(BROKER_IO_TIMEOUT));
         let tracked = registry.track(stream).unwrap();
-        assert_eq!(
-            tracked.stream.read_timeout().unwrap(),
-            Some(BROKER_IO_TIMEOUT)
-        );
-        assert_eq!(
-            tracked.stream.write_timeout().unwrap(),
-            Some(BROKER_IO_TIMEOUT)
-        );
+        assert_eq!(tracked.read_timeout().unwrap(), Some(BROKER_IO_TIMEOUT));
+        assert_eq!(tracked.write_timeout().unwrap(), Some(BROKER_IO_TIMEOUT));
     }
 
     #[test]
-    fn private_backend_advertises_and_signs_only_the_transport_key() {
+    fn broker_advertises_and_signs_only_the_transport_key() {
         let temp = tempfile::tempdir().unwrap();
         let ambient_socket = temp.path().join("ambient.sock");
         let _ambient = UnixListener::bind(&ambient_socket).unwrap();
@@ -3381,11 +2467,11 @@ mod tests {
         let (destination_private, destination) = key(52);
         let (transport, transport_public) = key(53);
         let transport = PrivateKey::from(transport);
-        let broker = ConstrainedAgentBroker::start_with_backend(
+        let broker = ConstrainedAgentBroker::start_with_private_key_and_socket(
             ambient_socket,
-            SigningBackend::Private(Arc::new(transport)),
             policy(source.clone(), destination.clone()),
             TEST_BROKER_CONNECTIONS,
+            transport,
         )
         .unwrap();
         let mut client = UnixStream::connect(broker.socket_path()).unwrap();

@@ -33,6 +33,10 @@ const HIGH_RTT_FAST_BATCH_FILES: usize = 512;
 const HIGH_RTT_US: u64 = 100_000;
 const FAST_BATCH_BYTES: u64 = 16 << 20;
 const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
+// Range splitting is a scheduler implementation detail, not a public transfer
+// policy. Keep a conservative floor that avoids turning small tails into
+// separately scheduled work.
+const DEFAULT_MIN_SPLIT_BYTES: u64 = 32 << 20;
 
 fn fast_batch_file_limit(
     src_rtt_us: Option<u64>,
@@ -141,11 +145,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
 
 fn operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
     if args.interface == Interface::Rsync {
-        if args.insecure_links {
-            OperatorSymlinkPolicy::FollowAll
-        } else {
-            OperatorSymlinkPolicy::TrustedOwner
-        }
+        OperatorSymlinkPolicy::TrustedOwner
     } else if args.native_follow {
         OperatorSymlinkPolicy::FollowAll
     } else {
@@ -224,6 +224,14 @@ fn one_line(message: &str) -> String {
         .join("; ")
 }
 
+fn interface_option<'a>(args: &Args, native: &'a str, rsync: &'a str) -> &'a str {
+    if args.interface == Interface::Rsync {
+        rsync
+    } else {
+        native
+    }
+}
+
 fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
     let diagnostics = spec.diagnostics();
     eprintln!("syq: {}:", spec.label());
@@ -240,9 +248,13 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
                 "managed helper cache"
             }
         } else if spec.syq_path.is_some() {
-            "--syq-path"
+            interface_option(args, "--syq-path", "--rsync-path")
         } else {
-            "remote PATH (--no-bootstrap)"
+            interface_option(
+                args,
+                "remote PATH (--no-bootstrap)",
+                "remote PATH (--syq-no-bootstrap)",
+            )
         };
         eprintln!("  helper: {} ({helper_mode})", peer.identity);
     }
@@ -300,7 +312,10 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
                 .and_then(|info| info.failure.clone())
                 .or(diagnostics.tcp_setup_error.clone());
             if args.no_tcp {
-                eprintln!("  transport: SSH {route_state} (--no-tcp)");
+                eprintln!(
+                    "  transport: SSH {route_state} ({})",
+                    interface_option(args, "--no-tcp", "--syq-no-tcp")
+                );
             } else if let Some(error) = tcp_failure {
                 eprintln!(
                     "  transport: SSH {route_state} (TCP unavailable: {})",
@@ -505,6 +520,11 @@ fn destination_identity_plan(
         // canonicalize the parent would both be unnecessary and exceed the
         // exact destination's observation scope.
         DestinationIdentityPlan::Enrolled(crate::fsops::resolve(destination_path))
+    } else if exact_native_destination && operator_dst_root == b"~" {
+        // Bare `~` names HOME rather than a literal leaf named `~`. Resolve the
+        // complete spelling so that expansion happens, while ordinary exact
+        // destinations continue to preserve their final symlink as a leaf.
+        DestinationIdentityPlan::Canonicalize(operator_dst_root.to_vec())
     } else if exact_native_destination {
         DestinationIdentityPlan::CanonicalizeParent {
             parent: parent_path(operator_dst_root),
@@ -699,8 +719,9 @@ fn handle_tcp_setup_error(
         progress.stop();
         return Err(error).with_context(|| {
             format!(
-                "{} could not apply --tcp-congestion {}",
+                "{} could not apply {} {}",
                 spec.label(),
+                interface_option(args, "--tcp-congestion", "--syq-tcp-congestion"),
                 args.tcp_congestion.as_deref().unwrap_or_default()
             )
         });
@@ -950,7 +971,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut args = args;
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
     let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
-    let min_split = parse_size(&args.min_split)?;
     let max_size = args.max_size.as_deref().map(parse_size).transpose()?;
     let min_size = args.min_size.as_deref().map(parse_size).transpose()?;
     let bwlimit = (args.bwlimit_bytes > 0)
@@ -975,6 +995,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .map(|(_, sources)| sources)
         .unwrap_or(&[]);
     let (dst, original_srcs) = locs.split_last().unwrap();
+    if args.interface == Interface::Rsync && original_srcs[0].is_remote() && dst.is_remote() {
+        bail!("syq rsync does not support remote-to-remote transfers");
+    }
     let direct_paths_are_utf8 = original_srcs
         .iter()
         .chain(std::iter::once(dst))
@@ -984,13 +1007,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && dst.is_remote()
         && !original_srcs[0].same_host(dst)
         && !args.relay
-        && (args.interface == Interface::Rsync || args.run_at != RunAt::Local)
+        && args.run_at != RunAt::Local
         // Native auto placement relays raw path bytes because they cannot be
         // represented in the remote coordinator's argv. Validate direct-only
         // controls against the topology that will actually run.
-        && (args.interface == Interface::Rsync
-            || args.run_at != RunAt::Auto
-            || direct_paths_are_utf8);
+        && (args.run_at != RunAt::Auto || direct_paths_are_utf8);
     if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
     {
         bail!(
@@ -998,21 +1019,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
     if args.pscope_explicit && coordinator_is_remote {
-        if args.interface == Interface::Rsync {
-            bail!(
-                "--pscope is not supported for direct remote-to-remote transfers; add --relay to keep the reusable connections on this machine"
-            );
-        }
         bail!(
             "--pscope is not supported with a remote transfer coordinator; use --run-at local to keep the reusable connections on this machine"
         );
     }
     if args.restricted_grant.is_some()
-        && (args.no_tcp
-            || args.tcp_plain
-            || original_srcs[0].is_remote()
-            || !dst.is_remote()
-            || args.relay)
+        && (args.no_tcp || args.tcp_plain || original_srcs[0].is_remote() || !dst.is_remote())
     {
         bail!(
             "a signed receiver grant is valid only for a local-to-remote orchestrator using encrypted TCP data connections"
@@ -1028,15 +1040,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "--unrestricted-agent-forwarding is only valid for a live direct transfer between two different remote hosts"
         );
     }
-    let source_operand_count = if !native_locations {
-        args.direct_source_operand_count
-            .unwrap_or(raw_source_operands.len())
-    } else {
+    let source_operand_count = if native_locations {
         original_srcs.len()
+    } else {
+        raw_source_operands.len()
     };
-    if source_operand_count < original_srcs.len() {
-        bail!("invalid direct source-operand count");
-    }
     if args.files_from.is_some() && source_operand_count > 1 {
         bail!("--files-from takes exactly one source directory");
     }
@@ -1046,9 +1054,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // `file file new-dest` still creates a directory like other multi-source
     // commands.
     let multiple_source_operands = source_operand_count > 1;
-    let srcs: Vec<Location> = if args.direct_sources_prededuplicated {
-        original_srcs.to_vec()
-    } else if native_locations {
+    let srcs: Vec<Location> = if native_locations {
         let mut seen_sources = std::collections::HashSet::new();
         original_srcs
             .iter()
@@ -1103,9 +1109,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_SSH;
         }
         if args.interface != Interface::Rsync && args.run_at == RunAt::Target {
-            return crate::direct::run_at_target(&args, srcs, dst, source_operand_count);
+            return crate::direct::run_at_target(&args, srcs, dst);
         }
-        return crate::direct::run(&args, srcs, dst, source_operand_count);
+        return crate::direct::run(&args, srcs, dst);
     }
     if srcs[0].is_remote() && dst.is_remote() {
         if args.interface != Interface::Rsync && args.run_at == RunAt::Local {
@@ -1130,13 +1136,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let src_ep = endpoint(&srcs[0], &args)?;
     let mut dst_ep = endpoint(dst, &args)?;
     if args.tcp_congestion.is_some() && !src_ep.is_remote() && !dst_ep.is_remote() {
-        bail!("--tcp-congestion applies only to copies with a remote endpoint");
+        bail!(
+            "{} applies only to copies with a remote endpoint",
+            interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
+        );
     }
     if matches!(dst_ep, Endpoint::Local) {
         dst_ep = Endpoint::Remote(RemoteSpec::local_receiver(args.quiet));
     }
     // TCP data connections are the default (auto-selecting the fastest reachable
-    // NIC and falling back to ssh if unreachable); --no-tcp forces ssh data.
+    // NIC and falling back to ssh if unreachable); the interface's no-TCP
+    // option forces SSH data.
     // A local receiver uses one child process and a loopback data listener so
     // every worker shares its retained destination cwd without changing the
     // orchestrator process's cwd.
@@ -1154,7 +1164,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {
         bail!(
-            "--tcp-congestion {algorithm} requires a Linux transfer orchestrator and Linux remote endpoints"
+            "{} {algorithm} requires a Linux transfer orchestrator and Linux remote endpoints",
+            interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
 
@@ -1189,7 +1200,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         min_size,
     });
 
-    let sched = Arc::new(Sched::new(block, min_split));
+    let sched = Arc::new(Sched::new(block, DEFAULT_MIN_SPLIT_BYTES));
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker
@@ -1453,6 +1464,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // wrong destination.
     let exact_native_destination =
         args.interface != Interface::Rsync && args.placement == Placement::As;
+    let expand_exact_home =
+        exact_native_destination && args.restricted_grant.is_none() && operator_dst_root == b"~";
     let identity_plan = destination_identity_plan(
         exact_native_destination,
         args.restricted_grant.is_some(),
@@ -1480,6 +1493,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // the final directory entry; --follow applies only to its parent path.
     let (dst_root, mut dst_root_entry) = match args.interface {
         Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?,
+        _ if expand_exact_home => (
+            dst_canonical.as_os_str().as_bytes().to_vec(),
+            dst_root_entry,
+        ),
         _ if args.native_follow && args.placement == Placement::Into => follow_container_symlink(
             &mut *dst_ctl,
             &operator_dst_root,
@@ -1599,7 +1616,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // for every request; HostA is not authorized to manage this anchoring
     // state itself.
     let use_operator_anchor = args.restricted_grant.is_none();
-    let operator_directory = if dst_is_dir {
+    let operator_directory = if expand_exact_home {
+        dst_root.clone()
+    } else if dst_is_dir {
         operator_dst_root.clone()
     } else {
         // Exact placement always retains the parent of the command-line leaf.
@@ -1607,7 +1626,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // changes which final directory entry the command addresses.
         parent_path(&operator_dst_root)
     };
-    let request_prefix = if dst_is_dir {
+    let request_prefix = if expand_exact_home || dst_is_dir {
         dst_root.clone()
     } else {
         operator_directory.clone()
@@ -2215,20 +2234,55 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     drop(st);
 
     // With a command-restricted receiver, ask for its signed receipt now that
-    // every mutation is settled, and hand it to the invoking machine as one
-    // marked line. That machine verifies it; this orchestrator's own report
-    // is not trusted for what landed.
+    // every mutation is settled, and hand its bounded frames to the invoking
+    // machine as marked lines. That machine verifies it; this orchestrator's
+    // own report is not trusted for what landed.
     if args.restricted_grant.is_some() {
         use base64::Engine as _;
-        match dst_ctl.call(Request::Receipt) {
-            Ok(Response::Receipt(envelope)) => println!(
-                "{}{}",
-                crate::receipt::RECEIPT_LINE_PREFIX,
-                base64::engine::general_purpose::STANDARD_NO_PAD.encode(envelope)
-            ),
-            Ok(Response::Err(error)) => progress.error(&format!("syq: receipt: {error}")),
-            Ok(other) => progress.error(&format!("syq: receipt: unexpected response {other:?}")),
-            Err(error) => progress.error(&format!("syq: receipt: {error:#}")),
+        if let Err(error) = dst_ctl.send(Request::Receipt) {
+            progress.error(&format!("syq: receipt: {error:#}"));
+        } else {
+            loop {
+                match dst_ctl.recv() {
+                    Ok(Response::Receipt(envelope)) => {
+                        println!(
+                            "{}{}",
+                            crate::receipt::RECEIPT_LINE_PREFIX,
+                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(envelope)
+                        );
+                        break;
+                    }
+                    Ok(Response::ReceiptV2(frame)) => {
+                        let terminal = match crate::receipt_v2::transport_frame_is_end(&frame) {
+                            Ok(terminal) => terminal,
+                            Err(error) => {
+                                progress.error(&format!("syq: receipt: {error:#}"));
+                                break;
+                            }
+                        };
+                        println!(
+                            "{}{}",
+                            crate::receipt_v2::RECEIPT_LINE_PREFIX,
+                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(frame)
+                        );
+                        if terminal {
+                            break;
+                        }
+                    }
+                    Ok(Response::Err(error)) => {
+                        progress.error(&format!("syq: receipt: {error}"));
+                        break;
+                    }
+                    Ok(other) => {
+                        progress.error(&format!("syq: receipt: unexpected response {other:?}"));
+                        break;
+                    }
+                    Err(error) => {
+                        progress.error(&format!("syq: receipt: {error:#}"));
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -7022,6 +7076,10 @@ mod tests {
                 parent: b"links".to_vec(),
                 exact_path: b"links/exact".to_vec(),
             }
+        );
+        assert_eq!(
+            destination_identity_plan(true, false, b"~", b"~"),
+            DestinationIdentityPlan::Canonicalize(b"~".to_vec())
         );
     }
 

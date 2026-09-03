@@ -96,7 +96,6 @@ jobs:
           program='target/${{ matrix.target }}/release/syq'
           test "$("$program" --version)" = "syq ${GITHUB_REF_NAME#v}"
           test "$("$program" --build-identity)" = "$GITHUB_REF_NAME"
-          test "$("$program" --remote-helper-id)" = "$GITHUB_REF_NAME-p0"
       - name: Stage raw and compressed binaries
         shell: bash
         run: |

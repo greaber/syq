@@ -1147,7 +1147,7 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
 }
 
 #[test]
-fn native_keeps_rsync_only_relay_out_of_its_transport_surface() {
+fn native_rejects_unknown_relay_option() {
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--relay", "source", "--into", "target"])
         .run()
@@ -1544,6 +1544,16 @@ fn top_level_rsync_syntax_is_rejected_without_mutation() {
     assert!(!t.path("dst").exists());
 }
 
+#[test]
+fn rsync_surface_rejects_top_level_lifecycle_options() {
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", "--self-update"])
+        .run()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("top-level syq options"));
+}
+
 #[cfg(debug_assertions)]
 fn interrupted_partial(args: &[&str], dir: &Path) -> PathBuf {
     interrupted_partial_from(args, dir, None)
@@ -1724,21 +1734,26 @@ exec /bin/sh -c "$1"
 
 fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
     let mut cmd = compat_command();
-    cmd.args(["-e", rsh.to_str().unwrap(), "--no-tcp", "-j", "1"])
-        .args(args)
-        .arg("--no-progress")
-        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("release.gz"))
-        .env("FAKE_CURL_LOG", t.path("curl.log"))
-        .env(
-            "FAKE_REMOTE_RELEASE_MANIFEST",
-            t.path("release-manifest.json"),
-        )
-        .env("FAKE_RSH_LOG", t.path("rsh.log"))
-        .env("FAKE_LEGACY_LOG", t.path("legacy.log"))
-        .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_CACHE_HOME", t.path("cache"));
+    cmd.args([
+        "-e",
+        rsh.to_str().unwrap(),
+        "--syq-no-tcp",
+        "--syq-connections",
+        "1",
+    ])
+    .args(args)
+    .arg("--no-progress")
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("release.gz"))
+    .env("FAKE_CURL_LOG", t.path("curl.log"))
+    .env(
+        "FAKE_REMOTE_RELEASE_MANIFEST",
+        t.path("release-manifest.json"),
+    )
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env("XDG_CONFIG_HOME", t.path("config"))
+    .env("XDG_CACHE_HOME", t.path("cache"));
     if let Ok(key) = fs::read_to_string(t.path("release-public-key")) {
         cmd.env("SYQ_TEST_RELEASE_PUBLIC_KEY", key.trim())
             .env("SYQ_TEST_RELEASE_BUILD", "1")
@@ -1801,25 +1816,6 @@ fn binary_identity(argument: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn legacy_cached_remote_helpers(t: &Tmp) -> [PathBuf; 2] {
-    let target = match std::env::consts::ARCH {
-        "x86_64" => "linux-x86_64",
-        "aarch64" => "linux-aarch64",
-        arch => panic!("unsupported test architecture {arch}"),
-    };
-    [
-        t.path(&format!(
-            "remote-home/.cache/syq/helpers/v{}-p5-download-v1/{target}/syq",
-            env!("CARGO_PKG_VERSION")
-        )),
-        t.path(&format!(
-            "remote-home/.cache/syq/helpers/v{}-p5/{target}/syq",
-            env!("CARGO_PKG_VERSION")
-        )),
-    ]
-}
-
-#[cfg(target_os = "linux")]
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -1847,7 +1843,6 @@ fn setup_release_bootstrap(t: &Tmp) {
         "repository": "https://github.com/greaber/syq",
         "version": env!("CARGO_PKG_VERSION"),
         "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
-        "helper_id": format!("v{}-p0", env!("CARGO_PKG_VERSION")),
         "artifacts": {
             (target): {
                 "binary": {
@@ -1922,19 +1917,9 @@ fn add_remote_tool(t: &Tmp, name: &str) {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn release_keyed_remote_helper_ignores_legacy_protocol_caches() {
+fn managed_remote_helper_install_is_cached() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    let legacy_helpers = legacy_cached_remote_helpers(&t);
-    for legacy_helper in &legacy_helpers {
-        executable(
-            legacy_helper,
-            br#"#!/bin/sh
-printf 'legacy helper ran\n' >> "$FAKE_LEGACY_LOG"
-exit 99
-"#,
-        );
-    }
     setup_release_bootstrap(&t);
 
     write(&t.path("src"), b"first");
@@ -1943,10 +1928,7 @@ exit 99
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
     assert!(cached_remote_helper(&t).is_file());
-    assert!(legacy_helpers.iter().all(|helper| helper.exists()));
-    assert!(!t.path("legacy.log").exists(), "legacy helper was executed");
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("uploading this executable"));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!(
             "helper: {} (managed; installed now)",
@@ -1961,7 +1943,6 @@ exit 99
         .count();
     assert_eq!(probes, 1);
 
-    // A cache hit goes straight to the helper: no platform probe or download.
     write(&t.path("src"), b"second");
     let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
@@ -2328,7 +2309,11 @@ fn no_bootstrap_uses_remote_path_without_managed_cache() {
 
     write(&t.path("src"), b"preinstalled");
     let remote = format!("fake:{}", t.s("dst"));
-    let out = remote_syq(&t, &rsh, &["-a", "--no-bootstrap", &t.s("src"), &remote]);
+    let out = remote_syq(
+        &t,
+        &rsh,
+        &["-a", "--syq-no-bootstrap", &t.s("src"), &remote],
+    );
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"preinstalled");
     assert!(!t.path("remote-home/.cache/syq/helpers").exists());
@@ -2355,7 +2340,7 @@ fn rsync_subcommand_wrapper_can_start_the_remote_server() {
         &rsh,
         &[
             "-a",
-            "--syq-path",
+            "--rsync-path",
             wrapper.to_str().unwrap(),
             &t.s("src"),
             &remote,
@@ -2384,13 +2369,21 @@ fn remote_retained_basis_handles_matching_and_changed_files() {
     let inode = fs::metadata(t.path("dst")).unwrap().ino();
     let remote = format!("fake:{}", t.s("dst"));
 
-    let matching = remote_syq(&t, &rsh, &["-ac", "--no-bootstrap", &t.s("src"), &remote]);
+    let matching = remote_syq(
+        &t,
+        &rsh,
+        &["-ac", "--syq-no-bootstrap", &t.s("src"), &remote],
+    );
     assert_output_ok(&matching);
     assert_eq!(fs::metadata(t.path("dst")).unwrap().ino(), inode);
 
     write(&t.path("src"), &changed);
     set_mtime(&t.path("src"), 1_600_000_002);
-    let repair = remote_syq(&t, &rsh, &["-a", "--no-bootstrap", &t.s("src"), &remote]);
+    let repair = remote_syq(
+        &t,
+        &rsh,
+        &["-a", "--syq-no-bootstrap", &t.s("src"), &remote],
+    );
     assert_output_ok(&repair);
     assert_eq!(read(&t.path("dst")), changed);
     assert!(partial_files(&t.0).is_empty());
@@ -2406,7 +2399,7 @@ fn double_verbose_dry_run_reports_tcp_without_extra_connection() {
     let out = compat_command()
         .arg("-e")
         .arg(&rsh)
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args(["--dry-run", "-vv", "-a"])
         .arg(t.s("src"))
@@ -2429,7 +2422,7 @@ fn double_verbose_dry_run_reports_tcp_without_extra_connection() {
     );
     assert!(
         stderr.contains(&format!(
-            "helper: {} (--syq-path)",
+            "helper: {} (--rsync-path)",
             binary_identity("--build-identity")
         )),
         "{stderr}"
@@ -2474,7 +2467,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
     let out = compat_command()
         .arg("-e")
         .arg(&rsh)
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args(["--dry-run", "-vv", "-a"])
         .arg(t.s("src"))
@@ -2524,9 +2517,9 @@ fn single_verbose_keeps_file_listing_semantics() {
     let out = compat_command()
         .arg("-e")
         .arg(&rsh)
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--no-tcp", "-v", "-a", "-j", "1"])
+        .args(["--syq-no-tcp", "-v", "-a", "--syq-connections", "1"])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -2555,7 +2548,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let dry = compat_command()
         .arg("-e")
         .arg(&rsh)
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args(["--dry-run", "-a"])
         .arg(t.s("src"))
@@ -2578,9 +2571,9 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let out = compat_command()
         .arg("-e")
         .arg(&rsh)
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--tcp-plain", "--stats", "-avv"])
+        .args(["--syq-tcp-plain", "--stats", "-avv"])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -2624,9 +2617,15 @@ fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
     let out = compat_command()
         .arg("-e")
         .arg(&rsh)
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--tcp-plain", "--inplace", "-a", "-j", "1"])
+        .args([
+            "--syq-tcp-plain",
+            "--inplace",
+            "-a",
+            "--syq-connections",
+            "1",
+        ])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -2650,9 +2649,9 @@ fn multiplexed_worker_refusal_falls_back_to_independent_ssh() {
     let remote = format!("fake:{}", t.s("dst"));
 
     let out = compat_command()
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--no-tcp", "-a", "-j", "1"])
+        .args(["--syq-no-tcp", "-a", "--syq-connections", "1"])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -2696,14 +2695,14 @@ fn tcp_congestion_override_is_applied_on_both_socket_ends_and_reported() {
         .arg("rsync")
         .arg("-e")
         .arg(&rsh)
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args([
-            "--tcp-plain",
-            "--tcp-congestion=reno",
+            "--syq-tcp-plain",
+            "--syq-tcp-congestion=reno",
             "--stats",
             "-avv",
-            "-j",
+            "--syq-connections",
             "1",
         ])
         .arg(t.s("src"))
@@ -2743,9 +2742,14 @@ fn rejected_tcp_congestion_override_is_fatal_instead_of_falling_back() {
         .arg("rsync")
         .arg("-e")
         .arg(&rsh)
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--tcp-congestion=syq_missing_cc", "-a", "-j", "1"])
+        .args([
+            "--syq-tcp-congestion=syq_missing_cc",
+            "-a",
+            "--syq-connections",
+            "1",
+        ])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -2760,7 +2764,7 @@ fn rejected_tcp_congestion_override_is_fatal_instead_of_falling_back() {
     assert!(!t.path("dst").exists());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("could not apply --tcp-congestion syq_missing_cc"),
+        stderr.contains("could not apply --syq-tcp-congestion syq_missing_cc"),
         "{stderr}"
     );
     assert!(stderr.contains("kernel rejected"), "{stderr}");
@@ -2785,13 +2789,13 @@ fn ordinary_tcp_setup_failure_still_falls_back_with_congestion_notice() {
         .arg("rsync")
         .arg("-e")
         .arg(&rsh)
-        .arg("--syq-path")
+        .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args([
-            "--tcp-congestion=reno",
-            &format!("--tcp-ports={port}-{port}"),
+            "--syq-tcp-congestion=reno",
+            &format!("--syq-tcp-ports={port}-{port}"),
             "-a",
-            "-j",
+            "--syq-connections",
             "1",
         ])
         .arg(t.s("src"))
@@ -2814,52 +2818,6 @@ fn ordinary_tcp_setup_failure_still_falls_back_with_congestion_notice() {
     );
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn direct_remote_to_remote_forwards_tcp_congestion_override() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    write(&t.path("src"), b"direct forwarding");
-    let src = format!("hostA:{}", t.s("src"));
-    let dst = format!("hostB:{}", t.s("dst"));
-
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .arg("rsync")
-        .arg("-e")
-        .arg(&rsh)
-        .arg("--syq-path")
-        .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--tcp-congestion=reno", "--dry-run", "-avv", "-j", "1"])
-        .arg(&src)
-        .arg(&dst)
-        .arg("--no-progress")
-        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_RSH_LOG", t.path("rsh.log"))
-        .env("XDG_CONFIG_HOME", t.path("config"))
-        .run()
-        .expect("run direct remote-to-remote dry-run with TCP congestion override");
-
-    assert_output_ok(&out);
-    assert!(!t.path("dst").exists());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("remote-to-remote: running on hostA"),
-        "{stderr}"
-    );
-    assert!(
-        stderr
-            .contains("congestion control: remote listener reno; local data sockets request reno"),
-        "{stderr}"
-    );
-    assert!(
-        fs::read_to_string(t.path("rsh.log"))
-            .unwrap()
-            .contains("--tcp-congestion=reno"),
-        "the source-side orchestrator did not receive the override"
-    );
-}
-
 #[test]
 fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it() {
     let t = Tmp::new();
@@ -2878,11 +2836,11 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
         command
             .arg("-e")
             .arg(&rsh)
-            .arg("--syq-path")
+            .arg("--rsync-path")
             .arg(env!("CARGO_BIN_EXE_syq"))
-            .args(["--no-tcp", "--stats", "-avv"]);
+            .args(["--syq-no-tcp", "--stats", "-avv"]);
         if let Some(fixed) = fixed {
-            command.args(["-j", &fixed.to_string()]);
+            command.args(["--syq-connections", &fixed.to_string()]);
         }
         command
             .arg(t.s("src"))
@@ -2937,7 +2895,7 @@ fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
         &rsh,
         &[
             "-a",
-            "--no-bootstrap",
+            "--syq-no-bootstrap",
             "--block-size=64K",
             &t.s("src"),
             &remote,
@@ -2988,9 +2946,9 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .arg("-e")
         .arg(&rsh)
         .args([
-            "--no-tcp",
+            "--syq-no-tcp",
             "-a",
-            "--no-bootstrap",
+            "--syq-no-bootstrap",
             "--block-size=64K",
             "--bwlimit=4M",
             "--stats",
@@ -3051,7 +3009,7 @@ fn lost_finalize_response_is_verified_after_reconnect() {
         &rsh,
         &[
             "-a",
-            "--no-bootstrap",
+            "--syq-no-bootstrap",
             "--block-size=64K",
             &t.s("src"),
             &remote,
@@ -3415,7 +3373,7 @@ fn checksum_repairs_silent_corruption() {
         "without -c the file must be left alone"
     );
 
-    let out = run_ok(&["-ac", "--block-size", "1M", &t.s("src/"), &t.s("dst/")]);
+    let out = run_ok(&["-ac", "-B1M", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(transferred(&out), 1, "{out}");
     assert!(read(&t.path("dst/f.bin")) == data, "-c should repair");
     assert!(
@@ -3430,7 +3388,7 @@ fn verify_only_detects_differences() {
     let t = Tmp::new();
     make_tree(&t.path("src"));
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    let out = syq(&["-a", "--verify-only", &t.s("src/"), &t.s("dst/")]);
+    let out = syq(&["-a", "--syq-verify-only", &t.s("src/"), &t.s("dst/")]);
     assert!(
         out.status.success(),
         "{}",
@@ -3446,7 +3404,7 @@ fn verify_only_detects_differences() {
     );
     fs::remove_file(t.path("dst/hello.txt")).unwrap();
 
-    let out = syq(&["-a", "--verify-only", &t.s("src/"), &t.s("dst/")]);
+    let out = syq(&["-a", "--syq-verify-only", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(out.status.code(), Some(23));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("DIFFERS a/med.bin"), "{err}");
@@ -3472,7 +3430,14 @@ fn hash_errors_do_not_desynchronize_worker_connections() {
     // Largest-first scheduling makes the unreadable file fail first. The
     // receiver still answers its already-issued hash request; that response
     // must be drained before this worker proceeds to `good`.
-    let copy = syq(&["-a", "-c", "-j", "1", &t.s("src/"), &t.s("dst/")]);
+    let copy = syq(&[
+        "-a",
+        "-c",
+        "--syq-connections",
+        "1",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
     assert_eq!(copy.status.code(), Some(23));
     let copy_stderr = String::from_utf8_lossy(&copy.stderr);
     assert!(
@@ -3485,9 +3450,9 @@ fn hash_errors_do_not_desynchronize_worker_connections() {
     // processing the connection after the source-side error.
     let verify = syq(&[
         "-a",
-        "--verify-only",
+        "--syq-verify-only",
         "-v",
-        "-j",
+        "--syq-connections",
         "1",
         &t.s("src/"),
         &t.s("dst/"),
@@ -3514,12 +3479,10 @@ fn large_file_parallel_chunks() {
     set_mtime(&t.path("src/huge.bin"), 1_600_000_000);
     run_ok(&[
         "-a",
-        "-j",
+        "--syq-connections",
         "8",
         "--block-size",
         "1M",
-        "--min-split",
-        "2M",
         &t.s("src/"),
         &t.s("dst/"),
     ]);
@@ -3531,12 +3494,10 @@ fn large_file_parallel_chunks() {
     let dst = t.s("dst/");
     let args = [
         "-a",
-        "-j",
+        "--syq-connections",
         "8",
         "--block-size",
         "1M",
-        "--min-split",
-        "2M",
         "--bwlimit",
         "1G",
         &src,
@@ -3569,7 +3530,7 @@ fn bwlimit_is_aggregate_across_workers() {
     let start = std::time::Instant::now();
     run_ok(&[
         "-a",
-        "-j",
+        "--syq-connections",
         "4",
         "--bwlimit",
         "1M",
@@ -3633,7 +3594,7 @@ fn dry_run_reports_typed_preflight_summary() {
         "--delete",
         "--max-size",
         "5",
-        "--ignore",
+        "--syq-ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -4002,128 +3963,6 @@ fn inplace_replaces_symlink_dest_not_its_target() {
 }
 
 #[test]
-fn rm_rejects_parent_traversal() {
-    let t = Tmp::new();
-    fs::create_dir_all(t.path("parent/child")).unwrap();
-    write(&t.path("parent/sibling"), b"x");
-    write(&t.path("parent/child/y"), b"y");
-    let out = compat_command()
-        .args(["--rm", ".."])
-        .arg("--no-progress")
-        .current_dir(t.path("parent/child"))
-        .run()
-        .unwrap();
-    assert!(!out.status.success());
-    // The sibling outside child must survive.
-    assert!(t.path("parent/sibling").exists());
-}
-
-#[test]
-fn rm_rejects_dangerous_roots() {
-    for target in ["/", ".", "~", "/tmp/.."] {
-        let out = syq(&["--rm", target]);
-        assert!(!out.status.success(), "should reject --rm {target}");
-    }
-}
-
-#[test]
-fn rm_normal_target_works() {
-    let t = Tmp::new();
-    fs::create_dir_all(t.path("killme/sub")).unwrap();
-    write(&t.path("killme/sub/f"), b"f");
-    run_ok(&["--rm", &t.s("killme")]);
-    assert!(!t.path("killme").exists());
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn rm_never_recurses_into_directory_that_replaced_scanned_leaf() {
-    let t = Tmp::new();
-    write(&t.path("killme/leaf"), b"old");
-    let ready = t.path("rm-leaf-ready");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["rsync", "--rm", "-j", "1", &t.s("killme"), "-q"])
-        .env("SYQ_TEST_RM_LEAF_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_RM_LEAF_MS", "1000")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .start()
-        .unwrap();
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    if !ready.exists() {
-        let _ = child.kill();
-        let out = child.wait_with_output().unwrap();
-        panic!(
-            "rm did not report the scanned leaf: stdout={} stderr={}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fs::remove_file(t.path("killme/leaf")).unwrap();
-    write(&t.path("killme/leaf/important"), b"keep");
-
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(23),
-        "stdout={}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("is now a directory"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(read(&t.path("killme/leaf/important")), b"keep");
-}
-
-#[test]
-fn quiet_overrides_verbose_and_json_progress_for_rm() {
-    let t = Tmp::new();
-    write(&t.path("killme/sub/f"), b"f");
-
-    let dry = syq(&[
-        "--rm",
-        "--dry-run",
-        "-q",
-        "-v",
-        "--progress-json",
-        &t.s("killme"),
-    ]);
-    assert_output_ok(&dry);
-    assert!(
-        dry.stdout.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&dry.stdout)
-    );
-    assert!(
-        dry.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&dry.stderr)
-    );
-    assert!(t.path("killme/sub/f").exists());
-
-    let actual = syq(&["--rm", "-q", "-v", "--progress-json", &t.s("killme")]);
-    assert_output_ok(&actual);
-    assert!(
-        actual.stdout.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&actual.stdout)
-    );
-    assert!(
-        actual.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&actual.stderr)
-    );
-    assert!(!t.path("killme").exists());
-}
-
-#[test]
 fn duplicate_destination_rejected() {
     let t = Tmp::new();
     write(&t.path("a/same"), b"A");
@@ -4159,50 +3998,6 @@ fn exactly_repeated_sources_are_deduplicated_without_changing_placement() {
     run_ok(&["-a", &file, &file, &t.s("file-dest")]);
     assert!(t.path("file-dest").is_dir());
     assert_eq!(read(&t.path("file-dest/file")), b"one");
-}
-
-#[test]
-fn direct_remote_dedup_uses_raw_operands_and_preserves_original_placement() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
-    write(&t.path("source-file"), b"payload");
-
-    let source = format!("fake:{}", t.s("source-file"));
-    let destination = format!("fake:{}", t.s("deduplicated"));
-    let repeated = remote_syq(
-        &t,
-        &rsh,
-        &["-a", "--no-bootstrap", &source, &source, &destination],
-    );
-    assert_output_ok(&repeated);
-    assert!(t.path("deduplicated").is_dir());
-    assert_eq!(read(&t.path("deduplicated/source-file")), b"payload");
-
-    // Bracket removal makes these Locations equal after parsing, but the raw
-    // operands are distinct and must still reach collision detection on the
-    // source-side orchestrator.
-    let bracketed_source = format!("[fake]:{}", t.s("source-file"));
-    let conflicting_destination = format!("fake:{}", t.s("conflict"));
-    let distinct = remote_syq(
-        &t,
-        &rsh,
-        &[
-            "-a",
-            "--no-bootstrap",
-            &source,
-            &bracketed_source,
-            &conflicting_destination,
-        ],
-    );
-    assert!(!distinct.status.success());
-    assert!(
-        stderr_of(&distinct).contains("two sources named"),
-        "{}",
-        stderr_of(&distinct)
-    );
-    assert!(!t.path("conflict").exists());
 }
 
 #[test]
@@ -4294,15 +4089,6 @@ fn partial_symlink_is_not_followed() {
 }
 
 #[test]
-fn rm_rejects_dot_final_component() {
-    let t = Tmp::new();
-    write(&t.path("p/f"), b"x");
-    let out = syq(&["--rm", &format!("{}/.", t.s("p"))]);
-    assert!(!out.status.success());
-    assert!(t.path("p/f").exists(), "contents must survive rm p/.");
-}
-
-#[test]
 fn dir_vs_file_destination_collision_rejected() {
     let t = Tmp::new();
     write(&t.path("A/x"), b"aaa"); // A/x is a file
@@ -4326,7 +4112,7 @@ fn file_over_nonempty_destination_directory_reports_error_without_panicking() {
     write(&t.path("src/foo"), b"source");
     write(&t.path("dest/foo/keep"), b"keep");
 
-    let out = syq(&["-j", "1", &t.s("src/foo"), &t.s("dest")]);
+    let out = syq(&["--syq-connections", "1", &t.s("src/foo"), &t.s("dest")]);
 
     assert_eq!(out.status.code(), Some(23));
     let err = String::from_utf8_lossy(&out.stderr);
@@ -4348,7 +4134,7 @@ fn verify_only_detects_symlink_difference() {
     std::os::unix::fs::symlink("target-b", t.path("d/l")).unwrap();
     let out = syq(&[
         "-a",
-        "--verify-only",
+        "--syq-verify-only",
         &format!("{}/", t.s("s")),
         &format!("{}/", t.s("d")),
     ]);
@@ -4427,7 +4213,7 @@ fn verify_only_flags_missing_directory() {
     fs::create_dir_all(t.path("d")).unwrap(); // d exists but d/sub does not
     let out = syq(&[
         "-a",
-        "--verify-only",
+        "--syq-verify-only",
         &format!("{}/", t.s("s")),
         &format!("{}/", t.s("d")),
     ]);
@@ -4453,7 +4239,7 @@ fn verify_only_flags_missing_special() {
     }
     let out = syq(&[
         "-a",
-        "--verify-only",
+        "--syq-verify-only",
         &format!("{}/", t.s("s")),
         &format!("{}/", t.s("d")),
     ]);
@@ -4521,7 +4307,7 @@ fn file_onto_itself_is_allowed_noop() {
     assert_eq!(read(&t.path("f")), b"hello");
 }
 
-/// Tree for the --ignore tests.
+/// Tree for the --syq-ignore tests.
 fn make_ignore_tree(root: &Path) {
     for f in [
         "hello.txt",
@@ -4606,17 +4392,15 @@ fn native_cp_with_prune_matches_rsync_delete() {
 }
 
 #[test]
-fn native_rm_matches_rsync_rm_and_contents_keeps_root() {
+fn native_rm_removes_named_tree_and_contents_keeps_root() {
     let t = Tmp::new();
-    for root in ["rsync", "native", "contents"] {
+    for root in ["native", "contents"] {
         write(&t.path(&format!("{root}/sub/file")), b"data");
     }
 
-    run_ok(&["--rm", &t.s("rsync")]);
     run_native_ok(&["rm", "--cwd", &t.s(""), "--src", "native"]);
     run_native_ok(&["rm", "--cwd", &t.s(""), "--src-src", "contents"]);
 
-    assert!(!t.path("rsync").exists());
     assert!(!t.path("native").exists());
     assert!(t.path("contents").is_dir());
     assert!(listing(&t.path("contents")).is_empty());
@@ -4755,7 +4539,7 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
     for args in [
         ["cp", "-a", "source", "--into", "dest"].as_slice(),
         ["cp", "--delete", "source", "--into", "dest"].as_slice(),
-        ["rm", "--no-tcp", "source", "", ""].as_slice(),
+        ["rm", "--syq-no-tcp", "source", "", ""].as_slice(),
         ["rm", "--bwlimit", "1M", "source", ""].as_slice(),
         ["rm", "--no-compress", "source", "", ""].as_slice(),
         ["rm", "--hash", "source", "", ""].as_slice(),
@@ -4844,11 +4628,11 @@ fn ignore_patterns_prune_dirs_and_files() {
     // `node_modules` at any depth, `*.o` anywhere, `/build` only at the root.
     run_ok(&[
         "-a",
-        "--ignore",
+        "--syq-ignore",
         "node_modules",
-        "--ignore",
+        "--syq-ignore",
         "*.o",
-        "--ignore",
+        "--syq-ignore",
         "/build",
         &t.s("src/"),
         &t.s("dst"),
@@ -4879,11 +4663,11 @@ fn ignore_only_idiom_and_empty_dirs() {
     // The gitignore "only *.jpg" idiom: directories are still all created.
     run_ok(&[
         "-a",
-        "--ignore",
+        "--syq-ignore",
         "*",
-        "--ignore",
+        "--syq-ignore",
         "!*/",
-        "--ignore",
+        "--syq-ignore",
         "!*.jpg",
         &t.s("src/"),
         &t.s("dst"),
@@ -4908,9 +4692,9 @@ fn ignore_from_file_and_later_negation_wins() {
     write(&t.path("pats"), b"# comment\nnode_modules\n\n*.o\r\n");
     run_ok(&[
         "-a",
-        "--ignore-from",
+        "--syq-ignore-from",
         &t.s("pats"),
-        "--ignore",
+        "--syq-ignore",
         "!x.o",
         &t.s("src/"),
         &t.s("dst"),
@@ -4918,16 +4702,16 @@ fn ignore_from_file_and_later_negation_wins() {
     let l = listing(&t.path("dst"));
     assert!(
         l.contains(&"x.o".to_string()),
-        "later --ignore '!x.o' must override file"
+        "later --syq-ignore '!x.o' must override file"
     );
     assert!(!l.contains(&"a/y.o".to_string()));
     assert!(!l.iter().any(|p| p.contains("node_modules")));
     // And the other order: the file's `*.o` comes last, so x.o stays ignored.
     run_ok(&[
         "-a",
-        "--ignore",
+        "--syq-ignore",
         "!x.o",
-        "--ignore-from",
+        "--syq-ignore-from",
         &t.s("pats"),
         &t.s("src/"),
         &t.s("dst2"),
@@ -4936,13 +4720,13 @@ fn ignore_from_file_and_later_negation_wins() {
     // Missing file is an error.
     let out = syq(&[
         "-a",
-        "--ignore-from",
+        "--syq-ignore-from",
         &t.s("nope"),
         &t.s("src/"),
         &t.s("dst3"),
     ]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--ignore-from"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--syq-ignore-from"));
 }
 
 #[test]
@@ -4954,7 +4738,7 @@ fn ignore_applies_per_source_root_and_dry_run() {
     // `/build` is anchored at each source's root, not the destination.
     run_ok(&[
         "-a",
-        "--ignore",
+        "--syq-ignore",
         "/build",
         &t.s("s1"),
         &t.s("s2"),
@@ -4966,9 +4750,9 @@ fn ignore_applies_per_source_root_and_dry_run() {
     // Dry run with the root itself matching a pattern: the root is never ignored.
     let out = run_ok(&[
         "-an",
-        "--ignore",
+        "--syq-ignore",
         "s1",
-        "--ignore",
+        "--syq-ignore",
         "*.o",
         &t.s("s1"),
         &t.s("dst2"),
@@ -4984,9 +4768,9 @@ fn ignore_reinclude_subdir_idiom() {
     // Everything directly under logs/ except the keep/ directory (git idiom).
     run_ok(&[
         "-a",
-        "--ignore",
+        "--syq-ignore",
         "logs/*",
-        "--ignore",
+        "--syq-ignore",
         "!logs/keep/",
         &t.s("src/"),
         &t.s("dst"),
@@ -5004,9 +4788,9 @@ fn ignore_from_strips_bom_and_hyphen_patterns_work() {
     write(&t.path("pats"), "\u{feff}*.o\n".as_bytes());
     run_ok(&[
         "-a",
-        "--ignore-from",
+        "--syq-ignore-from",
         &t.s("pats"),
-        "--ignore",
+        "--syq-ignore",
         "-secret",
         &t.s("src/"),
         &t.s("dst"),
@@ -5017,26 +4801,6 @@ fn ignore_from_strips_bom_and_hyphen_patterns_work() {
     );
     assert!(!t.path("dst/-secret").exists());
     assert!(t.path("dst/hello.txt").is_file());
-}
-
-#[test]
-fn ignore_conflicts_with_rm() {
-    let t = Tmp::new();
-    make_ignore_tree(&t.path("tree"));
-    let out = syq(&["--rm", "--ignore", "keep", &t.s("tree")]);
-    assert!(!out.status.success(), "--rm with --ignore must be rejected");
-    assert!(
-        t.path("tree/logs/keep/k").is_file(),
-        "nothing may be removed"
-    );
-    let out = syq(&[
-        "--rm",
-        "--ignore-from",
-        &t.s("tree/hello.txt"),
-        &t.s("tree"),
-    ]);
-    assert!(!out.status.success());
-    assert!(t.path("tree/hello.txt").is_file());
 }
 
 // ---------------------------------------------------------------- --delete
@@ -5064,7 +4828,7 @@ fn delete_removes_extras_and_protects_ignored() {
         "-n",
         "-v",
         "--delete",
-        "--ignore",
+        "--syq-ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -5098,7 +4862,7 @@ fn delete_removes_extras_and_protects_ignored() {
         "-a",
         "-v",
         "--delete",
-        "--ignore",
+        "--syq-ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -5617,7 +5381,7 @@ fn delete_with_inplace_replacing_many_symlinks() {
         "-a",
         "--inplace",
         "--delete",
-        "-j",
+        "--syq-connections",
         "16",
         &t.s("src/"),
         &t.s("dst"),
@@ -5659,7 +5423,7 @@ fn delete_nested_roots_keep_their_own_anchored_ignores() {
         "-a",
         "-v",
         "--delete",
-        "--ignore",
+        "--syq-ignore",
         "/foo",
         &t.s("src/"),
         &t.s("src2"),
@@ -5698,7 +5462,7 @@ fn delete_treats_partial_named_directory_as_ordinary_extra() {
         "-a",
         "-v",
         "--delete",
-        "--ignore",
+        "--syq-ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -5890,67 +5654,21 @@ fn existing_updates_through_a_destination_root_symlink_to_a_dir() {
 }
 
 #[test]
-fn no_forward_agent_conflicts_with_explicit_rsh() {
-    let t = Tmp::new();
-    write(&t.path("src"), b"data");
-    let out = syq(&[
-        "--no-forward-agent",
-        "-e",
-        "ssh -a",
-        &t.s("src"),
-        &t.s("dst"),
-    ]);
-    assert_eq!(out.status.code(), Some(2));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("cannot be used with"), "{err}");
-    assert!(!t.path("dst").exists());
-}
-
-#[test]
-fn unrestricted_agent_forwarding_is_an_explicit_live_direct_only_escape_hatch() {
-    let t = Tmp::new();
-    write(&t.path("src"), b"data");
-    for conflicting in [
-        &["--unrestricted-agent-forwarding", "-e", "ssh -A"][..],
-        &["--unrestricted-agent-forwarding", "--no-forward-agent"],
-        &["--unrestricted-agent-forwarding", "--detach"],
-        &["--unrestricted-agent-forwarding", "--relay"],
+fn rsync_rejects_remote_to_remote() {
+    for (source, destination) in [
+        ("host-a.invalid:source", "host-b.invalid:destination"),
+        ("same.invalid:source", "same.invalid:destination"),
     ] {
-        let (src, dst) = (t.s("src"), t.s("dst"));
-        let mut argv = conflicting.to_vec();
-        argv.extend([src.as_str(), dst.as_str()]);
-        let out = syq(&argv);
-        assert_eq!(out.status.code(), Some(2), "{conflicting:?}");
+        let started = std::time::Instant::now();
+        let out = syq(&[source, destination]);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
         assert!(
-            stderr_of(&out).contains("cannot be used with"),
-            "{conflicting:?}: {}",
-            stderr_of(&out)
-        );
-    }
-    for (src, dst) in [
-        (t.s("src"), "hostB:dst".to_string()),
-        ("hostA:src".to_string(), t.s("dst")),
-        ("same:src".to_string(), "same:dst".to_string()),
-    ] {
-        let out = syq(&["--unrestricted-agent-forwarding", &src, &dst]);
-        assert_eq!(out.status.code(), Some(1), "{src} -> {dst}");
-        assert!(
-            stderr_of(&out).contains("only valid for a live direct transfer"),
+            stderr_of(&out).contains("source and destination cannot both be remote"),
             "{}",
             stderr_of(&out)
         );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
-}
-
-#[test]
-fn detached_implicit_ssh_requires_source_host_credentials() {
-    let out = syq(&["--detach", "hostA:src", "hostB:dst"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        stderr_of(&out).contains("--detach requires --no-forward-agent"),
-        "{}",
-        stderr_of(&out)
-    );
 }
 
 // Ordinary copies keep no historical completion state: the current destination
@@ -6022,24 +5740,6 @@ fn readonly_root_copies_and_reruns() {
     assert_eq!(read(&t.path("dst/f")), b"data");
 }
 
-// The old implicit-marker subsystem is gone. Its former filename is ordinary
-// payload and must not make an otherwise identical second run look interrupted.
-#[test]
-fn legacy_marker_name_is_ordinary_payload() {
-    const LEGACY_TRANSFER_MARKER: &str = ".syq-transfer-session.json";
-
-    let t = Tmp::new();
-    let src_marker = t.path("src").join(LEGACY_TRANSFER_MARKER);
-    let dst_marker = t.path("dst").join(LEGACY_TRANSFER_MARKER);
-    write(&src_marker, b"ordinary user data");
-    write(&t.path("src/file"), b"payload");
-
-    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(read(&dst_marker), b"ordinary user data");
-    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(read(&t.path("dst/file")), b"payload");
-}
-
 #[test]
 fn source_partials_are_copied_and_warned_about() {
     let t = Tmp::new();
@@ -6048,10 +5748,7 @@ fn source_partials_are_copied_and_warned_about() {
     let dir = format!(".directory.syq-part.{id}");
     write(&t.path(&format!("src/{file}")), b"partial payload");
     write(&t.path(&format!("src/{dir}/child")), b"nested payload");
-    write(
-        &t.path("src/.legacy.syq-partial"),
-        b"legacy-looking payload",
-    );
+    write(&t.path("src/.ordinary.syq-partial"), b"ordinary payload");
 
     let output = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
     assert_output_ok(&output);
@@ -6074,11 +5771,11 @@ fn source_partials_are_copied_and_warned_about() {
         b"nested payload"
     );
     assert_eq!(
-        read(&t.path("dst/.legacy.syq-partial")),
-        b"legacy-looking payload"
+        read(&t.path("dst/.ordinary.syq-partial")),
+        b"ordinary payload"
     );
 
-    let output = syq(&["-a", "--progress-json", &t.s("src/"), &t.s("json-dst/")]);
+    let output = syq(&["-a", "--syq-progress-json", &t.s("src/"), &t.s("json-dst/")]);
     assert_output_ok(&output);
     let warning = String::from_utf8_lossy(&output.stderr)
         .lines()
@@ -6092,7 +5789,7 @@ fn source_partials_are_copied_and_warned_about() {
         "-q",
         "-v",
         "-a",
-        "--progress-json",
+        "--syq-progress-json",
         &t.s("src/"),
         &t.s("quiet-dst/"),
     ]);
@@ -6271,10 +5968,10 @@ fn root_meta_failure_is_visible() {
 fn readonly_modes_create_nothing() {
     let t = Tmp::new();
     write(&t.path("src/f"), b"data");
-    let out = syq(&["-a", "--verify-only", &t.s("src/"), &t.s("dst/")]);
+    let out = syq(&["-a", "--syq-verify-only", &t.s("src/"), &t.s("dst/")]);
     assert!(
         !t.path("dst").exists(),
-        "--verify-only must not create the destination"
+        "--syq-verify-only must not create the destination"
     );
     assert!(!out.status.success(), "everything is missing");
     let out = syq(&["-a", "-n", &t.s("src/"), &t.s("dst/")]);
@@ -6324,7 +6021,7 @@ fn different_jobs_use_distinct_partial_inodes() {
     let mut first = compat_command()
         .args([
             "-a",
-            "-j",
+            "--syq-connections",
             "1",
             "--bwlimit",
             "1G",
@@ -6348,7 +6045,7 @@ fn different_jobs_use_distinct_partial_inodes() {
 
     let second = syq(&[
         "-a",
-        "-j",
+        "--syq-connections",
         "1",
         "--bwlimit",
         "1G",
@@ -6388,7 +6085,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     let mut first = compat_command()
         .args([
             "-a",
-            "-j",
+            "--syq-connections",
             "1",
             "--bwlimit",
             "1G",
@@ -6416,7 +6113,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
 
     let second = syq(&[
         "-a",
-        "-j",
+        "--syq-connections",
         "1",
         "--bwlimit",
         "1G",
@@ -6444,7 +6141,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
     let mut child = compat_command()
         .args([
             "-a",
-            "-j",
+            "--syq-connections",
             "1",
             "--bwlimit",
             "1G",
@@ -6497,7 +6194,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     let mut first = compat_command()
         .args([
             "-a",
-            "-j",
+            "--syq-connections",
             "1",
             "--bwlimit",
             "1G",
@@ -6525,7 +6222,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
 
     let second = syq(&[
         "-a",
-        "-j",
+        "--syq-connections",
         "1",
         "--bwlimit",
         "1G",
@@ -6769,7 +6466,14 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
     set_mtime(&t.path("dst"), 1_600_000_000);
 
     let out = compat_command()
-        .args(["-a", "-j", "1", "--no-progress", &t.s("src"), &t.s("dst")])
+        .args([
+            "-a",
+            "--syq-connections",
+            "1",
+            "--no-progress",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .run()
         .unwrap();
@@ -6838,7 +6542,7 @@ fn copy_local_nfs_exdev_keeps_automatic_parallel_cases() {
     let cases: &[(&[&str], Option<&str>)] = &[
         (&[], Some("SYQ_TEST_COPY_LOCAL_SOURCE_NFS")),
         (&[], Some("SYQ_TEST_COPY_LOCAL_NFS_SYNC")),
-        (&["-j", "2"], None),
+        (&["--syq-connections", "2"], None),
     ];
     for (extra_args, extra_env) in cases {
         let t = Tmp::new();
@@ -7057,7 +6761,7 @@ fn symlink_destination_is_followed() {
 }
 
 #[test]
-fn foreign_owned_destination_root_symlink_is_refused_unless_explicitly_allowed() {
+fn foreign_owned_destination_root_symlink_is_refused() {
     if unsafe { libc::geteuid() } != 0 {
         return;
     }
@@ -7076,9 +6780,6 @@ fn foreign_owned_destination_root_symlink_is_refused_unless_explicitly_allowed()
         stderr_of(&refused)
     );
     assert!(!t.path("outside/f").exists());
-
-    run_ok(&["-a", "--insecure-links", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(read(&t.path("outside/f")), b"payload");
 }
 
 #[cfg(debug_assertions)]
@@ -7092,9 +6793,9 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
         let ready = t.path("anchor-ready");
 
         let mut command = compat_command();
-        command.args(["-a", "-j", "1", &t.s("src/"), &t.s("dst/")]);
+        command.args(["-a", "--syq-connections", "1", &t.s("src/"), &t.s("dst/")]);
         if no_tcp {
-            command.arg("--no-tcp");
+            command.arg("--syq-no-tcp");
         }
         let mut child = command
             .arg("--no-progress")
@@ -7200,7 +6901,7 @@ fn self_copy_guard_sees_through_symlinks() {
 }
 
 // Unsupported rsync flags get a helpful, specific error (not clap's generic
-// "unexpected argument"), and the filter family points at --ignore.
+// "unexpected argument"), and the filter family points at --syq-ignore.
 #[test]
 fn unsupported_rsync_flags_explain_themselves() {
     let t = Tmp::new();
@@ -7215,7 +6916,10 @@ fn unsupported_rsync_flags_explain_themselves() {
     ]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--ignore"), "should point to --ignore: {err}");
+    assert!(
+        err.contains("--syq-ignore"),
+        "should point to --syq-ignore: {err}"
+    );
     assert!(err.contains("gitignore"), "should mention gitignore: {err}");
 
     let out = syq(&["-a", "-i", &t.s("src/"), &t.s("itemized-dst/")]);
@@ -7226,8 +6930,8 @@ fn unsupported_rsync_flags_explain_themselves() {
         "should explain rsync -i: {err}"
     );
     assert!(
-        err.contains("long-only --ignore"),
-        "should name filtering: {err}"
+        err.contains("--syq-verify-only"),
+        "should name syq's nearest comparison operation: {err}"
     );
     assert!(!t.path("itemized-dst").exists());
 
@@ -7295,9 +6999,15 @@ fn rsync_compat_noops_are_accepted() {
 fn flag_like_ignore_pattern_is_not_rejected() {
     let t = Tmp::new();
     write(&t.path("src/keep"), b"k");
-    // `--ignore --exclude` means "ignore a pattern literally named --exclude"; it must
+    // `--syq-ignore --exclude` means "ignore a pattern literally named --exclude"; it must
     // not trip the --exclude rejection.
-    run_ok(&["-a", "--ignore", "--exclude", &t.s("src/"), &t.s("dst/")]);
+    run_ok(&[
+        "-a",
+        "--syq-ignore",
+        "--exclude",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
     assert_eq!(read(&t.path("dst/keep")), b"k");
 }
 
@@ -7374,10 +7084,12 @@ fn copy_onto_itself_among_sources_is_order_independent() {
 
 #[test]
 fn bad_size_limits_fail_before_anything_connects() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
     for value in ["12Q", "-1", "18446744073709551616", "1e999"] {
         let t0 = std::time::Instant::now();
         let max_size = format!("--max-size={value}");
-        let out = syq(&["-a", &max_size, "nohost-a.invalid:x", "nohost-b.invalid:y"]);
+        let out = syq(&["-a", &max_size, &t.s("src"), &t.s("dst")]);
         assert!(!out.status.success(), "accepted {value:?}");
         assert!(
             stderr_of(&out).contains("bad size"),
@@ -7393,11 +7105,11 @@ fn verify_only_checks_the_filtered_scope() {
     let t = Tmp::new();
     write(&t.path("src/big"), b"abc");
     write(&t.path("dst/big"), b"xyz");
-    let out = syq(&["-a", "--verify-only", &t.s("src/"), &t.s("dst")]);
+    let out = syq(&["-a", "--syq-verify-only", &t.s("src/"), &t.s("dst")]);
     assert_eq!(out.status.code(), Some(23));
     let so = run_ok(&[
         "-a",
-        "--verify-only",
+        "--syq-verify-only",
         "--max-size",
         "1",
         &t.s("src/"),
@@ -7406,7 +7118,7 @@ fn verify_only_checks_the_filtered_scope() {
     assert!(so.contains("verified 0 files"), "{so}");
     set_mtime(&t.path("src/big"), 1000);
     set_mtime(&t.path("dst/big"), 2000);
-    let so = run_ok(&["-a", "--verify-only", "-u", &t.s("src/"), &t.s("dst")]);
+    let so = run_ok(&["-a", "--syq-verify-only", "-u", &t.s("src/"), &t.s("dst")]);
     assert!(so.contains("verified 0 files"), "{so}");
 }
 
@@ -7435,7 +7147,14 @@ fn stats_report_connection_tuning_mode() {
         "{out}"
     );
     // An explicit -j is used as given, with no tuning.
-    let out = run_ok(&["-a", "--stats", "-j", "3", &t.s("src/"), &t.s("fixed/")]);
+    let out = run_ok(&[
+        "-a",
+        "--stats",
+        "--syq-connections",
+        "3",
+        &t.s("src/"),
+        &t.s("fixed/"),
+    ]);
     assert!(out.contains("connections: 3\n"), "{out}");
 }
 
@@ -7466,7 +7185,7 @@ fn delete_excluded_removes_ignored_destination_paths() {
     run_ok(&[
         "-a",
         "--delete",
-        "--ignore",
+        "--syq-ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -7480,7 +7199,7 @@ fn delete_excluded_removes_ignored_destination_paths() {
         "-a",
         "--delete",
         "--delete-excluded",
-        "--ignore",
+        "--syq-ignore",
         "*.log",
         &t.s("src/"),
         &t.s("dst"),
@@ -7545,9 +7264,25 @@ fn max_delete_refuses_everything_past_the_limit() {
         &t.s("dst"),
     ]);
     assert_eq!(listing(&t.path("dst")), ["a"]);
-    // --max-delete without --delete is a usage error.
-    let out = syq(&["-a", "--max-delete", "5", &t.s("src/"), &t.s("dst")]);
-    assert!(!out.status.success());
+    // As in rsync, --max-delete without --delete is accepted and has no effect.
+    write(&t.path("dst/extra"), b"keep");
+    run_ok(&["-a", "--max-delete", "5", &t.s("src/"), &t.s("dst")]);
+    assert!(t.path("dst/extra").exists());
+
+    // Zero is rsync's useful report-without-deleting idiom. Its historical -1
+    // spelling has the same effect and is accepted for command compatibility.
+    for value in ["0", "-1"] {
+        let out = syq(&[
+            "-a",
+            "--delete",
+            "--max-delete",
+            value,
+            &t.s("src/"),
+            &t.s("dst"),
+        ]);
+        assert_eq!(out.status.code(), Some(25), "{value}: {}", stderr_of(&out));
+        assert!(t.path("dst/extra").exists());
+    }
 }
 
 // ------------------------------------------------------------ review round 7
@@ -7707,10 +7442,10 @@ fn files_from_rejections_and_stdin() {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     assert_eq!(listing(&t.path("dst")), ["b"]);
-    // Cannot combine with --ignore / --ignore-from / --delete (clap-level errors).
+    // Cannot combine with --syq-ignore / --syq-ignore-from / --delete (clap-level errors).
     for extra in [
-        ["--ignore", "x"],
-        ["--ignore-from", "list"],
+        ["--syq-ignore", "x"],
+        ["--syq-ignore-from", "list"],
         ["--delete", "-v"],
     ] {
         let out = syq(&[
@@ -7730,7 +7465,7 @@ fn files_from_rejections_and_stdin() {
         );
     }
     assert!(!t.path("dst2").exists());
-    // Direct remote-to-remote needs --relay; refused before anything connects.
+    // Like rsync generally, a file-list copy cannot have two remote endpoints.
     let t0 = std::time::Instant::now();
     let out = syq(&[
         "-a",
@@ -7741,7 +7476,7 @@ fn files_from_rejections_and_stdin() {
     ]);
     assert!(!out.status.success());
     assert!(
-        stderr_of(&out).contains("needs --relay"),
+        stderr_of(&out).contains("source and destination cannot both be remote"),
         "{}",
         stderr_of(&out)
     );
@@ -8001,150 +7736,6 @@ fn files_from_leaves_unlisted_destination_root_metadata_alone() {
         &t.s("dst2"),
     ]);
     assert!(t.path("dst2").is_dir());
-}
-
-#[test]
-fn direct_remote_to_remote_verbose_diagnostics_are_orchestrator_relative() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
-    write(&t.path("src/a"), b"a");
-
-    let src = format!("hostA:{}", t.s("src/"));
-    let dst = format!("hostB:{}", t.s("dst"));
-    let out = remote_syq(
-        &t,
-        &rsh,
-        &["-avv", "--dry-run", "--no-bootstrap", &src, &dst],
-    );
-    assert_output_ok(&out);
-    assert!(!t.path("dst").exists());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("remote-to-remote: running on hostA"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("syq: hostB:\n"), "{stderr}");
-    assert!(!stderr.contains("syq: hostA:\n"), "{stderr}");
-    assert!(
-        stderr.contains("transport: SSH planned for a real transfer (--no-tcp)"),
-        "{stderr}"
-    );
-
-    let same_host_dst = format!("hostA:{}", t.s("same-host-dst"));
-    let out = remote_syq(
-        &t,
-        &rsh,
-        &["-avv", "--dry-run", "--no-bootstrap", &src, &same_host_dst],
-    );
-    assert_output_ok(&out);
-    assert!(!t.path("same-host-dst").exists());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("remote-to-remote: running on hostA"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("syq: transport: local filesystem"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("syq: hostA:\n"), "{stderr}");
-}
-
-#[test]
-fn direct_remote_to_remote_passes_through_defined_exit_codes() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
-    write(&t.path("src/a"), b"a");
-    write(&t.path("dst/extra1"), b"x");
-    write(&t.path("dst/extra2"), b"y");
-    let src = format!("fake:{}", t.s("src/"));
-    let dst = format!("fake:{}", t.s("dst"));
-    let dry = remote_syq(&t, &rsh, &["-an", "--no-bootstrap", &src, &dst]);
-    assert_output_ok(&dry);
-    let dry_stdout = String::from_utf8_lossy(&dry.stdout);
-    assert!(
-        dry_stdout.contains(&format!(
-            "mapping: fake:{} -> fake:{} (directory contents)",
-            t.s("src/"),
-            t.s("dst")
-        )),
-        "{dry_stdout}"
-    );
-    assert!(
-        dry_stdout.contains("route: local filesystem on fake; 1 worker (fixed)"),
-        "{dry_stdout}"
-    );
-    // --max-delete refusal on the remote orchestrator must surface as 25.
-    let out = remote_syq(
-        &t,
-        &rsh,
-        &[
-            "-a",
-            "--no-bootstrap",
-            "--delete",
-            "--max-delete",
-            "1",
-            &src,
-            &dst,
-        ],
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(25),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(t.path("dst/extra1").exists() && t.path("dst/extra2").exists());
-    // Partial failure (unreadable source file) must surface as 23.
-    write(&t.path("src/bad"), b"unreadable");
-    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
-    let out = remote_syq(&t, &rsh, &["-a", "--no-bootstrap", &src, &dst]);
-    fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(23),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn direct_remote_to_remote_forwards_receiver_policy_opt_outs() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
-    write(&t.path("src"), b"payload");
-    let src = format!("fake:{}", t.s("src"));
-    let dst = format!("fake:{}", t.s("dst"));
-
-    let out = remote_syq(
-        &t,
-        &rsh,
-        &[
-            "-a",
-            "--no-bootstrap",
-            "--no-compress",
-            "--insecure-links",
-            &src,
-            &dst,
-        ],
-    );
-    assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), b"payload");
-    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
-    assert!(
-        log.contains("--no-compress"),
-        "the source-side orchestrator silently reverted to default compression"
-    );
-    assert!(
-        log.contains("--insecure-links"),
-        "the source-side orchestrator silently changed destination-link policy"
-    );
 }
 
 #[test]
@@ -8490,6 +8081,39 @@ fn native_endpoint_port_reaches_ssh() {
 }
 
 #[test]
+fn native_remote_exact_bare_home_expands_before_identity_check() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-home")).unwrap();
+    write(&t.path("src/file"), b"home destination");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "fake",
+            "--as",
+            "~",
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("copy to a remote bare-home destination");
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("remote-home/file")), b"home destination");
+}
+
+#[test]
 fn native_detach_waits_for_coordinator_readiness() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
@@ -8519,8 +8143,8 @@ fn native_detach_waits_for_coordinator_readiness() {
         .run()
         .expect("launch detached native transfer");
     assert_output_ok(&out);
-    let follow_target = String::from_utf8(out.stdout).unwrap();
-    assert!(follow_target.starts_with("hostA:"), "{follow_target}");
+    let log_target = String::from_utf8(out.stdout).unwrap();
+    assert!(log_target.starts_with("hostA:"), "{log_target}");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !t.path("dst").exists() && std::time::Instant::now() < deadline {
@@ -8777,8 +8401,68 @@ fn native_map_refusals() {
     refuse(&["--src-src", "d1", "--src-src", "d2"], "only selector");
     refuse(&["--src-src", "d1", "d2"], "only selector");
     refuse(&["d1/n", "d2/n"], "same destination name");
-    refuse(&["d1", "--into-new", "z"], "never contacts a destination");
-    refuse(&["d1", "--from", "remotehost"], "not yet supported");
+    refuse(
+        &["d1", "--into-new", "z"],
+        "unexpected argument '--into-new'",
+    );
+    refuse(
+        &["d1", "--from", "remotehost"],
+        "unexpected argument '--from'",
+    );
+    refuse(&["d1", "--to", "remotehost"], "unexpected argument '--to'");
+    refuse(&["d1", "--ignore", "n"], "unexpected argument '--ignore'");
+    refuse(
+        &["d1", "--receipt", "sizes"],
+        "unexpected argument '--receipt'",
+    );
+}
+
+#[test]
+fn native_map_exposes_only_manifest_shaping_options() {
+    let help = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["map", "--help"])
+        .run()
+        .expect("run syq map --help");
+    assert_output_ok(&help);
+    let help = String::from_utf8(help.stdout).expect("map help is UTF-8");
+    for option in ["--cwd", "--follow", "--src", "--src-src", "--as"] {
+        assert!(help.contains(option), "map help omitted {option}:\n{help}");
+    }
+    for option in [
+        "--from",
+        "--to",
+        "--into",
+        "--into-new",
+        "--into-existing",
+        "--as-new",
+        "--as-existing",
+        "--mapping",
+        "--results",
+        "--dry-run",
+        "--verbose",
+        "--quiet",
+        "--connections",
+        "--progress",
+        "--no-progress",
+        "--progress-json",
+        "--hash",
+        "--no-compress",
+        "--bwlimit",
+        "--stats",
+        "--ignore",
+        "--ignore-from",
+        "--preserve",
+        "--inplace",
+        "--max-entries",
+        "--max-total-bytes",
+        "--max-runtime",
+        "--receipt",
+    ] {
+        assert!(
+            !help.contains(option),
+            "map help unexpectedly exposed {option}:\n{help}"
+        );
+    }
 }
 
 #[test]
@@ -9177,11 +8861,11 @@ fn native_cp_results_without_mapping_and_refusals() {
     assert_eq!(op["disposition"], "succeeded");
     assert!(op.get("src").is_none(), "non-mapping records carry no src");
     assert_eq!(lines.last().unwrap()["status"], "success");
-    // map refuses --results; pruning copies accept it (schema v1 covers
-    // deletions) and mark the run record.
+    // map does not expose --results; pruning copies accept it (schema v1
+    // covers deletions) and mark the run record.
     let out = syq_map_in(&t.path(""), &["--src-src", "src", "--results", "r.ndjson"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("only available on syq cp"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--results'"));
     let out = syq_cp_in(
         &t.path(""),
         &[
@@ -9974,7 +9658,6 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
         fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
         0o700
     );
-
     write(&t.path("src/a.txt"), b"a");
     let copy = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--pscope"])
@@ -10043,11 +9726,16 @@ exit 23
     let run = || {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
-                "rsync",
-                "-a",
+                "cp",
                 "--no-forward-agent",
-                "hostA:src/",
-                "hostB:dst/",
+                "--from",
+                "hostA",
+                "--src-src",
+                "src",
+                "--to",
+                "hostB",
+                "--into",
+                "dst",
                 "--no-progress",
             ])
             .env("XDG_CONFIG_HOME", t.path("config"))
@@ -10223,8 +9911,17 @@ fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
     let scope = ephemeral_scope(&t);
     write(&t.path("src/a"), b"a");
 
-    let compat = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let old_spelling = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["rsync", "-a", "--pscope"])
+        .arg(&scope)
+        .args([&t.s("src/"), &t.s("old-spelling"), "--no-progress"])
+        .run()
+        .unwrap();
+    assert_eq!(old_spelling.status.code(), Some(2));
+    assert!(stderr_of(&old_spelling).contains("unexpected argument '--pscope'"));
+
+    let compat = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", "-a", "--syq-pscope"])
         .arg(&scope)
         .args([&t.s("src/"), &t.s("compat"), "--no-progress"])
         .env("XDG_CONFIG_HOME", t.path("config"))
@@ -10299,7 +9996,7 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
         .args([
             "rsync",
             "-a",
-            "--pscope",
+            "--syq-pscope",
             scope,
             "hostA:src/",
             "hostB:dst/",
@@ -10310,7 +10007,7 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
         .run()
         .unwrap();
     assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("direct remote-to-remote"));
+    assert!(stderr_of(&out).contains("source and destination cannot both be remote"));
 
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([

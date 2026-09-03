@@ -13,18 +13,6 @@ pub enum Interface {
     NativeMap,
 }
 
-const NATIVE_COMMANDS: &[(&str, Interface)] = &[
-    ("cp", Interface::NativeCp),
-    ("rm", Interface::NativeRm),
-    ("map", Interface::NativeMap),
-];
-
-fn native_interface(command: &str) -> Option<Interface> {
-    NATIVE_COMMANDS
-        .iter()
-        .find_map(|(name, interface)| (*name == command).then_some(*interface))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Placement {
     #[default]
@@ -55,8 +43,8 @@ pub enum SourceSelection {
 /// Endpoint that owns the transfer coordinator for a native copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum RunAt {
-    /// Preserve the existing behavior: run locally unless both endpoints are
-    /// remote, then run at the source when possible.
+    /// Run locally unless both endpoints are remote, then use the source when
+    /// possible and otherwise relay locally.
     #[default]
     Auto,
     /// Run the coordinator at the source endpoint.
@@ -117,16 +105,31 @@ pub struct Args {
     /// stream; validated and wrapped at startup.
     #[arg(skip)]
     pub native_results_fd: Option<i32>,
-    /// Native coordinator placement. Rsync-shaped commands retain `--relay`.
+    /// Native coordinator placement.
     #[arg(skip)]
     pub run_at: RunAt,
+    /// Native local-relay selection derived from `--run-at local`.
+    #[arg(skip)]
+    pub relay: bool,
+    /// Native detached remote coordinator.
+    #[arg(skip)]
+    pub detach: bool,
+    /// Native remote coordinator uses its own peer credential.
+    #[arg(skip)]
+    pub no_forward_agent: bool,
+    /// Native remote coordinator receives the complete local SSH agent.
+    #[arg(skip)]
+    pub unrestricted_agent_forwarding: bool,
+    /// Native remote coordinator uses authentication-only broker confinement.
+    #[arg(skip)]
+    pub agent_broker_only: bool,
 
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
 
     /// Install the newest signed release (standalone installer builds only)
-    #[arg(long, exclusive = true)]
+    #[arg(long, hide = true, exclusive = true)]
     pub self_update: bool,
     /// Record an installation made by the official standalone installer
     #[arg(long, hide = true, exclusive = true)]
@@ -184,28 +187,20 @@ pub struct Args {
     /// No-op accepted for rsync compatibility (syq always uses numeric uid/gid)
     #[arg(long)]
     pub numeric_ids: bool,
-    /// Follow destination-path symlinks owned by other users. This restores
-    /// rsync's legacy behavior and is unsafe for a privileged receiver
-    #[arg(long)]
-    pub insecure_links: bool,
 
     /// Parallel connections/workers. Default for copies: auto-tuned — starts at
     /// the last settled count remembered for this host path and transport, or 16
     /// over TCP, 8 over ssh, or 32 when local. It probes from 1 to 64 while the
-    /// copy has enough work to measure. Give a number to fix it. --rm uses a fixed
-    /// 8 (32 when local).
-    #[arg(short = 'j', long = "connections", value_name = "N")]
+    /// copy has enough work to measure. Give a number to fix it.
+    #[arg(long = "syq-connections", value_name = "N")]
     pub connections_opt: Option<usize>,
     #[arg(skip)]
     pub connections: usize,
     #[arg(skip)]
     pub connections_default: bool,
     /// Transfer/hash block size (e.g. 4M)
-    #[arg(long, default_value = "4M", value_name = "SIZE")]
+    #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE")]
     pub block_size: String,
-    /// Don't split in-flight files with less than this much left (e.g. 32M)
-    #[arg(long, default_value = "32M", value_name = "SIZE")]
-    pub min_split: String,
     /// Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables)
     #[arg(long, value_name = "RATE")]
     pub bwlimit: Option<String>,
@@ -224,8 +219,8 @@ pub struct Args {
     /// No-op accepted for rsync compatibility (syq always keeps partial files)
     #[arg(long)]
     pub partial: bool,
-    /// Emit machine-readable progress lines (JSON) on stderr
-    #[arg(long)]
+    /// SYQ extension: emit machine-readable progress lines (JSON) on stderr
+    #[arg(long = "syq-progress-json")]
     pub progress_json: bool,
     /// Print transfer statistics at the end
     #[arg(long)]
@@ -234,8 +229,8 @@ pub struct Args {
     /// Skip quick check; compare file contents block by block and repair differences
     #[arg(short = 'c', long)]
     pub checksum: bool,
-    /// Only compare source and destination contents; transfer nothing
-    #[arg(long)]
+    /// SYQ extension: only compare source and destination contents; transfer nothing
+    #[arg(long = "syq-verify-only")]
     pub verify_only: bool,
     /// Update files in place instead of writing a partial and renaming. Use this to modify a
     /// large existing file without copying it first (saves time and disk space when only part
@@ -247,88 +242,61 @@ pub struct Args {
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
     /// Use this exact syq executable on the remote instead of the managed helper
-    #[arg(long, value_name = "PATH")]
+    #[arg(long = "rsync-path", value_name = "PATH")]
     pub syq_path: Option<String>,
-    /// Require syq on the remote PATH instead of installing a versioned helper
-    #[arg(long)]
+    /// SYQ extension: require syq on the remote PATH instead of installing a versioned helper
+    #[arg(long = "syq-no-bootstrap")]
     pub no_bootstrap: bool,
-    /// Use TCP data connections without encryption (trusted networks only)
-    #[arg(long)]
+    /// SYQ extension: use TCP data connections without encryption (trusted networks only)
+    #[arg(long = "syq-tcp-plain")]
     pub tcp_plain: bool,
-    /// Send all data over the ssh connection instead of separate TCP data connections
-    #[arg(long)]
+    /// SYQ extension: send all data over ssh instead of separate TCP data connections
+    #[arg(long = "syq-no-tcp")]
     pub no_tcp: bool,
-    /// Port range the remote listens on for TCP data connections
-    #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
-    pub tcp_ports: String,
-    /// Use this congestion-control algorithm for direct TCP data sockets (Linux only)
+    /// SYQ extension: port range the remote listens on for TCP data connections
     #[arg(
-        long,
+        long = "syq-tcp-ports",
+        default_value = "47600-47699",
+        value_name = "LO-HI"
+    )]
+    pub tcp_ports: String,
+    /// SYQ extension: use this congestion-control algorithm for direct TCP data sockets (Linux only)
+    #[arg(
+        long = "syq-tcp-congestion",
         value_name = "ALGO",
         value_parser = parse_tcp_congestion,
-        conflicts_with_all = ["no_tcp", "rm", "follow"]
+        conflicts_with = "no_tcp"
     )]
     pub tcp_congestion: Option<String>,
-    /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
-    #[arg(long, value_name = "PATH", conflicts_with = "rsh")]
+    /// SYQ extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    #[arg(long = "syq-pscope", value_name = "PATH", conflicts_with = "rsh")]
     pub pscope: Option<PathBuf>,
-    /// Whether --pscope was supplied rather than selected by the user-level policy
+    /// Whether --syq-pscope was supplied rather than selected by the user-level policy
     #[arg(skip)]
     pub pscope_explicit: bool,
-    /// Remote-to-remote: start the transfer detached on the source host (survives losing this
-    /// ssh session) and return; progress goes to a log you can watch with --follow
-    #[arg(long)]
-    pub detach: bool,
-    /// Follow a detached transfer: syq rsync --follow HOST:LOGFILE
-    #[arg(long)]
-    pub follow: bool,
-    /// Remote-to-remote: relay data through this machine instead of running on the source host
-    #[arg(long)]
-    pub relay: bool,
-    /// Remote-to-remote with the default ssh: disable agent forwarding to the source host; it
-    /// must authenticate to the destination with its own credentials
-    #[arg(long, conflicts_with = "rsh")]
-    pub no_forward_agent: bool,
-    /// Remote-to-remote with the default ssh: expose the unrestricted local agent to the source
-    /// host. This is a compatibility escape hatch; the default broker permits only user@hostB
-    #[arg(
-        long,
-        conflicts_with_all = ["rsh", "no_forward_agent", "detach", "relay"]
-    )]
-    pub unrestricted_agent_forwarding: bool,
-    /// Remote-to-remote: use only the live destination-bound agent broker and
-    /// do not create or use a command-restricted receiver enrollment
-    #[arg(
-        long,
-        conflicts_with_all = ["rsh", "no_forward_agent", "unrestricted_agent_forwarding", "detach", "relay"]
-    )]
-    pub agent_broker_only: bool,
-    /// Signed receiver grant forwarded to the source-host orchestrator
-    #[arg(long, hide = true)]
+    /// Signed receiver grant forwarded to a native source-host orchestrator
+    #[arg(skip)]
     pub restricted_grant: Option<String>,
-    /// Terminal width for the progress display (internal; used for remote-to-remote)
-    #[arg(long, hide = true)]
+    /// Terminal width for a native remote coordinator's progress display
+    #[arg(skip)]
     pub width: Option<usize>,
-    /// Original source endpoint for a remotely orchestrated dry-run summary
-    #[arg(long, hide = true)]
+    /// Original source endpoint for a native remote coordinator's dry-run summary
+    #[arg(skip)]
     pub plan_source_host: Option<String>,
-    /// Original source-operand count for a direct remote orchestrator
-    #[arg(long, hide = true)]
-    pub direct_source_operand_count: Option<usize>,
-    /// Direct remote launch already deduplicated its raw source operands
-    #[arg(long, hide = true, requires = "direct_source_operand_count")]
-    pub direct_sources_prededuplicated: bool,
-
-    /// Skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
+    /// SYQ extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
     /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together
-    /// with --ignore-from the patterns act like the lines of one .gitignore file, in
+    /// with --syq-ignore-from the patterns act like the lines of one .gitignore file, in
     /// command-line order, anchored at each source root. Skipping a directory skips its
-    /// whole subtree, so to copy only *.jpg use: --ignore '*' --ignore '!*/'
-    /// --ignore '!*.jpg'
-    #[arg(long = "ignore", value_name = "PATTERN", allow_hyphen_values = true)]
+    /// whole subtree, so to copy only *.jpg use: --syq-ignore '*' --syq-ignore '!*/'
+    /// --syq-ignore '!*.jpg'
+    #[arg(
+        long = "syq-ignore",
+        value_name = "PATTERN",
+        allow_hyphen_values = true
+    )]
     pub ignore: Vec<String>,
-    /// Read ignore patterns from FILE (one per line, # comments); repeatable
-    #[arg(long, value_name = "FILE")]
+    /// SYQ extension: read ignore patterns from FILE (one per line, # comments); repeatable
+    #[arg(long = "syq-ignore-from", value_name = "FILE")]
     pub ignore_from: Vec<String>,
     /// All ignore patterns, in command-line order (filled by parse_args)
     #[arg(skip)]
@@ -336,20 +304,26 @@ pub struct Args {
 
     /// Delete extraneous files from the destination directories (paths the source does not
     /// have). Deletion happens after the transfer and is skipped entirely if the source scan
-    /// reported any error. Ignored paths (--ignore) are protected on both sides. rsync's
+    /// reported any error. Ignored paths (--syq-ignore) are protected on both sides. rsync's
     /// --delete-after and --delete-delay mean the same thing and are accepted. Cannot be combined
-    /// with --verify-only or --files-from
+    /// with --syq-verify-only or --files-from
     #[arg(
         long,
         aliases = ["delete-after", "delete-delay"],
         conflicts_with_all = ["verify_only", "files_from"]
     )]
     pub delete: bool,
-    /// With --delete, also remove destination paths that the --ignore patterns exclude
+    /// With --delete, also remove destination paths that the --syq-ignore patterns exclude
     #[arg(long, requires = "delete")]
     pub delete_excluded: bool,
-    /// With --delete, refuse to delete anything if more than N deletions are planned (exit 25)
-    #[arg(long, value_name = "N", requires = "delete")]
+    /// With --delete, refuse all deletions if more than N are planned (exit 25).
+    /// Unlike positive rsync limits, this is atomic; 0 and -1 both prohibit deletion
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = parse_max_delete,
+        allow_hyphen_values = true
+    )]
     pub max_delete: Option<u64>,
     /// Native-only command-restricted receiver ceilings, signed into the grant.
     #[arg(skip)]
@@ -398,11 +372,11 @@ pub struct Args {
     #[arg(skip)]
     pub recursive_explicit: bool,
 
-    /// Remove the given paths recursively and in parallel (like rm -rf); honours -j, -n, -v, -q, -e
-    #[arg(long, conflicts_with_all = ["ignore", "ignore_from", "delete", "files_from"])]
+    /// Native `syq rm` dispatch marker
+    #[arg(skip)]
     pub rm: bool,
 
-    /// Source(s) and destination (or, with --rm, the paths to remove)
+    /// Source(s) and destination
     #[arg(
         required_unless_present_any = ["self_update", "register_standalone_install"],
         num_args = 1..,
@@ -412,8 +386,8 @@ pub struct Args {
 }
 
 impl Args {
-    /// Parse the command line and read --ignore-from files, keeping --ignore and
-    /// --ignore-from patterns in the order they were given (later lines win, as in
+    /// Parse the command line and read ignore files, keeping command-line and
+    /// file patterns in the order they were given (later lines win, as in
     /// a .gitignore file).
     pub fn parse_args() -> Result<Args> {
         let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -425,10 +399,10 @@ impl Args {
             bail!("command name is not valid UTF-8");
         };
         match command {
-            "rsync" => Self::parse_rsync(&argv[1..]),
-            command if native_interface(command).is_some() => {
-                parse_native(&argv[1..], native_interface(command).unwrap())
-            }
+            "rsync" => Self::parse_rsync(&argv[1..], false),
+            "cp" => parse_native(&argv[1..], Interface::NativeCp),
+            "rm" => parse_native(&argv[1..], Interface::NativeRm),
+            "map" => parse_native(&argv[1..], Interface::NativeMap),
             "--help" | "-h" => {
                 print_root_help();
                 std::process::exit(0);
@@ -437,16 +411,16 @@ impl Args {
                 println!("syq {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
-            // Installation lifecycle switches predate the verb grammar and
-            // remain top-level. Internal helper switches are handled in main.
-            "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv),
+            // Installation lifecycle switches remain top-level. Internal
+            // helper switches are handled in main.
+            "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv, true),
             _ => bail!(
                 "expected a command (`cp`, `rm`, `map`, `rsync`, or `persist`); rsync-shaped syntax now starts with `syq rsync`"
             ),
         }
     }
 
-    fn parse_rsync(argv: &[OsString]) -> Result<Args> {
+    fn parse_rsync(argv: &[OsString], allow_lifecycle: bool) -> Result<Args> {
         let utf8_argv: Vec<String> = argv
             .iter()
             .map(|arg| {
@@ -455,6 +429,16 @@ impl Args {
                     .map_err(|_| anyhow::anyhow!("rsync-compatible arguments must be valid UTF-8"))
             })
             .collect::<Result<_>>()?;
+        if !allow_lifecycle
+            && utf8_argv.iter().any(|argument| {
+                matches!(
+                    argument.as_str(),
+                    "--self-update" | "--register-standalone-install"
+                )
+            })
+        {
+            bail!("installation lifecycle options are top-level syq options, not rsync options");
+        }
         reject_unsupported_rsync_flags(&utf8_argv)?;
         let mut full_argv = vec!["syq rsync".to_string()];
         full_argv.extend(utf8_argv);
@@ -462,6 +446,7 @@ impl Args {
             .try_get_matches_from(full_argv)
             .unwrap_or_else(|error| error.exit());
         let args = Args::from_arg_matches(&matches)?;
+        reject_remote_to_remote(&args)?;
         finish_parse(args, &matches)
     }
 
@@ -513,27 +498,36 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
         .map(crate::bwlimit::parse_rate)
         .transpose()?
         .unwrap_or(0);
-    args.ignore_lines = ordered_ignore_lines(&args.ignore, &args.ignore_from, matches, true)?;
+    args.ignore_lines = ordered_ignore_lines(
+        &args.ignore,
+        &args.ignore_from,
+        matches,
+        true,
+        "--syq-ignore-from",
+    )?;
     if let Some(f) = &args.files_from {
-        // Check this before reading the list (it may be stdin) and before
-        // anything connects: the list lives on this machine, but a direct
-        // remote-to-remote copy would run the orchestrator on the source.
-        if !args.rm && !args.follow && !args.relay && args.paths.len() >= 2 {
-            let locs: Vec<Location> = if args.locations.is_empty() {
-                args.paths
-                    .iter()
-                    .map(|p| Location::parse(p))
-                    .collect::<Result<_>>()?
-            } else {
-                args.locations.clone()
-            };
-            if locs[0].is_remote() && locs[locs.len() - 1].is_remote() {
-                bail!("--files-from with a remote-to-remote copy needs --relay");
-            }
-        }
         args.files_from_lines = read_files_from(f, args.from0)?;
     }
     Ok(args)
+}
+
+fn reject_remote_to_remote(args: &Args) -> Result<()> {
+    let Some((destination, sources)) = args.paths.split_last() else {
+        return Ok(());
+    };
+    if sources.is_empty() || !Location::parse(destination)?.is_remote() {
+        return Ok(());
+    }
+    if sources
+        .iter()
+        .map(|source| Location::parse(source))
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(Location::is_remote)
+    {
+        bail!("The source and destination cannot both be remote.");
+    }
+    Ok(())
 }
 
 fn ordered_ignore_lines(
@@ -541,6 +535,7 @@ fn ordered_ignore_lines(
     ignore_from: &[String],
     matches: &clap::ArgMatches,
     follow_paths: bool,
+    ignore_from_name: &str,
 ) -> Result<Vec<String>> {
     let mut items: Vec<(usize, bool, String)> = Vec::new();
     if let Some(indices) = matches.indices_of("ignore") {
@@ -564,10 +559,10 @@ fn ordered_ignore_lines(
         if from_file {
             if !follow_paths {
                 crate::fsops::check_operator_path_no_symlinks(value.as_bytes(), false, false)
-                    .map_err(|error| anyhow::anyhow!("--ignore-from {value}: {error}"))?;
+                    .map_err(|error| anyhow::anyhow!("{ignore_from_name} {value}: {error}"))?;
             }
             let text = std::fs::read_to_string(&value)
-                .map_err(|error| anyhow::anyhow!("--ignore-from {value}: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("{ignore_from_name} {value}: {error}"))?;
             let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
             lines.extend(
                 text.lines()
@@ -582,16 +577,13 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a copy's resolved selection and placement as NDJSON\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the retained rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
 #[derive(clap::Args, Debug)]
-struct NativeSelectionArgs {
-    /// Source endpoint ([USER@]HOST[:PORT]); omitted means local
-    #[arg(long, value_name = "ENDPOINT")]
-    from: Option<String>,
-    /// Resolve relative source selectors from DIR at the source endpoint
+struct NativeSourceArgs {
+    /// Resolve relative source selectors from DIR
     #[arg(short = 'C', long, value_name = "DIR", allow_hyphen_values = true)]
     cwd: Option<OsString>,
     /// Follow symlinks that must be traversed in directly supplied endpoint paths
@@ -624,6 +616,15 @@ struct NativeSelectionArgs {
     /// Named source objects (shorthand for --src)
     #[arg(value_name = "PATH")]
     sources: Vec<OsString>,
+}
+
+#[derive(clap::Args, Debug)]
+struct NativeSelectionArgs {
+    /// Source endpoint ([USER@]HOST[:PORT]); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    from: Option<String>,
+    #[command(flatten)]
+    source: NativeSourceArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -737,7 +738,7 @@ struct NativeCopyOperationalArgs {
     /// Command-restricted receiver ceiling: the signed grant expires DURATION after it is issued, e.g. 30m or 2h (direct remote-to-remote only; at most 23h)
     #[arg(long, value_name = "DURATION")]
     max_runtime: Option<String>,
-    /// Receipt detail from the command-restricted receiver: sizes of published files (default) or also a BLAKE3 digest of each (direct remote-to-remote only)
+    /// Receiver receipt detail: final sizes (default) or also final BLAKE3 file digests (direct remote-to-remote only)
     #[arg(long, value_name = "MODE", value_enum)]
     receipt: Option<ReceiptMode>,
 }
@@ -779,7 +780,7 @@ struct NativeRemoteArgs {
         conflicts_with = "no_tcp"
     )]
     tcp_congestion: Option<String>,
-    /// Run a remote-to-remote transfer detached at its coordinator
+    /// Run at the remote coordinator and return after launch; restricted receipts remain plaintext in its log and are not locally verified
     #[arg(long)]
     detach: bool,
     /// Give a remote coordinator no forwarded agent; it must own credentials for the peer
@@ -919,13 +920,16 @@ struct NativeCopyCommand {
 #[command(
     name = "syq map",
     version,
-    about = "Print the resolved selection and placement of a copy as an NDJSON mapping",
-    long_about = "Print the resolved selection and placement of a copy as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to the target container), the object kind, and size/mtime for regular files. Emission is local and read-only; it never contacts a destination. Names must be valid UTF-8.",
-    override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... [PLACEMENT]"
+    about = "Print a local source selection as an NDJSON mapping",
+    long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8.",
+    override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeMapCommand {
     #[command(flatten)]
-    copy: NativeCopyFields,
+    source: NativeSourceArgs,
+    /// Rename the single selected root in the emitted mapping
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    r#as: Option<OsString>,
 }
 
 #[derive(Parser, Debug)]
@@ -947,91 +951,57 @@ struct NativeRmCommand {
 
 fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
     match interface {
-        Interface::NativeCp | Interface::NativeMap => parse_native_copy(argv, interface),
+        Interface::NativeCp => parse_native_copy(argv),
+        Interface::NativeMap => parse_native_map(argv),
         Interface::NativeRm => parse_native_rm(argv),
         Interface::Rsync => unreachable!(),
     }
 }
 
-fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
-    let mut full_argv = vec![OsString::from(command_label(interface))];
+fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
+    let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
-    let (mut parsed, remote, pscope, matches, prune, max_delete, size_selection) =
-        if interface == Interface::NativeMap {
-            let matches = NativeMapCommand::command()
-                .try_get_matches_from(full_argv)
-                .unwrap_or_else(|error| error.exit());
-            let parsed = NativeMapCommand::from_arg_matches(&matches)?;
-            (
-                parsed.copy,
-                NativeRemoteArgs::default(),
-                None,
-                matches,
-                false,
-                None,
-                NativeSizeSelectionArgs::default(),
-            )
-        } else {
-            let matches = NativeCopyCommand::command()
-                .try_get_matches_from(full_argv)
-                .unwrap_or_else(|error| error.exit());
-            let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
-            (
-                parsed.copy,
-                parsed.remote,
-                parsed.pscope,
-                matches,
-                parsed.prune,
-                parsed.max_delete,
-                parsed.size_selection,
-            )
-        };
+    let matches = NativeCopyCommand::command()
+        .try_get_matches_from(full_argv)
+        .unwrap_or_else(|error| error.exit());
+    let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
+    let NativeCopyCommand {
+        mut copy,
+        size_selection,
+        remote,
+        pscope,
+        prune,
+        max_delete,
+    } = parsed;
     if pscope.is_some() && remote.rsh.is_some() {
         bail!("--pscope cannot be used with --rsh");
     }
-    // `syq map` keeps `-C` out of selector paths so emitted `src` values stay
-    // relative to it; the walk joins it back.
-    let map_cwd = if interface == Interface::NativeMap {
-        parsed.selection.cwd.take().map(OsStringExt::into_vec)
-    } else {
-        None
-    };
-    let mapping = parsed.mapping.take();
-    if mapping.is_some() && interface != Interface::NativeCp {
-        bail!("--mapping is only available on syq cp");
-    }
-    let results = parsed.results.take();
-    if results.is_some() && interface == Interface::NativeMap {
-        bail!("--results is only available on syq cp");
-    }
-    let results_fd = parsed.results_fd.take();
-    if results_fd.is_some() && interface == Interface::NativeMap {
-        bail!("--results-fd is only available on syq cp");
-    }
-    if let Some(fd) = results_fd {
-        if fd <= 2 {
-            bail!(
-                "--results-fd needs a descriptor above 2 (0-2 are stdin, stdout, and stderr); open one in the caller, e.g. --results-fd 3 3>run.ndjson"
-            );
-        }
+    let mapping = copy.mapping.take();
+    let results = copy.results.take();
+    let results_fd = copy.results_fd.take();
+    if results_fd.is_some_and(|fd| fd <= 2) {
+        bail!(
+            "--results-fd needs a descriptor above 2 (0-2 are stdin, stdout, and stderr); open one in the caller, e.g. --results-fd 3 3>run.ndjson"
+        );
     }
     let mut locations = if mapping.is_some() {
-        let has_selectors = !(parsed.selection.src.is_empty()
-            && parsed.selection.src_src.is_empty()
-            && parsed.selection.srcs.is_empty()
-            && parsed.selection.src_srcs.is_empty()
-            && parsed.selection.src_file.is_empty()
-            && parsed.selection.src_dir.is_empty()
-            && parsed.selection.src_files.is_empty()
-            && parsed.selection.src_dirs.is_empty()
-            && parsed.selection.sources.is_empty());
+        let source = &copy.selection.source;
+        let has_selectors = !(source.src.is_empty()
+            && source.src_src.is_empty()
+            && source.srcs.is_empty()
+            && source.src_srcs.is_empty()
+            && source.src_file.is_empty()
+            && source.src_dir.is_empty()
+            && source.src_files.is_empty()
+            && source.src_dirs.is_empty()
+            && source.sources.is_empty());
         if has_selectors {
             bail!("--mapping replaces source selectors; do not combine them");
         }
-        let endpoint = parse_native_endpoint(parsed.selection.from.as_deref())?;
+        let endpoint = parse_native_endpoint(copy.selection.from.as_deref())?;
         let base = trim_native_trailing_slashes(
-            parsed
-                .selection
+            copy.selection
+                .source
                 .cwd
                 .clone()
                 .map(OsStringExt::into_vec)
@@ -1043,72 +1013,24 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         // The manifest is the selection; its entries resolve against this root.
         vec![Location::native(endpoint, base, SourceSelection::Contents)]
     } else {
-        lower_native_selection(&parsed.selection, &matches)?
+        lower_native_selection(&copy.selection, &matches)?
     };
-    if interface == Interface::NativeMap {
-        if parsed.selection.from.is_some() {
-            bail!("syq map with a remote source (--from) is not yet supported");
-        }
-        for source in &mut locations {
-            if source.path.starts_with(b"/")
-                || source.path == b"~"
-                || source.path.starts_with(b"~/")
-            {
-                bail!(
-                    "syq map selector {:?} is absolute; mapping entries are root-relative (use -C to set the base)",
-                    String::from_utf8_lossy(&source.path)
-                );
-            }
-            // Normalize the way --files-from does — drop `.` and empty
-            // components, reject `..` — so emitted paths are always valid
-            // manifest paths.
-            let mut parts: Vec<&[u8]> = Vec::new();
-            for component in source.path.split(|&byte| byte == b'/') {
-                match component {
-                    b"" | b"." => {}
-                    b".." => bail!(
-                        "syq map selector {:?} contains a `..` component",
-                        String::from_utf8_lossy(&source.path)
-                    ),
-                    other => parts.push(other),
-                }
-            }
-            let normalized = parts.join(&b"/"[..]);
-            source.path = if normalized.is_empty() {
-                b".".to_vec()
-            } else {
-                normalized
-            };
-        }
-        if locations
-            .iter()
-            .any(|location| location.selection == SourceSelection::Contents)
-            && locations.len() > 1
-        {
-            bail!(
-                "syq map takes --src-src DIR as the only selector, or any number of named selectors"
-            );
-        }
-    }
 
     let placements = [
-        (parsed.into, Placement::Into, Existence::Any),
-        (parsed.into_new, Placement::Into, Existence::New),
-        (parsed.into_existing, Placement::Into, Existence::Existing),
-        (parsed.r#as, Placement::As, Existence::Any),
-        (parsed.as_new, Placement::As, Existence::New),
-        (parsed.as_existing, Placement::As, Existence::Existing),
+        (copy.into, Placement::Into, Existence::Any),
+        (copy.into_new, Placement::Into, Existence::New),
+        (copy.into_existing, Placement::Into, Existence::Existing),
+        (copy.r#as, Placement::As, Existence::Any),
+        (copy.as_new, Placement::As, Existence::New),
+        (copy.as_existing, Placement::As, Existence::Existing),
     ];
     let (target, placement, existence) = match placements
         .into_iter()
         .find_map(|(path, placement, existence)| path.map(|path| (path, placement, existence)))
     {
         Some((path, placement, existence)) => (Some(path), placement, existence),
-        // `syq map` without placement emits the container-relative identity.
-        None if interface == Interface::NativeMap => (None, Placement::Into, Existence::Any),
         None => bail!(
-            "{} requires one of --into, --into-new, --into-existing, --as, --as-new, or --as-existing",
-            command_label(interface)
+            "syq cp requires one of --into, --into-new, --into-existing, --as, --as-new, or --as-existing"
         ),
     };
     if placement == Placement::As && mapping.is_some() {
@@ -1137,35 +1059,16 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
         }
         None => None,
     };
-    let mut native_map_target = None;
-    if interface == Interface::NativeMap {
-        if existence != Existence::Any {
-            bail!(
-                "syq map never contacts a destination and cannot check --into-new, --into-existing, --as-new, or --as-existing preconditions"
-            );
-        }
-        if placement == Placement::As {
-            let target = target.as_ref().expect("--as parsed with a target");
-            if native_basename(target).is_none() {
-                bail!(
-                    "--as target {:?} has no basename",
-                    String::from_utf8_lossy(target)
-                );
-            }
-        }
-        native_map_target = target;
-    } else {
-        let target = target.expect("copy placement parsed with a target");
-        let target_endpoint = parse_native_endpoint(parsed.to.as_deref())?;
-        locations.push(Location::native(
-            target_endpoint,
-            target,
-            SourceSelection::Named,
-        ));
-    }
+    let target = target.expect("copy placement parsed with a target");
+    let target_endpoint = parse_native_endpoint(copy.to.as_deref())?;
+    locations.push(Location::native(
+        target_endpoint,
+        target,
+        SourceSelection::Named,
+    ));
 
     let mut args = native_engine_defaults();
-    args.interface = interface;
+    args.interface = Interface::NativeCp;
     args.placement = placement;
     args.target_existence = existence;
     args.locations = locations;
@@ -1173,13 +1076,11 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
     args.max_delete = max_delete;
     args.max_size = size_selection.max_size;
     args.min_size = size_selection.min_size;
-    args.native_map_cwd = map_cwd;
-    args.native_map_target = native_map_target;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.native_results = results.map(OsStringExt::into_vec);
     args.native_results_fd = results_fd;
     args.pscope = pscope;
-    args.native_follow = parsed.selection.follow;
+    args.native_follow = copy.selection.source.follow;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
         // through the source connection; a direct remote-to-remote copy has
@@ -1190,10 +1091,8 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             bail!("--mapping with a remote-to-remote copy is not supported; one end must be local");
         }
     }
-    apply_native_copy_operational(&mut args, parsed.operational, &matches)?;
-    if interface != Interface::NativeMap {
-        apply_native_remote(&mut args, remote)?;
-    }
+    apply_native_copy_operational(&mut args, copy.operational, &matches)?;
+    apply_native_remote(&mut args, remote)?;
     if args.max_entries.is_some()
         || args.max_total_bytes.is_some()
         || args.max_runtime_secs.is_some()
@@ -1233,6 +1132,94 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
             );
         }
     }
+    Ok(args)
+}
+
+fn parse_native_map(argv: &[OsString]) -> Result<Args> {
+    let mut full_argv = vec![OsString::from("syq map")];
+    full_argv.extend_from_slice(argv);
+    let matches = NativeMapCommand::command()
+        .try_get_matches_from(full_argv)
+        .unwrap_or_else(|error| error.exit());
+    let mut parsed = NativeMapCommand::from_arg_matches(&matches)?;
+
+    // Keep `-C` out of selector paths so emitted `src` values stay relative
+    // to it; the walk joins it back.
+    let map_cwd = parsed.source.cwd.take().map(OsStringExt::into_vec);
+    let mut locations = lower_native_sources(&parsed.source, &matches, None)?;
+    for source in &mut locations {
+        if source.path.starts_with(b"/") || source.path == b"~" || source.path.starts_with(b"~/") {
+            bail!(
+                "syq map selector {:?} is absolute; mapping entries are root-relative (use -C to set the base)",
+                String::from_utf8_lossy(&source.path)
+            );
+        }
+        // Normalize the way --files-from does — drop `.` and empty
+        // components, reject `..` — so emitted paths are always valid
+        // manifest paths.
+        let mut parts: Vec<&[u8]> = Vec::new();
+        for component in source.path.split(|&byte| byte == b'/') {
+            match component {
+                b"" | b"." => {}
+                b".." => bail!(
+                    "syq map selector {:?} contains a `..` component",
+                    String::from_utf8_lossy(&source.path)
+                ),
+                other => parts.push(other),
+            }
+        }
+        let normalized = parts.join(&b"/"[..]);
+        source.path = if normalized.is_empty() {
+            b".".to_vec()
+        } else {
+            normalized
+        };
+    }
+    if locations
+        .iter()
+        .any(|location| location.selection == SourceSelection::Contents)
+        && locations.len() > 1
+    {
+        bail!("syq map takes --src-src DIR as the only selector, or any number of named selectors");
+    }
+
+    let (placement, target) = match parsed.r#as {
+        Some(target) => {
+            if locations.len() != 1 || locations[0].copies_contents() {
+                bail!("--as requires exactly one ordinary source object");
+            }
+            let target = trim_native_trailing_slashes(target.into_vec());
+            if target.is_empty() {
+                bail!("--as target may not be empty");
+            }
+            if native_basename(&target).is_none() {
+                bail!(
+                    "--as target {:?} has no basename",
+                    String::from_utf8_lossy(&target)
+                );
+            }
+            (Placement::As, Some(target))
+        }
+        None => {
+            for source in locations.iter().filter(|source| !source.copies_contents()) {
+                if native_basename(&source.path).is_none() {
+                    bail!(
+                        "named source {:?} has no target basename; use --src-src to select directory contents",
+                        String::from_utf8_lossy(&source.path)
+                    );
+                }
+            }
+            (Placement::Into, None)
+        }
+    };
+
+    let mut args = native_engine_defaults();
+    args.interface = Interface::NativeMap;
+    args.placement = placement;
+    args.locations = locations;
+    args.native_map_cwd = map_cwd;
+    args.native_map_target = target;
+    args.native_follow = parsed.source.follow;
     Ok(args)
 }
 
@@ -1324,6 +1311,15 @@ fn lower_native_selection(
     parsed: &NativeSelectionArgs,
     matches: &clap::ArgMatches,
 ) -> Result<Vec<Location>> {
+    let endpoint = parse_native_endpoint(parsed.from.as_deref())?;
+    lower_native_sources(&parsed.source, matches, endpoint)
+}
+
+fn lower_native_sources(
+    parsed: &NativeSourceArgs,
+    matches: &clap::ArgMatches,
+    endpoint: Option<NativeEndpoint>,
+) -> Result<Vec<Location>> {
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
     for (id, selection, paths) in [
         ("sources", SourceSelection::NamedNoFollow, &parsed.sources),
@@ -1349,7 +1345,6 @@ fn lower_native_selection(
         bail!("native operations need at least one source selector");
     }
 
-    let endpoint = parse_native_endpoint(parsed.from.as_deref())?;
     let cwd = parsed.cwd.as_deref().map(OsStrExt::as_bytes);
     ordered
         .into_iter()
@@ -1425,7 +1420,7 @@ mod native_sdk_inventory_tests {
         ];
         assert_eq!(
             inventory.commands.keys().cloned().collect::<BTreeSet<_>>(),
-            NATIVE_COMMANDS
+            commands
                 .iter()
                 .map(|(name, _)| (*name).to_owned())
                 .collect(),
@@ -1500,7 +1495,13 @@ fn apply_native_copy_operational(
         .unwrap_or(0);
     args.bwlimit = bwlimit;
     args.stats = stats;
-    args.ignore_lines = ordered_ignore_lines(&ignore, &ignore_from, matches, args.native_follow)?;
+    args.ignore_lines = ordered_ignore_lines(
+        &ignore,
+        &ignore_from,
+        matches,
+        args.native_follow,
+        "--ignore-from",
+    )?;
     args.ignore = ignore;
     args.ignore_from = ignore_from;
     args.inplace = inplace;
@@ -1563,15 +1564,6 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
         args.progress = true;
     }
     Ok(())
-}
-
-fn command_label(interface: Interface) -> &'static str {
-    match interface {
-        Interface::Rsync => "syq rsync",
-        Interface::NativeCp => "syq cp",
-        Interface::NativeRm => "syq rm",
-        Interface::NativeMap => "syq map",
-    }
 }
 
 fn qualify_source(cwd: Option<&[u8]>, path: Vec<u8>) -> Vec<u8> {
@@ -1762,20 +1754,18 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
     // that token so a value like `-e 'ssh ...'` is never mistaken for a flag.
     let value_long = [
         "--rsh",
-        "--ignore",
-        "--ignore-from",
-        "--connections",
+        "--syq-ignore",
+        "--syq-ignore-from",
+        "--syq-connections",
         "--block-size",
-        "--min-split",
         "--bwlimit",
         "--max-size",
         "--min-size",
         "--files-from",
         "--max-delete",
-        "--tcp-ports",
-        "--tcp-congestion",
-        "--syq-path",
-        "--width",
+        "--syq-tcp-ports",
+        "--syq-tcp-congestion",
+        "--rsync-path",
     ];
     let mut skip_next = false;
     for tok in argv {
@@ -1786,9 +1776,7 @@ fn reject_unsupported_rsync_flags(argv: &[String]) -> Result<()> {
         if tok == "--" {
             break; // end of options; the rest are paths
         }
-        if value_long.contains(&tok.as_str())
-            || (!tok.starts_with("--") && matches!(tok.as_str(), "-e" | "-j"))
-        {
+        if value_long.contains(&tok.as_str()) || matches!(tok.as_str(), "-e" | "-B") {
             skip_next = true;
             continue;
         }
@@ -1821,7 +1809,7 @@ fn unsupported_message(tok: &str) -> Option<String> {
         // Bundled short flags (e.g. `-auHz`): stop at the first value-taking
         // short, since everything after it is that option's value.
         for c in cluster.chars() {
-            if matches!(c, 'e' | 'j') {
+            if matches!(c, 'e' | 'B') {
                 break;
             }
             if let Some(m) = message_for_short(c) {
@@ -1832,8 +1820,8 @@ fn unsupported_message(tok: &str) -> Option<String> {
     None
 }
 
-const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. Use --ignore (or --ignore-from), which takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--ignore node_modules`. See the README's \"Ignoring paths\" section.";
-const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. Filtering uses the long-only --ignore option.";
+const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The SYQ extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See the README's \"Ignoring paths\" section.";
+const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. --syq-verify-only can compare contents without mutation, but it does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 
 fn message_for_long(base: &str) -> Option<&'static str> {
@@ -1902,6 +1890,17 @@ pub fn parse_duration_secs(s: &str) -> Result<u32> {
     Ok(seconds)
 }
 
+fn parse_max_delete(value: &str) -> std::result::Result<u64, String> {
+    if value == "-1" {
+        // Rsync documents -1 as the backward-compatible spelling of its
+        // no-deletion max-delete mode. Internally that is the same budget as 0.
+        return Ok(0);
+    }
+    value
+        .parse()
+        .map_err(|_| "must be a non-negative integer or -1".to_string())
+}
+
 pub fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {
@@ -1943,7 +1942,7 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
-        parse_size, Args, Interface, Placement, SourceSelection,
+        parse_size, Args, Placement, SourceSelection,
     };
     use clap::Parser;
 
@@ -1979,30 +1978,31 @@ mod tests {
     }
 
     #[test]
-    fn insecure_links_is_an_explicit_opt_out() {
-        assert!(!args(&[]).insecure_links);
-        assert!(args(&["--insecure-links"]).insecure_links);
-    }
-
-    #[test]
     fn tcp_congestion_names_are_validated() {
         assert_eq!(
-            args(&["--tcp-congestion", "bbr"]).tcp_congestion.as_deref(),
+            args(&["--syq-tcp-congestion", "bbr"])
+                .tcp_congestion
+                .as_deref(),
             Some("bbr")
         );
         assert_eq!(
-            args(&["--tcp-congestion", "foo-bar"])
+            args(&["--syq-tcp-congestion", "foo-bar"])
                 .tcp_congestion
                 .as_deref(),
             Some("foo-bar")
         );
         for value in ["", "1234567890123456"] {
-            let parsed = Args::try_parse_from(["syq", "--tcp-congestion", value, "src", "dst"]);
+            let parsed = Args::try_parse_from(["syq", "--syq-tcp-congestion", value, "src", "dst"]);
             assert!(parsed.is_err(), "accepted {value:?}");
         }
-        assert!(Args::try_parse_from(
-            ["syq", "--tcp-congestion", "bbr", "--no-tcp", "src", "dst",]
-        )
+        assert!(Args::try_parse_from([
+            "syq",
+            "--syq-tcp-congestion",
+            "bbr",
+            "--syq-no-tcp",
+            "src",
+            "dst",
+        ])
         .is_err());
     }
 
@@ -2030,7 +2030,7 @@ mod tests {
     #[test]
     fn native_hash_selects_content_comparison() {
         let argv = ["--hash", "source", "--into", "destination"].map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert!(args.checksum);
     }
 
@@ -2051,7 +2051,7 @@ mod tests {
             "destination",
         ]
         .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert!(args.native_follow);
         assert_eq!(args.ignore_lines, ["*.tmp", "!keep.tmp"]);
         assert!(args.perms);
@@ -2073,7 +2073,7 @@ mod tests {
             "destination",
         ]
         .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert!(args.delete);
         assert_eq!(args.max_delete, Some(3));
     }
@@ -2093,7 +2093,7 @@ mod tests {
             "destination",
         ]
         .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert_eq!(args.run_at, super::RunAt::Target);
         assert_eq!(args.rsh.as_deref(), Some("ssh -J jump"));
         assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
@@ -2113,7 +2113,7 @@ mod tests {
             "destination",
         ]
         .map(std::ffi::OsString::from);
-        let error = parse_native_copy(&argv, Interface::NativeCp).unwrap_err();
+        let error = parse_native_copy(&argv).unwrap_err();
         assert!(error
             .to_string()
             .contains("--pscope cannot be used with --rsh"));
@@ -2175,7 +2175,7 @@ mod tests {
             "dest",
         ]
         .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv, Interface::NativeCp).unwrap();
+        let args = parse_native_copy(&argv).unwrap();
         assert_eq!(args.placement, Placement::Into);
         assert_eq!(args.locations.len(), 2);
         assert_eq!(args.locations[0].host.as_deref(), Some("source.test"));

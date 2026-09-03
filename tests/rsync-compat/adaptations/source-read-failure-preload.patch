@@ -180,7 +180,7 @@ index 0000000..68e8bf4
 +
 +# A bandwidth limit selects SYQ's userspace ReadRange path instead of the local
 +# copy-file offload. One worker makes the later-file assertion deterministic.
-+argv = rsync_argv('-a', '-j', '1', '--bwlimit=1048576', f'{src}/', f'{dest}/')
++argv = rsync_argv('-a', '--syq-connections', '1', '--bwlimit=1048576', f'{src}/', f'{dest}/')
 +print('Running:', ' '.join(argv))
 +proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
 +                      text=True, env=env)

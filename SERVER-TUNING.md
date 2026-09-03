@@ -38,7 +38,7 @@ within normal run-to-run variation, revert the change.
 
 This is usually the most useful server-side change. syq authenticates over ssh,
 then asks the remote helper to listen on one available port in
-`47600-47699` (or the range given with `--tcp-ports`) for the duration of that
+`47600-47699` (or the range given with `--syq-tcp-ports`) for the duration of that
 transfer. The default TCP records are encrypted with a key exchanged through
 ssh. If no advertised address and port is reachable, syq reports the fallback
 once and carries data over separate ssh sessions instead.
@@ -55,7 +55,7 @@ Do not paste the placeholders literally. Use the host's existing firewall tool
 and policy, and verify the effective rule afterward. Remove the rule with that
 tool's normal delete operation to roll it back. Opening the range to the whole
 internet creates unnecessary exposure even though syq's protocol requires a
-per-transfer token and is encrypted unless `--tcp-plain` was requested.
+per-transfer token and is encrypted unless `--syq-tcp-plain` was requested.
 
 Trade-offs:
 
@@ -65,9 +65,9 @@ Trade-offs:
   processes so they can use multiple flows and cipher processes.
 - A firewall exception increases reachable attack surface. A private LAN, VPN,
   or narrowly scoped source rule is preferable to a public allow rule.
-- `--tcp-plain` saves encryption work but removes data confidentiality and
+- `--syq-tcp-plain` saves encryption work but removes data confidentiality and
   integrity. Use it only on a network whose trust boundary you understand.
-- `--no-tcp` requires no additional inbound ports, at the cost of using SSH for
+- `--syq-no-tcp` requires no additional inbound ports, at the cost of using SSH for
   the data transport.
 
 ## 2. Raise sshd `MaxStartups` only after observed drops
@@ -188,7 +188,7 @@ sysctl net.core.default_qdisc
 tc qdisc show
 ```
 
-For a scoped comparison on Linux, `syq rsync --tcp-congestion ALGO` selects an
+For a scoped comparison on Linux, `syq rsync --syq-tcp-congestion ALGO` selects an
 algorithm only for syq's direct TCP data sockets, on both the connecting and
 listening hosts. It does not change the host default. Both kernels must have
 the algorithm registered, and an unprivileged syq process may choose only an
@@ -205,17 +205,17 @@ empty a real destination for a benchmark.
 
 ```sh
 # Reset HOST:DISPOSABLE-DESTINATION to absent or empty before this command.
-syq rsync -a -j 1 --tcp-congestion cubic --stats SOURCE HOST:DISPOSABLE-DESTINATION
+syq rsync -a --syq-connections 1 --syq-tcp-congestion cubic --stats SOURCE HOST:DISPOSABLE-DESTINATION
 # Reset the same disposable destination again before this command.
-syq rsync -a -j 1 --tcp-congestion bbr --stats SOURCE HOST:DISPOSABLE-DESTINATION
+syq rsync -a --syq-connections 1 --syq-tcp-congestion bbr --stats SOURCE HOST:DISPOSABLE-DESTINATION
 ```
 
 Repeat and alternate the two commands, then test the other transfer direction:
 congestion control is sender-side, so a path can behave very differently in
 reverse. `--stats` reports the effective algorithm, retransmitted packets and
 bytes, round-trip time, congestion window, and delivery rate. If BBR wins
-repeatedly, pass `--tcp-congestion bbr` for that workload and rerun once without
-`-j 1` to measure normal automatic worker tuning. Prefer this per-transfer
+repeatedly, pass `--syq-tcp-congestion bbr` for that workload and rerun once without
+`--syq-connections 1` to measure normal automatic worker tuning. Prefer this per-transfer
 choice to a global sysctl change.
 
 The server setting governs bulk downloads, while the uploading client setting
@@ -251,9 +251,10 @@ drops with `ip -s link` and the vendor's tools.
 
 ## 6. Stop when the bottleneck is storage or CPU
 
-- A single spinning disk often performs better with `-j 1`; syq's automatic
-  tuner can reduce active workers during longer runs, but short jobs may finish
-  before it measures the slowdown.
+- A single spinning disk often performs better with one fixed connection;
+  use native `--connections 1` or compatibility `--syq-connections 1`. Syq's
+  automatic tuner can reduce active workers during longer runs, but short jobs
+  may finish before it measures the slowdown.
 - NVMe, RAID, NFS, and other high-latency filesystems often benefit from
   parallelism across files. A same-machine copy from a recognized local disk
   filesystem into one asynchronous NFS file is the exception: when kernel

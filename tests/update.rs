@@ -64,7 +64,7 @@ impl UpdateFixture {
         };
         let asset = format!("syq-{target}");
         let replacement = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {release_version}' ;;\n  --build-identity) echo '{executable_identity}' ;;\n  --remote-helper-id) echo 'v{release_version}-p0' ;;\n  *) exit 2 ;;\nesac\n"
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {release_version}' ;;\n  --build-identity) echo '{executable_identity}' ;;\n  *) exit 2 ;;\nesac\n"
         );
         let replacement = replacement.as_bytes();
         let archive_path = temp.path(&format!("fixtures/{asset}.gz"));
@@ -79,7 +79,6 @@ impl UpdateFixture {
             "repository": "https://github.com/greaber/syq",
             "version": release_version,
             "tag": format!("v{release_version}"),
-            "helper_id": format!("v{release_version}-p0"),
             "artifacts": {
                 (target): {
                     "binary": {
@@ -151,10 +150,6 @@ impl UpdateFixture {
 
     fn command(&self, argument: &str) -> Output {
         self.command_at(&self.installed, argument)
-    }
-
-    fn rsync_command(&self, argument: &str) -> Output {
-        self.command_at_args(&self.installed, &["rsync", argument])
     }
 
     fn register(&self) {
@@ -301,36 +296,6 @@ fn receipt_is_bound_to_the_exact_installed_executable() {
     assert_failure_contains(&update, "standalone install receipt belongs to");
     fixture.assert_original_unchanged();
     assert_eq!(fs::read(other).unwrap(), fixture.original);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn legacy_auto_update_setting_is_discarded_on_reregistration() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
-    fixture.register();
-    let path = fixture.config.join("syq/install.json");
-    let mut receipt = fixture.receipt();
-    receipt["auto_update"] = true.into();
-    fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
-
-    fixture.register();
-    assert!(fixture.receipt().get("auto_update").is_none());
-    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn automatic_update_flags_are_no_longer_supported() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
-
-    assert_failure_contains(
-        &fixture.rsync_command("--enable-auto-update"),
-        "unexpected argument '--enable-auto-update'",
-    );
-    assert_failure_contains(
-        &fixture.rsync_command("--disable-auto-update"),
-        "unexpected argument '--disable-auto-update'",
-    );
 }
 
 #[cfg(target_os = "linux")]

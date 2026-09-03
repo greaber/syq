@@ -15,6 +15,12 @@
 //! two cannot disagree. Unchanged and excluded entries are aggregated in
 //! the terminal record only, and metadata-only updates are not reported
 //! per operation (dry runs do trace them as `metadata_differs`).
+//!
+//! Attached direct copies through a command-restricted receiver are the one
+//! exception: receipt_v2 emits their stream locally after verification, marks
+//! its provenance, omits source-side claims hostB cannot authenticate, and
+//! includes closure-time final-state records. (Not yet reachable while
+//! remote-to-remote copies refuse the file/descriptor targets.)
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};

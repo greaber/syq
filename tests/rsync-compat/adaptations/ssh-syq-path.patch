@@ -8,9 +8,9 @@ index a02d55e..bf97067 100644
  from rsyncfns import RSYNC, RSYNC_PEER
 @@ -47,2 +47,2 @@ def _basic():
 -    checkit(['-avH', '-e', SSH, f'--rsync-path={rsync_path_arg()}',
-+    checkit(['-av', '-e', SSH, f'--syq-path={rsync_path_arg()}',
++    checkit(['-av', '-e', SSH, f'--rsync-path={rsync_path_arg()}',
               f'{FROMDIR}/', f'localhost:{TODIR}'], FROMDIR, TODIR)
 @@ -54,2 +54,2 @@ def _delete_after_rename():
 -    checkit(['--delete', '-avH', '-e', SSH, f'--rsync-path={rsync_path_arg()}',
-+    checkit(['--delete', '-av', '-e', SSH, f'--syq-path={rsync_path_arg()}',
++    checkit(['--delete', '-av', '-e', SSH, f'--rsync-path={rsync_path_arg()}',
               f'{FROMDIR}/', f'localhost:{TODIR}'], FROMDIR, TODIR)

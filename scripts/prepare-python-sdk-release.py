@@ -66,6 +66,19 @@ def load_manifest(path: Path) -> tuple[bytes, dict[str, Any]]:
         raise ValueError("release manifest has no valid base64 signature") from error
     if len(signature) != 64:
         raise ValueError("release manifest signature is not 64 bytes")
+    expected_fields = {
+        "schema",
+        "repository",
+        "version",
+        "tag",
+        "artifacts",
+        "installer",
+        "homebrew_formula",
+        "signature_scheme",
+        "signature",
+    }
+    if set(manifest) != expected_fields:
+        raise ValueError("release manifest fields do not match the current schema")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != EXPECTED_TARGETS:
         raise ValueError("release manifest does not contain every SDK target")
