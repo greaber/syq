@@ -215,6 +215,12 @@ jobs:
           cargo test --locked
           rooted::tests::operator_resolver_selects_a_last_component_symlink_without_following_it
           -- --exact
+      - name: Exercise macOS cross-process descriptor handoff
+        if: needs.scope.outputs.native == 'true'
+        run: >-
+          cargo test --locked
+          descriptor_broker::tests::independent_process_receives_exact_registered_descriptor
+          -- --exact
       - if: needs.scope.outputs.native == 'true'
         run: scripts/test-installer.sh
       - if: needs.scope.outputs.native == 'true'
