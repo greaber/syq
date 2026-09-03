@@ -27,12 +27,13 @@
 use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
@@ -60,7 +61,7 @@ const MODE_FIFO: u32 = libc::S_IFIFO as u32;
 
 /// Stable identity of an opened root. Independent helper processes can reopen
 /// the configured path and require this identity before serving requests.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RootIdentity {
     pub(crate) dev: u64,
     pub(crate) ino: u64,
@@ -452,7 +453,7 @@ impl RootMetadata {
 
 /// A syntactically safe descendant path. Empty means the opened root itself;
 /// operations that need a leaf reject it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RelativePath {
     components: Vec<Vec<u8>>,
 }
@@ -494,6 +495,14 @@ impl RelativePath {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.components.is_empty()
+    }
+
+    pub(crate) fn to_path_buf(&self) -> PathBuf {
+        let mut path = PathBuf::new();
+        for component in &self.components {
+            path.push(OsStr::from_bytes(component));
+        }
+        path
     }
 
     fn label(&self) -> String {

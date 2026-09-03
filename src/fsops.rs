@@ -740,14 +740,24 @@ pub struct FsOps {
 }
 
 struct HeldBasis {
-    path: PathBuf,
+    location: FileLocation,
+    label: PathBuf,
     partial_id: PartialId,
     file: File,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
+enum FileLocation {
+    Path(PathBuf),
+    Rooted {
+        root: RootIdentity,
+        relative: RelativePath,
+    },
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
 struct FdKey {
-    path: PathBuf,
+    location: FileLocation,
     /// Source files and partials get a fresh cache entry after a source-change
     /// retry. An old descriptor may point at an inode that was renamed away.
     attempt: u32,
@@ -957,6 +967,32 @@ impl FsOps {
         }
     }
 
+    fn rooted_destination_target(
+        &self,
+        path: &[u8],
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Option<RootedTarget>> {
+        if guard.is_some() && self.destination_root.is_some() {
+            bail!("destination request mixes registered and guarded root authorities");
+        }
+        if let Some(guard) = guard {
+            return guarded_target(path, guard).map(|target| Some(target.as_rooted()));
+        }
+        let Some(root) = &self.destination_root else {
+            return Ok(None);
+        };
+        let relative = RelativePath::new(path)?;
+        Ok(Some(RootedTarget {
+            root: root.clone(),
+            relative,
+            label: self.logical_destination_path(Path::new(OsStr::from_bytes(path))),
+            // The plan/apply phase owns directory creation. Regular-file
+            // requests must not silently expand either a registered root or a
+            // signed receiver's mutation authority.
+            create_missing_parents: false,
+        }))
+    }
+
     fn initial_absolute(&self, path: &[u8]) -> PathBytes {
         let path = resolve(path);
         let absolute = if path.is_absolute() {
@@ -1096,7 +1132,7 @@ impl FsOps {
 
     fn cached(&mut self, p: &Path, write: bool, attempt: u32, private: bool) -> Result<&File> {
         let key = FdKey {
-            path: p.to_path_buf(),
+            location: FileLocation::Path(p.to_path_buf()),
             attempt,
             private,
         };
@@ -1116,9 +1152,20 @@ impl FsOps {
     }
 
     fn uncache(&mut self, p: &Path) -> Option<File> {
+        self.uncache_location(&FileLocation::Path(p.to_path_buf()))
+    }
+
+    fn uncache_rooted(&mut self, root: &Root, relative: &RelativePath) -> Option<File> {
+        self.uncache_location(&FileLocation::Rooted {
+            root: root.identity(),
+            relative: relative.clone(),
+        })
+    }
+
+    fn uncache_location(&mut self, location: &FileLocation) -> Option<File> {
         let mut removed = None;
         self.fd_order.retain(|key| {
-            if key.path == p {
+            if &key.location == location {
                 removed = self.fds.remove(key).or(removed.take());
                 false
             } else {
@@ -1137,7 +1184,10 @@ impl FsOps {
         private: bool,
     ) -> Result<&File> {
         let key = FdKey {
-            path: label.to_path_buf(),
+            location: FileLocation::Rooted {
+                root: root.identity(),
+                relative: relative.clone(),
+            },
             attempt,
             private,
         };
@@ -1207,15 +1257,12 @@ impl FsOps {
         guard: Option<&ContainerGuard>,
     ) -> Vec<std::result::Result<PathBytes, String>> {
         parallel_map(paths, |path| {
-            if let Some(guard) = guard {
-                guarded_target(path, guard)?;
-            }
             let requested = Path::new(OsStr::from_bytes(path));
-            let resolved = if guard.is_some() {
-                partial_path_with_name_max(&resolve(path), partial_id, COMMON_NAME_MAX)
+            let resolved = if let Some(target) = self.rooted_destination_target(path, guard)? {
+                rooted_partial_target(&target, partial_id)?.1
             } else {
-                self.partial_path(&resolve(path), partial_id)
-            }?;
+                self.partial_path(&resolve(path), partial_id)?
+            };
             let name = resolved.file_name().expect("partial always has a name");
             let parent = requested.parent().unwrap_or_else(|| Path::new(""));
             Ok(path_bytes(&parent.join(name)))
@@ -1558,6 +1605,15 @@ struct RootedTarget {
     create_missing_parents: bool,
 }
 
+impl RootedTarget {
+    fn location(&self) -> FileLocation {
+        FileLocation::Rooted {
+            root: self.root.identity(),
+            relative: self.relative.clone(),
+        }
+    }
+}
+
 impl GuardedTarget {
     fn as_rooted(&self) -> RootedTarget {
         RootedTarget {
@@ -1567,6 +1623,30 @@ impl GuardedTarget {
             create_missing_parents: false,
         }
     }
+}
+
+fn rooted_partial_target(
+    target: &RootedTarget,
+    partial_id: &PartialId,
+) -> Result<(RelativePath, PathBuf)> {
+    let relative_path = target.relative.to_path_buf();
+    let component_limit = target.root.name_max_for_parent(&target.relative)?;
+    // Derive the visible component from the logical command-line spelling so
+    // PartialPaths and every state-machine request keep one stable sidecar
+    // name, including the PATH_MAX compact form. Only the resulting component
+    // is placed beneath the retained root.
+    let label = partial_path_with_name_max(&target.label, partial_id, component_limit)?;
+    let name = label
+        .file_name()
+        .context("partial path has no final component")?;
+    let relative_partial = relative_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(name);
+    Ok((
+        RelativePath::new(relative_partial.as_os_str().as_bytes())?,
+        label,
+    ))
 }
 
 fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
@@ -2353,11 +2433,8 @@ impl FsOps {
         partial_id: &PartialId,
         guard: Option<&ContainerGuard>,
     ) -> Result<Response> {
-        let p = resolve(path);
-        if let Some(guard) = guard {
-            let pp = partial_path(&p, partial_id)?;
-            let target = guarded_target(path, guard)?;
-            let relative = relative_under(&target.root_path, &pp)?;
+        if let Some(target) = self.rooted_destination_target(path, guard)? {
+            let (relative, _) = rooted_partial_target(&target, partial_id)?;
             let partial_size = target
                 .root
                 .metadata_optional(&relative)?
@@ -2365,6 +2442,7 @@ impl FsOps {
                 .map(|metadata| metadata.len);
             return Ok(Response::PartialSize(partial_size));
         }
+        let p = resolve(path);
         let pp = self.partial_path(&p, partial_id)?;
         let partial_size = match fs::symlink_metadata(&pp) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -2519,7 +2597,8 @@ impl FsOps {
         relative: &RelativePath,
         label: &Path,
     ) -> Result<(File, Option<u64>)> {
-        self.uncache(label);
+        self.uncache_rooted(root, relative);
+        let mut repaired_permissions = false;
         for _ in 0..8 {
             match root.metadata_optional(relative)? {
                 Some(metadata) if is_safe_rooted_partial(metadata) => {
@@ -2528,14 +2607,35 @@ impl FsOps {
                             let opened = file.metadata()?;
                             let named = root.metadata(relative)?;
                             if !is_safe_partial(&opened)
+                                || !is_safe_rooted_partial(named)
                                 || opened.dev() != named.dev
                                 || opened.ino() != named.ino
                             {
                                 continue;
                             }
                             if opened.mode() & 0o7777 != 0o600 {
-                                fail_partial_chmod_for_test()?;
-                                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                                let repair = (|| -> Result<()> {
+                                    fail_partial_chmod_for_test()?;
+                                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                                    Ok(())
+                                })();
+                                if let Err(error) = repair {
+                                    drop(file);
+                                    discard_safe_rooted_partial_if_same(
+                                        root,
+                                        relative,
+                                        opened.dev(),
+                                        opened.ino(),
+                                        label,
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "replace partial {} after chmod failed: {error:#}",
+                                            label.display()
+                                        )
+                                    })?;
+                                    continue;
+                                }
                             }
                             return Ok((file, Some(opened.len())));
                         }
@@ -2544,10 +2644,66 @@ impl FsOps {
                                 error.kind() == io::ErrorKind::PermissionDenied
                             }) =>
                         {
-                            fail_partial_chmod_for_test()?;
-                            let handle = root.open_metadata(relative)?;
+                            if repaired_permissions {
+                                discard_safe_rooted_partial_if_same(
+                                    root,
+                                    relative,
+                                    metadata.dev,
+                                    metadata.ino,
+                                    label,
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "replace partial {} after it remained unreadable",
+                                        label.display()
+                                    )
+                                })?;
+                                repaired_permissions = false;
+                                continue;
+                            }
+                            let handle = match root.open_metadata(relative) {
+                                Ok(handle) => handle,
+                                Err(repair_error) => {
+                                    discard_safe_rooted_partial_if_same(
+                                        root,
+                                        relative,
+                                        metadata.dev,
+                                        metadata.ino,
+                                        label,
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "replace partial {} after permission repair failed: {repair_error:#}",
+                                            label.display()
+                                        )
+                                    })?;
+                                    continue;
+                                }
+                            };
                             require_rooted_metadata(&handle, metadata, label)?;
-                            set_mode_handle(&handle, 0o600)?;
+                            let repair = (|| -> Result<()> {
+                                fail_partial_chmod_for_test()?;
+                                set_mode_handle(&handle, 0o600)?;
+                                Ok(())
+                            })();
+                            if let Err(error) = repair {
+                                drop(handle);
+                                discard_safe_rooted_partial_if_same(
+                                    root,
+                                    relative,
+                                    metadata.dev,
+                                    metadata.ino,
+                                    label,
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "replace partial {} after chmod failed: {error:#}",
+                                        label.display()
+                                    )
+                                })?;
+                                continue;
+                            }
+                            repaired_permissions = true;
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -2582,11 +2738,14 @@ impl FsOps {
         mode: u32,
         guard: Option<&ContainerGuard>,
     ) -> Result<()> {
-        let p = resolve(path);
-        if let Some(guard) = guard {
+        if let Some(target) = self.rooted_destination_target(path, guard)? {
             if inplace {
-                self.uncache(&p);
-                let target = guarded_target(path, guard)?;
+                self.uncache_rooted(&target.root, &target.relative);
+                // An interrupted non-inplace run must not strand this job's
+                // adjacent sidecar when the retry switches to --inplace.
+                if let Ok((partial, _)) = rooted_partial_target(&target, partial_id) {
+                    let _ = target.root.unlink(&partial);
+                }
                 for _ in 0..8 {
                     match target.root.metadata_optional(&target.relative)? {
                         Some(metadata) if metadata.is_file() => {
@@ -2624,17 +2783,24 @@ impl FsOps {
                     target.label.display()
                 );
             }
-            let target = guarded_target(path, guard)?;
-            let pp = partial_path(&p, partial_id)?;
-            let relative = relative_under(&target.root_path, &pp)?;
+            let (relative, label) = rooted_partial_target(&target, partial_id)?;
             let (file, basis_size) =
-                self.open_private_partial_rooted(&target.root, &relative, &pp)?;
+                self.open_private_partial_rooted(&target.root, &relative, &label)?;
             if basis_size.is_none() {
                 preallocate(&file, size)?;
             }
             file.set_len(size)?;
+            #[cfg(debug_assertions)]
+            if basis_size.is_none() {
+                if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARTIAL_MS") {
+                    if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                }
+            }
             return Ok(());
         }
+        let p = resolve(path);
         if inplace {
             self.uncache(&p);
             // A stale partial from an interrupted run would otherwise be orphaned.
@@ -2671,22 +2837,28 @@ impl FsOps {
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
     ) -> Result<(Vec<ContentDigest>, u64)> {
-        let p = resolve(path);
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
             bail!("injected retained-basis hash failure");
         }
-        let mut file = if let Some(guard) = guard {
-            let target = guarded_target(path, guard)?;
-            target.root.open_regular_read(&target.relative)?
+        let rooted = self.rooted_destination_target(path, guard)?;
+        let (mut file, location, label) = if let Some(target) = &rooted {
+            (
+                target.root.open_regular_read(&target.relative)?,
+                target.location(),
+                target.label.clone(),
+            )
         } else {
+            let p = resolve(path);
             open_existing_regular(&p, false)
-                .with_context(|| format!("open {} as repair basis", p.display()))?
+                .with_context(|| format!("open {} as repair basis", p.display()))
+                .map(|file| (file, FileLocation::Path(p.clone()), p))?
         };
-        require_open_target(&file, &p, condition)?;
+        require_open_target(&file, &label, condition)?;
         let hashes = hash_reader(&mut file, block, len)?;
         self.held_basis = Some(HeldBasis {
-            path: p,
+            location,
+            label,
             partial_id: *partial_id,
             file,
         });
@@ -2715,16 +2887,25 @@ impl FsOps {
         Ok((hashes, held_len))
     }
 
-    fn take_held_basis(&mut self, path: &[u8], partial_id: &PartialId) -> Result<HeldBasis> {
-        let expected = resolve(path);
+    fn take_held_basis(
+        &mut self,
+        path: &[u8],
+        partial_id: &PartialId,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<(HeldBasis, Option<RootedTarget>)> {
         let held = self
             .held_basis
             .take()
             .context("no retained destination basis")?;
-        if held.path != expected || held.partial_id != *partial_id {
+        let rooted = self.rooted_destination_target(path, guard)?;
+        let expected = rooted
+            .as_ref()
+            .map(RootedTarget::location)
+            .unwrap_or_else(|| FileLocation::Path(resolve(path)));
+        if held.location != expected || held.partial_id != *partial_id {
             bail!("retained destination basis does not match requested file");
         }
-        Ok(held)
+        Ok((held, rooted))
     }
 
     pub fn finish_basis(
@@ -2736,21 +2917,35 @@ impl FsOps {
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
     ) -> Result<()> {
-        let held = self.take_held_basis(path, partial_id)?;
-        require_open_target(&held.file, &held.path, condition)?;
+        let (held, rooted) = self.take_held_basis(path, partial_id, guard)?;
+        require_open_target(&held.file, &held.label, condition)?;
         set_meta_file(&held.file, meta, flags)
-            .with_context(|| format!("set metadata on basis {}", held.path.display()))?;
-        if let Some(guard) = guard {
-            let target = guarded_target(path, guard)?;
-            require_rooted_named_identity(
-                &target.root,
-                &target.relative,
-                &target.label,
-                &held.file,
-                condition,
-            )?;
+            .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
+        if let Some(target) = rooted {
+            if guard.is_some() {
+                // A signed receiver keeps the pre-existing guarded behavior:
+                // even an `Any` update must still be attached to its enrolled
+                // name. An unrestricted content-identical repair preserves
+                // the ordinary retry semantics below, where `Any` may finish
+                // through the retained inode after a concurrent publication.
+                require_rooted_named_identity(
+                    &target.root,
+                    &target.relative,
+                    &target.label,
+                    &held.file,
+                    condition,
+                )?;
+            } else if condition != TargetCondition::Any {
+                require_rooted_named_identity(
+                    &target.root,
+                    &target.relative,
+                    &target.label,
+                    &held.file,
+                    condition,
+                )?;
+            }
         } else {
-            require_named_target_identity(&held.file, &held.path, condition)?;
+            require_named_target_identity(&held.file, &held.label, condition)?;
         }
         Ok(())
     }
@@ -2762,15 +2957,13 @@ impl FsOps {
         len: u64,
         guard: Option<&ContainerGuard>,
     ) -> Result<()> {
-        let mut held = self.take_held_basis(path, partial_id)?;
-        let dst = if let Some(guard) = guard {
-            let pp = partial_path(&held.path, partial_id)?;
-            let target = guarded_target(path, guard)?;
-            let relative = relative_under(&target.root_path, &pp)?;
-            self.open_private_partial_rooted(&target.root, &relative, &pp)?
+        let (mut held, rooted) = self.take_held_basis(path, partial_id, guard)?;
+        let dst = if let Some(target) = rooted {
+            let (relative, label) = rooted_partial_target(&target, partial_id)?;
+            self.open_private_partial_rooted(&target.root, &relative, &label)?
                 .0
         } else {
-            let pp = self.partial_path(&held.path, partial_id)?;
+            let pp = self.partial_path(&held.label, partial_id)?;
             self.open_private_partial(&pp)?.0
         };
         dst.set_len(0)?;
@@ -2780,7 +2973,7 @@ impl FsOps {
         let mut writer = &dst;
         writer.seek(SeekFrom::Start(0))?;
         io::copy(&mut held.file.take(len), &mut writer)
-            .with_context(|| format!("seed partial from {}", held.path.display()))?;
+            .with_context(|| format!("seed partial from {}", held.label.display()))?;
         dst.set_len(len)?;
         Ok(())
     }
@@ -3049,29 +3242,24 @@ impl FsOps {
         len: u64,
         guard: Option<&ContainerGuard>,
     ) -> Result<Vec<ContentDigest>> {
-        let p = resolve(path);
-        let p = if which == Which::Partial {
-            if guard.is_some() {
-                partial_path(&p, partial_id)?
+        if let Some(target) = self.rooted_destination_target(path, guard)? {
+            let (relative, label) = if which == Which::Partial {
+                rooted_partial_target(&target, partial_id)?
             } else {
-                self.partial_path(&p, partial_id)?
-            }
-        } else {
-            p
-        };
-        if let Some(guard) = guard {
-            let target = guarded_target(path, guard)?;
-            let relative = relative_under(&target.root_path, &p)?;
+                (target.relative.clone(), target.label.clone())
+            };
             let mut file = target.root.open_regular_read(&relative)?;
-            if which == Which::Partial && !is_safe_rooted_partial(target.root.metadata(&relative)?)
-            {
-                bail!(
-                    "partial {} is not a singly-linked regular file",
-                    p.display()
-                );
+            if which == Which::Partial {
+                require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
             }
             return hash_reader(&mut file, block, len);
         }
+        let p = resolve(path);
+        let p = if which == Which::Partial {
+            self.partial_path(&p, partial_id)?
+        } else {
+            p
+        };
         let mut f = open_existing_regular(&p, false)?;
         if which == Which::Partial {
             require_safe_partial(&f, &p)?;
@@ -3239,7 +3427,7 @@ impl FsOps {
         let target = guarded_target(path, guard)?;
         if inplace {
             let file = self
-                .uncache(&target.label)
+                .uncache_rooted(&target.root, &target.relative)
                 .map(Ok)
                 .unwrap_or_else(|| target.root.open_regular_write(&target.relative, false))?;
             set_meta_file(&file, meta, flags)
@@ -3256,7 +3444,7 @@ impl FsOps {
         let src = partial_path(&target.label, partial_id)?;
         let src_relative = relative_under(&target.root_path, &src)?;
         let file = self
-            .uncache(&src)
+            .uncache_rooted(&target.root, &src_relative)
             .map(Ok)
             .unwrap_or_else(|| target.root.open_regular_write(&src_relative, false))?;
         let opened = file.metadata()?;
@@ -3703,6 +3891,50 @@ fn is_safe_partial(metadata: &fs::Metadata) -> bool {
 
 fn is_safe_rooted_partial(metadata: RootMetadata) -> bool {
     metadata.is_file() && metadata.nlink == 1
+}
+
+fn require_safe_rooted_named_partial(
+    root: &Root,
+    relative: &RelativePath,
+    label: &Path,
+    file: &File,
+) -> Result<()> {
+    let opened = file.metadata()?;
+    let named = root.metadata(relative)?;
+    if !is_safe_partial(&opened)
+        || !is_safe_rooted_partial(named)
+        || opened.dev() != named.dev
+        || opened.ino() != named.ino
+    {
+        bail!(
+            "partial {} is not the opened singly-linked regular file",
+            label.display()
+        );
+    }
+    Ok(())
+}
+
+/// Remove a failed permission-repair candidate only while its rooted name
+/// still identifies the safe inode that was inspected.
+fn discard_safe_rooted_partial_if_same(
+    root: &Root,
+    relative: &RelativePath,
+    expected_dev: u64,
+    expected_ino: u64,
+    label: &Path,
+) -> Result<()> {
+    match root.metadata_optional(relative)? {
+        Some(current)
+            if is_safe_rooted_partial(current)
+                && current.dev == expected_dev
+                && current.ino == expected_ino =>
+        {
+            root.unlink(relative)
+                .with_context(|| format!("replace {}", label.display()))?;
+        }
+        Some(_) | None => {}
+    }
+    Ok(())
 }
 
 /// Remove only the same safe sidecar that was just inspected. If the pathname
@@ -4364,6 +4596,235 @@ mod tests {
         assert!(operations.partial_paths(&[b"../outside".to_vec()], &[12; 16], None)[0].is_err());
         assert!(operations.file_hash(b"../outside", None).is_err());
         assert!(operations.stat_many(&[b"../outside".to_vec()], false, None)[0].is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
+        let dir = test_dir();
+        let selected = dir.join("selected");
+        let moved = dir.join("moved");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&selected).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(selected.join("basis"), b"held").unwrap();
+        fs::write(selected.join("inplace"), b"original").unwrap();
+        let root = Arc::new(Root::from_directory(File::open(&selected).unwrap()).unwrap());
+        let mut operations = FsOps::new();
+        operations.destination_root = Some(root);
+        operations.destination_prefix = Some(path_bytes(&selected));
+
+        fs::rename(&selected, &moved).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("basis"), b"replacement").unwrap();
+        fs::write(selected.join("inplace"), b"replacement").unwrap();
+
+        let partial_id = [31; 16];
+        let (hashes, held_len) = operations
+            .hash_and_hold(
+                b"basis",
+                &partial_id,
+                MIN_HASH_BLOCK_BYTES,
+                4,
+                TargetCondition::Any,
+                None,
+            )
+            .unwrap();
+        assert_eq!(hashes, vec![content_digest(b"held")]);
+        assert_eq!(held_len, 4);
+        operations
+            .seed_basis(b"basis", &partial_id, 4, None)
+            .unwrap();
+        let basis_partial = partial_path(&moved.join("basis"), &partial_id).unwrap();
+        assert_eq!(fs::read(&basis_partial).unwrap(), b"held");
+        let Response::PartialSize(partial_size) = operations
+            .probe_partial(b"basis", &partial_id, None)
+            .unwrap()
+        else {
+            panic!("unexpected partial probe response");
+        };
+        assert_eq!(partial_size, Some(4));
+        assert_eq!(
+            operations
+                .hash_blocks(
+                    b"basis",
+                    Which::Partial,
+                    &partial_id,
+                    MIN_HASH_BLOCK_BYTES,
+                    4,
+                    None,
+                )
+                .unwrap(),
+            vec![content_digest(b"held")]
+        );
+
+        operations
+            .hash_and_hold(
+                b"basis",
+                &partial_id,
+                MIN_HASH_BLOCK_BYTES,
+                4,
+                TargetCondition::Any,
+                None,
+            )
+            .unwrap();
+        operations
+            .finish_basis(
+                b"basis",
+                &partial_id,
+                &Meta {
+                    mode: 0o600,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                },
+                flags::MODE,
+                TargetCondition::Any,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(moved.join("basis")).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_ne!(
+            fs::metadata(selected.join("basis")).unwrap().mode() & 0o777,
+            0o600
+        );
+
+        let stale = partial_path(&moved.join("inplace"), &partial_id).unwrap();
+        fs::write(&stale, b"stale").unwrap();
+        operations
+            .prepare(b"inplace", 2, true, &partial_id, 0o600, None)
+            .unwrap();
+        assert_eq!(fs::metadata(moved.join("inplace")).unwrap().len(), 2);
+        assert!(!stale.exists());
+        assert_eq!(fs::read(selected.join("inplace")).unwrap(), b"replacement");
+
+        symlink(&outside, moved.join("redirect")).unwrap();
+        assert!(operations
+            .prepare(b"redirect/escaped", 1, false, &partial_id, 0o600, None)
+            .is_err());
+        assert!(operations
+            .hash_blocks(
+                b"redirect/escaped",
+                Which::Final,
+                &partial_id,
+                MIN_HASH_BLOCK_BYTES,
+                1,
+                None,
+            )
+            .is_err());
+        assert!(!outside.join("escaped").exists());
+        assert!(operations
+            .probe_partial(b"../outside", &partial_id, None)
+            .is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rooted_partial_hash_rejects_opened_and_named_inode_mismatch() {
+        let dir = test_dir();
+        fs::create_dir(&dir).unwrap();
+        let named = dir.join("partial");
+        fs::write(&named, b"old").unwrap();
+        let root = Root::open(&dir).unwrap();
+        let relative = RelativePath::new(b"partial").unwrap();
+        let opened = root.open_regular_read(&relative).unwrap();
+
+        fs::rename(&named, dir.join("old-partial")).unwrap();
+        fs::write(&named, b"new").unwrap();
+
+        assert!(require_safe_rooted_named_partial(&root, &relative, &named, &opened).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rooted_descriptor_cache_distinguishes_roots_with_the_same_relative_name() {
+        let dir = test_dir();
+        let first = dir.join("first");
+        let second = dir.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("same"), b"first").unwrap();
+        fs::write(second.join("same"), b"second").unwrap();
+        let first_root = Root::open(&first).unwrap();
+        let second_root = Root::open(&second).unwrap();
+        let relative = RelativePath::new(b"same").unwrap();
+        let mut operations = FsOps::new();
+
+        let first_inode = operations
+            .cached_rooted(Path::new("same"), &first_root, &relative, 0, false)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .ino();
+        let second_inode = operations
+            .cached_rooted(Path::new("same"), &second_root, &relative, 0, false)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .ino();
+
+        assert_ne!(first_inode, second_inode);
+        assert_eq!(operations.fds.len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retained_basis_cannot_be_consumed_under_another_root() {
+        let dir = test_dir();
+        let first = dir.join("first");
+        let second = dir.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("basis"), b"same").unwrap();
+        fs::write(second.join("basis"), b"same").unwrap();
+        let first_root = Arc::new(Root::open(&first).unwrap());
+        let second_root = Arc::new(Root::open(&second).unwrap());
+        let mut operations = FsOps::new();
+        operations.destination_root = Some(first_root);
+        operations.destination_prefix = Some(b"logical".to_vec());
+        let partial_id = [32; 16];
+
+        operations
+            .hash_and_hold(
+                b"basis",
+                &partial_id,
+                MIN_HASH_BLOCK_BYTES,
+                4,
+                TargetCondition::Any,
+                None,
+            )
+            .unwrap();
+        operations.destination_root = Some(second_root);
+        assert!(operations
+            .finish_basis(
+                b"basis",
+                &partial_id,
+                &Meta {
+                    mode: 0o600,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                },
+                flags::MODE,
+                TargetCondition::Any,
+                None,
+            )
+            .is_err());
+        assert_ne!(
+            fs::metadata(first.join("basis")).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_ne!(
+            fs::metadata(second.join("basis")).unwrap().mode() & 0o777,
+            0o600
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
