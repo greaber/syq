@@ -1947,11 +1947,15 @@ impl RestrictedAuthority {
             }
             Request::Scan {
                 root,
+                source,
                 follow_root,
                 ignore,
                 guard,
                 ..
             } => {
+                if source.is_some() {
+                    bail!("source references are not valid on a command-restricted destination");
+                }
                 if *follow_root {
                     bail!("signed destination scans cannot follow a root symlink");
                 }
@@ -1970,9 +1974,14 @@ impl RestrictedAuthority {
             }
             Request::StatMany {
                 paths,
+                sources,
                 follow,
                 guard,
+                ..
             } => {
+                if sources.is_some() {
+                    bail!("source references are not valid on a command-restricted destination");
+                }
                 if *follow {
                     bail!("signed destination stat cannot follow symlinks");
                 }
@@ -2013,18 +2022,29 @@ impl RestrictedAuthority {
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
             }
-            Request::FileHash { path, guard } => {
+            Request::FileHash {
+                path,
+                source,
+                guard,
+            } => {
+                if source.is_some() {
+                    bail!("source references are not valid on a command-restricted destination");
+                }
                 self.check_observation_path(path)?;
                 outcomes.push(PendingOutcome::Observe { path: path.clone() });
                 *guard = Some(self.guard.clone());
             }
             Request::HashBlocks {
                 path,
+                source,
                 block,
                 len,
                 guard,
                 ..
             } => {
+                if source.is_some() {
+                    bail!("source references are not valid on a command-restricted destination");
+                }
                 self.check_hash_request(*block, *len)?;
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
@@ -2230,6 +2250,8 @@ impl RestrictedAuthority {
                 bail!("request is not valid on a command-restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
+            | Request::CheckOperatorDirectoryAncestry { .. }
+            | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. } => {
                 bail!("destination-anchor management is not valid on a root-confined receiver")
@@ -4201,6 +4223,7 @@ mod tests {
 
         let mut stat = Request::StatMany {
             paths: vec![target.clone()],
+            sources: None,
             follow: false,
             guard: Some(ContainerGuard {
                 root: outside.clone(),
@@ -4235,6 +4258,7 @@ mod tests {
 
         let mut outside_stat = Request::StatMany {
             paths: vec![outside.clone()],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -4307,6 +4331,7 @@ mod tests {
 
         let mut exact = Request::StatMany {
             paths: vec![destination],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -4350,6 +4375,7 @@ mod tests {
 
         let scan = |ignore: Vec<String>| Request::Scan {
             root: target.clone(),
+            source: None,
             follow_root: false,
             ignore,
             report_ignored: true,
@@ -5809,6 +5835,7 @@ mod tests {
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let request = |block, len| Request::HashBlocks {
             path: target.clone(),
+            source: None,
             which: proto::Which::Final,
             partial_id: [0; 16],
             block,
@@ -5993,6 +6020,7 @@ mod tests {
 
         let mut observation = Request::StatMany {
             paths: vec![target],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -6033,6 +6061,7 @@ mod tests {
 
         let mut observe_container = Request::StatMany {
             paths: vec![target],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -6053,6 +6082,7 @@ mod tests {
                 .as_os_str()
                 .as_bytes()
                 .to_vec()],
+            sources: None,
             follow: false,
             guard: None,
         };
@@ -6094,6 +6124,7 @@ mod tests {
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let mut unfiltered_scan = Request::Scan {
             root: target,
+            source: None,
             follow_root: false,
             ignore: Vec::new(),
             report_ignored: true,
@@ -6198,6 +6229,7 @@ mod tests {
         let target = root.join("target").as_os_str().as_bytes().to_vec();
         let mut scan = Request::Scan {
             root: target.clone(),
+            source: None,
             follow_root: false,
             ignore: Vec::new(),
             report_ignored: false,
@@ -6434,6 +6466,7 @@ mod tests {
 
         let mut scan = Request::Scan {
             root: target.as_os_str().as_bytes().to_vec(),
+            source: None,
             follow_root: false,
             ignore: Vec::new(),
             report_ignored: false,
@@ -6469,6 +6502,7 @@ mod tests {
 
         let response = crate::fsops::FsOps::new().handle(&Request::HashBlocks {
             path: target.join("escape").as_os_str().as_bytes().to_vec(),
+            source: None,
             which: proto::Which::Final,
             partial_id: [0; 16],
             block: 4096,
@@ -6477,5 +6511,65 @@ mod tests {
         });
         assert!(matches!(response, proto::Response::Err(_)));
         assert_eq!(fs::metadata(outside.join("secret")).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn restricted_authority_rejects_caller_source_registration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+        let mut request = Request::RegisterSourceRoots {
+            selections: vec![proto::SourceRootSelection {
+                path: root.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
+            shared_workers: 0,
+            independent_claim_workers: 0,
+        };
+        let error = authority.authorize(&mut request, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("not valid on a root-confined receiver"));
+
+        let session = crate::descriptor_broker::DescriptorSessionSlot::default();
+        let ticket = session.register(fs::File::open(&root).unwrap()).unwrap();
+        let source = proto::RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap();
+        let mut scan = Request::Scan {
+            root: root.as_os_str().as_bytes().to_vec(),
+            source: Some(source.clone()),
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: false,
+            guard: None,
+        };
+        let error = authority.authorize(&mut scan, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("source references are not valid"));
+
+        for mut request in [
+            Request::FileHash {
+                path: root.join("file").as_os_str().as_bytes().to_vec(),
+                source: Some(source.clone()),
+                guard: None,
+            },
+            Request::HashBlocks {
+                path: root.join("file").as_os_str().as_bytes().to_vec(),
+                source: Some(source),
+                which: proto::Which::Final,
+                partial_id: [0; 16],
+                block: proto::MIN_HASH_BLOCK_BYTES,
+                len: 1,
+                guard: None,
+            },
+        ] {
+            let error = authority.authorize(&mut request, true).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("source references are not valid"));
+        }
     }
 }

@@ -241,7 +241,13 @@ those farms fall short — see [use-cases/link-farms.md](use-cases/link-farms.md
   traverse symlinks in them by default. `--follow-src` controls the source
   base, `--follow-dest` controls placement, and only the `--follow` umbrella
   also controls the coordinator-local manifest path. Paths inside the manifest
-  are data and are not changed by any follow option.
+  are data and are not changed by any follow option. A named manifest is read
+  from the identity retained by that resolution, and all its bytes are acquired
+  before destination mutation; replacing its pathname or a followed link
+  afterward cannot redirect the read. `--mapping -` is the portable stream
+  form. A directly named FIFO preserves blocking-open behavior through an exact
+  retained-descriptor reopen on Linux with procfs; systems without that
+  primitive refuse it before destination mutation.
 - When `syq map --follow-src` (or `--follow`) resolves a named selector, it
   emits the referent's source-base-relative path so the manifest remains
   executable without link traversal. It refuses a referent outside that base;
@@ -302,7 +308,11 @@ and its terminal record. Receiver-attested streams for attached direct
 copies through a command-restricted receiver — records verified and
 decrypted from hostB's receipt, marked `"provenance":"receiver_attested"`
 — exist in the engine and return once wired to the file/descriptor
-outputs.
+outputs. A named file is created fresh beneath its retained parent; an existing
+entry is refused rather than truncated. With `--follow`, that retained
+selection is the resolved referent, so replacing the link later cannot redirect
+the output. Use an inherited `--results-fd` when the caller needs another kind
+of sink.
 
 Failed operation records carry `src`, `dst`, and `kind`, so a retry
 manifest is one filter away:

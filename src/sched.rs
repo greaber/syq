@@ -1,6 +1,6 @@
 //! Work queue with largest-first file scheduling and range work-stealing.
 
-use crate::proto::{ContainerGuard, Entry, PathBytes};
+use crate::proto::{ContainerGuard, Entry, PathBytes, RegisteredPath};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -10,6 +10,10 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct FileJob {
     pub src: PathBytes,
+    /// Descriptor-session authority corresponding to `src`. Source workers,
+    /// and Linux destination workers using CopyLocal, claim its root during
+    /// authenticated initialization and use it for content opens.
+    pub source: RegisteredPath,
     pub dst: PathBytes,
     pub rel: String,
     pub entry: Entry,
