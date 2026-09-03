@@ -1220,11 +1220,16 @@ fn parse_native_copy(argv: &[OsString], interface: Interface) -> Result<Args> {
                 "--results cannot be used with --detach because the result stream would not remain attached"
             );
         }
-        if args.locations.split_last().is_some_and(|(dst, sources)| {
-            crate::transfer::uses_remote_coordinator(&args, sources, dst)
-        }) {
+        // The stream is written by the transfer coordinator. For a
+        // remote-to-remote copy that requires the local (relay) topology,
+        // which is never chosen implicitly on the stream's behalf: the
+        // operator opts in with an explicit --run-at local, even where
+        // auto placement would have relayed anyway.
+        let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
+        let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
+        if src_remote && dst_remote && args.run_at != RunAt::Local {
             bail!(
-                "--results is written by the transfer coordinator, which is remote for this copy; use --run-at local to keep it on this machine"
+                "--results with a remote-to-remote copy needs the local coordinator; pass --run-at local explicitly to route the transfer through this machine"
             );
         }
     }

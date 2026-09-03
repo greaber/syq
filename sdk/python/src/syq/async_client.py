@@ -598,6 +598,17 @@ class AsyncClient:
         timeout: float | None = None,
         check: bool = True,
     ) -> CpResult:
+        if from_ is not None and to is not None and run_at != "local":
+            # A remote-to-remote copy places the coordinator — and the
+            # results stream this surface relies on — on a remote host.
+            # The local relay topology is never chosen implicitly: routing
+            # the transfer through this machine is the operator's call.
+            raise SyqInvocationError(
+                "a remote-to-remote copy cannot write the local results "
+                "stream; pass run_at='local' explicitly to route the "
+                "transfer through this machine, or use run() for a raw "
+                "invocation"
+            )
         argv, source_count = _copy_arguments(
             "cp",
             sources,

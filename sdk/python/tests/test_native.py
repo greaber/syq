@@ -167,6 +167,7 @@ class NativeClientTests(unittest.TestCase):
             from_="source",
             follow=True,
             to="target",
+            run_at="local",
             into_existing="out",
             prune=True,
             max_delete=10,
@@ -273,6 +274,7 @@ class NativeClientTests(unittest.TestCase):
                     "source",
                     from_="source",
                     to="target",
+                    run_at="local",
                     into="out",
                     **parameter,
                 )

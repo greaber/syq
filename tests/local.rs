@@ -10872,27 +10872,37 @@ fn native_results_require_a_local_coordinator() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src"), b"local results");
-    for flag in [
-        &["--results", "r-remote.ndjson"][..],
-        &["--results-fd", "3"][..],
+    // Every placement except an explicit --run-at local is refused: the
+    // local (relay) topology is never chosen implicitly on the stream's
+    // behalf, auto included.
+    for run_at in [
+        &["--run-at", "target"][..],
+        &["--run-at", "source"][..],
+        &[][..],
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args(["cp", "--rsh"])
-            .arg(&rsh)
-            .args(["--from", "hostA", "--src", &t.s("src")])
-            .args(["--to", "hostB", "--run-at", "target"])
-            .args(["--as", &t.s("dst-remote")])
-            .args(flag)
-            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-            .env("FAKE_RSH_LOG", t.path("rsh.log"))
-            .run()
-            .expect("reject results with a remote coordinator");
-        // Usage lane: exit 2, no stream ever existed.
-        assert_eq!(out.status.code(), Some(2));
-        let stderr = stderr_of(&out);
-        assert!(stderr.contains("--run-at local"), "{stderr}");
-        assert!(!t.path("dst-remote").exists());
-        assert!(!t.path("r-remote.ndjson").exists());
+        for flag in [
+            &["--results", "r-remote.ndjson"][..],
+            &["--results-fd", "3"][..],
+        ] {
+            let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args(["cp", "--rsh"])
+                .arg(&rsh)
+                .args(["--from", "hostA", "--src", &t.s("src")])
+                .args(["--to", "hostB"])
+                .args(run_at)
+                .args(["--as", &t.s("dst-remote")])
+                .args(flag)
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .run()
+                .expect("reject results with a remote coordinator");
+            // Usage lane: exit 2, no stream ever existed.
+            assert_eq!(out.status.code(), Some(2));
+            let stderr = stderr_of(&out);
+            assert!(stderr.contains("--run-at local"), "{stderr}");
+            assert!(!t.path("dst-remote").exists());
+            assert!(!t.path("r-remote.ndjson").exists());
+        }
     }
 }

@@ -58,6 +58,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             from_="source",
             follow=True,
             to="target",
+            run_at="local",
             into_existing="out",
             dry_run=True,
             hash=True,
@@ -145,6 +146,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
                     "source",
                     from_="source",
                     to="target",
+                    run_at="local",
                     into="out",
                     **parameter,
                 )

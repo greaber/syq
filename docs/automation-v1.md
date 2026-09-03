@@ -39,8 +39,12 @@ the descriptor held for the whole run; the default operator-path
 policy refuses a symlinked `FILE` (pass `--follow` to allow it).
 
 The results writer lives with the transfer coordinator, so both forms
-require a local coordinator: a direct remote-to-remote copy must use
-`--run-at local` to produce a stream. `--results` is not available on
+require a local coordinator. A remote-to-remote copy is refused at
+argument parsing unless `--run-at local` is passed explicitly: the
+whole point of a remote-to-remote transfer is that data does not
+route through the invoking machine, so the relay topology is never
+chosen implicitly on the stream's behalf. (Streaming from a remote
+coordinator is a possible future extension.) `--results` is not available on
 `syq map` (its stdout is the manifest format) or, yet, on other
 commands, and cannot be combined with `--detach`. `--dry-run`
 composes; see below. `--results` cannot be combined with `--detach`, because

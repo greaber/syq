@@ -363,9 +363,10 @@ the file fresh (an existing file is refused — one file, one run), and
 `--results-fd N` writes to a descriptor the caller opened, e.g.
 `--results-fd 3 3>run.ndjson` (see
 [docs/automation-v1.md](docs/automation-v1.md)). The stream is written
-by the transfer coordinator, so both forms require it to be local
-(`--run-at local` for remote-to-remote copies), and both are rejected
-with `--detach`. Choose a results path outside the source and
+by the transfer coordinator, so both forms require it to be local; a
+remote-to-remote copy is refused unless `--run-at local` is passed
+explicitly — routing through this machine is never chosen implicitly
+on the stream's behalf. Both forms are rejected with `--detach`. Choose a results path outside the source and
 destination trees; one inside them can make the run's own accounting
 unpredictable. `--mapping` cannot be combined with `--prune` because
 mapping manifests define no deletion region; `--results` covers
