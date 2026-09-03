@@ -1169,7 +1169,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         args.connections = if src_ep.is_remote() || dst_ep.is_remote() {
             tune::START_SSH
         } else {
-            tune::START_LOCAL
+            tune::start_local()
         };
     }
     #[cfg(not(target_os = "linux"))]
@@ -2137,6 +2137,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     }
                 }
                 if !workers_started {
+                    // A same-machine file normally completes wholly inside one
+                    // small-file or receiver-side copy request (copy_file_range,
+                    // or the sequential NFS fallback). Starting 32 loopback
+                    // connections cannot help that request. If a larger file
+                    // instead discovers a partial or an unsupported offload,
+                    // the first worker wakes the tuner to restore the ordinary
+                    // local starting count immediately.
+                    let single_direct_candidate = autotune
+                        && opts.same_host
+                        && !opts.checksum
+                        && !opts.verify_only
+                        && bwlimit.is_none()
+                        && {
+                            let jobs = sched.jobs.lock().unwrap();
+                            matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
+                        };
+                    if single_direct_candidate {
+                        sched.arm_direct_fallback(args.connections);
+                        args.connections = 1;
+                        gate.set_active(1);
+                    }
                     spawn_workers(args.connections);
                 }
             }
@@ -2194,6 +2215,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if opts.dry_run {
         st.flush_dry_directory_traces();
     }
+    sched.clear_finished_work();
     let mut deleted = 0u64;
     let mut delete_plan = if opts.delete {
         DeletePlan::Skipped("the copy plan did not complete")
@@ -2260,14 +2282,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             loop {
                 match dst_ctl.recv() {
-                    Ok(Response::Receipt(envelope)) => {
-                        println!(
-                            "{}{}",
-                            crate::receipt::RECEIPT_LINE_PREFIX,
-                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(envelope)
-                        );
-                        break;
-                    }
                     Ok(Response::ReceiptV2(frame)) => {
                         let terminal = match crate::receipt_v2::transport_frame_is_end(&frame) {
                             Ok(terminal) => terminal,
@@ -3961,10 +3975,30 @@ impl Planner<'_> {
         let deferred = std::mem::take(&mut self.deferred_payloads);
         if let Some(buf) = &mut self.buffer {
             buf.extend(deferred);
-            return self.replay_buffered();
+            self.replay_buffered()?;
+        } else {
+            for m in deferred {
+                self.apply_mapped(m)?;
+            }
         }
-        for m in deferred {
-            self.apply_mapped(m)?;
+
+        // These sets exist only to validate and apply mapped scan entries.
+        // Jobs already own the source spelling needed by workers. Deletion
+        // alone still needs the destination claims and live sidecar names.
+        self.missing_dirs = std::collections::HashSet::new();
+        self.dry_run_replaced_dirs = std::collections::HashSet::new();
+        self.unusable_files = std::collections::HashSet::new();
+        // Dry-run directory traces are intentionally deferred until after
+        // planning, when a later explicit directory can have upgraded an
+        // implicit ancestor. They still need these two source-mapping sets.
+        if !self.opts.dry_run {
+            self.src_overrides = std::collections::HashMap::new();
+            self.implicit_dirs = std::collections::HashSet::new();
+        }
+        if !self.opts.delete {
+            self.dst_seen = std::collections::HashMap::new();
+            self.live_sidecars = Vec::new();
+            self.delete_roots = Vec::new();
         }
         Ok(())
     }
@@ -6265,6 +6299,9 @@ impl Worker {
                 }
             }
         };
+        if partial_size.is_some() {
+            self.sched.request_direct_fallback();
+        }
         // Same-machine copy: let the receiver move the bytes directly (kernel
         // offload, or one sequential writer for cross-mount NFS) instead of
         // framing, hashing and scheduling them through the transport.
@@ -6282,7 +6319,12 @@ impl Worker {
                     self.sched.ranges_ready(idx, vec![]);
                     return Ok(());
                 }
-                Ok(false) => {} // not offloadable — fall through to streaming
+                Ok(false) => {
+                    // The one-worker automatic start was only a cheap direct
+                    // copy probe. Restore the normal local worker count before
+                    // exposing userspace ranges for an unsupported offload.
+                    self.sched.request_direct_fallback();
+                }
                 Err(e) => {
                     self.sched.ranges_ready(idx, vec![]);
                     if self.transport_dead() {
@@ -6662,6 +6704,16 @@ impl Worker {
             }),
         );
         let block = self.transfer_block();
+        let read_window = if self.src.supports_request_pipelining() {
+            WINDOW
+        } else {
+            1
+        };
+        let write_window = if self.dst.supports_request_pipelining() {
+            WINDOW
+        } else {
+            1
+        };
         let inplace = job.inplace;
         let mut reads_out = 0usize;
         let mut writes_out = 0usize;
@@ -6671,7 +6723,7 @@ impl Worker {
                 // worker picks it up; what's already requested still completes.
                 self.sched.release_rest(h);
             }
-            while reads_out < WINDOW {
+            while reads_out < read_window {
                 let (off, n) = {
                     let mut g = h.lock().unwrap();
                     if g.pos >= g.end {
@@ -6715,7 +6767,7 @@ impl Worker {
             })?;
             self.t[1] += t0.elapsed().as_secs_f64();
             writes_out += 1;
-            if writes_out >= WINDOW {
+            if writes_out >= write_window {
                 let t0 = std::time::Instant::now();
                 ok(self.dst.recv()?, "write")?;
                 self.t[2] += t0.elapsed().as_secs_f64();

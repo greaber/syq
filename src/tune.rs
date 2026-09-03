@@ -40,10 +40,14 @@ pub const START_SSH: usize = 8;
 /// Workers to start with when every remote endpoint has a TCP data path.
 /// TCP data connections are cheap once the ssh control connection is up.
 pub const START_TCP: usize = 16;
-/// Workers to start with when both ends are local: threads are free, network
-/// filesystems like the concurrency, and short bursts never reach the first
-/// measurement. If it's too many for a spinning disk the ramp-down finds out.
+/// Workers to start with when both ends are local and the process has more
+/// than two CPUs available. Network filesystems like the concurrency, and
+/// short bursts never reach the first measurement.
 pub const START_LOCAL: usize = 32;
+/// A gentle reduction for CPU-constrained machines. Sixteen still leaves
+/// enough I/O concurrency for high-latency filesystems while avoiding half of
+/// the speculative worker setup on one- and two-CPU systems.
+pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune beyond this many workers.
 pub const MAX: usize = 64;
 /// Never auto-tune below this many.
@@ -77,6 +81,23 @@ const TAIL_FALLBACK_BYTES_PER_WORKER: u64 = 64 << 20;
 /// A completed file counts as this many bytes, so small-file transfers
 /// (where bytes are negligible) still produce a usable signal.
 pub const FILE_CREDIT: u64 = 512 * 1024;
+
+fn local_start_for_parallelism(parallelism: usize) -> usize {
+    if parallelism <= 2 {
+        START_LOCAL_LOW_CPU
+    } else {
+        START_LOCAL
+    }
+}
+
+/// Initial local worker count, respecting CPU affinity and container limits
+/// exposed by `available_parallelism`. If the platform cannot report a limit,
+/// retain the established local default.
+pub fn start_local() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| local_start_for_parallelism(parallelism.get()))
+        .unwrap_or(START_LOCAL)
+}
 
 fn sample_interval() -> Duration {
     #[cfg(debug_assertions)]
@@ -855,9 +876,35 @@ pub fn run(
     let mut last_rate = None;
     meter.set_active(policy.n);
     loop {
-        std::thread::sleep(poll);
+        sched.wait_for_tuning(poll);
         if sched.is_aborted() || sched.finished() {
             break;
+        }
+
+        // A same-machine single-file copy starts with one cheap direct-copy
+        // probe. If the receiver reports a partial or unsupported kernel
+        // offload, skip the measurement ramp and restore the ordinary local
+        // starting count before userspace ranges become the bottleneck.
+        let requested = sched.take_worker_count_request().min(policy.max);
+        if requested > active {
+            let before = active;
+            policy = Policy::new(requested, policy.min, policy.max);
+            active = requested;
+            gate.set_retain(requested);
+            for id in gate.begin_warming(requested) {
+                spawn(id);
+            }
+            gate.set_active(requested);
+            meter.set_active(requested);
+            sampler.reset();
+            last = (meter.bytes(), meter.files());
+            sample_start = std::time::Instant::now();
+            if crate::transfer::debug() {
+                eprintln!(
+                    "syq: tune: {before} -> {requested} workers (direct copy needs userspace transfer)"
+                );
+            }
+            continue;
         }
 
         // Apply reductions immediately. An increase leaves the current set
@@ -1049,6 +1096,14 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_start_reduces_only_for_one_or_two_cpus() {
+        assert_eq!(local_start_for_parallelism(1), START_LOCAL_LOW_CPU);
+        assert_eq!(local_start_for_parallelism(2), START_LOCAL_LOW_CPU);
+        assert_eq!(local_start_for_parallelism(3), START_LOCAL);
+        assert_eq!(local_start_for_parallelism(128), START_LOCAL);
+    }
 
     fn remote(host: &str, tcp: bool) -> Endpoint {
         Endpoint::Remote(crate::conn::RemoteSpec {

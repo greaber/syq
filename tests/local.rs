@@ -103,6 +103,14 @@ fn run_ok(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn expected_local_start() -> usize {
+    if std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() <= 2) {
+        16
+    } else {
+        32
+    }
+}
+
 /// Parse "syq: transferred N files" from the summary line.
 fn transferred(stdout: &str) -> u64 {
     let line = stdout
@@ -3321,7 +3329,11 @@ fn single_file_to_new_name() {
     let t = Tmp::new();
     write(&t.path("src/f.txt"), b"data");
     set_mtime(&t.path("src/f.txt"), 1_600_000_000);
-    run_ok(&["-a", &t.s("src/f.txt"), &t.s("out.txt")]);
+    let output = run_ok(&["-a", "--stats", &t.s("src/f.txt"), &t.s("out.txt")]);
+    assert!(
+        output.contains("connections: auto: settled at 1 (path 1, peak 1)"),
+        "{output}"
+    );
     assert_eq!(read(&t.path("out.txt")), b"data");
     assert_same_tree(&t.path("src/f.txt"), &t.path("out.txt"));
 }
@@ -3333,11 +3345,15 @@ fn archive_copies_mode_zero_empty_file_without_opening_source() {
     write(&src, b"");
     fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
 
-    run_ok(&["-a", &t.s("src/empty"), &t.s("dst/empty")]);
+    let output = run_ok(&["-a", "--stats", &t.s("src/empty"), &t.s("dst/empty")]);
 
     let dst = fs::metadata(t.path("dst/empty")).unwrap();
     assert_eq!(dst.len(), 0);
     assert_eq!(dst.mode() & 0o777, 0);
+    assert!(
+        output.contains("connections: auto: settled at 1 (path 1, peak 1)"),
+        "{output}"
+    );
 }
 
 #[test]
@@ -3754,7 +3770,10 @@ fn dry_run_reports_typed_preflight_summary() {
         "{out}"
     );
     assert!(
-        out.contains("route: local filesystem; 32 initial workers (auto-tuned)"),
+        out.contains(&format!(
+            "route: local filesystem; {} initial workers (auto-tuned)",
+            expected_local_start()
+        )),
         "{out}"
     );
     assert!(t.path("dst/extra").exists());
@@ -6614,6 +6633,30 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
+fn copy_local_exdev_auto_fallback_restores_parallel_workers() {
+    let t = Tmp::new();
+    let contents = vec![b'x'; 8 * 1024 * 1024];
+    write(&t.path("src"), &contents);
+
+    let out = compat_command()
+        .args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), contents);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "connections: auto: settled at {0} (path {0}, peak {0})",
+            expected_local_start()
+        )),
+        "{stdout}"
+    );
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
 fn native_inplace_exdev_fallback_preserves_hardlink_aliases() {
     let t = Tmp::new();
     let contents = vec![b'n'; 8 * 1024 * 1024];
@@ -7270,10 +7313,13 @@ fn stats_report_connection_tuning_mode() {
         std::fs::write(t.path(&format!("src/f{i}")), vec![b'x'; 1000]).unwrap();
     }
     // Without -j the count is auto-tuned; a short local copy never leaves the
-    // local starting count of 32.
+    // CPU-sensitive local starting count.
     let out = run_ok(&["-a", "--stats", &t.s("src/"), &t.s("auto/")]);
     assert!(
-        out.contains("connections: auto: settled at 32 (path 32, peak 32)"),
+        out.contains(&format!(
+            "connections: auto: settled at {0} (path {0}, peak {0})",
+            expected_local_start()
+        )),
         "{out}"
     );
     // An explicit -j is used as given, with no tuning.

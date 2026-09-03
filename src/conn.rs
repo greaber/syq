@@ -26,6 +26,12 @@ pub trait Conn: Send {
     fn is_dead(&self) -> bool {
         false
     }
+    /// Whether sending several requests before receiving their responses can
+    /// overlap useful work. LocalConn executes requests synchronously, so
+    /// queueing several block responses there only retains their buffers.
+    fn supports_request_pipelining(&self) -> bool {
+        true
+    }
     /// Current kernel RTT estimate for a direct TCP connection. This is a
     /// local socket query and never sends a protocol request.
     fn tcp_rtt_us(&self) -> Option<u64> {
@@ -393,6 +399,9 @@ impl Conn for LocalConn {
         self.pending
             .pop_front()
             .ok_or_else(|| anyhow!("no pending response"))
+    }
+    fn supports_request_pipelining(&self) -> bool {
+        false
     }
     fn scan(
         &mut self,
