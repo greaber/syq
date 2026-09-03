@@ -82,6 +82,15 @@ def _integer(record: dict[str, Any], key: str, *, nonnegative: bool = True) -> i
     return value
 
 
+def _attested_provenance(record: dict[str, Any], label: str) -> str | None:
+    provenance = _optional_string(record, "provenance")
+    if provenance is not None and provenance != "receiver_attested":
+        raise SyqProtocolError(
+            f"a {label}'s provenance can only be receiver_attested"
+        )
+    return provenance
+
+
 def _optional_integer(record: dict[str, Any], key: str) -> int | None:
     if key not in record:
         return None
@@ -287,6 +296,18 @@ class AutomationDecoder:
                 raise SyqProtocolError(
                     "a dry-run automation stream contains an operation result"
                 )
+            provenance = _attested_provenance(record, "operation result")
+            if provenance is None:
+                for field in ("scope", "code"):
+                    if field in record:
+                        raise SyqProtocolError(
+                            f"receipt field {field!r} appears on an operation "
+                            "result without receiver_attested provenance"
+                        )
+            elif "scope" not in record:
+                raise SyqProtocolError(
+                    "a receiver-attested operation result must carry its scope"
+                )
             return OperationResult(
                 **common,
                 action=_enum(record, "action", OperationAction),
@@ -300,17 +321,23 @@ class AutomationDecoder:
                 class_=_optional_enum(record, "class", ErrorClass),
                 os_kind=_optional_enum(record, "os_kind", OsKind),
                 message=_optional_string(record, "message"),
-                provenance=_optional_string(record, "provenance"),
+                provenance=provenance,
                 scope=_optional_integer(record, "scope"),
                 code=_optional_enum(record, "code", ReceiptCode),
             )
         if record_type == "error":
+            provenance = _attested_provenance(record, "error record")
+            if provenance is None and "code" in record:
+                raise SyqProtocolError(
+                    "a receipt code appears on an error record without "
+                    "receiver_attested provenance"
+                )
             return ErrorEvent(
                 **common,
                 message=_string(record, "message"),
                 class_=_optional_enum(record, "class", ErrorClass),
                 os_kind=_optional_enum(record, "os_kind", OsKind),
-                provenance=_optional_string(record, "provenance"),
+                provenance=provenance,
                 code=_optional_enum(record, "code", ReceiptCode),
             )
         if record_type == "final_state":
@@ -338,11 +365,22 @@ class AutomationDecoder:
                     {"code"},
                 ),
             }[variant]
-            extra = set(state) - allowed
+            known = {
+                "state",
+                "kind",
+                "size",
+                "metadata",
+                "digest",
+                "symlink_target",
+                "observation_error",
+                "code",
+                "message",
+            }
+            extra = (set(state) & known) - allowed
             if extra:
                 raise SyqProtocolError(
-                    f"final_state object carries fields outside its "
-                    f"{variant.value!r} variant: {sorted(extra)}"
+                    f"final_state object carries fields from another state "
+                    f"variant than {variant.value!r}: {sorted(extra)}"
                 )
             missing = required - set(state)
             if missing:
@@ -430,11 +468,7 @@ class AutomationDecoder:
                     "deletions_blocked",
                 )
             )
-            provenance = _optional_string(record, "provenance")
-            if provenance is not None and provenance != "receiver_attested":
-                raise SyqProtocolError(
-                    "a result's provenance can only be receiver_attested"
-                )
+            provenance = _attested_provenance(record, "result")
             attested = provenance is not None
             if attested:
                 # A receipt attests settled deletions (deletions_completed);

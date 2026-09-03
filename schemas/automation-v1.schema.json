@@ -305,6 +305,34 @@
       "allOf": [
         {
           "$ref": "#/$defs/envelope"
+        },
+        {
+          "if": {
+            "required": [
+              "provenance"
+            ]
+          },
+          "then": {
+            "required": [
+              "scope"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "scope"
+                  ]
+                },
+                {
+                  "required": [
+                    "code"
+                  ]
+                }
+              ]
+            }
+          }
         }
       ],
       "type": "object",
@@ -379,6 +407,21 @@
       "allOf": [
         {
           "$ref": "#/$defs/envelope"
+        },
+        {
+          "if": {
+            "required": [
+              "provenance"
+            ]
+          },
+          "then": {},
+          "else": {
+            "not": {
+              "required": [
+                "code"
+              ]
+            }
+          }
         }
       ],
       "type": "object",

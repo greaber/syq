@@ -632,6 +632,72 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
         )
         self.assertIs(event.kind, syq.FinalObjectKind.CHARACTER_DEVICE)
 
+    def test_unknown_final_state_fields_stay_additive(self) -> None:
+        # Additive optional fields from a future minor version are ignored;
+        # only known fields on the wrong variant are protocol errors.
+        decoder = self._final_state_decoder()
+        record = json.loads(self._final_state())
+        record["object"]["future_attestation"] = {"v": 2}
+        event = decoder.feed(json.dumps(record).encode())
+        self.assertIs(event.state, syq.FinalObjectState.PRESENT)
+
+    def test_attested_operation_and_error_fields_are_discriminated(self) -> None:
+        base = {
+            "schema": "syq.automation",
+            "schema_version": 1,
+            "seq": 1,
+        }
+        operation = {
+            **base,
+            "type": "operation_result",
+            "action": "transfer_file",
+            "dst": {"encoding": "utf-8", "value": "tree/file"},
+            "kind": "file",
+            "disposition": "succeeded",
+        }
+        bad_records = [
+            # provenance from nowhere
+            {**operation, "provenance": "self_reported", "scope": 0},
+            # receipt fields without attested provenance
+            {**operation, "scope": 0},
+            {**operation, "code": "execution_failed"},
+            # attested operations always carry their scope
+            {**operation, "provenance": "receiver_attested"},
+            # receipt code on an ordinary error record
+            {
+                **base,
+                "type": "error",
+                "message": "boom",
+                "code": "execution_failed",
+            },
+            {
+                **base,
+                "type": "error",
+                "message": "boom",
+                "provenance": "self_reported",
+            },
+        ]
+        for bad in bad_records:
+            decoder = self._final_state_decoder()
+            with self.assertRaises(syq.SyqProtocolError):
+                decoder.feed(json.dumps(bad).encode())
+
+        # An attested error's code is optional: a partial observation has none.
+        decoder = self._final_state_decoder()
+        event = decoder.feed(
+            json.dumps(
+                {
+                    **base,
+                    "type": "error",
+                    "message": "partly observed",
+                    "class": "io",
+                    "provenance": "receiver_attested",
+                }
+            ).encode()
+        )
+        self.assertEqual(event.provenance, "receiver_attested")
+        self.assertIsNone(event.code)
+
     def test_attested_terminals_are_discriminated(self) -> None:
         attested = {
             "provenance": "receiver_attested",
