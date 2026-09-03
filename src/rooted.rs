@@ -11,8 +11,9 @@
 //! descendant mutation and inspection; the unrestricted implementation remains
 //! separate. Existing roots, directory scans, regular-file I/O, leaf
 //! creation/replacement, metadata, and non-recursive unlink/rmdir are supported.
-//! Recursive removal and missing-root creation stay outside this layer. Roots
-//! and directory components must be openable with `O_RDONLY | O_DIRECTORY`.
+//! Recursive removal and missing-root creation stay outside this layer.
+//! Traversal uses search-only descriptors where the platform provides them;
+//! directory enumeration separately opens an independent readable descriptor.
 //!
 //! Linux currently uses the same component walk as other Unix platforms. An
 //! `openat2` fast path should be added only with tests proving that it has
@@ -29,7 +30,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -522,11 +523,19 @@ impl Root {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC)
             .open(path)
             .with_context(|| format!("open confined root {}", path.display()))?;
+        Self::from_directory(directory)
+            .with_context(|| format!("validate confined root {}", path.display()))
+    }
+
+    /// Adopt an already-open directory as the authority boundary. This never
+    /// resolves a pathname and therefore preserves the selected object across
+    /// renames and namespace replacement.
+    pub(crate) fn from_directory(directory: File) -> Result<Self> {
         let metadata = directory
             .metadata()
-            .with_context(|| format!("stat confined root {}", path.display()))?;
+            .context("stat confined root descriptor")?;
         if !metadata.is_dir() {
-            bail!("confined root {} is not a directory", path.display());
+            bail!("confined root descriptor is not a directory");
         }
         Ok(Self {
             directory,
@@ -555,6 +564,10 @@ impl Root {
 
     pub(crate) fn identity(&self) -> RootIdentity {
         self.identity
+    }
+
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
+        self.directory.as_raw_fd()
     }
 
     /// Open the root or a descendant directory without following any
@@ -688,11 +701,17 @@ impl Root {
     /// owns a duplicate descriptor and never reconstructs a pathname.
     pub(crate) fn read_directory(&self, path: &RelativePath) -> Result<Vec<Vec<u8>>> {
         let directory = self.open_directory(path)?;
-        let duplicated = retry_fd(|| unsafe { libc::dup(directory.as_raw_fd()) })?;
-        let stream = unsafe { libc::fdopendir(duplicated) };
+        // dup()/try_clone() would share the directory open-file-description
+        // offset. Reopen `.` so concurrent scans and retries each start with
+        // an independent readable stream, including when the authority is an
+        // O_PATH/O_SEARCH descriptor.
+        let readable = open_readable_directory_at(&directory, b".")
+            .with_context(|| format!("open readable confined directory {}", path.label()))?;
+        let descriptor = readable.into_raw_fd();
+        let stream = unsafe { libc::fdopendir(descriptor) };
         if stream.is_null() {
             let error = io::Error::last_os_error();
-            let _ = unsafe { libc::close(duplicated) };
+            let _ = unsafe { libc::close(descriptor) };
             return Err(error).context("open confined directory stream");
         }
         struct DirectoryStream(*mut libc::DIR);
@@ -720,6 +739,39 @@ impl Root {
             }
         }
         Ok(names)
+    }
+
+    /// Component limit for a sidecar beside `path`. Missing or non-directory
+    /// suffixes are walked back to the nearest existing real directory, never
+    /// through a symlink.
+    pub(crate) fn name_max_for_parent(&self, path: &RelativePath) -> Result<usize> {
+        let (parents, _) = path.leaf()?;
+        let mut components = parents.to_vec();
+        loop {
+            let candidate = RelativePath {
+                components: components.clone(),
+            };
+            match self.open_directory(&candidate) {
+                Ok(directory) => {
+                    set_errno(0);
+                    let limit =
+                        unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_NAME_MAX) };
+                    if limit > 0 {
+                        return Ok(limit as usize);
+                    }
+                    let errno = get_errno();
+                    if errno == 0 {
+                        return Ok(255);
+                    }
+                    return Err(io::Error::from_raw_os_error(errno))
+                        .context("query confined directory component limit");
+                }
+                Err(error) if missing_directory_suffix(&error) && !components.is_empty() => {
+                    components.pop();
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub(crate) fn read_link(&self, path: &RelativePath) -> Result<Vec<u8>> {
@@ -1203,6 +1255,21 @@ fn operator_symlink_owner_is_trusted(owner: u32, euid: u32) -> bool {
 }
 
 fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    let access = libc::O_PATH;
+    #[cfg(target_os = "macos")]
+    let access = libc::O_SEARCH;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let access = libc::O_RDONLY;
+    open_at(
+        parent.as_raw_fd(),
+        &component_cstring(component),
+        access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+fn open_readable_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     open_at(
         parent.as_raw_fd(),
         &component_cstring(component),
@@ -1214,6 +1281,15 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
             | libc::O_CLOEXEC,
         0,
     )
+}
+
+fn missing_directory_suffix(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            .is_some_and(|errno| matches!(errno, libc::ENOENT | libc::ENOTDIR | libc::ELOOP))
+    })
 }
 
 fn open_at(parent: RawFd, name: &CString, flags: libc::c_int, mode: u32) -> io::Result<File> {
@@ -1255,19 +1331,6 @@ fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
     loop {
         if operation() == 0 {
             return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-fn retry_fd(mut operation: impl FnMut() -> libc::c_int) -> io::Result<libc::c_int> {
-    loop {
-        let descriptor = operation();
-        if descriptor >= 0 {
-            return Ok(descriptor);
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -1849,6 +1912,61 @@ mod tests {
         old.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"old");
         assert!(root.open_regular_read(&relative(b"new")).is_err());
+    }
+
+    #[test]
+    fn adopted_operator_descriptor_stays_stable_and_can_be_enumerated_repeatedly() {
+        let tree = TestDir::new("adopted-root");
+        let selected = tree.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("first"), b"first").unwrap();
+        fs::write(selected.join("second"), b"second").unwrap();
+        let pinned = OperatorResolver::resolve_process(
+            selected.as_os_str().as_bytes(),
+            OperatorSymlinkPolicy::Refuse,
+            OperatorFinalComponent::Directory,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let PinnedPath::Directory(directory) = pinned else {
+            panic!("operator directory was not pinned");
+        };
+        let root = Root::from_directory(directory.into_parts().0).unwrap();
+
+        fs::rename(&selected, tree.path().join("moved")).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("replacement"), b"replacement").unwrap();
+
+        let mut first = root.read_directory(&relative(b"")).unwrap();
+        let mut second = root.read_directory(&relative(b"")).unwrap();
+        first.sort();
+        second.sort();
+        assert_eq!(first, [b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(second, first);
+        assert!(root.metadata(&relative(b"replacement")).is_err());
+    }
+
+    #[test]
+    fn descendant_traversal_needs_search_but_not_read_permission() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tree = TestDir::new("search-only");
+        let child = tree.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("file"), b"contents").unwrap();
+        let root = Root::open(tree.path()).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o111)).unwrap();
+
+        let metadata = root.metadata(&relative(b"child/file")).unwrap();
+        assert!(metadata.is_file());
+        let mut file = root.open_regular_read(&relative(b"child/file")).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"contents");
+
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

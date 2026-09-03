@@ -19,7 +19,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const PARTIAL_MARKER: &str = ".syq-part.";
 const FD_CACHE_MAX: usize = 16;
@@ -673,7 +673,14 @@ pub(crate) fn rooted_entry(
         _ => Kind::Other,
     };
     let link = if kind == Kind::Symlink {
-        Some(root.read_link(relative)?)
+        let target = root.read_link(relative)?;
+        let after = root.metadata(relative)?;
+        if (after.dev, after.ino, after.file_type())
+            != (metadata.dev, metadata.ino, metadata.file_type())
+        {
+            bail!("symlink changed while reading its target");
+        }
+        Some(target)
     } else {
         None
     };
@@ -727,7 +734,7 @@ pub struct FsOps {
     held_basis: Option<HeldBasis>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
-    destination_root: Option<File>,
+    destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
     initial_cwd: PathBuf,
 }
@@ -858,12 +865,13 @@ impl FsOps {
     }
 
     fn install_destination(&mut self, directory: File, request_prefix: &[u8]) -> Result<()> {
+        let root = Arc::new(Root::from_directory(directory)?);
         // Destination operations are still pathname-based in this transitional
-        // slice, so enter the exact received descriptor as their base. The next
-        // stacked slice replaces those operations with descriptor-relative
-        // primitives and removes process-wide cwd dependence entirely.
+        // path for operation families not migrated to Root yet, so enter the
+        // exact received descriptor as their base. Stacked slices replace the
+        // remaining operations and then remove process-wide cwd dependence.
         loop {
-            if unsafe { libc::fchdir(directory.as_raw_fd()) } == 0 {
+            if unsafe { libc::fchdir(root.as_raw_fd()) } == 0 {
                 break;
             }
             let error = io::Error::last_os_error();
@@ -875,7 +883,7 @@ impl FsOps {
         self.fd_order.clear();
         self.held_basis.take();
         self.destination_prefix = Some(request_prefix.to_vec());
-        self.destination_root = Some(directory);
+        self.destination_root = Some(root);
         Ok(())
     }
 
@@ -926,16 +934,14 @@ impl FsOps {
             return partial_path(final_path, partial_id);
         }
         let relative = path_bytes(final_path);
+        let strict_relative = RelativePath::new(&relative)?;
         let logical = PathBuf::from(OsStr::from_bytes(&self.destination_full(&relative)));
-        let parent = if final_path
-            .parent()
-            .is_some_and(|parent| !parent.as_os_str().is_empty())
-        {
-            final_path.parent().unwrap()
-        } else {
-            Path::new(".")
-        };
-        let logical_partial = partial_path_with_name_max(&logical, partial_id, name_max(parent))?;
+        let component_limit = self
+            .destination_root
+            .as_ref()
+            .context("destination prefix has no retained root")?
+            .name_max_for_parent(&strict_relative)?;
+        let logical_partial = partial_path_with_name_max(&logical, partial_id, component_limit)?;
         Ok(PathBuf::from(OsStr::from_bytes(
             &self.destination_relative(logical_partial.as_os_str().as_bytes())?,
         )))
@@ -1173,6 +1179,16 @@ impl FsOps {
                 rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok()
             });
         }
+        if let Some(root) = self.destination_root.clone() {
+            if follow {
+                return vec![None; paths.len()];
+            }
+            return parallel_map(paths, |path| {
+                let relative = RelativePath::new(path).ok()?;
+                let metadata = root.metadata(&relative).ok()?;
+                rooted_entry(&root, &relative, Vec::new(), metadata).ok()
+            });
+        }
         parallel_map(paths, |p| {
             let full = resolve(p);
             let md = if follow {
@@ -1192,22 +1208,21 @@ impl FsOps {
     ) -> Vec<std::result::Result<PathBytes, String>> {
         parallel_map(paths, |path| {
             if let Some(guard) = guard {
-                guarded_target(path, guard).map_err(|error| format!("{error:#}"))?;
+                guarded_target(path, guard)?;
             }
             let requested = Path::new(OsStr::from_bytes(path));
             let resolved = if guard.is_some() {
                 partial_path_with_name_max(&resolve(path), partial_id, COMMON_NAME_MAX)
             } else {
                 self.partial_path(&resolve(path), partial_id)
-            };
-            resolved
-                .map(|resolved| {
-                    let name = resolved.file_name().expect("partial always has a name");
-                    let parent = requested.parent().unwrap_or_else(|| Path::new(""));
-                    path_bytes(&parent.join(name))
-                })
-                .map_err(|error| format!("{error:#}"))
+            }?;
+            let name = resolved.file_name().expect("partial always has a name");
+            let parent = requested.parent().unwrap_or_else(|| Path::new(""));
+            Ok(path_bytes(&parent.join(name)))
         })
+        .into_iter()
+        .map(|result: Result<PathBytes>| result.map_err(|error| format!("{error:#}")))
+        .collect()
     }
 
     /// Ops within a batch are independent (the planner orders batches so that
@@ -3121,12 +3136,13 @@ impl FsOps {
     }
 
     pub fn file_hash(&mut self, path: &[u8], guard: Option<&ContainerGuard>) -> Result<Response> {
-        let p = resolve(path);
         let mut f = if let Some(guard) = guard {
             let target = guarded_target(path, guard)?;
             target.root.open_regular_read(&target.relative)?
+        } else if let Some(root) = &self.destination_root {
+            root.open_regular_read(&RelativePath::new(path)?)?
         } else {
-            open_existing_regular(&p, false)?
+            open_existing_regular(&resolve(path), false)?
         };
         let mut h = blake3::Hasher::new();
         let mut buf = vec![0u8; 1 << 20];
@@ -4167,6 +4183,43 @@ mod tests {
         assert!(name.as_bytes().len() <= 143);
         assert!(name.to_str().is_some());
         assert!(is_partial_name(name));
+    }
+
+    #[test]
+    fn destination_observation_uses_the_adopted_root_not_its_old_name() {
+        let dir = test_dir();
+        let selected = dir.join("selected");
+        fs::create_dir_all(&selected).unwrap();
+        fs::write(selected.join("marker"), b"original").unwrap();
+        let root = Arc::new(Root::from_directory(File::open(&selected).unwrap()).unwrap());
+        let mut operations = FsOps::new();
+        operations.destination_root = Some(root);
+        operations.destination_prefix = Some(b"logical".to_vec());
+
+        fs::rename(&selected, dir.join("moved")).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("marker"), b"replacement").unwrap();
+
+        let stats = operations.stat_many(&[b"marker".to_vec()], false, None);
+        assert_eq!(stats[0].as_ref().unwrap().size, 8);
+        let Response::FileHash { size, hash } = operations.file_hash(b"marker", None).unwrap()
+        else {
+            panic!("unexpected hash response");
+        };
+        assert_eq!(size, 8);
+        assert_eq!(hash, content_digest(b"original"));
+
+        let partial =
+            operations.partial_paths(&[b"missing/deeper/marker".to_vec()], &[12; 16], None);
+        assert!(partial[0]
+            .as_ref()
+            .unwrap()
+            .starts_with(b"missing/deeper/.marker.syq-part."));
+        assert!(operations.partial_paths(&[b"../outside".to_vec()], &[12; 16], None)[0].is_err());
+        assert!(operations.file_hash(b"../outside", None).is_err());
+        assert!(operations.stat_many(&[b"../outside".to_vec()], false, None)[0].is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
