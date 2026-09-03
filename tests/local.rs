@@ -8552,8 +8552,68 @@ fn native_map_refusals() {
     refuse(&["--src-src", "d1", "--src-src", "d2"], "only selector");
     refuse(&["--src-src", "d1", "d2"], "only selector");
     refuse(&["d1/n", "d2/n"], "same destination name");
-    refuse(&["d1", "--into-new", "z"], "never contacts a destination");
-    refuse(&["d1", "--from", "remotehost"], "not yet supported");
+    refuse(
+        &["d1", "--into-new", "z"],
+        "unexpected argument '--into-new'",
+    );
+    refuse(
+        &["d1", "--from", "remotehost"],
+        "unexpected argument '--from'",
+    );
+    refuse(&["d1", "--to", "remotehost"], "unexpected argument '--to'");
+    refuse(&["d1", "--ignore", "n"], "unexpected argument '--ignore'");
+    refuse(
+        &["d1", "--receipt", "sizes"],
+        "unexpected argument '--receipt'",
+    );
+}
+
+#[test]
+fn native_map_exposes_only_manifest_shaping_options() {
+    let help = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["map", "--help"])
+        .run()
+        .expect("run syq map --help");
+    assert_output_ok(&help);
+    let help = String::from_utf8(help.stdout).expect("map help is UTF-8");
+    for option in ["--cwd", "--follow", "--src", "--src-src", "--as"] {
+        assert!(help.contains(option), "map help omitted {option}:\n{help}");
+    }
+    for option in [
+        "--from",
+        "--to",
+        "--into",
+        "--into-new",
+        "--into-existing",
+        "--as-new",
+        "--as-existing",
+        "--mapping",
+        "--results",
+        "--dry-run",
+        "--verbose",
+        "--quiet",
+        "--connections",
+        "--progress",
+        "--no-progress",
+        "--progress-json",
+        "--hash",
+        "--no-compress",
+        "--bwlimit",
+        "--stats",
+        "--ignore",
+        "--ignore-from",
+        "--preserve",
+        "--inplace",
+        "--max-entries",
+        "--max-total-bytes",
+        "--max-runtime",
+        "--receipt",
+    ] {
+        assert!(
+            !help.contains(option),
+            "map help unexpectedly exposed {option}:\n{help}"
+        );
+    }
 }
 
 #[test]
@@ -8942,10 +9002,10 @@ fn native_cp_results_without_mapping_and_refusals() {
     assert_eq!(op["disposition"], "succeeded");
     assert!(op.get("src").is_none(), "non-mapping records carry no src");
     assert_eq!(lines.last().unwrap()["status"], "success");
-    // map and pruning copies refuse --results.
+    // map does not expose --results, and pruning copies refuse it.
     let out = syq_map_in(&t.path(""), &["--src-src", "src", "--results", "r.ndjson"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("only available on syq cp"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--results'"));
     let out = syq_cp_in(
         &t.path(""),
         &[
