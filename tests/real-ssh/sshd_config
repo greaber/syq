@@ -1,0 +1,29 @@
+Include /etc/ssh/sshd_config.d/*.conf
+
+Port 22
+ListenAddress 0.0.0.0
+AddressFamily inet
+HostKey /run/sshd/ssh_host_ed25519_key
+PidFile /run/sshd/sshd.pid
+
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+UsePAM no
+UseDNS no
+
+AllowUsers syq
+AuthorizedKeysFile .ssh/authorized_keys /run/lab/authorized_keys
+StrictModes yes
+AllowAgentForwarding yes
+AllowTcpForwarding no
+X11Forwarding no
+PermitTunnel no
+PermitUserEnvironment no
+GatewayPorts no
+PermitTTY no
+
+LogLevel VERBOSE
+Subsystem sftp internal-sftp
