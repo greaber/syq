@@ -1447,7 +1447,7 @@ impl RemoteSpec {
                     Err(error) if is_tcp_congestion_error(&error) => {
                         return Err(error).with_context(|| {
                             format!(
-                                "local/orchestrating host could not configure the connecting data socket to {}",
+                                "coordinator could not configure the connecting data socket to {}",
                                 self.label()
                             )
                         })
@@ -2226,7 +2226,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn connecting_socket_congestion_rejection_is_attributed_locally() {
+    fn connecting_socket_congestion_rejection_is_attributed_to_coordinator() {
         let spec = RemoteSpec {
             local_process: false,
             user: None,
@@ -2260,7 +2260,7 @@ mod tests {
         let message = format!("{error:#}");
         assert!(is_tcp_congestion_error(&error));
         assert!(message.contains(
-            "local/orchestrating host could not configure the connecting data socket to remote.example"
+            "coordinator could not configure the connecting data socket to remote.example"
         ));
     }
 
