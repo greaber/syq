@@ -226,7 +226,13 @@ command says what to change.
   divergences" 1; these are refused rather than pending.
 - `-H`/`--hard-links` — needs cross-file ordering in a scheduler that has
   none today.
-- `-L`/`--copy-links`, `-k`/`--copy-dirlinks`, `-K`/`--keep-dirlinks`.
+- `-L`/`--copy-links`, `--copy-unsafe-links`, `-k`/`--copy-dirlinks`,
+  `-K`/`--keep-dirlinks`. The first three expand source authority by
+  traversing descendant links; the last follows an existing destination
+  directory link. They are rejected explicitly and are not enabled by
+  `--insecure-links`.
+- `--safe-links` and `--munge-links`; syq currently preserves selected
+  symlink target bytes without filtering or rewriting them.
 - `--backup`/`--backup-dir`/`--suffix`.
 - `--link-dest`/`--compare-dest`/`--copy-dest`.
 - `--relative` (`-R`), `--partial-dir`.
