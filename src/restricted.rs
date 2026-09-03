@@ -6330,6 +6330,19 @@ mod tests {
         let mut source_modes = test_authority(&root, DeletionPolicy::Forbid, 1024);
         source_modes.copy.options.preserve_permissions = true;
         source_modes.copy.options.receiver_managed_modes = false;
+        let mut source_mkdir = Request::Apply {
+            ops: vec![Op::Mkdir {
+                path: target.clone(),
+                mode: 0o750,
+                condition: proto::TargetCondition::Any,
+            }],
+            guard: None,
+        };
+        source_modes.authorize(&mut source_mkdir, false).unwrap();
+        let Request::Apply { ops, .. } = source_mkdir else {
+            unreachable!()
+        };
+        assert!(matches!(ops[0], Op::Mkdir { mode: 0o750, .. }));
         let mut source_mode = metadata(proto::flags::MODE);
         source_modes.authorize(&mut source_mode, false).unwrap();
         let mut receiver_mode = metadata(proto::flags::RECEIVER_MODE);
@@ -6574,19 +6587,18 @@ mod tests {
     }
 
     #[test]
-    fn receiver_managed_new_directory_preserves_receiver_inherited_setgid() {
+    fn receiver_managed_missing_root_preserves_receiver_umask_and_inherited_setgid() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
-        let parent = root.join("target/inheriting-parent");
-        let child = parent.join("child");
-        fs::create_dir_all(&parent).unwrap();
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o2755)).unwrap();
+        let target = root.join("target");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o2755)).unwrap();
         let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         authority.receiver_umask = 0o022;
 
         let mut mkdir = Request::Apply {
             ops: vec![Op::Mkdir {
-                path: child.as_os_str().as_bytes().to_vec(),
+                path: target.as_os_str().as_bytes().to_vec(),
                 mode: 0o7777,
                 condition: proto::TargetCondition::Any,
             }],
@@ -6605,11 +6617,11 @@ mod tests {
             .apply(ops, Some(guard))
             .into_iter()
             .all(|error| error.is_none()));
-        assert_eq!(fs::metadata(&child).unwrap().mode() & 0o7777, 0o2700);
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o2700);
 
         let mut metadata = Request::Apply {
             ops: vec![Op::SetMeta {
-                path: child.as_os_str().as_bytes().to_vec(),
+                path: target.as_os_str().as_bytes().to_vec(),
                 meta: proto::Meta {
                     // None of these source-proposed special bits are trusted.
                     mode: 0o7777,
@@ -6644,7 +6656,7 @@ mod tests {
             .apply(ops, Some(guard))
             .into_iter()
             .all(|error| error.is_none()));
-        assert_eq!(fs::metadata(&child).unwrap().mode() & 0o7777, 0o2755);
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o2755);
     }
 
     #[test]
