@@ -47,6 +47,19 @@ printf 'sdk/python/native-api.json\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" native true
 assert_scope "$scope" sdks true
+for sdk_script in \
+  scripts/check-python-api-sync.py \
+  scripts/normalize-python-sdist.py \
+  scripts/prepare-python-sdk-release.py \
+  scripts/select-trusted-pr.jq \
+  scripts/test-python-sdk-release-tools.sh
+do
+  printf '%s\n' "$sdk_script" >"$paths"
+  scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+  assert_scope "$scope" tooling true
+  assert_scope "$scope" sdks true
+  assert_scope "$scope" native false
+done
 printf 'tests/rsync-compat/LEDGER.md\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" conformance true
@@ -86,7 +99,8 @@ git -C "$scope_repo" init -b master -q
 git -C "$scope_repo" config user.name Test
 git -C "$scope_repo" config user.email test@example.com
 printf 'documentation\n' >"$scope_repo/README.md"
-git -C "$scope_repo" add README.md
+printf 'mapping\n' >"$scope_repo/MAPPINGS.md"
+git -C "$scope_repo" add README.md MAPPINGS.md
 git -C "$scope_repo" commit -qm base
 scope_base=$(git -C "$scope_repo" rev-parse HEAD)
 mkdir -p "$scope_repo/sdk/python"
@@ -120,6 +134,19 @@ scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
 for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
   assert_scope "$scope" "$key" false
 done
+
+# Rename detection must expose both the affected source and inert destination.
+git -C "$scope_repo" switch -qc rename "$scope_base"
+mkdir "$scope_repo/docs"
+git -C "$scope_repo" mv MAPPINGS.md docs/mappings.md
+git -C "$scope_repo" commit -qm rename
+rename_head=$(git -C "$scope_repo" rev-parse HEAD)
+jq -n --arg base "$advanced_base" --arg head "$rename_head" \
+  '{pull_request:{base:{sha:$base},head:{sha:$head}}}' >"$scope_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
+assert_scope "$scope" mapping_docs true
+assert_scope "$scope" native false
+assert_scope "$scope" sdks false
 
 push_event="$work/push-event.json"
 jq -n --arg before "$scope_head" --arg after "$advanced_base" \

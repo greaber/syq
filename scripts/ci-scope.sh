@@ -53,7 +53,9 @@ elif [ -n "$event_path" ] && [ -f "$event_path" ]; then
     || { echo "CI scope base commit is unavailable: $base" >&2; exit 1; }
   git cat-file -e "$head^{commit}" 2>/dev/null \
     || { echo "CI scope head commit is unavailable: $head" >&2; exit 1; }
-  changed_paths=$(git diff --name-only "$diff_range")
+  # Classify both sides of a rename so moving an affected input into an
+  # otherwise inert directory cannot hide its former dependency boundary.
+  changed_paths=$(git diff --no-renames --name-only "$diff_range")
 else
   echo "usage: $0 GITHUB_EVENT_PATH" >&2
   exit 2
@@ -106,6 +108,10 @@ while IFS= read -r path; do
       conformance=true
       ;;
     .github/workflows/prepare-python-sdk.yml|.github/workflows/publish-sdks.yml|.github/workflows/python-api-sync.yml)
+      tooling=true
+      sdks=true
+      ;;
+    scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/prepare-python-sdk-release.py|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh)
       tooling=true
       sdks=true
       ;;

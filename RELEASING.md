@@ -257,11 +257,11 @@ and reports any additional integration tests justified by the change.
 
 Every native push to `master` runs the complete native, SDK, conformance, ARM,
 and macOS suites. Workflow concurrency cancels an older run when a newer commit
-arrives on the same pull request. Master runs are retained because a later push
-may affect a different subsystem and therefore cannot safely replace the
-earlier push's selected suites. A release candidate must be the exact commit
-whose post-merge checks completed; release preflight rejects a canceled or
-superseded commit.
+arrives on the same pull request. Each non-PR run has a unique concurrency
+group, including while it is pending, because a later push may affect a
+different subsystem and therefore cannot safely replace the earlier push's
+selected suites. A release candidate must be the exact commit whose post-merge
+checks completed; release preflight rejects a canceled or superseded commit.
 
 The checked-in classifier uses a pull request's merge-base diff rather than
 including unrelated base-branch changes. Documentation-only changes finish
