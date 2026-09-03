@@ -5058,14 +5058,21 @@ fn publish_partial_rooted(
         TargetCondition::Any => root.rename_regular_if_same(source, target, staged_identity),
         TargetCondition::Absent => root.publish_new_regular(source, target, staged_identity),
         TargetCondition::Matches { dev, ino } => {
-            root.replace_regular_if_same(source, target, dev, ino, None)
+            root.replace_regular_if_same(source, target, staged_identity, dev, ino, None)
         }
         TargetCondition::MatchesFingerprint {
             dev,
             ino,
             ctime,
             ctime_nsec,
-        } => root.replace_regular_if_same(source, target, dev, ino, Some((ctime, ctime_nsec))),
+        } => root.replace_regular_if_same(
+            source,
+            target,
+            staged_identity,
+            dev,
+            ino,
+            Some((ctime, ctime_nsec)),
+        ),
     }
 }
 
