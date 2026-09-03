@@ -10867,3 +10867,68 @@ fn native_cp_dry_summary_and_terminal_record_count_the_same_directories() {
         .unwrap();
     assert_eq!(terminal["directories_created"], 1);
 }
+
+#[test]
+fn native_remote_results_withhold_terminal_on_lost_exit_status() {
+    let t = Tmp::new();
+    let inner = fake_rsh(&t);
+    // An rsh whose transport "loses" the exit status: the remote command
+    // runs to completion (full stream relayed) but the wrapper exits 255,
+    // the way ssh reports its own transport failures.
+    let wrapper = t.path("lossy-rsh");
+    executable(
+        &wrapper,
+        format!("#!/bin/sh\n\"{}\" \"$@\"\nexit 255\n", inner.display()).as_bytes(),
+    );
+    write(&t.path("src"), b"held back");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&wrapper)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--run-at",
+            "target",
+            "--as",
+            &t.s("dst"),
+            "--results",
+            "-",
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("run with a lossy transport");
+
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("withholding the relayed terminal record"),
+        "{stderr}"
+    );
+    // The copy itself completed remotely; only the confirmation was lost.
+    assert_eq!(read(&t.path("dst")), b"held back");
+    // The stream must end unsettled: records relayed, but no terminal that
+    // the exit status could not confirm.
+    let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("results line is JSON"))
+        .collect();
+    assert!(!records.is_empty());
+    assert_eq!(records.first().unwrap()["type"], "run");
+    assert!(
+        records.iter().all(|record| record["type"] != "result"),
+        "terminal must be withheld"
+    );
+}

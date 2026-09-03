@@ -1064,9 +1064,11 @@ fn run_remote(
     let run = || {
         let mut cmd = make_command();
         cmd.stdin(Stdio::null()).stderr(Stdio::inherit());
-        if receipt_expectation.is_none() {
+        if receipt_expectation.is_none() && args.native_results.is_none() {
             // Nothing to intercept: leave stdout to the terminal or pipe the
-            // user gave us, bytes and all.
+            // user gave us, bytes and all. A results stream is relayed even
+            // without a receipt, so its terminal record can be withheld
+            // when the coordinator's exit status fails to confirm it.
             let status = cmd
                 .status()
                 .with_context(|| format!("spawn {:?}", rsh[0]))?;
@@ -1104,6 +1106,8 @@ fn run_remote(
         // transport failures); a custom shell that exits 23/25 itself would
         // be mistaken for the orchestrator.
         Some(c @ (23 | 25)) => Ok(c),
+        // These arms build Err values rather than bailing: every failure
+        // must pass through the held-terminal settlement below.
         Some(c) => {
             if args.rsh.is_none()
                 && !args.no_forward_agent
@@ -1111,21 +1115,43 @@ fn run_remote(
                 && !same_host
             {
                 if args.interface == Interface::Rsync {
-                    bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Retry with --relay, use --no-forward-agent with coordinator-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
+                    Err(anyhow::anyhow!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Retry with --relay, use --no-forward-agent with coordinator-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer")))
+                } else {
+                    Err(anyhow::anyhow!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --no-forward-agent with coordinator-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer")))
                 }
-                bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --no-forward-agent with coordinator-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
+            } else if args.interface == Interface::Rsync {
+                Err(anyhow::anyhow!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); if {coordinator_host} cannot reach the destination, retry with --relay"))
+            } else {
+                Err(anyhow::anyhow!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); {coordinator_host} may not be able to reach the peer endpoint"))
             }
-            if args.interface == Interface::Rsync {
-                bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); if {coordinator_host} cannot reach the destination, retry with --relay")
-            }
-            bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); {coordinator_host} may not be able to reach the peer endpoint")
         }
-        None => bail!("remote syq on {coordinator_host} killed by signal"),
+        None => Err(anyhow::anyhow!(
+            "remote syq on {coordinator_host} killed by signal"
+        )),
     };
+    // A held line that is not actually a terminal record is ordinary
+    // output and is always released. A genuine terminal is released only
+    // when the coordinator's exit status, the record's own exit_code, and
+    // (when expected) the receipt all confirm it — otherwise the stream
+    // ends without a terminal record, the documented unknown-outcome
+    // signal, rather than with a result the transport or receipt could
+    // not vouch for.
+    let terminal_exit_code = held_terminal.as_deref().and_then(|line| {
+        serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .filter(|record| record["type"] == "result")
+            .map(|record| record["exit_code"].as_i64())
+    });
     let code = match outcome {
         Ok(code) => code,
         Err(error) => {
-            release_held_line(held_terminal)?;
+            if terminal_exit_code.is_some() {
+                eprintln!(
+                    "syq: withholding the relayed terminal record: the coordinator's exit status did not confirm it"
+                );
+            } else {
+                release_held_line(held_terminal)?;
+            }
             return Err(error);
         }
     };
@@ -1138,16 +1164,7 @@ fn run_remote(
             code == 0,
             args.verbose > 0,
         ) {
-            // Drop the held line only when it really is the terminal
-            // record: a stream whose receipt failed verification must not
-            // end in a trustworthy-looking result, and the missing terminal
-            // is the documented unknown-outcome signal. Anything else is
-            // released untouched.
-            let genuine_terminal = held_terminal.as_deref().is_some_and(|line| {
-                serde_json::from_slice::<serde_json::Value>(line)
-                    .is_ok_and(|record| record["type"] == "result")
-            });
-            if genuine_terminal {
+            if terminal_exit_code.is_some() {
                 eprintln!(
                     "syq: withholding the relayed terminal record: the receipt did not verify"
                 );
@@ -1155,6 +1172,17 @@ fn run_remote(
                 release_held_line(held_terminal)?;
             }
             return Err(error);
+        }
+    }
+    if let Some(advertised) = terminal_exit_code {
+        if advertised != Some(i64::from(code)) {
+            // Same struct drives both on the coordinator, so any mismatch
+            // means corruption or mangling in between.
+            eprintln!(
+                "syq: withholding the relayed terminal record: it advertises exit code {} but the coordinator exited {code}",
+                advertised.map_or_else(|| "none".to_string(), |c| c.to_string())
+            );
+            bail!("the relayed terminal record disagrees with the coordinator exit status");
         }
     }
     release_held_line(held_terminal)?;
