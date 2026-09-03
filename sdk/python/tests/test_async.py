@@ -14,9 +14,9 @@ from unittest import mock
 import syq
 
 try:
-    from test_native import FAKE_NATIVE
+    from test_native import FAKE_NATIVE, full_nonblocking_pipe
 except ModuleNotFoundError:
-    from sdk.python.tests.test_native import FAKE_NATIVE
+    from sdk.python.tests.test_native import FAKE_NATIVE, full_nonblocking_pipe
 
 
 RAW_PROCESS = r"""#!/usr/bin/env python3
@@ -117,6 +117,21 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertFalse(self.argv_log.exists())
+
+    async def test_results_rejects_a_nonblocking_sink_without_progress(
+        self,
+    ) -> None:
+        read_fd, sink = full_nonblocking_pipe()
+        try:
+            self.assertIsNone(sink.write(b"x"))
+            with self.assertRaisesRegex(
+                syq.SyqOutputError,
+                "nonblocking results sinks are unsupported",
+            ):
+                await self.client.cp("source", into="target", results=sink)
+        finally:
+            sink.close()
+            os.close(read_fd)
 
     async def test_results_preserves_receiver_attested_records(self) -> None:
         output = io.BytesIO()

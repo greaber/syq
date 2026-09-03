@@ -163,7 +163,10 @@ def _write_all(stream: BinaryIO, data: bytes) -> None:
     while offset < len(data):
         written = stream.write(data[offset:])
         if written is None:
-            return
+            raise SyqOutputError(
+                "results.write() made no progress; nonblocking results sinks "
+                "are unsupported"
+            )
         if (
             not isinstance(written, int)
             or isinstance(written, bool)

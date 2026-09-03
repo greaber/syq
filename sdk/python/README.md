@@ -72,9 +72,12 @@ with open("run.ndjson", "wb") as records:
     result = syq.cp("data", into="backup", results=records)
 ```
 
-The SDK flushes but never closes the object. Typed calls receive automation
-records through native `--results-fd`; stdout is not treated as machine output.
-Callers that need native `--results FILE` path behavior can use `run()`.
+The object must report positive byte counts for non-empty writes. Nonblocking
+sinks that return `None` when full are rejected so an incomplete result stream
+cannot appear successful. The SDK flushes but never closes the object. Typed
+calls receive automation records through native `--results-fd`; stdout is not
+treated as machine output. Callers that need native `--results FILE` path
+behavior can use `run()`.
 
 Asyncio applications use the same command names and result types. Native
 asyncio subprocesses keep the event loop responsive; async callbacks are

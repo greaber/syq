@@ -166,6 +166,22 @@ raise SystemExit(exit_code)
 """
 
 
+def full_nonblocking_pipe() -> tuple[int, io.FileIO]:
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_blocking(write_fd, False)
+        while True:
+            try:
+                os.write(write_fd, b"x" * 64 * 1024)
+            except BlockingIOError:
+                break
+        return read_fd, os.fdopen(write_fd, "wb", buffering=0)
+    except BaseException:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
+
+
 class NativeClientTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -269,6 +285,19 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("source", into="target", results=io.StringIO())
 
         self.assertFalse(self.argv_log.exists())
+
+    def test_results_rejects_a_nonblocking_sink_without_progress(self) -> None:
+        read_fd, sink = full_nonblocking_pipe()
+        try:
+            self.assertIsNone(sink.write(b"x"))
+            with self.assertRaisesRegex(
+                syq.SyqOutputError,
+                "nonblocking results sinks are unsupported",
+            ):
+                self.client.cp("source", into="target", results=sink)
+        finally:
+            sink.close()
+            os.close(read_fd)
 
     def test_results_preserves_receiver_attested_records(self) -> None:
         output = io.BytesIO()
