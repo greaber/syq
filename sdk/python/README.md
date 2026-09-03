@@ -1,18 +1,19 @@
 # syq for Python
 
-`syq` is the official Python client for the
-[syq parallel file copier](https://github.com/greaber/syq). It invokes syq with
-an argument array and never constructs a shell command. The typed API mirrors
-native `cp`, including `cp --prune`, and `map`. Commands without an automation
-result stream, including `rm`, remain available through `run`.
+The official Python client for [syq](https://github.com/greaber/syq), a fast
+file transfer tool. Call `syq.cp(...)` (including `cp --prune`) and
+`syq.map(...)` and get typed results back; anything else syq can do, such as
+`rm`, is one `syq.run([...])` away.
 
 ```sh
 python -m pip install syq
 ```
 
-Package installation does not download an executable. The first call that
-needs syq downloads the exact release pinned by this SDK into the user cache.
-For Python package `0.0.3`, that release is syq `0.1.8`.
+Installing the package does not install syq itself. The first call downloads
+the syq release this package was tested with into your user cache, checks it
+against the signed release manifest, and uses that binary from then on.
+For Python package `0.0.3`, that release is syq `0.1.8`. syq always runs as a
+subprocess with an argument list, never through a shell.
 
 ```python
 import syq
