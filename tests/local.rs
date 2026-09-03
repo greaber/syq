@@ -10584,7 +10584,7 @@ fn native_map_refusals() {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(stderr.contains(needle), "stderr for {args:?}: {stderr}");
     };
-    refuse(&["/etc"], "root-relative");
+    refuse(&["/etc"], "mapping source base");
     refuse(&["--src-src", "d1", "--src-src", "d2"], "only selector");
     refuse(&["--src-src", "d1", "d2"], "only selector");
     refuse(&["d1/n", "d2/n"], "same destination name");
