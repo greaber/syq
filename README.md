@@ -241,28 +241,40 @@ containment guarantee for copy. Native `rm` retains the resolved directories
 and selected identities through mutation. Copy resolves and registers every
 selected source before destination mutation, and every source worker claims
 those exact directory or parent descriptors during authenticated startup,
-before it reports readiness. Source jobs and requests already carry the
-resulting opaque root ID plus strict relative bytes. This is deliberately
-inert transitional vocabulary: ordinary source scans, stats, hashes, and reads
-still execute the parallel legacy pathname field, and the registered reference
-is not an allowlist or confinement boundary yet. Worker startup validates the
-ticket/root correspondence and retains the exact descriptor; the source-role,
-request-reference, and descriptor-relative access boundary lands with the
-source-operation cutover. Copy also gives
+before it reports readiness. Source discovery and metadata stats, including
+retry checks, use the resulting opaque root ID plus strict relative bytes as
+their authority. They do not reopen the operator spelling or follow descendant
+symlinks; a selected file authorizes only that exact leaf, not siblings beneath
+its retained parent. The endpoint registry and every initialized worker also
+keep that selected object open, so the pin remains valid even if the control
+connection exits first. Exact-symlink target bytes are snapshotted through the
+opened symlink object and never reread through its mutable directory name.
+Replacing an exact selected leaf is an error, while changed-source retry remains
+available for entries beneath a selected directory. On macOS this
+descriptor-bound symlink operation requires macOS 13 or newer; older releases
+fail source registration rather than fall back to a name-based read. Source
+content hashing, range/small reads, local-copy source opens, and the same-machine
+self-copy canonical-path check still use legacy pathnames and are the remaining
+source-confinement work.
+This is therefore not yet a complete hostile-namespace guarantee for source
+file contents. Copy also gives
 every destination worker the selected directory descriptor; destination
 observation, directory and special-file creation, metadata changes, and
 planned non-recursive deletion are relative to that descriptor. Destination
 scanning, including the walk that plans `--delete`, is relative to it too and
 never follows descendant symlinks.
-Source registration does not change `--files-from`'s documented treatment of
-symlinks in listed or implied paths; that policy is settled with the source-read
-cutover rather than by worker initialization.
+Rsync-mode `--insecure-links` is the explicit compatibility opt-out: that
+session uses the legacy unconfined pathname discovery path, including traversal
+through symlinked `--files-from` ancestors. Native mapping/generated names never
+inherit native `--follow`; they remain strict descendants of the registered
+source root.
 Registration also budgets the process's currently open descriptors, one
-retained descriptor per source root for the registry, control connection, and
-every worker that may share its process, plus conservative per-worker file
-cache and transport overhead. If the endpoint's open-file limit cannot hold
-that set, the copy fails before destination mutation with guidance to reduce
-selectors or `--connections`.
+retained parent descriptor per source root and one object descriptor per exact
+leaf for the registry, control connection, and every worker that may share its
+process, plus conservative per-worker file-cache, transport, and concurrent
+independent-worker broker-claim overhead. If the endpoint's open-file limit
+cannot hold that set, the copy fails before destination mutation with guidance
+to reduce selectors or `--connections`.
 Regular-file destination transfer state has not all moved to
 descriptor-relative access yet either. The default therefore rejects
 links present during preflight, while the remaining containment work must also
@@ -564,6 +576,7 @@ accept them.
 | `--max-size SIZE`, `--min-size SIZE` | Don't transfer regular files larger / smaller than SIZE |
 | `--files-from FILE` | Copy only the listed paths (relative to the one source directory; see below) |
 | `--from0` | `--files-from` entries are NUL-separated |
+| `--insecure-links` | Permit legacy unconfined traversal through symlinked source ancestors, including `--files-from` implied parents |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
 Like rsync, `-q` suppresses ordinary non-error output: progress, summaries,
@@ -1432,10 +1445,15 @@ the same command would transfer and nothing else.
 relative to the single source directory, to the same relative path under the
 destination. The source is not walked, which is the point on a slow
 filesystem when the list is known. Parent directories of listed paths are
-created (with their metadata). A parent that is a symlink on the source is
-followed — you named a path through it — and becomes a real directory on the
-destination, so nothing is ever written through a destination symlink; a
-parent that resolves to a file or dangles is an error. A listed directory is copied *without*
+created (with their metadata). By default, a parent that is a symlink on the
+source is not traversed and that listed path fails. This is deliberately
+stricter than hardened rsync 3.5.0: rsync may first emit the implied destination
+directory and then fail the content open, while SYQ refuses the path before
+emitting that implied parent. Both report a partial-transfer error (exit 23).
+`--insecure-links` opts the whole source session into the legacy unconfined
+pathname behavior: such a parent is followed and becomes a real directory on
+the destination. A parent that resolves to a file or dangles is an error. A
+listed directory is copied *without*
 its contents unless `-r` is given on the command line itself — `-a` alone
 does not count, as in rsync — so `-a -r --files-from` walks the directories
 the list names (never the implied parents).

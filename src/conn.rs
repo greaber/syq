@@ -42,7 +42,7 @@ pub trait Conn: Send {
     fn scan(
         &mut self,
         root: &[u8],
-        _source: Option<&RegisteredPath>,
+        source: Option<&RegisteredPath>,
         follow_root: bool,
         ignore: &[String],
         report_ignored: bool,
@@ -362,25 +362,42 @@ pub fn ok(resp: Response, what: &str) -> Result<Response> {
 pub struct LocalConn {
     ops: FsOps,
     pending: VecDeque<Response>,
-    is_control: bool,
+    role: LocalConnectionRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalConnectionRole {
+    Control,
+    SourceWorker,
+    DestinationWorker,
+}
+
+impl From<&ConnectionRole> for LocalConnectionRole {
+    fn from(role: &ConnectionRole) -> Self {
+        match role {
+            ConnectionRole::Control => Self::Control,
+            ConnectionRole::SourceWorker { .. } => Self::SourceWorker,
+            ConnectionRole::DestinationWorker { .. } => Self::DestinationWorker,
+        }
+    }
 }
 
 impl LocalConn {
     fn new(
-        is_control: bool,
+        role: &ConnectionRole,
         descriptor_session: crate::descriptor_broker::DescriptorSessionSlot,
     ) -> Self {
         LocalConn {
             ops: FsOps::with_descriptor_session(descriptor_session),
             pending: VecDeque::new(),
-            is_control,
+            role: role.into(),
         }
     }
 }
 
 impl Conn for LocalConn {
     fn send(&mut self, req: Request) -> Result<()> {
-        if !self.is_control
+        if self.role != LocalConnectionRole::Control
             && matches!(
                 &req,
                 Request::TcpListen { .. }
@@ -397,6 +414,12 @@ impl Conn for LocalConn {
             ));
             return Ok(());
         }
+        if self.role == LocalConnectionRole::SourceWorker && !req.allowed_on_source_worker() {
+            self.pending.push_back(Response::Err(
+                "request is not valid on a source worker".into(),
+            ));
+            return Ok(());
+        }
         let resp = self.ops.handle(&req);
         self.pending.push_back(resp);
         Ok(())
@@ -409,7 +432,7 @@ impl Conn for LocalConn {
     fn scan(
         &mut self,
         root: &[u8],
-        _source: Option<&RegisteredPath>,
+        source: Option<&RegisteredPath>,
         follow_root: bool,
         ignore: &[String],
         report_ignored: bool,
@@ -417,11 +440,27 @@ impl Conn for LocalConn {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
+        if let Some(source) = self.ops.source_scan_root(source)? {
+            return crate::scan::scan_descriptor(
+                source.root,
+                &source.relative,
+                source.expected_leaf,
+                false,
+                false,
+                ignore,
+                report_ignored,
+                sink,
+                ignored,
+                warn,
+            );
+        }
         if let Some((destination_root, relative)) = self.ops.destination_scan_root(root)? {
             return crate::scan::scan_descriptor(
                 destination_root,
                 &relative,
+                None,
                 follow_root,
+                true,
                 ignore,
                 report_ignored,
                 sink,
@@ -452,6 +491,9 @@ impl Conn for LocalConn {
         trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
         sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
     ) -> Result<()> {
+        if self.role != LocalConnectionRole::Control {
+            bail!("native removal is allowed only on the control connection");
+        }
         crate::native_rm::remove(
             cwd,
             root,
@@ -719,10 +761,13 @@ impl Drop for RemoteConn {
 /// unauthenticated ones, so each failed connect halves the limit (down to
 /// MIN_CONCURRENT_CONNECTS) for the rest of the run, and the retry then
 /// succeeds. The control connection bypasses this entirely.
-const START_CONCURRENT_CONNECTS: usize = 32;
+/// Hard upper bound on simultaneously establishing data connections. A source
+/// endpoint's descriptor broker therefore sees no more concurrent independent
+/// SSH worker claims than this, even when tuning warms a larger candidate set.
+pub(crate) const MAX_CONCURRENT_CONNECTS: usize = 32;
 const MIN_CONCURRENT_CONNECTS: usize = 4;
 static CONNECT_LIMIT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(START_CONCURRENT_CONNECTS);
+    std::sync::atomic::AtomicUsize::new(MAX_CONCURRENT_CONNECTS);
 static CONNECTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 static CONNECTS_CV: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -2151,10 +2196,7 @@ impl Endpoint {
                 // descriptors in process instead of claiming SCM_RIGHTS from
                 // the broker after worker threads exist (unsupported on
                 // Darwin).
-                let mut conn = LocalConn::new(
-                    matches!(&role, ConnectionRole::Control),
-                    descriptor_session.clone(),
-                );
+                let mut conn = LocalConn::new(&role, descriptor_session.clone());
                 match role {
                     ConnectionRole::DestinationWorker {
                         destination: Some(destination),
@@ -2256,7 +2298,9 @@ mod tests {
                     follow_root: false,
                 }],
                 symlink_policy: OperatorSymlinkPolicy::Refuse,
+                allow_unconfined_paths: false,
                 shared_workers: 1,
+                independent_claim_workers: 0,
             })
             .unwrap();
         let Response::SourceRootsRegistered(roots) = response else {
@@ -2273,6 +2317,85 @@ mod tests {
             .err()
             .expect("a fresh local endpoint must not share another session");
         assert!(format!("{error:#}").contains("connect to descriptor broker"));
+    }
+
+    #[test]
+    fn local_source_worker_rejects_destination_mutation_requests() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        let marker = selected.join("marker");
+        std::fs::write(&marker, b"marker").unwrap();
+        let endpoint = Endpoint::local();
+        let mut control = endpoint.connect_control(false).unwrap();
+        let response = control
+            .call(Request::RegisterSourceRoots {
+                selections: vec![SourceRootSelection {
+                    path: selected.as_os_str().as_bytes().to_vec(),
+                    follow_root: false,
+                }],
+                symlink_policy: OperatorSymlinkPolicy::Refuse,
+                allow_unconfined_paths: false,
+                shared_workers: 1,
+                independent_claim_workers: 0,
+            })
+            .unwrap();
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        let mut source = endpoint.connect_with_sources(false, roots).unwrap();
+        let response = source
+            .call(Request::Apply {
+                ops: vec![Op::Unlink {
+                    path: marker.as_os_str().as_bytes().to_vec(),
+                }],
+                guard: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(response, Response::Err(error) if error.contains("not valid on a source worker"))
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"marker");
+
+        let selection = [NativeRemoveSelection {
+            path: b"marker".to_vec(),
+            kind: NativeRemoveKind::File,
+        }];
+        let mut trace = |_| Ok(());
+        let mut sink = |_| Ok(());
+        let error = source
+            .native_remove(
+                Some(selected.as_os_str().as_bytes()),
+                None,
+                &selection,
+                false,
+                false,
+                1,
+                &mut trace,
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("only on the control connection"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"marker");
+
+        // Match the remote server's non-control gate for destination workers
+        // too; this direct trait method must not be a role bypass.
+        let role = ConnectionRole::DestinationWorker { destination: None };
+        let mut destination = LocalConn::new(&role, Default::default());
+        let error = destination
+            .native_remove(
+                Some(selected.as_os_str().as_bytes()),
+                None,
+                &selection,
+                false,
+                false,
+                1,
+                &mut trace,
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("only on the control connection"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"marker");
     }
 
     impl<R: Read> Read for ExitObserved<R> {

@@ -1,9 +1,10 @@
-//! Session-scoped directory registration and exact cross-process handoff.
+//! Session-scoped descriptor registration and exact cross-process handoff.
 //!
-//! A control process owns the registry and keeps every registered directory
-//! open. Threads in that process clone roots directly; independent workers use
-//! a private, secret-authenticated Unix socket and receive the same open file
-//! description with `SCM_RIGHTS`. No worker reopens an operator pathname.
+//! A control process owns the registry and keeps every registered root and
+//! exact source-leaf object open. Threads in that process clone descriptors
+//! directly; independent workers use a private, secret-authenticated Unix
+//! socket and receive the same open file descriptions with `SCM_RIGHTS`. No
+//! worker reopens an operator pathname.
 
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 use anyhow::{anyhow, bail, Context, Result};
@@ -23,7 +24,7 @@ use std::time::Duration;
 
 const CLAIM_MAGIC: &[u8; 8] = b"SYQFD001";
 const SECRET_LEN: usize = 32;
-const CLAIM_LEN: usize = CLAIM_MAGIC.len() + SECRET_LEN + size_of::<u64>();
+const CLAIM_LEN: usize = CLAIM_MAGIC.len() + SECRET_LEN + size_of::<u64>() + 1;
 const RESPONSE_OK: u8 = 0;
 const RESPONSE_REJECTED: u8 = 1;
 const RESPONSE_INTERNAL: u8 = 2;
@@ -50,6 +51,30 @@ impl RegisteredRootId {
 
 struct RegisteredRoot {
     directory: File,
+    source_leaf: Option<File>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum RegisteredDescriptorKind {
+    Directory,
+    SourceLeaf,
+}
+
+impl RegisteredDescriptorKind {
+    fn wire_byte(self) -> u8 {
+        match self {
+            Self::Directory => 0,
+            Self::SourceLeaf => 1,
+        }
+    }
+
+    fn from_wire_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Directory),
+            1 => Some(Self::SourceLeaf),
+            _ => None,
+        }
+    }
 }
 
 struct RegistryState {
@@ -93,6 +118,52 @@ impl RegisteredRootRegistry {
                 bail!("only directories may be registered as session roots");
             }
         }
+        self.register_entries(
+            directories
+                .into_iter()
+                .map(|directory| RegisteredRoot {
+                    directory,
+                    source_leaf: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn register_source_handles(
+        &self,
+        handles: Vec<(File, Option<File>)>,
+    ) -> Result<Vec<RegisteredRootId>> {
+        for (directory, source_leaf) in &handles {
+            let metadata = directory
+                .metadata()
+                .context("inspect source directory registered with descriptor session")?;
+            if !metadata.is_dir() {
+                bail!("source authority roots must be directories");
+            }
+            if let Some(source_leaf) = source_leaf {
+                let metadata = source_leaf
+                    .metadata()
+                    .context("inspect source leaf registered with descriptor session")?;
+                if metadata.is_dir() {
+                    bail!("exact source objects must not be directories");
+                }
+            }
+        }
+        self.register_entries(
+            handles
+                .into_iter()
+                .map(|(directory, source_leaf)| RegisteredRoot {
+                    directory,
+                    source_leaf,
+                })
+                .collect(),
+        )
+    }
+
+    fn register_entries(&self, roots: Vec<RegisteredRoot>) -> Result<Vec<RegisteredRootId>> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut state = self
             .state
             .lock()
@@ -100,7 +171,7 @@ impl RegisteredRootRegistry {
         let new_len = state
             .roots
             .len()
-            .checked_add(directories.len())
+            .checked_add(roots.len())
             .context("descriptor session root count overflow")?;
         if new_len > self.max_roots {
             bail!(
@@ -108,17 +179,17 @@ impl RegisteredRootRegistry {
                 self.max_roots
             );
         }
-        let count = u64::try_from(directories.len()).context("too many session roots")?;
+        let count = u64::try_from(roots.len()).context("too many session roots")?;
         let next_id = state
             .next_id
             .checked_add(count)
             .context("descriptor session exhausted root identifiers")?;
         let first_id = state.next_id;
         state.next_id = next_id;
-        let mut ids = Vec::with_capacity(directories.len());
-        for (offset, directory) in directories.into_iter().enumerate() {
+        let mut ids = Vec::with_capacity(roots.len());
+        for (offset, root) in roots.into_iter().enumerate() {
             let id = RegisteredRootId(first_id + offset as u64);
-            state.roots.insert(id, RegisteredRoot { directory });
+            state.roots.insert(id, root);
             ids.push(id);
         }
         Ok(ids)
@@ -126,27 +197,39 @@ impl RegisteredRootRegistry {
 
     /// Used by local workers and TCP workers hosted by the control process.
     pub(crate) fn acquire(&self, id: RegisteredRootId) -> Result<File> {
-        self.acquire_optional(id)?
+        self.acquire_optional(id, RegisteredDescriptorKind::Directory)?
             .with_context(|| format!("unknown descriptor session root {}", id.0))
     }
 
-    fn acquire_optional(&self, id: RegisteredRootId) -> Result<Option<File>> {
+    fn acquire_optional(
+        &self,
+        id: RegisteredRootId,
+        kind: RegisteredDescriptorKind,
+    ) -> Result<Option<File>> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .roots
             .get(&id)
-            .map(|root| root.directory.try_clone())
+            .and_then(|root| match kind {
+                RegisteredDescriptorKind::Directory => Some(&root.directory),
+                RegisteredDescriptorKind::SourceLeaf => root.source_leaf.as_ref(),
+            })
+            .map(File::try_clone)
             .transpose()
-            .context("duplicate registered session root")
+            .context("duplicate registered session descriptor")
     }
 
-    fn contains(&self, id: RegisteredRootId) -> bool {
+    fn contains(&self, id: RegisteredRootId, kind: RegisteredDescriptorKind) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .roots
-            .contains_key(&id)
+            .get(&id)
+            .is_some_and(|root| match kind {
+                RegisteredDescriptorKind::Directory => true,
+                RegisteredDescriptorKind::SourceLeaf => root.source_leaf.is_some(),
+            })
     }
 }
 
@@ -156,6 +239,7 @@ pub struct DescriptorTicket {
     socket_path: Vec<u8>,
     secret: [u8; SECRET_LEN],
     root_id: RegisteredRootId,
+    kind: RegisteredDescriptorKind,
 }
 
 impl std::fmt::Debug for DescriptorTicket {
@@ -164,6 +248,7 @@ impl std::fmt::Debug for DescriptorTicket {
             .debug_struct("DescriptorTicket")
             .field("socket_path", &self.socket_path())
             .field("root_id", &self.root_id)
+            .field("kind", &self.kind)
             .finish_non_exhaustive()
     }
 }
@@ -175,6 +260,21 @@ impl DescriptorTicket {
 
     pub(crate) fn root_id(&self) -> RegisteredRootId {
         self.root_id
+    }
+
+    /// Tickets belong to the same endpoint session only when both the private
+    /// broker address and unguessable session secret match. Root IDs restart
+    /// per registry and therefore cannot establish this relationship alone.
+    pub(crate) fn same_session(&self, other: &Self) -> bool {
+        self.socket_path == other.socket_path && self.secret == other.secret
+    }
+
+    pub(crate) fn is_directory(&self) -> bool {
+        self.kind == RegisteredDescriptorKind::Directory
+    }
+
+    pub(crate) fn is_source_leaf(&self) -> bool {
+        self.kind == RegisteredDescriptorKind::SourceLeaf
     }
 
     #[cfg(test)]
@@ -228,13 +328,26 @@ impl DescriptorSession {
     }
 
     pub(crate) fn ticket(&self, root_id: RegisteredRootId) -> Result<DescriptorTicket> {
-        if !self.registry.contains(root_id) {
+        self.ticket_for(root_id, RegisteredDescriptorKind::Directory)
+    }
+
+    fn source_leaf_ticket(&self, root_id: RegisteredRootId) -> Result<DescriptorTicket> {
+        self.ticket_for(root_id, RegisteredDescriptorKind::SourceLeaf)
+    }
+
+    fn ticket_for(
+        &self,
+        root_id: RegisteredRootId,
+        kind: RegisteredDescriptorKind,
+    ) -> Result<DescriptorTicket> {
+        if !self.registry.contains(root_id, kind) {
             bail!("unknown descriptor session root {}", root_id.0);
         }
         Ok(DescriptorTicket {
             socket_path: self.broker.socket_path().as_os_str().as_bytes().to_vec(),
             secret: self.secret,
             root_id,
+            kind,
         })
     }
 
@@ -244,7 +357,9 @@ impl DescriptorSession {
         {
             bail!("descriptor ticket does not belong to this endpoint session");
         }
-        self.registry.acquire(ticket.root_id)
+        self.registry
+            .acquire_optional(ticket.root_id, ticket.kind)?
+            .with_context(|| format!("unknown descriptor session root {}", ticket.root_id.0))
     }
 }
 
@@ -305,6 +420,51 @@ impl DescriptorSessionSlot {
             .collect()
     }
 
+    /// Atomically register each source authority directory together with its
+    /// optional exact-leaf object. Both tickets share one opaque root ID but
+    /// carry distinct descriptor kinds, so neither can be substituted for the
+    /// other during worker initialization.
+    pub(crate) fn register_source_handles(
+        &self,
+        handles: Vec<(File, Option<File>)>,
+    ) -> Result<Vec<(DescriptorTicket, Option<DescriptorTicket>)>> {
+        if handles.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.closed.load(Ordering::Acquire) {
+            bail!("descriptor session is closed");
+        }
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            bail!("descriptor session is closed");
+        }
+        if session.is_none() {
+            *session = Some(DescriptorSession::start(
+                self.max_roots,
+                self.max_connections,
+            )?);
+        }
+        let session = session.as_ref().expect("descriptor session initialized");
+        let has_leaf: Vec<_> = handles.iter().map(|(_, leaf)| leaf.is_some()).collect();
+        session
+            .registry
+            .register_source_handles(handles)?
+            .into_iter()
+            .zip(has_leaf)
+            .map(|(root_id, has_leaf)| {
+                Ok((
+                    session.ticket(root_id)?,
+                    has_leaf
+                        .then(|| session.source_leaf_ticket(root_id))
+                        .transpose()?,
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) fn acquire(&self, ticket: &DescriptorTicket) -> Result<File> {
         let session = self
             .session
@@ -351,7 +511,10 @@ pub(crate) fn claim_descriptor(ticket: &DescriptorTicket) -> Result<File> {
     claim[..CLAIM_MAGIC.len()].copy_from_slice(CLAIM_MAGIC);
     let secret_start = CLAIM_MAGIC.len();
     claim[secret_start..secret_start + SECRET_LEN].copy_from_slice(&ticket.secret);
-    claim[secret_start + SECRET_LEN..].copy_from_slice(&ticket.root_id.0.to_be_bytes());
+    let root_start = secret_start + SECRET_LEN;
+    let root_end = root_start + size_of::<u64>();
+    claim[root_start..root_end].copy_from_slice(&ticket.root_id.0.to_be_bytes());
+    claim[root_end] = ticket.kind.wire_byte();
     stream.write_all(&claim)?;
 
     let (status, descriptor) = receive_descriptor(stream.as_raw_fd())?;
@@ -381,12 +544,18 @@ fn serve_claim(
         stream.write_all(&[RESPONSE_REJECTED])?;
         return Ok(());
     }
+    let root_start = secret_start + SECRET_LEN;
+    let root_end = root_start + size_of::<u64>();
     let root_id = RegisteredRootId(u64::from_be_bytes(
-        claim[secret_start + SECRET_LEN..]
+        claim[root_start..root_end]
             .try_into()
             .expect("claim root identifier has a fixed length"),
     ));
-    match registry.acquire_optional(root_id) {
+    let Some(kind) = RegisteredDescriptorKind::from_wire_byte(claim[root_end]) else {
+        stream.write_all(&[RESPONSE_REJECTED])?;
+        return Ok(());
+    };
+    match registry.acquire_optional(root_id, kind) {
         Ok(Some(directory)) => send_descriptor(stream.as_raw_fd(), directory.as_raw_fd())?,
         Ok(None) => stream.write_all(&[RESPONSE_REJECTED])?,
         Err(_) => stream.write_all(&[RESPONSE_INTERNAL])?,
@@ -585,6 +754,7 @@ mod tests {
                     .parse()
                     .unwrap(),
             ),
+            kind: RegisteredDescriptorKind::Directory,
         }
     }
 
@@ -627,6 +797,52 @@ mod tests {
             );
             assert_eq!(read_at(&directory, c"marker"), b"original");
         }
+    }
+
+    #[test]
+    fn source_parent_and_object_are_distinct_repeatable_capabilities() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = temp.path().join("selected");
+        std::fs::write(&selected, b"selected").unwrap();
+        let object = File::open(&selected).unwrap();
+        let object_identity = object.metadata().unwrap();
+        let session = DescriptorSessionSlot::default();
+        let mut registrations = session
+            .register_source_handles(vec![(File::open(temp.path()).unwrap(), Some(object))])
+            .unwrap();
+        let (directory_ticket, leaf_ticket) = registrations.remove(0);
+        let leaf_ticket = leaf_ticket.unwrap();
+        assert!(directory_ticket.is_directory());
+        assert!(leaf_ticket.is_source_leaf());
+        assert_eq!(directory_ticket.root_id(), leaf_ticket.root_id());
+        assert!(directory_ticket.same_session(&leaf_ticket));
+
+        // An empty slot takes the independent-worker SCM_RIGHTS path. Both
+        // kinds can be claimed repeatedly and each receipt is close-on-exec.
+        let fresh = DescriptorSessionSlot::default();
+        let directory = fresh.acquire(&directory_ticket).unwrap();
+        assert!(directory.metadata().unwrap().is_dir());
+        for object in [
+            fresh.acquire(&leaf_ticket).unwrap(),
+            fresh.acquire(&leaf_ticket).unwrap(),
+        ] {
+            let metadata = object.metadata().unwrap();
+            assert_eq!(
+                (metadata.dev(), metadata.ino()),
+                (object_identity.dev(), object_identity.ino())
+            );
+            assert_ne!(
+                unsafe { libc::fcntl(object.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+
+        let mut missing_object = session.register(File::open(temp.path()).unwrap()).unwrap();
+        missing_object.kind = RegisteredDescriptorKind::SourceLeaf;
+        assert!(claim_descriptor(&missing_object)
+            .unwrap_err()
+            .to_string()
+            .contains("rejected"));
     }
 
     #[test]

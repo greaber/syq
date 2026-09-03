@@ -1658,11 +1658,15 @@ impl RestrictedAuthority {
             }
             Request::Scan {
                 root,
+                source,
                 follow_root,
                 ignore,
                 guard,
                 ..
             } => {
+                if source.is_some() {
+                    bail!("source references are not valid on a command-restricted destination");
+                }
                 if *follow_root {
                     bail!("signed destination scans cannot follow a root symlink");
                 }
@@ -1681,10 +1685,14 @@ impl RestrictedAuthority {
             }
             Request::StatMany {
                 paths,
+                sources,
                 follow,
                 guard,
                 ..
             } => {
+                if sources.is_some() {
+                    bail!("source references are not valid on a command-restricted destination");
+                }
                 if *follow {
                     bail!("signed destination stat cannot follow symlinks");
                 }
@@ -6297,11 +6305,28 @@ mod tests {
                 follow_root: false,
             }],
             symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
             shared_workers: 0,
+            independent_claim_workers: 0,
         };
         let error = authority.authorize(&mut request, true).unwrap_err();
         assert!(error
             .to_string()
             .contains("not valid on a root-confined receiver"));
+
+        let session = crate::descriptor_broker::DescriptorSessionSlot::default();
+        let ticket = session.register(fs::File::open(&root).unwrap()).unwrap();
+        let mut scan = Request::Scan {
+            root: root.as_os_str().as_bytes().to_vec(),
+            source: Some(proto::RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap()),
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: false,
+            guard: None,
+        };
+        let error = authority.authorize(&mut scan, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("source references are not valid"));
     }
 }

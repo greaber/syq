@@ -1341,12 +1341,52 @@ fn open_operator_symlink_at(parent: RawFd, name: &CString) -> Result<Option<File
 }
 
 fn operator_read_link_at(parent: RawFd, name: &CString) -> Result<Vec<u8>> {
+    read_link_bytes(|target, capacity| unsafe {
+        libc::readlinkat(parent, name.as_ptr(), target, capacity)
+    })
+}
+
+/// Read raw target bytes through an already-open symlink object. `None` means
+/// the running platform lacks a descriptor-bound API; security-sensitive
+/// callers must fail closed instead of reopening the symlink by name.
+pub(crate) fn read_open_symlink(object: &File) -> Result<Option<Vec<u8>>> {
+    #[cfg(target_os = "linux")]
+    {
+        let empty = c"";
+        read_link_bytes(|target, capacity| unsafe {
+            libc::readlinkat(object.as_raw_fd(), empty.as_ptr(), target, capacity)
+        })
+        .map(Some)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `freadlink` was added in macOS 13. Resolve it dynamically so a binary
+        // that otherwise runs on an older release does not gain a hard loader
+        // dependency. Callers reject `None` rather than re-address by name.
+        type Freadlink =
+            unsafe extern "C" fn(libc::c_int, *mut libc::c_char, libc::size_t) -> libc::ssize_t;
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"freadlink".as_ptr()) };
+        if symbol.is_null() {
+            return Ok(None);
+        }
+        let freadlink: Freadlink = unsafe { std::mem::transmute(symbol) };
+        read_link_bytes(|target, capacity| unsafe {
+            freadlink(object.as_raw_fd(), target, capacity)
+        })
+        .map(Some)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = object;
+        Ok(None)
+    }
+}
+
+fn read_link_bytes(mut read: impl FnMut(*mut libc::c_char, usize) -> isize) -> Result<Vec<u8>> {
     let mut capacity = 256usize;
     loop {
         let mut target = Vec::<u8>::with_capacity(capacity);
-        let length = unsafe {
-            libc::readlinkat(parent, name.as_ptr(), target.as_mut_ptr().cast(), capacity)
-        };
+        let length = read(target.as_mut_ptr().cast(), capacity);
         if length < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -1502,7 +1542,7 @@ fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
     })
 }
 
-fn root_metadata_from_std(metadata: &std::fs::Metadata) -> Result<RootMetadata> {
+pub(crate) fn root_metadata_from_std(metadata: &std::fs::Metadata) -> Result<RootMetadata> {
     Ok(RootMetadata {
         dev: metadata.dev(),
         ino: metadata.ino(),

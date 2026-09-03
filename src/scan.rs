@@ -1,8 +1,11 @@
 //! Parallel directory walk producing `Entry` batches in parent-before-child order.
 
-use crate::fsops::{join, lstat_entry, path_bytes, rooted_entry, rooted_entry_in_directory};
+use crate::fsops::{
+    join, lstat_entry, path_bytes, require_source_leaf_identity, rooted_entry_in_directory,
+    rooted_source_entry,
+};
 use crate::proto::ContainerGuard;
-use crate::proto::{Entry, PathBytes};
+use crate::proto::{Entry, PathBytes, SourceLeafIdentity};
 use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -243,6 +246,7 @@ fn produce_descriptor_scan(
     root: Arc<Root>,
     scan_root: PathBytes,
     scan_root_metadata: RootMetadata,
+    hold_destination_for_test: bool,
     ignore: Option<Gitignore>,
     report_ignored: bool,
     tx: SyncSender<ScanChunk>,
@@ -260,12 +264,14 @@ fn produce_descriptor_scan(
         if directory.opened.is_some() {
             retained_directories -= 1;
         }
-        if let Err(error) = hold_descriptor_directory_for_test(&directory.relative) {
-            chunk.push(ScanEvent::Warning(format!(
-                "scan: {}: {error:#}",
-                String::from_utf8_lossy(&directory.relative)
-            )));
-            break;
+        if hold_destination_for_test {
+            if let Err(error) = hold_descriptor_directory_for_test(&directory.relative) {
+                chunk.push(ScanEvent::Warning(format!(
+                    "scan: {}: {error:#}",
+                    String::from_utf8_lossy(&directory.relative)
+                )));
+                break;
+            }
         }
         let rooted_directory = match RelativePath::new(&join(&scan_root, &directory.relative)) {
             Ok(directory) => directory,
@@ -536,14 +542,16 @@ pub fn scan(
     Ok(())
 }
 
-/// Walk a destination subtree beneath an already-adopted authority root. The
+/// Walk a subtree beneath an already-adopted endpoint authority root. The
 /// request supplies only a strict path relative to that root; no pathname is
 /// reconstructed and descendant symlinks are reported rather than traversed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_descriptor(
     root: Arc<Root>,
     scan_root: &[u8],
+    expected_root: Option<SourceLeafIdentity>,
     follow_root: bool,
+    hold_destination_for_test: bool,
     ignore: &[String],
     report_ignored: bool,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
@@ -551,11 +559,23 @@ pub(crate) fn scan_descriptor(
     warn: &mut dyn FnMut(String),
 ) -> Result<()> {
     if follow_root {
-        anyhow::bail!("a descriptor-rooted destination scan never follows a root symlink");
+        anyhow::bail!("a descriptor-rooted scan never follows a root symlink");
     }
     let scan_relative = RelativePath::new(scan_root)?;
     let metadata = root.metadata(&scan_relative)?;
-    let root_entry = rooted_entry(&root, &scan_relative, Vec::new(), metadata)?;
+    if let Some(expected) = expected_root.as_ref() {
+        require_source_leaf_identity(expected, metadata)?;
+    }
+    let root_entry = rooted_source_entry(
+        &root,
+        &scan_relative,
+        Vec::new(),
+        metadata,
+        expected_root.as_ref(),
+    )?;
+    if let Some(expected) = expected_root.as_ref() {
+        require_source_leaf_identity(expected, root.metadata(&scan_relative)?)?;
+    }
     if root_entry.kind != crate::proto::Kind::Dir {
         return sink(vec![root_entry]);
     }
@@ -570,7 +590,15 @@ pub(crate) fn scan_descriptor(
     let producer = std::thread::Builder::new()
         .name("syq-descriptor-scan-producer".into())
         .spawn(move || {
-            produce_descriptor_scan(root, scan_root, metadata, matcher, report_ignored, tx)
+            produce_descriptor_scan(
+                root,
+                scan_root,
+                metadata,
+                hold_destination_for_test,
+                matcher,
+                report_ignored,
+                tx,
+            )
         })
         .context("start descriptor scan producer")?;
     let received = receive_scan(
@@ -751,6 +779,8 @@ mod tests {
         scan_descriptor(
             root,
             b"",
+            None,
+            false,
             false,
             &[],
             true,

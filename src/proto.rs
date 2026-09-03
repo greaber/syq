@@ -17,6 +17,10 @@ const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
 const HASH_RESPONSE_OVERHEAD: u64 = 24;
 const COMPRESS_MIN: usize = 512;
 const COMPRESS_LEVEL: i32 = 1;
+#[cfg(target_os = "linux")]
+const MODE_SYMLINK: u32 = libc::S_IFLNK;
+#[cfg(not(target_os = "linux"))]
+const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
 
 pub fn hash_response_fits(block: u64, len: u64) -> bool {
     if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
@@ -32,12 +36,10 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
 
-/// Transitional, syntactically strict descriptor-relative path vocabulary.
+/// A syntactically strict descriptor-relative source path.
 ///
-/// In the initialization-only protocol this is carried beside a legacy
-/// pathname but is deliberately inert: it neither authorizes nor confines the
-/// operation. The source-operation cutover will make the registered reference
-/// authoritative after the worker has acquired its corresponding ticket.
+/// Source discovery and stat operations use this reference as their authority;
+/// the parallel legacy pathname is only a display/compatibility spelling.
 #[derive(Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredPath {
     pub(crate) root: RegisteredRootId,
@@ -345,19 +347,76 @@ pub struct DestinationRoot {
     pub request_prefix: PathBytes,
 }
 
+/// Serialized identity of one exact non-directory source selection. The
+/// descriptor session and every initialized worker keep the originally opened
+/// object alive while workers use this identity to reject a replaced name
+/// beneath the retained parent. Symlink targets are snapshotted through that
+/// opened object and are never reread through the mutable name.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct SourceLeafIdentity {
+    pub dev: u64,
+    pub ino: u64,
+    pub file_type: u32,
+    pub symlink_target: Option<PathBytes>,
+}
+
 /// One operator source selection registered by the endpoint control session.
 /// `selection` is either empty beneath a selected directory or a literal leaf
 /// beneath its selected parent.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RegisteredSourceRoot {
     pub ticket: DescriptorTicket,
+    /// Present only for an exact non-directory selection. This typed ticket
+    /// names the original selected object, not its containing directory.
+    pub leaf_ticket: Option<DescriptorTicket>,
     pub selection: RegisteredPath,
+    /// Present only for an exact leaf. Every worker acquires and retains its
+    /// own clone of `leaf_ticket` before acknowledging readiness, preventing
+    /// identity reuse even if the control connection exits first.
+    pub expected_leaf: Option<SourceLeafIdentity>,
+    /// Permit this explicitly opted-in rsync session to use legacy unconfined
+    /// source pathnames for `--insecure-links` compatibility.
+    pub allow_unconfined_paths: bool,
 }
 
 impl RegisteredSourceRoot {
     pub(crate) fn validate(&self) -> Result<()> {
+        if !self.ticket.is_directory() {
+            bail!("source root requires a directory descriptor ticket");
+        }
         if self.ticket.root_id() != self.selection.root() {
             bail!("source root ticket and registered path identify different roots");
+        }
+        let exact_leaf = !self.selection.relative.is_empty();
+        if exact_leaf != self.expected_leaf.is_some() || exact_leaf != self.leaf_ticket.is_some() {
+            bail!("source root leaf selection and expected identity disagree");
+        }
+        if exact_leaf && self.selection.relative.contains(&b'/') {
+            bail!("exact source leaf selection must be one literal component");
+        }
+        if let Some(expected) = &self.expected_leaf {
+            let is_symlink = expected.file_type == MODE_SYMLINK;
+            if is_symlink != expected.symlink_target.is_some() {
+                bail!("source leaf type and symlink target disagree");
+            }
+            if expected
+                .symlink_target
+                .as_ref()
+                .is_some_and(|target| target.len() > libc::PATH_MAX as usize * 2)
+            {
+                bail!("registered source symlink target is too long");
+            }
+        }
+        if let Some(ticket) = &self.leaf_ticket {
+            if !ticket.is_source_leaf() {
+                bail!("source leaf requires an exact-object descriptor ticket");
+            }
+            if ticket.root_id() != self.selection.root() {
+                bail!("source leaf ticket and registered path identify different roots");
+            }
+            if !ticket.same_session(&self.ticket) {
+                bail!("source parent and leaf tickets belong to different endpoint sessions");
+            }
         }
         Ok(())
     }
@@ -374,12 +433,13 @@ pub enum ConnectionRole {
     /// The one connection allowed to create endpoint-session capabilities and
     /// start its TCP data listener.
     Control,
-    /// A data connection reserved for reading a source endpoint. Request-time
-    /// source-role enforcement lands with the source-operation cutover.
+    /// A data connection reserved for reading a source endpoint. Discovery
+    /// and stat are confined to the registered roots; content reads are
+    /// migrated in a later protocol slice.
     SourceWorker {
-        /// Every registered source root is acquired before HelloOk. Local and
-        /// same-process TCP workers clone in process; a fresh SSH helper
-        /// finishes SCM_RIGHTS receipt while single-threaded.
+        /// Every registered parent and exact-object descriptor is acquired
+        /// before HelloOk. Local and same-process TCP workers clone in process;
+        /// a fresh SSH helper finishes SCM_RIGHTS receipt while single-threaded.
         roots: Vec<RegisteredSourceRoot>,
     },
     /// A data connection used to mutate a destination endpoint. Unrestricted
@@ -412,8 +472,8 @@ pub enum Request {
     /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
     Scan {
         root: PathBytes,
-        /// Inert registered spelling of `root`; the source scanner cutover
-        /// makes it authoritative.
+        /// Authoritative registered source reference. Its parallel `root`
+        /// spelling is used only by the explicit `--insecure-links` opt-out.
         source: Option<RegisteredPath>,
         follow_root: bool,
         ignore: Vec<String>,
@@ -434,8 +494,8 @@ pub enum Request {
     /// lstat each path; with `follow`, stat through symlinks instead.
     StatMany {
         paths: Vec<PathBytes>,
-        /// Inert registered spellings for source-side calls; these are not an
-        /// allowlist until the source stat cutover.
+        /// Authoritative registered source references. Parallel `paths` are
+        /// used only outside a source session or by `--insecure-links`.
         sources: Option<Vec<RegisteredPath>>,
         follow: bool,
         guard: Option<ContainerGuard>,
@@ -449,13 +509,20 @@ pub enum Request {
     },
     /// Resolve every operator source selection, then atomically register its
     /// opened directory or parent descriptor. Only a control connection may
-    /// create these endpoint-session capabilities.
+    /// create these endpoint-session capabilities, and it may do so only once
+    /// so every issued worker identity keeps its original pins alive.
     RegisterSourceRoots {
         selections: Vec<SourceRootSelection>,
         symlink_policy: OperatorSymlinkPolicy,
+        /// Explicit rsync compatibility opt-out. It permits legacy unconfined
+        /// source discovery only for the session created by this registration.
+        allow_unconfined_paths: bool,
         /// Maximum source workers that can share the control helper process.
         /// Zero still budgets the registry and control connection themselves.
         shared_workers: usize,
+        /// Maximum concurrent independent-worker claims against the control
+        /// process's private descriptor broker.
+        independent_claim_workers: usize,
     },
     /// Create the missing suffix retained by CheckOperatorDirectory, then
     /// return the selected directory's stable identity.
@@ -616,6 +683,25 @@ pub enum Request {
     /// ends the grant's mutation authority.
     Receipt,
     Shutdown,
+}
+
+impl Request {
+    /// Requests an authenticated source-worker connection may execute. Keep
+    /// this protocol boundary shared by remote dispatch and the in-process
+    /// adapter so choosing a local endpoint cannot grant mutation authority.
+    pub(crate) fn allowed_on_source_worker(&self) -> bool {
+        matches!(
+            self,
+            Request::Scan { .. }
+                | Request::StatMany { .. }
+                | Request::HashBlocks { .. }
+                | Request::ReadRange { .. }
+                | Request::ReadSmallBatch(_)
+                | Request::FileHash { .. }
+                | Request::TransportStats
+                | Request::Shutdown
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

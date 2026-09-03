@@ -6,8 +6,8 @@ use crate::descriptor_broker::{
 };
 use crate::proto::*;
 use crate::rooted::{
-    OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root, RootIdentity,
-    RootMetadata,
+    read_open_symlink, root_metadata_from_std, OperatorFinalComponent, OperatorResolver,
+    PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -700,6 +700,38 @@ pub(crate) fn rooted_entry(
     Ok(entry_from_root_metadata(path, metadata, kind, link))
 }
 
+/// Build an entry for a registered source. An exact symlink's target is the
+/// descriptor-bound registration snapshot: reading it through `relative`
+/// would let a same-inode A -> B -> A name race return B's target.
+pub(crate) fn rooted_source_entry(
+    root: &Root,
+    relative: &RelativePath,
+    path: PathBytes,
+    metadata: RootMetadata,
+    expected: Option<&SourceLeafIdentity>,
+) -> Result<Entry> {
+    let Some(expected) = expected else {
+        return rooted_entry(root, relative, path, metadata);
+    };
+    require_source_leaf_identity(expected, metadata)?;
+    if metadata.is_symlink() {
+        let target = expected
+            .symlink_target
+            .clone()
+            .context("registered source symlink is missing its pinned target")?;
+        return Ok(entry_from_root_metadata(
+            path,
+            metadata,
+            Kind::Symlink,
+            Some(target),
+        ));
+    }
+    if expected.symlink_target.is_some() {
+        bail!("registered non-symlink source carries a symlink target");
+    }
+    rooted_entry(root, relative, path, metadata)
+}
+
 /// Build an entry relative to a directory already opened by a descriptor
 /// scanner. Symlink target reads and the confirming stat use that same parent
 /// descriptor, so neither operation has to rewalk a possibly renamed path.
@@ -787,22 +819,29 @@ fn source_descriptor_requirement(
     current_open: usize,
     root_count: usize,
     shared_workers: usize,
+    independent_workers: usize,
 ) -> Result<usize> {
-    // Registry + control connection retain each root. Every shared local/TCP
-    // worker retains another descriptor; independent SSH workers pay that
-    // one-root-set cost in their own process. Add live process descriptors and
-    // per-worker cache/transport state separately: a fixed reserve alone does
-    // not grow with concurrency and can admit a setup that later hits EMFILE.
+    // Conservatively treat every selection as an exact leaf. The registry,
+    // control connection, and each shared worker then retain both its parent
+    // and object. Independent SSH workers retain those descriptors in their
+    // own processes, but each concurrent broker claim transiently costs this
+    // process an accepted socket, tracked socket clone, and descriptor clone.
     root_count
         .checked_mul(
             shared_workers
                 .checked_add(2)
                 .context("source worker count overflow")?,
         )
+        .and_then(|count| count.checked_mul(2))
         .and_then(|count| {
             SOURCE_SHARED_WORKER_FD_RESERVE
                 .checked_mul(shared_workers)
                 .and_then(|workers| count.checked_add(workers))
+        })
+        .and_then(|count| {
+            independent_workers
+                .checked_mul(3)
+                .and_then(|claims| count.checked_add(claims))
         })
         .and_then(|count| count.checked_add(SOURCE_FD_RESERVE))
         .and_then(|count| count.checked_add(current_open))
@@ -847,7 +886,11 @@ fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<usize> {
     Ok(open)
 }
 
-fn require_source_descriptor_capacity(root_count: usize, shared_workers: usize) -> Result<()> {
+fn require_source_descriptor_capacity(
+    root_count: usize,
+    shared_workers: usize,
+    independent_workers: usize,
+) -> Result<()> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -859,10 +902,15 @@ fn require_source_descriptor_capacity(root_count: usize, shared_workers: usize) 
         return Ok(());
     }
     let current_open = current_open_descriptor_count(limit.rlim_cur)?;
-    let required = source_descriptor_requirement(current_open, root_count, shared_workers)?;
+    let required = source_descriptor_requirement(
+        current_open,
+        root_count,
+        shared_workers,
+        independent_workers,
+    )?;
     if required as u128 > limit.rlim_cur as u128 {
         bail!(
-            "source setup needs about {required} open-file slots ({current_open} currently open) for {root_count} roots and {shared_workers} shared workers, but this endpoint permits {}; reduce the number of source selectors or use a smaller explicit --connections value",
+            "source setup needs about {required} open-file slots ({current_open} currently open) for {root_count} roots, {shared_workers} shared workers, and {independent_workers} independent workers, but this endpoint permits {}; reduce the number of source selectors or use a smaller explicit --connections value",
             limit.rlim_cur
         );
     }
@@ -878,6 +926,7 @@ pub struct FsOps {
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
+    allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
     initial_cwd: PathBuf,
@@ -890,10 +939,47 @@ struct HeldBasis {
 }
 
 struct SourceRootHandle {
-    _root: Arc<Root>,
-    /// Transitional selection spelling retained for the source-operation
-    /// cutover. It does not authorize the parallel legacy pathname yet.
-    _selection: PathBytes,
+    root: Arc<Root>,
+    /// Each worker retains its own exact-object clone for the entire worker
+    /// lifetime. It is not used for content I/O; it prevents inode reuse while
+    /// the literal name is checked against `expected_leaf`.
+    _leaf_object: Option<File>,
+    /// An empty selection authorizes the whole registered directory. A
+    /// non-empty selection is one exact leaf beneath the registered parent.
+    selection: PathBytes,
+    expected_leaf: Option<SourceLeafIdentity>,
+}
+
+struct RegisteredSourceTarget {
+    root: Arc<Root>,
+    relative: RelativePath,
+    expected_leaf: Option<SourceLeafIdentity>,
+}
+
+pub(crate) struct SourceScanRoot {
+    pub(crate) root: Arc<Root>,
+    pub(crate) relative: PathBytes,
+    pub(crate) expected_leaf: Option<SourceLeafIdentity>,
+}
+
+pub(crate) fn require_source_leaf_identity(
+    expected: &SourceLeafIdentity,
+    metadata: RootMetadata,
+) -> Result<()> {
+    if (metadata.dev, metadata.ino, metadata.file_type())
+        != (expected.dev, expected.ino, expected.file_type)
+    {
+        bail!(
+            "registered source leaf changed identity (expected {}:{} type {:#o}, found {}:{} type {:#o})",
+            expected.dev,
+            expected.ino,
+            expected.file_type,
+            metadata.dev,
+            metadata.ino,
+            metadata.file_type()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -936,6 +1022,7 @@ impl FsOps {
             operator_selection: None,
             descriptor_session,
             source_roots: HashMap::new(),
+            allow_unconfined_source_paths: false,
             destination_root: None,
             destination_prefix: None,
             initial_cwd: process_initial_cwd(),
@@ -1024,8 +1111,13 @@ impl FsOps {
         &mut self,
         selections: &[SourceRootSelection],
         symlink_policy: OperatorSymlinkPolicy,
+        allow_unconfined_paths: bool,
         shared_workers: usize,
+        independent_workers: usize,
     ) -> Result<Vec<RegisteredSourceRoot>> {
+        if !self.source_roots.is_empty() {
+            bail!("source roots are already registered on this control connection");
+        }
         if selections.is_empty() {
             bail!("source registration requires at least one selection");
         }
@@ -1035,7 +1127,7 @@ impl FsOps {
                 selections.len()
             );
         }
-        require_source_descriptor_capacity(selections.len(), shared_workers)?;
+        require_source_descriptor_capacity(selections.len(), shared_workers, independent_workers)?;
         let mut resolved = Vec::with_capacity(selections.len());
         for selection in selections {
             let path = resolve(&selection.path);
@@ -1058,11 +1150,31 @@ impl FsOps {
             match pinned {
                 PinnedPath::Directory(directory) => {
                     let (directory, _) = directory.into_parts();
-                    resolved.push((directory, Vec::new()));
+                    resolved.push((directory, Vec::new(), None, None));
                 }
                 PinnedPath::Leaf(leaf) => {
-                    let (parent, name, _, _) = leaf.into_parts();
-                    resolved.push((parent, name.as_bytes().to_vec()));
+                    let (parent, name, metadata, object) = leaf.into_parts();
+                    let object = object
+                        .context("this platform cannot retain the selected source leaf safely")?;
+                    let symlink_target = if metadata.is_symlink() {
+                        Some(
+                            read_open_symlink(&object)?
+                                .context("this platform cannot snapshot a selected source symlink through its pinned object (macOS 13 or newer is required on Darwin)")?,
+                        )
+                    } else {
+                        None
+                    };
+                    resolved.push((
+                        parent,
+                        name.as_bytes().to_vec(),
+                        Some(SourceLeafIdentity {
+                            dev: metadata.dev,
+                            ino: metadata.ino,
+                            file_type: metadata.file_type(),
+                            symlink_target,
+                        }),
+                        Some(object),
+                    ));
                 }
                 PinnedPath::Missing(_) => {
                     unreachable!("source resolution did not allow a missing suffix")
@@ -1070,25 +1182,47 @@ impl FsOps {
             }
         }
 
-        let relative: Vec<_> = resolved
+        let registrations: Vec<_> = resolved
             .iter()
-            .map(|(_, relative)| relative.clone())
+            .map(|(_, relative, expected_leaf, _)| (relative.clone(), expected_leaf.clone()))
             .collect();
-        let tickets = self.descriptor_session.register_many(
+        let tickets = self.descriptor_session.register_source_handles(
             resolved
                 .into_iter()
-                .map(|(directory, _)| directory)
+                .map(|(directory, _, _, object)| (directory, object))
                 .collect(),
         )?;
         let registered: Vec<_> = tickets
             .into_iter()
-            .zip(relative)
-            .map(|(ticket, relative)| {
+            .zip(registrations)
+            .map(|((ticket, leaf_ticket), (relative, expected_leaf))| {
                 let selection = RegisteredPath::new(ticket.root_id(), relative)?;
-                Ok(RegisteredSourceRoot { ticket, selection })
+                Ok(RegisteredSourceRoot {
+                    ticket,
+                    leaf_ticket,
+                    selection,
+                    expected_leaf,
+                    allow_unconfined_paths,
+                })
             })
             .collect::<Result<_>>()?;
         self.initialize_sources(&registered)?;
+        #[cfg(debug_assertions)]
+        {
+            if let Some(ready) = std::env::var_os("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE") {
+                fs::write(&ready, b"ready").with_context(|| {
+                    format!(
+                        "write source-registration-ready signal {}",
+                        Path::new(&ready).display()
+                    )
+                })?;
+            }
+            if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_SOURCE_ROOTS_MS") {
+                if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
+        }
         Ok(registered)
     }
 
@@ -1108,8 +1242,16 @@ impl FsOps {
             );
         }
         let mut roots = HashMap::with_capacity(sources.len());
+        let endpoint_ticket = &sources[0].ticket;
+        let allow_unconfined_paths = sources[0].allow_unconfined_paths;
         for source in sources {
             source.validate()?;
+            if !source.ticket.same_session(endpoint_ticket) {
+                bail!("source roots belong to different endpoint sessions");
+            }
+            if source.allow_unconfined_paths != allow_unconfined_paths {
+                bail!("source worker received inconsistent unconfined-path permissions");
+            }
             let id = source.selection.root();
             if roots.contains_key(&id) {
                 bail!(
@@ -1118,15 +1260,49 @@ impl FsOps {
                 );
             }
             let directory = self.descriptor_session.acquire(&source.ticket)?;
+            let leaf_object = match (&source.leaf_ticket, &source.expected_leaf) {
+                (Some(ticket), Some(expected)) => {
+                    let object = self.descriptor_session.acquire(ticket)?;
+                    let metadata = root_metadata_from_std(
+                        &object
+                            .metadata()
+                            .context("inspect registered exact source object")?,
+                    )?;
+                    require_source_leaf_identity(expected, metadata)?;
+                    match (metadata.is_symlink(), expected.symlink_target.as_ref()) {
+                        (true, Some(expected_target)) => {
+                            let target = read_open_symlink(&object)?.context(
+                                "this platform cannot validate a registered source symlink through its pinned object (macOS 13 or newer is required on Darwin)",
+                            )?;
+                            if &target != expected_target {
+                                bail!("registered source symlink target does not match its pinned capability");
+                            }
+                        }
+                        (true, None) => {
+                            bail!("registered source symlink capability is missing its target")
+                        }
+                        (false, Some(_)) => {
+                            bail!("registered non-symlink source carries a symlink target")
+                        }
+                        (false, None) => {}
+                    }
+                    Some(object)
+                }
+                (None, None) => None,
+                _ => bail!("source root leaf selection and object ticket disagree"),
+            };
             roots.insert(
                 id,
                 SourceRootHandle {
-                    _root: Arc::new(Root::from_directory(directory)?),
-                    _selection: source.selection.relative.clone(),
+                    root: Arc::new(Root::from_directory(directory)?),
+                    _leaf_object: leaf_object,
+                    selection: source.selection.relative.clone(),
+                    expected_leaf: source.expected_leaf.clone(),
                 },
             );
         }
         self.source_roots = roots;
+        self.allow_unconfined_source_paths = allow_unconfined_paths;
         Ok(())
     }
 
@@ -1134,7 +1310,79 @@ impl FsOps {
     fn source_root_identity(&self, id: RegisteredRootId) -> Option<RootIdentity> {
         self.source_roots
             .get(&id)
-            .map(|source| source._root.identity())
+            .map(|source| source.root.identity())
+    }
+
+    fn registered_source_target(&self, source: &RegisteredPath) -> Result<RegisteredSourceTarget> {
+        let handle = self
+            .source_roots
+            .get(&source.root())
+            .with_context(|| format!("unknown registered source root {}", source.root().get()))?;
+        if !handle.selection.is_empty() && source.relative != handle.selection {
+            bail!("registered source leaf does not authorize the requested path");
+        }
+        Ok(RegisteredSourceTarget {
+            root: handle.root.clone(),
+            relative: RelativePath::new(&source.relative)?,
+            expected_leaf: handle.expected_leaf.clone(),
+        })
+    }
+
+    /// Resolve a source scan to its retained root. Once source roots exist,
+    /// omission is never an implicit fallback: only a registration carrying
+    /// the explicit `--insecure-links` permission may use the legacy pathname.
+    pub(crate) fn source_scan_root(
+        &self,
+        source: Option<&RegisteredPath>,
+    ) -> Result<Option<SourceScanRoot>> {
+        if let Some(source) = source {
+            let target = self.registered_source_target(source)?;
+            return Ok(Some(SourceScanRoot {
+                root: target.root,
+                relative: source.relative.clone(),
+                expected_leaf: target.expected_leaf,
+            }));
+        }
+        if self.source_roots.is_empty() {
+            return Ok(None);
+        }
+        if self.allow_unconfined_source_paths {
+            return Ok(None);
+        }
+        bail!("source scan omitted its registered source reference")
+    }
+
+    /// A source worker never accepts destination-style caller guards. Those
+    /// guards carry a fresh pathname root and would otherwise bypass the
+    /// endpoint-session source capabilities, even on request variants whose
+    /// source-reference cutover has not landed yet.
+    pub(crate) fn validate_source_session_request(&self, request: &Request) -> Result<()> {
+        if self.source_roots.is_empty() {
+            return Ok(());
+        }
+        let has_guard = match request {
+            Request::Scan { guard, .. }
+            | Request::StatMany { guard, .. }
+            | Request::PartialPaths { guard, .. }
+            | Request::Apply { guard, .. }
+            | Request::PlanBatch { guard, .. }
+            | Request::ProbePartial { guard, .. }
+            | Request::Prepare { guard, .. }
+            | Request::HashAndHold { guard, .. }
+            | Request::FinishBasis { guard, .. }
+            | Request::SeedBasis { guard, .. }
+            | Request::HashBlocks { guard, .. }
+            | Request::WriteRange { guard, .. }
+            | Request::Finalize { guard, .. }
+            | Request::FileHash { guard, .. }
+            | Request::Canonicalize { guard, .. } => guard.is_some(),
+            Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_some()),
+            _ => false,
+        };
+        if has_guard {
+            bail!("an initialized source session rejects caller-supplied guards");
+        }
+        Ok(())
     }
 
     fn install_destination(&mut self, directory: File, request_prefix: &[u8]) -> Result<()> {
@@ -1487,6 +1735,64 @@ impl FsOps {
             };
             md.ok().map(|md| entry_from_meta(Vec::new(), &full, &md))
         })
+    }
+
+    fn stat_many_request(
+        &mut self,
+        paths: &[PathBytes],
+        sources: Option<&[RegisteredPath]>,
+        follow: bool,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Vec<Option<Entry>>> {
+        if guard.is_some() && sources.is_some() {
+            bail!("a guarded destination stat cannot carry source references");
+        }
+        if let Some(sources) = sources {
+            if sources.len() != paths.len() {
+                bail!("source stat capability count does not match path count");
+            }
+            let targets = sources
+                .iter()
+                .map(|source| self.registered_source_target(source))
+                .collect::<Result<Vec<_>>>()?;
+            // `follow` describes the legacy pathname request. A registered
+            // selection has already applied the operator-root policy, and no
+            // descendant component gains symlink-traversal authority here.
+            return parallel_map(&targets, |target| {
+                let Some(expected) = target.expected_leaf.as_ref() else {
+                    let Some(metadata) = target.root.metadata(&target.relative).ok() else {
+                        return Ok(None);
+                    };
+                    return Ok(
+                        rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok(),
+                    );
+                };
+                let metadata = target
+                    .root
+                    .metadata(&target.relative)
+                    .context("inspect registered source leaf")?;
+                require_source_leaf_identity(expected, metadata)?;
+                let entry = rooted_source_entry(
+                    &target.root,
+                    &target.relative,
+                    Vec::new(),
+                    metadata,
+                    Some(expected),
+                )?;
+                let after = target
+                    .root
+                    .metadata(&target.relative)
+                    .context("recheck registered source leaf")?;
+                require_source_leaf_identity(expected, after)?;
+                Ok(Some(entry))
+            })
+            .into_iter()
+            .collect();
+        }
+        if !self.source_roots.is_empty() && !self.allow_unconfined_source_paths {
+            bail!("source stat omitted its registered source references");
+        }
+        Ok(self.stat_many(paths, follow, guard))
     }
 
     pub fn partial_paths(
@@ -3598,6 +3904,9 @@ impl FsOps {
 
     /// Dispatch a request that has a single response (everything except Scan).
     pub fn handle(&mut self, req: &Request) -> Response {
+        if let Err(error) = self.validate_source_session_request(req) {
+            return Response::Err(errstr(&error));
+        }
         let req = match self.map_request(req) {
             Ok(req) => req,
             Err(error) => return Response::Err(errstr(&error)),
@@ -3614,14 +3923,12 @@ impl FsOps {
         let r: Result<Response> = match &req {
             Request::StatMany {
                 paths,
+                sources,
                 follow,
                 guard,
-                ..
-            } => Ok(Response::Stats(self.stat_many(
-                paths,
-                *follow,
-                guard.as_ref(),
-            ))),
+            } => self
+                .stat_many_request(paths, sources.as_deref(), *follow, guard.as_ref())
+                .map(Response::Stats),
             Request::CheckOperatorDirectory {
                 path,
                 allow_missing,
@@ -3633,9 +3940,17 @@ impl FsOps {
             Request::RegisterSourceRoots {
                 selections,
                 symlink_policy,
+                allow_unconfined_paths,
                 shared_workers,
+                independent_claim_workers,
             } => self
-                .register_source_roots(selections, *symlink_policy, *shared_workers)
+                .register_source_roots(
+                    selections,
+                    *symlink_policy,
+                    *allow_unconfined_paths,
+                    *shared_workers,
+                    *independent_claim_workers,
+                )
                 .map(Response::SourceRootsRegistered),
             Request::CreateOperatorDirectory {
                 mode,
@@ -4904,6 +5219,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("original"), b"original").unwrap();
         let identity = fs::metadata(&selected).unwrap();
         let session = DescriptorSessionSlot::default();
         let mut control = FsOps::with_descriptor_session(session.clone());
@@ -4913,28 +5229,50 @@ mod tests {
                 follow_root: false,
             }],
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
             shared_workers: 0,
+            independent_claim_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
         };
         let id = roots[0].selection.root();
 
-        fs::rename(&selected, temporary.path().join("moved")).unwrap();
-        fs::create_dir(&selected).unwrap();
+        let moved = temporary.path().join("moved");
+        let replacement = temporary.path().join("replacement");
+        fs::rename(&selected, &moved).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(replacement.join("replacement"), b"replacement").unwrap();
+        std::os::unix::fs::symlink(&replacement, &selected).unwrap();
 
         let mut shared = FsOps::with_descriptor_session(session);
         shared.initialize_sources(&roots).unwrap();
         let mut fresh = FsOps::new();
         fresh.initialize_sources(&roots).unwrap();
-        for worker in [&shared, &fresh] {
+        for worker in [&mut shared, &mut fresh] {
             let adopted = worker.source_root_identity(id).unwrap();
             assert_eq!((adopted.dev, adopted.ino), (identity.dev(), identity.ino()));
+            let original = roots[0].selection.join(b"original").unwrap();
+            let response = worker.handle(&Request::StatMany {
+                paths: vec![selected.join("original").as_os_str().as_bytes().to_vec()],
+                sources: Some(vec![original]),
+                follow: false,
+                guard: None,
+            });
+            assert!(matches!(response, Response::Stats(stats) if stats[0].is_some()));
+            let replacement = roots[0].selection.join(b"replacement").unwrap();
+            let response = worker.handle(&Request::StatMany {
+                paths: vec![selected.join("replacement").as_os_str().as_bytes().to_vec()],
+                sources: Some(vec![replacement]),
+                follow: false,
+                guard: None,
+            });
+            assert!(matches!(response, Response::Stats(stats) if stats[0].is_none()));
         }
         assert_ne!(
             (
-                fs::metadata(&selected).unwrap().dev(),
-                fs::metadata(&selected).unwrap().ino()
+                fs::metadata(&replacement).unwrap().dev(),
+                fs::metadata(&replacement).unwrap().ino()
             ),
             (identity.dev(), identity.ino())
         );
@@ -4961,7 +5299,9 @@ mod tests {
                 },
             ],
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
             shared_workers: 0,
+            independent_claim_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -4971,6 +5311,16 @@ mod tests {
         mismatched.selection = roots[1].selection.clone();
         let mut worker = FsOps::with_descriptor_session(session.clone());
         assert!(worker.initialize_sources(&[mismatched]).is_err());
+        assert!(worker.source_roots.is_empty());
+
+        let mut malformed = roots[0].clone();
+        malformed.expected_leaf = Some(SourceLeafIdentity {
+            dev: 1,
+            ino: 2,
+            file_type: 0,
+            symlink_target: None,
+        });
+        assert!(worker.initialize_sources(&[malformed]).is_err());
         assert!(worker.source_roots.is_empty());
 
         session.close();
@@ -4984,7 +5334,185 @@ mod tests {
     }
 
     #[test]
-    fn source_request_reference_is_inert_until_operation_cutover() {
+    fn source_initialization_rejects_missing_mistyped_and_cross_session_leaf_tickets() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let register = |control: &mut FsOps, path: &Path| {
+            let response = control.handle(&Request::RegisterSourceRoots {
+                selections: vec![SourceRootSelection {
+                    path: path.as_os_str().as_bytes().to_vec(),
+                    follow_root: false,
+                }],
+                symlink_policy: OperatorSymlinkPolicy::Refuse,
+                allow_unconfined_paths: false,
+                shared_workers: 0,
+                independent_claim_workers: 0,
+            });
+            let Response::SourceRootsRegistered(roots) = response else {
+                panic!("unexpected source registration response: {response:?}")
+            };
+            roots.into_iter().next().unwrap()
+        };
+
+        let mut first_control = FsOps::new();
+        let first_root = register(&mut first_control, &first);
+        let mut second_control = FsOps::new();
+        let second_root = register(&mut second_control, &second);
+        assert_eq!(
+            first_root.selection.root(),
+            second_root.selection.root(),
+            "independent registries should exercise coincident numeric IDs"
+        );
+
+        let mut worker = FsOps::new();
+        let mut missing = first_root.clone();
+        missing.leaf_ticket = None;
+        assert!(worker.initialize_sources(&[missing]).is_err());
+        assert!(worker.source_roots.is_empty());
+
+        let mut mistyped = first_root.clone();
+        mistyped.leaf_ticket = Some(mistyped.ticket.clone());
+        assert!(worker.initialize_sources(&[mistyped]).is_err());
+        assert!(worker.source_roots.is_empty());
+
+        let mut nested = first_root.clone();
+        nested.selection =
+            RegisteredPath::new(nested.selection.root(), b"nested/leaf".to_vec()).unwrap();
+        assert!(worker.initialize_sources(&[nested]).is_err());
+        assert!(worker.source_roots.is_empty());
+
+        let mut impossible_target = first_root.clone();
+        impossible_target
+            .expected_leaf
+            .as_mut()
+            .unwrap()
+            .symlink_target = Some(b"not-a-regular-file-property".to_vec());
+        assert!(worker.initialize_sources(&[impossible_target]).is_err());
+        assert!(worker.source_roots.is_empty());
+
+        let mut cross_session_pair = first_root.clone();
+        cross_session_pair.leaf_ticket = second_root.leaf_ticket.clone();
+        assert!(worker.initialize_sources(&[cross_session_pair]).is_err());
+        assert!(worker.source_roots.is_empty());
+
+        // All roots in one Hello must come from the same endpoint session,
+        // even when each root/leaf pair is internally consistent.
+        assert!(worker
+            .initialize_sources(&[first_root, second_root])
+            .is_err());
+        assert!(worker.source_roots.is_empty());
+    }
+
+    #[test]
+    fn independent_source_worker_keeps_exact_object_after_control_and_broker_close() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::write(&selected, b"original").unwrap();
+        let session = DescriptorSessionSlot::default();
+        let mut control = FsOps::with_descriptor_session(session.clone());
+        let response = control.handle(&Request::RegisterSourceRoots {
+            selections: vec![SourceRootSelection {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
+            shared_workers: 0,
+            independent_claim_workers: 1,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        let expected = roots[0].expected_leaf.clone().unwrap();
+
+        // An empty slot exercises the independent-worker broker claim path.
+        let mut worker = FsOps::new();
+        worker.initialize_sources(&roots).unwrap();
+        drop(control);
+        session.close();
+
+        let original = temporary.path().join("original-unlinked");
+        fs::rename(&selected, &original).unwrap();
+        fs::remove_file(&original).unwrap();
+        fs::write(&selected, b"replacement").unwrap();
+        let held = worker.source_roots[&roots[0].selection.root()]
+            ._leaf_object
+            .as_ref()
+            .unwrap()
+            .metadata()
+            .unwrap();
+        assert_eq!((held.dev(), held.ino()), (expected.dev, expected.ino));
+        assert_eq!(held.nlink(), 0);
+
+        let response = worker.handle(&Request::StatMany {
+            paths: vec![selected.as_os_str().as_bytes().to_vec()],
+            sources: Some(vec![roots[0].selection.clone()]),
+            follow: false,
+            guard: None,
+        });
+        assert!(matches!(
+            response,
+            Response::Err(error) if error.contains("registered source leaf changed identity")
+        ));
+    }
+
+    #[test]
+    fn repeated_source_registration_keeps_the_original_root_and_leaf_pin() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let mut control = FsOps::new();
+        let register = |path: &Path| Request::RegisterSourceRoots {
+            selections: vec![SourceRootSelection {
+                path: path.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
+            shared_workers: 0,
+            independent_claim_workers: 0,
+        };
+        let response = control.handle(&register(&first));
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        let original_id = roots[0].selection.root();
+        let expected = roots[0].expected_leaf.clone().unwrap();
+        assert_eq!(control.source_roots.len(), 1);
+        assert!(control.source_roots[&original_id]._leaf_object.is_some());
+
+        let response = control.handle(&register(&second));
+        assert!(matches!(
+            response,
+            Response::Err(error) if error.contains("already registered")
+        ));
+        assert_eq!(control.source_roots.len(), 1);
+        let pin = control.source_roots[&original_id]
+            ._leaf_object
+            .as_ref()
+            .unwrap();
+        let metadata = pin.metadata().unwrap();
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (expected.dev, expected.ino)
+        );
+
+        let response = control.handle(&Request::StatMany {
+            paths: vec![first.as_os_str().as_bytes().to_vec()],
+            sources: Some(vec![roots[0].selection.clone()]),
+            follow: false,
+            guard: None,
+        });
+        assert!(matches!(response, Response::Stats(stats) if stats[0].is_some()));
+    }
+
+    #[test]
+    fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
         let temporary = tempfile::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         fs::write(&selected, b"selected").unwrap();
@@ -4997,15 +5525,36 @@ mod tests {
                 follow_root: false,
             }],
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
             shared_workers: 0,
+            independent_claim_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
         };
         assert_eq!(roots[0].selection.relative, b"selected");
+        assert!(roots[0].expected_leaf.is_some());
+        assert!(control.source_roots[&roots[0].selection.root()]
+            ._leaf_object
+            .is_some());
 
         let mut worker = FsOps::with_descriptor_session(session);
         worker.initialize_sources(&roots).unwrap();
+        let response = worker.handle(&Request::StatMany {
+            // A contradictory display spelling cannot redirect the registered
+            // selected leaf.
+            paths: vec![temporary
+                .path()
+                .join("sibling")
+                .as_os_str()
+                .as_bytes()
+                .to_vec()],
+            sources: Some(vec![roots[0].selection.clone()]),
+            follow: false,
+            guard: None,
+        });
+        assert!(matches!(response, Response::Stats(stats) if stats[0].is_some()));
+
         let sibling = RegisteredPath::new(roots[0].selection.root(), b"sibling".to_vec()).unwrap();
         let response = worker.handle(&Request::StatMany {
             paths: vec![temporary
@@ -5014,28 +5563,238 @@ mod tests {
                 .as_os_str()
                 .as_bytes()
                 .to_vec()],
-            // This intentionally does not correspond to the legacy pathname.
-            // The field is syntax-only until the source-stat cutover; treating
-            // it as a partial allowlist would create a bypassable boundary.
             sources: Some(vec![sibling]),
             follow: false,
             guard: None,
         });
-        let Response::Stats(stats) = response else {
-            panic!("unexpected stat response: {response:?}")
+        assert!(matches!(response, Response::Err(error) if error.contains("does not authorize")));
+
+        let response = worker.handle(&Request::StatMany {
+            paths: vec![selected.as_os_str().as_bytes().to_vec()],
+            sources: None,
+            follow: false,
+            guard: None,
+        });
+        assert!(matches!(response, Response::Err(error) if error.contains("omitted")));
+
+        fs::rename(&selected, temporary.path().join("selected-original")).unwrap();
+        fs::write(&selected, b"replacement").unwrap();
+        let response = worker.handle(&Request::StatMany {
+            paths: vec![selected.as_os_str().as_bytes().to_vec()],
+            sources: Some(vec![roots[0].selection.clone()]),
+            follow: false,
+            guard: None,
+        });
+        assert!(matches!(
+            response,
+            Response::Err(error) if error.contains("registered source leaf changed identity")
+        ));
+    }
+
+    #[test]
+    fn source_scan_rejects_a_replaced_exact_symlink() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("target-a"), b"a").unwrap();
+        fs::write(temporary.path().join("target-b"), b"b").unwrap();
+        let selected = temporary.path().join("selected");
+        std::os::unix::fs::symlink("target-a", &selected).unwrap();
+        let session = DescriptorSessionSlot::default();
+        let mut control = FsOps::with_descriptor_session(session);
+        let response = control.handle(&Request::RegisterSourceRoots {
+            selections: vec![SourceRootSelection {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
+            shared_workers: 0,
+            independent_claim_workers: 0,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
         };
-        assert_eq!(stats.len(), 1);
-        assert!(stats[0].is_some());
+        assert!(control.source_roots[&roots[0].selection.root()]
+            ._leaf_object
+            .is_some());
+
+        let mut worker = FsOps::new();
+        worker.initialize_sources(&roots).unwrap();
+        fs::rename(&selected, temporary.path().join("selected-original")).unwrap();
+        std::os::unix::fs::symlink("target-b", &selected).unwrap();
+        let source = worker
+            .source_scan_root(Some(&roots[0].selection))
+            .unwrap()
+            .unwrap();
+        let error = crate::scan::scan_descriptor(
+            source.root,
+            &source.relative,
+            source.expected_leaf,
+            false,
+            false,
+            &[],
+            false,
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("registered source leaf changed identity"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_symlink_scan_uses_the_descriptor_bound_raw_target_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        let target = OsString::from_vec(b"raw-target-\xff".to_vec());
+        symlink(Path::new(&target), &selected).unwrap();
+        let session = DescriptorSessionSlot::default();
+        let mut control = FsOps::with_descriptor_session(session);
+        let response = control.handle(&Request::RegisterSourceRoots {
+            selections: vec![SourceRootSelection {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
+            shared_workers: 0,
+            independent_claim_workers: 1,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        assert_eq!(
+            roots[0]
+                .expected_leaf
+                .as_ref()
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some(target.as_bytes())
+        );
+
+        let mut worker = FsOps::new();
+        worker.initialize_sources(&roots).unwrap();
+        // Temporarily replace the name, then restore the original symlink
+        // object. The emitted target belongs to that pinned object; discovery
+        // never obtains it with readlinkat(parent, name).
+        let original = temporary.path().join("selected-original");
+        fs::rename(&selected, &original).unwrap();
+        symlink("different-target", &selected).unwrap();
+        fs::remove_file(&selected).unwrap();
+        fs::rename(&original, &selected).unwrap();
+
+        let source = worker
+            .source_scan_root(Some(&roots[0].selection))
+            .unwrap()
+            .unwrap();
+        let mut entries = Vec::new();
+        crate::scan::scan_descriptor(
+            source.root,
+            &source.relative,
+            source.expected_leaf,
+            false,
+            false,
+            &[],
+            false,
+            &mut |batch| {
+                entries.extend(batch);
+                Ok(())
+            },
+            &mut |_| Ok(()),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, Kind::Symlink);
+        assert_eq!(entries[0].link.as_deref(), Some(target.as_bytes()));
+    }
+
+    #[test]
+    fn source_stat_does_not_follow_intermediate_symlinks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret"), b"secret").unwrap();
+        std::os::unix::fs::symlink("../outside", selected.join("link")).unwrap();
+        let session = DescriptorSessionSlot::default();
+        let mut control = FsOps::with_descriptor_session(session.clone());
+        let response = control.handle(&Request::RegisterSourceRoots {
+            selections: vec![SourceRootSelection {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: false,
+            shared_workers: 0,
+            independent_claim_workers: 0,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        let secret = roots[0].selection.join(b"link/secret").unwrap();
+        let mut worker = FsOps::with_descriptor_session(session);
+        worker.initialize_sources(&roots).unwrap();
+        let response = worker.handle(&Request::StatMany {
+            paths: vec![selected.join("link/secret").as_os_str().as_bytes().to_vec()],
+            sources: Some(vec![secret]),
+            follow: true,
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::Stats(stats) if stats.len() == 1 && stats[0].is_none())
+        );
+    }
+
+    #[test]
+    fn source_legacy_stat_requires_explicit_unconfined_registration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        let sibling = temporary.path().join("sibling");
+        fs::write(&selected, b"selected").unwrap();
+        fs::write(&sibling, b"sibling").unwrap();
+        let session = DescriptorSessionSlot::default();
+        let mut control = FsOps::with_descriptor_session(session.clone());
+        let response = control.handle(&Request::RegisterSourceRoots {
+            selections: vec![SourceRootSelection {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            }],
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            allow_unconfined_paths: true,
+            shared_workers: 0,
+            independent_claim_workers: 0,
+        });
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        let mut worker = FsOps::with_descriptor_session(session);
+        worker.initialize_sources(&roots).unwrap();
+        let response = worker.handle(&Request::StatMany {
+            paths: vec![sibling.as_os_str().as_bytes().to_vec()],
+            sources: None,
+            follow: false,
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::Stats(stats) if stats.len() == 1 && stats[0].is_some())
+        );
     }
 
     #[test]
     fn source_descriptor_budget_accounts_for_registry_control_and_workers() {
         assert_eq!(SOURCE_SHARED_WORKER_FD_RESERVE, 16 + 5 + 1);
         assert_eq!(
-            source_descriptor_requirement(7, 4, 3).unwrap(),
-            7 + SOURCE_FD_RESERVE + 4 * 5 + SOURCE_SHARED_WORKER_FD_RESERVE * 3
+            source_descriptor_requirement(7, 4, 3, 2).unwrap(),
+            7 + SOURCE_FD_RESERVE + 2 * 4 * 5 + SOURCE_SHARED_WORKER_FD_RESERVE * 3 + 3 * 2
         );
-        assert!(source_descriptor_requirement(0, usize::MAX, usize::MAX).is_err());
+        assert!(source_descriptor_requirement(0, usize::MAX, usize::MAX, usize::MAX).is_err());
     }
 
     #[test]

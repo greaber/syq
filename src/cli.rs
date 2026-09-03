@@ -140,6 +140,9 @@ pub struct Args {
     /// Copy symlinks as symlinks
     #[arg(short = 'l', long)]
     pub links: bool,
+    /// Permit unconfined traversal through symlinked source ancestors
+    #[arg(long)]
+    pub insecure_links: bool,
     /// Preserve permissions
     #[arg(short = 'p', long)]
     pub perms: bool,

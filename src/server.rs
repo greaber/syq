@@ -173,6 +173,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         bail!("control role is not allowed on a TCP data connection");
     }
     let is_control = matches!(&role, ConnectionRole::Control);
+    let is_source_worker = matches!(&role, ConnectionRole::SourceWorker { .. });
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
     match &role {
         ConnectionRole::SourceWorker { .. } if authority.is_some() => {
@@ -253,6 +254,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
             ))?;
             continue;
         }
+        if is_source_worker && !req.allowed_on_source_worker() {
+            w.write_msg(&Response::Err(
+                "request is not valid on a source worker".into(),
+            ))?;
+            continue;
+        }
         let settlement = match &authority {
             Some(authority) => match authority.authorize(&mut req, over_ssh) {
                 Ok(settlement) => Some(settlement),
@@ -263,6 +270,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
             },
             None => None,
         };
+        if let Err(error) = ops.validate_source_session_request(&req) {
+            w.write_msg(&Response::Err(format!("{error:#}")))?;
+            continue;
+        }
         match &req {
             Request::WriteRange { data, .. } => {
                 blocks += 1;
@@ -355,13 +366,24 @@ fn serve<R: Read + Send + 'static, W: Write>(
             }
             Request::Scan {
                 root,
-                source: _,
+                source,
                 follow_root,
                 ignore,
                 report_ignored,
                 guard,
             } => {
                 let requested_root = root.clone();
+                let source_scan = if guard.is_none() {
+                    match ops.source_scan_root(source.as_ref()) {
+                        Ok(scan) => scan,
+                        Err(error) => {
+                            w.write_msg(&Response::Err(format!("{error:#}")))?;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let destination_scan = if guard.is_none() {
                     match ops.destination_scan_root(&root) {
                         Ok(scan) => scan,
@@ -415,11 +437,26 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         &mut ignored,
                         &mut |msg| warns.borrow_mut().push(msg),
                     )
+                } else if let Some(source) = source_scan {
+                    crate::scan::scan_descriptor(
+                        source.root,
+                        &source.relative,
+                        source.expected_leaf,
+                        false,
+                        false,
+                        &ignore,
+                        report_ignored,
+                        &mut sink,
+                        &mut ignored,
+                        &mut |msg| warns.borrow_mut().push(msg),
+                    )
                 } else if let Some((destination_root, relative)) = destination_scan {
                     crate::scan::scan_descriptor(
                         destination_root,
                         &relative,
+                        None,
                         follow_root,
+                        true,
                         &ignore,
                         report_ignored,
                         &mut sink,
@@ -779,6 +816,8 @@ impl<R: Read> Read for TimeoutOnce<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
 
     struct ExitObserved<R> {
         inner: R,
@@ -803,6 +842,8 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let selected = tempfile::tempdir().unwrap();
+        let marker = selected.path().join("marker");
+        std::fs::write(&marker, b"marker").unwrap();
         let descriptor_session = DescriptorSessionSlot::default();
         let ticket = descriptor_session
             .register(std::fs::File::open(selected.path()).unwrap())
@@ -810,6 +851,9 @@ mod tests {
         let source = RegisteredSourceRoot {
             selection: RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap(),
             ticket,
+            leaf_ticket: None,
+            expected_leaf: None,
+            allow_unconfined_paths: false,
         };
         let server_session = descriptor_session.clone();
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -852,6 +896,51 @@ mod tests {
             reader.read_msg::<Response>().unwrap(),
             Response::HelloOk { .. }
         ));
+        let selected_metadata = std::fs::metadata(selected.path()).unwrap();
+        let guard = ContainerGuard {
+            root: selected.path().as_os_str().as_bytes().to_vec(),
+            dev: selected_metadata.dev(),
+            ino: selected_metadata.ino(),
+        };
+        writer
+            .write_msg(&Request::Scan {
+                root: selected.path().as_os_str().as_bytes().to_vec(),
+                source: None,
+                follow_root: false,
+                ignore: Vec::new(),
+                report_ignored: false,
+                guard: Some(guard.clone()),
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(error) if error.contains("source session rejects caller-supplied guards")
+        ));
+        writer
+            .write_msg(&Request::Apply {
+                ops: vec![Op::Unlink {
+                    path: marker.as_os_str().as_bytes().to_vec(),
+                }],
+                guard: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(error) if error.contains("not valid on a source worker")
+        ));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"marker");
+        writer
+            .write_msg(&Request::StatMany {
+                paths: vec![selected.path().as_os_str().as_bytes().to_vec()],
+                sources: None,
+                follow: false,
+                guard: Some(guard),
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(error) if error.contains("source session rejects caller-supplied guards")
+        ));
         writer
             .write_msg(&Request::RegisterSourceRoots {
                 selections: vec![SourceRootSelection {
@@ -859,7 +948,9 @@ mod tests {
                     follow_root: false,
                 }],
                 symlink_policy: OperatorSymlinkPolicy::Refuse,
+                allow_unconfined_paths: false,
                 shared_workers: 0,
+                independent_claim_workers: 0,
             })
             .unwrap();
         assert!(matches!(
@@ -934,6 +1025,9 @@ mod tests {
         let source = RegisteredSourceRoot {
             selection: RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap(),
             ticket,
+            leaf_ticket: None,
+            expected_leaf: None,
+            allow_unconfined_paths: false,
         };
         owner.close();
 
