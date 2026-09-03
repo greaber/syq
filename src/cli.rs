@@ -1174,6 +1174,17 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
                 "--results cannot be used with --detach because the result stream would not remain attached"
             );
         }
+        // A dry run's traces and planned totals exist only on the
+        // coordinator, and a receiver receipt cannot attest a plan; until
+        // the coordinator's own stream can be relayed home (recorded
+        // follow-up), remote dry-run streams are refused up front.
+        let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
+        let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
+        if args.dry_run && src_remote && dst_remote && args.coordinate_at != CoordinateAt::Local {
+            bail!(
+                "--dry-run with --results needs a local coordinator for a remote-to-remote copy; pass --coordinate-at local to preview with the full trace stream"
+            );
+        }
     }
     Ok(args)
 }

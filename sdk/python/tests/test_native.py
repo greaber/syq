@@ -462,3 +462,110 @@ class NativeClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReceiverAttestedDecodingTests(unittest.TestCase):
+    def test_attested_records_decode_with_the_receiver_vocabulary(self) -> None:
+        from syq.protocol import AutomationDecoder
+
+        decoder = AutomationDecoder(prune=True, mapping=False, dry_run=False)
+        envelope = {"schema": "syq.automation", "schema_version": 1}
+        records = [
+            {
+                **envelope,
+                "seq": 0,
+                "type": "run",
+                "run_id": "attested",
+                "started_at": 1,
+                "syq_version": "0.0.0",
+                "mode": "cp",
+                "prune": True,
+                "mapping": False,
+                "dry_run": False,
+                "endpoints": [
+                    {"role": "source", "kind": "ssh", "host": "a"},
+                    {"role": "destination", "kind": "ssh", "host": "b"},
+                ],
+            },
+            {
+                **envelope,
+                "seq": 1,
+                "type": "operation_result",
+                "provenance": "receiver_attested",
+                "action": "set_metadata",
+                "scope": 0,
+                "dst": {"encoding": "utf-8", "value": "tree"},
+                "disposition": "succeeded",
+            },
+            {
+                **envelope,
+                "seq": 2,
+                "type": "operation_result",
+                "provenance": "receiver_attested",
+                "action": "observe_hash",
+                "kind": "file",
+                "scope": 0,
+                "dst": {"encoding": "utf-8", "value": "tree/a"},
+                "disposition": "observed",
+            },
+            {
+                **envelope,
+                "seq": 3,
+                "type": "final_state",
+                "provenance": "receiver_attested",
+                "scope": 0,
+                "dst": {"encoding": "utf-8", "value": "tree/a"},
+                "object": {
+                    "state": "present",
+                    "kind": "file",
+                    "size": 3,
+                    "metadata": {
+                        "mode": 0o644,
+                        "uid": 0,
+                        "gid": 0,
+                        "mtime": 1,
+                        "mtime_nsec": 0,
+                        "rdev": 0,
+                    },
+                    "digest": {"algorithm": "blake3", "value": "ab" * 32},
+                },
+            },
+            {
+                **envelope,
+                "seq": 4,
+                "type": "result",
+                "provenance": "receiver_attested",
+                "receipt_status": "clean",
+                "status": "success",
+                "exit_code": 0,
+                "dry_run": False,
+                "files_transferred": 1,
+                "files_unchanged": 0,
+                "files_excluded": 0,
+                "directories_created": 0,
+                "symlinks_created": 0,
+                "specials_created": 0,
+                "errors": 0,
+                "bytes_transferred": 3,
+                "bytes_unchanged": 0,
+                "elapsed_ms": 5,
+            },
+        ]
+        events = [
+            decoder.feed(json.dumps(record).encode()) for record in records
+        ]
+        metadata = events[1]
+        self.assertIsInstance(metadata, syq.OperationResult)
+        self.assertIs(metadata.action, syq.OperationAction.SET_METADATA)
+        self.assertIsNone(metadata.kind)
+        self.assertEqual(metadata.provenance, "receiver_attested")
+        observed = events[2]
+        self.assertIs(observed.disposition, syq.Disposition.OBSERVED)
+        final = events[3]
+        self.assertIsInstance(final, syq.FinalStateEvent)
+        self.assertIs(final.state, syq.FinalObjectState.PRESENT)
+        self.assertEqual(final.digest, "ab" * 32)
+        result = decoder.finish(0)
+        # Attested prune terminals carry no deletion totals.
+        self.assertIsNone(result.deletions_planned)
+        self.assertEqual(result.receipt_status, "clean")

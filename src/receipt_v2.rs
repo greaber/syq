@@ -889,7 +889,9 @@ pub(crate) fn emit_automation_records(
         "bytes_transferred": terminal.summary.transferred_bytes,
         "bytes_unchanged": 0,
         "elapsed_ms": elapsed_ms,
-        "deletions_completed": terminal.summary.deletions,
+        // No deletions_* aggregates: a receipt attests settled deletions as
+        // individual delete records, but planning and --max-delete blocking
+        // are coordinator concepts it cannot vouch for.
         "operations": terminal.summary.operations,
         "final_states": terminal.summary.final_states,
         "receipt_records": terminal.record_count,
@@ -934,6 +936,10 @@ fn outcome_name(code: OutcomeCodeV2) -> &'static str {
         OutcomeCodeV2::FileLifecycleIncomplete => "file_lifecycle_incomplete",
         OutcomeCodeV2::ObservationFailed => "observation_failed",
     }
+}
+
+pub(crate) fn receipt_status_label(status: ReceiptStatusV2) -> &'static str {
+    receipt_status_name(status)
 }
 
 fn receipt_status_name(status: ReceiptStatusV2) -> &'static str {

@@ -37,12 +37,30 @@ class OperationAction(_StringEnum):
     CREATE_SYMLINK = "create_symlink"
     CREATE_SPECIAL = "create_special"
     DELETE = "delete"
+    SET_METADATA = "set_metadata"
+    OBSERVE_HASH = "observe_hash"
 
 
 class Disposition(_StringEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     BLOCKED = "blocked"
+    INCOMPLETE = "incomplete"
+    OBSERVED = "observed"
+
+
+class ReceiptCode(_StringEnum):
+    NONE = "none"
+    EXECUTION_FAILED = "execution_failed"
+    AUTHORIZATION_REFUSED = "authorization_refused"
+    FILE_LIFECYCLE_INCOMPLETE = "file_lifecycle_incomplete"
+    OBSERVATION_FAILED = "observation_failed"
+
+
+class FinalObjectState(_StringEnum):
+    PRESENT = "present"
+    ABSENT = "absent"
+    OBSERVATION_FAILED = "observation_failed"
 
 
 class Retryability(_StringEnum):
@@ -256,7 +274,7 @@ class OperationResult:
     action: OperationAction
     dst: PathValue
     src: PathValue | None
-    kind: EntryKind
+    kind: EntryKind | None
     disposition: Disposition
     bytes: int | None
     attempts: int | None
@@ -264,6 +282,9 @@ class OperationResult:
     class_: ErrorClass | None
     os_kind: OsKind | None
     message: str | None
+    provenance: str | None = None
+    scope: int | None = None
+    code: ReceiptCode | None = None
     type: str = "operation_result"
 
     @property
@@ -274,7 +295,7 @@ class OperationResult:
         )
 
     def retry_entry(self) -> MappingEntry | None:
-        if not self.is_retryable or self.src is None:
+        if not self.is_retryable or self.src is None or self.kind is None:
             return None
         try:
             return MappingEntry(
@@ -294,7 +315,30 @@ class ErrorEvent:
     message: str
     class_: ErrorClass | None
     os_kind: OsKind | None
+    provenance: str | None = None
+    code: ReceiptCode | None = None
     type: str = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class FinalStateEvent:
+    """A receiver-attested closure-time observation of one touched path."""
+
+    schema: str
+    schema_version: int
+    seq: int
+    provenance: str
+    scope: int
+    dst: PathValue
+    state: FinalObjectState
+    kind: str | None
+    size: int | None
+    digest: str | None
+    symlink_target: PathValue | None
+    observation_error: str | None
+    code: ReceiptCode | None
+    message: str | None
+    type: str = "final_state"
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +362,8 @@ class OperationSummary:
     deletions_planned: int | None
     deletions_completed: int | None
     deletions_blocked: int | None
+    provenance: str | None = None
+    receipt_status: str | None = None
     type: str = "result"
 
 
@@ -332,6 +378,7 @@ AutomationEvent = (
     | TraceEvent
     | OperationResult
     | ErrorEvent
+    | FinalStateEvent
     | CpResult
 )
 

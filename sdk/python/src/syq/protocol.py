@@ -18,12 +18,15 @@ from .models import (
     EntryKind,
     ErrorClass,
     ErrorEvent,
+    FinalObjectState,
+    FinalStateEvent,
     MappingEntry,
     OperationAction,
     OperationResult,
     OperationStatus,
     OperationSummary,
     OsKind,
+    ReceiptCode,
     PathValue,
     ProgressEvent,
     Retryability,
@@ -279,7 +282,7 @@ class AutomationDecoder:
                 action=_enum(record, "action", OperationAction),
                 dst=_tagged(record.get("dst"), label="dst"),
                 src=_tagged(record["src"], label="src") if "src" in record else None,
-                kind=_enum(record, "kind", EntryKind),
+                kind=_optional_enum(record, "kind", EntryKind),
                 disposition=_enum(record, "disposition", Disposition),
                 bytes=_optional_integer(record, "bytes"),
                 attempts=_optional_integer(record, "attempts"),
@@ -287,6 +290,9 @@ class AutomationDecoder:
                 class_=_optional_enum(record, "class", ErrorClass),
                 os_kind=_optional_enum(record, "os_kind", OsKind),
                 message=_optional_string(record, "message"),
+                provenance=_optional_string(record, "provenance"),
+                scope=_optional_integer(record, "scope"),
+                code=_optional_enum(record, "code", ReceiptCode),
             )
         if record_type == "error":
             return ErrorEvent(
@@ -294,6 +300,33 @@ class AutomationDecoder:
                 message=_string(record, "message"),
                 class_=_optional_enum(record, "class", ErrorClass),
                 os_kind=_optional_enum(record, "os_kind", OsKind),
+                provenance=_optional_string(record, "provenance"),
+                code=_optional_enum(record, "code", ReceiptCode),
+            )
+        if record_type == "final_state":
+            state = record.get("object")
+            if not isinstance(state, dict):
+                raise SyqProtocolError("final_state record has no object")
+            digest = state.get("digest")
+            if digest is not None and not isinstance(digest, dict):
+                raise SyqProtocolError("final_state digest is not an object")
+            return FinalStateEvent(
+                **common,
+                provenance=_string(record, "provenance"),
+                scope=_integer(record, "scope"),
+                dst=_tagged(record.get("dst"), label="dst"),
+                state=_enum(state, "state", FinalObjectState),
+                kind=_optional_string(state, "kind"),
+                size=_optional_integer(state, "size"),
+                digest=digest.get("value") if digest else None,
+                symlink_target=(
+                    _tagged(state["symlink_target"], label="symlink_target")
+                    if "symlink_target" in state
+                    else None
+                ),
+                observation_error=_optional_string(state, "observation_error"),
+                code=_optional_enum(state, "code", ReceiptCode),
+                message=_optional_string(state, "message"),
             )
         if record_type == "result":
             status = _enum(record, "status", OperationStatus)
@@ -322,11 +355,20 @@ class AutomationDecoder:
                     "deletions_blocked",
                 )
             )
-            if self.run.prune and any(value is None for value in deletion_values):
+            attested = record.get("provenance") == "receiver_attested"
+            if attested:
+                # A receipt attests settled deletions as individual delete
+                # records; it cannot vouch for planning or --max-delete
+                # blocking, so attested terminals carry no deletion totals.
+                if any(value is not None for value in deletion_values):
+                    raise SyqProtocolError(
+                        "a receiver-attested result may not contain deletion totals"
+                    )
+            elif self.run.prune and any(value is None for value in deletion_values):
                 raise SyqProtocolError(
                     "a prune result must contain every deletion total"
                 )
-            if not self.run.prune and any(
+            elif not self.run.prune and any(
                 value is not None for value in deletion_values
             ):
                 raise SyqProtocolError(
@@ -350,6 +392,8 @@ class AutomationDecoder:
                 deletions_planned=deletion_values[0],
                 deletions_completed=deletion_values[1],
                 deletions_blocked=deletion_values[2],
+                provenance=_optional_string(record, "provenance"),
+                receipt_status=_optional_string(record, "receipt_status"),
             )
             self.result = result
             return result

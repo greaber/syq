@@ -10631,3 +10631,23 @@ fn native_remote_to_remote_carries_any_path_bytes_directly() {
         b"raw bytes travel"
     );
 }
+
+#[test]
+fn native_remote_dry_run_results_need_a_local_coordinator() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    // Traces and planned totals exist only on the coordinator; until its
+    // stream can be relayed home, a remote dry-run stream is refused in
+    // the usage lane.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "-n", "--from", "hostA", "--src", &t.s("src")])
+        .args(["--to", "hostB", "--as", &t.s("dst")])
+        .args(["--results", "r.ndjson"])
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("--coordinate-at local"), "{stderr}");
+    assert!(!t.path("r.ndjson").exists());
+}

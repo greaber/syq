@@ -32,14 +32,14 @@ fn receipt_settlement_outcome(
     refusals: u64,
     orchestrator_exit_code: i32,
 ) -> ReceiptSettlementOutcome {
+    // The receipt decides whether verification fails the run: a non-clean
+    // receipt against a coordinator that claimed success is a contradiction
+    // the exit code must surface.
     let rejects_receipt = refusals > 0
         || (receipt_status != crate::receipt_v2::ReceiptStatusV2::Clean
             && orchestrator_exit_code == 0);
-    let exit_code = if rejects_receipt {
-        1
-    } else {
-        orchestrator_exit_code
-    };
+    // Status first, then the exit code the automation contract pairs with
+    // it — the two can never disagree.
     let results_status = if receipt_status == crate::receipt_v2::ReceiptStatusV2::Incomplete {
         // An incomplete receipt stream can omit operations. Never describe it
         // as safe input for a per-entry retry, even when the coordinator also
@@ -47,10 +47,18 @@ fn receipt_settlement_outcome(
         "aborted"
     } else if refusals > 0 || orchestrator_exit_code == 25 {
         "refused"
-    } else if exit_code == 0 {
-        "success"
-    } else {
+    } else if receipt_status != crate::receipt_v2::ReceiptStatusV2::Clean
+        || orchestrator_exit_code == 23
+    {
         "partial"
+    } else {
+        "success"
+    };
+    let exit_code = match results_status {
+        "success" => 0,
+        "partial" => 23,
+        "refused" => 25,
+        _ => 1,
     };
     ReceiptSettlementOutcome {
         results_status,
@@ -137,15 +145,21 @@ impl Iterator for CapturedFrames<'_> {
 /// receipt marker lines to ourselves. Used only when a receipt is expected;
 /// other transfers inherit stdout untouched. V2 frames are decoded one line
 /// at a time and spooled rather than accumulated in memory.
-fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceiptV2>> {
-    relay_stdout_bounded(stdout)
+fn relay_stdout(
+    stdout: impl std::io::Read,
+    passthrough: bool,
+) -> Result<Option<CapturedReceiptV2>> {
+    relay_stdout_bounded(stdout, passthrough)
 }
 
 /// Streams every ordinary line straight through without holding more than
 /// one buffer of it, so a hostile orchestrator cannot make this machine
 /// buffer an arbitrarily long line; only a receipt line is collected, up to
 /// its protocol-specific limit.
-fn relay_stdout_bounded(stdout: impl std::io::Read) -> Result<Option<CapturedReceiptV2>> {
+fn relay_stdout_bounded(
+    stdout: impl std::io::Read,
+    passthrough: bool,
+) -> Result<Option<CapturedReceiptV2>> {
     let v2_prefix = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes();
     let decision_len = v2_prefix.len();
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
@@ -186,7 +200,7 @@ fn relay_stdout_bounded(stdout: impl std::io::Read) -> Result<Option<CapturedRec
                     decided = true;
                     if head.starts_with(v2_prefix) {
                         capturing = Some(head[v2_prefix.len()..].to_vec());
-                    } else {
+                    } else if passthrough {
                         out.write_all(&head)
                             .context("relay remote orchestrator output")?;
                     }
@@ -194,7 +208,7 @@ fn relay_stdout_bounded(stdout: impl std::io::Read) -> Result<Option<CapturedRec
                 }
             } else if let Some(payload) = capturing.as_mut() {
                 payload.extend_from_slice(segment);
-            } else {
+            } else if passthrough {
                 out.write_all(segment)
                     .context("relay remote orchestrator output")?;
             }
@@ -218,7 +232,7 @@ fn relay_stdout_bounded(stdout: impl std::io::Read) -> Result<Option<CapturedRec
     if !head.is_empty() {
         if head.starts_with(v2_prefix) {
             capturing = Some(head[v2_prefix.len()..].to_vec());
-        } else {
+        } else if passthrough {
             out.write_all(&head)
                 .context("relay remote orchestrator output")?;
         }
@@ -252,6 +266,7 @@ struct ReceiptSettlement<'a> {
     results: Option<&'a crate::results::ResultsWriter>,
     elapsed_ms: u64,
     verbose: bool,
+    quiet: bool,
 }
 
 fn settle_receipt(
@@ -281,6 +296,7 @@ fn settle_receipt_v2(
         results,
         elapsed_ms,
         verbose,
+        quiet,
     } = settlement;
     if !captured.ended {
         bail!("the receipt relayed through {src_host} has no terminal frame");
@@ -401,6 +417,26 @@ fn settle_receipt_v2(
             elapsed_ms,
         )
         .context("write receiver-attested --results stream")?;
+        // The human summary renders from the same verified terminal the
+        // machine just received (the coordinator's own narration was
+        // discarded by the relay), so the two can never disagree.
+        if !quiet {
+            let errors = terminal
+                .summary
+                .failed
+                .saturating_add(terminal.summary.incomplete)
+                .saturating_add(terminal.summary.refusals)
+                .saturating_add(terminal.summary.observation_failures);
+            println!(
+                "syq: receiver-attested: {} files published ({}), {} deleted, {} error(s); receipt {}; {}",
+                terminal.summary.published_files,
+                crate::progress::human(terminal.summary.transferred_bytes),
+                terminal.summary.deletions,
+                errors,
+                crate::receipt_v2::receipt_status_label(terminal.status),
+                outcome.results_status,
+            );
+        }
     }
     if let Some(message) = settlement_error {
         bail!(message);
@@ -1118,7 +1154,12 @@ fn run_remote(
         let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", rsh[0]))?;
         let stdout = child.stdout.take().expect("piped stdout");
         // Always reap the child, even when relaying its output failed.
-        let relayed = relay_stdout(stdout);
+        // When the attested stream will carry the run's records, the remote
+        // coordinator's human stdout is discarded: the summary a person
+        // reads is rendered locally from the same verified terminal the
+        // machine parses, never from the coordinator's pre-verification
+        // narration.
+        let relayed = relay_stdout(stdout, results.is_none());
         let status = child
             .wait()
             .with_context(|| format!("wait for {:?}", rsh[0]))?;
@@ -1167,6 +1208,7 @@ fn run_remote(
                 results: results.as_deref(),
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 verbose: args.verbose > 0,
+                quiet: args.quiet,
             },
         )?;
     }
@@ -1348,14 +1390,17 @@ mod tests {
     fn receipt_settlement_preserves_terminal_outcomes() {
         use crate::receipt_v2::ReceiptStatusV2::{Clean, Failed, Incomplete};
 
+        // Every (status, exit_code) pair matches the automation contract's
+        // table: success/0, partial/23, refused/25, aborted/1.
         let cases = [
             (Clean, 0, 0, "success", 0, false),
             (Clean, 0, 23, "partial", 23, false),
             (Clean, 0, 25, "refused", 25, false),
-            (Failed, 0, 0, "partial", 1, true),
-            (Failed, 1, 23, "refused", 1, true),
+            (Failed, 0, 0, "partial", 23, true),
+            (Failed, 0, 23, "partial", 23, false),
+            (Failed, 1, 23, "refused", 25, true),
             (Incomplete, 0, 0, "aborted", 1, true),
-            (Incomplete, 0, 23, "aborted", 23, false),
+            (Incomplete, 0, 23, "aborted", 1, false),
             (Incomplete, 1, 23, "aborted", 1, true),
         ];
         for (receipt_status, refusals, coordinator, status, exit_code, rejects) in cases {
@@ -1371,10 +1416,12 @@ mod tests {
         // Ordinary output streams through byte for byte, including bytes
         // that are not UTF-8; a stream with no receipt lines captures
         // nothing.
-        assert!(relay_stdout(b"plain\n".as_slice()).unwrap().is_none());
-        assert!(relay_stdout(b"syq: transferred 1 files\xff\r\n".as_slice())
-            .unwrap()
-            .is_none());
+        assert!(relay_stdout(b"plain\n".as_slice(), true).unwrap().is_none());
+        assert!(
+            relay_stdout(b"syq: transferred 1 files\xff\r\n".as_slice(), true)
+                .unwrap()
+                .is_none()
+        );
 
         // Marker lines are decoded and spooled as separate bounded frames,
         // not accumulated into one receipt allocation.
@@ -1403,7 +1450,7 @@ mod tests {
             );
             output.push(b'\n');
         }
-        let mut captured = relay_stdout(&output[..])
+        let mut captured = relay_stdout(&output[..], true)
             .unwrap()
             .expect("captured receipt v2 frames");
         let captured: Vec<Vec<u8>> = captured.frames().unwrap().map(Result::unwrap).collect();
@@ -1413,7 +1460,7 @@ mod tests {
         let mut oversized = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
         oversized.extend(std::iter::repeat_n(b'A', MAX_RECEIPT_V2_LINE_BYTES + 1));
         oversized.push(b'\n');
-        assert!(relay_stdout(oversized.as_slice()).is_err());
+        assert!(relay_stdout(oversized.as_slice(), true).is_err());
     }
 
     #[test]

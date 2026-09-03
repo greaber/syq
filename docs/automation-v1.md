@@ -50,7 +50,13 @@ verified account comes home. Without an enrollment there is no
 trusted channel, so the run fails (with a settled `failed` terminal
 record) unless `--coordinate-at local` explicitly routes the transfer
 through this machine — the relay topology is never chosen implicitly
-on the stream's behalf. `--results` is not available on
+on the stream's behalf. For attested runs the human summary is also
+rendered locally from the verified terminal (the coordinator's own
+narration is discarded), so the numbers a person reads and a machine
+parses come from the same verified record. `--dry-run` with
+`--results` needs a local coordinator today: traces and planned
+totals exist only on the coordinator, and a receipt cannot attest a
+plan (relaying the coordinator's own stream is a recorded follow-up). `--results` is not available on
 `syq map` (its stdout is the manifest format) or, yet, on other
 commands, and cannot be combined with `--detach`. `--dry-run`
 composes; see below. `--results` cannot be combined with `--detach`, because
@@ -184,7 +190,9 @@ terminal additionally carries `provenance`, the verified
 bookkeeping (`operations`, `final_states`, `receipt_records`); its
 aggregates cover receiver-visible work only — unchanged and excluded
 entries are orchestrator concepts a receipt cannot attest, and read
-as zero.
+as zero, and it carries no `deletions_*` totals even under `--prune`
+(settled deletions appear as individual `delete` records; planning
+and `--max-delete` blocking are coordinator concepts).
 
 The human summary is rendered from this same record, so the numbers a
 person reads and a machine parses cannot disagree.
