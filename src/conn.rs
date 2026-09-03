@@ -48,6 +48,7 @@ pub trait Conn: Send {
     fn scan(
         &mut self,
         root: &[u8],
+        source: Option<&RegisteredPath>,
         follow_root: bool,
         ignore: &[String],
         report_ignored: bool,
@@ -145,18 +146,6 @@ fn is_multiplexed_ssh_session_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<MultiplexedSshSessionError>())
-}
-
-fn worker_initialization_response(response: Response) -> Result<()> {
-    match response {
-        Response::Ok => Ok(()),
-        Response::Err(error) => Err(WorkerInitializationError(error).into()),
-        Response::EndpointError(error) => Err(WorkerInitializationError(error.message).into()),
-        other => Err(WorkerInitializationError(format!(
-            "unexpected worker initialization response {other:?}"
-        ))
-        .into()),
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -384,19 +373,65 @@ pub fn endpoint_error(error: WireError) -> anyhow::Error {
 pub struct LocalConn {
     ops: FsOps,
     pending: VecDeque<Response>,
+    role: LocalConnectionRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalConnectionRole {
+    Control,
+    SourceWorker,
+    DestinationWorker,
+}
+
+impl From<&ConnectionRole> for LocalConnectionRole {
+    fn from(role: &ConnectionRole) -> Self {
+        match role {
+            ConnectionRole::Control => Self::Control,
+            ConnectionRole::SourceWorker { .. } => Self::SourceWorker,
+            ConnectionRole::DestinationWorker { .. } => Self::DestinationWorker,
+        }
+    }
 }
 
 impl LocalConn {
-    pub fn new() -> Self {
+    fn new(
+        role: &ConnectionRole,
+        descriptor_session: crate::descriptor_broker::DescriptorSessionSlot,
+    ) -> Self {
         LocalConn {
-            ops: FsOps::new(),
+            ops: FsOps::with_descriptor_session(descriptor_session),
             pending: VecDeque::new(),
+            role: role.into(),
         }
     }
 }
 
 impl Conn for LocalConn {
     fn send(&mut self, req: Request) -> Result<()> {
+        if self.role != LocalConnectionRole::Control
+            && matches!(
+                &req,
+                Request::TcpListen { .. }
+                    | Request::NativeRemove { .. }
+                    | Request::CheckOperatorDirectory { .. }
+                    | Request::CheckOperatorDirectoryAncestry { .. }
+                    | Request::RegisterSourceRoots { .. }
+                    | Request::CreateOperatorDirectory { .. }
+                    | Request::AnchorDestination { .. }
+                    | Request::Receipt
+            )
+        {
+            self.pending.push_back(Response::Err(
+                "request is allowed only on the control connection".into(),
+            ));
+            return Ok(());
+        }
+        if self.role == LocalConnectionRole::SourceWorker && !req.allowed_on_source_worker() {
+            self.pending.push_back(Response::Err(
+                "request is not valid on a source worker".into(),
+            ));
+            return Ok(());
+        }
         let resp = self.ops.handle(&req);
         self.pending.push_back(resp);
         Ok(())
@@ -412,6 +447,7 @@ impl Conn for LocalConn {
     fn scan(
         &mut self,
         root: &[u8],
+        source: Option<&RegisteredPath>,
         follow_root: bool,
         ignore: &[String],
         report_ignored: bool,
@@ -419,6 +455,34 @@ impl Conn for LocalConn {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
+        if let Some(source) = self.ops.source_scan_root(source)? {
+            return crate::scan::scan_descriptor(
+                source.root,
+                &source.relative,
+                source.expected_leaf,
+                false,
+                false,
+                ignore,
+                report_ignored,
+                sink,
+                ignored,
+                warn,
+            );
+        }
+        if let Some((destination_root, relative)) = self.ops.destination_scan_root(root)? {
+            return crate::scan::scan_descriptor(
+                destination_root,
+                &relative,
+                None,
+                follow_root,
+                true,
+                ignore,
+                report_ignored,
+                sink,
+                ignored,
+                warn,
+            );
+        }
         let root = self.ops.scan_root(root)?;
         crate::scan::scan(
             &fsops::resolve(&root),
@@ -442,6 +506,9 @@ impl Conn for LocalConn {
         trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
         sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
     ) -> Result<()> {
+        if self.role != LocalConnectionRole::Control {
+            bail!("native removal is allowed only on the control connection");
+        }
         crate::native_rm::remove(
             cwd,
             root,
@@ -611,6 +678,7 @@ impl Conn for RemoteConn {
     fn scan(
         &mut self,
         root: &[u8],
+        source: Option<&RegisteredPath>,
         follow_root: bool,
         ignore: &[String],
         report_ignored: bool,
@@ -620,6 +688,7 @@ impl Conn for RemoteConn {
     ) -> Result<()> {
         self.send(Request::Scan {
             root: root.to_vec(),
+            source: source.cloned(),
             follow_root,
             ignore: ignore.to_vec(),
             report_ignored,
@@ -707,10 +776,13 @@ impl Drop for RemoteConn {
 /// unauthenticated ones, so each failed connect halves the limit (down to
 /// MIN_CONCURRENT_CONNECTS) for the rest of the run, and the retry then
 /// succeeds. The control connection bypasses this entirely.
-const START_CONCURRENT_CONNECTS: usize = 32;
+/// Hard upper bound on simultaneously establishing data connections. A source
+/// endpoint's descriptor broker therefore sees no more concurrent independent
+/// SSH worker claims than this, even when tuning warms a larger candidate set.
+pub(crate) const MAX_CONCURRENT_CONNECTS: usize = 32;
 const MIN_CONCURRENT_CONNECTS: usize = 4;
 static CONNECT_LIMIT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(START_CONCURRENT_CONNECTS);
+    std::sync::atomic::AtomicUsize::new(MAX_CONCURRENT_CONNECTS);
 static CONNECTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 static CONNECTS_CV: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -1061,16 +1133,21 @@ impl RemoteSpec {
     /// queue behind workers. In managed mode the release helper is installed
     /// on first use if the remote lacks it.
     pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
-        self.connect_with_request(compress, limited, None)
+        let role = if limited {
+            ConnectionRole::SourceWorker { roots: Vec::new() }
+        } else {
+            ConnectionRole::Control
+        };
+        self.connect_with_role(compress, limited, role)
     }
 
-    fn connect_with_request(
+    fn connect_with_role(
         &self,
         compress: bool,
         limited: bool,
-        initial_request: Option<Request>,
+        role: ConnectionRole,
     ) -> Result<RemoteConn> {
-        let first = self.connect_retried(compress, limited, initial_request.clone());
+        let first = self.connect_retried(compress, limited, role.clone());
         let Err(first_error) = first else {
             return first;
         };
@@ -1079,7 +1156,7 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress, limited, initial_request)
+        self.connect_retried(compress, limited, role)
             .with_context(|| {
                 format!(
                     "could not start the {} helper installed on {}",
@@ -1093,14 +1170,14 @@ impl RemoteSpec {
         &self,
         compress: bool,
         limited: bool,
-        initial_request: Option<Request>,
+        role: ConnectionRole,
     ) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
         for attempt in 0..6 {
             let _slot = limited.then(connect_slot);
             let ssh_connection = self.ssh_connection(limited);
-            match self.connect_once(compress, ssh_connection, initial_request.clone()) {
+            match self.connect_once(compress, ssh_connection, role.clone()) {
                 Ok(c) => return Ok(c),
                 Err(e)
                     if ssh_connection == SshConnection::Worker
@@ -1167,7 +1244,7 @@ impl RemoteSpec {
         &self,
         compress: bool,
         ssh_connection: SshConnection,
-        initial_request: Option<Request>,
+        role: ConnectionRole,
     ) -> Result<RemoteConn> {
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = &self.restricted_grant {
@@ -1213,7 +1290,7 @@ impl RemoteSpec {
             tcp_socket: None,
             multiplexed_ssh: ssh_connection == SshConnection::Worker,
         };
-        let conn = hello(conn, compress, Vec::new(), initial_request)?;
+        let conn = hello(conn, compress, Vec::new(), role)?;
         self.record_peer(&conn);
         Ok(conn)
     }
@@ -1432,7 +1509,7 @@ impl RemoteSpec {
         &self,
         info: &TcpInfo,
         compress: bool,
-        initial_request: Option<Request>,
+        role: ConnectionRole,
     ) -> Result<RemoteConn> {
         let n = info.addrs.len();
         let start = info.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
@@ -1506,7 +1583,7 @@ impl RemoteSpec {
                 tcp_socket: Some(tcp_socket),
                 multiplexed_ssh: false,
             };
-            let conn = hello(conn, compress, info.token.clone(), initial_request.clone())?;
+            let conn = hello(conn, compress, info.token.clone(), role.clone())?;
             self.record_peer(&conn);
             return Ok(conn);
         }
@@ -1623,20 +1700,16 @@ fn hello(
     mut conn: RemoteConn,
     compress: bool,
     token: Vec<u8>,
-    initial_request: Option<Request>,
+    role: ConnectionRole,
 ) -> Result<RemoteConn> {
+    let worker = !matches!(role, ConnectionRole::Control);
     conn.send(Request::Hello {
         identity: crate::identity::build().to_string(),
         compress,
         debug: crate::transfer::debug(),
         token,
+        role,
     })?;
-    // Worker destination anchoring is independent of the Hello response. Put
-    // it on the wire immediately so the receiver can authenticate, anchor,
-    // and acknowledge within one WAN turn while preserving response order.
-    if let Some(request) = initial_request.as_ref() {
-        conn.send(request.clone())?;
-    }
     match conn.recv() {
         Ok(Response::HelloOk { identity, platform }) if identity == crate::identity::build() => {
             conn.peer = Some(PeerInfo { identity, platform });
@@ -1648,15 +1721,22 @@ fn hello(
                 crate::identity::build()
             )
         }
-        Ok(Response::Err(e)) => bail!("{}: {e}", conn.label),
+        Ok(Response::Err(error)) if worker => {
+            return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into())
+        }
+        Ok(Response::Err(error)) => bail!("{}: {error}", conn.label),
+        Ok(other) if worker => {
+            return Err(WorkerInitializationError(format!(
+                "{}: unexpected handshake response {other:?}",
+                conn.label
+            ))
+            .into())
+        }
         Ok(other) => bail!("{}: unexpected handshake response {other:?}", conn.label),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("could not start the remote syq on {}", conn.label))
         }
-    }
-    if initial_request.is_some() {
-        worker_initialization_response(conn.recv()?)?;
     }
     Ok(conn)
 }
@@ -2070,13 +2150,30 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-#[derive(Clone, Debug)]
-pub enum Endpoint {
-    Local,
+#[derive(Clone)]
+pub(crate) enum Endpoint {
+    Local {
+        descriptor_session: crate::descriptor_broker::DescriptorSessionSlot,
+    },
     Remote(RemoteSpec),
 }
 
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Endpoint::Local { .. } => formatter.write_str("Local"),
+            Endpoint::Remote(spec) => formatter.debug_tuple("Remote").field(spec).finish(),
+        }
+    }
+}
+
 impl Endpoint {
+    pub(crate) fn local() -> Self {
+        Self::Local {
+            descriptor_session: Default::default(),
+        }
+    }
+
     pub fn is_remote(&self) -> bool {
         matches!(self, Endpoint::Remote(spec) if !spec.local_process)
     }
@@ -2085,27 +2182,88 @@ impl Endpoint {
         matches!(self, Endpoint::Remote(_))
     }
 
-    pub fn connect(&self, compress: bool) -> Result<Box<dyn Conn>> {
-        self.connect_with_request(compress, None)
+    pub(crate) fn connect_control(&self, compress: bool) -> Result<Box<dyn Conn>> {
+        self.connect_with_role(compress, ConnectionRole::Control)
     }
 
-    pub(crate) fn connect_with_request(
+    pub(crate) fn connect_with_sources(
         &self,
         compress: bool,
-        initial_request: Option<Request>,
+        roots: Vec<RegisteredSourceRoot>,
     ) -> Result<Box<dyn Conn>> {
+        self.connect_with_role(compress, ConnectionRole::SourceWorker { roots })
+    }
+
+    pub(crate) fn connect_with_copy_capabilities(
+        &self,
+        compress: bool,
+        destination: Option<DestinationRoot>,
+        copy_sources: Vec<RegisteredSourceRoot>,
+    ) -> Result<Box<dyn Conn>> {
+        self.connect_with_role(
+            compress,
+            ConnectionRole::DestinationWorker {
+                destination,
+                copy_sources,
+            },
+        )
+    }
+
+    fn connect_with_role(&self, compress: bool, role: ConnectionRole) -> Result<Box<dyn Conn>> {
         match self {
-            Endpoint::Local => {
-                let mut conn = LocalConn::new();
-                if let Some(request) = initial_request {
-                    worker_initialization_response(conn.call(request)?)?;
+            Endpoint::Local { descriptor_session } => {
+                // Every connection clone for this logical local endpoint uses
+                // the control connection's process-local session slot. Once
+                // the control registers roots, workers clone those retained
+                // descriptors in process instead of claiming SCM_RIGHTS from
+                // the broker after worker threads exist (unsupported on
+                // Darwin).
+                let mut conn = LocalConn::new(&role, descriptor_session.clone());
+                match role {
+                    ConnectionRole::DestinationWorker {
+                        destination: Some(destination),
+                        copy_sources,
+                    } => {
+                        conn.ops
+                            .initialize_destination(&destination)
+                            .map_err(|error| {
+                                WorkerInitializationError(format!(
+                                    "initialize local destination worker: {error:#}"
+                                ))
+                            })?;
+                        if !copy_sources.is_empty() {
+                            conn.ops
+                                .initialize_copy_sources(&copy_sources)
+                                .map_err(|error| {
+                                    WorkerInitializationError(format!(
+                                        "initialize local copy sources: {error:#}"
+                                    ))
+                                })?;
+                        }
+                    }
+                    ConnectionRole::DestinationWorker {
+                        destination: None, ..
+                    } => {
+                        return Err(WorkerInitializationError(
+                            "local destination worker requires a registered root".into(),
+                        )
+                        .into())
+                    }
+                    ConnectionRole::SourceWorker { roots } => {
+                        conn.ops.initialize_sources(&roots).map_err(|error| {
+                            WorkerInitializationError(format!(
+                                "initialize local source worker: {error:#}"
+                            ))
+                        })?
+                    }
+                    ConnectionRole::Control => {}
                 }
                 Ok(Box::new(conn))
             }
             Endpoint::Remote(spec) => {
                 let info = spec.tcp.lock().unwrap().clone();
                 if let Some(info) = info.filter(|i| !i.failed) {
-                    match spec.connect_tcp(&info, compress, initial_request.clone()) {
+                    match spec.connect_tcp(&info, compress, role.clone()) {
                         Ok(c) => return Ok(Box::new(c)),
                         Err(e)
                             if is_tcp_congestion_error(&e)
@@ -2144,11 +2302,7 @@ impl Endpoint {
                         spec.label()
                     );
                 }
-                Ok(Box::new(spec.connect_with_request(
-                    compress,
-                    true,
-                    initial_request,
-                )?))
+                Ok(Box::new(spec.connect_with_role(compress, true, role)?))
             }
         }
     }
@@ -2158,10 +2312,141 @@ impl Endpoint {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
 
     struct ExitObserved<R> {
         inner: R,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[test]
+    fn local_workers_clone_the_control_descriptor_session_in_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        let endpoint = Endpoint::local();
+        let mut control = endpoint.connect_control(false).unwrap();
+        let response = control
+            .call(Request::RegisterSourceRoots {
+                selections: vec![SourceRootSelection {
+                    path: selected.as_os_str().as_bytes().to_vec(),
+                    follow_root: false,
+                }],
+                symlink_policy: OperatorSymlinkPolicy::Refuse,
+                allow_unconfined_paths: false,
+                shared_workers: 1,
+                independent_claim_workers: 0,
+            })
+            .unwrap();
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+
+        // Once the socket name is gone, an empty session slot cannot claim the
+        // ticket with SCM_RIGHTS. The endpoint clone still succeeds because it
+        // reaches the control connection's process-local registry instead.
+        std::fs::remove_file(roots[0].ticket.broker_path()).unwrap();
+        endpoint.connect_with_sources(false, roots.clone()).unwrap();
+        let error = Endpoint::local()
+            .connect_with_sources(false, roots)
+            .err()
+            .expect("a fresh local endpoint must not share another session");
+        assert!(format!("{error:#}").contains("connect to descriptor broker"));
+    }
+
+    #[test]
+    fn local_source_worker_rejects_destination_mutation_requests() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        let marker = selected.join("marker");
+        std::fs::write(&marker, b"marker").unwrap();
+        let endpoint = Endpoint::local();
+        let mut control = endpoint.connect_control(false).unwrap();
+        let response = control
+            .call(Request::RegisterSourceRoots {
+                selections: vec![SourceRootSelection {
+                    path: selected.as_os_str().as_bytes().to_vec(),
+                    follow_root: false,
+                }],
+                symlink_policy: OperatorSymlinkPolicy::Refuse,
+                allow_unconfined_paths: false,
+                shared_workers: 1,
+                independent_claim_workers: 0,
+            })
+            .unwrap();
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("unexpected source registration response: {response:?}")
+        };
+        let source_marker = roots[0].selection.join(b"marker").unwrap();
+        let mut source = endpoint.connect_with_sources(false, roots).unwrap();
+
+        let response = source
+            .call(Request::ReadRange {
+                path: b"contradictory-path".to_vec(),
+                source: Some(source_marker),
+                attempt: 0,
+                off: 0,
+                len: 6,
+            })
+            .unwrap();
+        assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
+
+        let response = source
+            .call(Request::Apply {
+                ops: vec![Op::Unlink {
+                    path: marker.as_os_str().as_bytes().to_vec(),
+                }],
+                guard: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(response, Response::Err(error) if error.contains("not valid on a source worker"))
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"marker");
+
+        let selection = [NativeRemoveSelection {
+            path: b"marker".to_vec(),
+            kind: NativeRemoveKind::File,
+        }];
+        let mut trace = |_| Ok(());
+        let mut sink = |_| Ok(());
+        let error = source
+            .native_remove(
+                Some(selected.as_os_str().as_bytes()),
+                None,
+                &selection,
+                false,
+                false,
+                1,
+                &mut trace,
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("only on the control connection"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"marker");
+
+        // Match the remote server's non-control gate for destination workers
+        // too; this direct trait method must not be a role bypass.
+        let role = ConnectionRole::DestinationWorker {
+            destination: None,
+            copy_sources: Vec::new(),
+        };
+        let mut destination = LocalConn::new(&role, Default::default());
+        let error = destination
+            .native_remove(
+                Some(selected.as_os_str().as_bytes()),
+                None,
+                &selection,
+                false,
+                false,
+                1,
+                &mut trace,
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("only on the control connection"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"marker");
     }
 
     impl<R: Read> Read for ExitObserved<R> {
@@ -2269,7 +2554,11 @@ mod tests {
         };
 
         let error = spec
-            .connect_tcp(&info, false, None)
+            .connect_tcp(
+                &info,
+                false,
+                ConnectionRole::SourceWorker { roots: Vec::new() },
+            )
             .err()
             .expect("unregistered congestion control should fail locally");
         let message = format!("{error:#}");
@@ -2290,14 +2579,22 @@ mod tests {
 
     #[test]
     fn rejected_worker_initialization_is_not_a_retryable_transport_error() {
-        let error = worker_initialization_response(Response::Err("destination changed".into()))
-            .unwrap_err();
+        let error: anyhow::Error = WorkerInitializationError("destination changed".into()).into();
         assert!(is_worker_initialization_error(&error));
         assert!(!is_tcp_congestion_error(&error));
     }
 
     #[test]
-    fn hello_sends_worker_initialization_before_waiting_for_its_response() {
+    fn hello_carries_destination_initialization_before_readiness() {
+        let temp = tempfile::tempdir().unwrap();
+        let descriptor_session = crate::descriptor_broker::DescriptorSessionSlot::default();
+        let ticket = descriptor_session
+            .register(std::fs::File::open(temp.path()).unwrap())
+            .unwrap();
+        let destination = DestinationRoot {
+            ticket,
+            request_prefix: b"destination".to_vec(),
+        };
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -2306,14 +2603,20 @@ mod tests {
                 .set_read_timeout(Some(std::time::Duration::from_secs(1)))
                 .unwrap();
             let mut reader = FrameReader::new(socket.try_clone().unwrap());
-            assert!(matches!(
-                reader.read_msg::<Request>().unwrap(),
-                Request::Hello { .. }
-            ));
-            assert!(matches!(
-                reader.read_msg::<Request>().unwrap(),
-                Request::AnchorDestination { .. }
-            ));
+            let hello = reader.read_msg::<Request>().unwrap();
+            let Request::Hello {
+                role:
+                    ConnectionRole::DestinationWorker {
+                        destination: Some(destination),
+                        copy_sources,
+                    },
+                ..
+            } = hello
+            else {
+                panic!("destination initialization was not carried in Hello");
+            };
+            assert!(copy_sources.is_empty());
+            assert_eq!(destination.request_prefix, b"destination");
 
             let mut writer = FrameWriter::new(socket, false);
             writer
@@ -2322,7 +2625,6 @@ mod tests {
                     platform: crate::identity::platform(),
                 })
                 .unwrap();
-            writer.write_msg(&Response::Ok).unwrap();
         });
 
         let socket = TcpStream::connect(address).unwrap();
@@ -2342,18 +2644,16 @@ mod tests {
             conn,
             false,
             Vec::new(),
-            Some(Request::AnchorDestination {
-                path: Some(b"destination".to_vec()),
-                expected_dev: 1,
-                expected_ino: 2,
-                request_prefix: b"destination".to_vec(),
-                symlink_policy: OperatorSymlinkPolicy::TrustedOwner,
-            }),
+            ConnectionRole::DestinationWorker {
+                destination: Some(destination),
+                copy_sources: Vec::new(),
+            },
         )
         .unwrap();
         assert!(conn.peer.is_some());
         drop(conn);
         server.join().unwrap();
+        descriptor_session.close();
     }
 
     #[test]

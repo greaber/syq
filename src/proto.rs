@@ -5,7 +5,9 @@
 //! flag bit 0 means the payload is zstd-compressed. Each writer decides
 //! independently whether to compress, readers always accept both.
 
-use serde::{Deserialize, Serialize};
+use crate::descriptor_broker::{DescriptorTicket, RegisteredRootId};
+use anyhow::{bail, Result};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
@@ -15,6 +17,10 @@ const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
 const HASH_RESPONSE_OVERHEAD: u64 = 24;
 const COMPRESS_MIN: usize = 512;
 const COMPRESS_LEVEL: i32 = 1;
+#[cfg(target_os = "linux")]
+const MODE_SYMLINK: u32 = libc::S_IFLNK;
+#[cfg(not(target_os = "linux"))]
+const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
 
 pub fn hash_response_fits(block: u64, len: u64) -> bool {
     if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
@@ -29,6 +35,71 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
 
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
+
+/// A syntactically strict descriptor-relative source path.
+///
+/// Source discovery and stat operations use this reference as their authority;
+/// the parallel legacy pathname is only a display/compatibility spelling.
+#[derive(Serialize, Clone, Debug, Eq, PartialEq)]
+pub struct RegisteredPath {
+    pub(crate) root: RegisteredRootId,
+    pub relative: PathBytes,
+}
+
+impl RegisteredPath {
+    pub(crate) fn new(root: RegisteredRootId, relative: PathBytes) -> Result<Self> {
+        validate_relative_path(&relative)?;
+        Ok(Self { root, relative })
+    }
+
+    pub(crate) fn root(&self) -> RegisteredRootId {
+        self.root
+    }
+
+    pub(crate) fn join(&self, relative: &[u8]) -> Result<Self> {
+        validate_relative_path(relative)?;
+        let mut joined = self.relative.clone();
+        if !joined.is_empty() && !relative.is_empty() {
+            joined.push(b'/');
+        }
+        joined.extend_from_slice(relative);
+        Self::new(self.root, joined)
+    }
+}
+
+impl<'de> Deserialize<'de> for RegisteredPath {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WirePath {
+            root: RegisteredRootId,
+            relative: PathBytes,
+        }
+        let wire = WirePath::deserialize(deserializer)?;
+        RegisteredPath::new(wire.root, wire.relative).map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_relative_path(path: &[u8]) -> Result<()> {
+    if path.starts_with(b"/") {
+        bail!("registered path must be relative");
+    }
+    if path.contains(&0) {
+        bail!("registered path contains NUL");
+    }
+    if path.is_empty() {
+        return Ok(());
+    }
+    if path
+        .split(|byte| *byte == b'/')
+        .any(|component| component.is_empty() || component == b"." || component == b"..")
+    {
+        bail!("registered path contains an unsafe component");
+    }
+    Ok(())
+}
 /// Full BLAKE3 digest used whenever content equality affects copy behavior.
 pub type ContentDigest = [u8; 32];
 
@@ -148,6 +219,10 @@ pub struct ContainerGuard {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallRead {
     pub path: PathBytes,
+    /// Authoritative source capability. `path` is only a diagnostic/legacy
+    /// spelling when this is present; omission is reserved for the explicit
+    /// rsync `--insecure-links` compatibility path.
+    pub source: Option<RegisteredPath>,
     pub attempt: u32,
     pub len: u32,
 }
@@ -271,12 +346,145 @@ pub enum Op {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DestinationRoot {
+    pub ticket: DescriptorTicket,
+    pub request_prefix: PathBytes,
+}
+
+/// Serialized identity of one exact non-directory source selection. The
+/// descriptor session and every initialized worker keep the originally opened
+/// object alive while workers use this identity to reject a replaced name
+/// beneath the retained parent. Symlink targets are snapshotted through that
+/// opened object and are never reread through the mutable name.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct SourceLeafIdentity {
+    pub dev: u64,
+    pub ino: u64,
+    pub file_type: u32,
+    pub symlink_target: Option<PathBytes>,
+}
+
+/// One operator source selection registered by the endpoint control session.
+/// `selection` is either empty beneath a selected directory or a literal leaf
+/// beneath its selected parent.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RegisteredSourceRoot {
+    pub ticket: DescriptorTicket,
+    /// Present only for an exact non-directory selection. This typed ticket
+    /// names the original selected object, not its containing directory.
+    pub leaf_ticket: Option<DescriptorTicket>,
+    pub selection: RegisteredPath,
+    /// Present only for an exact leaf. Every worker acquires and retains its
+    /// own clone of `leaf_ticket` before acknowledging readiness, preventing
+    /// identity reuse even if the control connection exits first.
+    pub expected_leaf: Option<SourceLeafIdentity>,
+    /// Permit this explicitly opted-in rsync session to use legacy unconfined
+    /// source pathnames for `--insecure-links` compatibility.
+    pub allow_unconfined_paths: bool,
+}
+
+impl RegisteredSourceRoot {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.ticket.is_directory() {
+            bail!("source root requires a directory descriptor ticket");
+        }
+        if self.ticket.root_id() != self.selection.root() {
+            bail!("source root ticket and registered path identify different roots");
+        }
+        let exact_leaf = !self.selection.relative.is_empty();
+        if exact_leaf != self.expected_leaf.is_some() || exact_leaf != self.leaf_ticket.is_some() {
+            bail!("source root leaf selection and expected identity disagree");
+        }
+        if exact_leaf && self.selection.relative.contains(&b'/') {
+            bail!("exact source leaf selection must be one literal component");
+        }
+        if let Some(expected) = &self.expected_leaf {
+            let is_symlink = expected.file_type == MODE_SYMLINK;
+            if is_symlink != expected.symlink_target.is_some() {
+                bail!("source leaf type and symlink target disagree");
+            }
+            if expected
+                .symlink_target
+                .as_ref()
+                .is_some_and(|target| target.len() > libc::PATH_MAX as usize * 2)
+            {
+                bail!("registered source symlink target is too long");
+            }
+        }
+        if let Some(ticket) = &self.leaf_ticket {
+            if !ticket.is_source_leaf() {
+                bail!("source leaf requires an exact-object descriptor ticket");
+            }
+            if ticket.root_id() != self.selection.root() {
+                bail!("source leaf ticket and registered path identify different roots");
+            }
+            if !ticket.same_session(&self.ticket) {
+                bail!("source parent and leaf tickets belong to different endpoint sessions");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SourceRootSelection {
+    pub path: PathBytes,
+    pub follow_root: bool,
+}
+
+/// Compare effective destination directories beneath the receiver's retained
+/// operator selection with one exact source-directory capability. `suffixes`
+/// are operator-relative spellings rather than transfer paths: an empty value
+/// names the selected destination directory, and `.` or `..` retain their
+/// ordinary component semantics.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DirectoryAncestryCheck {
+    pub source_root: DescriptorTicket,
+    pub suffixes: Vec<PathBytes>,
+}
+
+/// Relationship of one effective destination directory to its source root.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryRelation {
+    Separate,
+    Same,
+    Descendant,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ConnectionRole {
+    /// The one connection allowed to create endpoint-session capabilities and
+    /// start its TCP data listener.
+    Control,
+    /// A data connection reserved for reading a source endpoint. Discovery
+    /// metadata, block/file hashes, and range/small reads are confined to the
+    /// registered roots unless the registration explicitly permits the rsync
+    /// `--insecure-links` compatibility path.
+    SourceWorker {
+        /// Every registered parent and exact-object descriptor is acquired
+        /// before HelloOk. Local and same-process TCP workers clone in process;
+        /// a fresh SSH helper finishes SCM_RIGHTS receipt while single-threaded.
+        roots: Vec<RegisteredSourceRoot>,
+    },
+    /// A data connection used to mutate a destination endpoint. Unrestricted
+    /// receivers require an exact registered root; restricted receivers derive
+    /// their confinement from the signed grant and reject a supplied ticket.
+    /// A same-machine worker may additionally receive source capabilities for
+    /// `CopyLocal`; no other destination request may use them.
+    DestinationWorker {
+        destination: Option<DestinationRoot>,
+        copy_sources: Vec<RegisteredSourceRoot>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Request {
     Hello {
         identity: String,
         compress: bool,
         debug: bool,
         token: Vec<u8>,
+        role: ConnectionRole,
     },
     /// Ask the server to accept data connections over TCP (see crypto.rs).
     /// `key` is None for plaintext; `token` authenticates plaintext connections.
@@ -291,6 +499,9 @@ pub enum Request {
     /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
     Scan {
         root: PathBytes,
+        /// Authoritative registered source reference. Its parallel `root`
+        /// spelling is used only by the explicit `--insecure-links` opt-out.
+        source: Option<RegisteredPath>,
         follow_root: bool,
         ignore: Vec<String>,
         report_ignored: bool,
@@ -310,6 +521,9 @@ pub enum Request {
     /// lstat each path; with `follow`, stat through symlinks instead.
     StatMany {
         paths: Vec<PathBytes>,
+        /// Authoritative registered source references. Parallel `paths` are
+        /// used only outside a source session or by `--insecure-links`.
+        sources: Option<Vec<RegisteredPath>>,
         follow: bool,
         guard: Option<ContainerGuard>,
     },
@@ -320,6 +534,29 @@ pub enum Request {
         allow_missing: bool,
         symlink_policy: OperatorSymlinkPolicy,
     },
+    /// Compare candidate directories beneath the retained operator selection
+    /// with exact source-directory descriptors. This is a control-only safety
+    /// query and never reopens either operator pathname.
+    CheckOperatorDirectoryAncestry {
+        checks: Vec<DirectoryAncestryCheck>,
+    },
+    /// Resolve every operator source selection, then atomically register its
+    /// opened directory or parent descriptor. Only a control connection may
+    /// create these endpoint-session capabilities, and it may do so only once
+    /// so every issued worker identity keeps its original pins alive.
+    RegisterSourceRoots {
+        selections: Vec<SourceRootSelection>,
+        symlink_policy: OperatorSymlinkPolicy,
+        /// Explicit rsync compatibility opt-out. It permits legacy unconfined
+        /// source discovery only for the session created by this registration.
+        allow_unconfined_paths: bool,
+        /// Maximum source workers that can share the control helper process.
+        /// Zero still budgets the registry and control connection themselves.
+        shared_workers: usize,
+        /// Maximum concurrent independent-worker claims against the control
+        /// process's private descriptor broker.
+        independent_claim_workers: usize,
+    },
     /// Create the missing suffix retained by CheckOperatorDirectory, then
     /// return the selected directory's stable identity.
     CreateOperatorDirectory {
@@ -328,15 +565,12 @@ pub enum Request {
         /// it. Intermediate directories may still be shared safely.
         require_absent: bool,
     },
-    /// Retain and enter the selected destination directory for this
-    /// connection. The control connection reuses its checked descriptor;
-    /// independent workers securely reopen `path` and verify its identity.
+    /// Register the destination directory retained by the preceding operator
+    /// walk. Only the control connection may create this session capability.
     AnchorDestination {
-        path: Option<PathBytes>,
         expected_dev: u64,
         expected_ino: u64,
         request_prefix: PathBytes,
-        symlink_policy: OperatorSymlinkPolicy,
     },
     /// Inspect the filesystem containing the receiver's retained destination
     /// directory. `target` selects an observed descendant directory when
@@ -421,10 +655,10 @@ pub enum Request {
     },
     /// Receiver-side copy of a same-machine file (copy_file_range when
     /// possible, optionally a sequential userspace fallback for a local
-    /// source and asynchronous NFS destination). Err("EXDEV") tells the
-    /// caller to use the normal streaming path.
+    /// source and asynchronous NFS destination). `CopyLocalUnsupported`
+    /// tells the caller to use the normal streaming path.
     CopyLocal {
-        src: PathBytes,
+        source: RegisteredPath,
         dst: PathBytes,
         inplace: bool,
         allow_sequential_nfs_fallback: bool,
@@ -434,6 +668,9 @@ pub enum Request {
     },
     HashBlocks {
         path: PathBytes,
+        /// Authoritative for source hashing when present. Destination hashing
+        /// omits it; a confined source session rejects an omission.
+        source: Option<RegisteredPath>,
         which: Which,
         partial_id: PartialId,
         block: u64,
@@ -443,6 +680,9 @@ pub enum Request {
     },
     ReadRange {
         path: PathBytes,
+        /// Authoritative source capability. A confined source session rejects
+        /// an omission instead of falling back to `path`.
+        source: Option<RegisteredPath>,
         attempt: u32,
         off: u64,
         len: u32,
@@ -473,6 +713,9 @@ pub enum Request {
     PutSmallBatch(Vec<SmallPut>),
     FileHash {
         path: PathBytes,
+        /// Authoritative for source hashing when present. Destination hashing
+        /// omits it; a confined source session rejects an omission.
+        source: Option<RegisteredPath>,
         guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
@@ -489,6 +732,25 @@ pub enum Request {
     /// ends the grant's mutation authority.
     Receipt,
     Shutdown,
+}
+
+impl Request {
+    /// Requests an authenticated source-worker connection may execute. Keep
+    /// this protocol boundary shared by remote dispatch and the in-process
+    /// adapter so choosing a local endpoint cannot grant mutation authority.
+    pub(crate) fn allowed_on_source_worker(&self) -> bool {
+        matches!(
+            self,
+            Request::Scan { .. }
+                | Request::StatMany { .. }
+                | Request::HashBlocks { .. }
+                | Request::ReadRange { .. }
+                | Request::ReadSmallBatch(_)
+                | Request::FileHash { .. }
+                | Request::TransportStats
+                | Request::Shutdown
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -521,6 +783,9 @@ pub enum Response {
     /// Absolute operator spelling plus device/inode of the securely opened
     /// directory, or None when an allowed missing suffix was reached.
     DirectorySelection(Option<DirectoryAnchor>),
+    DirectoryRelations(Vec<Vec<DirectoryRelation>>),
+    DestinationRegistered(DescriptorTicket),
+    SourceRootsRegistered(Vec<RegisteredSourceRoot>),
     DestinationFilesystemInfo(DestinationFilesystemInfo),
     PathResults(Vec<std::result::Result<PathBytes, String>>),
     BatchPlan {
@@ -558,6 +823,10 @@ pub enum Response {
     /// and authorization protocol failures continue to use Err(String).
     EndpointError(WireError),
     Err(String),
+    /// `CopyLocal` could not use the receiver-side direct-copy path. This is
+    /// deliberately distinct from `Err`: filenames and other diagnostics are
+    /// untrusted text and must never select a recovery path.
+    CopyLocalUnsupported,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -870,5 +1139,49 @@ mod tests {
             incompressible[4], 0,
             "an expanded compressed representation was selected"
         );
+    }
+
+    #[test]
+    fn registered_paths_reject_unsafe_wire_components() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session = crate::descriptor_broker::DescriptorSessionSlot::default();
+        let ticket = session
+            .register(std::fs::File::open(temporary.path()).unwrap())
+            .unwrap();
+        let root = ticket.root_id();
+        assert_eq!(
+            RegisteredPath::new(root, b"safe/non-utf8-\xff".to_vec())
+                .unwrap()
+                .relative,
+            b"safe/non-utf8-\xff"
+        );
+        for relative in [
+            b"/absolute".as_slice(),
+            b"a//b",
+            b".",
+            b"a/../b",
+            b"nul\0byte",
+        ] {
+            let invalid = RegisteredPath {
+                root,
+                relative: relative.to_vec(),
+            };
+            let encoded = postcard::to_allocvec(&invalid).unwrap();
+            assert!(postcard::from_bytes::<RegisteredPath>(&encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn copy_local_fallback_has_a_structured_wire_response() {
+        let mut frame = Vec::new();
+        FrameWriter::new(&mut frame, false)
+            .write_msg(&Response::CopyLocalUnsupported)
+            .unwrap();
+        assert!(matches!(
+            FrameReader::new(frame.as_slice())
+                .read_msg::<Response>()
+                .unwrap(),
+            Response::CopyLocalUnsupported
+        ));
     }
 }

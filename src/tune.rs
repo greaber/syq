@@ -137,7 +137,7 @@ struct TuningCache {
 
 fn endpoint_key(endpoint: &Endpoint) -> String {
     match endpoint {
-        Endpoint::Local => "local".into(),
+        Endpoint::Local { .. } => "local".into(),
         Endpoint::Remote(spec) if spec.local_process => "local".into(),
         Endpoint::Remote(spec) => spec.label(),
     }
@@ -145,7 +145,7 @@ fn endpoint_key(endpoint: &Endpoint) -> String {
 
 fn transport_key(endpoint: &Endpoint) -> Option<&'static str> {
     match endpoint {
-        Endpoint::Local => None,
+        Endpoint::Local { .. } => None,
         Endpoint::Remote(spec) if spec.local_process => None,
         Endpoint::Remote(spec) => Some(match spec.data_transport() {
             DataTransport::Ssh => "ssh",
@@ -1343,7 +1343,7 @@ mod tests {
 
     #[test]
     fn cache_key_separates_direction_and_transport() {
-        let local = Endpoint::Local;
+        let local = Endpoint::local();
         let ssh = remote("host", false);
         let tcp = remote("host", true);
         assert_ne!(path_key(&local, &ssh), path_key(&ssh, &local));
@@ -1353,7 +1353,7 @@ mod tests {
 
     #[test]
     fn tcp_fallback_changes_the_cache_key() {
-        let local = Endpoint::Local;
+        let local = Endpoint::local();
         let remote = remote("host", true);
         let initial = path_key(&local, &remote);
         let Endpoint::Remote(spec) = &remote else {

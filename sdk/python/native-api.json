@@ -101,7 +101,9 @@
         "connections",
         "progress",
         "no-progress",
-        "progress-json"
+        "progress-json",
+        "syq-path",
+        "no-bootstrap"
       ],
       "follow_up": [
         "pscope"
