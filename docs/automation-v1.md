@@ -38,13 +38,25 @@ is the same rule as for any `>` redirect. The file is opened once and
 the descriptor held for the whole run; the default operator-path
 policy refuses a symlinked `FILE` (pass `--follow` to allow it).
 
-The results writer lives with the transfer coordinator, so both forms
-require a local coordinator. A remote-to-remote copy is refused at
-argument parsing unless `--coordinate-at local` is passed explicitly: the
-whole point of a remote-to-remote transfer is that data does not
-route through the invoking machine, so the relay topology is never
-chosen implicitly on the stream's behalf. (Streaming from a remote
-coordinator is a possible future extension.) `--results` is not available on
+The results writer always lives on the invoking machine. For a
+remote-to-remote copy there are two ways to fill it. Through a
+command-restricted receiver enrollment, the stream is
+**receiver-attested**: hostB records every operation and closure-time
+final state inside its encrypted, signed receipt, the invoking
+machine verifies and decrypts it, and only then emits the records —
+marked `"provenance": "receiver_attested"` — into the local file or
+descriptor. Data still flows directly between the remotes; only the
+verified account comes home. Without an enrollment there is no
+trusted channel, so the run fails (with a settled `failed` terminal
+record) unless `--coordinate-at local` explicitly routes the transfer
+through this machine — the relay topology is never chosen implicitly
+on the stream's behalf. For attested runs the human summary is also
+rendered locally from the verified terminal (the coordinator's own
+narration is discarded), so the numbers a person reads and a machine
+parses come from the same verified record. `--dry-run` with
+`--results` needs a local coordinator today: traces and planned
+totals exist only on the coordinator, and a receipt cannot attest a
+plan (relaying the coordinator's own stream is a recorded follow-up). `--results` is not available on
 `syq map` (its stdout is the manifest format) or, yet, on other
 commands, and cannot be combined with `--detach`. `--dry-run`
 composes; see below. `--results` cannot be combined with `--detach`, because
@@ -113,12 +125,18 @@ not pretend otherwise.
 
 Also one per failed mapping entry. Fields: `action` (`transfer_file`
 | `create_directory` | `create_symlink` | `create_special` | `delete`
-(`--prune`)), `dst` (container-relative), `src` (base-relative;
-mapping runs — a failed record round-trips as a retry manifest
-entry), `kind` (`file`|`dir`|`symlink`|`special`), and `disposition`:
-`succeeded` | `failed` | `blocked` (a `--max-delete` refusal).
-Optional: `bytes`, `attempts`, and on failures `retryable`
-(`yes`|`no`|`unknown`), `class`, `os_kind`, `message`. Unchanged and
+(`--prune`) | `set_metadata` | `observe_hash` — the last two appear
+in receiver-attested streams today), `dst` (container-relative), `src`
+(base-relative; mapping runs — a failed record round-trips as a retry
+manifest entry), `kind` (`file`|`dir`|`symlink`|`special`; present
+when known — a receiver-attested `set_metadata` omits it), and
+`disposition`: `succeeded` | `failed` | `blocked` (a `--max-delete`
+refusal) | `incomplete` | `observed` (receiver-attested streams).
+Optional: `bytes`, `attempts`, on failures `retryable`
+(`yes`|`no`|`unknown`), `class`, `os_kind`, `message`, and on
+receiver-attested records `provenance`, `scope` (the index of the
+signed mutation scope `dst` is relative to), and `code` (the
+receiver's outcome code). Unchanged and
 excluded entries emit no per-operation records; they are aggregated
 in the terminal record only. Metadata-only updates (permissions,
 ownership, or times reconciled on an otherwise unchanged object) are
@@ -130,7 +148,9 @@ is a candidate additive extension.
 ### `error` — one per counted error
 
 `message` is display text, never a parsing contract. Optional `class`
-and `os_kind` where the emission site knows them.
+and `os_kind` where the emission site knows them; a receiver refusal
+arrives as an `error` with `class: "safety_limit"`, `provenance`, and
+the receiver's `code`.
 
 The seven classes each call for different consumer behavior: `io`
 (the operation failed at the filesystem), `transport` (transient —
@@ -144,6 +164,19 @@ error meaning across remote connections even when the endpoints use different
 numeric errno values. Errors without an OS classification cannot always be
 classified more narrowly than `other`.
 
+### `final_state` — receiver-attested streams only
+
+One per path the transfer could have changed, observed by the
+receiver at closure after every request settled: `scope`, `dst`, and
+an `object` that is `{"state": "absent"}`, an observation failure
+(`state`, `code`, `message`), or `{"state": "present"}` with `kind`
+(the receiver's precise vocabulary: `dir`, `file`, `symlink`, `fifo`,
+`socket`, `character_device`, `block_device`, `other`), `size`,
+`metadata` (mode/uid/gid/mtime), and — under `--receipt hashed` — a
+`digest` (`{"algorithm": "blake3", "value": <hex>}`), plus
+`symlink_target` where applicable. Final states are what a verifier
+audits: they attest the tree, not the transfer's own narration.
+
 ### `result` — exactly one, always last, flushed
 
 `status`: `success` | `partial` | `refused` | `aborted` | `failed`.
@@ -153,7 +186,21 @@ Plus `exit_code`, `dry_run`, and the aggregates:
 `errors`, `bytes_transferred`, `bytes_unchanged`, `elapsed_ms`, and
 on `--prune` runs `deletions_planned`, `deletions_completed`,
 `deletions_blocked`. On a `failed` terminal record the aggregates
-describe what settled before the run died.
+describe what settled before the run died. A receiver-attested
+terminal additionally carries `provenance`, the verified
+`receipt_status` (`clean`|`failed`|`incomplete`), and receipt
+bookkeeping (`operations`, `final_states`, `receipt_records`); its
+aggregates cover receiver-visible work only — unchanged and excluded
+entries are orchestrator concepts a receipt cannot attest, and read
+as zero. Of the deletion totals it carries only `deletions_completed`,
+the settled deletions the receipt attests (each also appears as an
+individual `delete` record); `deletions_planned` and
+`deletions_blocked` never appear because planning and `--max-delete`
+blocking are coordinator concepts. Its `errors` count equals the
+receiver-attested `error` records emitted on the stream: one per
+failed or incomplete operation, per refusal, and per failed or
+partial final-state observation (a present object whose hash or link
+target could not be read).
 
 The human summary is rendered from this same record, so the numbers a
 person reads and a machine parses cannot disagree.

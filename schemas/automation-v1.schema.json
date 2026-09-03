@@ -4,22 +4,48 @@
   "title": "syq automation results stream, schema version 1",
   "description": "One record per NDJSON line of a `syq cp --results` stream. This schema is strict (additionalProperties: false) so that any change to syq's output shape fails the repository's validation tests and gets reviewed as an API change; consumers should instead ignore unknown record types and unknown optional fields, per docs/automation-v1.md.",
   "oneOf": [
-    { "$ref": "#/$defs/run" },
-    { "$ref": "#/$defs/progress" },
-    { "$ref": "#/$defs/trace" },
-    { "$ref": "#/$defs/operation_result" },
-    { "$ref": "#/$defs/error" },
-    { "$ref": "#/$defs/result" }
+    {
+      "$ref": "#/$defs/run"
+    },
+    {
+      "$ref": "#/$defs/progress"
+    },
+    {
+      "$ref": "#/$defs/trace"
+    },
+    {
+      "$ref": "#/$defs/operation_result"
+    },
+    {
+      "$ref": "#/$defs/error"
+    },
+    {
+      "$ref": "#/$defs/result"
+    },
+    {
+      "$ref": "#/$defs/final_state"
+    }
   ],
   "$defs": {
     "envelope": {
       "type": "object",
       "properties": {
-        "schema": { "const": "syq.automation" },
-        "schema_version": { "const": 1 },
-        "seq": { "$ref": "#/$defs/u64" }
+        "schema": {
+          "const": "syq.automation"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "seq": {
+          "$ref": "#/$defs/u64"
+        }
       },
-      "required": ["schema", "schema_version", "seq", "type"]
+      "required": [
+        "schema",
+        "schema_version",
+        "seq",
+        "type"
+      ]
     },
     "u64": {
       "type": "integer",
@@ -30,10 +56,20 @@
       "type": "object",
       "description": "Lossless path: value is the path itself when it is valid UTF-8, otherwise the standard base64 encoding of its raw bytes.",
       "properties": {
-        "encoding": { "enum": ["utf-8", "base64"] },
-        "value": { "type": "string" }
+        "encoding": {
+          "enum": [
+            "utf-8",
+            "base64"
+          ]
+        },
+        "value": {
+          "type": "string"
+        }
       },
-      "required": ["encoding", "value"],
+      "required": [
+        "encoding",
+        "value"
+      ],
       "additionalProperties": false
     },
     "action": {
@@ -42,11 +78,18 @@
         "create_directory",
         "create_symlink",
         "create_special",
-        "delete"
+        "delete",
+        "set_metadata",
+        "observe_hash"
       ]
     },
     "objectKind": {
-      "enum": ["file", "dir", "symlink", "special"]
+      "enum": [
+        "file",
+        "dir",
+        "symlink",
+        "special"
+      ]
     },
     "reason": {
       "enum": [
@@ -81,31 +124,68 @@
       ]
     },
     "run": {
-      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
       "type": "object",
       "properties": {
         "schema": true,
         "schema_version": true,
         "seq": true,
-        "type": { "const": "run" },
-        "run_id": { "type": "string" },
-        "started_at": { "type": "integer" },
-        "syq_version": { "type": "string" },
-        "mode": { "const": "cp" },
-        "prune": { "type": "boolean" },
-        "mapping": { "type": "boolean" },
-        "dry_run": { "type": "boolean" },
+        "type": {
+          "const": "run"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "integer"
+        },
+        "syq_version": {
+          "type": "string"
+        },
+        "mode": {
+          "const": "cp"
+        },
+        "prune": {
+          "type": "boolean"
+        },
+        "mapping": {
+          "type": "boolean"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
         "endpoints": {
           "type": "array",
           "items": {
             "type": "object",
             "properties": {
-              "role": { "enum": ["source", "destination"] },
-              "kind": { "enum": ["local", "ssh"] },
-              "host": { "type": "string" },
-              "user": { "type": "string" }
+              "role": {
+                "enum": [
+                  "source",
+                  "destination"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "local",
+                  "ssh"
+                ]
+              },
+              "host": {
+                "type": "string"
+              },
+              "user": {
+                "type": "string"
+              }
             },
-            "required": ["role", "kind"],
+            "required": [
+              "role",
+              "kind"
+            ],
             "additionalProperties": false
           }
         }
@@ -123,23 +203,49 @@
       "additionalProperties": false
     },
     "progress": {
-      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
       "type": "object",
       "properties": {
         "schema": true,
         "schema_version": true,
         "seq": true,
-        "type": { "const": "progress" },
-        "bytes_done": { "$ref": "#/$defs/u64" },
-        "bytes_total": { "$ref": "#/$defs/u64" },
-        "bytes_unchanged": { "$ref": "#/$defs/u64" },
-        "files_done": { "$ref": "#/$defs/u64" },
-        "files_total": { "$ref": "#/$defs/u64" },
-        "files_unchanged": { "$ref": "#/$defs/u64" },
-        "files_excluded": { "$ref": "#/$defs/u64" },
-        "scanned": { "$ref": "#/$defs/u64" },
-        "scan_done": { "type": "boolean" },
-        "elapsed_ms": { "$ref": "#/$defs/u64" }
+        "type": {
+          "const": "progress"
+        },
+        "bytes_done": {
+          "$ref": "#/$defs/u64"
+        },
+        "bytes_total": {
+          "$ref": "#/$defs/u64"
+        },
+        "bytes_unchanged": {
+          "$ref": "#/$defs/u64"
+        },
+        "files_done": {
+          "$ref": "#/$defs/u64"
+        },
+        "files_total": {
+          "$ref": "#/$defs/u64"
+        },
+        "files_unchanged": {
+          "$ref": "#/$defs/u64"
+        },
+        "files_excluded": {
+          "$ref": "#/$defs/u64"
+        },
+        "scanned": {
+          "$ref": "#/$defs/u64"
+        },
+        "scan_done": {
+          "type": "boolean"
+        },
+        "elapsed_ms": {
+          "$ref": "#/$defs/u64"
+        }
       },
       "required": [
         "bytes_done",
@@ -156,87 +262,342 @@
       "additionalProperties": false
     },
     "trace": {
-      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
       "type": "object",
       "properties": {
         "schema": true,
         "schema_version": true,
         "seq": true,
-        "type": { "const": "trace" },
-        "action": { "$ref": "#/$defs/action" },
-        "dst": { "$ref": "#/$defs/taggedPath" },
-        "src": { "$ref": "#/$defs/taggedPath" },
-        "kind": { "$ref": "#/$defs/objectKind" },
-        "bytes": { "$ref": "#/$defs/u64" },
-        "reason": { "$ref": "#/$defs/reason" }
+        "type": {
+          "const": "trace"
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "dst": {
+          "$ref": "#/$defs/taggedPath"
+        },
+        "src": {
+          "$ref": "#/$defs/taggedPath"
+        },
+        "kind": {
+          "$ref": "#/$defs/objectKind"
+        },
+        "bytes": {
+          "$ref": "#/$defs/u64"
+        },
+        "reason": {
+          "$ref": "#/$defs/reason"
+        }
       },
-      "required": ["action", "dst", "kind", "reason"],
+      "required": [
+        "action",
+        "dst",
+        "kind",
+        "reason"
+      ],
       "additionalProperties": false
     },
     "operation_result": {
-      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        },
+        {
+          "if": {
+            "required": [
+              "provenance"
+            ]
+          },
+          "then": {
+            "required": [
+              "scope"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "scope"
+                  ]
+                },
+                {
+                  "required": [
+                    "code"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
       "type": "object",
       "properties": {
         "schema": true,
         "schema_version": true,
         "seq": true,
-        "type": { "const": "operation_result" },
-        "action": { "$ref": "#/$defs/action" },
-        "dst": { "$ref": "#/$defs/taggedPath" },
-        "src": { "$ref": "#/$defs/taggedPath" },
-        "kind": { "$ref": "#/$defs/objectKind" },
-        "disposition": { "enum": ["succeeded", "failed", "blocked"] },
-        "bytes": { "$ref": "#/$defs/u64" },
-        "attempts": { "$ref": "#/$defs/u64" },
-        "retryable": { "enum": ["yes", "no", "unknown"] },
-        "class": { "$ref": "#/$defs/errorClass" },
-        "os_kind": { "$ref": "#/$defs/osKind" },
-        "message": { "type": "string" }
+        "type": {
+          "const": "operation_result"
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "dst": {
+          "$ref": "#/$defs/taggedPath"
+        },
+        "src": {
+          "$ref": "#/$defs/taggedPath"
+        },
+        "kind": {
+          "$ref": "#/$defs/objectKind"
+        },
+        "disposition": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "blocked",
+            "incomplete",
+            "observed"
+          ]
+        },
+        "bytes": {
+          "$ref": "#/$defs/u64"
+        },
+        "attempts": {
+          "$ref": "#/$defs/u64"
+        },
+        "retryable": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ]
+        },
+        "class": {
+          "$ref": "#/$defs/errorClass"
+        },
+        "os_kind": {
+          "$ref": "#/$defs/osKind"
+        },
+        "message": {
+          "type": "string"
+        },
+        "provenance": {
+          "const": "receiver_attested"
+        },
+        "scope": {
+          "$ref": "#/$defs/u64"
+        },
+        "code": {
+          "$ref": "#/$defs/receiptCode"
+        }
       },
-      "required": ["action", "dst", "kind", "disposition"],
+      "required": [
+        "action",
+        "dst",
+        "disposition"
+      ],
       "additionalProperties": false
     },
     "error": {
-      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        },
+        {
+          "if": {
+            "required": [
+              "provenance"
+            ]
+          },
+          "then": {},
+          "else": {
+            "not": {
+              "required": [
+                "code"
+              ]
+            }
+          }
+        }
+      ],
       "type": "object",
       "properties": {
         "schema": true,
         "schema_version": true,
         "seq": true,
-        "type": { "const": "error" },
-        "message": { "type": "string" },
-        "class": { "$ref": "#/$defs/errorClass" },
-        "os_kind": { "$ref": "#/$defs/osKind" }
+        "type": {
+          "const": "error"
+        },
+        "message": {
+          "type": "string"
+        },
+        "class": {
+          "$ref": "#/$defs/errorClass"
+        },
+        "os_kind": {
+          "$ref": "#/$defs/osKind"
+        },
+        "provenance": {
+          "const": "receiver_attested"
+        },
+        "code": {
+          "$ref": "#/$defs/receiptCode"
+        }
       },
-      "required": ["message"],
+      "required": [
+        "message"
+      ],
       "additionalProperties": false
     },
     "result": {
-      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        },
+        {
+          "if": {
+            "required": [
+              "provenance"
+            ]
+          },
+          "then": {
+            "required": [
+              "provenance",
+              "receipt_status",
+              "operations",
+              "final_states",
+              "receipt_records",
+              "deletions_completed"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "deletions_planned"
+                  ]
+                },
+                {
+                  "required": [
+                    "deletions_blocked"
+                  ]
+                }
+              ]
+            }
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "receipt_status"
+                  ]
+                },
+                {
+                  "required": [
+                    "operations"
+                  ]
+                },
+                {
+                  "required": [
+                    "final_states"
+                  ]
+                },
+                {
+                  "required": [
+                    "receipt_records"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
       "type": "object",
       "properties": {
         "schema": true,
         "schema_version": true,
         "seq": true,
-        "type": { "const": "result" },
-        "status": {
-          "enum": ["success", "partial", "refused", "aborted", "failed"]
+        "type": {
+          "const": "result"
         },
-        "exit_code": { "type": "integer" },
-        "dry_run": { "type": "boolean" },
-        "files_transferred": { "$ref": "#/$defs/u64" },
-        "files_unchanged": { "$ref": "#/$defs/u64" },
-        "files_excluded": { "$ref": "#/$defs/u64" },
-        "directories_created": { "$ref": "#/$defs/u64" },
-        "symlinks_created": { "$ref": "#/$defs/u64" },
-        "specials_created": { "$ref": "#/$defs/u64" },
-        "errors": { "$ref": "#/$defs/u64" },
-        "bytes_transferred": { "$ref": "#/$defs/u64" },
-        "bytes_unchanged": { "$ref": "#/$defs/u64" },
-        "elapsed_ms": { "$ref": "#/$defs/u64" },
-        "deletions_planned": { "$ref": "#/$defs/u64" },
-        "deletions_completed": { "$ref": "#/$defs/u64" },
-        "deletions_blocked": { "$ref": "#/$defs/u64" }
+        "status": {
+          "enum": [
+            "success",
+            "partial",
+            "refused",
+            "aborted",
+            "failed"
+          ]
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "files_transferred": {
+          "$ref": "#/$defs/u64"
+        },
+        "files_unchanged": {
+          "$ref": "#/$defs/u64"
+        },
+        "files_excluded": {
+          "$ref": "#/$defs/u64"
+        },
+        "directories_created": {
+          "$ref": "#/$defs/u64"
+        },
+        "symlinks_created": {
+          "$ref": "#/$defs/u64"
+        },
+        "specials_created": {
+          "$ref": "#/$defs/u64"
+        },
+        "errors": {
+          "$ref": "#/$defs/u64"
+        },
+        "bytes_transferred": {
+          "$ref": "#/$defs/u64"
+        },
+        "bytes_unchanged": {
+          "$ref": "#/$defs/u64"
+        },
+        "elapsed_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "deletions_planned": {
+          "$ref": "#/$defs/u64"
+        },
+        "deletions_completed": {
+          "$ref": "#/$defs/u64"
+        },
+        "deletions_blocked": {
+          "$ref": "#/$defs/u64"
+        },
+        "provenance": {
+          "const": "receiver_attested"
+        },
+        "receipt_status": {
+          "enum": [
+            "clean",
+            "failed",
+            "incomplete"
+          ]
+        },
+        "operations": {
+          "$ref": "#/$defs/u64"
+        },
+        "final_states": {
+          "$ref": "#/$defs/u64"
+        },
+        "receipt_records": {
+          "$ref": "#/$defs/u64"
+        }
       },
       "required": [
         "status",
@@ -252,6 +613,167 @@
         "bytes_transferred",
         "bytes_unchanged",
         "elapsed_ms"
+      ],
+      "additionalProperties": false
+    },
+    "receiptCode": {
+      "enum": [
+        "none",
+        "execution_failed",
+        "authorization_refused",
+        "file_lifecycle_incomplete",
+        "observation_failed"
+      ]
+    },
+    "final_state": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": {
+          "const": "final_state"
+        },
+        "provenance": {
+          "const": "receiver_attested"
+        },
+        "scope": {
+          "$ref": "#/$defs/u64"
+        },
+        "dst": {
+          "$ref": "#/$defs/taggedPath"
+        },
+        "object": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "const": "present"
+                },
+                "kind": {
+                  "enum": [
+                    "dir",
+                    "file",
+                    "symlink",
+                    "fifo",
+                    "socket",
+                    "character_device",
+                    "block_device",
+                    "other"
+                  ]
+                },
+                "size": {
+                  "$ref": "#/$defs/u64"
+                },
+                "metadata": {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "uid": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "gid": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "mtime": {
+                      "type": "integer"
+                    },
+                    "mtime_nsec": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "rdev": {
+                      "$ref": "#/$defs/u64"
+                    }
+                  },
+                  "required": [
+                    "mode",
+                    "uid",
+                    "gid",
+                    "mtime",
+                    "mtime_nsec",
+                    "rdev"
+                  ],
+                  "additionalProperties": false
+                },
+                "digest": {
+                  "type": "object",
+                  "properties": {
+                    "algorithm": {
+                      "const": "blake3"
+                    },
+                    "value": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  },
+                  "required": [
+                    "algorithm",
+                    "value"
+                  ],
+                  "additionalProperties": false
+                },
+                "symlink_target": {
+                  "$ref": "#/$defs/taggedPath"
+                },
+                "observation_error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "state",
+                "kind",
+                "size",
+                "metadata"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "const": "absent"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "const": "observation_failed"
+                },
+                "code": {
+                  "$ref": "#/$defs/receiptCode"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "state",
+                "code"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "required": [
+        "provenance",
+        "scope",
+        "dst",
+        "object"
       ],
       "additionalProperties": false
     }

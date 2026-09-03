@@ -348,14 +348,6 @@ def _append_remote_arguments(
             raise SyqInvocationError(
                 "--coordinate-at must be auto, local, src, or dest"
             )
-        if coordinate_at in {"src", "dest"}:
-            # The results stream this library relies on is written by the
-            # transfer coordinator, which these placements move to a remote
-            # host; syq refuses the combination at argument parsing.
-            raise SyqInvocationError(
-                "the results stream needs a local transfer coordinator; "
-                "use coordinate_at='local' (or run() for a raw invocation)"
-            )
         argv.extend(("--coordinate-at", coordinate_at))
     if rsh is not None:
         argv.extend(("--rsh", _text_arg(rsh, label="rsh")))
@@ -763,16 +755,17 @@ class Client:
         timeout: float | None = None,
         check: bool = True,
     ) -> CpResult:
-        if from_ is not None and to is not None and coordinate_at != "local":
-            # A remote-to-remote copy places the coordinator — and the
-            # results stream this surface relies on — on a remote host.
-            # The local relay topology is never chosen implicitly: routing
-            # the transfer through this machine is the operator's call.
+        if (
+            from_ is not None
+            and to is not None
+            and dry_run
+            and coordinate_at != "local"
+        ):
+            # Mirrors the CLI's usage-lane refusal: a dry run's traces exist
+            # only on the coordinator, which these placements move remote.
             raise SyqInvocationError(
-                "a remote-to-remote copy cannot write the local results "
-                "stream; pass coordinate_at='local' explicitly to route the "
-                "transfer through this machine, or use run() for a raw "
-                "invocation"
+                "a remote-to-remote dry run cannot produce the results "
+                "stream this surface relies on; pass coordinate_at='local'"
             )
         argv, source_count = _copy_arguments(
             "cp",

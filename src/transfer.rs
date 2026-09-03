@@ -1,4 +1,4 @@
-//! The coordinator: scan, diff, schedule, and the per-worker transfer loop.
+//! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{
@@ -937,17 +937,10 @@ pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &L
     let Some(source) = sources.first() else {
         return false;
     };
-    let direct_paths_are_utf8 = sources
-        .iter()
-        .chain(std::iter::once(dst))
-        .all(|location| std::str::from_utf8(&location.path).is_ok());
     source.is_remote()
         && dst.is_remote()
         && !args.relay
         && (args.interface == Interface::Rsync || args.coordinate_at != CoordinateAt::Local)
-        && (args.interface == Interface::Rsync
-            || args.coordinate_at != CoordinateAt::Auto
-            || direct_paths_are_utf8)
 }
 
 fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
@@ -1041,20 +1034,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if args.interface == Interface::Rsync && original_srcs[0].is_remote() && dst.is_remote() {
         bail!("syq rsync does not support remote-to-remote transfers");
     }
-    let direct_paths_are_utf8 = original_srcs
-        .iter()
-        .chain(std::iter::once(dst))
-        .all(|location| std::str::from_utf8(&location.path).is_ok());
     let coordinator_is_remote = uses_remote_coordinator(&args, original_srcs, dst);
     let direct_remote_to_remote = original_srcs[0].is_remote()
         && dst.is_remote()
         && !original_srcs[0].same_host(dst)
         && !args.relay
-        && args.coordinate_at != CoordinateAt::Local
-        // Native auto placement cannot delegate raw path bytes because they
-        // cannot be represented in the remote coordinator's argv. Validate
-        // direct-only controls against the topology that will actually run.
-        && (args.coordinate_at != CoordinateAt::Auto || direct_paths_are_utf8);
+        && args.coordinate_at != CoordinateAt::Local;
     if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
     {
         bail!(
@@ -1070,7 +1055,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && (args.no_tcp || args.tcp_plain || original_srcs[0].is_remote() || !dst.is_remote())
     {
         bail!(
-            "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted TCP data connections"
+            "a signed receiver grant is valid only for a local-to-remote orchestrator using encrypted TCP data connections"
         );
     }
     for source in original_srcs {
@@ -1152,24 +1137,23 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_SSH;
         }
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dest {
-            return crate::direct::coordinate_at_dest(&args, srcs, dst);
+            return crate::direct::coordinate_at_dest(
+                &args,
+                srcs,
+                dst,
+                progress.results_writer().cloned(),
+            );
         }
-        return crate::direct::run(&args, srcs, dst);
+        return crate::direct::run(&args, srcs, dst, progress.results_writer().cloned());
     }
     if srcs[0].is_remote() && dst.is_remote() {
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Local {
             args.relay = true;
         }
-        if !args.relay {
-            // Data is never routed through this machine implicitly. Path
-            // bytes that cannot travel in a remote command line make the
-            // direct topology unavailable today (encoded delegation
-            // operands are the planned fix); until then, relaying is the
-            // operator's explicit choice.
-            bail!(
-                "remote-to-remote copy: these path bytes cannot be carried in a remote command line, so a direct transfer is not possible; pass --coordinate-at local to route the transfer through this machine instead"
-            );
-        }
+        // Delegated operands are base64 in the remote argv, so every
+        // non-relay remote-to-remote copy took the direct return above; the
+        // only way here is the operator's explicit --coordinate-at local.
+        debug_assert!(args.relay);
         if !args.quiet {
             eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
         }
@@ -1192,7 +1176,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // option forces SSH data.
     // A local receiver uses one child process and a loopback data listener so
     // every worker shares its retained destination cwd without changing the
-    // coordinator process's cwd.
+    // orchestrator process's cwd.
     let use_tcp = !args.no_tcp && (src_ep.has_data_server() || dst_ep.has_data_server());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
     // start conservatively until TCP reachability has been established below.
@@ -1207,7 +1191,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {
         bail!(
-            "{} {algorithm} requires a Linux transfer coordinator and Linux remote endpoints",
+            "{} {algorithm} requires a Linux transfer orchestrator and Linux remote endpoints",
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
@@ -1565,11 +1549,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     match args.target_existence {
         Existence::Any => {}
         Existence::New if dst_existed => bail!(
-            "destination {} already exists, but the selected placement requires a new path",
+            "target {} already exists, but the selected placement requires a new path",
             display(&dst_root)
         ),
         Existence::Existing if !dst_existed => bail!(
-            "destination {} does not exist, but the selected placement requires an existing path",
+            "target {} does not exist, but the selected placement requires an existing path",
             display(&dst_root)
         ),
         Existence::New | Existence::Existing => {}
@@ -1589,7 +1573,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
             if dst_existed && !dst_entry_is_dir {
                 bail!(
-                    "--into destination {} exists but is not a directory",
+                    "--into target {} exists but is not a directory",
                     display(&dst_root)
                 );
             }
@@ -1610,7 +1594,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !dst_entry_is_dir
     {
         bail!(
-            "--into-existing destination {} is not an existing directory",
+            "--into-existing target {} is not an existing directory",
             display(&dst_root)
         );
     }
@@ -2407,7 +2391,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     // With a command-restricted receiver, ask for its signed receipt now that
     // every mutation is settled, and hand its bounded frames to the invoking
-    // machine as marked lines. That machine verifies it; this coordinator's
+    // machine as marked lines. That machine verifies it; this orchestrator's
     // own report is not trusted for what landed.
     if args.restricted_grant.is_some() {
         use base64::Engine as _;
@@ -2545,7 +2529,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
     let capacity_only_dry_run_abort = opts.dry_run && fresh_capacity_shortage.is_some();
-    if !args.quiet && (!aborted || capacity_only_dry_run_abort) {
+    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
                 println!(
@@ -2595,14 +2579,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 }
             );
         }
-        if args.stats {
-            let (
-                files_label,
-                unchanged_files_label,
-                bytes_label,
-                unchanged_bytes_label,
-                bytes_work,
-            ) = if opts.dry_run {
+    }
+    // --stats is additional human output, not the summary line the local
+    // attested settlement re-renders; a delegated coordinator keeps it.
+    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && args.stats {
+        let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
+            if opts.dry_run {
                 (
                     "files needing content work",
                     "files with unchanged content",
@@ -2619,11 +2601,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     done,
                 )
             };
-            let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
+        let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
                 matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
             });
-            let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-            println!(
+        let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
+        println!(
                 "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
@@ -2647,7 +2629,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 },
                 tcp_stats,
             );
-        }
     }
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
@@ -2736,12 +2717,7 @@ fn mkdir_root(
     }
     stat_one(conn, dst_root, false)?
         .filter(|entry| entry.kind == Kind::Dir)
-        .with_context(|| {
-            format!(
-                "created destination {} is not a directory",
-                display(dst_root)
-            )
-        })
+        .with_context(|| format!("created target {} is not a directory", display(dst_root)))
 }
 
 fn mkdir_root_batches(
@@ -3747,7 +3723,7 @@ impl Planner<'_> {
         match current {
             Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
             _ => bail!(
-                "destination {} changed after the placement precondition was checked",
+                "target {} changed after the placement precondition was checked",
                 display(&self.root_path)
             ),
         }
@@ -4709,7 +4685,7 @@ impl Planner<'_> {
                         .pop()
                         .flatten()
                         .filter(|entry| entry.kind == Kind::Dir)
-                        .context("new exact destination was not a directory after creation")?;
+                        .context("new exact target was not a directory after creation")?;
                     self.exact_condition = target_identity(&created);
                     self.mutation_root_condition = target_identity(&created);
                     if self.guard_containers {
@@ -4894,7 +4870,7 @@ impl Planner<'_> {
             };
             if !target_condition_holds {
                 self.progress.error(&format!(
-                    "syq: destination {} changed after the placement precondition was checked",
+                    "syq: target {} changed after the placement precondition was checked",
                     display(&dst_path)
                 ));
                 self.collision = true;

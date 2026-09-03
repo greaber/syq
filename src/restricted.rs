@@ -117,7 +117,7 @@ struct PendingEnrollment {
 
 pub(crate) struct PreparedTransfer {
     pub(crate) private_key: PrivateKey,
-    pub(crate) canonical_destination: String,
+    pub(crate) canonical_destination: Vec<u8>,
     pub(crate) grant: String,
     pub(crate) enrollment_id: EnrollmentId,
     /// The nonce the grant was signed with; the receipt must name it.
@@ -152,6 +152,7 @@ struct AuthorityState {
     deletions: u64,
     live_connections: u16,
     tcp_listener_started: bool,
+    /// What hostB will attest to in its receipt.
     /// Receipt records live in an anonymous spool; only mutation-relevant paths
     /// enter `touched_v2`, never paths merely returned by a destination scan.
     ledger_v2: Option<crate::receipt_v2::StreamWriterV2>,
@@ -1344,7 +1345,7 @@ impl RestrictedAuthority {
         let target = Path::new(OsStr::from_bytes(path));
         let relative = target.strip_prefix(root_path).with_context(|| {
             format!(
-                "receiver metadata destination {} is outside enrolled root {}",
+                "receiver metadata target {} is outside enrolled root {}",
                 target.display(),
                 root_path.display()
             )
@@ -1422,9 +1423,7 @@ impl RestrictedAuthority {
                         ));
                     };
                     if !metadata.is_dir() {
-                        bail!(
-                            "receiver-managed directory destination changed before authorization"
-                        );
+                        bail!("receiver-managed directory target changed before authorization");
                     }
 
                     // Mkdir itself was constrained to 0700, so a setgid bit
@@ -1594,7 +1593,7 @@ impl RestrictedAuthority {
                         expected_ctime,
                         expected_ctime_nsec,
                     ) == (dev, ino, ctime, ctime_nsec) => {}
-                    _ => bail!("receiver-managed mode destination changed before authorization"),
+                    _ => bail!("receiver-managed mode target changed before authorization"),
                 }
             }
             // From this point on MODE contains receiver-authored data. FsOps
@@ -2635,12 +2634,14 @@ fn signer_name(id: EnrollmentId) -> String {
     format!("syq-enrollment-{id}")
 }
 
-fn normalize_absolute(path: &str, home: &Path) -> Result<PathBuf> {
-    let raw = if path == "~" {
+fn normalize_absolute(path: &std::ffi::OsStr, home: &Path) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = path.as_bytes();
+    let raw = if bytes == b"~" {
         home.to_path_buf()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        home.join(rest)
-    } else if path.starts_with('/') {
+    } else if let Some(rest) = bytes.strip_prefix(b"~/") {
+        home.join(std::ffi::OsStr::from_bytes(rest))
+    } else if bytes.starts_with(b"/") {
         PathBuf::from(path)
     } else {
         home.join(path)
@@ -2715,7 +2716,8 @@ pub(crate) fn remote_install() -> Result<()> {
     if account != request.target_login {
         bail!("enrollment target login does not match the remote account");
     }
-    let destination = normalize_absolute(&request.requested_destination, &home)?;
+    let destination =
+        normalize_absolute(std::ffi::OsStr::new(&request.requested_destination), &home)?;
     let parent = requested_parent(&destination);
     let canonical_root = fs::canonicalize(parent)
         .with_context(|| format!("resolve restricted destination parent {}", parent.display()))?;
@@ -3106,7 +3108,7 @@ fn enroll(
     requested_destination: &str,
     jump: Option<&SshEndpoint>,
     refresh_existing: bool,
-) -> Result<(LocalEnrollment, PathBuf, String)> {
+) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
     let base = local_state_base()?;
     let base_lock = open_directory(&base)?;
     lock_directory(&base_lock)?;
@@ -3114,7 +3116,8 @@ fn enroll(
     let mut active = None;
     for (metadata, directory) in load_local_enrollments()? {
         if metadata.host == host && metadata.port == port && metadata.target_login == login {
-            if let Some(canonical_destination) = destination_for(&metadata, requested_destination)?
+            if let Some(canonical_destination) =
+                destination_for(&metadata, requested_destination.as_bytes())?
             {
                 active = Some((metadata, directory, canonical_destination));
                 break;
@@ -3214,23 +3217,33 @@ fn enroll(
         receipt_public_key: response.receipt_public_key,
     };
     complete_local_enrollment(&directory, &metadata)?;
-    Ok((metadata, directory, response.canonical_destination))
+    Ok((
+        metadata,
+        directory,
+        response.canonical_destination.into_bytes(),
+    ))
 }
 
-fn destination_for(metadata: &LocalEnrollment, requested: &str) -> Result<Option<String>> {
-    let normalized = normalize_absolute(requested, Path::new(&metadata.remote_home))?;
+fn destination_for(metadata: &LocalEnrollment, requested: &[u8]) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let normalized = normalize_absolute(
+        std::ffi::OsStr::from_bytes(requested),
+        Path::new(&metadata.remote_home),
+    )?;
     if requested_parent(&normalized) != Path::new(&metadata.requested_parent) {
         return Ok(None);
     }
     let leaf = normalized
         .file_name()
         .context("restricted destination / is not supported")?;
+    // The enrollment's canonical root is UTF-8 (it is administrative,
+    // declared at enrollment time); the leaf may be any bytes.
     Ok(Some(
         Path::new(&metadata.canonical_root)
             .join(leaf)
-            .to_str()
-            .context("canonical restricted destination is not UTF-8")?
-            .to_owned(),
+            .as_os_str()
+            .as_bytes()
+            .to_vec(),
     ))
 }
 
@@ -3348,7 +3361,7 @@ fn grant_for(
     sources: &[Location],
     id: EnrollmentId,
     login: &str,
-    destination: &str,
+    destination: &[u8],
 ) -> Result<Grant> {
     validate_restricted_args(args)?;
     let issued_at = now()?;
@@ -3398,7 +3411,7 @@ fn grant_for(
         }
         Placement::Into | Placement::Rsync => DestinationPlacement::DirectoryAsChild,
     };
-    let destination_bytes = destination.as_bytes().to_vec();
+    let destination_bytes = destination.to_vec();
     let mut mutation_scopes = match placement {
         DestinationPlacement::ExactPath | DestinationPlacement::DirectoryContents => {
             vec![MutationScope {
@@ -3532,8 +3545,7 @@ pub(crate) fn prepare_transfer(
         .host
         .as_deref()
         .context("destination host missing")?;
-    let requested = std::str::from_utf8(&destination.path)
-        .context("restricted destination path is not UTF-8")?;
+    let requested = destination.path.as_slice();
     let mut selected = None;
     for (metadata, directory) in load_local_enrollments()? {
         if metadata.host == host
@@ -3563,7 +3575,12 @@ pub(crate) fn prepare_transfer(
                 host,
                 destination.port,
                 destination_login,
-                requested,
+                // Automatic enrollment declares a new administrative scope,
+                // which stays UTF-8; transfers against an existing
+                // enrollment accept any destination bytes above.
+                std::str::from_utf8(requested).context(
+                    "automatic enrollment requires a UTF-8 destination; pre-enroll a scope with `syq enrollment add` to copy to this path",
+                )?,
                 Some(&jump),
                 false,
             )?
@@ -3607,11 +3624,7 @@ pub(crate) fn prepare_transfer(
             max_file_data_bytes_per_second: args.bwlimit_bytes,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
-                destination_roots: filter_destination_roots(
-                    args,
-                    sources,
-                    canonical_destination.as_bytes(),
-                )?,
+                destination_roots: filter_destination_roots(args, sources, &canonical_destination)?,
                 delete_excluded: args.delete_excluded,
             },
             root_existence: root_existence_for(args.target_existence),
@@ -3803,7 +3816,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
                 "enrolled {} for {}:{}",
                 metadata.id,
                 endpoint(&metadata.target_login, &metadata.host, metadata.port)?.label(),
-                destination
+                String::from_utf8_lossy(&destination)
             );
             Ok(0)
         })()),
@@ -4083,12 +4096,55 @@ mod tests {
     }
 
     #[test]
+    fn enrolled_destinations_accept_any_leaf_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let metadata = LocalEnrollment {
+            version: 1,
+            id: EnrollmentId::random(),
+            host: "hostB".into(),
+            port: None,
+            target_login: "backup".into(),
+            remote_home: "/home/backup".into(),
+            requested_parent: "/home/backup/archive".into(),
+            canonical_root: "/srv/archive".into(),
+            receiver_path: "/usr/bin/syq".into(),
+            receipt_public_key: String::new(),
+        };
+        // A destination whose leaf is not UTF-8 still resolves inside the
+        // enrollment's (UTF-8, administrative) scope.
+        let mut requested = b"archive/leaf-".to_vec();
+        requested.push(0xff);
+        let canonical = destination_for(&metadata, &requested).unwrap().unwrap();
+        let mut expected = b"/srv/archive/leaf-".to_vec();
+        expected.push(0xff);
+        assert_eq!(canonical, expected);
+        assert_eq!(
+            std::ffi::OsStr::from_bytes(&canonical),
+            Path::new("/srv/archive")
+                .join(std::ffi::OsStr::from_bytes(b"leaf-\xff"))
+                .as_os_str()
+        );
+        // Outside the enrolled parent, no match.
+        assert!(destination_for(&metadata, b"elsewhere/leaf")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn relative_destination_resolution_rejects_parent_components() {
         assert_eq!(
-            normalize_absolute("archive/file", Path::new("/home/backup")).unwrap(),
+            normalize_absolute(
+                std::ffi::OsStr::new("archive/file"),
+                Path::new("/home/backup")
+            )
+            .unwrap(),
             Path::new("/home/backup/archive/file")
         );
-        assert!(normalize_absolute("archive/../escape", Path::new("/home/backup")).is_err());
+        assert!(normalize_absolute(
+            std::ffi::OsStr::new("archive/../escape"),
+            Path::new("/home/backup")
+        )
+        .is_err());
     }
 
     #[test]
@@ -5078,6 +5134,232 @@ mod tests {
         );
     }
 
+    fn existence_authority_with_receipt(
+        root: &Path,
+        policy: &crate::receipt_v2::ReceiptPolicyV2,
+        deadline_ms: u64,
+    ) -> RestrictedAuthority {
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let mut authority = test_authority_with_receipt(
+            root,
+            DeletionPolicy::DeleteDestinationOnly,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((key, policy.clone())),
+        )
+        .unwrap();
+        // Waiting for in-flight requests is bounded by the grant deadline;
+        // keep tests from sitting out the full minute.
+        authority.deadline = Instant::now() + std::time::Duration::from_millis(deadline_ms);
+        authority
+    }
+
+    #[test]
+    fn receipt_attests_confirmed_outcomes_and_closes_the_grant() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let kept = target.join("kept");
+        let fresh = target.join("fresh");
+        let gone = target.join("gone");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&kept, b"old").unwrap();
+        fs::write(&gone, b"bye").unwrap();
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = encrypted_v2_policy(true);
+        let authority = test_authority_with_receipt(
+            &root,
+            DeletionPolicy::DeleteDestinationOnly,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((key, policy.clone())),
+        )
+        .unwrap();
+
+        // An observation the orchestrator asked for is hostB's own view.
+        let mut hash = Request::FileHash {
+            path: path_bytes(&kept),
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut hash, false).unwrap();
+        authority.settle(
+            settlement,
+            &proto::Response::FileHash {
+                size: 3,
+                hash: [9; 32],
+            },
+        );
+
+        // A confirmed staged publication, a confirmed deletion, and a
+        // refused request.
+        let settlement = authority
+            .authorize(&mut prepare_request(&fresh), false)
+            .unwrap();
+        authority.settle(settlement, &proto::Response::Ok);
+        let mut publish = finalize_request(&fresh, proto::TargetCondition::Any);
+        let settlement = authority.authorize(&mut publish, false).unwrap();
+        fs::write(&fresh, b"data").unwrap();
+        authority.settle(settlement, &proto::Response::Ok);
+        let mut delete = apply(Op::Unlink {
+            path: path_bytes(&gone),
+        });
+        let settlement = authority.authorize(&mut delete, false).unwrap();
+        fs::remove_file(&gone).unwrap();
+        authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        let mut outside = prepare_request(&root.join("elsewhere"));
+        assert!(authority.authorize(&mut outside, false).is_err());
+
+        let mut verified = open_issued(&authority, &secret, &policy);
+        assert_eq!(verified.terminal.summary.refusals, 1);
+        assert_eq!(verified.terminal.summary.published_files, 1);
+        assert_eq!(verified.terminal.summary.deletions, 1);
+        let mut records = Vec::new();
+        verified
+            .for_each_record(|record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+        assert!(records.iter().any(|record| matches!(
+            record,
+            crate::receipt_v2::RecordV2::Operation(operation)
+                if operation.path == b"kept"
+                    && operation.disposition
+                        == crate::receipt_v2::OperationDispositionV2::Observed
+        )));
+        assert!(records.iter().any(|record| matches!(
+            record,
+            crate::receipt_v2::RecordV2::FinalState(state)
+                if state.path == b"fresh"
+                    && matches!(
+                        state.object,
+                        crate::receipt_v2::FinalObjectV2::Present {
+                            digest: Some(digest),
+                            ..
+                        } if digest == *blake3::hash(b"data").as_bytes()
+                    )
+        )));
+        assert!(records.iter().any(|record| matches!(
+            record,
+            crate::receipt_v2::RecordV2::FinalState(state)
+                if state.path == b"gone"
+                    && state.object == crate::receipt_v2::FinalObjectV2::Absent
+        )));
+
+        // Issuing the receipt closes the grant: no mutation, no second copy,
+        // no further observation.
+        assert!(authority
+            .authorize(&mut prepare_request(&target.join("late")), false)
+            .is_err());
+        assert!(authority.issue_receipt().is_err());
+        let mut observe = Request::StatMany {
+            paths: vec![path_bytes(&kept)],
+            follow: false,
+            guard: None,
+        };
+        assert!(authority.authorize(&mut observe, false).is_err());
+
+        // A request still in flight holds the receipt back.
+        let waiting = existence_authority_with_receipt(&root, &policy, 200);
+        let settlement = waiting
+            .authorize(&mut prepare_request(&target.join("inflight")), false)
+            .unwrap();
+        assert!(waiting.issue_receipt().is_err());
+        waiting.settle(settlement, &proto::Response::Ok);
+
+        // A published file that cannot be read back at closure is attested
+        // present with the hash failure recorded rather than silently
+        // unhashed.
+        let (hashing_secret, hashing_policy) = encrypted_v2_policy(true);
+        let hashing = existence_authority_with_receipt(&root, &hashing_policy, 5_000);
+        let unreadable = target.join("unreadable");
+        let settlement = hashing
+            .authorize(&mut prepare_request(&unreadable), false)
+            .unwrap();
+        hashing.settle(settlement, &proto::Response::Ok);
+        let mut publish = finalize_request(&unreadable, proto::TargetCondition::Any);
+        let settlement = hashing.authorize(&mut publish, false).unwrap();
+        fs::write(&unreadable, b"sealed").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        hashing.settle(settlement, &proto::Response::Ok);
+        let mut verified = open_issued(&hashing, &hashing_secret, &hashing_policy);
+        let mut records = Vec::new();
+        verified
+            .for_each_record(|record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(records.iter().any(|record| matches!(
+            record,
+            crate::receipt_v2::RecordV2::FinalState(state)
+                if state.path == b"unreadable"
+                    && matches!(
+                        &state.object,
+                        crate::receipt_v2::FinalObjectV2::Present {
+                            digest: None,
+                            observation_error: Some(_),
+                            ..
+                        }
+                    )
+        )));
+
+        // The receipt states the final tree, not settlement order: a file
+        // republished then deleted is absent, and one deleted then
+        // republished is present.
+        let (racing_secret, racing_policy) = encrypted_v2_policy(false);
+        let racing = existence_authority_with_receipt(&root, &racing_policy, 5_000);
+        let vanished = target.join("vanished");
+        let returned = target.join("returned");
+        fs::write(&returned, b"back").unwrap();
+        for path in [&vanished, &returned] {
+            let settlement = racing.authorize(&mut prepare_request(path), false).unwrap();
+            racing.settle(settlement, &proto::Response::Ok);
+            let mut publish = finalize_request(path, proto::TargetCondition::Any);
+            let settlement = racing.authorize(&mut publish, false).unwrap();
+            racing.settle(settlement, &proto::Response::Ok);
+            let mut delete = apply(Op::Unlink {
+                path: path_bytes(path),
+            });
+            let settlement = racing.authorize(&mut delete, false).unwrap();
+            racing.settle(settlement, &proto::Response::Applied(vec![None]));
+        }
+        let mut verified = open_issued(&racing, &racing_secret, &racing_policy);
+        let mut records = Vec::new();
+        verified
+            .for_each_record(|record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+        assert!(records.iter().any(|record| matches!(
+            record,
+            crate::receipt_v2::RecordV2::FinalState(state)
+                if state.path == b"vanished"
+                    && state.object == crate::receipt_v2::FinalObjectV2::Absent
+        )));
+        assert!(records.iter().any(|record| matches!(
+            record,
+            crate::receipt_v2::RecordV2::FinalState(state)
+                if state.path == b"returned"
+                    && matches!(
+                        state.object,
+                        crate::receipt_v2::FinalObjectV2::Present { size: 4, .. }
+                    )
+        )));
+    }
+
     #[test]
     fn receipt_v2_records_each_outcome_and_closure_state_then_encrypts_it() {
         let temporary = tempfile::tempdir().unwrap();
@@ -5214,6 +5496,157 @@ mod tests {
     }
 
     #[test]
+    fn in_place_files_appear_in_the_receipt_before_their_final_step() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let image = target.join("image");
+        fs::create_dir_all(&target).unwrap();
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = encrypted_v2_policy(false);
+        let authority = test_authority_with_receipt(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::InPlace,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((key, policy.clone())),
+        )
+        .unwrap();
+        let mut prepare = Request::Prepare {
+            path: path_bytes(&image),
+            size: 4,
+            inplace: true,
+            partial_id: [1; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut prepare, false).unwrap();
+        fs::write(&image, b"half").unwrap();
+        authority.settle(settlement, &proto::Response::Ok);
+        let mut write = Request::WriteRange {
+            path: path_bytes(&image),
+            inplace: true,
+            partial_id: [1; 16],
+            attempt: 0,
+            off: 0,
+            hash: crate::fsops::content_digest(b"ha"),
+            data: b"ha".to_vec(),
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut write, false).unwrap();
+        authority.settle(settlement, &proto::Response::Ok);
+
+        // Without a final step the receipt still records the file; the
+        // incomplete lifecycle fails the receipt.
+        let verified = open_issued(&authority, &secret, &policy);
+        assert_eq!(
+            verified.terminal.status,
+            crate::receipt_v2::ReceiptStatusV2::Failed
+        );
+        assert!(verified.terminal.summary.incomplete > 0);
+
+        // With it, the same file is complete and the receipt is clean.
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = encrypted_v2_policy(false);
+        let finished = test_authority_with_receipt(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::InPlace,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((key, policy.clone())),
+        )
+        .unwrap();
+        let mut prepare = Request::Prepare {
+            path: path_bytes(&image),
+            size: 4,
+            inplace: true,
+            partial_id: [2; 16],
+            mode: 0o600,
+            guard: None,
+        };
+        let settlement = finished.authorize(&mut prepare, false).unwrap();
+        finished.settle(settlement, &proto::Response::Ok);
+        let mut finalize = Request::Finalize {
+            path: path_bytes(&image),
+            inplace: true,
+            partial_id: [2; 16],
+            meta: plain_meta(),
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        let settlement = finished.authorize(&mut finalize, false).unwrap();
+        finished.settle(settlement, &proto::Response::Ok);
+        let verified = open_issued(&finished, &secret, &policy);
+        assert_eq!(
+            verified.terminal.status,
+            crate::receipt_v2::ReceiptStatusV2::Clean
+        );
+        assert_eq!(verified.terminal.summary.incomplete, 0);
+    }
+
+    fn racing_public(authority: &RestrictedAuthority) -> String {
+        authority.receipt_key.public_key().to_openssh().unwrap()
+    }
+
+    fn encrypted_v2_policy(
+        hashed: bool,
+    ) -> (
+        crate::receipt_v2::RecipientSecret,
+        crate::receipt_v2::ReceiptPolicyV2,
+    ) {
+        let (secret, recipient_public_key) = crate::receipt_v2::generate_recipient().unwrap();
+        (
+            secret,
+            crate::receipt_v2::ReceiptPolicyV2 {
+                required: true,
+                hashed,
+                max_records: 64,
+                max_plaintext_bytes: 1 << 20,
+                delivery: crate::receipt_v2::ReceiptDeliveryV2::AttachedEncrypted {
+                    suite:
+                        crate::receipt_v2::HpkeSuiteV1::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+                    recipient_public_key,
+                },
+            },
+        )
+    }
+
+    fn open_issued(
+        authority: &RestrictedAuthority,
+        secret: &crate::receipt_v2::RecipientSecret,
+        policy: &crate::receipt_v2::ReceiptPolicyV2,
+    ) -> crate::receipt_v2::VerifiedReceiptV2 {
+        let issued = authority.issue_receipt().unwrap();
+        let mut frames = Vec::new();
+        crate::receipt_v2::emit_transport_frames(issued, |frame| {
+            frames.push(Ok(frame));
+            Ok(())
+        })
+        .unwrap();
+        crate::receipt_v2::open_attached_frames(
+            frames,
+            secret,
+            &racing_public(authority),
+            authority.enrollment_id,
+            authority.request_id,
+            [0; 32],
+            policy,
+        )
+        .unwrap()
+    }
+
+    #[test]
     fn guarded_executor_honors_creation_conditions() {
         use proto::TargetCondition::{Absent, Any, Matches};
         let temporary = tempfile::tempdir().unwrap();
@@ -5346,7 +5779,7 @@ mod tests {
         )
         .unwrap();
 
-        // The coordinator refuses the same combination before signing. The
+        // The orchestrator refuses the same combination before signing. The
         // rsync-shaped parser already makes --inplace and --ignore-existing
         // conflict, so the reachable case is the native --as-new placement.
         let mut args = Args::try_parse_from([
@@ -6260,7 +6693,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup",
+            b"/backup",
         )
         .unwrap();
         let GrantOperation::Copy(copy) = &grant.operation;
@@ -6288,7 +6721,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup",
+            b"/backup",
         )
         .unwrap();
         let GrantOperation::Copy(default_copy) = &default_grant.operation;
@@ -6315,7 +6748,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup",
+            b"/backup",
         )
         .unwrap();
         let GrantOperation::Copy(copy) = &grant.operation;
@@ -6333,7 +6766,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup"
+            b"/backup"
         )
         .is_err());
 
@@ -6345,7 +6778,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup"
+            b"/backup"
         )
         .is_err());
         let mut bounded = parse(&["--delete", "--max-delete", "40"]);
@@ -6355,7 +6788,7 @@ mod tests {
             std::slice::from_ref(&source),
             id,
             "backup",
-            "/backup",
+            b"/backup",
         )
         .unwrap();
         let GrantOperation::Copy(copy) = &grant.operation;
@@ -6363,7 +6796,7 @@ mod tests {
         assert_eq!(copy.limits.max_deletions, 30);
         // A read-only run plans no deletion, so it needs no budget.
         let preview = parse(&["--delete", "--dry-run"]);
-        let grant = grant_for(&preview, &[source], id, "backup", "/backup").unwrap();
+        let grant = grant_for(&preview, &[source], id, "backup", b"/backup").unwrap();
         let GrantOperation::Copy(copy) = &grant.operation;
         assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
     }
@@ -6375,7 +6808,7 @@ mod tests {
             Args::try_parse_from(["syq rsync", "-r", "host-a:source", "host-b:/backup"]).unwrap();
         named_args.normalize();
         let named_source = Location::parse("host-a:source").unwrap();
-        let named = grant_for(&named_args, &[named_source], id, "backup", "/backup").unwrap();
+        let named = grant_for(&named_args, &[named_source], id, "backup", b"/backup").unwrap();
         let GrantOperation::Copy(named) = named.operation;
         assert_eq!(
             named.mutation_scopes,
@@ -6396,7 +6829,7 @@ mod tests {
         contents_args.normalize();
         let contents_source = Location::parse("host-a:source/").unwrap();
         let contents =
-            grant_for(&contents_args, &[contents_source], id, "backup", "/backup").unwrap();
+            grant_for(&contents_args, &[contents_source], id, "backup", b"/backup").unwrap();
         let GrantOperation::Copy(contents) = contents.operation;
         assert_eq!(
             contents.mutation_scopes,
@@ -6410,7 +6843,8 @@ mod tests {
             Args::try_parse_from(["syq rsync", "host-a:file", "host-b:/backup"]).unwrap();
         nonrecursive_args.normalize();
         let file = Location::parse("host-a:file").unwrap();
-        let nonrecursive = grant_for(&nonrecursive_args, &[file], id, "backup", "/backup").unwrap();
+        let nonrecursive =
+            grant_for(&nonrecursive_args, &[file], id, "backup", b"/backup").unwrap();
         let GrantOperation::Copy(nonrecursive) = nonrecursive.operation;
         assert!(nonrecursive
             .mutation_scopes
@@ -6420,7 +6854,7 @@ mod tests {
         let mut unsupported = nonrecursive_args;
         unsupported.min_size = Some("1".into());
         let file = Location::parse("host-a:file").unwrap();
-        assert!(grant_for(&unsupported, &[file], id, "backup", "/backup").is_err());
+        assert!(grant_for(&unsupported, &[file], id, "backup", b"/backup").is_err());
     }
 
     #[test]

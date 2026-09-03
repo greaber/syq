@@ -137,7 +137,7 @@ Git-derived identity when an explicit source-built helper is used.
 ## Native commands
 
 Native syntax starts with an operation and keeps endpoints, selectors, and
-destination placement in separate arguments:
+target placement in separate arguments:
 
 ```sh
 syq cp project --to server --into /backup       # named object → /backup/project
@@ -161,7 +161,7 @@ syq rm --cwd /srv --follow-src --src-dir current-release
 ```
 
 `--from [USER@]HOST[:PORT]` selects one source endpoint and `--to
-[USER@]HOST[:PORT]` selects one destination endpoint; omission means local. Enclose
+[USER@]HOST[:PORT]` selects one target endpoint; omission means local. Enclose
 an IPv6 address in brackets, for example `alice@[2001:db8::1]:2222`. The port
 override is used consistently for the SSH connection, `ssh -G` policy
 resolution, known-host lookup, automatic enrollment, and later enrollment
@@ -173,7 +173,7 @@ Removal selectors are always relative; native `rm` rejects a leading slash and
 any `.` or `..` component.
 
 Bare paths and repeatable `--src PATH` select named objects. A named directory
-keeps its basename at the destination; by default a named symlink is copied as a
+keeps its basename at the target; by default a named symlink is copied as a
 symlink. A trailing slash is ordinary path spelling and has no semantic effect.
 `--src-file PATH` adds the precondition that the named object is not a
 directory, while `--src-dir DIR` requires a directory. Without `--follow`, a
@@ -182,7 +182,7 @@ symlink satisfies `--src-file` and is copied as a symlink, while it fails the
 and copy both apply to the referent. These typed selectors are available to
 `cp` and `rm`.
 `--src-src DIR` selects a directory's contents and merges them directly into
-the destination container. `--srcs PATH...`, `--src-srcs DIR...`, `--src-files
+the target container. `--srcs PATH...`, `--src-srcs DIR...`, `--src-files
 PATH...`, and `--src-dirs DIR...` are bulk conveniences for the corresponding
 singular selectors. Symlinks found while traversing a selected directory are
 copied as symlinks and are never followed. Singular selector options consume
@@ -251,7 +251,7 @@ changing an identity after that check.
 
 Placement is always explicit in this initial native surface:
 
-| Placement | Mapping | Destination precondition |
+| Placement | Mapping | Target precondition |
 |---|---|---|
 | `--into DIR` | Put selected names inside `DIR` | Use or create the directory |
 | `--into-new DIR` | Put selected names inside `DIR` | Must not exist |
@@ -272,9 +272,9 @@ command-restricted remote-to-remote path the precondition is also signed: the
 receiver checks it against the enrolled root when it claims the grant, and a
 `new` root can only be created without replacing anything.
 
-`cp` copies or updates mapped source objects and keeps unrelated destination objects
+`cp` copies or updates mapped source objects and keeps unrelated target objects
 by default. With `--prune`, it then applies the existing safe deletion planner
-to remove destination-only descendants in mapped directory scopes. Pruning never
+to remove target-only descendants in mapped directory scopes. Pruning never
 removes a source and requires explicit placement; `--max-delete N` keeps its
 all-or-nothing deletion budget.
 
@@ -365,10 +365,10 @@ the file fresh (an existing file is refused — one file, one run), and
 by the transfer coordinator, so both forms require it to be local; a
 remote-to-remote copy is refused unless `--coordinate-at local` is passed
 explicitly — routing through this machine is never chosen implicitly
-on the stream's behalf. (Receiver-attested streams for restricted
-direct copies, derived locally from the verified receipt, exist in the
-engine and return once wired to these output forms.) Both forms are
-rejected with `--detach`. Choose a results path outside the source and
+on the stream's behalf — or through a command-restricted receiver
+enrollment, whose verified receipt becomes a receiver-attested stream
+written locally while data flows directly between the remotes. Both
+forms are rejected with `--detach`. Choose a results path outside the source and
 destination trees; one inside them can make the run's own accounting
 unpredictable. `--mapping` cannot be combined with `--prune` because
 mapping manifests define no deletion region; `--results` covers
@@ -384,21 +384,20 @@ broker/receiver setup. A port in native endpoint syntax can be combined with
 the default SSH command or an explicit command whose executable is `ssh`; an
 arbitrary remote-shell wrapper must carry its own port option.
 
-For two remote endpoints, `--coordinate-at auto` (the default) places the
-coordinator at the source when the paths can be represented in a remote
-command, and refuses otherwise: data is never routed through this machine
-implicitly.
-`--coordinate-at src` explicitly selects a direct push, `--coordinate-at dest`
-selects a direct pull with the SSH edge reversed, and `--coordinate-at local`
-explicitly selects a relay through this machine. Direct placement therefore
-requires UTF-8 paths today. `--coordinate-at` is rejected for copies that do
-not have two remote endpoints.
+For two remote endpoints, `--coordinate-at auto` (the default) places the coordinator
+at the source. Path operands travel base64-encoded inside the delegated
+command line, so direct placement works for every filename and data is never
+routed through this machine implicitly. `--coordinate-at src` explicitly selects a
+direct push, `--coordinate-at dest` selects a direct pull with the SSH edge
+reversed, and `--coordinate-at local` explicitly selects a relay through this
+machine. `--coordinate-at` is rejected for copies that do not have two remote
+endpoints.
 
 The default push uses destination-bound agent authentication plus the
 command-restricted write receiver. Default pull fails closed until the
 corresponding read-restricted receiver is implemented; it never silently
 downgrades to authentication-only confinement. Pull is currently available
-with an explicit `--rsh`, `--no-forward-agent` when the destination owns source
+with an explicit `--rsh`, `--no-forward-agent` when the target owns source
 credentials, `--agent-broker-only`, or
 `--unrestricted-agent-forwarding`. The authentication options and `--detach`
 apply only to a direct copy between distinct remote endpoints. A detached
@@ -593,12 +592,11 @@ syq cp --from hostA --src-src big --to hostB --into big
 syq cp --prune --from hostA --src-src tree --to hostB --into-existing tree
 ```
 
-For paths representable in a remote command, syq starts the coordinator on
-hostA and pushes directly to hostB, so file data does not traverse the invoking
-machine. Matching helpers are installed automatically on both hosts and output
-is streamed back. Raw path bytes that cannot be represented safely in the
-remote command require an explicit `--coordinate-at local` relay. When both
-endpoints name the same host and user, syq runs a local copy on that host.
+syq starts the orchestrator on hostA and pushes directly to hostB, so file
+data does not traverse the invoking machine; path operands travel encoded in
+the delegated command, so any filename works. Matching helpers are installed
+automatically on both hosts and output is streamed back. When both endpoints
+name the same host and user, syq runs a local copy on that host.
 
 With implicit OpenSSH, the default combines a pre-enrolled forced receiver on
 hostB with a temporary local agent broker. The first transfer to a destination
@@ -998,11 +996,16 @@ counts.
 On the receiving side a file that needs content changes is written beside its
 destination as `.name.syq-part.<job-id>` (preallocated with `fallocate`,
 written with `pwrite` from several workers), given its metadata, and `rename`d
+<<<<<<< HEAD
+over the target. Newly created sidecars are mode `0600`; final metadata is
+applied just before publication. When an existing final file is the comparison
+=======
 over the destination. Newly created sidecars are mode `0600`; final metadata is
 applied just before publication. On Linux, SYQ uses the sparse-length fallback
 only when `fallocate` is unsupported; actual space and quota failures remain
 errors and abort the whole transfer instead of letting later files keep filling
 the filesystem. When an existing final file is the comparison
+>>>>>>> origin/master
 basis, the receiver retains that open descriptor while its blocks are hashed.
 If every block matches, metadata is applied through the descriptor without
 allocating or publishing a sidecar; otherwise that exact descriptor seeds the
@@ -1326,7 +1329,7 @@ sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specif
 ```
 
 Use `-vv` to see the route planned for the real transfer. For each remote
-endpoint seen by the active coordinator it reports the authenticated helper
+endpoint seen by the active orchestrator it reports the authenticated helper
 identity and platform, every TCP address syq considered, reachability and
 advertised link speed, why a reachable address was or was not selected by the
 preflight, the resulting planned TCP/ssh transport, and the initial connection
@@ -1341,9 +1344,9 @@ or start transfer workers, and verbosity does not change dry-run's success or
 failure. The reported route is therefore a plan for a real transfer, not a
 claim that a worker data connection was completed.
 
-Native remote-to-remote copies work the same way: the coordinator on hostA
+Native remote-to-remote copies work the same way: the orchestrator on hostA
 connects to hostB's listener. Diagnostics are relative to that active
-coordinator. If both endpoints name hostA, `-vv` reports a local filesystem
+orchestrator. If both endpoints name hostA, `-vv` reports a local filesystem
 route there.
 
 No special server setup is required. For a measurement-first checklist of

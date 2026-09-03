@@ -240,7 +240,7 @@ fn native_copy_distinguishes_named_contents_and_exact_placement() {
     assert_eq!(read(&t.path("exact/sub/file")), b"data");
     assert!(!t.path("exact/src").exists());
 
-    // Existing destination state does not change either placement mapping.
+    // Existing target state does not change either placement mapping.
     fs::create_dir_all(t.path("named-existing")).unwrap();
     fs::create_dir_all(t.path("exact-existing")).unwrap();
     run_native_ok(&["cp", &t.s("src"), "--into-existing", &t.s("named-existing")]);
@@ -381,7 +381,7 @@ fn native_copy_uses_explicit_endpoints_cwd_and_option_safe_selectors() {
 
     let no_basename = native_syq(&["cp", "..", "--into", &t.s("no-basename")]);
     assert!(!no_basename.status.success());
-    assert!(String::from_utf8_lossy(&no_basename.stderr).contains("no destination basename"));
+    assert!(String::from_utf8_lossy(&no_basename.stderr).contains("no target basename"));
     assert!(!t.path("no-basename").exists());
 }
 
@@ -1246,57 +1246,17 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
 }
 
 #[test]
-fn native_rejects_removed_topology_options() {
-    for arguments in [
-        &["cp", "--relay", "source", "--into", "destination"][..],
-        &[
-            "cp",
-            "--run-at",
-            "source",
-            "--src",
-            "source",
-            "--into",
-            "destination",
-        ][..],
-    ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args(arguments)
-            .run()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(2));
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
-#[test]
-fn native_coordinate_at_rejects_old_endpoint_names() {
-    for value in ["source", "target"] {
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args([
-                "cp",
-                "--coordinate-at",
-                value,
-                "--from",
-                "host-a",
-                "source",
-                "--to",
-                "host-b",
-                "--into",
-                "destination",
-            ])
-            .run()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(2));
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("invalid value"),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+fn native_rejects_unknown_relay_option() {
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--relay", "source", "--into", "target"])
+        .run()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -8396,27 +8356,21 @@ fn native_coordinate_at_dest_reverses_the_remote_ssh_edge() {
     assert_eq!(read(&t.path("dst/file")), b"pulled");
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     let mut invocations = log.lines();
-    let destination_command = invocations.next().expect("destination coordinator launch");
+    let target_command = invocations.next().expect("target coordinator launch");
+    assert!(target_command.contains("--from hostA"), "{target_command}");
+    assert!(target_command.contains("--no-tcp"), "{target_command}");
     assert!(
-        destination_command.contains("--from hostA"),
-        "{destination_command}"
-    );
-    assert!(
-        destination_command.contains("--no-tcp"),
-        "{destination_command}"
-    );
-    assert!(
-        destination_command.contains("--tcp-ports=49000-49002"),
-        "{destination_command}"
+        target_command.contains("--tcp-ports=49000-49002"),
+        "{target_command}"
     );
     assert!(
         invocations.next().is_some(),
-        "the destination coordinator never opened the reversed edge to hostA: {log}"
+        "the target coordinator never opened the reversed edge to hostA: {log}"
     );
 }
 
 #[test]
-fn native_destination_dry_run_labels_the_real_endpoints_and_ports() {
+fn native_target_dry_run_labels_the_real_endpoints_and_ports() {
     let t = Tmp::new();
     let ssh = fake_ssh(&t);
     write(&t.path("src/file"), b"planned");
@@ -8465,37 +8419,6 @@ fn native_destination_dry_run_labels_the_real_endpoints_and_ports() {
         ssh_log.lines().any(|line| line.contains("-p 2200")),
         "{ssh_log}"
     );
-}
-
-#[test]
-fn native_auto_raw_path_rejects_direct_only_controls() {
-    let mut raw_source = b"/source-".to_vec();
-    raw_source.push(0xff);
-    let raw_source = std::ffi::OsString::from_vec(raw_source);
-
-    for option in [
-        "--detach",
-        "--no-forward-agent",
-        "--agent-broker-only",
-        "--unrestricted-agent-forwarding",
-    ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .arg("cp")
-            .arg(option)
-            .args(["--from", "hostA", "--src"])
-            .arg(&raw_source)
-            .args(["--to", "hostB", "--as", "/target"])
-            .run()
-            .expect("reject a direct-only option before transfer selection");
-
-        assert!(!out.status.success(), "{option} unexpectedly succeeded");
-        let stderr = stderr_of(&out);
-        assert!(stderr.contains("direct"), "{option}: {stderr}");
-        assert!(
-            !stderr.contains("relaying raw path bytes"),
-            "{option} entered relay execution: {stderr}"
-        );
-    }
 }
 
 #[test]
@@ -11143,67 +11066,108 @@ fn native_cp_results_fd_refusals() {
 }
 
 #[test]
-fn native_results_require_a_local_coordinator() {
+fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src"), b"local results");
-    // Every placement except an explicit --coordinate-at local is refused: the
-    // local (relay) topology is never chosen implicitly on the stream's
-    // behalf, auto included.
-    for coordinate_at in [
-        &["--coordinate-at", "dest"][..],
-        &["--coordinate-at", "src"][..],
-        &[][..],
-    ] {
-        for flag in [
-            &["--results", "r-remote.ndjson"][..],
-            &["--results-fd", "3"][..],
-        ] {
-            let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-                .args(["cp", "--rsh"])
-                .arg(&rsh)
-                .args(["--from", "hostA", "--src", &t.s("src")])
-                .args(["--to", "hostB"])
-                .args(coordinate_at)
-                .args(["--as", &t.s("dst-remote")])
-                .args(flag)
-                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-                .env("FAKE_RSH_LOG", t.path("rsh.log"))
-                .run()
-                .expect("reject results with a remote coordinator");
-            // Usage lane: exit 2, no stream ever existed.
-            assert_eq!(out.status.code(), Some(2));
-            let stderr = stderr_of(&out);
-            assert!(stderr.contains("--coordinate-at local"), "{stderr}");
-            assert!(!t.path("dst-remote").exists());
-            assert!(!t.path("r-remote.ndjson").exists());
-        }
-    }
-}
-
-#[test]
-fn native_remote_to_remote_never_relays_implicitly() {
-    use std::os::unix::ffi::OsStrExt;
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    // A source path with non-UTF-8 bytes cannot ride the delegated remote
-    // command line, so the direct topology is unavailable — and the relay
-    // is never chosen on the operator's behalf.
+    // Without a command-restricted receiver there is no verified channel to
+    // carry records home from a remote coordinator: the run fails, but the
+    // stream still settles with a failed terminal record.
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--rsh"])
         .arg(&rsh)
-        .args(["--from", "hostA"])
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args([
+            "--no-tcp",
+            "-j",
+            "1",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+        ])
+        .args([
+            "--to",
+            "hostB",
+            "--coordinate-at",
+            "dest",
+            "--as",
+            &t.s("dst-remote"),
+        ])
+        .args(["--results", "r-remote.ndjson"])
+        .current_dir(t.path(""))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .expect("refuse results without a receiver");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("command-restricted receiver"), "{stderr}");
+    assert!(stderr.contains("--coordinate-at local"), "{stderr}");
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r-remote.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.first().unwrap()["type"], "run");
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "failed");
+}
+#[test]
+fn native_remote_to_remote_carries_any_path_bytes_directly() {
+    use std::os::unix::ffi::OsStrExt;
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    // Non-UTF-8 path bytes ride the delegated command line as encoded
+    // operands: the direct topology works for every filename, with no
+    // implicit relay through this machine.
+    let name = std::ffi::OsStr::from_bytes(b"src-\xff");
+    write(&t.path("").join(name), b"raw bytes travel");
+    let mut destination = t.path("").into_os_string();
+    destination.push("/dst-\u{1}");
+    let mut destination_bytes = t.s("").into_bytes();
+    destination_bytes.extend_from_slice(b"dst-\xfe");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args(["--no-tcp", "-j", "1", "--from", "hostA"])
         .arg("--src")
-        .arg(std::ffi::OsStr::from_bytes(b"src-\xff"))
-        .args(["--to", "hostB", "--as", &t.s("dst")])
+        .arg(t.path("").join(name))
+        .args(["--to", "hostB", "--as"])
+        .arg(std::ffi::OsStr::from_bytes(&destination_bytes))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .run()
         .unwrap();
-    assert!(!out.status.success());
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(!stderr.contains("relaying"), "no implicit relay: {stderr}");
+    assert_eq!(
+        read(Path::new(std::ffi::OsStr::from_bytes(&destination_bytes))),
+        b"raw bytes travel"
+    );
+}
+
+#[test]
+fn native_remote_dry_run_results_need_a_local_coordinator() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    // Traces and planned totals exist only on the coordinator; until its
+    // stream can be relayed home, a remote dry-run stream is refused in
+    // the usage lane.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "-n", "--from", "hostA", "--src", &t.s("src")])
+        .args(["--to", "hostB", "--as", &t.s("dst")])
+        .args(["--results", "r.ndjson"])
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
     let stderr = stderr_of(&out);
     assert!(stderr.contains("--coordinate-at local"), "{stderr}");
-    assert!(!stderr.contains("relaying"), "no implicit relay: {stderr}");
+    assert!(!t.path("r.ndjson").exists());
 }

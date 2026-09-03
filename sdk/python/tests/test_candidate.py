@@ -202,21 +202,6 @@ exec /bin/sh -c "$1"
                 },
             )
 
-            # Remote coordinators cannot write the local stream: the typed
-            # surface refuses source/destination placement before spawning.
-            with self.assertRaises(syq.SyqInvocationError):
-                client.cp(
-                    src=source,
-                    from_="hostA",
-                    to="hostB",
-                    coordinate_at="dest",
-                    as_=destination,
-                    rsh=os.fspath(rsh),
-                    syq_path=EXECUTABLE,
-                    no_tcp=True,
-                    connections=1,
-                )
-
             result = client.cp(
                 src=source,
                 from_="hostA",
