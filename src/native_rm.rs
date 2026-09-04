@@ -1283,14 +1283,16 @@ mod tests {
     use std::os::unix::fs::{symlink, OpenOptionsExt};
     use std::sync::OnceLock;
 
-    type UnlinkHook = Box<dyn Fn(&CStr) + Send + Sync>;
+    type UnlinkHook = Arc<dyn Fn(&CStr) + Send + Sync>;
 
     /// Hooks that run between the identity re-check and `unlinkat`, keyed by
     /// the identity of the parent directory whose entry is about to be
     /// removed. Tests register a hook for their own temporary directory so
-    /// concurrent tests never observe it.
-    fn unlink_hooks() -> &'static Mutex<Vec<(Identity, UnlinkHook)>> {
-        static HOOKS: OnceLock<Mutex<Vec<(Identity, UnlinkHook)>>> = OnceLock::new();
+    /// concurrent tests never observe it, and the returned guard removes the
+    /// hook again so a later test whose temporary directory reuses the inode
+    /// does not fire it.
+    fn unlink_hooks() -> &'static Mutex<Vec<(u64, Identity, UnlinkHook)>> {
+        static HOOKS: OnceLock<Mutex<Vec<(u64, Identity, UnlinkHook)>>> = OnceLock::new();
         HOOKS.get_or_init(|| Mutex::new(Vec::new()))
     }
 
@@ -1300,17 +1302,41 @@ mod tests {
             return;
         }
         let identity = identity_from_stat(&stat);
-        let hooks = unlink_hooks().lock().unwrap();
-        for (target, hook) in hooks.iter() {
-            if *target == identity {
-                hook(name);
-            }
+        let matching: Vec<UnlinkHook> = unlink_hooks()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, target, _)| *target == identity)
+            .map(|(_, _, hook)| hook.clone())
+            .collect();
+        for hook in matching {
+            hook(name);
         }
     }
 
-    fn hook_unlinks_in(directory: &std::path::Path, hook: UnlinkHook) {
+    struct UnlinkHookGuard(u64);
+
+    impl Drop for UnlinkHookGuard {
+        fn drop(&mut self) {
+            unlink_hooks()
+                .lock()
+                .unwrap()
+                .retain(|(token, _, _)| *token != self.0);
+        }
+    }
+
+    fn hook_unlinks_in(
+        directory: &std::path::Path,
+        hook: impl Fn(&CStr) + Send + Sync + 'static,
+    ) -> UnlinkHookGuard {
+        static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(0);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) as u64;
         let identity = identity_from_file(&File::open(directory).unwrap()).unwrap();
-        unlink_hooks().lock().unwrap().push((identity, hook));
+        unlink_hooks()
+            .lock()
+            .unwrap()
+            .push((token, identity, Arc::new(hook)));
+        UnlinkHookGuard(token)
     }
 
     fn remove_selectors(
@@ -1587,15 +1613,12 @@ mod tests {
         fs::create_dir(base.join("tree")).unwrap();
         fs::write(base.join("tree/old"), b"old").unwrap();
         let swap = base.clone();
-        hook_unlinks_in(
-            &base,
-            Box::new(move |name| {
-                if name.to_bytes() == b"tree" {
-                    fs::rename(swap.join("tree"), swap.join("moved")).unwrap();
-                    fs::create_dir(swap.join("tree")).unwrap();
-                }
-            }),
-        );
+        let _hook = hook_unlinks_in(&base, move |name| {
+            if name.to_bytes() == b"tree" {
+                fs::rename(swap.join("tree"), swap.join("moved")).unwrap();
+                fs::create_dir(swap.join("tree")).unwrap();
+            }
+        });
 
         let outcomes = remove_selectors(&base, &[selector(b"tree", NativeRemoveKind::Directory)]);
 
@@ -1630,20 +1653,17 @@ mod tests {
         fs::create_dir(base.join("full")).unwrap();
         fs::write(base.join("full/keep"), b"keep").unwrap();
         let swap = base.clone();
-        hook_unlinks_in(
-            &base,
-            Box::new(move |name| match name.to_bytes() {
-                b"file" => {
-                    fs::rename(swap.join("file"), swap.join("file-moved")).unwrap();
-                    symlink("referent", swap.join("file")).unwrap();
-                }
-                b"dir-file" => {
-                    fs::rename(swap.join("dir-file"), swap.join("dir-file-moved")).unwrap();
-                    fs::rename(swap.join("full"), swap.join("dir-file")).unwrap();
-                }
-                _ => {}
-            }),
-        );
+        let _hook = hook_unlinks_in(&base, move |name| match name.to_bytes() {
+            b"file" => {
+                fs::rename(swap.join("file"), swap.join("file-moved")).unwrap();
+                symlink("referent", swap.join("file")).unwrap();
+            }
+            b"dir-file" => {
+                fs::rename(swap.join("dir-file"), swap.join("dir-file-moved")).unwrap();
+                fs::rename(swap.join("full"), swap.join("dir-file")).unwrap();
+            }
+            _ => {}
+        });
 
         let outcomes = remove_selectors(
             &base,
@@ -1695,14 +1715,11 @@ mod tests {
         let base = temp.path().to_path_buf();
         fs::create_dir(base.join("tree")).unwrap();
         let swap = base.clone();
-        hook_unlinks_in(
-            &base,
-            Box::new(move |name| {
-                if name.to_bytes() == b"tree" {
-                    fs::rename(swap.join("tree"), swap.join("moved")).unwrap();
-                }
-            }),
-        );
+        let _hook = hook_unlinks_in(&base, move |name| {
+            if name.to_bytes() == b"tree" {
+                fs::rename(swap.join("tree"), swap.join("moved")).unwrap();
+            }
+        });
 
         let outcomes = remove_selectors(&base, &[selector(b"tree", NativeRemoveKind::Directory)]);
 
