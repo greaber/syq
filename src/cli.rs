@@ -1032,7 +1032,7 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
 struct NativeMapCommand {
     #[command(flatten)]
     source: NativeSourceArgs,
-    /// Rename the single selected root in the emitted mapping
+    /// Emit the single selected root at PATH, relative to the future destination container; PATH may be nested
     #[arg(long, value_name = "PATH")]
     r#as: Option<OsString>,
 }
@@ -1412,12 +1412,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
             if target.is_empty() {
                 bail!("--as target may not be empty");
             }
-            if native_basename(&target).is_none() {
-                bail!(
-                    "--as target {:?} has no basename",
-                    String::from_utf8_lossy(&target)
-                );
-            }
+            crate::transfer::validate_manifest_path(&target, "--as")?;
             (Placement::As, Some(target))
         }
         None => {
