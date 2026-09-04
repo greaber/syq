@@ -107,10 +107,17 @@ What is different from rsync, or weaker:
   creation and the singly-linked-regular-file check limit what that buys, but
   they cannot prove who created a predictable pathname. Do not run a
   privileged copy into a directory writable by untrusted users.
-- **The rsync-mode escape hatch.** `syq rsync --insecure-links` restores the
-  unconfined, name-based source traversal, including through symlinked
+- **The rsync-mode escape hatch.** `syq rsync --insecure-links` turns off the
+  symlink ownership check for every path the operator supplies: the source
+  and destination arguments and control files such as `--files-from` and
+  `--syq-ignore-from`. A symlink in any of those paths is then followed
+  whoever owns it, so the flag also drops the destination-side refusal of an
+  attacker-owned link, not only the source-side one. It additionally restores
+  the unconfined, name-based source traversal, including through symlinked
   `--files-from` parents. It exists for compatibility and is never selected
-  automatically. It does not enable rsync's separate descendant-link modes:
+  automatically; do not reach for it to satisfy a source-side need without
+  accepting that destination and control paths lose the same check. It does
+  not enable rsync's separate descendant-link modes:
   `-L`/`--copy-links`, `--copy-unsafe-links`, `-k`/`--copy-dirlinks`, and
   `-K`/`--keep-dirlinks` remain unsupported and are rejected before either
   endpoint is contacted. `--safe-links` and `--munge-links` are likewise not

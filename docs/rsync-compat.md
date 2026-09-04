@@ -36,6 +36,12 @@ Categories:
 python3 scripts/rsync-compat.py
 ```
 
+Use `--area security` for the focused security slice. Run it once as an
+ordinary user and once as root: the root pass adds the foreign-owner symlink
+cases that an ordinary user cannot construct. This selects security-classified
+tests from the same matrix; upstream does not provide a separate security test
+target.
+
 The manifest pins rsync commit `7c20b077` and defines one target representing
 SYQ's `syq rsync` compatibility surface. Its configured `rsync`
 argument routes every upstream invocation through that subcommand without
@@ -54,11 +60,11 @@ product position: compatible, unimplemented, intentional divergence, undecided
 policy, or unresolved test claim. CI fails when the observation changes in
 either direction until it is reviewed, but an expected test failure is not
 misreported as a harness crash. Runner completeness and output parsing are
-checked independently. All 351 pinned tests are classified: 36 are runnable,
-133 require unsupported user-facing features, and 182 exercise rsync's own
+checked independently. All 351 pinned tests are classified: 38 are runnable,
+130 require unsupported user-facing features, and 183 exercise rsync's own
 internals, protocol, daemon, or restricted wrapper. There are no unassessed
-tests. The runnable sources produce 38 independently reported scenarios. CI
-runs 34 scenarios as a non-root user, then those scenarios plus four
+tests. The runnable sources produce 40 independently reported scenarios. CI
+runs 36 scenarios as a non-root user, then those scenarios plus four
 root-only circumstances as root, and publishes JSON, Markdown, static HTML,
 and raw-log matrices rather than a headline score.
 
