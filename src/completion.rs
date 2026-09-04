@@ -7,7 +7,7 @@
 //! endpoint selection, and local/remote directory discovery remains in Rust.
 
 use crate::cli::{parse_native_endpoint, NativeEndpoint};
-use crate::conn::{Conn, RemoteSpec, SshMultiplexer};
+use crate::conn::{Conn, RemoteConn, RemoteSpec, SshMultiplexer};
 use crate::proto::{CompletionEntry, Request, Response};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -1109,16 +1109,31 @@ fn remote_path_candidates(
     let prefix_for_thread = prefix.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let result = fetch_remote_entries(
+        let connection = connect_completion_endpoint(
             endpoint_for_thread,
             pscope.as_deref(),
             syq_path,
             no_bootstrap,
-            directory_for_thread,
-            root_for_thread,
-            prefix_for_thread,
         );
+        let (result, connection) = match connection {
+            Ok(mut connection) => {
+                let result = list_remote_entries(
+                    &mut connection,
+                    directory_for_thread,
+                    root_for_thread,
+                    prefix_for_thread,
+                );
+                (result, Some(connection))
+            }
+            Err(error) => (Err(error), None),
+        };
+        // Hand the entries back before closing the connection. Closing it
+        // sends Shutdown and then waits for the remote helper's exit status,
+        // a whole network round trip that must not delay the candidates. The
+        // process exits once they are printed; the ssh child finishes on its
+        // own.
         let _ = sender.send(result);
+        drop(connection);
     });
     let entries = receiver
         .recv_timeout(REMOTE_COMPLETION_DEADLINE)
@@ -1131,15 +1146,12 @@ fn remote_path_candidates(
     ))
 }
 
-fn fetch_remote_entries(
+fn connect_completion_endpoint(
     endpoint: NativeEndpoint,
     pscope: Option<&Path>,
     syq_path: Option<String>,
     no_bootstrap: bool,
-    directory: Vec<u8>,
-    confined_root: Option<Vec<u8>>,
-    prefix: Vec<u8>,
-) -> Result<Vec<CompletionEntry>> {
+) -> Result<RemoteConn> {
     let multiplexer = match crate::persistence::scope_for_implicit_ssh(pscope)? {
         Some(scope) => Arc::new(SshMultiplexer::persistent(
             &scope,
@@ -1176,7 +1188,15 @@ fn fetch_remote_entries(
         tcp: Default::default(),
         diagnostics: Default::default(),
     };
-    let mut connection = spec.connect_completion()?;
+    spec.connect_completion()
+}
+
+fn list_remote_entries(
+    connection: &mut RemoteConn,
+    directory: Vec<u8>,
+    confined_root: Option<Vec<u8>>,
+    prefix: Vec<u8>,
+) -> Result<Vec<CompletionEntry>> {
     match connection.call(Request::ListDir {
         directory,
         confined_root,
