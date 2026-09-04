@@ -99,7 +99,7 @@ go further:
 What is different from rsync, or weaker:
 
 - **Resume files.** Syq always keeps partials, at deterministic names
-  (`.name.syq-part.<job-id>`) so a rerun finds its state without a state file.
+  (`.name.syq-part.<copy-id>`) so a rerun finds its state without a state file.
   Rsync's equivalent, `--partial-dir`, is opt-in and its manual warns that the
   directory must not be writable by other users. The same warning applies to
   syq's destination directories, and applies by default: a user who can write

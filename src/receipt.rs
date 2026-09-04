@@ -131,7 +131,7 @@ pub(crate) enum OperationAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum OperationDisposition {
-    Applied,
+    Succeeded,
     Failed,
     Incomplete,
     Observed,
@@ -209,7 +209,7 @@ pub(crate) enum ReceiptRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ReceiptSummary {
     pub operations: u64,
-    pub applied: u64,
+    pub succeeded: u64,
     pub failed: u64,
     pub incomplete: u64,
     pub refusals: u64,
@@ -475,21 +475,21 @@ fn summarize(record: &ReceiptRecord, summary: &mut ReceiptSummary) {
         ReceiptRecord::Operation(record) => {
             summary.operations += 1;
             match record.disposition {
-                OperationDisposition::Applied | OperationDisposition::Observed => {
-                    summary.applied += 1
+                OperationDisposition::Succeeded | OperationDisposition::Observed => {
+                    summary.succeeded += 1
                 }
                 OperationDisposition::Failed => summary.failed += 1,
                 OperationDisposition::Incomplete => summary.incomplete += 1,
             }
             match record.action {
                 OperationAction::PublishFile { size, .. }
-                    if record.disposition == OperationDisposition::Applied =>
+                    if record.disposition == OperationDisposition::Succeeded =>
                 {
                     summary.published_files += 1;
                     summary.published_bytes = summary.published_bytes.saturating_add(size);
                 }
                 OperationAction::DeleteFile | OperationAction::DeleteDirectory
-                    if record.disposition == OperationDisposition::Applied =>
+                    if record.disposition == OperationDisposition::Succeeded =>
                 {
                     summary.deletions += 1;
                 }
@@ -811,19 +811,19 @@ pub(crate) fn emit_automation_records(
                         ("transfer_file", Some("file"), Some(size))
                     }
                     OperationAction::EnsureDirectory => {
-                        if record.disposition == OperationDisposition::Applied {
+                        if record.disposition == OperationDisposition::Succeeded {
                             directories_created += 1;
                         }
                         ("create_directory", Some("dir"), None)
                     }
                     OperationAction::CreateSymlink => {
-                        if record.disposition == OperationDisposition::Applied {
+                        if record.disposition == OperationDisposition::Succeeded {
                             symlinks_created += 1;
                         }
                         ("create_symlink", Some("symlink"), None)
                     }
                     OperationAction::CreateSpecial { .. } => {
-                        if record.disposition == OperationDisposition::Applied {
+                        if record.disposition == OperationDisposition::Succeeded {
                             specials_created += 1;
                         }
                         ("create_special", Some("special"), None)
@@ -1046,7 +1046,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 fn disposition_name(disposition: OperationDisposition) -> &'static str {
     match disposition {
-        OperationDisposition::Applied => "succeeded",
+        OperationDisposition::Succeeded => "succeeded",
         OperationDisposition::Failed => "failed",
         OperationDisposition::Incomplete => "incomplete",
         OperationDisposition::Observed => "observed",
@@ -1309,7 +1309,9 @@ fn validate_record(record: &ReceiptRecord, policy: &ReceiptPolicy) -> Result<()>
                 bail!("receipt operation has an invalid path or diagnostic");
             }
             let expected_code = match record.disposition {
-                OperationDisposition::Applied | OperationDisposition::Observed => OutcomeCode::None,
+                OperationDisposition::Succeeded | OperationDisposition::Observed => {
+                    OutcomeCode::None
+                }
                 OperationDisposition::Failed => OutcomeCode::ExecutionFailed,
                 OperationDisposition::Incomplete => OutcomeCode::FileLifecycleIncomplete,
             };
@@ -1317,10 +1319,10 @@ fn validate_record(record: &ReceiptRecord, policy: &ReceiptPolicy) -> Result<()>
                 || (record.disposition == OperationDisposition::Observed
                     && record.action != OperationAction::ObserveFileHash)
                 || (record.action == OperationAction::ObserveFileHash
-                    && matches!(record.disposition, OperationDisposition::Applied))
+                    && matches!(record.disposition, OperationDisposition::Succeeded))
                 || (matches!(
                     record.disposition,
-                    OperationDisposition::Applied | OperationDisposition::Observed
+                    OperationDisposition::Succeeded | OperationDisposition::Observed
                 ) && record.diagnostic.is_some())
             {
                 bail!("receipt operation code, disposition, and diagnostic are inconsistent");
@@ -1768,7 +1770,7 @@ mod tests {
                 size: 3,
                 inplace: false,
             },
-            disposition: OperationDisposition::Applied,
+            disposition: OperationDisposition::Succeeded,
             code: OutcomeCode::None,
             diagnostic: None,
         }));
@@ -1903,7 +1905,7 @@ mod tests {
                 scope: 0,
                 path: b"artifact".to_vec(),
                 action: OperationAction::EnsureDirectory,
-                disposition: OperationDisposition::Applied,
+                disposition: OperationDisposition::Succeeded,
                 code: OutcomeCode::None,
                 diagnostic: None,
             }));
@@ -1962,7 +1964,7 @@ mod tests {
             scope: 1,
             path: b"plain".to_vec(),
             action: OperationAction::EnsureDirectory,
-            disposition: OperationDisposition::Applied,
+            disposition: OperationDisposition::Succeeded,
             code: OutcomeCode::None,
             diagnostic: None,
         }));
@@ -2022,7 +2024,7 @@ mod tests {
                 scope: 0,
                 path: path.to_vec(),
                 action: OperationAction::EnsureDirectory,
-                disposition: OperationDisposition::Applied,
+                disposition: OperationDisposition::Succeeded,
                 code: OutcomeCode::None,
                 diagnostic: None,
             }));

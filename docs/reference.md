@@ -676,7 +676,7 @@ Identical to rsync:
   spelling afterward therefore cannot redirect its writes. A symlink
   encountered below the destination root is payload at that path: it is
   replaced rather than followed, even when it points to a directory.
-- Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
+- Recognizable `.syq-part.<copy-id>` paths in a source are copied as ordinary
   payload and produce one warning summary. Before transfer starts, SYQ rejects
   the exceptional case where a mapped payload path exactly equals a sidecar
   this job would use for another mapped file.
@@ -787,7 +787,7 @@ left, so the tail of a transfer stays parallel without pre-deciding chunk
 counts.
 
 On the receiving side a file that needs content changes is written beside its
-target as `.name.syq-part.<job-id>`, written with `pwrite` from several workers,
+target as `.name.syq-part.<copy-id>`, written with `pwrite` from several workers,
 given its metadata, and `rename`d over the target. Eligible local filesystems
 preallocate fresh sidecars with `fallocate`; NFS sidecars grow from the data
 writes themselves so allocation and initial-size requests do not add
@@ -801,7 +801,7 @@ blocks are hashed.
 If every block matches, metadata is applied through the descriptor without
 allocating or publishing a sidecar; otherwise that exact descriptor seeds the
 sidecar.
-The job ID is a 128-bit digest of the normalized source/destination mapping and
+The copy ID is a 128-bit digest of the normalized source/destination mapping and
 content-affecting options, and is stable when the same logical command is
 rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
 semantics and block size, but not operational controls such as checksum
@@ -839,7 +839,7 @@ levels.
 **Within a file.** There is no per-file state file — the partial *is* the state:
 
 - Files whose size and mtime already match are skipped (the rsync quick check).
-- If this job's range-transfer `.name.syq-part.<job-id>` exists, both sides
+- If this copy's range-transfer `.name.syq-part.<copy-id>` exists, both sides
   hash it and the source with full BLAKE3 digests in `--block-size` blocks and
   only the mismatching blocks are sent. A leftover is reused only when it can
   be safely opened as a singly-linked regular file without following a symlink; numeric ownership is
@@ -860,7 +860,7 @@ databases, logs). It does **not** catch a byte inserted near the start of a
 file, which rsync's rolling checksum would — for syq's intended use (fresh
 uploads and downloads) that trade was made deliberately.
 
-The partial job ID includes `--block-size` and the ordered ignore rules, so
+The partial copy ID includes `--block-size` and the ordered ignore rules, so
 changing either starts a separate resumable namespace. Old sidecars are not
 garbage-collected automatically and may be deleted manually when the earlier
 command will not be resumed. Options that do not change the copy itself, such
@@ -938,7 +938,7 @@ rest.
 
 Compared with rsync: ordinary content-changing writes use the same
 temporary-file plus atomic rename model; `--inplace` explicitly gives that up.
-Rsync chooses a random temporary suffix, while SYQ uses a deterministic job ID
+Rsync chooses a random temporary suffix, while SYQ uses a deterministic copy ID
 so an interrupted command can find its partial again without a local state
 file. The change-during-transfer check is the same idea; `--delete` runs
 strictly after the transfer (see below); hardlinks aren't implemented.
@@ -1015,13 +1015,13 @@ have is removed. The rules are simpler than rsync's, deliberately:
   has begun, interruption can leave some planned extras removed; rerunning
   finishes the mirror. Directory mtimes are set after the deletes.
 - **Sidecar-patterned files are extras unless they are this job's live
-  resume state.** A `.name.syq-part.<job-id>` of *this* command whose `name`
+  resume state.** A `.name.syq-part.<copy-id>` of *this* command whose `name`
   is still in the source stays, whatever happened to that file this run
   (failed, filtered, already up to date): the next transfer of that file
   consumes it. Everything else matching the pattern — an orphan of this
-  command, or any other job id — is an ordinary extra: syq copies such names
+  command, or any other copy ID — is an ordinary extra: syq copies such names
   as payload, so the name alone proves nothing, and mirroring the source is
-  what --delete is for. Note that the job identity includes the command's
+  what --delete is for. Note that the copy identity includes the command's
   semantic options: change those (or the source/destination spelling they
   normalize to) and the previous identity's sidecars become orphans —
   removed by `--delete`, inert otherwise.
@@ -1111,7 +1111,7 @@ differs and why, what's missing, and the open issues. The short version:
   counters are collected for diagnosis, but a loss-tolerant transport would be
   a separate protocol and security design.
 - Preserving existing partial files from `rsync --partial`; only SYQ's own
-  `.name.syq-part.<job-id>` sidecars for the same logical command are
+  `.name.syq-part.<copy-id>` sidecars for the same logical command are
   recognised.
 
 ## Exit codes

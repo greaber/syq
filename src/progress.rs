@@ -25,10 +25,10 @@ pub struct Progress {
     /// `bytes_done` back, but retransmitting the same range is not fresh useful
     /// throughput and cannot advance this meter until progress passes the mark.
     tuning_high_water: AtomicU64,
-    pub bytes_skipped: AtomicU64,
+    pub bytes_unchanged: AtomicU64,
     pub files_total: AtomicU64,
     pub files_done: AtomicU64,
-    pub files_skipped: AtomicU64,
+    pub files_unchanged: AtomicU64,
     /// Source files deliberately not transferred (-u, size limits, --existing,
     /// symlinks without -l, ...); neither "transferred" nor "unchanged".
     pub files_excluded: AtomicU64,
@@ -46,8 +46,8 @@ pub struct Progress {
     pub deletions_blocked: AtomicU64,
     /// Settled creations, mirrored here (like the deletion counters) so a
     /// fatal-error terminal record reports what the run actually did.
-    pub dirs_created: AtomicU64,
-    pub links_created: AtomicU64,
+    pub directories_created: AtomicU64,
+    pub symlinks_created: AtomicU64,
     pub specials_created: AtomicU64,
     /// Workers currently allowed to take work (0 = fixed -j, not shown).
     pub active_workers: AtomicU64,
@@ -83,10 +83,10 @@ impl Progress {
             bytes_total: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
             tuning_high_water: AtomicU64::new(0),
-            bytes_skipped: AtomicU64::new(0),
+            bytes_unchanged: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
-            files_skipped: AtomicU64::new(0),
+            files_unchanged: AtomicU64::new(0),
             files_excluded: AtomicU64::new(0),
             paths_ignored: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
@@ -95,8 +95,8 @@ impl Progress {
             deletions_planned: AtomicU64::new(0),
             deletions_completed: AtomicU64::new(0),
             deletions_blocked: AtomicU64::new(0),
-            dirs_created: AtomicU64::new(0),
-            links_created: AtomicU64::new(0),
+            directories_created: AtomicU64::new(0),
+            symlinks_created: AtomicU64::new(0),
             specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             start: Instant::now(),
@@ -221,7 +221,7 @@ impl Progress {
         let total = self.bytes_total.load(Relaxed);
         let fdone = self.files_done.load(Relaxed);
         let ftotal = self.files_total.load(Relaxed);
-        let skipped = self.bytes_skipped.load(Relaxed);
+        let skipped = self.bytes_unchanged.load(Relaxed);
         let scan_done = self.scan_done.load(Relaxed);
         let remaining = total.saturating_sub(done);
         let eta = if rate > 0.0 && scan_done {
@@ -242,7 +242,7 @@ impl Progress {
                     bytes_unchanged: skipped,
                     files_done: fdone,
                     files_total: ftotal,
-                    files_unchanged: self.files_skipped.load(Relaxed),
+                    files_unchanged: self.files_unchanged.load(Relaxed),
                     files_excluded: self.files_excluded.load(Relaxed),
                     scanned: self.scanned.load(Relaxed),
                     scan_done,
@@ -257,8 +257,8 @@ impl Progress {
             {
                 t.last_json = Some(now);
                 eprintln!(
-                    "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_skipped\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_skipped\":{},\"files_excluded\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
-                    self.files_skipped.load(Relaxed),
+                    "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_unchanged\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_unchanged\":{},\"files_excluded\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
+                    self.files_unchanged.load(Relaxed),
                     self.files_excluded.load(Relaxed),
                     self.scanned.load(Relaxed),
                     rate,

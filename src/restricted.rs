@@ -151,7 +151,7 @@ struct AuthorityState {
     /// write or publication must name a declared partial. Observation-only
     /// preparations own separate provisional holds so an older absent
     /// observation cannot roll back a newer preparation for the same key.
-    reserved: HashMap<(Vec<u8>, proto::PartialId), ByteReservation>,
+    reserved: HashMap<(Vec<u8>, proto::CopyId), ByteReservation>,
     reserved_bytes: u64,
     next_reservation_hold: u64,
     transferred_bytes: u64,
@@ -163,7 +163,7 @@ struct AuthorityState {
     /// enter `touched`, never paths merely returned by a destination scan.
     receipt_stream: Option<crate::receipt::ReceiptStreamWriter>,
     touched: BTreeSet<Vec<u8>>,
-    file_lifecycles: HashMap<(Vec<u8>, proto::PartialId), FileLifecycle>,
+    file_lifecycles: HashMap<(Vec<u8>, proto::CopyId), FileLifecycle>,
     /// Requests authorized for execution whose outcome has not been settled
     /// yet, across every connection. The receipt waits for zero.
     in_flight: u64,
@@ -792,12 +792,12 @@ impl RestrictedAuthority {
     fn reserve_bytes(
         &self,
         path: &[u8],
-        partial_id: proto::PartialId,
+        copy_id: proto::CopyId,
         size: u64,
         observation_only: bool,
     ) -> Result<Option<ReservationHoldId>> {
         let mut state = self.state.lock().unwrap();
-        let key = (path.to_vec(), partial_id);
+        let key = (path.to_vec(), copy_id);
         let previous = state
             .reserved
             .get(&key)
@@ -840,7 +840,7 @@ impl RestrictedAuthority {
     /// holds installed by requests that ran before or after it.
     fn settle_observation_reservation(
         state: &mut AuthorityState,
-        key: &(Vec<u8>, proto::PartialId),
+        key: &(Vec<u8>, proto::CopyId),
         hold: ReservationHoldId,
         retain: bool,
     ) {
@@ -874,12 +874,12 @@ impl RestrictedAuthority {
     /// The size this grant declared for a partial, which bounds what may be
     /// written into it and what may be published from it. A partial left by
     /// an earlier grant has no declaration here and cannot be used.
-    fn declared_size(&self, path: &[u8], partial_id: proto::PartialId) -> Result<u64> {
+    fn declared_size(&self, path: &[u8], copy_id: proto::CopyId) -> Result<u64> {
         self.state
             .lock()
             .unwrap()
             .reserved
-            .get(&(path.to_vec(), partial_id))
+            .get(&(path.to_vec(), copy_id))
             .and_then(ByteReservation::effective_size)
             .with_context(|| {
                 format!(
@@ -894,14 +894,14 @@ impl RestrictedAuthority {
     fn check_published_length(
         &self,
         path: &[u8],
-        partial_id: proto::PartialId,
+        copy_id: proto::CopyId,
         inplace: bool,
     ) -> Result<()> {
-        let declared = self.declared_size(path, partial_id)?;
+        let declared = self.declared_size(path, copy_id)?;
         let staged = if inplace {
             path.to_vec()
         } else {
-            crate::fsops::partial_path(Path::new(OsStr::from_bytes(path)), &partial_id)?
+            crate::fsops::partial_path(Path::new(OsStr::from_bytes(path)), &copy_id)?
                 .into_os_string()
                 .into_vec()
         };
@@ -1051,7 +1051,7 @@ impl RestrictedAuthority {
             crate::receipt::OperationDisposition::Incomplete => {
                 crate::receipt::OutcomeCode::FileLifecycleIncomplete
             }
-            crate::receipt::OperationDisposition::Applied
+            crate::receipt::OperationDisposition::Succeeded
             | crate::receipt::OperationDisposition::Observed => crate::receipt::OutcomeCode::None,
         };
         stream.append(&crate::receipt::ReceiptRecord::Operation(
@@ -1138,7 +1138,7 @@ impl RestrictedAuthority {
                         if error.is_some() {
                             crate::receipt::OperationDisposition::Failed
                         } else {
-                            crate::receipt::OperationDisposition::Applied
+                            crate::receipt::OperationDisposition::Succeeded
                         },
                         error,
                     );
@@ -1146,7 +1146,7 @@ impl RestrictedAuthority {
                 PendingOutcome::FileStage {
                     index,
                     path,
-                    partial_id,
+                    copy_id,
                     size,
                     inplace,
                     stage,
@@ -1160,7 +1160,7 @@ impl RestrictedAuthority {
                     let absent =
                         skip_if_absent && matches!(response, proto::Response::PartialSize(None));
                     if let Some(hold) = observation_hold {
-                        let key = (path.clone(), partial_id);
+                        let key = (path.clone(), copy_id);
                         Self::settle_observation_reservation(&mut state, &key, hold, !absent);
                     }
                     // If no sidecar existed, the observation performed no
@@ -1177,7 +1177,7 @@ impl RestrictedAuthority {
                     let emit_complete = {
                         let lifecycle = state
                             .file_lifecycles
-                            .entry((path.clone(), partial_id))
+                            .entry((path.clone(), copy_id))
                             .or_insert(FileLifecycle {
                                 size,
                                 inplace,
@@ -1217,7 +1217,7 @@ impl RestrictedAuthority {
                             &mut state,
                             &path,
                             crate::receipt::OperationAction::PublishFile { size, inplace },
-                            crate::receipt::OperationDisposition::Applied,
+                            crate::receipt::OperationDisposition::Succeeded,
                             None,
                         );
                     }
@@ -2196,7 +2196,7 @@ impl RestrictedAuthority {
             }
             Request::SeedBasis {
                 path,
-                partial_id,
+                copy_id,
                 len,
                 guard,
                 ..
@@ -2209,11 +2209,11 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, false, None, pending)?;
-                self.reserve_bytes(path, *partial_id, *len, false)?;
+                self.reserve_bytes(path, *copy_id, *len, false)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
-                    partial_id: *partial_id,
+                    copy_id: *copy_id,
                     size: *len,
                     inplace: false,
                     stage: FileStage::Prepare,
@@ -2251,7 +2251,7 @@ impl RestrictedAuthority {
                 path,
                 size,
                 inplace,
-                partial_id,
+                copy_id,
                 create_if_missing,
                 guard,
                 ..
@@ -2265,11 +2265,11 @@ impl RestrictedAuthority {
                 self.check_mutation_path(path, false)?;
                 self.constrain_prepare(path)?;
                 let observation_hold =
-                    self.reserve_bytes(path, *partial_id, *size, !*create_if_missing)?;
+                    self.reserve_bytes(path, *copy_id, *size, !*create_if_missing)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
-                    partial_id: *partial_id,
+                    copy_id: *copy_id,
                     size: *size,
                     inplace: *inplace,
                     stage: FileStage::Prepare,
@@ -2286,7 +2286,7 @@ impl RestrictedAuthority {
             Request::WriteRange {
                 path,
                 inplace,
-                partial_id,
+                copy_id,
                 off,
                 data,
                 guard,
@@ -2295,7 +2295,7 @@ impl RestrictedAuthority {
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file write does not match the signed publication policy");
                 }
-                let declared = self.declared_size(path, *partial_id)?;
+                let declared = self.declared_size(path, *copy_id)?;
                 if off
                     .checked_add(data.len() as u64)
                     .is_none_or(|end| end > declared)
@@ -2308,7 +2308,7 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
-                    partial_id: *partial_id,
+                    copy_id: *copy_id,
                     size: declared,
                     inplace: *inplace,
                     stage: FileStage::Write,
@@ -2321,7 +2321,7 @@ impl RestrictedAuthority {
             Request::Finalize {
                 path,
                 inplace,
-                partial_id,
+                copy_id,
                 meta,
                 flags,
                 condition,
@@ -2332,13 +2332,13 @@ impl RestrictedAuthority {
                     bail!("file finalization does not match the signed publication policy");
                 }
                 self.check_mutation_path(path, false)?;
-                self.check_published_length(path, *partial_id, *inplace)?;
+                self.check_published_length(path, *copy_id, *inplace)?;
                 self.constrain_creation(path, condition, false, 0, pending)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
-                    partial_id: *partial_id,
-                    size: self.declared_size(path, *partial_id)?,
+                    copy_id: *copy_id,
+                    size: self.declared_size(path, *copy_id)?,
                     inplace: *inplace,
                     stage: FileStage::Finalize,
                     skip_if_absent: false,
@@ -2483,7 +2483,7 @@ enum PendingOutcome {
     FileStage {
         index: usize,
         path: Vec<u8>,
-        partial_id: proto::PartialId,
+        copy_id: proto::CopyId,
         size: u64,
         inplace: bool,
         stage: FileStage,
@@ -5017,7 +5017,7 @@ pub(crate) mod tests {
 
         let mut plan = Request::PlanBatch {
             partial_paths: vec![target.clone()],
-            partial_id: [3; 16],
+            copy_id: [3; 16],
             directories: vec![target.clone()],
             others: vec![target.clone()],
             guard: None,
@@ -5055,7 +5055,7 @@ pub(crate) mod tests {
 
         let mut small = Request::PutSmallBatch(vec![proto::SmallPut {
             path: target.clone(),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             data: vec![0; 4],
             hash: [0; 32],
             meta: proto::Meta {
@@ -5086,7 +5086,7 @@ pub(crate) mod tests {
         let mut write = Request::WriteRange {
             path: target,
             inplace: false,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             attempt: 0,
             off: 0,
             hash: [0; 32],
@@ -5166,7 +5166,7 @@ pub(crate) mod tests {
             path,
             size: 4,
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -5245,7 +5245,7 @@ pub(crate) mod tests {
             path,
             size: 4,
             inplace: false,
-            partial_id: [2; 16],
+            copy_id: [2; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -5275,7 +5275,7 @@ pub(crate) mod tests {
             path: target.clone(),
             size: 4,
             inplace,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -5325,7 +5325,7 @@ pub(crate) mod tests {
             path: path_bytes(path),
             size: 4,
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -5337,7 +5337,7 @@ pub(crate) mod tests {
         Request::Finalize {
             path: path_bytes(path),
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: plain_meta(),
             flags: 0,
             condition,
@@ -5355,7 +5355,7 @@ pub(crate) mod tests {
     fn small_put(path: &Path) -> Request {
         Request::PutSmallBatch(vec![proto::SmallPut {
             path: path_bytes(path),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             data: b"new".to_vec(),
             hash: crate::fsops::content_digest(b"new"),
             meta: plain_meta(),
@@ -5504,7 +5504,7 @@ pub(crate) mod tests {
         // governed by the separately signed deletion policy.
         let mut finish = Request::FinishBasis {
             path: path_bytes(&kept),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: plain_meta(),
             flags: 0,
             condition: Any,
@@ -5513,7 +5513,7 @@ pub(crate) mod tests {
         assert!(authority.authorize(&mut finish, false).is_err());
         let mut seed = Request::SeedBasis {
             path: path_bytes(&kept),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             len: 3,
             attempt: 0,
             guard: None,
@@ -5590,7 +5590,7 @@ pub(crate) mod tests {
 
         let mut finish = Request::FinishBasis {
             path: path_bytes(&present),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: plain_meta(),
             flags: 0,
             condition: Any,
@@ -5786,7 +5786,7 @@ pub(crate) mod tests {
         assert_eq!(op_condition(&same), expected);
         let mut finish = Request::FinishBasis {
             path: path_bytes(&present),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: plain_meta(),
             flags: 0,
             condition: Any,
@@ -6271,7 +6271,7 @@ pub(crate) mod tests {
         .unwrap();
         let put = |path: &Path| proto::SmallPut {
             path: path_bytes(path),
-            partial_id: [7; 16],
+            copy_id: [7; 16],
             data: b"new".to_vec(),
             hash: crate::fsops::content_digest(b"new"),
             meta: plain_meta(),
@@ -6338,7 +6338,7 @@ pub(crate) mod tests {
             record,
             crate::receipt::ReceiptRecord::Operation(operation)
                 if operation.path == copied_name
-                    && operation.disposition == crate::receipt::OperationDisposition::Applied
+                    && operation.disposition == crate::receipt::OperationDisposition::Succeeded
         )));
         assert!(records.iter().any(|record| matches!(
             record,
@@ -6392,7 +6392,7 @@ pub(crate) mod tests {
             path: path_bytes(&image),
             size: 4,
             inplace: true,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -6404,7 +6404,7 @@ pub(crate) mod tests {
         let mut write = Request::WriteRange {
             path: path_bytes(&image),
             inplace: true,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             attempt: 0,
             off: 0,
             hash: crate::fsops::content_digest(b"ha"),
@@ -6443,7 +6443,7 @@ pub(crate) mod tests {
             path: path_bytes(&image),
             size: 4,
             inplace: true,
-            partial_id: [2; 16],
+            copy_id: [2; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -6454,7 +6454,7 @@ pub(crate) mod tests {
         let mut finalize = Request::Finalize {
             path: path_bytes(&image),
             inplace: true,
-            partial_id: [2; 16],
+            copy_id: [2; 16],
             meta: plain_meta(),
             flags: 0,
             condition: proto::TargetCondition::Any,
@@ -6970,7 +6970,7 @@ pub(crate) mod tests {
         fs::set_permissions(&existing_file, fs::Permissions::from_mode(0o600)).unwrap();
         let put = |path: &Path, mode| proto::SmallPut {
             path: path.as_os_str().as_bytes().to_vec(),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             data: b"new".to_vec(),
             hash: crate::fsops::content_digest(b"new"),
             meta: proto::Meta {
@@ -7144,7 +7144,7 @@ pub(crate) mod tests {
             path: target.clone(),
             source: None,
             which: proto::Which::Final,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             block,
             len,
             attempt: 0,
@@ -7183,7 +7183,7 @@ pub(crate) mod tests {
         let request = |off| Request::WriteRange {
             path: target.clone(),
             inplace: false,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             attempt: 0,
             off,
             hash: [0; 32],
@@ -7197,7 +7197,7 @@ pub(crate) mod tests {
             path: target.clone(),
             size: 1024,
             inplace: false,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -7323,7 +7323,7 @@ pub(crate) mod tests {
 
         let mut small = Request::PutSmallBatch(vec![proto::SmallPut {
             path: target.clone(),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             data: vec![0],
             hash: [0; 32],
             meta: proto::Meta {
@@ -7481,7 +7481,7 @@ pub(crate) mod tests {
                 .to_vec(),
             size,
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -7498,7 +7498,7 @@ pub(crate) mod tests {
         authority.authorize(&mut prepare("b", 2), false).unwrap();
         let mut seed = Request::SeedBasis {
             path: root.join("target/b").as_os_str().as_bytes().to_vec(),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             len: 3,
             attempt: 0,
             guard: None,
@@ -7512,7 +7512,7 @@ pub(crate) mod tests {
         let mut publish_empty = Request::Finalize {
             path: root.join("target/empty").as_os_str().as_bytes().to_vec(),
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: proto::Meta {
                 mode: 0o644,
                 uid: 0,
@@ -7529,7 +7529,7 @@ pub(crate) mod tests {
         let mut publish_foreign = Request::Finalize {
             path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
             inplace: false,
-            partial_id: [9; 16],
+            copy_id: [9; 16],
             meta: proto::Meta {
                 mode: 0o644,
                 uid: 0,
@@ -7813,7 +7813,7 @@ pub(crate) mod tests {
             path: target.join("escape").as_os_str().as_bytes().to_vec(),
             source: None,
             which: proto::Which::Final,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             block: 4096,
             len: 1,
             attempt: 0,
@@ -7871,7 +7871,7 @@ pub(crate) mod tests {
                 path: root.join("file").as_os_str().as_bytes().to_vec(),
                 source: Some(source),
                 which: proto::Which::Final,
-                partial_id: [0; 16],
+                copy_id: [0; 16],
                 block: proto::MIN_HASH_BLOCK_BYTES,
                 len: 1,
                 attempt: 0,

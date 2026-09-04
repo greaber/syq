@@ -324,7 +324,7 @@ fn settle_captured_receipt(
                 crate::receipt::ReceiptRecord::Operation(record)
                     if !matches!(
                         record.disposition,
-                        crate::receipt::OperationDisposition::Applied
+                        crate::receipt::OperationDisposition::Succeeded
                             | crate::receipt::OperationDisposition::Observed
                     ) =>
                 {
@@ -856,7 +856,7 @@ fn run_remote(
         port: coordinator.port,
         rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
         syq_path: args.syq_path.clone(),
-        auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
+        bootstrap_helper: args.syq_path.is_none() && !args.no_bootstrap,
         restricted_grant: None,
         helper_install: Default::default(),
         ssh_multiplexer: None,
@@ -1142,7 +1142,7 @@ fn run_remote(
             cmd.output().with_context(|| format!("spawn {:?}", rsh[0]))
         };
         let mut out = run()?;
-        if helper_missing(out.status.code(), spec.auto_helper) {
+        if helper_missing(out.status.code(), spec.bootstrap_helper) {
             spec.install_helper()?;
             out = run()?;
         }
@@ -1184,7 +1184,7 @@ fn run_remote(
         Ok((status, relayed?))
     };
     let (mut status, mut receipt_payload) = run()?;
-    if helper_missing(status.code(), spec.auto_helper) {
+    if helper_missing(status.code(), spec.bootstrap_helper) {
         spec.install_helper()?;
         (status, receipt_payload) = run()?;
     }

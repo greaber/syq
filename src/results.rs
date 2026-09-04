@@ -102,7 +102,7 @@ pub struct TraceRecord<'a> {
     pub reason: &'static str,
 }
 
-pub struct RemovalSelectionRecord<'a> {
+pub struct SelectionResultRecord<'a> {
     pub selector: u64,
     pub path: &'a [u8],
     pub status: &'static str,
@@ -141,7 +141,7 @@ pub struct ResultRecord {
     pub deletions_blocked: Option<u64>,
 }
 
-pub struct RemovalResultRecord {
+pub struct RmResultRecord {
     pub status: &'static str,
     pub exit_code: i32,
     pub dry_run: bool,
@@ -354,7 +354,7 @@ impl ResultsWriter {
         self.write(record);
     }
 
-    pub fn emit_removal_selection(&self, selection: &RemovalSelectionRecord) {
+    pub fn emit_selection_result(&self, selection: &SelectionResultRecord) {
         let mut record = serde_json::json!({
             "type": "selection_result",
             "selector": selection.selector,
@@ -383,7 +383,7 @@ impl ResultsWriter {
         }));
     }
 
-    pub fn emit_removal(&self, removal: &RemovalRecord) {
+    pub fn emit_removal_result(&self, removal: &RemovalRecord) {
         let mut record = serde_json::json!({
             "type": "removal_result",
             "selector": removal.selector,
@@ -507,7 +507,7 @@ impl ResultsWriter {
         self.write_and_seal(record, true);
     }
 
-    pub fn emit_removal_result(&self, result: &RemovalResultRecord) {
+    pub fn emit_rm_result(&self, result: &RmResultRecord) {
         self.write_and_seal(
             serde_json::json!({
                 "type": "result",

@@ -82,7 +82,7 @@ const REDEMPTION_RECORD_LEN: usize = REDEMPTION_MAGIC.len() + 8 + 32 + 32;
 use crate::enrollment::EnrollmentId;
 
 /// A one-redemption nonce generated independently for every signed request.
-/// It is intentionally not constructible from `proto::PartialId`.
+/// It is intentionally not constructible from `proto::CopyId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct RequestId([u8; 32]);
 
@@ -2701,7 +2701,7 @@ mod tests {
         let second = RequestId::fresh(NOW).expect("fresh request ID");
         assert_ne!(first, second);
         assert_eq!(std::mem::size_of::<RequestId>(), 32);
-        assert_eq!(std::mem::size_of::<crate::proto::PartialId>(), 16);
+        assert_eq!(std::mem::size_of::<crate::proto::CopyId>(), 16);
     }
 
     #[test]
