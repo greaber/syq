@@ -1078,7 +1078,7 @@ pub(crate) fn require_constrained_openssh(program: &str, location: &str) -> Resu
     match openssh_version(program) {
         Some(version) if version < CONSTRAINED_OPENSSH_MINIMUM => {
             Err(OpenSshVersionError(format!(
-                "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --no-forward-agent with credentials on the coordinator host, --unrestricted-agent-forwarding, or an explicit --rsh policy"
+                "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --peer-auth own-credentials with credentials on the coordinator host, --peer-auth full-agent, or an explicit --rsh policy"
             ))
             .into())
         }

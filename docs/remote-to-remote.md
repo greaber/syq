@@ -160,7 +160,7 @@ commitment, summary, and terminal status before printing trusted results.
 Missing, altered, reordered, replayed, or suppressed frames cannot become a
 valid clean receipt; suppression remains a denial of service. `-v` prints the
 verified totals. Enrollments made by an older syq must be refreshed with
-`syq enrollment add` first (eligible ordinary copies can do this
+`syq receiver enroll` first (eligible ordinary copies can do this
 automatically). The initial signed policy caps the stream at 4,000,000 records
 and 512 MiB of plaintext. Reaching either cap closes further mutation authority
 and produces an explicit non-clean terminal instead of a truncated clean
@@ -179,7 +179,7 @@ is required for source completeness and byte authenticity.
 
 `--detach` is not available with the command-restricted receiver because its
 constrained agent exists only while syq remains attached. A detached launch
-instead requires coordinator-owned peer credentials (`--no-forward-agent`) or
+instead requires coordinator-owned peer credentials (`--peer-auth own-credentials`) or
 an explicit `--rsh` policy. Neither path prepares a restricted grant or signed
 receipt; the returned remote log is not a locally authenticated receipt.
 
@@ -221,7 +221,7 @@ Deletion through the receiver (`cp --prune`) requires an explicit
 inside the scope is always stated on the command line rather than defaulting
 to a hundred million; `--max-delete 0` signs a grant that forbids deletion
 outright. The other signed ceilings default to 100 million entries and 8 TiB of
-file data; native `--max-entries` and `--max-total-bytes` lower them for one
+file data; native `--receiver-max-entries` and `--receiver-max-bytes` lower them for one
 transfer, which bounds what a claimed grant is worth to hostA. Every grant also
 carries two deadlines: hostA must start the transfer within 24 hours of the
 grant being issued, and the transfer must finish within 7 days of it.
@@ -229,7 +229,7 @@ grant being issued, and the transfer must finish within 7 days of it.
 `--dry-run` and `--verify-only` are cryptographically read-only: the signed
 grant marks them as such and the receiver rejects every mutation even if hostA
 sends one. They use an existing enrollment but do not install one; run
-`syq enrollment add` first when previewing or verifying a new destination.
+`syq receiver enroll` first when previewing or verifying a new destination.
 Destination-root symlinks are also refused in this mode; enroll the explicit
 referent so the signed pathname and opened root identify the same object.
 
@@ -243,15 +243,15 @@ first when that distinction matters.
 
 ## Enrollment lifecycle
 
-Use `syq enrollment add [USER@]HOST:DEST [--via [USER@]HOST]` to pre-enroll,
-`syq enrollment list` to list local enrollments, and
-`syq enrollment revoke ID [--via ...]` to
+Use `syq receiver enroll [USER@]HOST:DEST [--via [USER@]HOST]` to pre-enroll,
+`syq receiver list` to list local enrollments, and
+`syq receiver revoke ID [--via ...]` to
 remove the forced key and both sides' per-enrollment state. Before changing
 hostB, syq durably records a pending enrollment and its private key locally. If
 the installation response is lost, the next enrollment of the same endpoint
-and destination retries the same ID safely; `syq enrollment list` labels that
-state `pending`, and `syq enrollment revoke` can remove either pending or
-active state. Running `syq enrollment add` again for an active destination
+and destination retries the same ID safely; `syq receiver list` labels that
+state `pending`, and `syq receiver revoke` can remove either pending or
+active state. Running `syq receiver enroll` again for an active destination
 also refreshes the installed
 receiver to the exact local syq binary; the receipt key is kept for the life
 of the enrollment, so a refresh, or a retry after a lost reply, never leaves

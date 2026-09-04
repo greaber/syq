@@ -1029,10 +1029,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !original_srcs[0].same_host(dst)
         && !args.relay
         && args.coordinate_at != CoordinateAt::Local;
-    if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
+    if (args.detach || args.peer_auth != crate::cli::PeerAuth::Restricted)
+        && !direct_remote_to_remote
     {
         bail!(
-            "--detach, --no-forward-agent, and --agent-broker-only apply only to a direct copy between two different remote endpoints"
+            "--detach and --peer-auth apply only to a direct copy between two different remote endpoints"
         );
     }
     if args.pscope_explicit && coordinator_is_remote {
@@ -1051,11 +1052,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if !source.same_host(&original_srcs[0]) {
             bail!("all sources must be on the same host");
         }
-    }
-    if args.unrestricted_agent_forwarding && !direct_remote_to_remote {
-        bail!(
-            "--unrestricted-agent-forwarding is only valid for a live direct transfer between two different remote hosts"
-        );
     }
     let source_operand_count = if native_locations {
         original_srcs.len()

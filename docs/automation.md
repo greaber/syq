@@ -217,7 +217,7 @@ an `object` that is `{"state": "absent"}`, an observation failure
 (`state`, `code`, `message`), or `{"state": "present"}` with `kind`
 (the receiver's precise vocabulary: `dir`, `file`, `symlink`, `fifo`,
 `socket`, `character_device`, `block_device`, `other`), `size`,
-`metadata` (mode/uid/gid/mtime), and — under `--receipt hashed` — a
+`metadata` (mode/uid/gid/mtime), and — under `--receiver-receipt digests` — a
 `digest` (`{"algorithm": "blake3", "value": <hex>}`), plus
 `symlink_target` where applicable. Final states are what a verifier
 audits: they attest the tree, not the transfer's own narration.

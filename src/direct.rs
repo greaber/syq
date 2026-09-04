@@ -1,6 +1,7 @@
 //! Direct remote-to-remote: run the orchestrator on the source host so data
 //! flows source→destination without passing through this machine.
 
+use crate::cli::PeerAuth;
 use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, SourceSelection};
 use crate::delegation::RequestId;
 use crate::enrollment::EnrollmentId;
@@ -727,14 +728,9 @@ pub fn coordinate_at_dest(
     if args.interface == Interface::Rsync {
         bail!("--coordinate-at dest is available only through native copy syntax");
     }
-    if !srcs[0].same_host(dst)
-        && args.rsh.is_none()
-        && !args.no_forward_agent
-        && !args.unrestricted_agent_forwarding
-        && !args.agent_broker_only
-    {
+    if !srcs[0].same_host(dst) && args.rsh.is_none() && args.peer_auth == PeerAuth::Restricted {
         bail!(
-            "--coordinate-at dest requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with target-host credentials, or an explicit --rsh policy"
+            "--coordinate-at dest requires a read-restricted source enrollment, which is not implemented yet; use --peer-auth broker, --peer-auth own-credentials with the coordinator's own credentials for the peer, or an explicit --rsh policy"
         );
     }
     run_remote(args, srcs, dst, true, results)
@@ -753,9 +749,10 @@ fn run_remote(
     let peer = if coordinator_at_target { &srcs[0] } else { dst };
     let coordinator_host = coordinator.host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
-    if args.detach && args.rsh.is_none() && !same_host && !args.no_forward_agent {
+    if args.detach && args.rsh.is_none() && !same_host && args.peer_auth != PeerAuth::OwnCredentials
+    {
         bail!(
-            "a constrained agent exists only while syq is attached; --detach requires --no-forward-agent and credentials on {coordinator_host}, or an explicit --rsh policy"
+            "a constrained agent exists only while syq is attached; --detach requires --peer-auth own-credentials and credentials on {coordinator_host}, or an explicit --rsh policy"
         );
     }
 
@@ -768,9 +765,9 @@ fn run_remote(
     let mut receipt_expectation = None;
     let default_ssh_agent_policy = if args.rsh.is_some() {
         None
-    } else if same_host || args.no_forward_agent {
+    } else if same_host || args.peer_auth == PeerAuth::OwnCredentials {
         Some(AgentForwarding::Disabled)
-    } else if args.unrestricted_agent_forwarding {
+    } else if args.peer_auth == PeerAuth::FullAgent {
         Some(AgentForwarding::Unrestricted)
     } else {
         crate::conn::require_constrained_openssh(&rsh[0], "on this machine")?;
@@ -795,7 +792,7 @@ fn run_remote(
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
         // form instead of silently keeping only the constrained broker.
-        let prepared = (!coordinator_at_target && !args.agent_broker_only)
+        let prepared = (!coordinator_at_target && args.peer_auth != PeerAuth::Broker)
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
@@ -808,7 +805,7 @@ fn run_remote(
             })
             .transpose()
             .context(
-                "prepare command-restricted destination enrollment; use --agent-broker-only to explicitly request authentication-only confinement",
+                "prepare command-restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
             )?;
         let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
         let limit = broker_connection_limit(args.connections_opt, args.connections)?;
@@ -845,11 +842,13 @@ fn run_remote(
             broker: socket,
         })
     };
-    if (args.max_entries.is_some() || args.max_total_bytes.is_some() || args.receipt_requested)
+    if (args.receiver_max_entries.is_some()
+        || args.receiver_max_bytes.is_some()
+        || args.receiver_receipt.is_some())
         && restricted_grant.is_none()
     {
         bail!(
-            "--max-entries, --max-total-bytes, and --receipt address the command-restricted receiver, but this transfer does not use the enrolled receiver"
+            "--receiver-max-entries, --receiver-max-bytes, and --receiver-receipt address the command-restricted receiver, but this transfer does not use the enrolled receiver"
         );
     }
     let coordinator_target = endpoint_display(coordinator);
@@ -1132,9 +1131,9 @@ fn run_remote(
             default_ssh_agent_policy.as_ref(),
         )
     };
-    if args.unrestricted_agent_forwarding {
+    if args.peer_auth == PeerAuth::FullAgent {
         eprintln!(
-            "syq: warning: --unrestricted-agent-forwarding exposes every capability in your SSH agent to {coordinator_host} for this transfer"
+            "syq: warning: --peer-auth full-agent exposes every capability in your SSH agent to {coordinator_host} for this transfer"
         );
     }
     if args.detach {
@@ -1209,11 +1208,10 @@ fn run_remote(
         // must pass through the held-terminal settlement below.
         Some(c) => {
             if args.rsh.is_none()
-                && !args.no_forward_agent
-                && !args.unrestricted_agent_forwarding
+                && matches!(args.peer_auth, PeerAuth::Restricted | PeerAuth::Broker)
                 && !same_host
             {
-                bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --no-forward-agent with coordinator-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
+                bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --peer-auth own-credentials with coordinator-host credentials, or explicitly accept full agent exposure with --peer-auth full-agent", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
             }
             bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); {coordinator_host} may not be able to reach the peer endpoint")
         }

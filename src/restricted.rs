@@ -3796,19 +3796,19 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     // Range-check every ceiling here, before automatic enrollment can touch
     // hostB, rather than leaving it to grant validation after the fact.
     if args
-        .max_entries
+        .receiver_max_entries
         .is_some_and(|entries| entries == 0 || entries > delegation::MAX_ENTRIES)
     {
         bail!(
-            "--max-entries must be between 1 and {}",
+            "--receiver-max-entries must be between 1 and {}",
             delegation::MAX_ENTRIES
         );
     }
     if args
-        .max_total_bytes
+        .receiver_max_bytes
         .is_some_and(|bytes| bytes == 0 || bytes > delegation::MAX_COPY_BYTES)
     {
-        bail!("--max-total-bytes must be at least 1 byte");
+        bail!("--receiver-max-bytes must be at least 1 byte");
     }
     if let Some(maximum) = args.max_size.as_deref() {
         if crate::cli::parse_size(maximum)? == 0 {
@@ -3864,8 +3864,8 @@ fn grant_for(
     } else {
         DeletionPolicy::Forbid
     };
-    let max_entries = args.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
-    let max_total_bytes = args.max_total_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    let max_entries = args.receiver_max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
+    let max_total_bytes = args.receiver_max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let max_file_bytes = args
         .max_size
         .as_deref()
@@ -4046,7 +4046,7 @@ pub(crate) fn prepare_transfer(
         None => {
             if !allow_enrollment {
                 bail!(
-                    "read-only operations will not install a receiver enrollment; pre-enroll this destination with `syq enrollment add` or explicitly use --agent-broker-only"
+                    "read-only operations will not install a receiver enrollment; pre-enroll this destination with `syq receiver enroll` or explicitly use --peer-auth broker"
                 );
             }
             let jump = endpoint(
@@ -4062,7 +4062,7 @@ pub(crate) fn prepare_transfer(
                 // which stays UTF-8; transfers against an existing
                 // enrollment accept any destination bytes above.
                 std::str::from_utf8(requested).context(
-                    "automatic enrollment requires a UTF-8 destination; pre-enroll a scope with `syq enrollment add` to copy to this path",
+                    "automatic enrollment requires a UTF-8 destination; pre-enroll a scope with `syq receiver enroll` to copy to this path",
                 )?,
                 Some(&jump),
                 false,
@@ -4103,7 +4103,7 @@ pub(crate) fn prepare_transfer(
     };
     let receipt_policy = crate::receipt_v2::ReceiptPolicyV2 {
         required: true,
-        hashed: args.receipt_hashed,
+        hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Digests),
         max_records: crate::receipt_v2::DEFAULT_MAX_RECORDS,
         max_plaintext_bytes: crate::receipt_v2::DEFAULT_MAX_PLAINTEXT_BYTES,
         delivery: receipt_delivery,
@@ -4242,30 +4242,30 @@ fn management_via(arguments: &[OsString]) -> Result<Option<SshEndpoint>> {
     )?))
 }
 
-const ENROLLMENT_USAGE: &str = "Usage: syq enrollment <COMMAND>\n\nManage command-restricted receiver enrollments.\n\nCommands:\n  add     Enroll a remote destination, or refresh an existing enrollment\n  list    List local enrollments\n  revoke  Remove an enrollment from both machines\n\nRun `syq enrollment <COMMAND> --help` for command-specific help.";
+const RECEIVER_USAGE: &str = "Usage: syq receiver <COMMAND>\n\nManage command-restricted receiver enrollments.\n\nCommands:\n  enroll  Enroll a remote destination, or refresh an existing enrollment\n  list    List local enrollments\n  revoke  Remove an enrollment from both machines\n\nRun `syq receiver <COMMAND> --help` for command-specific help.";
 
-/// `syq enrollment add|list|revoke`: the receiver enrollment system is one
+/// `syq receiver enroll|list|revoke`: the receiver enrollment system is one
 /// subcommand with its verbs beneath it. `argv[1]` is `enrollment`.
-pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
-    if argv.get(1)?.to_str()? != "enrollment" {
+pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>> {
+    if argv.get(1)?.to_str()? != "receiver" {
         return None;
     }
     let Some(command) = argv.get(2).and_then(|argument| argument.to_str()) else {
-        eprintln!("{ENROLLMENT_USAGE}");
+        eprintln!("{RECEIVER_USAGE}");
         return Some(Ok(2));
     };
     match command {
         "--help" | "-h" => {
-            println!("{ENROLLMENT_USAGE}");
+            println!("{RECEIVER_USAGE}");
             Some(Ok(0))
         }
         "list" => Some((|| {
             if argv.get(3).is_some_and(|argument| argument == "--help") {
-                println!("Usage: syq enrollment list\n\nList local command-restricted receiver enrollments.");
+                println!("Usage: syq receiver list\n\nList local command-restricted receiver enrollments.");
                 return Ok(0);
             }
             if argv.len() != 3 {
-                bail!("usage: syq enrollment list");
+                bail!("usage: syq receiver list");
             }
             let active = load_local_enrollments()?;
             let active_ids = active
@@ -4294,15 +4294,15 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             }
             Ok(0)
         })()),
-        "add" => Some((|| {
+        "enroll" => Some((|| {
             if argv.get(3).is_some_and(|argument| argument == "--help") {
                 println!(
-                    "Usage: syq enrollment add [USER@]HOST:DESTINATION [--via [USER@]HOST]\n\nEnroll a command-restricted receiver for DESTINATION's existing parent, or refresh an existing enrollment's receiver."
+                    "Usage: syq receiver enroll [USER@]HOST:DESTINATION [--via [USER@]HOST]\n\nEnroll a command-restricted receiver for DESTINATION's existing parent, or refresh an existing enrollment's receiver."
                 );
                 return Ok(0);
             }
             if argv.len() < 4 {
-                bail!("usage: syq enrollment add [USER@]HOST:DESTINATION [--via [USER@]HOST]");
+                bail!("usage: syq receiver enroll [USER@]HOST:DESTINATION [--via [USER@]HOST]");
             }
             let target = argv[3].to_str().context("enrollment target is not UTF-8")?;
             let location = Location::parse(target)?;
@@ -4334,12 +4334,12 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
         "revoke" => Some((|| {
             if argv.get(3).is_some_and(|argument| argument == "--help") {
                 println!(
-                    "Usage: syq enrollment revoke ENROLLMENT-ID [--via [USER@]HOST]\n\nRemove the forced key and per-enrollment state from both machines."
+                    "Usage: syq receiver revoke ENROLLMENT-ID [--via [USER@]HOST]\n\nRemove the forced key and per-enrollment state from both machines."
                 );
                 return Ok(0);
             }
             if argv.len() < 4 {
-                bail!("usage: syq enrollment revoke ENROLLMENT-ID [--via [USER@]HOST]");
+                bail!("usage: syq receiver revoke ENROLLMENT-ID [--via [USER@]HOST]");
             }
             let id = EnrollmentId::parse(argv[3].to_str().context("enrollment ID is not UTF-8")?)?;
             let via = management_via(&argv[4..])?;
@@ -4400,7 +4400,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             Ok(0)
         })()),
         other => Some(Err(anyhow::anyhow!(
-            "unknown enrollment command {other:?}\n{ENROLLMENT_USAGE}"
+            "unknown receiver command {other:?}\n{RECEIVER_USAGE}"
         ))),
     }
 }
@@ -7598,12 +7598,12 @@ pub(crate) mod tests {
         // the enrollment lookup or installation.
         let mut args = parse(&[]);
         validate_restricted_args(&args).unwrap();
-        args.max_entries = Some(0);
+        args.receiver_max_entries = Some(0);
         assert!(validate_restricted_args(&args).is_err());
-        args.max_entries = Some(delegation::MAX_ENTRIES + 1);
+        args.receiver_max_entries = Some(delegation::MAX_ENTRIES + 1);
         assert!(validate_restricted_args(&args).is_err());
         let mut args = parse(&[]);
-        args.max_total_bytes = Some(0);
+        args.receiver_max_bytes = Some(0);
         assert!(validate_restricted_args(&args).is_err());
         assert!(validate_restricted_args(&parse(&["--max-size", "0"])).is_err());
         assert!(validate_restricted_args(&parse(&["--delete"])).is_err());
@@ -7664,8 +7664,8 @@ pub(crate) mod tests {
         // Explicit ceilings land in the signed limits; the per-file bound
         // never exceeds the total, and the validity shrinks to the runtime.
         let mut ceilings = parse(&["--max-size", "3M"]);
-        ceilings.max_entries = Some(12);
-        ceilings.max_total_bytes = Some(2 << 20);
+        ceilings.receiver_max_entries = Some(12);
+        ceilings.receiver_max_bytes = Some(2 << 20);
         let grant = grant_for(
             &ceilings,
             std::slice::from_ref(&source),
@@ -7692,7 +7692,7 @@ pub(crate) mod tests {
         )
         .is_err());
         let mut bounded = parse(&["--delete", "--max-delete", "40"]);
-        bounded.max_entries = Some(30);
+        bounded.receiver_max_entries = Some(30);
         let grant = grant_for(
             &bounded,
             std::slice::from_ref(&source),

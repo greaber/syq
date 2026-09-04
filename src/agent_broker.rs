@@ -1,7 +1,7 @@
 //! A fail-closed SSH-agent proxy for native remote-to-remote transfers.
 //!
 //! The default mode exposes only the transfer's enrolled transport key. Native
-//! `--agent-broker-only` instead advertises supported ambient-agent identities,
+//! `--peer-auth broker` instead advertises supported ambient-agent identities,
 //! while applying the same signature restrictions. OpenSSH's session-bind
 //! messages prove the delegate and destination sessions, and the host-bound
 //! userauth request binds each signature to the destination host key and login
@@ -759,7 +759,7 @@ impl std::fmt::Debug for ConstrainedAgentBroker {
 
 impl ConstrainedAgentBroker {
     /// Start a destination-bound broker backed by the current SSH agent. This
-    /// is the native `--agent-broker-only` mode: signatures remain limited to
+    /// is the native `--peer-auth broker` mode: signatures remain limited to
     /// the validated delegate-to-destination session and login user.
     pub fn start(policy: BrokerPolicy, max_connections: usize) -> Result<Self> {
         let ambient = std::env::var_os("SSH_AUTH_SOCK")

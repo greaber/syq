@@ -136,15 +136,9 @@ pub struct Args {
     /// Native detached remote coordinator.
     #[arg(skip)]
     pub detach: bool,
-    /// Native remote coordinator uses its own peer credential.
+    /// How a native remote coordinator authenticates to the peer.
     #[arg(skip)]
-    pub no_forward_agent: bool,
-    /// Native remote coordinator receives the complete local SSH agent.
-    #[arg(skip)]
-    pub unrestricted_agent_forwarding: bool,
-    /// Native remote coordinator uses authentication-only broker confinement.
-    #[arg(skip)]
-    pub agent_broker_only: bool,
+    pub peer_auth: PeerAuth,
 
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
@@ -353,15 +347,12 @@ pub struct Args {
     pub max_delete: Option<u64>,
     /// Native-only command-restricted receiver ceilings, signed into the grant.
     #[arg(skip)]
-    pub max_entries: Option<u64>,
+    pub receiver_max_entries: Option<u64>,
     #[arg(skip)]
-    pub max_total_bytes: Option<u64>,
-    /// Native-only: `--receipt` was given at all, and whether it asked the
-    /// command-restricted receiver for a hashed receipt.
+    pub receiver_max_bytes: Option<u64>,
+    /// Native-only: the receipt detail `--receiver-receipt` asked for, if any.
     #[arg(skip)]
-    pub receipt_requested: bool,
-    #[arg(skip)]
-    pub receipt_hashed: bool,
+    pub receiver_receipt: Option<ReceiptDetail>,
     /// Skip regular files that are newer on the destination (directories,
     /// symlinks and specials are unaffected)
     #[arg(short = 'u', long)]
@@ -448,7 +439,7 @@ impl Args {
             // helper switches are handled in main.
             "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv, true),
             _ => bail!(
-                "expected a command (`cp`, `rm`, `map`, `rsync`, `persist`, `completion`, or `enrollment`); rsync-shaped syntax now starts with `syq rsync`"
+                "expected a command (`cp`, `rm`, `map`, `rsync`, `persist`, `completion`, or `receiver`); rsync-shaped syntax now starts with `syq rsync`"
             ),
         }
     }
@@ -618,7 +609,7 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  completion   Generate shell completion and manage its disposable local cache\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  completion   Generate shell completion and manage its disposable local cache\n  receiver     Manage command-restricted receiver enrollments (enroll, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -798,22 +789,42 @@ struct NativeCopyOperationalArgs {
     /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
     #[arg(long)]
     inplace: bool,
-    /// Command-restricted receiver ceiling: refuse to touch more than N destination entries (direct remote-to-remote only)
-    #[arg(long, value_name = "N")]
-    max_entries: Option<u64>,
-    /// Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total (direct remote-to-remote only)
-    #[arg(long, value_name = "SIZE")]
-    max_total_bytes: Option<String>,
-    /// Receiver receipt detail: final sizes (default) or also final BLAKE3 file digests (direct remote-to-remote only)
-    #[arg(long, value_name = "MODE", value_enum)]
-    receipt: Option<ReceiptMode>,
+    /// Command-restricted receiver ceiling: refuse to touch more than N destination entries
+    #[arg(long, value_name = "N", help_heading = REMOTE_TO_REMOTE_HEADING)]
+    receiver_max_entries: Option<u64>,
+    /// Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total
+    #[arg(long, value_name = "SIZE", help_heading = REMOTE_TO_REMOTE_HEADING)]
+    receiver_max_bytes: Option<String>,
+    /// Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file digests
+    #[arg(long, value_name = "DETAIL", value_enum, help_heading = REMOTE_TO_REMOTE_HEADING)]
+    receiver_receipt: Option<ReceiptDetail>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum ReceiptMode {
-    Sizes,
-    Hashed,
+/// How a remote coordinator authenticates to the peer of a direct
+/// remote-to-remote copy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum PeerAuth {
+    /// Constrained agent broker plus the command-restricted receiver on the peer
+    #[default]
+    Restricted,
+    /// Constrained agent broker only; the peer runs no command-restricted receiver
+    Broker,
+    /// Forward nothing; the coordinator must hold its own credentials for the peer
+    OwnCredentials,
+    /// Expose the complete local SSH agent to the coordinator, as `ssh -A` would
+    FullAgent,
 }
+
+/// What the command-restricted receiver records in its signed receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ReceiptDetail {
+    /// Final type and size of every path the transfer could have changed
+    Sizes,
+    /// Sizes plus a closure-time BLAKE3 digest of every regular file
+    Digests,
+}
+
+const REMOTE_TO_REMOTE_HEADING: &str = "Remote-to-remote transfers";
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteHelperArgs {
@@ -828,7 +839,7 @@ struct NativeRemoteHelperArgs {
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
     /// Choose the endpoint that runs the coordinator
-    #[arg(long, value_enum, default_value_t = CoordinateAt::Auto)]
+    #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
     coordinate_at: CoordinateAt,
     /// Remote shell command (default: ssh); the command owns SSH and agent policy when set
     #[arg(long = "rsh", value_name = "COMMAND")]
@@ -852,24 +863,18 @@ struct NativeRemoteArgs {
         conflicts_with = "no_tcp"
     )]
     tcp_congestion: Option<String>,
-    /// Run at the remote coordinator and return after launch; requires --no-forward-agent or --rsh
-    #[arg(long)]
+    /// Run at the remote coordinator and return after launch; requires --peer-auth own-credentials or --rsh
+    #[arg(long, help_heading = REMOTE_TO_REMOTE_HEADING)]
     detach: bool,
-    /// Give a remote coordinator no forwarded agent; it must own credentials for the peer
-    #[arg(long, conflicts_with = "rsh")]
-    no_forward_agent: bool,
-    /// Expose the complete local SSH agent to a live remote coordinator
+    /// How the coordinator authenticates to the peer (see the values below); --rsh takes over this policy entirely
     #[arg(
         long,
-        conflicts_with_all = ["rsh", "no_forward_agent", "detach"]
+        value_enum,
+        value_name = "MODE",
+        default_value_t = PeerAuth::Restricted,
+        help_heading = REMOTE_TO_REMOTE_HEADING
     )]
-    unrestricted_agent_forwarding: bool,
-    /// Use destination-bound authentication without a command-restricted enrollment
-    #[arg(
-        long,
-        conflicts_with_all = ["rsh", "no_forward_agent", "unrestricted_agent_forwarding", "detach"]
-    )]
-    agent_broker_only: bool,
+    peer_auth: PeerAuth,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1323,7 +1328,10 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     }
     apply_native_copy_operational(&mut args, copy.operational, &matches)?;
     apply_native_remote(&mut args, remote)?;
-    if args.max_entries.is_some() || args.max_total_bytes.is_some() || args.receipt_requested {
+    if args.receiver_max_entries.is_some()
+        || args.receiver_max_bytes.is_some()
+        || args.receiver_receipt.is_some()
+    {
         // These are assertions for hostB's enrolled receiver to enforce; with
         // no such receiver in the topology, nothing would enforce them, so
         // refuse rather than let them read as local limits.
@@ -1331,7 +1339,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
         if !(src_remote && dst_remote) {
             bail!(
-                "--max-entries, --max-total-bytes, and --receipt address the command-restricted receiver; they apply only to direct remote-to-remote copies"
+                "--receiver-max-entries, --receiver-max-bytes, and --receiver-receipt address the command-restricted receiver; they apply only to direct remote-to-remote copies"
             );
         }
     }
@@ -1695,14 +1703,13 @@ fn apply_native_copy_operational(
         ignore_from,
         preserve,
         inplace,
-        max_entries,
-        max_total_bytes,
-        receipt,
+        receiver_max_entries,
+        receiver_max_bytes,
+        receiver_receipt,
     } = operational;
-    args.receipt_requested = receipt.is_some();
-    args.receipt_hashed = receipt == Some(ReceiptMode::Hashed);
-    args.max_entries = max_entries;
-    args.max_total_bytes = max_total_bytes.as_deref().map(parse_size).transpose()?;
+    args.receiver_receipt = receiver_receipt;
+    args.receiver_max_entries = receiver_max_entries;
+    args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
     args.no_compress = no_compress;
     if no_compress {
@@ -1744,6 +1751,14 @@ fn apply_native_copy_operational(
 }
 
 fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> {
+    if remote.rsh.is_some() && remote.peer_auth != PeerAuth::Restricted {
+        bail!("--peer-auth cannot be combined with --rsh; the remote shell command owns SSH and agent policy");
+    }
+    if remote.detach && matches!(remote.peer_auth, PeerAuth::Broker | PeerAuth::FullAgent) {
+        bail!(
+            "--detach cannot be combined with --peer-auth broker or full-agent; a brokered or forwarded agent exists only while syq stays attached"
+        );
+    }
     args.coordinate_at = remote.coordinate_at;
     args.rsh = remote.rsh;
     args.syq_path = remote.helper.syq_path;
@@ -1754,9 +1769,7 @@ fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> 
     args.tcp_ports = remote.tcp_ports;
     args.tcp_congestion = remote.tcp_congestion;
     args.detach = remote.detach;
-    args.no_forward_agent = remote.no_forward_agent;
-    args.unrestricted_agent_forwarding = remote.unrestricted_agent_forwarding;
-    args.agent_broker_only = remote.agent_broker_only;
+    args.peer_auth = remote.peer_auth;
     Ok(())
 }
 
