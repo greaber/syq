@@ -23,34 +23,31 @@
 //! does not issue macOS `F_FULLFSYNC`, which Apple documents as the stronger
 //! power-loss barrier.
 //!
-//! Enrollment provisioning, not request handling, must create the replay
-//! namespace once beneath a stable absolute chain of trusted directories. A
-//! missing or replaced namespace is a security failure that requires explicit
-//! repair or re-enrollment; [`ReplayStore::open`] never creates it.
-//! Every path component including `/` must be root/effective-user owned and
-//! not writable by another principal. Linux user-private-group write bits are
-//! accepted only after the account database proves that the owner is the
-//! group's sole non-root member. Linux accepts access ACLs only when their
-//! effective write grants are confined to those same trusted principals;
-//! default ACLs do not authorize changes to an existing ancestor, and every
-//! newly created component is revalidated before use. macOS conservatively
-//! rejects extended ACLs on trusted paths.
+//! Enrollment provisioning, not request handling, creates the replay namespace
+//! once. It remains a real, target-owned mode-0700 directory; replay records and
+//! other private state remain target-owned mode-0600 regular files. Opening and
+//! reading state uses no-follow descriptors and fixed size bounds. Ownership,
+//! mode, and ACL walks over ancestor directories are deliberately not part of
+//! sender confinement: the receiver account and its local filesystem are in
+//! the trusted boundary. The restricted receiver instead prevents signed copy
+//! scopes from overlapping its executable, SSH configuration, verifier, or
+//! enrollment state.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
-use std::ffi::{CStr, CString, OsStr};
-use std::fs::{File, OpenOptions};
+use std::ffi::{CString, OsStr};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -836,8 +833,8 @@ impl SshsigPolicy {
         signature: &[u8],
         payload: &[u8],
     ) -> Result<()> {
-        validate_secure_executable(&self.ssh_keygen, "SSHSIG verifier")?;
-        let allowed = read_secure_regular(
+        validate_regular_executable(&self.ssh_keygen, "SSHSIG verifier")?;
+        let allowed = read_private_regular(
             &self.allowed_signers,
             "allowed-signers policy",
             MAX_POLICY_BYTES,
@@ -845,7 +842,9 @@ impl SshsigPolicy {
         let revocation = self
             .revocation_file
             .as_ref()
-            .map(|path| read_secure_regular(path, "SSHSIG revocation policy", MAX_REVOCATION_BYTES))
+            .map(|path| {
+                read_private_regular(path, "SSHSIG revocation policy", MAX_REVOCATION_BYTES)
+            })
             .transpose()?;
         let signature_file = store.temporary_file("signature", signature)?;
         let allowed_file = store.temporary_file("allowed-signers", &allowed)?;
@@ -1414,233 +1413,26 @@ fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
             mode
         );
     }
-    if !file_has_trusted_writers(
-        directory,
-        &metadata,
-        &format!("private directory {}", path.display()),
-    )? {
-        bail!(
-            "private directory {} must not grant write access to another principal",
-            path.display()
-        );
-    }
     Ok(())
 }
 
 pub(crate) fn validate_private_directory_path(path: &Path) -> Result<()> {
-    let directory = open_trusted_directory_path(path, "private directory")?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open private directory {}", path.display()))?;
     validate_private_directory(&directory, path)
 }
 
-pub(crate) fn validate_trusted_directory_path(path: &Path) -> Result<()> {
-    open_trusted_directory_path(path, "trusted directory").map(|_| ())
-}
-
-fn open_trusted_directory_path(path: &Path, label: &str) -> Result<File> {
-    validate_canonical_trusted_path(path, label)?;
-    let mut violations = Vec::new();
-    let mut directory = OpenOptions::new()
+fn open_existing_replay_directory(path: &Path) -> Result<File> {
+    let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/")
-        .with_context(|| format!("open filesystem root for {label}"))?;
-    collect_trusted_directory_violation(&directory, label, Path::new("/"), &mut violations)?;
-    let mut components = path.components();
-    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
-        bail!("{label} path must start at the filesystem root");
-    }
-    let mut current = PathBuf::from("/");
-    for component in components {
-        let std::path::Component::Normal(name) = component else {
-            bail!("{label} path contains a noncanonical component");
-        };
-        current.push(name);
-        directory = openat_os_file(
-            directory.as_raw_fd(),
-            name,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )
-        .with_context(|| format!("securely open {label} {}", path.display()))?;
-        collect_trusted_directory_violation(&directory, label, &current, &mut violations)?;
-    }
-    if !violations.is_empty() {
-        bail!(
-            "unsafe {label} path components in {}:\n  - {}",
-            path.display(),
-            violations.join("\n  - ")
-        );
-    }
-    Ok(directory)
-}
-
-fn open_existing_replay_directory(path: &Path) -> Result<File> {
-    let directory = open_trusted_directory_path(path, "replay state directory")?;
+        .open(path)
+        .with_context(|| format!("open replay state directory {}", path.display()))?;
     validate_private_directory(&directory, path)?;
     Ok(directory)
-}
-
-fn trusted_owner_mode(
-    owner: libc::uid_t,
-    group: libc::gid_t,
-    mode: u32,
-    effective_uid: libc::uid_t,
-    private_group: Option<libc::gid_t>,
-) -> bool {
-    (owner == 0 || owner == effective_uid)
-        && mode & 0o002 == 0
-        && (mode & 0o020 == 0 || private_group == Some(group))
-}
-
-/// A Linux user-private group does not add a second writer even when the
-/// conventional umask 002 leaves group-write set. Prove the convention from
-/// NSS instead of assuming that equal numeric uid/gid values imply privacy.
-#[cfg(target_os = "linux")]
-fn lookup_account_uid(name: &CStr) -> Result<Option<libc::uid_t>> {
-    const MAX_ACCOUNT_BUFFER: usize = 1024 * 1024;
-    let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result = std::ptr::null_mut();
-    let mut buffer = vec![0u8; MAX_ACCOUNT_BUFFER];
-    let status = unsafe {
-        libc::getpwnam_r(
-            name.as_ptr(),
-            &mut passwd,
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            &mut result,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status)).context("look up private-group member");
-    }
-    Ok((!result.is_null()).then_some(passwd.pw_uid))
-}
-
-#[cfg(target_os = "linux")]
-fn discover_private_group() -> Result<Option<libc::gid_t>> {
-    const MAX_ACCOUNT_BUFFER: usize = 1024 * 1024;
-    let uid = unsafe { libc::geteuid() };
-    let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut passwd_result = std::ptr::null_mut();
-    let mut passwd_buffer = vec![0u8; MAX_ACCOUNT_BUFFER];
-    let status = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &mut passwd,
-            passwd_buffer.as_mut_ptr().cast(),
-            passwd_buffer.len(),
-            &mut passwd_result,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status)).context("look up private-group owner");
-    }
-    if passwd_result.is_null() || passwd.pw_name.is_null() {
-        return Ok(None);
-    }
-    let username = unsafe { CStr::from_ptr(passwd.pw_name) }
-        .to_bytes()
-        .to_vec();
-    let gid = passwd.pw_gid;
-
-    let mut group: libc::group = unsafe { std::mem::zeroed() };
-    let mut group_result = std::ptr::null_mut();
-    let mut group_buffer = vec![0u8; MAX_ACCOUNT_BUFFER];
-    let status = unsafe {
-        libc::getgrgid_r(
-            gid,
-            &mut group,
-            group_buffer.as_mut_ptr().cast(),
-            group_buffer.len(),
-            &mut group_result,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status)).context("look up private group");
-    }
-    if group_result.is_null()
-        || group.gr_name.is_null()
-        || unsafe { CStr::from_ptr(group.gr_name) }.to_bytes() != username
-    {
-        return Ok(None);
-    }
-    let mut member = group.gr_mem;
-    while !member.is_null() && unsafe { !(*member).is_null() } {
-        let member_name = unsafe { CStr::from_ptr(*member) };
-        if member_name.to_bytes() != username && lookup_account_uid(member_name)? != Some(0) {
-            return Ok(None);
-        }
-        member = unsafe { member.add(1) };
-    }
-
-    // Supplementary members appear in gr_mem, but users whose primary group
-    // is this gid do not. Enumerate passwd entries so a reused primary gid is
-    // not mistaken for a user-private group.
-    unsafe { libc::setpwent() };
-    let enumeration = (|| -> Result<bool> {
-        loop {
-            unsafe { *libc::__errno_location() = 0 };
-            let entry = unsafe { libc::getpwent() };
-            if entry.is_null() {
-                let error = unsafe { *libc::__errno_location() };
-                return if error == 0 {
-                    Ok(true)
-                } else {
-                    Err(io::Error::from_raw_os_error(error))
-                        .context("enumerate private-group accounts")
-                };
-            }
-            let entry = unsafe { &*entry };
-            if entry.pw_gid == gid && entry.pw_uid != uid && entry.pw_uid != 0 {
-                return Ok(false);
-            }
-        }
-    })();
-    unsafe { libc::endpwent() };
-    Ok(enumeration?.then_some(gid))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn discover_private_group() -> Result<Option<libc::gid_t>> {
-    Ok(None)
-}
-
-fn private_group() -> Option<libc::gid_t> {
-    static PRIVATE_GROUP: OnceLock<Option<libc::gid_t>> = OnceLock::new();
-    *PRIVATE_GROUP.get_or_init(|| discover_private_group().unwrap_or(None))
-}
-
-fn collect_trusted_directory_violation(
-    directory: &File,
-    label: &str,
-    path: &Path,
-    violations: &mut Vec<String>,
-) -> Result<()> {
-    let metadata = directory
-        .metadata()
-        .with_context(|| format!("inspect {label}"))?;
-    let trusted_writers = if metadata.is_dir() {
-        match file_has_trusted_writers(directory, &metadata, &format!("{label} {}", path.display()))
-        {
-            Ok(trusted) => trusted,
-            Err(error) => {
-                violations.push(format!("{}: {error:#}", path.display()));
-                true
-            }
-        }
-    } else {
-        false
-    };
-    if !metadata.is_dir() || !trusted_writers {
-        violations.push(format!(
-            "{}: must be a root/target-owned directory not writable by another principal (mode {:04o}, uid {}, gid {})",
-            path.display(),
-            metadata.permissions().mode() & 0o7777,
-            metadata.uid(),
-            metadata.gid()
-        ));
-    }
-    Ok(())
 }
 
 fn validate_private_file(file: &File, label: &str) -> Result<()> {
@@ -1651,183 +1443,30 @@ fn validate_private_file(file: &File, label: &str) -> Result<()> {
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o7777 != 0o600
     {
-        bail!("{label} must be a target-owned private regular file");
-    }
-    if !file_has_trusted_writers(file, &metadata, label)? {
-        bail!("{label} must not grant write access to another principal");
+        bail!("{label} must be a target-owned mode-0600 regular file");
     }
     Ok(())
 }
 
-pub(crate) fn validate_secure_executable(path: &Path, label: &str) -> Result<()> {
-    validate_canonical_trusted_path(path, label)?;
-    let mut violations = Vec::new();
-    let mut directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/")
-        .with_context(|| format!("open filesystem root for {label} validation"))?;
-    collect_trusted_directory_violation(
-        &directory,
-        &format!("{label} ancestor"),
-        Path::new("/"),
-        &mut violations,
-    )?;
-    let mut components = path.components().peekable();
-    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
-        bail!("{label} path must start at the filesystem root");
-    }
-    let mut current = PathBuf::from("/");
-    while let Some(component) = components.next() {
-        let std::path::Component::Normal(name) = component else {
-            bail!("{label} path contains a noncanonical component");
-        };
-        current.push(name);
-        if components.peek().is_some() {
-            let next = openat_os_file(
-                directory.as_raw_fd(),
-                name,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0,
-            )
-            .with_context(|| format!("securely open {label} ancestor in {}", path.display()))?;
-            collect_trusted_directory_violation(
-                &next,
-                &format!("{label} ancestor"),
-                &current,
-                &mut violations,
-            )?;
-            directory = next;
-            continue;
-        }
-
-        let file = openat_os_file(
-            directory.as_raw_fd(),
-            name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )
-        .with_context(|| format!("open trusted {label} {}", path.display()))?;
-        let metadata = file.metadata()?;
-        let trusted_writers = match file_has_trusted_writers(
-            &file,
-            &metadata,
-            &format!("{label} {}", current.display()),
-        ) {
-            Ok(trusted) => trusted,
-            Err(error) => {
-                violations.push(format!("{}: {error:#}", current.display()));
-                true
-            }
-        };
-        if !metadata.is_file() || !trusted_writers || metadata.permissions().mode() & 0o111 == 0 {
-            violations.push(format!(
-                "{}: {label} must be a trusted executable not writable by another principal (mode {:04o}, uid {}, gid {})",
-                current.display(),
-                metadata.permissions().mode() & 0o7777,
-                metadata.uid(),
-                metadata.gid()
-            ));
-        }
-        if !violations.is_empty() {
-            bail!(
-                "unsafe {label} path components in {}:\n  - {}",
-                path.display(),
-                violations.join("\n  - ")
-            );
-        }
-        // The validated ancestor chain cannot be replaced by an untrusted OS
-        // user, so Command's subsequent path resolution cannot be redirected.
-        // The receiver's own effective uid is part of the trusted boundary.
-        return Ok(());
-    }
-    bail!("{label} path has no executable component")
-}
-
-pub(crate) fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>> {
-    validate_canonical_trusted_path(path, label)?;
-    let mut violations = Vec::new();
-    let mut directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/")
-        .with_context(|| format!("open filesystem root for {label} validation"))?;
-    collect_trusted_directory_violation(
-        &directory,
-        &format!("{label} ancestor"),
-        Path::new("/"),
-        &mut violations,
-    )?;
-
-    let mut components = path.components().peekable();
-    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
-        bail!("{label} path must start at the filesystem root");
-    }
-    let mut current = PathBuf::from("/");
-    let mut file = loop {
-        let Some(component) = components.next() else {
-            bail!("{label} path has no regular-file component");
-        };
-        let std::path::Component::Normal(name) = component else {
-            bail!("{label} path contains a noncanonical component");
-        };
-        current.push(name);
-        if components.peek().is_some() {
-            let next = openat_os_file(
-                directory.as_raw_fd(),
-                name,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0,
-            )
-            .with_context(|| format!("securely open {label} ancestor in {}", path.display()))?;
-            collect_trusted_directory_violation(
-                &next,
-                &format!("{label} ancestor"),
-                &current,
-                &mut violations,
-            )?;
-            directory = next;
-            continue;
-        }
-
-        break openat_os_file(
-            directory.as_raw_fd(),
-            name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )
-        .with_context(|| format!("open trusted {label} {}", path.display()))?;
-    };
-    let metadata = file.metadata()?;
-    let trusted_writers =
-        match file_has_trusted_writers(&file, &metadata, &format!("{label} {}", current.display()))
-        {
-            Ok(trusted) => trusted,
-            Err(error) => {
-                violations.push(format!("{}: {error:#}", current.display()));
-                true
-            }
-        };
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.file_type().is_socket()
-        || !trusted_writers
-    {
-        violations.push(format!(
-            "{}: {label} must be a trusted regular file not writable by another principal (mode {:04o}, uid {}, gid {})",
-            current.display(),
-            metadata.permissions().mode() & 0o7777,
-            metadata.uid(),
-            metadata.gid()
-        ));
-    }
-    if !violations.is_empty() {
+pub(crate) fn validate_regular_executable(path: &Path, label: &str) -> Result<()> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("inspect {label} {}", path.display()))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
         bail!(
-            "unsafe {label} path components in {}:\n  - {}",
-            path.display(),
-            violations.join("\n  - ")
+            "{label} {} must be a regular executable file",
+            path.display()
         );
     }
+    Ok(())
+}
+
+pub(crate) fn read_private_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open {label} {}", path.display()))?;
+    validate_private_file(&file, &format!("{label} {}", path.display()))?;
     let mut contents = Vec::new();
     Read::by_ref(&mut file)
         .take(maximum as u64 + 1)
@@ -1836,243 +1475,6 @@ pub(crate) fn read_secure_regular(path: &Path, label: &str, maximum: usize) -> R
         bail!("{label} size is outside the supported range");
     }
     Ok(contents)
-}
-
-fn validate_canonical_trusted_path(path: &Path, label: &str) -> Result<()> {
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.first() != Some(&b'/') {
-        bail!("{label} path must be absolute");
-    }
-    if bytes.len() > 1
-        && (bytes.ends_with(b"/")
-            || bytes[1..]
-                .split(|byte| *byte == b'/')
-                .any(|component| component.is_empty() || component == b"." || component == b".."))
-    {
-        bail!("{label} path contains a noncanonical component");
-    }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn file_has_trusted_writers(
-    _file: &File,
-    metadata: &std::fs::Metadata,
-    _label: &str,
-) -> Result<bool> {
-    Ok(trusted_owner_mode(
-        metadata.uid(),
-        metadata.gid(),
-        metadata.permissions().mode(),
-        unsafe { libc::geteuid() },
-        private_group(),
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn read_fd_xattr(file: &File, name: &CStr, label: &str) -> Result<Option<Vec<u8>>> {
-    const MAX_ACL_XATTR: usize = 1024 * 1024;
-    for _ in 0..3 {
-        let size =
-            unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
-        if size < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ENODATA) {
-                return Ok(None);
-            }
-            return Err(error).with_context(|| format!("inspect {label} ACL"));
-        }
-        let size = usize::try_from(size).context("ACL size is not representable")?;
-        if size > MAX_ACL_XATTR {
-            bail!("{label} ACL exceeds the supported size");
-        }
-        let mut encoded = vec![0u8; size];
-        let read = unsafe {
-            libc::fgetxattr(
-                file.as_raw_fd(),
-                name.as_ptr(),
-                encoded.as_mut_ptr().cast(),
-                encoded.len(),
-            )
-        };
-        if read >= 0 {
-            encoded.truncate(usize::try_from(read).context("ACL size is not representable")?);
-            return Ok(Some(encoded));
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENODATA) {
-            return Ok(None);
-        }
-        if error.raw_os_error() != Some(libc::ERANGE) {
-            return Err(error).with_context(|| format!("read {label} ACL"));
-        }
-    }
-    bail!("{label} ACL changed repeatedly while it was inspected")
-}
-
-#[cfg(target_os = "linux")]
-fn posix_acl_has_only_trusted_writers(
-    encoded: &[u8],
-    metadata: &std::fs::Metadata,
-    effective_uid: libc::uid_t,
-    private_group: Option<libc::gid_t>,
-    label: &str,
-) -> Result<bool> {
-    const VERSION: u32 = 2;
-    const USER_OBJ: u16 = 0x01;
-    const USER: u16 = 0x02;
-    const GROUP_OBJ: u16 = 0x04;
-    const GROUP: u16 = 0x08;
-    const MASK: u16 = 0x10;
-    const OTHER: u16 = 0x20;
-    const WRITE: u16 = 0x02;
-    const UNDEFINED_ID: u32 = u32::MAX;
-
-    if encoded.len() < 4 || !(encoded.len() - 4).is_multiple_of(8) {
-        bail!("{label} has a malformed POSIX access ACL");
-    }
-    let version = u32::from_le_bytes(encoded[..4].try_into().unwrap());
-    if version != VERSION {
-        bail!("{label} has an unsupported POSIX access ACL version {version}");
-    }
-    let entries = encoded[4..]
-        .chunks_exact(8)
-        .map(|entry| {
-            (
-                u16::from_le_bytes(entry[..2].try_into().unwrap()),
-                u16::from_le_bytes(entry[2..4].try_into().unwrap()),
-                u32::from_le_bytes(entry[4..].try_into().unwrap()),
-            )
-        })
-        .collect::<Vec<_>>();
-    let masks = entries
-        .iter()
-        .filter(|(tag, _, _)| *tag == MASK)
-        .map(|(_, permissions, _)| *permissions)
-        .collect::<Vec<_>>();
-    if masks.len() != 1 {
-        bail!("{label} has a malformed POSIX access ACL mask");
-    }
-    let mask = masks[0];
-    let mut user_objects = 0;
-    let mut group_objects = 0;
-    let mut others = 0;
-    for &(tag, permissions, id) in &entries {
-        if permissions & !0o7 != 0 {
-            bail!("{label} has malformed POSIX access ACL permissions");
-        }
-        let (effective_permissions, trusted) = match tag {
-            USER_OBJ => {
-                user_objects += 1;
-                if id != UNDEFINED_ID {
-                    bail!("{label} has a malformed POSIX owner ACL entry");
-                }
-                (permissions, true)
-            }
-            USER => {
-                if id == UNDEFINED_ID {
-                    bail!("{label} has a malformed POSIX named-user ACL entry");
-                }
-                (permissions & mask, id == effective_uid || id == 0)
-            }
-            GROUP_OBJ => {
-                group_objects += 1;
-                if id != UNDEFINED_ID {
-                    bail!("{label} has a malformed POSIX owner-group ACL entry");
-                }
-                (permissions & mask, private_group == Some(metadata.gid()))
-            }
-            GROUP => {
-                if id == UNDEFINED_ID {
-                    bail!("{label} has a malformed POSIX named-group ACL entry");
-                }
-                (permissions & mask, private_group == Some(id))
-            }
-            MASK => {
-                if id != UNDEFINED_ID {
-                    bail!("{label} has a malformed POSIX mask ACL entry");
-                }
-                (0, true)
-            }
-            OTHER => {
-                others += 1;
-                if id != UNDEFINED_ID {
-                    bail!("{label} has a malformed POSIX other ACL entry");
-                }
-                (permissions, false)
-            }
-            _ => bail!("{label} has an unknown POSIX access ACL entry"),
-        };
-        if effective_permissions & WRITE != 0 && !trusted {
-            return Ok(false);
-        }
-    }
-    if user_objects != 1 || group_objects != 1 || others != 1 {
-        bail!("{label} has malformed POSIX access ACL base entries");
-    }
-    Ok(true)
-}
-
-#[cfg(target_os = "linux")]
-fn file_has_trusted_writers(
-    file: &File,
-    metadata: &std::fs::Metadata,
-    label: &str,
-) -> Result<bool> {
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != 0 && metadata.uid() != effective_uid {
-        return Ok(false);
-    }
-    let Some(acl) = read_fd_xattr(file, c"system.posix_acl_access", label)? else {
-        return Ok(trusted_owner_mode(
-            metadata.uid(),
-            metadata.gid(),
-            metadata.permissions().mode(),
-            effective_uid,
-            private_group(),
-        ));
-    };
-    posix_acl_has_only_trusted_writers(&acl, metadata, effective_uid, private_group(), label)
-}
-
-#[cfg(target_os = "macos")]
-fn file_has_trusted_writers(
-    file: &File,
-    metadata: &std::fs::Metadata,
-    label: &str,
-) -> Result<bool> {
-    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
-
-    unsafe extern "C" {
-        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
-        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
-    }
-
-    // Apple reports a missing FILESEC_ACL as ENOENT. Clear errno first because
-    // acl_get_fd_np returns null both for that expected absence and for errors.
-    unsafe {
-        *libc::__error() = 0;
-    }
-    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(trusted_owner_mode(
-                metadata.uid(),
-                metadata.gid(),
-                metadata.permissions().mode(),
-                unsafe { libc::geteuid() },
-                private_group(),
-            ));
-        }
-        return Err(error).with_context(|| format!("inspect {label} extended ACL"));
-    }
-    let free_result = unsafe { acl_free(acl) };
-    if free_result != 0 {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("release {label} extended ACL"));
-    }
-    bail!("{label} must not have an extended ACL")
 }
 
 fn claim_record(request: RequestId, digest: [u8; 32], claimed_at: i64) -> Result<Vec<u8>> {
@@ -2238,7 +1640,7 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
     use std::process::Child;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -2401,13 +1803,6 @@ mod tests {
             .mode(0o700)
             .create(path)
             .expect("provision test replay directory");
-    }
-
-    #[cfg(target_os = "macos")]
-    fn add_macos_acl(path: &Path, entry: &str) {
-        let mut command = Command::new("/bin/chmod");
-        command.env_clear().args(["+a", entry]).arg(path);
-        command_output(command, "add test extended ACL");
     }
 
     fn write_allowed_signers(path: &Path, signer: &str, public_key: &Path, certificate: bool) {
@@ -3190,7 +2585,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_store_rejects_nonprivate_or_symlinked_state() {
+    fn replay_store_checks_the_final_private_directory_not_its_ancestors() {
         let directory = TestDir::new("replay-security");
         let missing = directory.join("missing-state");
         assert!(ReplayStore::open(&missing).is_err());
@@ -3211,8 +2606,10 @@ mod tests {
             .mode(0o700)
             .create(&private)
             .expect("create private state directory");
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o777))
+            .expect("make the non-secret ancestor broadly writable");
         let dotted = PathBuf::from(format!("{}/./private-state", directory.0.display()));
-        assert!(ReplayStore::open(&dotted).is_err());
+        ReplayStore::open(&dotted).expect("ancestor permissions do not reject private state");
         let link = directory.join("state-link");
         std::os::unix::fs::symlink(&private, &link).expect("create state symlink");
         assert!(ReplayStore::open(&link).is_err());
@@ -3231,253 +2628,28 @@ mod tests {
     }
 
     #[test]
-    fn replay_store_rejects_writable_ancestor_rollback() {
-        let directory = TestDir::new("replay-rollback");
-        let state = directory.join("state");
-        let retained = directory.join("retained-state");
-        provision_test_replay_directory(&state);
-        let request = RequestId([21; 32]);
-        ReplayStore::open(&state)
-            .expect("open enrolled replay namespace")
-            .claim(request, [0x44; 32], NOW)
-            .expect("claim request before rollback");
+    fn verifier_and_policy_checks_are_structural_not_ownership_walks() {
+        let directory = TestDir::new("structural-policy");
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o777)).unwrap();
 
-        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o702))
-            .expect("make replay ancestor writable by another principal");
-        fs::rename(&state, &retained).expect("roll back replay namespace");
-        provision_test_replay_directory(&state);
-        assert!(ReplayStore::open(&state).is_err());
-        assert!(retained
-            .join(format!("claim-{}", request.file_component()))
-            .is_file());
-    }
-
-    #[test]
-    fn trusted_writer_policy_accepts_only_a_proven_private_group() {
-        let uid = 1000;
-        let private_gid = 2000;
-        assert!(trusted_owner_mode(
-            uid,
-            private_gid,
-            0o770,
-            uid,
-            Some(private_gid)
-        ));
-        assert!(!trusted_owner_mode(uid, private_gid, 0o770, uid, None));
-        assert!(!trusted_owner_mode(
-            uid,
-            private_gid + 1,
-            0o770,
-            uid,
-            Some(private_gid)
-        ));
-        assert!(!trusted_owner_mode(
-            uid,
-            private_gid,
-            0o707,
-            uid,
-            Some(private_gid)
-        ));
-        assert!(!trusted_owner_mode(
-            uid + 1,
-            private_gid,
-            0o700,
-            uid,
-            Some(private_gid)
-        ));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_trusted_paths_reject_only_effective_untrusted_acl_writers() {
-        fn entry(encoded: &mut Vec<u8>, tag: u16, permissions: u16, id: u32) {
-            encoded.extend_from_slice(&tag.to_le_bytes());
-            encoded.extend_from_slice(&permissions.to_le_bytes());
-            encoded.extend_from_slice(&id.to_le_bytes());
-        }
-
-        let directory = TestDir::new("posix-acl");
-        let set_acl = |path: &Path, name: &CStr, named_uid, permissions| {
-            let opened = File::open(path).unwrap();
-            let mut acl = 2u32.to_le_bytes().to_vec();
-            entry(&mut acl, 0x01, 0o7, u32::MAX); // ACL_USER_OBJ
-            entry(&mut acl, 0x02, permissions, named_uid); // ACL_USER
-            entry(&mut acl, 0x04, 0, u32::MAX); // ACL_GROUP_OBJ
-            entry(&mut acl, 0x10, permissions, u32::MAX); // ACL_MASK
-            entry(&mut acl, 0x20, 0, u32::MAX); // ACL_OTHER
-            let result = unsafe {
-                libc::fsetxattr(
-                    opened.as_raw_fd(),
-                    name.as_ptr(),
-                    acl.as_ptr().cast(),
-                    acl.len(),
-                    0,
-                )
-            };
-            assert_eq!(result, 0, "set test ACL: {}", io::Error::last_os_error());
-        };
-        let make_directory = |name| {
-            let path = directory.join(name);
-            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
-            path
-        };
-        let effective_uid = unsafe { libc::geteuid() };
-        let other_uid = effective_uid.saturating_add(1);
-
-        let default_parent = make_directory("default-parent");
-        let guarded = default_parent.join("guarded");
-        fs::DirBuilder::new().mode(0o700).create(&guarded).unwrap();
-        set_acl(&default_parent, c"system.posix_acl_default", other_uid, 0o7);
-        validate_trusted_directory_path(&guarded)
-            .expect("a default ACL does not authorize writes to its existing directory");
-        let inherited_private = default_parent.join("inherited-private");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&inherited_private)
-            .unwrap();
-        validate_private_directory_path(&inherited_private)
-            .expect("a mode-0700 child masks inherited access grants before validation");
-
-        let named_reader = make_directory("named-reader");
-        set_acl(&named_reader, c"system.posix_acl_access", other_uid, 0o4);
-        validate_trusted_directory_path(&named_reader)
-            .expect("a named read-only ACL entry is not a writer");
-
-        let owner_alias = make_directory("owner-alias");
-        set_acl(&owner_alias, c"system.posix_acl_access", effective_uid, 0o7);
-        validate_trusted_directory_path(&owner_alias)
-            .expect("an ACL entry naming the effective user is not another writer");
-
-        let named_writer = make_directory("named-writer");
-        set_acl(&named_writer, c"system.posix_acl_access", other_uid, 0o6);
-        let error = validate_trusted_directory_path(&named_writer).unwrap_err();
-        let diagnostic = error.to_string();
-        assert!(
-            diagnostic.contains("not writable by another principal"),
-            "{diagnostic}"
-        );
-        assert!(diagnostic.contains(&named_writer.display().to_string()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_replay_store_rejects_delete_child_and_inherited_snapshot_acls() {
-        let directory = TestDir::new("replay-acl");
-        let state = directory.join("state");
-        provision_test_replay_directory(&state);
-        add_macos_acl(&state, "everyone allow delete_child");
-        assert!(ReplayStore::open(&state).is_err());
-
-        let inherited_state = directory.join("inherited-state");
-        provision_test_replay_directory(&inherited_state);
-        let store = ReplayStore::open(&inherited_state).expect("pin ACL-free replay namespace");
-        add_macos_acl(&inherited_state, "everyone allow read,file_inherit");
-        assert!(store
-            .temporary_file("inherited-policy", b"must not be accepted")
-            .is_err());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_verifier_and_policy_reject_any_extended_acl() {
-        let directory = TestDir::new("verifier-acl");
         let verifier = directory.join("ssh-keygen");
-        write_private(&verifier, b"test executable");
-        fs::set_permissions(&verifier, fs::Permissions::from_mode(0o500))
-            .expect("make test verifier executable");
-        add_macos_acl(&verifier, "everyone allow execute");
-        assert!(validate_secure_executable(&verifier, "test verifier").is_err());
+        fs::write(&verifier, b"test executable").unwrap();
+        fs::set_permissions(&verifier, fs::Permissions::from_mode(0o777)).unwrap();
+        validate_regular_executable(&verifier, "test verifier")
+            .expect("writable permissions do not reject a trusted receiver executable");
+        fs::set_permissions(&verifier, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(validate_regular_executable(&verifier, "test verifier").is_err());
 
         let policy = directory.join("allowed-signers");
-        write_private(&policy, b"signer ssh-ed25519 test\n");
-        add_macos_acl(&policy, "everyone allow read");
-        assert!(read_secure_regular(&policy, "test policy", 1024).is_err());
-    }
-
-    #[test]
-    fn verifier_rejects_a_group_or_world_writable_ancestor() {
-        validate_secure_executable(&ssh_tool("ssh-keygen"), "test verifier")
-            .expect("system verifier chain is trusted");
-
-        let directory = TestDir::new("verifier-ancestor");
-        let ancestor = directory.join("unsafe");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&ancestor)
-            .expect("create verifier ancestor");
-        let executable = ancestor.join("ssh-keygen");
-        write_private(&executable, b"test executable");
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))
-            .expect("make test verifier executable");
-        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o702))
-            .expect("make verifier ancestor writable by another principal");
-
-        assert!(validate_secure_executable(&executable, "test verifier").is_err());
-    }
-
-    #[test]
-    fn verifier_reports_every_unsafe_ancestor_with_its_path() {
-        let directory = TestDir::new("verifier-ancestor-report");
-        let first = directory.join("first");
-        let second = first.join("second");
-        fs::create_dir_all(&second).unwrap();
-        let executable = second.join("ssh-keygen");
-        write_private(&executable, b"test executable");
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
-        fs::set_permissions(&first, fs::Permissions::from_mode(0o702)).unwrap();
-        fs::set_permissions(&second, fs::Permissions::from_mode(0o702)).unwrap();
-
-        let error = validate_secure_executable(&executable, "test verifier").unwrap_err();
-        let diagnostic = error.to_string();
-        assert!(
-            diagnostic.contains(&first.display().to_string()),
-            "{diagnostic}"
+        fs::write(&policy, b"signer ssh-ed25519 test\n").unwrap();
+        fs::set_permissions(&policy, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_private_regular(&policy, "test policy", 1024).unwrap(),
+            b"signer ssh-ed25519 test\n"
         );
-        assert!(
-            diagnostic.contains(&second.display().to_string()),
-            "{diagnostic}"
-        );
-    }
-
-    #[test]
-    fn policy_files_reject_a_writable_ancestor_rollback() {
-        let directory = TestDir::new("policy-rollback");
-        let ancestor = directory.join("unsafe");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&ancestor)
-            .expect("create policy ancestor");
-
-        for name in ["allowed-signers", "revocations"] {
-            write_private(&ancestor.join(name), b"current policy\n");
-            write_private(
-                &ancestor.join(format!("{name}.retained")),
-                b"retained policy\n",
-            );
-        }
-        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o702))
-            .expect("make policy ancestor writable by another principal");
-
-        for name in ["allowed-signers", "revocations"] {
-            let active = ancestor.join(name);
-            let replaced = ancestor.join(format!("{name}.replaced"));
-            let retained = ancestor.join(format!("{name}.retained"));
-            fs::rename(&active, &replaced).expect("remove current policy inode");
-            fs::rename(&retained, &active).expect("restore retained policy inode");
-        }
-
-        assert!(read_secure_regular(
-            &ancestor.join("allowed-signers"),
-            "allowed-signers policy",
-            MAX_POLICY_BYTES,
-        )
-        .is_err());
-        assert!(read_secure_regular(
-            &ancestor.join("revocations"),
-            "SSHSIG revocation policy",
-            MAX_REVOCATION_BYTES,
-        )
-        .is_err());
+        fs::set_permissions(&policy, fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(read_private_regular(&policy, "test policy", 1024).is_err());
+        assert!(read_private_regular(&directory.0, "test policy", 1024).is_err());
     }
 
     #[test]
