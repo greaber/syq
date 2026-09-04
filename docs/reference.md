@@ -248,7 +248,7 @@ removed by another selector is successful. Symlinks encountered while walking
 inside a selected directory are removed as entries and are never followed.
 
 Each pinned entry is atomically moved into an owner-only quarantine directory
-in a trusted ancestor on the same filesystem before it is unlinked. With
+in a trusted ancestor on the same mount before it is unlinked. With
 `--root`, syq first checks without making changes that the selected entry's
 opened parent still leads to the opened root. If the parent was moved
 elsewhere, removal fails; otherwise the ancestor search stops at the root and
@@ -260,7 +260,7 @@ path and leaves both entries in place. A later writer at the selected name is
 likewise left alone and reported as a conflict. Removal fails without deleting
 the selected entry when the platform or filesystem cannot provide atomic
 no-replace rename, or when no writable trusted ancestor exists within the
-allowed boundary on that filesystem. On Linux, syq also uses the open
+allowed boundary on that mount. On Linux, syq also uses the open
 descriptor for a selected directory to report a failure if it is renamed away
 before the quarantine move. macOS does not expose the corresponding unlinked
 directory state, so there the same rename is reported as already absent.

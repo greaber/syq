@@ -701,6 +701,26 @@ pub(crate) fn operator_directory_identities_match(
     }
 }
 
+pub(crate) fn operator_directories_share_mount(
+    left: OperatorDirectoryIdentity,
+    right: OperatorDirectoryIdentity,
+) -> bool {
+    if left.dev != right.dev {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match (left.mount_id, right.mount_id) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn operator_mount_id(directory: &File) -> Result<Option<u64>> {
     let mut status = std::mem::MaybeUninit::<libc::statx>::zeroed();
@@ -2972,6 +2992,28 @@ mod tests {
         assert!(!operator_directory_identities_match(
             identity,
             OperatorDirectoryIdentity {
+                mount_id: None,
+                ..identity
+            }
+        ));
+        assert!(!operator_directories_share_mount(
+            identity,
+            OperatorDirectoryIdentity {
+                mount_id: Some(17),
+                ..identity
+            }
+        ));
+        assert!(operator_directories_share_mount(
+            identity,
+            OperatorDirectoryIdentity {
+                ino: 19,
+                ..identity
+            }
+        ));
+        assert!(operator_directories_share_mount(
+            identity,
+            OperatorDirectoryIdentity {
+                ino: 19,
                 mount_id: None,
                 ..identity
             }

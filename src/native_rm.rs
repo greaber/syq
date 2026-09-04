@@ -13,8 +13,9 @@ use crate::proto::{
     NativeRemoveOutcome, NativeRemoveSelection, OperatorSymlinkPolicy, PathBytes,
 };
 use crate::rooted::{
-    operator_directory_identities_match, operator_directory_identity, OperatorFinalComponent,
-    OperatorResolver, OperatorSymlinkHop, PinnedLeaf as RootedPinnedLeaf, PinnedPath, RootMetadata,
+    operator_directories_share_mount, operator_directory_identities_match,
+    operator_directory_identity, OperatorFinalComponent, OperatorResolver, OperatorSymlinkHop,
+    PinnedLeaf as RootedPinnedLeaf, PinnedPath, RootMetadata,
 };
 use anyhow::{bail, Context, Result};
 use std::ffi::CString;
@@ -1199,34 +1200,44 @@ impl RemovalQuarantine {
         let mut directory = source_parent
             .try_clone()
             .context("duplicate removal parent descriptor")?;
-        let source_device = directory.metadata()?.dev();
+        let source_identity = operator_directory_identity(&directory)?;
         let ceiling_identity = operator_directory_identity(ceiling)?;
         let effective_uid = effective_user_id();
-        let mut candidate = None;
-        let mut candidate_chain_is_trusted = false;
+        let mut lowest_candidate = None;
+        let mut highest_candidate = None;
         let mut reached_ceiling = false;
 
         for parent_hops in 0..REMOVE_QUARANTINE_ANCESTORS {
             let metadata = directory.metadata()?;
             let trusted = is_trusted_quarantine_parent(&metadata, effective_uid);
-            if metadata.dev() == source_device {
-                // Keep the highest same-filesystem directory. When the root is
-                // on this filesystem this is the root itself, so an untrusted
-                // descendant cannot reparent the quarantine after validation.
-                candidate = Some((
+            let directory_identity = operator_directory_identity(&directory)?;
+            if !trusted {
+                // A candidate beneath this directory could be reparented by
+                // an untrusted namespace writer. A later trusted ancestor can
+                // start a new stable suffix of the chain.
+                lowest_candidate = None;
+                highest_candidate = None;
+            } else if operator_directories_share_mount(directory_identity, source_identity) {
+                // Keep two descriptors rather than one per ancestor. The
+                // highest candidate preserves the ordinary placement, while
+                // the lowest lets a validated rooted walk fall back when the
+                // highest directory is not writable.
+                if lowest_candidate.is_none() {
+                    lowest_candidate = Some((
+                        directory
+                            .try_clone()
+                            .context("retain lower removal quarantine ancestor")?,
+                        parent_hops,
+                    ));
+                }
+                highest_candidate = Some((
                     directory
                         .try_clone()
-                        .context("retain removal quarantine ancestor")?,
+                        .context("retain higher removal quarantine ancestor")?,
                     parent_hops,
                 ));
-                candidate_chain_is_trusted = trusted;
-            } else if candidate.is_some() {
-                // For a nested filesystem, every directory anchoring its mount
-                // back to `--root` must also exclude untrusted namespace writers.
-                candidate_chain_is_trusted &= trusted;
             }
 
-            let directory_identity = operator_directory_identity(&directory)?;
             if operator_directory_identities_match(directory_identity, ceiling_identity) {
                 reached_ceiling = true;
                 break;
@@ -1246,46 +1257,101 @@ impl RemovalQuarantine {
         if !reached_ceiling {
             bail!("removal parent is no longer beneath the retained removal root");
         }
-        let Some((candidate, parent_hops)) = candidate else {
-            bail!(
-                "no trusted ancestor within the removal root can hold the removal quarantine on this filesystem"
+        let (Some((lowest_candidate, lowest_hops)), Some((highest_candidate, highest_hops))) =
+            (lowest_candidate, highest_candidate)
+        else {
+            return Err(quarantine_permission_denied(
+                "no trusted ancestor chain within the removal root can hold the removal quarantine on this filesystem",
             )
+            .into());
         };
-        if !candidate_chain_is_trusted {
-            bail!(
-                "no trusted ancestor chain within the removal root can hold the removal quarantine on this filesystem"
+        match Self::create_in(&highest_candidate, highest_hops, effective_uid) {
+            Ok(quarantine) => return Ok(quarantine),
+            Err(error) if is_quarantine_parent_unwritable(&error) => {}
+            Err(error) => return Err(error).context("create removal quarantine"),
+        }
+        Self::create_in_trusted_chain(
+            lowest_candidate,
+            lowest_hops,
+            source_identity,
+            ceiling_identity,
+            effective_uid,
+        )
+    }
+
+    fn create_in_trusted_chain(
+        mut directory: File,
+        mut parent_hops: usize,
+        source_identity: crate::rooted::OperatorDirectoryIdentity,
+        ceiling_identity: crate::rooted::OperatorDirectoryIdentity,
+        effective_uid: u32,
+    ) -> Result<Self> {
+        let mut last_create_error = None;
+        for _ in 0..REMOVE_QUARANTINE_ANCESTORS.saturating_sub(parent_hops) {
+            let directory_identity = operator_directory_identity(&directory)?;
+            if !operator_directories_share_mount(directory_identity, source_identity) {
+                break;
+            }
+            let metadata = directory.metadata()?;
+            if !is_trusted_quarantine_parent(&metadata, effective_uid) {
+                return Err(quarantine_permission_denied(
+                    "the validated removal quarantine ancestor chain changed before creation",
+                )
+                .into());
+            }
+            match Self::create_in(&directory, parent_hops, effective_uid) {
+                Ok(quarantine) => return Ok(quarantine),
+                Err(error) if is_quarantine_parent_unwritable(&error) => {
+                    last_create_error = Some(error);
+                }
+                Err(error) => return Err(error).context("create removal quarantine"),
+            }
+            if operator_directory_identities_match(directory_identity, ceiling_identity) {
+                break;
+            }
+            let parent = open_directory_at(&directory, b"..")
+                .context("walk to a writable removal quarantine ancestor")?;
+            let parent_identity = operator_directory_identity(&parent)?;
+            let parent_metadata = parent.metadata()?;
+            if !operator_directories_share_mount(parent_identity, source_identity)
+                || (parent_metadata.dev() == metadata.dev()
+                    && parent_metadata.ino() == metadata.ino())
+            {
+                break;
+            }
+            directory = parent;
+            parent_hops += 1;
+        }
+
+        if let Some(error) = last_create_error {
+            return Err(error).context(
+                "no writable trusted ancestor within the removal root can hold the removal quarantine on this filesystem",
             );
         }
-        Self::create_in(&candidate, parent_hops, effective_uid).context(
+        Err(quarantine_permission_denied(
             "no writable trusted ancestor within the removal root can hold the removal quarantine on this filesystem",
         )
+        .into())
     }
 
     fn create_unconfined(source_parent: &PinnedParent) -> Result<Self> {
         let mut directory = source_parent
             .try_clone()
             .context("duplicate removal parent descriptor")?;
-        let source_device = directory.metadata()?.dev();
+        let source_identity = operator_directory_identity(&directory)?;
         let effective_uid = effective_user_id();
         let mut last_create_error = None;
 
         for parent_hops in 0..REMOVE_QUARANTINE_ANCESTORS {
             let metadata = directory.metadata()?;
-            if metadata.dev() != source_device {
+            let directory_identity = operator_directory_identity(&directory)?;
+            if !operator_directories_share_mount(directory_identity, source_identity) {
                 break;
             }
             if is_trusted_quarantine_parent(&metadata, effective_uid) {
                 match Self::create_in(&directory, parent_hops, effective_uid) {
                     Ok(quarantine) => return Ok(quarantine),
-                    Err(error)
-                        if matches!(
-                            error.raw_os_error(),
-                            Some(errno)
-                                if errno == libc::EACCES
-                                    || errno == libc::EPERM
-                                    || errno == libc::EROFS
-                        ) =>
-                    {
+                    Err(error) if is_quarantine_parent_unwritable(&error) => {
                         last_create_error = Some(error);
                     }
                     Err(error) => return Err(error).context("create removal quarantine"),
@@ -1294,8 +1360,9 @@ impl RemovalQuarantine {
 
             let parent = open_directory_at(&directory, b"..")
                 .context("walk to a trusted removal quarantine parent")?;
+            let parent_identity = operator_directory_identity(&parent)?;
             let parent_metadata = parent.metadata()?;
-            if parent_metadata.dev() != source_device
+            if !operator_directories_share_mount(parent_identity, source_identity)
                 || (parent_metadata.dev() == metadata.dev()
                     && parent_metadata.ino() == metadata.ino())
             {
@@ -1309,7 +1376,10 @@ impl RemovalQuarantine {
                 "no writable trusted ancestor can hold the removal quarantine on this filesystem",
             );
         }
-        bail!("no trusted ancestor can hold the removal quarantine on this filesystem")
+        Err(quarantine_permission_denied(
+            "no trusted ancestor can hold the removal quarantine on this filesystem",
+        )
+        .into())
     }
 
     fn create_in(parent: &File, parent_hops: usize, effective_uid: u32) -> io::Result<Self> {
@@ -1408,6 +1478,17 @@ fn is_trusted_quarantine_parent(metadata: &std::fs::Metadata, effective_uid: u32
     owner_is_trusted && (!writable_by_others || sticky)
 }
 
+fn is_quarantine_parent_unwritable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(errno) if errno == libc::EACCES || errno == libc::EPERM || errno == libc::EROFS
+    )
+}
+
+fn quarantine_permission_denied(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
 fn random_quarantine_name() -> io::Result<CString> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut random = [0u8; 16];
@@ -1440,16 +1521,43 @@ fn restore_or_preserve_quarantine(
     ) {
         Ok(()) => cleanup_quarantine_after_error(quarantine, cause),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            cleanup_quarantine_after_error(quarantine, cause.context(error))
+            match metadata_at_cstring(quarantine.directory.as_raw_fd(), candidate) {
+                Err(inspect) if inspect.kind() == io::ErrorKind::NotFound => {
+                    cleanup_quarantine_after_error(quarantine, cause.context(error))
+                }
+                Ok(_) => preserve_quarantine_after_restore_error(
+                    quarantine,
+                    candidate,
+                    cause,
+                    error.into(),
+                ),
+                Err(inspect) => preserve_quarantine_after_restore_error(
+                    quarantine,
+                    candidate,
+                    cause,
+                    anyhow::Error::new(inspect).context(format!(
+                        "restoration failed with {error}; could not inspect the quarantined entry afterward"
+                    )),
+                ),
+            }
         }
         Err(error) => {
-            let label = quarantine.candidate_label(candidate);
-            quarantine.preserve();
-            anyhow::Error::new(error).context(format!(
-                "{cause:#}; preserved the entry at {label:?} because its original name could not be restored"
-            ))
+            preserve_quarantine_after_restore_error(quarantine, candidate, cause, error.into())
         }
     }
+}
+
+fn preserve_quarantine_after_restore_error(
+    quarantine: &mut RemovalQuarantine,
+    candidate: &CString,
+    cause: anyhow::Error,
+    restore_error: anyhow::Error,
+) -> anyhow::Error {
+    let label = quarantine.candidate_label(candidate);
+    quarantine.preserve();
+    restore_error.context(format!(
+        "{cause:#}; preserved the entry at {label:?} because its original name could not be restored"
+    ))
 }
 
 fn cleanup_quarantine_after_error(
@@ -1496,9 +1604,25 @@ fn rename_noreplace_at(
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+            return Err(describe_linux_noreplace_error(error));
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn describe_linux_noreplace_error(error: io::Error) -> io::Error {
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    ) {
+        return io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "filesystem cannot provide atomic no-replace rename for removal quarantine: {error}"
+            ),
+        );
+    }
+    error
 }
 
 #[cfg(target_os = "macos")]
@@ -1981,6 +2105,46 @@ mod tests {
     }
 
     #[test]
+    fn pinned_removal_reports_preserved_candidate_when_original_parent_is_unlinked() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("parent");
+        fs::create_dir(&parent_path).unwrap();
+        fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::write(parent_path.join("selected"), b"selected").unwrap();
+        let directory = File::open(&parent_path).unwrap();
+        let selected = pinned_test_name(&directory, b"selected");
+        let mut retained = None;
+
+        let error = remove_pinned_with_hook(&selected, false, None, |quarantine, _| {
+            retained = Some((
+                quarantine.parent.try_clone()?,
+                quarantine.name.clone(),
+                quarantine.directory.try_clone()?,
+            ));
+            fs::remove_dir(&parent_path)?;
+            bail!("injected failure after original parent was unlinked")
+        })
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("injected failure after original parent was unlinked"));
+        assert!(message.contains("preserved the entry at"), "{message}");
+        assert!(!message.contains("empty removal quarantine"), "{message}");
+        let (quarantine_parent, quarantine_name, quarantine_directory) = retained.unwrap();
+        assert_eq!(
+            metadata_at(quarantine_directory.as_raw_fd(), REMOVE_QUARANTINE_ENTRY).unwrap(),
+            selected.identity
+        );
+
+        let candidate = component_cstring(REMOVE_QUARANTINE_ENTRY).unwrap();
+        retry_zero(|| unsafe {
+            libc::unlinkat(quarantine_directory.as_raw_fd(), candidate.as_ptr(), 0)
+        })
+        .unwrap();
+        remove_directory_at(quarantine_parent.as_raw_fd(), &quarantine_name).unwrap();
+    }
+
+    #[test]
     fn pinned_removal_quarantines_outside_an_untrusted_parent() {
         let temp = tempfile::tempdir().unwrap();
         let hostile = temp.path().join("hostile");
@@ -2039,6 +2203,58 @@ mod tests {
             failure.error.message.contains("within the removal root"),
             "{failure:?}"
         );
+        assert_eq!(failure.class, NativeRemoveErrorClass::Io);
+        assert_eq!(
+            failure.error.io_kind,
+            Some(crate::proto::WireIoKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn removal_root_need_not_be_writable_when_a_stable_lower_parent_is() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("owned")).unwrap();
+        fs::write(root.join("owned/selected"), b"selected").unwrap();
+        fs::set_permissions(root.join("owned"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        let mut outcomes = Vec::new();
+
+        remove(
+            None,
+            Some(root.as_os_str().as_bytes()),
+            &[selector(b"owned/selected", NativeRemoveKind::File)],
+            false,
+            false,
+            1,
+            &mut |_| Ok(()),
+            &mut |batch| {
+                outcomes.extend(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!root.join("owned/selected").exists(), "{outcomes:#?}");
+        assert!(removal_quarantines(&root).is_empty());
+        assert!(removal_quarantines(&root.join("owned")).is_empty());
+        assert!(outcomes.iter().all(|outcome| outcome.failure.is_none()));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_linux_noreplace_errors_have_the_documented_diagnostic() {
+        for errno in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            let error = describe_linux_noreplace_error(io::Error::from_raw_os_error(errno));
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot provide atomic no-replace rename"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

@@ -72,7 +72,7 @@ go further:
 - Native `rm` resolves and pins every selector before its first change and
   enumerates opened directories. Before deletion, it atomically moves the
   current entry into an owner-only quarantine directory in a trusted ancestor
-  on the same filesystem, then re-checks device, inode, and type there. Under
+  on the same mount, then re-checks device, inode, and type there. Under
   `--root`, it verifies that the selected entry's opened parent still has the
   opened root in its ancestor chain before it creates the quarantine; a parent
   moved outside the root is refused. A name swapped to a different inode is
