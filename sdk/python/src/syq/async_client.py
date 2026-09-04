@@ -30,6 +30,7 @@ from .client import (
     _append_remote_arguments,
     _argument,
     _copy_arguments,
+    _insert_mapping_option,
     _map_stream_cwd,
     _mapping_line,
     _prepare_results_file,
@@ -661,7 +662,7 @@ class AsyncClient:
         results = await _complete_task(
             asyncio.create_task(asyncio.to_thread(_prepare_results_file, results))
         )
-        argv, source_count = _copy_arguments(
+        argv, source_count, source_end = _copy_arguments(
             "cp",
             sources,
             src=src,
@@ -736,7 +737,9 @@ class AsyncClient:
         if any(value is not None for value in (as_, as_new, as_existing)):
             raise SyqInvocationError("--mapping conflicts with --as")
         if isinstance(mapping, (str, bytes, os.PathLike)):
-            argv.extend(("--mapping", _argument(mapping, label="mapping")))
+            _insert_mapping_option(
+                argv, source_end, _argument(mapping, label="mapping")
+            )
             result = await self._typed(
                 argv,
                 mode="cp",
@@ -767,7 +770,9 @@ class AsyncClient:
                     )
                 )
                 await _complete_task(materialize, on_cancel=cancelled.set)
-            argv.extend(("--mapping", os.path.realpath(manifest.name)))
+            _insert_mapping_option(
+                argv, source_end, os.path.realpath(manifest.name)
+            )
             result = await self._typed(
                 argv,
                 mode="cp",
@@ -856,7 +861,7 @@ class AsyncClient:
         src_src_values = _values(src_src, label="--src-src")
         src_file_values = _values(src_file, label="--src-file")
         src_dir_values = _values(src_dir, label="--src-dir")
-        argv, source_count = _copy_arguments(
+        argv, source_count, _source_end = _copy_arguments(
             "map",
             sources,
             src=src_values,

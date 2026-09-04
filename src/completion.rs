@@ -750,8 +750,12 @@ fn filesystem_command_candidates(
     let command_meta = crate::cli::command_for_completion(command)
         .ok_or_else(|| anyhow!("missing completion metadata for {command}"))?;
     let after_double_dash = args.iter().any(|arg| arg == b"--");
+    let copy_destination_started = command == "cp" && native_copy_destination_started(args);
     if !after_double_dash {
         if let Some((option, value)) = split_inline_option(current) {
+            if copy_destination_started && native_copy_source_option(option) {
+                return Ok(Vec::new());
+            }
             if let Some(kind) = value_completion(command, option, &command_meta) {
                 let mut values = complete_value(command, args, value, kind)?;
                 for candidate in &mut values {
@@ -764,6 +768,9 @@ fn filesystem_command_candidates(
             }
         }
         if let Some(previous) = args.last() {
+            if copy_destination_started && native_copy_source_option(previous) {
+                return Ok(Vec::new());
+            }
             if let Some(kind) = value_completion(command, previous, &command_meta) {
                 if command == "rsync" || !current.starts_with(b"-") {
                     return complete_value(command, args, current, kind);
@@ -771,15 +778,57 @@ fn filesystem_command_candidates(
             }
         }
         if current.starts_with(b"-") {
-            return Ok(option_candidates(&command_meta, current));
+            let mut candidates = option_candidates(&command_meta, current);
+            if copy_destination_started {
+                candidates.retain(|candidate| !native_copy_source_option(&candidate.value));
+            }
+            return Ok(candidates);
         }
     }
 
     match command {
+        "cp" if copy_destination_started => Ok(Vec::new()),
         "cp" | "rm" | "map" => complete_path_for(command, args, current, true),
         "rsync" => complete_rsync_operand(args, current),
         _ => Ok(Vec::new()),
     }
+}
+
+fn native_copy_destination_started(args: &[Vec<u8>]) -> bool {
+    const OPTIONS: &[&[u8]] = &[
+        b"--to",
+        b"--into",
+        b"--into-new",
+        b"--into-existing",
+        b"--as",
+        b"--as-new",
+        b"--as-existing",
+    ];
+    args.iter().any(|argument| {
+        OPTIONS.iter().any(|option| {
+            argument == option
+                || (argument.starts_with(option) && argument.get(option.len()) == Some(&b'='))
+        })
+    })
+}
+
+fn native_copy_source_option(option: &[u8]) -> bool {
+    matches!(
+        option.split(|byte| *byte == b'=').next().unwrap_or(option),
+        b"--from"
+            | b"-C"
+            | b"--cwd"
+            | b"--root"
+            | b"--src"
+            | b"--src-src"
+            | b"--src-file"
+            | b"--src-dir"
+            | b"--srcs"
+            | b"--src-srcs"
+            | b"--src-files"
+            | b"--src-dirs"
+            | b"--mapping"
+    )
 }
 
 fn split_inline_option(current: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -1816,6 +1865,25 @@ mod tests {
             values(filesystem_command_candidates("cp", &[b"--src-dir".to_vec()], b"--i").unwrap());
         assert!(options.contains(&b"--ignore".to_vec()));
         assert!(options.contains(&b"--into".to_vec()));
+    }
+
+    #[test]
+    fn native_copy_stops_completing_sources_after_the_destination_starts() {
+        let args = [b"source".to_vec(), b"--into".to_vec(), b"target".to_vec()];
+        assert!(filesystem_command_candidates("cp", &args, b"")
+            .unwrap()
+            .is_empty());
+
+        let options = values(filesystem_command_candidates("cp", &args, b"--").unwrap());
+        assert!(options.contains(&b"--dry-run".to_vec()));
+        assert!(!options.contains(&b"--src".to_vec()));
+        assert!(!options.contains(&b"--mapping".to_vec()));
+
+        let mut invalid_source = args.to_vec();
+        invalid_source.push(b"--src".to_vec());
+        assert!(filesystem_command_candidates("cp", &invalid_source, b"s")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

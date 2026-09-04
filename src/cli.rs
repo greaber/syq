@@ -947,7 +947,7 @@ struct NativeSizeSelectionArgs {
     name = "syq cp",
     version,
     about = "Copy selected objects with explicit endpoint and placement syntax",
-    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
+    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
     override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyCommand {
@@ -967,6 +967,58 @@ struct NativeCopyCommand {
     /// With --prune, refuse all removals if more than N are planned
     #[arg(long, value_name = "N", requires = "prune")]
     max_delete: Option<u64>,
+}
+
+fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()> {
+    const DESTINATION_ARGUMENTS: &[(&str, &str)] = &[
+        ("to", "--to"),
+        ("into", "--into"),
+        ("into_new", "--into-new"),
+        ("into_existing", "--into-existing"),
+        ("as", "--as"),
+        ("as_new", "--as-new"),
+        ("as_existing", "--as-existing"),
+    ];
+    const SOURCE_ARGUMENTS: &[(&str, &str)] = &[
+        ("from", "--from"),
+        ("cwd", "--cwd"),
+        ("root", "--root"),
+        ("src", "--src"),
+        ("src_src", "--src-src"),
+        ("src_file", "--src-file"),
+        ("src_dir", "--src-dir"),
+        ("src_files", "--src-files"),
+        ("src_dirs", "--src-dirs"),
+        ("srcs", "--srcs"),
+        ("src_srcs", "--src-srcs"),
+        ("sources", "a positional source"),
+        ("mapping", "--mapping"),
+    ];
+
+    let first_destination = DESTINATION_ARGUMENTS
+        .iter()
+        .filter_map(|(id, option)| {
+            matches
+                .indices_of(id)
+                .and_then(|mut indices| indices.next())
+                .map(|index| (index, *option))
+        })
+        .min_by_key(|(index, _)| *index);
+    let Some((destination_index, destination_option)) = first_destination else {
+        return Ok(());
+    };
+
+    for (id, source_option) in SOURCE_ARGUMENTS {
+        let follows_destination = matches
+            .indices_of(id)
+            .is_some_and(|mut indices| indices.any(|index| index > destination_index));
+        if follows_destination {
+            bail!(
+                "{source_option} must appear before destination arguments; move it before {destination_option}"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Parser, Debug)]
@@ -1144,6 +1196,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let matches = NativeCopyCommand::command()
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
+    validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
     let NativeCopyCommand {
         mut copy,
@@ -2520,17 +2573,67 @@ mod tests {
     }
 
     #[test]
-    fn native_endpoint_modifiers_may_follow_bare_sources() {
+    fn native_source_arguments_must_precede_destination_arguments() {
+        for (argv, source_argument) in [
+            (
+                vec![
+                    "source",
+                    "--to",
+                    "target.test",
+                    "--from",
+                    "source.test",
+                    "--into",
+                    "dest",
+                ],
+                "--from",
+            ),
+            (vec!["--into", "dest", "source"], "a positional source"),
+            (vec!["source", "--into", "dest", "--src", "extra"], "--src"),
+            (vec!["--into", "dest", "--mapping", "manifest"], "--mapping"),
+            (
+                vec!["source", "--to=target.test", "extra", "--into", "dest"],
+                "a positional source",
+            ),
+            (
+                vec![
+                    "source",
+                    "--to",
+                    "target.test",
+                    "--cwd",
+                    "base",
+                    "--into",
+                    "dest",
+                ],
+                "--cwd",
+            ),
+        ] {
+            let argv = argv
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            let error = parse_native_copy(&argv).unwrap_err().to_string();
+            assert!(error.contains(source_argument), "{error}");
+            assert!(
+                error.contains("must appear before destination arguments"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_operational_options_may_follow_destination_arguments() {
         let argv = [
             "one",
             "--cwd",
             "base",
-            "--to",
-            "target.test",
             "--from",
             "source.test",
+            "--to",
+            "target.test",
             "--into",
             "dest",
+            "--dry-run",
+            "--follow-src",
         ]
         .map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv).unwrap();
@@ -2543,6 +2646,8 @@ mod tests {
         assert!(args.native_source_root.is_none());
         assert_eq!(args.locations[1].host.as_deref(), Some("target.test"));
         assert_eq!(args.locations[1].path, b"dest");
+        assert!(args.dry_run);
+        assert!(args.native_follow_src);
     }
 }
 

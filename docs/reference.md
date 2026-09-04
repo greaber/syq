@@ -49,6 +49,14 @@ override is used consistently for the SSH connection, `ssh -G` policy
 resolution, known-host lookup, automatic enrollment, and later enrollment
 reuse. A local path containing `:` stays local because native mode never
 guesses endpoints from path text.
+
+In `cp`, finish the source specification before starting the destination. The
+source endpoint, `--cwd` or `--root`, every positional or `--src*` selector,
+and `--mapping` must all appear before the first `--to` or placement option.
+Other options remain order-independent, so flags such as `--dry-run` may still
+follow the placement. This rule makes every bare path's role clear and applies
+equally to local and remote copies.
+
 `--cwd DIR`/`-C DIR` changes where relative source selectors are resolved at
 the source endpoint. Copy selectors may be absolute and then ignore `--cwd`.
 Removal selectors are always relative; native `rm` rejects a leading slash and

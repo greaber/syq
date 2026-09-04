@@ -342,6 +342,12 @@ class NativeClientTests(unittest.TestCase):
         self.assertNotIn("-base", argv)
         self.assertNotIn("-destination", argv)
 
+    def test_mapping_precedes_the_destination(self) -> None:
+        self.client.cp(mapping="manifest", into="target")
+
+        argv = self.argv()
+        self.assertLess(argv.index("--mapping"), argv.index("--into"))
+
     def test_rm_hyphen_prefixed_syq_path_uses_an_attached_value(self) -> None:
         self.client.rm("victim", from_="host", syq_path="-helper")
 
@@ -658,6 +664,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertTrue(result.status is syq.OperationStatus.SUCCESS)
         argv = self.argv()
         manifest = Path(argv[argv.index("--mapping") + 1])
+        self.assertLess(argv.index("--mapping"), argv.index("--into"))
         self.assertFalse(manifest.exists(), "temporary manifest survived the call")
 
     def test_generated_mapping_path_resolves_temporary_directory_symlinks(self) -> None:
