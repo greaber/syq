@@ -42,6 +42,54 @@ const COMMON_NAME_MAX: usize = 255;
 const COMPACT_HASH_BYTES: usize = 10;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
+#[cfg(debug_assertions)]
+fn test_race_barrier(
+    ready_env: &str,
+    continue_env: &str,
+    hold_env: &str,
+    label: &str,
+) -> Result<()> {
+    let ready = std::env::var_os(ready_env);
+    let continuation = std::env::var_os(continue_env);
+    if continuation.is_some() && ready.is_none() {
+        bail!("{continue_env} requires {ready_env}");
+    }
+    if let Some(ready) = ready {
+        fs::write(&ready, b"ready")
+            .with_context(|| format!("write {label} signal {}", Path::new(&ready).display()))?;
+    }
+    if let Some(continuation) = continuation {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match File::open(&continuation) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "open {label} continuation {}",
+                            Path::new(&continuation).display()
+                        )
+                    })
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for {label} continuation {}",
+                    Path::new(&continuation).display()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    if let Some(ms) = std::env::var_os(hold_env) {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct NameMaxCache {
     paths: HashMap<PathBuf, usize>,
@@ -1530,21 +1578,12 @@ impl FsOps {
         self.install_destination(directory, request_prefix)?;
 
         #[cfg(debug_assertions)]
-        {
-            if let Some(ready) = std::env::var_os("SYQ_TEST_DESTINATION_ANCHORED_FILE") {
-                fs::write(&ready, b"ready").with_context(|| {
-                    format!(
-                        "write destination-anchor-ready signal {}",
-                        Path::new(&ready).display()
-                    )
-                })?;
-            }
-            if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS") {
-                if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                }
-            }
-        }
+        test_race_barrier(
+            "SYQ_TEST_DESTINATION_ANCHORED_FILE",
+            "SYQ_TEST_DESTINATION_ANCHOR_CONTINUE_FILE",
+            "SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS",
+            "destination-anchor-ready",
+        )?;
         Ok(ticket)
     }
 
@@ -1722,21 +1761,12 @@ impl FsOps {
             .collect::<Result<_>>()?;
         self.initialize_sources(&registered)?;
         #[cfg(debug_assertions)]
-        {
-            if let Some(ready) = std::env::var_os("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE") {
-                fs::write(&ready, b"ready").with_context(|| {
-                    format!(
-                        "write source-registration-ready signal {}",
-                        Path::new(&ready).display()
-                    )
-                })?;
-            }
-            if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_SOURCE_ROOTS_MS") {
-                if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                }
-            }
-        }
+        test_race_barrier(
+            "SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE",
+            "SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE",
+            "SYQ_TEST_HOLD_SOURCE_ROOTS_MS",
+            "source-registration-ready",
+        )?;
         Ok(registered)
     }
 
@@ -3498,15 +3528,12 @@ fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
     if !path.ends_with(suffix.as_bytes()) {
         return Ok(());
     }
-    if let Some(ready) = std::env::var_os("SYQ_TEST_GUARDED_MUTATION_READY_FILE") {
-        fs::write(&ready, b"ready")?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_GUARDED_MUTATION_MS") {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
-    Ok(())
+    test_race_barrier(
+        "SYQ_TEST_GUARDED_MUTATION_READY_FILE",
+        "SYQ_TEST_GUARDED_MUTATION_CONTINUE_FILE",
+        "SYQ_TEST_HOLD_GUARDED_MUTATION_MS",
+        "guarded-mutation-ready",
+    )
 }
 
 #[cfg(not(debug_assertions))]
@@ -4312,11 +4339,12 @@ impl FsOps {
                 self.preallocate_new_partial(&file, size)?;
             }
             #[cfg(debug_assertions)]
-            if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARTIAL_MS") {
-                if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                }
-            }
+            test_race_barrier(
+                "SYQ_TEST_PARTIAL_READY_FILE",
+                "SYQ_TEST_PARTIAL_CONTINUE_FILE",
+                "SYQ_TEST_HOLD_PARTIAL_MS",
+                "partial-ready",
+            )?;
             self.cache_file(
                 FileLocation::Rooted {
                     root: target.root.identity(),
@@ -4354,11 +4382,12 @@ impl FsOps {
             self.preallocate_new_partial(&f, size)?;
         }
         #[cfg(debug_assertions)]
-        if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_PARTIAL_MS") {
-            if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
-        }
+        test_race_barrier(
+            "SYQ_TEST_PARTIAL_READY_FILE",
+            "SYQ_TEST_PARTIAL_CONTINUE_FILE",
+            "SYQ_TEST_HOLD_PARTIAL_MS",
+            "partial-ready",
+        )?;
         self.cache_file(FileLocation::Path(pp), attempt, true, f);
         Ok(basis_size)
     }
@@ -6390,6 +6419,88 @@ mod tests {
             .is_err());
         assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps() {
+        const CHILD_ENV: &str = "SYQ_TEST_GUARDED_MUTATION_CHILD";
+        const ROOT_ENV: &str = "SYQ_TEST_GUARDED_MUTATION_ROOT";
+        const TEST_NAME: &str =
+            "fsops::tests::confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root_path = PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+            let identity = Root::open(&root_path).unwrap().identity();
+            let guard = ContainerGuard {
+                root: root_path.as_os_str().as_bytes().to_vec(),
+                dev: identity.dev,
+                ino: identity.ino,
+            };
+            let target = root_path.join("target/parent/escaped");
+            let errors = FsOps::new().apply(
+                &[Op::Mkdir {
+                    path: target.as_os_str().as_bytes().to_vec(),
+                    mode: 0o755,
+                    condition: TargetCondition::Any,
+                }],
+                Some(&guard),
+            );
+            assert!(
+                errors[0].is_some(),
+                "guarded mutation followed a raced namespace"
+            );
+            return;
+        }
+
+        for swap_root in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root_path = temporary.path().join("root");
+            let outside = temporary.path().join("outside");
+            fs::create_dir_all(root_path.join("target/parent")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("sentinel"), b"outside").unwrap();
+            let ready = temporary.path().join("guarded-ready");
+            let continuation = temporary.path().join("guarded-continue");
+
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env(ROOT_ENV, &root_path)
+                .env("SYQ_TEST_GUARDED_MUTATION_SUFFIX", "parent/escaped")
+                .env("SYQ_TEST_GUARDED_MUTATION_READY_FILE", &ready)
+                .env("SYQ_TEST_GUARDED_MUTATION_CONTINUE_FILE", &continuation)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "guarded-mutation child exited before its race window"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "guarded-mutation race window timed out");
+
+            if swap_root {
+                fs::rename(&root_path, temporary.path().join("displaced-root")).unwrap();
+                symlink(&outside, &root_path).unwrap();
+            } else {
+                fs::rename(
+                    root_path.join("target/parent"),
+                    root_path.join("target/displaced-parent"),
+                )
+                .unwrap();
+                symlink(&outside, root_path.join("target/parent")).unwrap();
+            }
+            fs::write(&continuation, b"continue").unwrap();
+
+            assert!(
+                child.wait().unwrap().success(),
+                "guarded-mutation child failed for swap_root={swap_root}"
+            );
+            assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
+            assert!(!outside.join("escaped").exists());
+        }
     }
 
     #[test]

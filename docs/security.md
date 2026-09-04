@@ -35,9 +35,9 @@ addresses these systematically: peer file lists are untrusted and validated;
 transfer paths are resolved component by component from a retained root
 descriptor; leaf work happens through `*at()` calls relative to a held parent;
 temporary files are created exclusively with random names and owner-only
-access; and the protocol is fuzzed. Syq's design follows the same principles
-and, in the places it has been applied, uses the same mechanisms. It has not
-yet been applied everywhere.
+access; and the protocol is fuzzed. Syq's native copy, removal, and restricted
+receiver paths follow the same descriptor-rooted principles. The deliberate
+exceptions and remaining differences are listed below.
 
 ### Where syq stands
 
@@ -107,6 +107,37 @@ What is different from rsync, or weaker:
 - **Protocol robustness.** Frames are length-bounded and several requests have
   specific limits, but the peer protocol has not been fuzzed the way rsync's
   has.
+
+### How confinement is verified
+
+The adversarial `confinement_matrix_` tests use bounded two-way barriers after
+a path has been selected or registered. Syq acknowledges that it has reached
+the barrier and does not continue until the test confirms that it has renamed
+the selected directory or object and replaced its old pathname with a symlink
+or a different inode. The operation must then either continue through the
+retained descriptor or fail without touching the replacement. These matrix
+cases exercise the race boundary directly instead of relying on scheduler
+timing.
+
+The evidence is split along the boundaries where authority changes form:
+
+| Boundary | What is exercised |
+| --- | --- |
+| Operator selection | Root replacement, intermediate-link substitution, exact-leaf replacement, and missing-path placement |
+| Source capability handoff | Local workers, remote TCP workers that clone the registered descriptor, and fresh remote worker processes that claim it from the descriptor broker |
+| Destination capability handoff | Local receivers, remote TCP receivers, and fresh remote receiver processes, for both root replacement and descendant-parent substitution |
+| Restricted receiver | A changed signed root identity is refused, and descendant parents are opened without following links |
+| Descriptor-rooted operations | Scanning, stat and hashing, content reads, sidecar preparation, writes, publication, metadata, and pruning are tested separately against the shared rooted primitives |
+| Native `rm` and `map` | Pre-mutation selector pinning, replacement races, and descriptor-rooted traversal |
+
+Linux CI runs the complete suite. macOS CI also runs the tests whose names
+begin with `confinement_matrix_`, including both remote worker transports and
+the restricted-receiver race. The loopback remote-shell harness starts real
+syq client and server processes and exercises the wire protocol, descriptor
+broker, and TCP handoff; it does not test sshd authentication or claim to be a
+network-filesystem stress test. Each operation family is tested at the shared
+rooted primitive rather than repeating every operation over every transport:
+after handoff, all transports use the same `Root` methods.
 
 ### What to do
 
