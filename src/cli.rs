@@ -2818,6 +2818,10 @@ mod tests {
                 "a positional source",
             ),
             (
+                vec!["source", "--tos=target.test", "extra", "--into", "dest"],
+                "a positional source",
+            ),
+            (
                 vec![
                     "source",
                     "--to",

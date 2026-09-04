@@ -138,6 +138,105 @@ class AutomationFixtureTests(unittest.TestCase):
             syq.MappingEntry("missing.txt", "missing.txt", "file"),
         )
 
+    def test_multi_target_progress_and_results_are_typed_and_complete(self) -> None:
+        envelope = {"schema": "syq.automation", "schema_version": 1}
+        records = [
+            {
+                **envelope,
+                "seq": 0,
+                "type": "run",
+                "run_id": "fanout",
+                "started_at": 1,
+                "syq_version": "1.0.0",
+                "mode": "cp",
+                "prune": False,
+                "mapping": False,
+                "dry_run": False,
+                "endpoints": [
+                    {"role": "source", "kind": "local"},
+                    {"role": "destination", "kind": "ssh", "host": "alpha"},
+                    {"role": "destination", "kind": "ssh", "host": "beta"},
+                ],
+            },
+            {
+                **envelope,
+                "seq": 1,
+                "type": "progress",
+                "destination_index": 1,
+                "bytes_done": 1,
+                "bytes_total": 2,
+                "bytes_unchanged": 0,
+                "files_done": 0,
+                "files_total": 1,
+                "files_unchanged": 0,
+                "files_excluded": 0,
+                "scanned": 1,
+                "scan_done": True,
+                "elapsed_ms": 2,
+            },
+        ]
+        for index in range(2):
+            records.append(
+                {
+                    **envelope,
+                    "seq": len(records),
+                    "type": "destination_result",
+                    "destination_index": index,
+                    "status": "success",
+                    "exit_code": 0,
+                    "dry_run": False,
+                    "files_transferred": 1,
+                    "files_unchanged": 0,
+                    "files_excluded": 0,
+                    "directories_created": 0,
+                    "symlinks_created": 0,
+                    "specials_created": 0,
+                    "errors": 0,
+                    "bytes_transferred": 2,
+                    "bytes_unchanged": 0,
+                    "elapsed_ms": 3,
+                }
+            )
+        records.append(
+            {
+                **envelope,
+                "seq": len(records),
+                "type": "result",
+                "status": "success",
+                "exit_code": 0,
+                "dry_run": False,
+                "files_transferred": 2,
+                "files_unchanged": 0,
+                "files_excluded": 0,
+                "directories_created": 0,
+                "symlinks_created": 0,
+                "specials_created": 0,
+                "errors": 0,
+                "bytes_transferred": 4,
+                "bytes_unchanged": 0,
+                "elapsed_ms": 4,
+            }
+        )
+
+        decoder = AutomationDecoder(dry_run=False)
+        events = [decoder.feed(json.dumps(record).encode()) for record in records]
+        self.assertIsInstance(events[1], syq.ProgressEvent)
+        self.assertEqual(events[1].destination_index, 1)
+        self.assertIsInstance(events[2], syq.DestinationResult)
+        self.assertEqual(events[2].destination_index, 0)
+        self.assertIs(decoder.finish(0), events[-1])
+
+        decoder = AutomationDecoder(dry_run=False)
+        for seq, record in enumerate([records[0], records[2]]):
+            decoder.feed(json.dumps({**record, "seq": seq}).encode())
+        with self.assertRaisesRegex(syq.SyqProtocolError, "one result per destination"):
+            decoder.feed(json.dumps({**records[-1], "seq": 2}).encode())
+
+        decoder = AutomationDecoder(dry_run=False)
+        decoder.feed(json.dumps(records[0]).encode())
+        with self.assertRaisesRegex(syq.SyqProtocolError, "destination order"):
+            decoder.feed(json.dumps({**records[3], "seq": 1}).encode())
+
 
 if __name__ == "__main__":
     unittest.main()

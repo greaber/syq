@@ -881,9 +881,10 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
-    let fanout = args.fanout_run.is_some();
+    let fanout_run = args.fanout_run.clone();
     if let Some(run) = &args.fanout_run {
         progress.set_result_destination(run.destination_index);
+        progress.set_fanout_group(&run.group);
         run.group
             .register_progress(run.destination_index, &progress);
         if let Some(writer) = run.group.results() {
@@ -901,7 +902,7 @@ pub fn run(args: Args) -> Result<i32> {
     let dry_run = args.dry_run;
     let prune = args.delete;
     let outcome = run_transfer(args, Arc::clone(&progress));
-    if outcome.is_err() {
+    if let Err(error) = &outcome {
         // An error can unwind past run_transfer's own ticker shutdown; stop
         // it here so no progress render races the terminal record below
         // (the writer additionally seals itself after emit_result).
@@ -909,32 +910,22 @@ pub fn run(args: Args) -> Result<i32> {
         // The error text reaches stderr via main; the stream still gets its
         // terminal record so a consumer never mistakes a handled fatal for a
         // crash (only a real crash leaves the terminal record missing).
-        if !fanout {
+        // Mutations and deletions that settled before the run died remain in
+        // this authoritative member record. Fan-out adds the fatal member
+        // error that its coordinator also writes to the shared error stream.
+        let terminal = progress.failed_result(dry_run, prune, u64::from(fanout_run.is_some()));
+        if let Some(run) = fanout_run {
             if let Some(results) = progress.results_writer() {
-                results.emit_result(&crate::results::ResultRecord {
-                    status: "failed",
-                    exit_code: 1,
-                    dry_run,
-                    files_transferred: progress.files_done.load(Relaxed),
-                    files_unchanged: progress.files_skipped.load(Relaxed),
-                    files_excluded: progress.files_excluded.load(Relaxed),
-                    // Mutations that settled (and streamed their records)
-                    // before the run died must not vanish from the aggregates.
-                    directories_created: progress.dirs_created.load(Relaxed),
-                    symlinks_created: progress.links_created.load(Relaxed),
-                    specials_created: progress.specials_created.load(Relaxed),
-                    errors: progress.errors.load(Relaxed),
-                    bytes_transferred: progress.bytes_done.load(Relaxed),
-                    bytes_unchanged: progress.bytes_skipped.load(Relaxed),
-                    elapsed_ms: progress.start.elapsed().as_millis() as u64,
-                    // What the deletion pass did before the run died; zeros
-                    // mean it never got that far, and status "failed" already
-                    // marks every aggregate here as pre-failure state.
-                    deletions_planned: prune.then(|| progress.deletions_planned.load(Relaxed)),
-                    deletions_completed: prune.then(|| progress.deletions_completed.load(Relaxed)),
-                    deletions_blocked: prune.then(|| progress.deletions_blocked.load(Relaxed)),
-                });
+                results.emit_error_classified_for(
+                    &format!("syq: fan-out: target {}: {error:#}", run.label),
+                    None,
+                    None,
+                    Some(run.destination_index),
+                );
             }
+            run.group.complete_member(run.destination_index, terminal);
+        } else if let Some(results) = progress.results_writer() {
+            results.emit_result(&terminal);
         }
     }
     outcome
@@ -2719,6 +2710,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
     let capacity_only_dry_run_abort = opts.dry_run && fresh_capacity_shortage.is_some();
+    let _human_output = args
+        .fanout_run
+        .as_ref()
+        .map(|run| run.group.lock_human_output());
     if !args.quiet && (!aborted || capacity_only_dry_run_abort) && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
@@ -2742,7 +2737,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         } else if opts.verify_only {
             println!(
-                "syq: verified {} files, {} differ/missing, {} in {}",
+                "syq: {}verified {} files, {} differ/missing, {} in {}",
+                target_summary_prefix(&args),
                 commas(progress.files_done.load(Relaxed) + errors),
                 errors,
                 human(done),
@@ -2750,7 +2746,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         } else {
             println!(
-                "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
+                "syq: {}transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
+                target_summary_prefix(&args),
                 commas(terminal.files_transferred),
                 human(terminal.bytes_transferred),
                 human(terminal.bytes_unchanged),
@@ -2773,6 +2770,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // --stats is additional human output, not the summary line the local
     // attested settlement re-renders; a delegated coordinator keeps it.
     if !args.quiet && (!aborted || capacity_only_dry_run_abort) && args.stats {
+        if let Some(run) = &args.fanout_run {
+            println!("syq: target {}: stats", run.label);
+        }
         let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
             if opts.dry_run {
                 (
@@ -3676,7 +3676,7 @@ fn print_dry_run_summary(
     changes: &DryRunChanges,
     capacity: Option<FreshCapacityAssessment>,
 ) {
-    println!("syq: dry-run summary");
+    println!("syq: {}dry-run summary", target_summary_prefix(args));
     for (source, mapping) in srcs.iter().zip(mappings) {
         println!(
             "  mapping: {} -> {} ({})",
@@ -3765,6 +3765,12 @@ fn print_dry_run_summary(
     );
 
     println!("  route: {}", selected_route(src_ep, dst_ep, args));
+}
+
+fn target_summary_prefix(args: &Args) -> String {
+    args.fanout_run
+        .as_ref()
+        .map_or_else(String::new, |run| format!("target {}: ", run.label))
 }
 
 fn path_has_partial_component(path: &[u8]) -> bool {

@@ -146,8 +146,9 @@ syq.cp(
 
 Pass `tos=` an iterable for a coordinated local-source copy to several
 destinations. When both are present, the client combines `to=` and `tos=` into
-one native `--tos` group sharing the requested placement. Operation, trace,
-and error events expose their optional `destination_index`:
+one native `--tos` group sharing the requested placement. Progress, operation,
+trace, and error events expose their optional `destination_index`, and each
+target finishes with a `DestinationResult` before the aggregate `CpResult`:
 
 ```python
 syq.cp(
@@ -584,7 +585,8 @@ shared execution trace and terminal result.
 
 Typed operations consume the stable automation stream. `on_event` receives
 frozen dataclasses corresponding to its known records: `RunEvent`, sampled
-`ProgressEvent`, copy `TraceEvent` or `OperationResult`, removal
+`ProgressEvent`, copy `TraceEvent`, `OperationResult`, or
+`DestinationResult`, removal
 `SelectionResult`, `RemovalTrace`, or `RemovalResult` (including inspection
 failures during a preview), `ErrorEvent`,
 receiver-attested `FinalStateEvent`, and the terminal `CpResult` or `RmResult`.

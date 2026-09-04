@@ -76,6 +76,8 @@ potentially enormous operation ledger in memory:
 def observe(event: syq.AutomationEvent) -> None:
     if isinstance(event, (syq.TraceEvent, syq.OperationResult)):
         print(event.action, event.dst)
+    elif isinstance(event, syq.DestinationResult):
+        print(event.destination_index, event.status)
     elif isinstance(event, (syq.RemovalTrace, syq.RemovalResult)):
         print(event.disposition, event.path)
 

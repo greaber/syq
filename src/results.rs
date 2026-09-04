@@ -8,7 +8,9 @@
 //! sanitized endpoints, and copy-only prune/mapping flags); sampled `progress`
 //! records; command-specific per-path records; an `error` record for every
 //! counted error; and exactly one terminal `result` whose numbers also feed the
-//! human summary, so the two cannot disagree. Copy emits `operation_result` or
+//! human summary, so the two cannot disagree. A multi-target copy attributes
+//! progress and operations by destination and emits one `destination_result`
+//! per target before the aggregate terminal. Copy emits `operation_result` or
 //! dry-run `trace` records. Removal emits one `selection_result` per explicit
 //! selector followed by `removal_result` or dry-run `removal_trace` records for
 //! entries in the selected trees. Unchanged and excluded copy entries are
@@ -82,6 +84,7 @@ pub struct EndpointRecord {
 }
 
 pub struct ProgressRecord {
+    pub destination_index: Option<usize>,
     pub bytes_done: u64,
     pub bytes_total: u64,
     pub bytes_unchanged: u64,
@@ -331,7 +334,7 @@ impl ResultsWriter {
     }
 
     pub fn emit_progress(&self, progress: &ProgressRecord) {
-        self.write(serde_json::json!({
+        let mut record = serde_json::json!({
             "type": "progress",
             "bytes_done": progress.bytes_done,
             "bytes_total": progress.bytes_total,
@@ -343,7 +346,14 @@ impl ResultsWriter {
             "scanned": progress.scanned,
             "scan_done": progress.scan_done,
             "elapsed_ms": progress.elapsed_ms,
-        }));
+        });
+        if let Some(destination_index) = progress.destination_index {
+            record
+                .as_object_mut()
+                .expect("record is an object")
+                .insert("destination_index".into(), destination_index.into());
+        }
+        self.write(record);
     }
 
     /// Dry run only: one intended mutation, sharing `operation_result`'s
@@ -507,10 +517,9 @@ impl ResultsWriter {
         self.write(record);
     }
 
-    /// The terminal record; flushes the stream. Nothing may be written after.
-    pub fn emit_result(&self, result: &ResultRecord) {
+    fn copy_result_record(record_type: &'static str, result: &ResultRecord) -> serde_json::Value {
         let mut record = serde_json::json!({
-            "type": "result",
+            "type": record_type,
             "status": result.status,
             "exit_code": result.exit_code,
             "dry_run": result.dry_run,
@@ -535,7 +544,22 @@ impl ResultsWriter {
         if let Some(blocked) = result.deletions_blocked {
             object.insert("deletions_blocked".into(), blocked.into());
         }
-        self.write_and_seal(record, true);
+        record
+    }
+
+    /// One target's settled outcome in a coordinated multi-target copy.
+    pub fn emit_destination_result(&self, destination_index: usize, result: &ResultRecord) {
+        let mut record = Self::copy_result_record("destination_result", result);
+        record
+            .as_object_mut()
+            .expect("record is an object")
+            .insert("destination_index".into(), destination_index.into());
+        self.write(record);
+    }
+
+    /// The terminal record; flushes the stream. Nothing may be written after.
+    pub fn emit_result(&self, result: &ResultRecord) {
+        self.write_and_seal(Self::copy_result_record("result", result), true);
     }
 
     pub fn emit_removal_result(&self, result: &RemovalResultRecord) {
@@ -679,6 +703,7 @@ mod tests {
         let after = sink.0.lock().unwrap().len();
         // A straggling ticker render (or a second terminal) must be inert.
         writer.emit_progress(&ProgressRecord {
+            destination_index: None,
             bytes_done: 1,
             bytes_total: 1,
             bytes_unchanged: 0,

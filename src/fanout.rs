@@ -70,6 +70,8 @@ pub struct Group {
     schedulers: Mutex<Vec<Weak<Sched>>>,
     progresses: Mutex<Vec<Option<Arc<Progress>>>>,
     terminals: Mutex<Vec<Option<crate::results::ResultRecord>>>,
+    human_output: Mutex<()>,
+    progress_lines: Mutex<usize>,
     results: Option<Arc<crate::results::ResultsWriter>>,
     bandwidth: Option<Arc<BandwidthLimit>>,
 }
@@ -111,6 +113,8 @@ impl Group {
             schedulers: Mutex::new(Vec::with_capacity(total)),
             progresses: Mutex::new(vec![None; total]),
             terminals: Mutex::new(vec![None; total]),
+            human_output: Mutex::new(()),
+            progress_lines: Mutex::new(0),
             results,
             bandwidth: (bytes_per_second > 0)
                 .then(|| Arc::new(BandwidthLimit::new(bytes_per_second))),
@@ -141,17 +145,68 @@ impl Group {
     }
 
     pub fn complete_member(&self, index: usize, terminal: crate::results::ResultRecord) {
-        self.terminals.lock().unwrap()[index] = Some(terminal);
+        let previous = self.terminals.lock().unwrap()[index].replace(terminal);
+        debug_assert!(previous.is_none(), "a fan-out member settled twice");
+    }
+
+    pub fn lock_human_output(&self) -> std::sync::MutexGuard<'_, ()> {
+        let output = self.human_output.lock().unwrap();
+        let mut lines = self.progress_lines.lock().unwrap();
+        if *lines > 0 {
+            eprint!("\r\x1b[{}A\x1b[J", *lines);
+            let _ = std::io::stderr().flush();
+            *lines = 0;
+        }
+        output
+    }
+
+    fn set_progress_lines(&self, lines: usize) {
+        *self.progress_lines.lock().unwrap() = lines;
+    }
+
+    fn ensure_failed_member(&self, index: usize, args: &Args) -> bool {
+        let progress = self.progresses.lock().unwrap()[index].clone();
+        let mut terminals = self.terminals.lock().unwrap();
+        if terminals[index].is_some() {
+            return false;
+        }
+        terminals[index] = Some(progress.map_or_else(
+            || failed_result(args, 0, 1),
+            |progress| progress.failed_result(args.dry_run, args.delete, 1),
+        ));
+        true
+    }
+
+    fn terminal_records(&self) -> Vec<crate::results::ResultRecord> {
+        self.terminals
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|terminal| {
+                terminal
+                    .clone()
+                    .expect("every joined fan-out member has a terminal result")
+            })
+            .collect()
+    }
+
+    fn member_progresses(&self) -> Vec<(usize, Arc<Progress>)> {
+        self.progresses
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, progress)| progress.clone().map(|progress| (index, progress)))
+            .collect()
     }
 
     fn aggregate_terminal(
         &self,
         args: &Args,
+        terminals: &[crate::results::ResultRecord],
         exit_code: i32,
         elapsed_ms: u64,
     ) -> crate::results::ResultRecord {
-        let terminals = self.terminals.lock().unwrap();
-        let progresses = self.progresses.lock().unwrap();
         let mut aggregate = crate::results::ResultRecord {
             status: match exit_code {
                 0 => "success",
@@ -175,135 +230,40 @@ impl Group {
             deletions_completed: args.delete.then_some(0),
             deletions_blocked: args.delete.then_some(0),
         };
-        for (index, terminal) in terminals.iter().enumerate() {
-            if let Some(terminal) = terminal {
-                aggregate.files_transferred = aggregate
-                    .files_transferred
-                    .saturating_add(terminal.files_transferred);
-                aggregate.files_unchanged = aggregate
-                    .files_unchanged
-                    .saturating_add(terminal.files_unchanged);
-                aggregate.files_excluded = aggregate
-                    .files_excluded
-                    .saturating_add(terminal.files_excluded);
-                aggregate.directories_created = aggregate
-                    .directories_created
-                    .saturating_add(terminal.directories_created);
-                aggregate.symlinks_created = aggregate
-                    .symlinks_created
-                    .saturating_add(terminal.symlinks_created);
-                aggregate.specials_created = aggregate
-                    .specials_created
-                    .saturating_add(terminal.specials_created);
-                aggregate.errors = aggregate.errors.saturating_add(terminal.errors);
-                aggregate.bytes_transferred = aggregate
-                    .bytes_transferred
-                    .saturating_add(terminal.bytes_transferred);
-                aggregate.bytes_unchanged = aggregate
-                    .bytes_unchanged
-                    .saturating_add(terminal.bytes_unchanged);
-                aggregate.deletions_planned =
-                    sum_optional(aggregate.deletions_planned, terminal.deletions_planned);
-                aggregate.deletions_completed =
-                    sum_optional(aggregate.deletions_completed, terminal.deletions_completed);
-                aggregate.deletions_blocked =
-                    sum_optional(aggregate.deletions_blocked, terminal.deletions_blocked);
-            } else {
-                // A target without a terminal failed before its ordinary
-                // engine could settle. Count that group-level failure in
-                // addition to any target-local errors already observed.
-                aggregate.errors = aggregate.errors.saturating_add(1);
-                if let Some(progress) = progresses[index].as_ref() {
-                    aggregate.files_transferred = aggregate
-                        .files_transferred
-                        .saturating_add(progress.files_done.load(Relaxed));
-                    aggregate.files_unchanged = aggregate
-                        .files_unchanged
-                        .saturating_add(progress.files_skipped.load(Relaxed));
-                    aggregate.files_excluded = aggregate
-                        .files_excluded
-                        .saturating_add(progress.files_excluded.load(Relaxed));
-                    aggregate.directories_created = aggregate
-                        .directories_created
-                        .saturating_add(progress.dirs_created.load(Relaxed));
-                    aggregate.symlinks_created = aggregate
-                        .symlinks_created
-                        .saturating_add(progress.links_created.load(Relaxed));
-                    aggregate.specials_created = aggregate
-                        .specials_created
-                        .saturating_add(progress.specials_created.load(Relaxed));
-                    aggregate.errors = aggregate
-                        .errors
-                        .saturating_add(progress.errors.load(Relaxed));
-                    aggregate.bytes_transferred = aggregate
-                        .bytes_transferred
-                        .saturating_add(progress.bytes_done.load(Relaxed));
-                    aggregate.bytes_unchanged = aggregate
-                        .bytes_unchanged
-                        .saturating_add(progress.bytes_skipped.load(Relaxed));
-                    aggregate.deletions_planned = sum_optional(
-                        aggregate.deletions_planned,
-                        args.delete
-                            .then(|| progress.deletions_planned.load(Relaxed)),
-                    );
-                    aggregate.deletions_completed = sum_optional(
-                        aggregate.deletions_completed,
-                        args.delete
-                            .then(|| progress.deletions_completed.load(Relaxed)),
-                    );
-                    aggregate.deletions_blocked = sum_optional(
-                        aggregate.deletions_blocked,
-                        args.delete
-                            .then(|| progress.deletions_blocked.load(Relaxed)),
-                    );
-                }
-            }
+        for terminal in terminals {
+            aggregate.files_transferred = aggregate
+                .files_transferred
+                .saturating_add(terminal.files_transferred);
+            aggregate.files_unchanged = aggregate
+                .files_unchanged
+                .saturating_add(terminal.files_unchanged);
+            aggregate.files_excluded = aggregate
+                .files_excluded
+                .saturating_add(terminal.files_excluded);
+            aggregate.directories_created = aggregate
+                .directories_created
+                .saturating_add(terminal.directories_created);
+            aggregate.symlinks_created = aggregate
+                .symlinks_created
+                .saturating_add(terminal.symlinks_created);
+            aggregate.specials_created = aggregate
+                .specials_created
+                .saturating_add(terminal.specials_created);
+            aggregate.errors = aggregate.errors.saturating_add(terminal.errors);
+            aggregate.bytes_transferred = aggregate
+                .bytes_transferred
+                .saturating_add(terminal.bytes_transferred);
+            aggregate.bytes_unchanged = aggregate
+                .bytes_unchanged
+                .saturating_add(terminal.bytes_unchanged);
+            aggregate.deletions_planned =
+                sum_optional(aggregate.deletions_planned, terminal.deletions_planned);
+            aggregate.deletions_completed =
+                sum_optional(aggregate.deletions_completed, terminal.deletions_completed);
+            aggregate.deletions_blocked =
+                sum_optional(aggregate.deletions_blocked, terminal.deletions_blocked);
         }
         aggregate
-    }
-
-    fn progress_snapshot(&self, elapsed_ms: u64) -> crate::results::ProgressRecord {
-        let progresses = self.progresses.lock().unwrap();
-        let active: Vec<_> = progresses.iter().flatten().collect();
-        crate::results::ProgressRecord {
-            bytes_done: active
-                .iter()
-                .map(|progress| progress.bytes_done.load(Relaxed))
-                .fold(0u64, u64::saturating_add),
-            bytes_total: active
-                .iter()
-                .map(|progress| progress.bytes_total.load(Relaxed))
-                .fold(0u64, u64::saturating_add),
-            bytes_unchanged: active
-                .iter()
-                .map(|progress| progress.bytes_skipped.load(Relaxed))
-                .fold(0u64, u64::saturating_add),
-            files_done: active
-                .iter()
-                .map(|progress| progress.files_done.load(Relaxed))
-                .fold(0u64, u64::saturating_add),
-            files_total: active
-                .iter()
-                .map(|progress| progress.files_total.load(Relaxed))
-                .fold(0u64, u64::saturating_add),
-            files_unchanged: active
-                .iter()
-                .map(|progress| progress.files_skipped.load(Relaxed))
-                .fold(0u64, u64::saturating_add),
-            files_excluded: active
-                .iter()
-                .map(|progress| progress.files_excluded.load(Relaxed))
-                .fold(0u64, u64::saturating_add),
-            scanned: active
-                .iter()
-                .map(|progress| progress.scanned.load(Relaxed))
-                .fold(0u64, u64::saturating_add),
-            scan_done: active.len() == self.total
-                && active
-                    .iter()
-                    .all(|progress| progress.scan_done.load(Relaxed)),
-            elapsed_ms,
-        }
     }
 
     pub fn claim_source(&self, index: usize) -> Result<ScanClaim> {
@@ -447,24 +407,12 @@ pub fn run(mut args: Args) -> Result<i32> {
             Err(error) => {
                 if let Some(writer) = &results {
                     writer.emit_error_classified(&format!("syq: {error:#}"), None, None);
-                    writer.emit_result(&crate::results::ResultRecord {
-                        status: "failed",
-                        exit_code: 1,
-                        dry_run: args.dry_run,
-                        files_transferred: 0,
-                        files_unchanged: 0,
-                        files_excluded: 0,
-                        directories_created: 0,
-                        symlinks_created: 0,
-                        specials_created: 0,
-                        errors: 1,
-                        bytes_transferred: 0,
-                        bytes_unchanged: 0,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                        deletions_planned: args.delete.then_some(0),
-                        deletions_completed: args.delete.then_some(0),
-                        deletions_blocked: args.delete.then_some(0),
-                    });
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    let member = failed_result(&args, elapsed_ms, 0);
+                    for index in 0..target_count {
+                        writer.emit_destination_result(index, &member);
+                    }
+                    writer.emit_result(&failed_result(&args, elapsed_ms, 1));
                 }
                 return Err(error);
             }
@@ -489,18 +437,20 @@ fn run_group(
     started: std::time::Instant,
 ) -> Result<i32> {
     let target_count = destinations.len();
-    let total_connections = args.connections.max(target_count);
+    let labels: Vec<_> = destinations
+        .iter()
+        .map(|destination| crate::transfer::endpoint_identity(&destination.location))
+        .collect();
     let group = Group::new(
         target_count,
         source_count,
-        args.quiet,
+        args.quiet || human_progress_enabled(args),
         args.bwlimit_bytes,
         results,
     );
-    let ticker = spawn_progress_ticker(group.clone(), args);
+    let ticker = spawn_progress_ticker(group.clone(), labels.clone(), args);
     let mut threads = Vec::with_capacity(target_count);
-    for (index, destination) in destinations.iter().cloned().enumerate() {
-        let label = crate::transfer::endpoint_identity(&destination.location);
+    for (index, (destination, label)) in destinations.iter().cloned().zip(labels).enumerate() {
         let mut member = args.clone();
         member.locations = sources.to_vec();
         member.locations.push(destination.location);
@@ -512,16 +462,17 @@ fn run_group(
             label: label.clone(),
             destination_index: index,
         });
-        // A fan-out connection count is one aggregate budget. Every member
-        // receives at least one worker; no member may independently multiply
-        // the user's total through auto-tuning.
-        let connections = total_connections / target_count
-            + usize::from(index < total_connections % target_count);
-        member.connections = connections;
-        member.connections_opt = Some(connections);
-        member.connections_default = false;
-        // A group renderer owns the terminal. Member tickers would overwrite
-        // one another; aggregate progress is added at the coordination layer.
+        // An explicit count is one aggregate budget. With no explicit count,
+        // leave the defaults intact so each destination tunes its own path.
+        if let Some(total_connections) = args.connections_opt {
+            let connections = total_connections / target_count
+                + usize::from(index < total_connections % target_count);
+            member.connections = connections;
+            member.connections_opt = Some(connections);
+            member.connections_default = false;
+        }
+        // A group renderer owns stderr. Member tickers would overwrite one
+        // another; the coordinator renders one labelled row per destination.
         member.no_progress = true;
         member.progress = false;
         let member_group = group.clone();
@@ -545,12 +496,13 @@ fn run_group(
     }
 
     let mut exit_code = 0;
+    let mut notices = Vec::new();
     let mut failures = Vec::new();
     for (index, label, thread) in threads {
         match thread.join() {
             Ok(Ok(0)) => {
                 if !args.quiet {
-                    eprintln!("syq: fan-out: target {label} complete");
+                    notices.push(format!("target {label} complete"));
                 }
             }
             Ok(Ok(code)) => {
@@ -558,16 +510,18 @@ fn run_group(
                 failures.push(format!("target {label} exited {code}"));
             }
             Ok(Err(error)) => {
-                group.failed(&label, &error);
                 exit_code = 1;
                 let failure = format!("target {label}: {error:#}");
-                if let Some(results) = group.results() {
-                    results.emit_error_classified_for(
-                        &format!("syq: fan-out: {failure}"),
-                        None,
-                        None,
-                        Some(index),
-                    );
+                if group.ensure_failed_member(index, args) {
+                    let results = group.results();
+                    if let Some(results) = results {
+                        results.emit_error_classified_for(
+                            &format!("syq: fan-out: {failure}"),
+                            None,
+                            None,
+                            Some(index),
+                        );
+                    }
                 }
                 failures.push(failure);
             }
@@ -575,28 +529,38 @@ fn run_group(
                 group.cancel();
                 exit_code = 1;
                 let failure = format!("target {label}: worker thread panicked");
-                if let Some(results) = group.results() {
-                    results.emit_error_classified_for(
-                        &format!("syq: fan-out: {failure}"),
-                        None,
-                        None,
-                        Some(index),
-                    );
+                if group.ensure_failed_member(index, args) {
+                    if let Some(results) = group.results() {
+                        results.emit_error_classified_for(
+                            &format!("syq: fan-out: {failure}"),
+                            None,
+                            None,
+                            Some(index),
+                        );
+                    }
                 }
                 failures.push(failure);
             }
         }
     }
-    for failure in failures {
-        eprintln!("syq: fan-out: {failure}");
-    }
     if let Some((stop, ticker)) = ticker {
         stop.store(true, Relaxed);
         let _ = ticker.join();
     }
+    for notice in notices {
+        eprintln!("syq: fan-out: {notice}");
+    }
+    for failure in failures {
+        eprintln!("syq: fan-out: {failure}");
+    }
+    let terminals = group.terminal_records();
     if let Some(results) = group.results() {
+        for (index, terminal) in terminals.iter().enumerate() {
+            results.emit_destination_result(index, terminal);
+        }
         results.emit_result(&group.aggregate_terminal(
             args,
+            &terminals,
             exit_code,
             started.elapsed().as_millis() as u64,
         ));
@@ -604,81 +568,101 @@ fn run_group(
     Ok(exit_code)
 }
 
+fn failed_result(args: &Args, elapsed_ms: u64, errors: u64) -> crate::results::ResultRecord {
+    crate::results::ResultRecord {
+        status: "failed",
+        exit_code: 1,
+        dry_run: args.dry_run,
+        files_transferred: 0,
+        files_unchanged: 0,
+        files_excluded: 0,
+        directories_created: 0,
+        symlinks_created: 0,
+        specials_created: 0,
+        errors,
+        bytes_transferred: 0,
+        bytes_unchanged: 0,
+        elapsed_ms,
+        deletions_planned: args.delete.then_some(0),
+        deletions_completed: args.delete.then_some(0),
+        deletions_blocked: args.delete.then_some(0),
+    }
+}
+
 fn spawn_progress_ticker(
     group: Arc<Group>,
+    labels: Vec<String>,
     args: &Args,
 ) -> Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)> {
-    let human = !args.no_progress
-        && !args.quiet
-        && !args.dry_run
-        && (args.progress || std::io::stderr().is_terminal());
+    let human = human_progress_enabled(args);
     let json = !args.quiet && args.progress_json;
     if !human && !json && group.results().is_none() {
         return None;
     }
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
-    let started = std::time::Instant::now();
     let width = args.width.unwrap_or_else(crate::progress::term_width);
     let ticker = std::thread::spawn(move || {
         let mut last_sample = None;
         while !thread_stop.load(Relaxed) {
-            let elapsed = started.elapsed();
-            let snapshot = group.progress_snapshot(elapsed.as_millis() as u64);
-            if last_sample.is_none_or(|last| elapsed - last >= std::time::Duration::from_secs(1)) {
-                last_sample = Some(elapsed);
-                if let Some(results) = group.results() {
-                    results.emit_progress(&snapshot);
-                }
-                if json {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "bytes_done": snapshot.bytes_done,
-                            "bytes_total": snapshot.bytes_total,
-                            "bytes_skipped": snapshot.bytes_unchanged,
-                            "files_done": snapshot.files_done,
-                            "files_total": snapshot.files_total,
-                            "files_skipped": snapshot.files_unchanged,
-                            "files_excluded": snapshot.files_excluded,
-                            "scanned": snapshot.scanned,
-                            "scan_done": snapshot.scan_done,
-                            "elapsed": elapsed.as_secs_f64(),
-                            "fanout_targets": group.total,
-                        })
-                    );
+            let now = std::time::Instant::now();
+            let snapshots: Vec<_> = group
+                .member_progresses()
+                .into_iter()
+                .map(|(index, progress)| (index, progress.snapshot()))
+                .collect();
+            if !snapshots.is_empty()
+                && last_sample.is_none_or(|last| now - last >= std::time::Duration::from_secs(1))
+            {
+                last_sample = Some(now);
+                for (index, snapshot) in &snapshots {
+                    if let Some(results) = group.results() {
+                        results.emit_progress(&snapshot.result_record(Some(*index)));
+                    }
+                    if json {
+                        eprintln!(
+                            "{}",
+                            crate::progress::progress_json(
+                                snapshot,
+                                Some(*index),
+                                Some(&labels[*index]),
+                            )
+                        );
+                    }
                 }
             }
-            if human {
-                let percent = if snapshot.bytes_total > 0 {
-                    snapshot.bytes_done.saturating_mul(100) / snapshot.bytes_total
-                } else {
-                    0
-                };
-                let line = format!(
-                    "fan-out {} / {}  {percent:>3}%  files {}/{}  {} targets",
-                    crate::progress::human(snapshot.bytes_done),
-                    crate::progress::human(snapshot.bytes_total),
-                    snapshot.files_done,
-                    snapshot.files_total,
-                    group.total,
-                );
-                let line = if line.chars().count() >= width {
-                    line.chars().take(width.saturating_sub(1)).collect()
-                } else {
-                    line
-                };
-                eprint!("\r\x1b[K{line}");
-                let _ = std::io::stderr().flush();
+            if human && !snapshots.is_empty() {
+                let _output = group.lock_human_output();
+                let mut err = std::io::stderr().lock();
+                for (index, snapshot) in &snapshots {
+                    let line = format!(
+                        "target {}: {}",
+                        labels[*index],
+                        crate::progress::progress_line(snapshot)
+                    );
+                    let _ = writeln!(
+                        err,
+                        "{}",
+                        crate::progress::truncate(&line, width.saturating_sub(1))
+                    );
+                }
+                let _ = err.flush();
+                group.set_progress_lines(snapshots.len());
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if human {
-            eprint!("\r\x1b[K");
-            let _ = std::io::stderr().flush();
+            let _output = group.lock_human_output();
         }
     });
     Some((stop, ticker))
+}
+
+fn human_progress_enabled(args: &Args) -> bool {
+    !args.no_progress
+        && !args.quiet
+        && !args.dry_run
+        && (args.progress || std::io::stderr().is_terminal())
 }
 
 fn combine_exit_codes(current: i32, next: i32) -> i32 {

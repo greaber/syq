@@ -1167,6 +1167,16 @@ fn fanout_mapping_failure_elapsed_time_includes_stdin_acquisition() {
         terminal["elapsed_ms"].as_u64().unwrap() >= 50,
         "mapping acquisition was missing from elapsed time: {terminal:#?}"
     );
+    let destination_results: Vec<_> = records
+        .iter()
+        .filter(|record| record["type"] == "destination_result")
+        .collect();
+    assert_eq!(destination_results.len(), 2);
+    assert!(destination_results.iter().all(|record| {
+        matches!(record["status"].as_str(), Some("failed" | "aborted"))
+            && record["exit_code"] == 1
+            && record["errors"].as_u64().is_some_and(|errors| errors > 0)
+    }));
 }
 
 #[test]
@@ -1227,6 +1237,16 @@ fn fanout_results_are_one_stream_with_target_indexed_operations() {
     destinations.sort_unstable();
     destinations.dedup();
     assert_eq!(destinations, [0, 1]);
+    let destination_results: Vec<_> = records
+        .iter()
+        .filter(|record| record["type"] == "destination_result")
+        .collect();
+    assert_eq!(destination_results.len(), 2);
+    for (index, result) in destination_results.iter().enumerate() {
+        assert_eq!(result["destination_index"], index as u64);
+        assert_eq!(result["status"], "success");
+        assert_eq!(result["files_transferred"], 1);
+    }
     assert_eq!(
         records
             .iter()
@@ -1237,6 +1257,150 @@ fn fanout_results_are_one_stream_with_target_indexed_operations() {
     let terminal = records.last().unwrap();
     assert_eq!(terminal["type"], "result");
     assert_eq!(terminal["files_transferred"], 2);
+}
+
+#[test]
+fn fanout_summaries_label_targets_and_default_to_per_target_tuning() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("source"), b"summarize me");
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--no-tcp",
+            "--no-progress",
+            "--stats",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for host in ["alpha", "beta"] {
+        assert!(
+            stdout.contains(&format!("syq: target {host}: transferred 1 files")),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("syq: target {host}: stats")),
+            "{stdout}"
+        );
+    }
+    assert_eq!(stdout.matches("connections: auto:").count(), 2, "{stdout}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fanout_progress_json_keeps_standard_fields_and_labels_each_target() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("source"), &vec![b'p'; 8 * 1024 * 1024]);
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--connections",
+            "2",
+            "--no-tcp",
+            "--no-progress",
+            "--progress-json",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .env("SYQ_TEST_HOLD_PARTIAL_MS", "750")
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let records: Vec<serde_json::Value> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(!records.is_empty(), "{stderr}");
+    for (index, host) in ["alpha", "beta"].into_iter().enumerate() {
+        let record = records
+            .iter()
+            .find(|record| record["destination_index"] == index as u64)
+            .unwrap_or_else(|| panic!("missing progress for {host}: {stderr}"));
+        assert_eq!(record["destination"], host);
+        assert!(record.get("rate").is_some(), "{record:#?}");
+        assert!(record.get("eta").is_some(), "{record:#?}");
+        assert!(record.get("fanout_targets").is_none(), "{record:#?}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fanout_human_progress_has_one_labelled_row_per_target() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("source"), &vec![b'p'; 8 * 1024 * 1024]);
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--connections",
+            "2",
+            "--no-tcp",
+            "--progress",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .env("SYQ_TEST_HOLD_PARTIAL_MS", "750")
+        .run()
+        .unwrap();
+
+    assert_output_ok(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for host in ["alpha", "beta"] {
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains(&format!("target {host}:")) && line.contains("files ")),
+            "{stderr}"
+        );
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -1288,6 +1452,14 @@ fn fanout_fatal_member_results_preserve_completed_deletions() {
     assert_eq!(terminal["deletions_planned"], 2);
     assert_eq!(terminal["deletions_completed"], 2);
     assert_eq!(terminal["deletions_blocked"], 0);
+    let destination_results: Vec<_> = records
+        .iter()
+        .filter(|record| record["type"] == "destination_result")
+        .collect();
+    assert_eq!(destination_results.len(), 2);
+    assert!(destination_results
+        .iter()
+        .all(|record| { record["deletions_planned"] == 1 && record["deletions_completed"] == 1 }));
 }
 
 #[cfg(debug_assertions)]

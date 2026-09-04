@@ -118,8 +118,18 @@ lossy by design — drive spinners and dashboards from it, never final
 accounting; the terminal record is the only authority on totals.
 Removal has no byte accounting, so its byte and unchanged/excluded fields are
 zero; its file counts reflect endpoint outcomes delivered so far.
-For a multi-target copy these counters and the terminal counters are sums over
-all destinations.
+For a multi-target copy there is one progress record per destination, carrying
+the same `destination_index` used by that destination's traces, operations,
+errors, and result. Ordinary one-target progress records omit the index.
+
+### `destination_result` — one per destination in a multi-target copy
+
+Before the final result, a coordinated multi-target copy emits one
+`destination_result` for every destination, in the destination order from the
+run record. It has `destination_index` and the same status, exit code, copy
+counters, elapsed time, and optional deletion counters as a copy `result`, but
+describes only that destination. It is not terminal: the stream remains open
+until the final aggregate `result` arrives.
 
 ### `trace` — dry-run only, one per intended mutation
 
@@ -258,6 +268,12 @@ receiver-attested `error` records emitted on the stream: one per
 failed or incomplete operation, per refusal, and per failed or
 partial final-state observation (a present object whose hash or link
 target could not be read).
+
+For a multi-target copy, the final counters are sums of the destination
+results. A failure before any destination starts, such as an unreadable mapping
+input, can add a run-level error that is not charged to an individual
+destination. The final `elapsed_ms` is wall-clock time for the whole command,
+not the sum of the destinations' overlapping elapsed times.
 
 A removal result is distinguished by `mode: "rm"`, has `status`: `success` |
 `partial` | `failed`, and carries `selectors_total`, `selectors_resolved`,

@@ -53,7 +53,8 @@ guesses endpoints from path text.
 
 In `cp`, finish the source specification before starting the destination. The
 source endpoint, `--cwd` or `--root`, every positional or `--src*` selector,
-and `--mapping` must all appear before the first `--to` or placement option.
+and `--mapping` must all appear before the first `--to`, `--tos`, or placement
+option.
 Other options remain order-independent, so flags such as `--dry-run` may still
 follow the placement. This rule makes every bare path's role clear and applies
 equally to local and remote copies.
@@ -99,13 +100,17 @@ new-only precondition cannot be reused.
 Multi-target copies support the ordinary local-source `cp` options, including
 `--root`, directional link following, `--mapping` (stdin is acquired once),
 `--inplace`, `--prune`, dry runs, filtering and preservation, progress, stats,
-and automation results. `--connections` is one budget divided among targets;
-an explicit value smaller than the number of targets is refused. `--bwlimit`
-is likewise one aggregate file-data limit. Human and JSON progress are
-aggregated across targets. `--results` and `--results-fd` produce one stream;
-its run record lists all destinations and each target-specific trace,
+and automation results. Without `--connections`, each destination tunes its
+own connection count for its path. An explicit `--connections` value is one
+budget divided among targets, and a value smaller than the number of targets
+is refused. `--bwlimit` is likewise one aggregate file-data limit. Human
+progress has one labelled row per destination; progress JSON has one record
+per destination with its label and zero-based index. Human summaries are also
+labelled by destination. `--results` and `--results-fd` produce one stream; its
+run record lists all destinations and each target-specific progress, trace,
 operation, or error carries a zero-based `destination_index` into that ordered
-destination list.
+destination list. A `destination_result` records each target's outcome before
+the final aggregate `result` seals the stream.
 
 A remote source is the remaining unsupported multi-target topology. Direct
 remote-to-remote coordination and its command-restricted receiver grants bind
