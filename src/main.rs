@@ -174,7 +174,7 @@ fn main() {
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--session-pool") {
         if let Err(error) = session_pool::run(&argv[2..]) {
-            eprintln!("syq session pool: {error:#}");
+            crate::output::diagnostic!("syq session pool: {error:#}");
             std::process::exit(1);
         }
         return;

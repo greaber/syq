@@ -1410,7 +1410,7 @@ impl RemoteSpec {
         match receive_hello(conn, false) {
             Ok(conn) => {
                 if crate::transfer::debug() {
-                    eprintln!(
+                    crate::output::diagnostic!(
                         "syq: {}: control connection from the session pool",
                         self.label()
                     );
@@ -1420,7 +1420,7 @@ impl RemoteSpec {
             }
             Err(error) => {
                 if crate::transfer::debug() {
-                    eprintln!(
+                    crate::output::diagnostic!(
                         "syq: {}: pooled session unusable ({error:#}); connecting directly",
                         self.label()
                     );
@@ -3493,6 +3493,7 @@ mod tests {
                 next: Default::default(),
             }))),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
         let endpoint = Endpoint::Remote(spec.clone());
         assert!(endpoint
