@@ -342,6 +342,13 @@ class NativeClientTests(unittest.TestCase):
         self.assertNotIn("-base", argv)
         self.assertNotIn("-destination", argv)
 
+    def test_rm_hyphen_prefixed_syq_path_uses_an_attached_value(self) -> None:
+        self.client.rm("victim", from_="host", syq_path="-helper")
+
+        argv = self.argv()
+        self.assertIn("--syq-path=-helper", argv)
+        self.assertNotIn("-helper", argv)
+
     def test_rm_uses_native_names_and_returns_structured_outcomes(self) -> None:
         events: list[syq.AutomationEvent] = []
         output = io.BytesIO()

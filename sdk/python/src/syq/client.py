@@ -776,7 +776,9 @@ def _rm_arguments(
     if syq_path is not None and no_bootstrap:
         raise SyqInvocationError("syq_path and no_bootstrap conflict")
     if syq_path is not None:
-        argv.extend(("--syq-path", _text_arg(syq_path, label="syq_path")))
+        _append_path_option(
+            argv, "--syq-path", _text_arg(syq_path, label="syq_path")
+        )
     if no_bootstrap:
         argv.append("--no-bootstrap")
     return argv, source_count

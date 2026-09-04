@@ -1047,27 +1047,48 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
         b"--pscope",
         b"--syq-path",
     ];
+    const VARIADIC_VALUE_OPTIONS: &[&[u8]] =
+        &[b"--srcs", b"--src-srcs", b"--src-files", b"--src-dirs"];
 
-    for pair in argv
+    let arguments = argv
         .split(|argument| argument.as_bytes() == b"--")
         .next()
-        .unwrap_or_default()
-        .windows(2)
-    {
+        .unwrap_or_default();
+
+    for pair in arguments.windows(2) {
         let option = pair[0].as_bytes();
         if ATTACHED_VALUE_OPTIONS.contains(&option) && pair[1].as_bytes() == b"-" {
-            let option = String::from_utf8_lossy(option);
-            let attached = if option == "-C" {
-                "--cwd=-".to_string()
-            } else {
-                format!("{option}=-")
-            };
-            bail!(
-                "a native path or pattern value beginning with `-` must be attached with `=`; use {attached}"
-            );
+            reject_detached_dash(option)?;
+        }
+    }
+
+    let mut variadic_option = None;
+    for argument in arguments {
+        let argument = argument.as_bytes();
+        if argument == b"-" {
+            if let Some(option) = variadic_option {
+                reject_detached_dash(option)?;
+            }
+        } else if argument.starts_with(b"-") {
+            variadic_option = VARIADIC_VALUE_OPTIONS.iter().copied().find(|option| {
+                argument == *option
+                    || (argument.starts_with(option) && argument.get(option.len()) == Some(&b'='))
+            });
         }
     }
     Ok(())
+}
+
+fn reject_detached_dash(option: &[u8]) -> Result<()> {
+    let option = String::from_utf8_lossy(option);
+    let attached = if option == "-C" {
+        "--cwd=-".to_string()
+    } else {
+        format!("{option}=-")
+    };
+    bail!(
+        "a native path or pattern value beginning with `-` must be attached with `=`; use {attached}"
+    )
 }
 
 /// Decode the base64 path operands of a delegated remote-to-remote argv
