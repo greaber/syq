@@ -883,9 +883,9 @@ pub enum SmallCopyOutcome {
     /// Nothing was written and the session is untouched; the engine repeats
     /// the preflight and reports the shortage itself.
     CapacityShort,
-    /// Staging failed before anything was published. Every staged sidecar
-    /// was removed, but the session now holds the destination root, so the
-    /// engine needs a fresh control session to continue.
+    /// Staging failed before any final file was published. Sidecars may
+    /// remain for resume, and the session now holds the destination root,
+    /// so the engine needs a fresh control session to continue.
     StagingFailed(WireError),
 }
 

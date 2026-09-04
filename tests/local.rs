@@ -7071,6 +7071,7 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
 fn small_pushes_take_one_turn_and_match_the_engine() {
     let t = Tmp::new();
     let ssh = fake_ssh(&t);
+    fs::create_dir_all(t.path("remote-home")).unwrap();
     write(&t.path("src/one.txt"), b"one");
     write(&t.path("src/two.txt"), b"");
     write(&t.path("src/three.bin"), &[7u8; 4096]);
@@ -7081,6 +7082,7 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
         let results = t.s(&format!("{label}.ndjson"));
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
+            .current_dir(t.path("remote-home"))
             .args([
                 "cp",
                 "--syq-path",
@@ -7218,6 +7220,37 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
         comparable(&exact_records),
         comparable(&exact_engine_records)
     );
+
+    // Relative exact placement uses the same request-prefix spelling as the
+    // receiver. A plain leaf must not cost a declined request and fallback.
+    for (label, prefix) in [("relative", ""), ("dot-relative", "./")] {
+        let fast_name = format!("{prefix}{label}-fast.txt");
+        let engine_name = format!("{prefix}{label}-engine.txt");
+        let (fast, fast_records) = push(label, false, &sources[..1], &["--as", &fast_name]);
+        let (engine, engine_records) = push(
+            &format!("{label}-engine"),
+            true,
+            &sources[..1],
+            &["--as", &engine_name],
+        );
+        assert_output_ok(&fast);
+        assert_output_ok(&engine);
+        assert!(
+            stderr_of(&fast).contains("small copy: published"),
+            "{}",
+            stderr_of(&fast)
+        );
+        assert_eq!(read(&t.path("remote-home").join(&fast_name)), b"one");
+        assert_eq!(summary(&fast), summary(&engine));
+        assert_eq!(comparable(&fast_records), comparable(&engine_records));
+        assert_eq!(
+            fs::read_to_string(t.path(&format!("{label}.rsh.log")))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+        );
+    }
 
     // An existing target is the engine's case: the one-turn path writes
     // nothing and hands over on the same connection.
@@ -7384,8 +7417,8 @@ fn small_push_refusals_and_failures_match_the_engine() {
         assert!(fs::read_dir(t.path(dir)).unwrap().next().is_none(), "{dir}");
     }
 
-    // A staging failure publishes nothing and leaves no sidecar; the engine
-    // then reports the same failure for the same file and publishes the rest.
+    // A staging failure publishes no final files; the engine then reports
+    // the same failure, keeps its partial, and publishes the rest.
     for dir in ["stage-fast", "stage-engine"] {
         fs::create_dir_all(t.path(dir)).unwrap();
     }

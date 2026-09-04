@@ -722,11 +722,11 @@ struct StagedSmallFile {
 /// prefix. Nested paths are the ordinary engine's business.
 fn small_copy_leaf<'a>(request_prefix: &[u8], path: &'a [u8]) -> Result<&'a [u8]> {
     let mut prefix_len = request_prefix.len();
-    while prefix_len > 0 && request_prefix[prefix_len - 1] == b'/' {
+    while prefix_len > 1 && request_prefix[prefix_len - 1] == b'/' {
         prefix_len -= 1;
     }
     let leaf = match path.strip_prefix(&request_prefix[..prefix_len]) {
-        Some(rest) if prefix_len == 0 => rest,
+        Some(rest) if prefix_len == 0 || &request_prefix[..prefix_len] == b"/" => rest,
         Some(rest) if rest.first() == Some(&b'/') => &rest[1..],
         _ => bail!("small copy path is not beneath the request prefix"),
     };
@@ -1795,8 +1795,8 @@ impl FsOps {
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;
 
-        // Stage everything before publishing anything, so a failure leaves
-        // the destination exactly as it was found.
+        // Stage everything before publishing any final files. A staging
+        // failure can leave sidecars for the fallback engine to resume.
         let mut staged = Vec::with_capacity(request.files.len());
         for file in &request.files {
             match self.stage_small_file(
@@ -1819,6 +1819,8 @@ impl FsOps {
                 }
             }
         }
+        // Each publication has its own outcome; earlier successes remain
+        // published if a later file fails.
         let results = staged
             .iter()
             .map(|item| {
@@ -7386,6 +7388,33 @@ mod tests {
         );
         assert!(target.is_dir());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn small_copy_leaf_accepts_root_and_relative_prefixes_without_nested_paths() {
+        for (prefix, path) in [
+            (&b"/"[..], &b"/file"[..]),
+            (b"/directory/", b"/directory/file"),
+            (b".", b"./file"),
+            (b"directory", b"directory/file"),
+            (b"", b"file"),
+        ] {
+            assert_eq!(small_copy_leaf(prefix, path).unwrap(), b"file");
+        }
+        for (prefix, path) in [
+            (&b"/"[..], &b"/nested/file"[..]),
+            (b"/", b"//file"),
+            (b"/", b"/.."),
+            (b"/", b"/"),
+            (b".", b"../file"),
+            (b"directory", b"directory-other/file"),
+            (b"directory", b"directory/nested/file"),
+        ] {
+            assert!(
+                small_copy_leaf(prefix, path).is_err(),
+                "{prefix:?}: {path:?}"
+            );
+        }
     }
 
     /// The one-turn small copy publishes fresh files through the ordinary

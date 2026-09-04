@@ -939,7 +939,13 @@ fn attempt_small_copy(
             let name = source.basename();
             (join(&operator_dst_root, &name), name)
         } else {
-            (operator_dst_root.clone(), Vec::new())
+            (
+                join(
+                    &directory,
+                    dst_leaf.as_ref().expect("exact destination leaf"),
+                ),
+                Vec::new(),
+            )
         };
         if targets.iter().any(|(existing, _, _)| *existing == dst_path) {
             return Ok(SmallCopy::Declined);
