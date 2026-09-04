@@ -295,9 +295,9 @@ command line. Options whose semantics the receiver cannot enforce
 independently of hostA fail closed rather than trusting hostA: `--mapping`,
 `--min-size`, unencrypted or ssh data transport, and several others (the
 [complete list](remote-to-remote.md#signed-policies-and-options-that-fail-closed)
-is in the remote-to-remote guide). `--dry-run` and verification-only runs are marked
-read-only in the grant, and the receiver rejects every mutation under them even
-if hostA sends one.
+is in the remote-to-remote guide). `--dry-run` is marked read-only in the
+grant, and the receiver rejects every mutation under it even if hostA sends
+one.
 
 ### Layer 4: the rooted receiver
 
@@ -337,9 +337,10 @@ become a valid clean receipt, though suppression remains a denial of service.
 
 The receipt is hostB's closure-time account of hostB: it says what landed, not
 what hostA omitted or invented, and it is neither a transaction nor a rollback.
-`--detach` cannot use this path at all: a detached transfer needs
-`--no-forward-agent`, with hostA holding its own credential for hostB, or an
-explicit `--rsh`, so no enrolled receiver runs and no receipt is produced.
+`--detach` cannot use this path at all: unless both endpoints are the same
+host, a detached transfer needs `--no-forward-agent`, with the coordinator
+host holding its own credential for the other endpoint, or an explicit
+`--rsh`, so no enrolled receiver runs and no receipt is produced.
 
 ### Putting the layers together
 

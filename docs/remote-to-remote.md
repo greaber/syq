@@ -178,10 +178,12 @@ codes and dispositions are authoritative. An authenticated expected manifest
 is required for source completeness and byte authenticity.
 
 `--detach` cannot use the command-restricted path: the constrained agent
-exists only while syq is attached, so a detached transfer needs
-`--no-forward-agent`, with hostA holding its own credential for hostB, or an
-explicit `--rsh` policy. No enrolled receiver runs and no receipt is produced;
-the launcher reports only that the job started and where its log is on hostA.
+exists only while syq is attached, so unless both endpoints are the same host
+a detached transfer needs `--no-forward-agent`, with the coordinator host
+holding its own credential for the other endpoint, or an explicit `--rsh`
+policy. No enrolled receiver runs and no receipt is produced; the launcher
+reports only that the job started and where its log is on the coordinator
+host.
 
 ## Signed policies and options that fail closed
 
@@ -219,10 +221,10 @@ grant; `--max-entries` and `--max-total-bytes` replace their defaults for one
 transfer and may be set above or below them. Either way, what a claimed grant
 is worth to hostA is stated on the command line.
 
-`--dry-run` and `--verify-only` are cryptographically read-only: the signed
-grant marks them as such and the receiver rejects every mutation even if hostA
-sends one. They use an existing enrollment but do not install one; run
-`syq enrollment add` first when previewing or verifying a new destination.
+`--dry-run` is cryptographically read-only: the signed grant marks it as
+such and the receiver rejects every mutation even if hostA sends one. A dry
+run uses an existing enrollment but does not install one; run
+`syq enrollment add` first when previewing a new destination.
 
 Enrollment never follows a destination-root symlink; enroll the explicit
 referent so the signed pathname and the opened root identify the same object.

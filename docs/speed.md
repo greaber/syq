@@ -25,7 +25,7 @@ table](reference.md#compatibility-options)).
    measured rate (one worker is a valid answer for a spinning disk), and, for
    copies with a remote endpoint, remembers that count per host path and
    transport as the next run's starting point. Same-machine copies, including
-   copies into a mounted NFS path, always start from the local default. See
+   copies into a mounted NFS path, are not remembered. See
    [How many connections](#how-many-connections).
 2. **A TCP data path beside ssh.** OpenSSH caps each channel at a 2 MB window,
    which is roughly 2 MB per round trip (about 7 MB/s at 265 ms), and caps each
@@ -165,7 +165,7 @@ Without an explicit connection count, syq tunes the number of workers while a
 copy runs instead of guessing. It starts at the count that settled last time on
 the same data path and transport. On a path it has not measured, it starts with
 16 over TCP data connections, 8 over ssh, or, when both ends are local, 16 on a
-process limited to one or two CPUs and 32 otherwise. A job of nothing but small
+process limited to one or two CPUs and 32 otherwise. A job of nothing but new small
 files starts no more workers than it has batches, and a single file copied on
 one machine starts with one worker when the kernel or the receiver can copy it
 directly, since extra loopback connections cannot help.
@@ -253,7 +253,9 @@ its reachability and link speed, why each was or was not selected, the
 planned TCP or ssh transport, and the initial connection count. Under
 `--dry-run` the same probes run and the same route is reported, but no data
 connection is opened. For a native remote-to-remote copy the report is
-relative to the coordinator on hostA, which connects to hostB's listener.
+relative to whichever endpoint runs the coordinator (the source unless
+`--coordinate-at` says otherwise), which connects to the other endpoint's
+listener.
 
 No special server setup is required. For a measurement-first checklist of
 optional firewall, sshd, TCP, and host-network changes, see [Server
@@ -280,7 +282,8 @@ write contention and needless transport framing and hashing. NFS-to-NFS copies,
 other source filesystem types, synchronous NFS destinations, an explicit fixed
 worker count above one, and unsupported non-NFS destinations retain the
 parallel, hash-resumable streaming fallback.
-`-c`, any existing partial, and `--bwlimit` disable the receiver-side shortcut.
+`--hash`, any existing partial, and `--bwlimit` disable the receiver-side
+shortcut.
 Small new bandwidth-limited files that fit in one paced transfer block still
 use the pipelined whole-file request described in the
 [transfer engine](reference.md#how-it-works) section.

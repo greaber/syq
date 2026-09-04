@@ -1,9 +1,11 @@
 # Installing syq
 
 Syq runs on Linux and macOS. The local machine needs one of the installation
-paths below; remote hosts need nothing installed in advance, because syq
-installs a matching helper there on first use (see [Remote helper
-bootstrap](#remote-helper-bootstrap)).
+paths below. With the standalone installer or Homebrew, remote hosts need
+nothing installed in advance, because syq installs a matching helper there on
+first use (see [Remote helper bootstrap](#remote-helper-bootstrap)). A Cargo
+or checkout build cannot do that and must be pointed at a compatible remote
+`syq`, as the Cargo section below describes.
 
 ## Standalone installer
 

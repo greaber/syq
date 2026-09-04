@@ -58,10 +58,13 @@ follow the placement. This rule makes every bare path's role clear and applies
 equally to local and remote copies.
 
 `--cwd DIR`/`-C DIR` changes where relative source selectors are resolved at
-the source endpoint. A selector may also be absolute, and a relative selector
-may use `.` and `..`, including a `..` that leaves `--cwd`: `--cwd` is a
-resolution base, not a boundary. With `--root DIR` in its place, every selector
-must be relative and must stay beneath `DIR`; an absolute selector, a `~`
+the source endpoint. For `cp` and `rm`, a selector may also be absolute, and a
+relative selector may use `.` and `..`, including a `..` that leaves `--cwd`:
+`--cwd` is a resolution base, not a boundary. `syq map` is stricter, because
+it writes each named selector relative to that base: a named selector must be
+relative and must resolve inside it, while a contents selector may point
+anywhere. With `--root DIR` in place of `--cwd`, every selector must be
+relative and must stay beneath `DIR`; an absolute selector, a `~`
 selector, or a `..` that would leave the root is refused before anything
 changes.
 

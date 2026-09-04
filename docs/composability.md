@@ -52,7 +52,7 @@ Several guarantees make the plan more than a printout:
   as a `capacity` line, and a real run refuses to start if they do not fit. It
   is a sanity check, not a reservation.
 - **`--dry-run` and `--syq-verify-only` are read-only by construction.** Under the
-  command-restricted remote-to-remote path, the signed grant marks them
+  command-restricted remote-to-remote path, the signed grant marks a dry run
   read-only and the receiver rejects every mutation even if the sending host
   attempts one.
 
@@ -126,9 +126,10 @@ or a stream can express too:
   local` explicitly routes the data through your machine. A dry run of a
   remote-to-remote copy with `--results` always needs `--coordinate-at local`,
   enrolled or not, because only a local coordinator produces the trace
-  stream. Failed copy records carry `src`, `dst`, and `kind` (delete records
-  carry only `dst` and `kind`), so once the terminal record says the run
-  settled, a retry manifest is one filter away. The
+  stream. In a mapping run, failed copy records carry `src`, `dst`, and
+  `kind` (delete records, and records from copies without a mapping, carry
+  only `dst` and `kind`), so once the terminal record says the run settled, a
+  retry manifest is one filter away. The
   [mappings guide](mappings.md#machine-readable-results) has that filter,
   including the terminal-record check. This is what an exit code cannot
   express: which entries failed, and whether a retry could help.
