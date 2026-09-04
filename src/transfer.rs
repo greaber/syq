@@ -328,9 +328,13 @@ fn print_small_copy_diagnostics(args: &Args, dst_ep: &Endpoint) {
     }
     if let Endpoint::Remote(spec) = dst_ep {
         print_remote_control_diagnostics(spec, args);
-        eprintln!("  transport: control connection (small files sent in one request)");
+        crate::output::diagnostic!(
+            "  transport: control connection (small files sent in one request)"
+        );
     }
-    eprintln!("syq: concurrency: no data connections (small files sent on the control connection)");
+    crate::output::diagnostic!(
+        "syq: concurrency: no data connections (small files sent on the control connection)"
+    );
 }
 
 fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
@@ -1038,7 +1042,9 @@ fn attempt_small_copy(
             ..
         }) => {
             if debug() {
-                crate::output::diagnostic!("syq: small copy: a destination exists; using the ordinary engine");
+                crate::output::diagnostic!(
+                    "syq: small copy: a destination exists; using the ordinary engine"
+                );
             }
             return Ok(SmallCopy::Declined);
         }
@@ -1047,7 +1053,7 @@ fn attempt_small_copy(
             ..
         }) => {
             if debug() {
-                eprintln!(
+                crate::output::diagnostic!(
                     "syq: small copy: capacity preflight would refuse; using the ordinary engine"
                 );
             }
@@ -1058,7 +1064,7 @@ fn attempt_small_copy(
             ..
         }) => {
             if debug() {
-                eprintln!(
+                crate::output::diagnostic!(
                     "syq: small copy: staging failed ({}); using the ordinary engine on a new control connection",
                     error.message
                 );

@@ -7297,6 +7297,76 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
     assert_eq!(read(&t.path("dest-fast/new/one.txt")), b"one");
 }
 
+/// Human output failures must leave the small-copy result and receipt intact.
+#[test]
+fn small_push_preserves_results_with_closed_human_streams() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let broken_output = || {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        Stdio::from(OwnedFd::from(writer))
+    };
+    for broken_stderr in [false, true] {
+        let t = Tmp::new();
+        let ssh = fake_ssh(&t);
+        fs::create_dir_all(t.path("remote-home/dest")).unwrap();
+        write(&t.path("source"), b"small copy survives broken output");
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "-vv",
+                "--no-progress",
+            ])
+            .arg(t.path("source"))
+            .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
+            .args(["--results", &t.s("results.ndjson")])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("SYQ_DEBUG", "1")
+            .stdin(Stdio::null())
+            .stdout(broken_output())
+            .stderr(if broken_stderr {
+                broken_output()
+            } else {
+                Stdio::piped()
+            })
+            .start()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(
+            read(&t.path("remote-home/dest/source")),
+            read(&t.path("source"))
+        );
+        let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+        let terminal: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(terminal["type"], "result");
+        assert_eq!(terminal["exit_code"], 0);
+        assert_eq!(terminal["files_transferred"], 1);
+        assert_eq!(
+            fs::read_to_string(t.path("rsh.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        if !broken_stderr {
+            assert!(stderr_of(&output).contains("small copy: published"));
+        }
+    }
+}
+
 /// The one-turn push refuses, fails, warns, and explains itself exactly as
 /// the engine does: the fresh-destination capacity preflight, a staging
 /// failure that publishes nothing, a source named like a sidecar, and the
