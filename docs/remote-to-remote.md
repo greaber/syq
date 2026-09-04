@@ -177,11 +177,11 @@ Diagnostic text is bounded context rather than a stable interface; structured
 codes and dispositions are authoritative. An authenticated expected manifest
 is required for source completeness and byte authenticity.
 
-Restricted `--detach` deliberately has a weaker boundary until durable local
-job state exists. The launcher prints a security warning even under `-q` and
-reports only that the job started. HostB's signed v2 stream is plaintext in
-hostA's detached log, so hostA can read or suppress it, and `--follow` displays
-but does not locally authenticate completion.
+`--detach` is not available with the command-restricted receiver because its
+constrained agent exists only while syq remains attached. A detached launch
+instead requires coordinator-owned peer credentials (`--no-forward-agent`) or
+an explicit `--rsh` policy. Neither path prepares a restricted grant or signed
+receipt; the returned remote log is not a locally authenticated receipt.
 
 ## Signed policies and options that fail closed
 

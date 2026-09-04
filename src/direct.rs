@@ -1141,11 +1141,6 @@ fn run_remote(
         );
     }
     if args.detach {
-        if receipt_expectation.is_some() {
-            eprintln!(
-                "syq: warning: detached restricted transfer reports only that the job started; its final signed receipt will be plaintext in hostA's log, visible to hostA, and will not be verified on this machine"
-            );
-        }
         let run = || {
             let mut cmd = make_command();
             cmd.stdin(Stdio::null())

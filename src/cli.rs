@@ -857,7 +857,7 @@ struct NativeRemoteArgs {
         conflicts_with = "no_tcp"
     )]
     tcp_congestion: Option<String>,
-    /// Run at the remote coordinator and return after launch; restricted receipts remain plaintext in its log and are not locally verified
+    /// Run at the remote coordinator and return after launch; requires --no-forward-agent or --rsh
     #[arg(long)]
     detach: bool,
     /// Give a remote coordinator no forwarded agent; it must own credentials for the peer
