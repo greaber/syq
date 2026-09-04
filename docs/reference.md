@@ -183,7 +183,9 @@ source, destination, and control paths, and uses the legacy unconfined source
 discovery and content-read paths. As in rsync, the flag is local only. It
 applies to the source or destination on the machine where you run syq and to
 the control files syq reads there; it is never passed to a remote endpoint,
-which keeps the default trusted-owner policy and confined source paths. Native
+which keeps the default trusted-owner policy and confined source paths. Rsync
+lets the remote side opt out through `--rsync-path`; syq's `--rsync-path` is
+an executable path only, so a remote endpoint cannot opt out. Native
 mapping/generated names never inherit native `--follow`; they remain strict
 descendants of the registered source root. Rsync-compatible operator control
 paths retain rsync's implicit policy of following a symlink owned by root or

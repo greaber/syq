@@ -118,7 +118,9 @@ What is different from rsync, or weaker:
   automatically; do not reach for it to satisfy a source-side need without
   accepting that destination and control paths lose the same check. Like
   rsync's flag, it is local only: it never reaches a remote endpoint, which
-  keeps the default ownership check and confined source paths. It does
+  keeps the default ownership check and confined source paths. Rsync lets
+  the remote side opt out through `--rsync-path`; syq's `--rsync-path` names
+  an executable only, so a remote endpoint cannot opt out. It does
   not enable rsync's separate descendant-link modes:
   `-L`/`--copy-links`, `--copy-unsafe-links`, `-k`/`--copy-dirlinks`, and
   `-K`/`--keep-dirlinks` remain unsupported and are rejected before either
@@ -392,11 +394,16 @@ verified:
 - **Source builds are honest about identity.** A checkout build carries its Git
   revision, is not an immutable release, and cannot populate the managed
   helper cache; peers must present matching build identities to connect.
-- **Both sides always run the same build.** Every connection starts by
+- **Peers must have matching build identities.** Every connection starts by
   exchanging build identities in plain bytes, and any mismatch is refused
-  before either side decodes a protocol message. There is no protocol version
-  number and no negotiation between versions: the wire format is free to
-  change between releases because two different builds never talk to each
-  other. The managed helper install is what makes this practical; the local
-  client puts its own verified release on the remote side rather than
-  adapting to whatever is installed there.
+  before either side decodes a protocol message. The identity is the release
+  version for an official binary and the Git revision (plus a hash of any
+  uncommitted changes) for a source build, so it names the source the binary
+  was built from, not the exact executable: release artifacts for different
+  platforms share one identity, and so do clean builds of the same commit.
+  There is no protocol version number and no negotiation between versions;
+  the wire format is free to change between releases because peers built
+  from different source never talk to each other. The managed helper install
+  is what makes this practical, and it separately guarantees that the remote
+  side runs a verified release artifact rather than whatever is installed
+  there.
