@@ -160,6 +160,16 @@ network-filesystem stress test. Each operation family is tested at the shared
 rooted primitive rather than repeating every operation over every transport:
 after handoff, all transports use the same `Root` methods.
 
+Linux normally resolves a multi-component confined parent in one `openat2`
+call with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, relative to the already
+opened root. This is a performance optimization, not a different authority
+model: it permits nested mounts but neither `..` escape nor any descendant
+symlink. If the syscall is unavailable, blocked, or rejects a request, syq
+uses the portable component-by-component descriptor walk; it never falls back
+to an unconfined full pathname. Direct tests compare the selected inode with
+the portable walk, refuse an intermediate symlink, preserve the portable
+failure, and cross a nested mount. macOS always uses the portable walk.
+
 ### What to do
 
 - Prefer native `cp` without `--preserve` when you do not need owner, mode,
