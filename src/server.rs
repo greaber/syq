@@ -649,24 +649,14 @@ fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
 /// rest so that LAN addresses are tried before public ones and overlay
 /// (CGNAT / Tailscale) addresses last.
 fn addr_bucket(ip: IpAddr) -> u8 {
+    if crate::conn::is_overlay_address(&ip.to_string()) {
+        return 3; // CGNAT / Tailscale
+    }
     match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, _, _] = v4.octets();
-            if v4.is_private() {
-                1
-            } else if a == 100 && (b & 0xc0) == 64 {
-                3 // CGNAT / Tailscale (100.64.0.0/10)
-            } else {
-                2 // public
-            }
-        }
-        IpAddr::V6(v6) => {
-            if (v6.segments()[0] & 0xfe00) == 0xfc00 {
-                1 // unique local (fc00::/7), e.g. a private cloud network
-            } else {
-                2
-            }
-        }
+        IpAddr::V4(v4) if v4.is_private() => 1,
+        // Unique local (fc00::/7), e.g. a private cloud network.
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xfe00) == 0xfc00 => 1,
+        _ => 2, // public
     }
 }
 
@@ -1090,6 +1080,7 @@ mod tests {
 2: eth0    inet6 fe80::9e6b:ff:fe4e:89ad/64 scope link \\       valid_lft forever preferred_lft forever
 3: bond0    inet 10.2.201.45/24 brd 10.2.201.255 scope global bond0\\       valid_lft forever preferred_lft forever
 4: tailscale0    inet 100.101.102.103/32 scope global tailscale0\\       valid_lft forever preferred_lft forever
+4: tailscale0    inet6 fd7a:115c:a1e0::1234/128 scope global \\       valid_lft forever preferred_lft forever
 5: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever
 ";
 
@@ -1114,6 +1105,7 @@ mod tests {
                 ("172.19.3.10".to_string(), 1000),
                 ("2001:db8::2".to_string(), 1000),
                 ("100.101.102.103".to_string(), 0),
+                ("fd7a:115c:a1e0::1234".to_string(), 0),
             ]
         );
     }

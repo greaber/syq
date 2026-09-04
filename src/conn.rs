@@ -854,6 +854,26 @@ impl Drop for ConnectSlot {
 
 pub const CIPHERS: &str = "Ciphers=aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com";
 
+/// Whether an advertised address belongs to an overlay network (CGNAT /
+/// Tailscale). Such routes are last in priority on both ends: the server
+/// buckets them last, and the client inserts the direct ssh target before
+/// them, so an overlay never wins over the public address ssh reached.
+/// Tailscale uses `100.64.0.0/10` and `fd7a:115c:a1e0::/48`; any other IPv6
+/// unique-local address is an ordinary private network.
+pub(crate) fn is_overlay_address(address: &str) -> bool {
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let [a, b, _, _] = v4.octets();
+            a == 100 && (b & 0xc0) == 64
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+        Err(_) => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataAddressSource {
     RemoteInterface,
@@ -1441,7 +1461,7 @@ impl RemoteSpec {
             if !candidates.iter().any(|candidate| candidate.address == h) {
                 let at = candidates
                     .iter()
-                    .position(|candidate| candidate.address.starts_with("100."))
+                    .position(|candidate| is_overlay_address(&candidate.address))
                     .unwrap_or(candidates.len());
                 candidates.insert(
                     at,
@@ -3216,5 +3236,15 @@ mod tests {
         assert_eq!(candidates[1].reachable, via_localhost);
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn overlay_addresses_are_recognized_in_both_families() {
+        assert!(is_overlay_address("100.101.102.103"));
+        assert!(is_overlay_address("fd7a:115c:a1e0::1234"));
+        assert!(!is_overlay_address("100.1.2.3"));
+        assert!(!is_overlay_address("fdaa:0:1:a7b::2"));
+        assert!(!is_overlay_address("192.168.1.2"));
+        assert!(!is_overlay_address("gpu01.example.net"));
     }
 }
