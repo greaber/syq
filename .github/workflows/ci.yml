@@ -288,6 +288,12 @@ jobs:
           cargo test --locked
           descriptor_broker::tests::independent_process_receives_exact_registered_descriptor
           -- --exact
+      - name: Exercise macOS descriptor soft-limit raise and umask read
+        if: needs.scope.outputs.macos == 'true'
+        run: >-
+          cargo test --locked --bin syq --
+          --exact tests::raise_nofile_lifts_the_soft_limit_to_a_usable_value
+          fsops::tests::process_umask_matches_file_creation
       - name: Exercise macOS descriptor-pressure bounds
         if: needs.scope.outputs.macos == 'true'
         run: cargo test --locked --test local source_fd_budget_
