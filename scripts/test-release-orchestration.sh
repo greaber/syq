@@ -374,7 +374,9 @@ status_bin="$work/status-bin"
 mkdir "$status_bin"
 status_commit=89abcdef0123456789abcdef0123456789abcdef
 status_tag_object=76543210abcdef9876543210abcdef9876543210
-status_formula_b64=$(printf 'url "https://github.com/greaber/syq/releases/download/v0.1.8/syq"\n' | openssl base64 -A)
+status_tag=$(jq -er .tag sdk/python/src/syq/syq-release-manifest.json)
+status_version=$(jq -er .version sdk/python/src/syq/syq-release-manifest.json)
+status_formula_b64=$(printf 'url "https://github.com/greaber/syq/releases/download/%s/syq"\n' "$status_tag" | openssl base64 -A)
 cat >"$status_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -383,12 +385,15 @@ case "$1:$2" in
     {conclusion:null,databaseId:303,event:"push",headSha:$sha,status:"in_progress",url:"https://example.test/303",workflowName:"release"}]' ;;
   api:*)
     case " $* " in
-      *'/git/matching-refs/tags/v0.1.8 '*) jq -cn --arg sha "$SYQ_TEST_STATUS_TAG_OBJECT" '[{ref:"refs/tags/v0.1.8",object:{type:"tag",sha:$sha}}]' ;;
+      *"/git/matching-refs/tags/$SYQ_TEST_STATUS_TAG "*) jq -cn \
+        --arg sha "$SYQ_TEST_STATUS_TAG_OBJECT" --arg tag "$SYQ_TEST_STATUS_TAG" \
+        '[{ref:("refs/tags/" + $tag),object:{type:"tag",sha:$sha}}]' ;;
       *'/git/tags/'*) jq -cn --arg sha "$SYQ_TEST_STATUS_COMMIT" \
-        --arg tag "${SYQ_TEST_STATUS_OBJECT_TAG:-v0.1.8}" \
+        --arg tag "${SYQ_TEST_STATUS_OBJECT_TAG:-$SYQ_TEST_STATUS_TAG}" \
         --arg type "${SYQ_TEST_STATUS_TARGET_TYPE:-commit}" \
         '{tag:$tag,object:{type:$type,sha:$sha},verification:{verified:true,reason:"valid"}}' ;;
-      *'/releases?per_page=100 '*) printf '[[{"tag_name":"v0.1.8","draft":false,"immutable":true,"html_url":"https://example.test/v0.1.8"}]]\n' ;;
+      *'/releases?per_page=100 '*) jq -cn --arg tag "$SYQ_TEST_STATUS_TAG" \
+        '[[{tag_name:$tag,draft:false,immutable:true,html_url:("https://example.test/" + $tag)}]]' ;;
       *'/actions/runs/303/pending_deployments '*) printf '[{"environment":{"name":"release"}}]\n' ;;
       *'homebrew-tap/contents/Formula/syq.rb '*) jq -cn --arg content "$SYQ_TEST_STATUS_FORMULA_B64" '{content:$content}' ;;
       *) echo "unexpected fake gh api invocation: $*" >&2; exit 2 ;;
@@ -400,8 +405,10 @@ EOF
 cat >"$status_bin/curl" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in
-  *'crates.io/'*) printf '{"versions":[{"num":"0.1.8"}]}\n' ;;
-  *'pypi.org/'*) printf '{"info":{"version":"0.1.8"},"releases":{"0.1.8":[{}]}}\n' ;;
+  *'crates.io/'*) jq -cn --arg version "$SYQ_TEST_STATUS_VERSION" \
+    '{versions:[{num:$version}]}' ;;
+  *'pypi.org/'*) jq -cn --arg version "$SYQ_TEST_STATUS_VERSION" \
+    '{info:{version:$version},releases:{($version):[{}]}}' ;;
   *) exit 2 ;;
 esac
 EOF
@@ -409,8 +416,10 @@ chmod 755 "$status_bin/gh" "$status_bin/curl"
 PATH="$status_bin:$PATH" \
 SYQ_TEST_STATUS_COMMIT="$status_commit" \
 SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
+SYQ_TEST_STATUS_TAG="$status_tag" \
+SYQ_TEST_STATUS_VERSION="$status_version" \
 SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
-  "$script_dir/release-status.sh" --json v0.1.8 >"$work/status.json"
+  "$script_dir/release-status.sh" --json "$status_tag" >"$work/status.json"
 jq -e --arg commit "$status_commit" '
   .tag_state == "verified" and .tag_commit == $commit and
   .github_release.state == "published" and .github_release.immutable == true and
@@ -428,18 +437,22 @@ jq -e --arg commit "$status_commit" '
 PATH="$status_bin:$PATH" \
 SYQ_TEST_STATUS_COMMIT="$status_commit" \
 SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
-SYQ_TEST_STATUS_OBJECT_TAG=v0.1.7 \
+SYQ_TEST_STATUS_TAG="$status_tag" \
+SYQ_TEST_STATUS_VERSION="$status_version" \
+SYQ_TEST_STATUS_OBJECT_TAG="${status_tag}-mismatch" \
 SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
-  "$script_dir/release-status.sh" --json v0.1.8 >"$work/status-name-mismatch.json"
+  "$script_dir/release-status.sh" --json "$status_tag" >"$work/status-name-mismatch.json"
 jq -e '.tag_state == "name-mismatch" and .tag_commit == null' \
   "$work/status-name-mismatch.json" >/dev/null
 
 PATH="$status_bin:$PATH" \
 SYQ_TEST_STATUS_COMMIT="$status_commit" \
 SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
+SYQ_TEST_STATUS_TAG="$status_tag" \
+SYQ_TEST_STATUS_VERSION="$status_version" \
 SYQ_TEST_STATUS_TARGET_TYPE=tag \
 SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
-  "$script_dir/release-status.sh" --json v0.1.8 >"$work/status-nested-tag.json"
+  "$script_dir/release-status.sh" --json "$status_tag" >"$work/status-nested-tag.json"
 jq -e '.tag_state == "invalid-target" and .tag_commit == null' \
   "$work/status-nested-tag.json" >/dev/null
 
