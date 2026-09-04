@@ -91,7 +91,10 @@ mutation. A failure before that barrier leaves every target unchanged. This is
 not a distributed transaction: a connection or filesystem failure after the
 barrier can leave some targets complete and others partial, and `--prune`
 planning and removal run after each target's file transfers. Rerunning the same
-command safely converges the targets.
+command safely converges the targets unless its placement is new-only. After a
+partial `--into-new` or `--as-new` run, inspect the targets and retry with
+`--into` or `--as`, respectively: the successful targets now exist, so the
+original new-only precondition cannot be reused.
 
 Multi-target copies support the ordinary local-source `cp` options, including
 `--root`, directional link following, `--mapping` (stdin is acquired once),

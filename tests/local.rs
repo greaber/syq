@@ -835,6 +835,7 @@ fn fanout_target_preflight_failure_leaves_ready_target_unchanged() {
     assert_eq!(terminal["type"], "result");
     assert_eq!(terminal["status"], "failed");
     assert_eq!(terminal["exit_code"], 1);
+    assert!(terminal.get("deletions_planned").is_none());
     let errors: Vec<_> = records
         .iter()
         .filter(|record| record["type"] == "error")
@@ -1028,6 +1029,64 @@ fn fanout_acquires_a_mapping_once_and_applies_it_to_every_target() {
 }
 
 #[test]
+fn fanout_mapping_failure_elapsed_time_includes_stdin_acquisition() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src")).unwrap();
+    let rsh = fanout_fake_rsh(&t);
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--cwd",
+            &t.s("src"),
+            "--mapping",
+            "-",
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--results",
+            &t.s("results.ndjson"),
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"not a mapping\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert!(
+        terminal["elapsed_ms"].as_u64().unwrap() >= 50,
+        "mapping acquisition was missing from elapsed time: {terminal:#?}"
+    );
+}
+
+#[test]
 fn fanout_results_are_one_stream_with_target_indexed_operations() {
     let t = Tmp::new();
     let rsh = fanout_fake_rsh(&t);
@@ -1095,6 +1154,57 @@ fn fanout_results_are_one_stream_with_target_indexed_operations() {
     let terminal = records.last().unwrap();
     assert_eq!(terminal["type"], "result");
     assert_eq!(terminal["files_transferred"], 2);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fanout_fatal_member_results_preserve_completed_deletions() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("src/keep"), b"same");
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        write(&home.join("dst/keep"), b"same");
+        write(&home.join("dst/remove"), b"delete me");
+        install_cached_remote_helper(&home);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            &t.s("src"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--prune",
+            "--results",
+            &t.s("results.ndjson"),
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "dst")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    for host in ["alpha", "beta"] {
+        assert!(!t.path(&format!("remotes/{host}/dst/remove")).exists());
+    }
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["deletions_planned"], 2);
+    assert_eq!(terminal["deletions_completed"], 2);
+    assert_eq!(terminal["deletions_blocked"], 0);
 }
 
 #[cfg(debug_assertions)]

@@ -241,6 +241,21 @@ impl Group {
                     aggregate.bytes_unchanged = aggregate
                         .bytes_unchanged
                         .saturating_add(progress.bytes_skipped.load(Relaxed));
+                    aggregate.deletions_planned = sum_optional(
+                        aggregate.deletions_planned,
+                        args.delete
+                            .then(|| progress.deletions_planned.load(Relaxed)),
+                    );
+                    aggregate.deletions_completed = sum_optional(
+                        aggregate.deletions_completed,
+                        args.delete
+                            .then(|| progress.deletions_completed.load(Relaxed)),
+                    );
+                    aggregate.deletions_blocked = sum_optional(
+                        aggregate.deletions_blocked,
+                        args.delete
+                            .then(|| progress.deletions_blocked.load(Relaxed)),
+                    );
                 }
             }
         }
@@ -417,6 +432,7 @@ fn target_label(target: &Location) -> String {
 }
 
 pub fn run(mut args: Args) -> Result<i32> {
+    let started = std::time::Instant::now();
     let target_count = args.fanout_targets.len() + 1;
     if args.connections_opt.is_some() && args.connections < target_count {
         bail!(
@@ -463,7 +479,7 @@ pub fn run(mut args: Args) -> Result<i32> {
                         errors: 1,
                         bytes_transferred: 0,
                         bytes_unchanged: 0,
-                        elapsed_ms: 0,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
                         deletions_planned: args.delete.then_some(0),
                         deletions_completed: args.delete.then_some(0),
                         deletions_blocked: args.delete.then_some(0),
@@ -473,7 +489,14 @@ pub fn run(mut args: Args) -> Result<i32> {
             }
         }
     }
-    run_group(&args, &sources, &destinations, source_count, results)
+    run_group(
+        &args,
+        &sources,
+        &destinations,
+        source_count,
+        results,
+        started,
+    )
 }
 
 fn run_group(
@@ -482,8 +505,8 @@ fn run_group(
     destinations: &[crate::cli::FanoutTarget],
     source_count: usize,
     results: Option<Arc<crate::results::ResultsWriter>>,
+    started: std::time::Instant,
 ) -> Result<i32> {
-    let started = std::time::Instant::now();
     let target_count = destinations.len();
     let total_connections = args.connections.max(target_count);
     let group = Group::new(
