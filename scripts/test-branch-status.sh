@@ -28,7 +28,10 @@ case "$1:$2" in
     cat "$SYQ_TEST_RUNS_DIR/$workflow.json"
     ;;
   pr:view)
-    if [ -n "${SYQ_TEST_PR_JSON:-}" ]; then
+    if [ "${SYQ_TEST_PR_JSON:-}" = FAIL ]; then
+      echo 'GraphQL: simulated GraphQL failure' >&2
+      exit 1
+    elif [ -n "${SYQ_TEST_PR_JSON:-}" ]; then
       printf '%s\n' "$SYQ_TEST_PR_JSON"
     else
       echo 'no pull requests found for branch' >&2
@@ -135,6 +138,30 @@ with_pr "$failed_pr" expect_exit 1 run_status
 expect_output 'failed checks: rust failure'
 expect_output 'WARNING: PR #7 checks: rust failure'
 
+# A failed commit status context, which carries state rather than conclusion.
+context_pr=$(jq -c '.statusCheckRollup += [{context:"external", state:"FAILURE"}]' <<<"$pr_json")
+with_pr "$context_pr" expect_exit 1 run_status
+expect_output 'failed checks: external failure'
+expect_output 'WARNING: PR #7 checks: external failure'
+
+# A pending commit status context is neither green nor a failure.
+context_pr=$(jq -c '.statusCheckRollup += [{context:"external", state:"PENDING"}]' <<<"$pr_json")
+with_pr "$context_pr" expect_exit 0 run_status
+expect_output 'pending checks: external'
+expect_no_output WARNING
+
+# An empty rollup is not success.
+empty_pr=$(jq -c '.statusCheckRollup = []' <<<"$pr_json")
+with_pr "$empty_pr" expect_exit 0 run_status
+expect_output 'checks: none registered yet'
+expect_no_output 'all completed successfully'
+
+# A pull-request lookup failure other than "no pull request" is an error.
+with_pr FAIL expect_exit 2 run_status
+expect_output 'could not look up the pull request for task'
+expect_output 'simulated GraphQL failure'
+expect_no_output 'Pull request: none'
+
 # A pending pull-request check is reported without a warning.
 pending_pr=$(jq -c '.statusCheckRollup[0] = {name:"rust", status:"IN_PROGRESS", conclusion:null}' <<<"$pr_json")
 with_pr "$pending_pr" expect_exit 0 run_status
@@ -173,6 +200,23 @@ set_run ci.yml completed failure
 expect_exit 1 run_status --json
 jq -e '.exit_status == 1 and (.warnings | length) == 1 and .master_ci[0].state == "failure"' "$work/out" >/dev/null
 set_run ci.yml completed success
+
+# --json --check stays one JSON document even when the checks write to stdout.
+cat > "$fakebin/cargo" <<'FAKE'
+#!/bin/sh
+echo "fake cargo $*"
+[ "$1" != clippy ] || exit 1
+FAKE
+chmod 755 "$fakebin/cargo"
+json_check_status=0
+run_status --json --check > "$work/out" 2>"$work/err" || json_check_status=$?
+test "$json_check_status" = 1
+grep -F 'fake cargo clippy' "$work/err" >/dev/null
+jq -e '.checks == [{name:"fmt", command:"cargo fmt --all -- --check", result:"pass"},
+  {name:"clippy", command:"cargo clippy --all-targets --all-features -- -D warnings", result:"fail"},
+  {name:"unit-tests", command:"cargo test --bin syq", result:"pass"}]
+  and .warnings == ["clippy failed"] and .exit_status == 1' "$work/out" >/dev/null
+rm "$fakebin/cargo"
 
 # Usage errors.
 expect_exit 2 run_status --bogus

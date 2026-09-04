@@ -90,10 +90,17 @@ done
 # The pull request for this branch, if any.
 pr=null
 if [ "$branch" != HEAD ]; then
+  pr_error=$(mktemp)
   if pr_json=$(gh pr view "$branch" --repo "$repository" \
-      --json number,url,state,isDraft,baseRefName,headRefOid,reviewDecision,mergeStateStatus,statusCheckRollup 2>/dev/null); then
+      --json number,url,state,isDraft,baseRefName,headRefOid,reviewDecision,mergeStateStatus,statusCheckRollup 2>"$pr_error"); then
     pr=$pr_json
+  elif ! grep -q 'no pull requests found' "$pr_error"; then
+    echo "could not look up the pull request for $branch:" >&2
+    cat "$pr_error" >&2
+    rm -f "$pr_error"
+    exit 2
   fi
+  rm -f "$pr_error"
 fi
 pr_head_relation=none
 if [ "$pr" != null ]; then
@@ -111,14 +118,19 @@ if [ "$pr" != null ]; then
     pr_head_relation=unrelated
     warn "PR #$pr_number head ${pr_head:0:7} is not related to local $short_sha"
   fi
-  failed_checks=$(jq -r '[.statusCheckRollup[]? |
-    select((.conclusion // "") as $c | ($c | ascii_upcase) as $u |
-      ($u != "SUCCESS" and $u != "SKIPPED" and $u != "NEUTRAL" and $u != "")) |
-    (.name // .context) + " " + (.conclusion | ascii_downcase)] | join(", ")' <<<"$pr")
+  # The rollup mixes check runs (name, status, conclusion) and commit status
+  # contexts (context, state); normalize both to a name, an outcome, and
+  # whether the check is still pending.
+  checks_json=$(jq -c '[.statusCheckRollup[]? |
+    {name: (.name // .context // "unnamed"),
+     outcome: ((.conclusion // .state // "") | ascii_upcase)} |
+    .pending = (.outcome == "" or .outcome == "PENDING" or .outcome == "EXPECTED")]' <<<"$pr")
+  check_count=$(jq 'length' <<<"$checks_json")
+  failed_checks=$(jq -r '[.[] | select(.pending | not) |
+    select(.outcome != "SUCCESS" and .outcome != "SKIPPED" and .outcome != "NEUTRAL") |
+    .name + " " + (.outcome | ascii_downcase)] | join(", ")' <<<"$checks_json")
   [ -z "$failed_checks" ] || warn "PR #$pr_number checks: $failed_checks"
-  pending_checks=$(jq -r '[.statusCheckRollup[]? |
-    select((.conclusion // "") == "" and ((.status // "") | ascii_upcase) != "COMPLETED") |
-    (.name // .context)] | join(", ")' <<<"$pr")
+  pending_checks=$(jq -r '[.[] | select(.pending) | .name] | join(", ")' <<<"$checks_json")
 fi
 
 # Optional fixed Rust baseline.
@@ -127,7 +139,8 @@ if [ "$check" = true ]; then
   run_check() {
     local name=$1; shift
     local result=pass
-    if ! (cd "$toplevel" && "$@"); then result=fail; warn "$name failed"; fi
+    # Keep stdout for the report, so --json stays a single document.
+    if ! (cd "$toplevel" && "$@" >&2); then result=fail; warn "$name failed"; fi
     checks=$(jq -c --arg name "$name" --arg command "$*" --arg result "$result" \
       '. + [{name:$name, command:$command, result:$result}]' <<<"$checks")
   }
@@ -204,7 +217,9 @@ else
   echo "Pull request: #$(jq -r .number <<<"$pr") $(jq -r .url <<<"$pr")"
   echo "  base $(jq -r .baseRefName <<<"$pr"), $(jq -r 'if .isDraft then "draft" else .state | ascii_downcase end' <<<"$pr"), review $(jq -r '.reviewDecision // "" | if . == "" then "none" else ascii_downcase end' <<<"$pr"), merge state $(jq -r '.mergeStateStatus // "unknown" | ascii_downcase' <<<"$pr")"
   echo "  GitHub head $(jq -r '.headRefOid[0:7]' <<<"$pr"): $pr_head_relation local $short_sha"
-  if [ -n "$failed_checks" ]; then
+  if [ "$check_count" -eq 0 ]; then
+    echo "  checks: none registered yet"
+  elif [ -n "$failed_checks" ]; then
     echo "  failed checks: $failed_checks"
   elif [ -n "$pending_checks" ]; then
     echo "  pending checks: $pending_checks"
