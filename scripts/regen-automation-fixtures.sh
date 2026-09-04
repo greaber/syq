@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate the golden automation-v1 fixture streams from real syq runs.
+# Regenerate the golden automation fixture streams from real syq runs.
 #
 # Normalization keeps regeneration deterministic so a diff shows only real
 # API changes — fixture review is API review. Volatile identity fields
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-out="$repo/tests/fixtures/automation-v1"
+out="$repo/tests/fixtures/automation"
 cargo build --quiet --manifest-path "$repo/Cargo.toml"
 syq="$repo/target/debug/syq"
 work="$(mktemp -d)"

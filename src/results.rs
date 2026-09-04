@@ -1,6 +1,6 @@
 //! `--results`: an NDJSON stream of machine-readable operation outcomes for
-//! native cp and rm. Automation schema version 1: every record carries `schema`
-//! (`syq.automation`), `schema_version`, and a monotonic `seq`. The stream
+//! native cp and rm. Every record carries `schema` (`syq.automation`),
+//! `schema_version`, and a monotonic `seq`. The stream
 //! target is a freshly created file (`--results FILE`) or a descriptor the
 //! caller opened (`--results-fd N`); human output is untouched.
 //!

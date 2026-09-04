@@ -763,7 +763,7 @@ struct NativeOperationalArgs {
 #[derive(clap::Args, Debug, Default)]
 struct NativeResultsArgs {
     /// Write the machine-readable NDJSON result stream to FILE (created
-    /// fresh; an existing file is refused). Automation schema version 1
+    /// fresh; an existing file is refused)
     #[arg(long, value_name = "FILE")]
     results: Option<OsString>,
     /// Write the result stream to an inherited file descriptor the caller

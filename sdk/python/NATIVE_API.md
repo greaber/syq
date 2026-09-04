@@ -1,7 +1,7 @@
 # Python native API
 
-Status: implemented for the upcoming automation-v1 syq version. Until a syq
-release containing v1 exists, source-tree users must select the candidate
+Status: implemented for the upcoming syq release that ships the automation
+results stream. Until such a release exists, source-tree users must select the candidate
 binary explicitly; the next Python SDK release updates its managed pin after
 conformance tests pass.
 
@@ -561,8 +561,8 @@ or `RmResult` carries `dry_run=True`; copy uses `TraceEvent` while removal uses
 
 A dry run describes what syq observed and would have done. It is not an
 executable transaction, authorization token, or promise that the filesystem
-will remain unchanged before a later operation. Automation v1 supplies the
-shared execution trace and terminal result.
+will remain unchanged before a later operation. The automation results stream
+supplies the shared execution trace and terminal result.
 
 ## Events and terminal results
 
@@ -575,8 +575,8 @@ receiver-attested `FinalStateEvent`, and the terminal `CpResult` or `RmResult`.
 Additive unknown record types are validated for a well-formed envelope and
 sequence position, then ignored.
 
-The product's [automation-v1 contract](../../docs/automation-v1.md) and
-[JSON Schema](../../schemas/automation-v1.schema.json), not this document, own
+The product's [automation results contract](../../docs/automation.md) and
+[JSON Schema](../../schemas/automation.schema.json), not this document, own
 their exact fields and enum members. The Python types expose every stable
 schema field without parsing display text.
 
@@ -661,7 +661,7 @@ the source/destination state is still appropriate belong to the application.
 An incomplete stream cannot produce a complete retry manifest: unobserved
 operations may exist. Collected entries must not be used until the terminal
 result arrives with status `success` or `partial`, the two statuses for which
-automation v1 guarantees that every queued operation settled.
+the automation contract guarantees that every queued operation settled.
 
 ## Raw execution
 
@@ -776,9 +776,9 @@ The initial typed API does not provide:
 | Raw stdin and safe streaming | Process behavior only | Implemented |
 | `RelativePath` and mapping codecs | Exact binary pairing | Implemented |
 | `map` and safe `cp(mapping=...)` input | Native mapping commands | Implemented |
-| Typed `cp`, including `prune=True` | Automation v1 | Implemented |
+| Typed `cp`, including `prune=True` | Automation results stream | Implemented |
 | Typed `rm` | Native `rm` result stream | Implemented for local and ordinary SSH endpoints |
-| Typed `dry_run=True` | Automation-v1 trace records | Implemented |
+| Typed `dry_run=True` | Automation trace records | Implemented |
 | Asyncio native commands and mapping stream | Same contracts as `Client` | Implemented |
 
 The source inventory `native-api.json` records the disposition of every native

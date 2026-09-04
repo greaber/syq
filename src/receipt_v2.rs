@@ -789,21 +789,20 @@ impl VerifiedReceiptV2 {
     }
 }
 
-/// Publish the already-verified receiver account as the version-0 automation
-/// stream. These records deliberately identify their provenance: unlike the
-/// coordinator's ordinary `--results`, every fact here came from the signed
-/// receipt. Scope-relative paths are not expanded into ambient hostB paths.
-/// Emit the receiver-attested automation records into the run's results
-/// stream: one v1-vocabulary `operation_result` per receipt operation, an
-/// `error` record per refusal, a `final_state` record per closure-time
-/// observation, and the sealed terminal `result`. Every attested record
-/// carries `provenance: "receiver_attested"`.
 /// What the emission produced, for the human summary that renders from the
 /// same data.
 pub(crate) struct EmittedAutomationRecords {
     pub errors: u64,
 }
 
+/// Publish the already-verified receiver account as automation records in the
+/// run's results stream: one `operation_result` per receipt operation, an
+/// `error` record per refusal, a `final_state` record per closure-time
+/// observation, and the sealed terminal `result`. These records identify their
+/// provenance: unlike the coordinator's ordinary `--results`, every fact here
+/// came from the signed receipt, and every attested record carries
+/// `provenance: "receiver_attested"`. Scope-relative paths are not expanded
+/// into ambient hostB paths.
 pub(crate) fn emit_automation_records(
     receipt: &mut VerifiedReceiptV2,
     writer: &crate::results::ResultsWriter,
@@ -1693,7 +1692,7 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schemas/automation-v1.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../schemas/automation.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record["seq"], index as u64);
@@ -1876,7 +1875,7 @@ mod tests {
         // The records ride the shared envelope with contiguous sequencing
         // and validate against the committed automation schema.
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schemas/automation-v1.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../schemas/automation.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record["seq"], index as u64);
