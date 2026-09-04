@@ -991,6 +991,82 @@ pub(crate) struct SshMultiplexer {
 /// no-reauthentication window stays comparable to sudo's credential cache.
 const REUSE_PERSIST_SECONDS: &str = "300";
 
+/// The oldest OpenSSH release whose client speaks the agent session-bind
+/// extension and host-bound public-key authentication. Constrained agent
+/// forwarding relies on both, on the local machine and on the coordinator
+/// host, and the peer's `sshd` must be at least this new as well.
+pub(crate) const CONSTRAINED_OPENSSH_MINIMUM: OpenSshVersion =
+    OpenSshVersion { major: 8, minor: 9 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OpenSshVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl std::fmt::Display for OpenSshVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OpenSSH {}.{}", self.major, self.minor)
+    }
+}
+
+/// Read the release number out of an `ssh -V` banner such as
+/// `OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13 30 Jan 2024`. Other
+/// clients report nothing recognizable and yield `None`.
+pub(crate) fn parse_openssh_version(banner: &[u8]) -> Option<OpenSshVersion> {
+    let text = String::from_utf8_lossy(banner);
+    let rest = text.split("OpenSSH_").nth(1)?;
+    let mut numbers = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .take(2)
+        .map(|digits| digits.parse::<u32>().ok());
+    let major = numbers.next()??;
+    let minor = numbers.next()??;
+    Some(OpenSshVersion { major, minor })
+}
+
+/// Ask `program -V` for its version once per program name. Only programs
+/// whose name ends in `ssh` are probed: an arbitrary `--rsh` command is a
+/// complete user policy and might do anything with a `-V` argument.
+pub(crate) fn openssh_version(program: &str) -> Option<OpenSshVersion> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, Option<OpenSshVersion>>>> = Mutex::new(None);
+    if !program.ends_with("ssh") {
+        return None;
+    }
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some(version) = cache.get(program) {
+        return *version;
+    }
+    let version = Command::new(program)
+        .arg("-V")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| {
+            parse_openssh_version(&output.stderr).or_else(|| parse_openssh_version(&output.stdout))
+        });
+    cache.insert(program.to_owned(), version);
+    version
+}
+
+/// Refuse constrained agent forwarding through an OpenSSH client that
+/// predates session binding. A client whose version cannot be read is left to
+/// fail on its own, so this only turns a confusing authentication failure
+/// into a direct explanation.
+pub(crate) fn require_constrained_openssh(program: &str, location: &str) -> Result<()> {
+    match openssh_version(program) {
+        Some(version) if version < CONSTRAINED_OPENSSH_MINIMUM => bail!(
+            "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --no-forward-agent with credentials on the coordinator host, --unrestricted-agent-forwarding, or an explicit --rsh policy"
+        ),
+        _ => Ok(()),
+    }
+}
+
 impl SshMultiplexer {
     pub(crate) fn new() -> Result<Self> {
         let directory = tempfile::Builder::new()
@@ -1369,6 +1445,13 @@ impl RemoteSpec {
             command.args(&server_args);
             command
         } else {
+            if self
+                .rsh
+                .iter()
+                .any(|argument| argument == "PubkeyAuthentication=host-bound")
+            {
+                require_constrained_openssh(&self.rsh[0], "on the coordinator host")?;
+            }
             let mut command = self.ssh_command(ssh_connection);
             let remote_command = if self.restricted_grant.is_some() {
                 // This text is inspected by the forced receiver through
@@ -2633,6 +2716,43 @@ mod tests {
             self.dropped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn openssh_version_banners_parse_and_compare() {
+        let parse = |banner: &str| parse_openssh_version(banner.as_bytes());
+        assert_eq!(
+            parse("OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13 30 Jan 2024\n"),
+            Some(OpenSshVersion { major: 9, minor: 6 })
+        );
+        assert_eq!(
+            parse("OpenSSH_8.9p1, LibreSSL 3.3.6"),
+            Some(CONSTRAINED_OPENSSH_MINIMUM)
+        );
+        assert_eq!(
+            parse("OpenSSH_10.0p2"),
+            Some(OpenSshVersion {
+                major: 10,
+                minor: 0
+            })
+        );
+        assert_eq!(parse("Dropbear v2024.85"), None);
+        assert_eq!(parse("OpenSSH_"), None);
+        assert!(OpenSshVersion { major: 8, minor: 2 } < CONSTRAINED_OPENSSH_MINIMUM);
+        assert!(
+            OpenSshVersion {
+                major: 8,
+                minor: 10
+            } > CONSTRAINED_OPENSSH_MINIMUM
+        );
+        assert!(OpenSshVersion { major: 9, minor: 0 } > CONSTRAINED_OPENSSH_MINIMUM);
+        assert_eq!(CONSTRAINED_OPENSSH_MINIMUM.to_string(), "OpenSSH 8.9");
+    }
+
+    #[test]
+    fn only_ssh_named_programs_are_probed_for_a_version() {
+        assert_eq!(openssh_version("fake-rsh"), None);
+        assert_eq!(openssh_version("/definitely/missing/ssh"), None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

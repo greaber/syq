@@ -298,6 +298,9 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
             spec.remote_shell_name(),
             peer.platform
         );
+        if let Some(version) = crate::conn::openssh_version(&spec.rsh[0]) {
+            eprintln!("  ssh client: {version}");
+        }
         let helper_mode = remote_helper_mode(spec, args.interface);
         eprintln!("  helper: {} ({helper_mode})", peer.identity);
     }
