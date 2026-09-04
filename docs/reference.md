@@ -16,19 +16,19 @@ target placement in separate arguments:
 
 ```sh
 syq cp project --to server --into /backup       # named object → /backup/project
-syq cp --src-src project --to server --into /app # project contents → /app
+syq cp --srcs-in project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
 syq cp --from server:2222 data --to backup:2200 --into /archive
-syq cp --from server data --to backup --coordinate-at dest --into /archive
+syq cp --from server data --to backup --coordinate-at dst --into /archive
 syq cp --src-file report --src-dir assets --into /backup
 syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
 syq cp report --to server --as-new /reports/final
 syq cp --hash report --to server --as-existing /reports/final
-syq cp --ignore '*.tmp' --src-src project --to server --into /app
-syq cp --follow-src --src-src current-project --to server --into /app
+syq cp --ignore '*.tmp' --srcs-in project --to server --into /app
+syq cp --follow-src --srcs-in current-project --to server --into /app
 syq cp --preserve=permissions,ownership project --to server --into /backup
 syq cp --inplace disk.img --to server --as-existing /images/disk.img
-syq cp --prune --src-src build --to server --into-existing /srv/app
+syq cp --prune --srcs-in build --to server --into-existing /srv/app
 syq rm cache old-output
 syq rm --from server --cwd /srv --src old-output
 syq rm --from server --syq-path /opt/syq-dev --src old-output
@@ -71,8 +71,8 @@ symlink satisfies `--src-file` and is copied as a symlink, while it fails the
 `--src-dir` precondition. With `--follow-src` (or `--follow`), the precondition
 and copy both apply to the referent. These typed selectors are available to
 `cp` and `rm`.
-`--src-src DIR` selects a directory's contents and merges them directly into
-the target container. `--srcs PATH...`, `--src-srcs DIR...`, `--src-files
+`--srcs-in DIR` selects a directory's contents and merges them directly into
+the target container. `--srcs PATH...`, `--src-files
 PATH...`, and `--src-dirs DIR...` are bulk conveniences for the corresponding
 singular selectors. Symlinks found while traversing a selected directory are
 copied as symlinks and are never followed. Singular selector options consume
@@ -83,10 +83,10 @@ All native commands use one link-resolution rule for filesystem paths supplied
 directly by the operator. By default, SYQ refuses a symlink in any component
 that must be traversed. The last path component of a named `--src` is the
 selected object rather than something to traverse, so a symlink there remains
-symlink payload. A directory-required selector such as `--src-src` or
+symlink payload. A directory-required selector such as `--srcs-in` or
 `--src-dir` cannot use a symlink as its selected directory by default.
 `--follow-src` permits this traversal only in directly supplied source paths,
-including `--cwd`, `rm --root`, and source selectors. `cp --follow-dest`
+including `--cwd`, `rm --root`, and source selectors. `cp --follow-dst`
 permits it only in the destination placement path. `--follow` is the umbrella:
 it enables both directions and also permits traversal in coordinator-local
 control paths such as `--ignore-from`, `--mapping`, and `--results`. The
@@ -99,21 +99,21 @@ substitution of every operand with the output of `realpath`. Logical source
 mapping remains separate. If `current` points to `releases/v3`, then
 `syq cp --follow-src current --into backup` copies the referent as
 `backup/current`, not `backup/v3`. A contents selector still omits that name:
-`--follow-src --src-src current --into backup` merges the referent's children
+`--follow-src --srcs-in current --into backup` merges the referent's children
 directly into `backup`.
 
 For exact placement, the last path component is the requested directory entry,
-not something to traverse. Both `--as link` and `--follow-dest --as link`
-address and may replace the symlink itself; `--follow-dest` controls only
+not something to traverse. Both `--as link` and `--follow-dst --as link`
+address and may replace the symlink itself; `--follow-dst` controls only
 symlinks in the parent path. The `new` and `existing` preconditions test the
 named entry, so a dangling symlink exists for `--as-new` and `--as-existing`.
 
 An `--into` destination, by contrast, must be traversed as a container. A symlink
-there is refused by default and accepted with `--follow-dest` (or the
+there is refused by default and accepted with `--follow-dst` (or the
 `--follow` umbrella). If the container link is dangling, a placement form that
 permits creation may create its referent directory. Thus, if `live` points to
-`../releases/v3`, `--follow-dest --into live` uses `v3` as the container,
-while `--follow-dest --as live` replaces the directory entry named `live` and
+`../releases/v3`, `--follow-dst --into live` uses `v3` as the container,
+while `--follow-dst --as live` replaces the directory entry named `live` and
 leaves `v3` untouched. To update the referent itself, pass its explicit path,
 for example from `realpath`.
 
@@ -123,7 +123,7 @@ makes the choice clearer than using a follow option:
 ```sh
 readlink -- current-project                 # inspect the link's stored target
 realpath -- current-project                 # print the fully resolved path
-syq cp --src-src "$(realpath -- current-project)" --into /backup
+syq cp --srcs-in "$(realpath -- current-project)" --into /backup
 ```
 
 A relative value printed by `readlink` is relative to the directory containing
@@ -287,7 +287,7 @@ For removal, `--src PATH` and bare paths accept either a selected file or
 directory and remove that object, recursively for a directory. As with copy,
 `--src-file PATH` requires a selected non-directory object, while
 `--src-dir DIR` requires a directory and removes its entire tree.
-`--src-src DIR` requires a directory, removes its contents, and retains the
+`--srcs-in DIR` requires a directory, removes its contents, and retains the
 resolved directory itself. All type checks and selector resolution finish
 before deletion begins. `-vv` prints the base identity, symlink hops, and final
 device/inode resolution used for the operation's audit trail.
@@ -314,9 +314,9 @@ Native `cp` and `rm` accept `--follow-src`, the `--follow` umbrella,
 `-n`/`--dry-run`, `-v`/`--verbose`,
 `-q`/`--quiet`, `-j`/`--connections`, `--progress`/`--no-progress`, and
 `--progress-json` in addition to their endpoint and selector options. `cp`
-also accepts `--follow-dest`, `--hash`, `--no-compress`, `--bwlimit RATE`,
+also accepts `--follow-dst`, `--hash`, `--no-compress`, `--bwlimit RATE`,
 `--stats`, repeatable `--ignore PATTERN`/`--ignore-from FILE`, `--preserve`,
-and `--inplace`. Native `cp` and `rm` also accept an isolated SSH persistence
+and `--inplace`. Native `cp` and `rm` also accept an ephemeral SSH persistence
 scope through `--pscope PATH`. Filters
 use the gitignore semantics described below and apply at every source root;
 `--prune` protects excluded destination paths from pruning. `--hash`
@@ -375,7 +375,7 @@ For two remote endpoints, `--coordinate-at auto` (the default) places the coordi
 at the source. Path operands travel base64-encoded inside the delegated
 command line, so direct placement works for every filename and data is never
 routed through this machine implicitly. `--coordinate-at src` explicitly selects a
-direct push, `--coordinate-at dest` selects a direct pull with the SSH edge
+direct push, `--coordinate-at dst` selects a direct pull with the SSH edge
 reversed, and `--coordinate-at local` explicitly selects a relay through this
 machine. `--coordinate-at` is rejected for copies that do not have two remote
 endpoints.
@@ -425,9 +425,9 @@ interaction. `status` shows the global scope and its recorded endpoints;
 `off` disables the policy, asks every live syq-owned master to exit, and
 removes the global runtime scope. The durable preference lives in
 `$XDG_CONFIG_HOME/syq/persistence.json` (normally under `~/.config`), while
-control sockets live in a private per-user runtime directory.
+control sockets live in a mode-0700 per-user runtime directory.
 
-Scripts can avoid changing that shared preference by creating an isolated
+Scripts can avoid changing that shared preference by creating an ephemeral
 persistence scope:
 
 ```sh
@@ -439,7 +439,7 @@ syq cp --pscope "$pscope" second --to server --into /backup
 syq persist status --pscope "$pscope"
 ```
 
-`on --ephemeral` prints exactly the new private scope path. Passing that path
+`on --ephemeral` prints exactly the new ephemeral scope path. Passing that path
 with `--pscope` lets separately launched or parallel commands share only that
 scope, independently of the global setting. `off --pscope` closes its live
 masters and removes it. If a script is killed before its cleanup trap runs,
@@ -449,9 +449,9 @@ with a literal `~` or containing `${...}` are refused because OpenSSH expands
 those forms before opening a control socket.
 
 `--pscope` is intentionally not an ordinary control-file selection. It names a
-private directory created and permission-checked by the persistence subsystem;
+mode-0700 directory created and permission-checked by the persistence subsystem;
 OpenSSH derives socket names beneath that directory. Its confinement therefore
-comes from that private-directory model, not from the retained single-file
+comes from that dedicated-directory model, not from the retained single-file
 descriptors used for filters, mappings, file lists, and results.
 
 During either persistence window, anything able to act as the same local user
@@ -530,7 +530,7 @@ a transfer:
 
 ```bash
 set -o pipefail
-syq map --src-src photos \
+syq map --srcs-in photos \
   | jq -c '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C photos --to nas --into /pub
 ```
@@ -600,7 +600,7 @@ accept them.
 | `--syq-tcp-plain` | SYQ extension: TCP data connections without encryption (trusted networks only) |
 | `--syq-tcp-ports LO-HI` | SYQ extension: port range the remote listens on for TCP data (default 47600-47699) |
 | `--syq-tcp-congestion ALGO` | SYQ extension, Linux: use `ALGO` on both ends of TCP data sockets; the host default is unchanged |
-| `--syq-pscope PATH` | SYQ extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral` |
+| `--syq-pscope PATH` | SYQ extension: use an ephemeral SSH persistence scope created by `syq persist on --ephemeral` |
 | `--syq-ignore PATTERN` | SYQ extension: skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--syq-ignore-from FILE` | SYQ extension: read ignore patterns from a file (repeatable, stacks with `--syq-ignore`) |
 | `--delete` | Remove destination paths the source doesn't have (see below); `--delete-after`/`--delete-delay` are synonyms |
@@ -958,8 +958,8 @@ syq rsync -a --syq-ignore '*.o' --syq-ignore /build src/ host:dst/
 syq rsync -a --syq-ignore 'logs/*' --syq-ignore '!logs/keep/' src/ dst/
 syq rsync -a --syq-ignore-from .gitignore --syq-ignore '!dist/' repo/ host:repo/
 syq rsync -a --syq-ignore '*' --syq-ignore '!*/' --syq-ignore '!*.jpg' photos/ bak/
-syq cp --ignore-from .gitignore --src-src repo --to host --into repo
-syq cp --prune --ignore cache/ --src-src build --into-existing deploy
+syq cp --ignore-from .gitignore --srcs-in repo --to host --into repo
+syq cp --prune --ignore cache/ --srcs-in build --into-existing deploy
 ```
 
 Rules of thumb (they're git's): `foo` matches a file or directory named `foo`

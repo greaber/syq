@@ -10,7 +10,7 @@ before a single byte moves.
 
 ```bash
 set -o pipefail
-syq map --src-src photos \
+syq map --srcs-in photos \
   | jq -c '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C photos --to nas --into /pub
 ```
@@ -59,7 +59,7 @@ directories no entry names are created implicitly, as with
 selection as a mapping instead of copying:
 
 ```sh
-syq map --src-src photos          # contents of photos/, dst == src
+syq map --srcs-in photos          # contents of photos/, dst == src
 syq map photos                    # named object: dst starts with photos/
 ```
 
@@ -69,7 +69,7 @@ yourself may use the base64 form for such names.
 
 `syq map` deliberately has a destination-independent surface: `-C`, `--root`,
 `--follow-src`/`--follow`, the source-selector family, and `--as`. It takes
-either `--src-src DIR` as the only selector or any number of relative named
+either `--srcs-in DIR` as the only selector or any number of relative named
 selectors. `--as PATH` places the single selected root at `PATH`, which may
 be nested; `cp --mapping` creates any missing parents. Destination, filtering,
 transfer, execution, result, receiver-ceiling, and receipt options belong to
@@ -93,7 +93,7 @@ manifest instead:
 
 ```bash
 set -o pipefail
-syq map --src-src src | jq -c '.dst.value |= ascii_downcase' > m.ndjson \
+syq map --srcs-in src | jq -c '.dst.value |= ascii_downcase' > m.ndjson \
   && syq cp --mapping m.ndjson -C src --to nas --into /pub
 ```
 
@@ -103,7 +103,7 @@ A migration to a case-insensitive filesystem:
 
 ```bash
 set -o pipefail
-syq map --src-src src \
+syq map --srcs-in src \
   | jq -c '.dst.value |= ascii_downcase' \
   | syq cp --mapping - -C src --to nas --into /pub
 ```
@@ -151,7 +151,7 @@ up around every run.
 
 ```bash
 set -o pipefail
-syq map --src-src photos \
+syq map --srcs-in photos \
   | jq -c 'select(.kind == "file")
         | .dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value' \
   | syq cp --mapping - -C photos --to nas --into /archive
@@ -178,7 +178,7 @@ lifecycle (rebuild after changes, clean up after runs).
 
 ```bash
 set -o pipefail
-syq map --src-src data \
+syq map --srcs-in data \
   | jq -c 'select(.kind != "file" or .size >= 1048576)' \
   | syq cp --mapping - -C data --to nas --into /big
 ```
@@ -240,7 +240,7 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
 - The command-line path naming a manifest, the `-C`/`--root` source base, and the
   `--into` placement are directly supplied paths. Native mode refuses to
   traverse symlinks in them by default. `--follow-src` controls the source
-  base, `--follow-dest` controls placement, and only the `--follow` umbrella
+  base, `--follow-dst` controls placement, and only the `--follow` umbrella
   also controls the coordinator-local manifest path. Paths inside the manifest
   are data and are not changed by any follow option. A named manifest is read
   from the identity retained by that resolution, and all its bytes are acquired

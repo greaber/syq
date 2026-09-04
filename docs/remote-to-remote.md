@@ -16,8 +16,8 @@ Rsync refuses two remote operands, and so does `syq rsync`. Native copy keeps
 syq's endpoint-aware remote-to-remote operation:
 
 ```sh
-syq cp --from hostA --src-src big --to hostB --into big
-syq cp --prune --from hostA --src-src tree --to hostB --into-existing tree
+syq cp --from hostA --srcs-in big --to hostB --into big
+syq cp --prune --from hostA --srcs-in tree --to hostB --into-existing tree
 ```
 
 syq starts the coordinator on hostA and pushes directly to hostB, so file

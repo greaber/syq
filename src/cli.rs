@@ -52,7 +52,7 @@ pub enum CoordinateAt {
     /// Run the coordinator at the source endpoint.
     Src,
     /// Run the coordinator at the destination endpoint.
-    Dest,
+    Dst,
     /// Keep the coordinator on the invoking machine and relay the data there.
     Local,
 }
@@ -100,7 +100,7 @@ pub struct Args {
     pub native_follow_src: bool,
     /// Permit symlinks that must be traversed in directly supplied destination paths.
     #[arg(skip)]
-    pub native_follow_dest: bool,
+    pub native_follow_dst: bool,
     /// Source-side base for `syq map` selectors, joined at walk time so the
     /// emitted `src` values stay relative to it.
     #[arg(skip)]
@@ -288,7 +288,7 @@ pub struct Args {
         conflicts_with = "no_tcp"
     )]
     pub tcp_congestion: Option<String>,
-    /// SYQ extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    /// SYQ extension: use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long = "syq-pscope", value_name = "PATH", conflicts_with = "rsh")]
     pub pscope: Option<PathBuf>,
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
@@ -407,7 +407,7 @@ impl Args {
     }
 
     pub(crate) fn follows_native_destination_paths(&self) -> bool {
-        self.native_follow || self.native_follow_dest
+        self.native_follow || self.native_follow_dst
     }
 
     /// Parse the command line and read ignore files, keeping command-line and
@@ -645,7 +645,7 @@ struct NativeSourceArgs {
     src: Vec<OsString>,
     /// Select a directory's contents; attach =DIR when it begins with `-` (repeatable)
     #[arg(long, value_name = "DIR")]
-    src_src: Vec<OsString>,
+    srcs_in: Vec<OsString>,
     /// Select a named non-directory source object; attach =PATH when it begins with `-` (repeatable)
     #[arg(long, value_name = "PATH")]
     src_file: Vec<OsString>,
@@ -661,9 +661,6 @@ struct NativeSourceArgs {
     /// Select several named source objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
-    /// Select the contents of several directories
-    #[arg(long, value_name = "DIR", num_args = 1..)]
-    src_srcs: Vec<OsString>,
     /// Named source objects (shorthand for --src)
     #[arg(value_name = "PATH")]
     sources: Vec<OsString>,
@@ -700,7 +697,7 @@ struct NativeRmSelectionArgs {
     src: Vec<OsString>,
     /// Select a directory's contents; attach =DIR when it begins with `-` (repeatable)
     #[arg(long, value_name = "DIR")]
-    src_src: Vec<OsString>,
+    srcs_in: Vec<OsString>,
     /// Select a non-directory object; attach =PATH when it begins with `-` (repeatable)
     #[arg(long, value_name = "PATH")]
     src_file: Vec<OsString>,
@@ -716,9 +713,6 @@ struct NativeRmSelectionArgs {
     /// Select several objects without constraining their selected types
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
-    /// Select the contents of several directories
-    #[arg(long, value_name = "DIR", num_args = 1..)]
-    src_srcs: Vec<OsString>,
     /// Selected objects (shorthand for --src)
     #[arg(value_name = "PATH")]
     sources: Vec<OsString>,
@@ -902,7 +896,7 @@ struct NativeCopyFields {
     to: Option<String>,
     /// Follow symlinks in directly supplied destination paths
     #[arg(long)]
-    follow_dest: bool,
+    follow_dst: bool,
     /// Put selected names inside DIR, creating it if necessary
     #[arg(long, value_name = "DIR", group = "placement")]
     into: Option<OsString>,
@@ -948,7 +942,7 @@ struct NativeSizeSelectionArgs {
     version,
     about = "Copy selected objects with explicit endpoint and placement syntax",
     long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
-    override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
+    override_usage = "syq cp [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyCommand {
     #[command(flatten)]
@@ -957,7 +951,7 @@ struct NativeCopyCommand {
     size_selection: NativeSizeSelectionArgs,
     #[command(flatten)]
     remote: NativeRemoteArgs,
-    /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    /// Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
     /// After copying, remove target-only objects in mapped directory scopes;
@@ -984,13 +978,12 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
         ("cwd", "--cwd"),
         ("root", "--root"),
         ("src", "--src"),
-        ("src_src", "--src-src"),
+        ("srcs_in", "--srcs-in"),
         ("src_file", "--src-file"),
         ("src_dir", "--src-dir"),
         ("src_files", "--src-files"),
         ("src_dirs", "--src-dirs"),
         ("srcs", "--srcs"),
-        ("src_srcs", "--src-srcs"),
         ("sources", "a positional source"),
         ("mapping", "--mapping"),
     ];
@@ -1027,7 +1020,7 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
     version,
     about = "Print a local source selection as an NDJSON mapping",
     long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
-    override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
+    override_usage = "syq map [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeMapCommand {
     #[command(flatten)]
@@ -1043,7 +1036,7 @@ struct NativeMapCommand {
     version,
     about = "Remove endpoint-resolved object trees without following symlinks by default",
     long_about = "Remove endpoint-resolved object trees without following symlinks by default.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
-    override_usage = "syq rm [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
+    override_usage = "syq rm [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeRmCommand {
     #[command(flatten)]
@@ -1054,7 +1047,7 @@ struct NativeRmCommand {
     helper: NativeRemoteHelperArgs,
     #[command(flatten)]
     results_output: NativeResultsArgs,
-    /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    /// Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
 }
@@ -1080,11 +1073,10 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
         b"--cwd",
         b"--root",
         b"--src",
-        b"--src-src",
+        b"--srcs-in",
         b"--src-file",
         b"--src-dir",
         b"--srcs",
-        b"--src-srcs",
         b"--src-files",
         b"--src-dirs",
         b"--into",
@@ -1099,8 +1091,7 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
         b"--pscope",
         b"--syq-path",
     ];
-    const VARIADIC_VALUE_OPTIONS: &[&[u8]] =
-        &[b"--srcs", b"--src-srcs", b"--src-files", b"--src-dirs"];
+    const VARIADIC_VALUE_OPTIONS: &[&[u8]] = &[b"--srcs", b"--src-files", b"--src-dirs"];
 
     let arguments = argv
         .split(|argument| argument.as_bytes() == b"--")
@@ -1159,13 +1150,12 @@ fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
     let source = &mut copy.selection.source;
     for list in [
         &mut source.src,
-        &mut source.src_src,
+        &mut source.srcs_in,
         &mut source.src_file,
         &mut source.src_dir,
         &mut source.src_files,
         &mut source.src_dirs,
         &mut source.srcs,
-        &mut source.src_srcs,
         &mut source.sources,
     ] {
         for value in list.iter_mut() {
@@ -1219,9 +1209,8 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut locations = if mapping.is_some() {
         let source = &copy.selection.source;
         let has_selectors = !(source.src.is_empty()
-            && source.src_src.is_empty()
+            && source.srcs_in.is_empty()
             && source.srcs.is_empty()
-            && source.src_srcs.is_empty()
             && source.src_file.is_empty()
             && source.src_dir.is_empty()
             && source.src_files.is_empty()
@@ -1268,7 +1257,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         for source in locations.iter().filter(|source| !source.copies_contents()) {
             if native_basename(&source.path).is_none() {
                 bail!(
-                    "named source {:?} has no target basename; use --src-src to select directory contents",
+                    "named source {:?} has no target basename; use --srcs-in to select directory contents",
                     String::from_utf8_lossy(&source.path)
                 );
             }
@@ -1315,7 +1304,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         .map(OsStringExt::into_vec);
     args.native_follow = copy.selection.source.follow;
     args.native_follow_src = copy.selection.source.follow_src;
-    args.native_follow_dest = copy.follow_dest;
+    args.native_follow_dst = copy.follow_dst;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
         // through the source connection; a direct remote-to-remote copy has
@@ -1399,7 +1388,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
         .any(|location| location.selection == SourceSelection::Contents)
         && locations.len() > 1
     {
-        bail!("syq map takes --src-src DIR as the only selector, or any number of named selectors");
+        bail!("syq map takes --srcs-in DIR as the only selector, or any number of named selectors");
     }
 
     let (placement, target) = match parsed.r#as {
@@ -1418,7 +1407,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
             for source in locations.iter().filter(|source| !source.copies_contents()) {
                 if native_basename(&source.path).is_none() {
                     bail!(
-                        "named source {:?} has no target basename; use --src-src to select directory contents",
+                        "named source {:?} has no target basename; use --srcs-in to select directory contents",
                         String::from_utf8_lossy(&source.path)
                     );
                 }
@@ -1463,14 +1452,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
             &parsed.selection.srcs,
         ),
         (
-            "src_src",
+            "srcs_in",
             SourceSelection::Contents,
-            &parsed.selection.src_src,
-        ),
-        (
-            "src_srcs",
-            SourceSelection::Contents,
-            &parsed.selection.src_srcs,
+            &parsed.selection.srcs_in,
         ),
         (
             "src_file",
@@ -1561,8 +1545,7 @@ fn lower_native_sources(
         ("sources", SourceSelection::NamedNoFollow, &parsed.sources),
         ("src", SourceSelection::NamedNoFollow, &parsed.src),
         ("srcs", SourceSelection::NamedNoFollow, &parsed.srcs),
-        ("src_src", SourceSelection::Contents, &parsed.src_src),
-        ("src_srcs", SourceSelection::Contents, &parsed.src_srcs),
+        ("srcs_in", SourceSelection::Contents, &parsed.srcs_in),
         ("src_file", SourceSelection::File, &parsed.src_file),
         ("src_dir", SourceSelection::Directory, &parsed.src_dir),
         ("src_files", SourceSelection::File, &parsed.src_files),
@@ -2388,7 +2371,7 @@ mod tests {
         let argv = [
             "--follow-src",
             "source",
-            "--follow-dest",
+            "--follow-dst",
             "--into",
             "destination",
         ]
@@ -2396,7 +2379,7 @@ mod tests {
         let args = parse_native_copy(&argv).unwrap();
         assert!(!args.native_follow);
         assert!(args.native_follow_src);
-        assert!(args.native_follow_dest);
+        assert!(args.native_follow_dst);
         assert!(args.follows_native_source_paths());
         assert!(args.follows_native_destination_paths());
 
@@ -2404,7 +2387,7 @@ mod tests {
         let args = parse_native_copy(&argv).unwrap();
         assert!(args.native_follow);
         assert!(!args.native_follow_src);
-        assert!(!args.native_follow_dest);
+        assert!(!args.native_follow_dst);
         assert!(args.follows_native_source_paths());
         assert!(args.follows_native_destination_paths());
     }
@@ -2427,7 +2410,7 @@ mod tests {
     #[test]
     fn native_remote_controls_lower_to_the_shared_engine() {
         let argv = [
-            "--coordinate-at=dest",
+            "--coordinate-at=dst",
             "--rsh=ssh -J jump",
             "--syq-path=/opt/syq",
             "--no-tcp",
@@ -2439,7 +2422,7 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv).unwrap();
-        assert_eq!(args.coordinate_at, super::CoordinateAt::Dest);
+        assert_eq!(args.coordinate_at, super::CoordinateAt::Dst);
         assert_eq!(args.rsh.as_deref(), Some("ssh -J jump"));
         assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
         assert!(!args.no_bootstrap);

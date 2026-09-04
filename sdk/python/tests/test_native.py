@@ -66,7 +66,7 @@ if command == "rm":
     status = os.environ.get("SYQ_FAKE_STATUS", "success")
     exit_code = 0 if status == "success" else 23
     selector_total = sum(
-        arg in {"--src", "--src-src", "--src-file", "--src-dir"}
+        arg in {"--src", "--srcs-in", "--src-file", "--src-dir"}
         for arg in args
     ) or 1
     records = [{
@@ -274,7 +274,7 @@ class NativeClientTests(unittest.TestCase):
             from_="source",
             root="source-root",
             follow_src=True,
-            follow_dest=True,
+            follow_dst=True,
             to="target",
             coordinate_at="local",
             into_existing="out",
@@ -316,7 +316,7 @@ class NativeClientTests(unittest.TestCase):
         argv = self.argv()
         for expected in (
             "cp", "--src", "--src-dir", "--from", "--root", "--follow-src",
-            "--follow-dest", "--to",
+            "--follow-dst", "--to",
             "--into-existing", "--prune", "--max-delete", "--dry-run",
             "--hash", "--no-compress", "--bwlimit", "--connections",
             "--receiver-max-entries", "--receiver-max-bytes",
@@ -365,7 +365,7 @@ class NativeClientTests(unittest.TestCase):
 
         result = self.client.rm(
             src="victim",
-            src_src="contents",
+            srcs_in="contents",
             src_file="leaf",
             src_dir="tree",
             from_="source",
@@ -399,7 +399,7 @@ class NativeClientTests(unittest.TestCase):
         for expected in (
             "rm",
             "--src",
-            "--src-src",
+            "--srcs-in",
             "--src-file",
             "--src-dir",
             "--from",
@@ -707,7 +707,7 @@ class NativeClientTests(unittest.TestCase):
 
     def test_map_is_streaming_typed_and_context_managed(self) -> None:
         with self.client.map(
-            src_src="source", root="source-root", follow_src=True
+            srcs_in="source", root="source-root", follow_src=True
         ) as stream:
             entries = list(stream)
         self.assertEqual(len(entries), 1)
@@ -730,7 +730,7 @@ class NativeClientTests(unittest.TestCase):
             process_cwd=self.root,
         )
         with client.map(
-            src_src="link/../selected", cwd="base", follow_src=True
+            srcs_in="link/../selected", cwd="base", follow_src=True
         ) as stream:
             list(stream)
         self.assertEqual(
@@ -745,7 +745,7 @@ class NativeClientTests(unittest.TestCase):
             env={**self.env, "HOME": os.fspath(home)},
             process_cwd=self.root,
         )
-        with client.map(src_src="~/selected", cwd="ignored") as stream:
+        with client.map(srcs_in="~/selected", cwd="ignored") as stream:
             list(stream)
         self.assertEqual(stream.cwd, home / "selected")
 
@@ -759,7 +759,7 @@ class NativeClientTests(unittest.TestCase):
         with self.assertRaisesRegex(syq.SyqInvocationError, "ordinary source"):
             self.client.cp("a", "b", as_="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "ordinary source"):
-            self.client.map(src_src="source", as_="target")
+            self.client.map(srcs_in="source", as_="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "mutually exclusive"):
             self.client.cp("source", cwd="a", root="b", into="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "mutually exclusive"):
