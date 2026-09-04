@@ -191,8 +191,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          release_notes=".github/release-notes/$GITHUB_REF_NAME.md"
+          test -s "$release_notes" || {
+            echo "Release notes are missing: $release_notes" >&2
+            exit 1
+          }
           gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
-            --title "syq ${GITHUB_REF_NAME#v}" --generate-notes
+            --title "syq ${GITHUB_REF_NAME#v}" --generate-notes \
+            --notes "$(cat "$release_notes")"
           gh release upload "$GITHUB_REF_NAME" dist/*
           scripts/verify-release-assets.sh "$GITHUB_REF_NAME" dist
           gh release edit "$GITHUB_REF_NAME" --draft=false

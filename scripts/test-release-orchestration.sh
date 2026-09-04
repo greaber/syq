@@ -6,6 +6,8 @@ set -euo pipefail
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 grep -F 'rust,sdks,macos,linux-arm64,conformance' \
   "$script_dir/../.github/workflows/release.yml" >/dev/null
+grep -F '.github/release-notes/$GITHUB_REF_NAME.md' \
+  "$script_dir/../.github/workflows/release.yml" >/dev/null
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-release-orchestration-test.XXXXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
