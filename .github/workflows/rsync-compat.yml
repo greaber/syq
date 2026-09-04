@@ -1,14 +1,12 @@
 name: rsync compatibility
 
 on:
-  pull_request:
   push:
     branches: [master]
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.run_id }}
 
 permissions:
   contents: read
@@ -100,9 +98,8 @@ jobs:
           path: target/rsync-compat/reports/
           if-no-files-found: warn
 
-  # Keep the required check name stable while making it depend on the selected
-  # platform cells above. Pull requests run Linux; master and manual runs add
-  # macOS.
+  # Keep the conformance release-evidence name stable while making it depend
+  # on the selected platform cells above.
   conformance:
     needs: [scope, conformance_platforms]
     if: always()

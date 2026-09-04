@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Fixture-driven checks for path selection, generated-PR approval, preflight,
-# and release status reporting.
+# Fixture-driven checks for path selection, preflight, and release status
+# reporting.
 set -euo pipefail
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -223,76 +223,6 @@ scope=$(cd "$scope_repo" && \
 for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" true
 done
-
-# The approval helper binds the PR and both workflow runs to the same trusted
-# repository, native pull_request event, branch, and exact head SHA.
-approval_bin="$work/approval-bin"
-mkdir "$approval_bin"
-approval_log="$work/approvals"
-head_sha=0123456789abcdef0123456789abcdef01234567
-cat >"$approval_bin/gh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-if [ "$1" = api ] && [[ " $* " == *" repos/greaber/syq/pulls "* ]]; then
-  jq -cn --arg repo "${SYQ_TEST_PR_REPOSITORY:-greaber/syq}" \
-    --arg branch automation/python-sdk-v0.1.9 --arg sha "$SYQ_TEST_HEAD_SHA" '
-    [{head:{repo:{full_name:$repo},ref:$branch,sha:$sha},base:{ref:"master"}}]'
-elif [ "$1:$2" = 'run:list' ]; then
-  jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_HEAD_SHA}" \
-    --arg event "${SYQ_TEST_RUN_EVENT:-pull_request}" '[
-    {conclusion:"action_required",databaseId:101,event:$event,headSha:$sha,status:"completed",url:"https://example.test/101",workflowName:"ci"},
-    {conclusion:"action_required",databaseId:102,event:$event,headSha:$sha,status:"completed",url:"https://example.test/102",workflowName:"rsync compatibility"}]'
-elif [ "$1" = api ] && [[ " $* " == *'/approve '* ]]; then
-  printf '%s\n' "$*" >>"$SYQ_TEST_APPROVAL_LOG"
-elif [ "$1" = api ] && [[ "$2" == *'/check-runs?'* ]]; then
-  status=${SYQ_TEST_SDK_STATUS:-completed}
-  conclusion=${SYQ_TEST_SDK_CONCLUSION:-success}
-  if [ "$conclusion" = null ]; then
-    jq -cn --arg status "$status" \
-      '{check_runs:[{name:"sdks",status:$status,conclusion:null}]}'
-  else
-    jq -cn --arg status "$status" --arg conclusion "$conclusion" \
-      '{check_runs:[{name:"sdks",status:$status,conclusion:$conclusion}]}'
-  fi
-else
-  echo "unexpected fake gh invocation: $*" >&2
-  exit 2
-fi
-EOF
-chmod 755 "$approval_bin/gh"
-SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_APPROVAL_LOG="$approval_log" \
-  PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha" >/dev/null
-[ "$(wc -l <"$approval_log")" -eq 2 ]
-expect_failure 'expected one trusted open pull request' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_PR_REPOSITORY=attacker/syq \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
-expect_failure 'timed out waiting for native pull-request workflow runs' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_RUN_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" SYQ_APPROVAL_TIMEOUT_SECONDS=0 \
-  PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
-expect_failure 'required generated-PR check sdks is completed/failure' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_SDK_CONCLUSION=failure \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
-expect_failure 'timed out waiting for required generated-PR check sdks' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_SDK_STATUS=in_progress \
-  SYQ_TEST_SDK_CONCLUSION=null SYQ_REQUIRED_CHECK_TIMEOUT_SECONDS=0 \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
-expect_failure 'timed out waiting for native pull-request workflow runs' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_RUN_EVENT=workflow_dispatch \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" SYQ_APPROVAL_TIMEOUT_SECONDS=0 \
-  PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
 
 # Build a clean disposable canonical checkout and serve every GitHub/registry
 # response from fixtures. The preflight must not create a tag or publication.

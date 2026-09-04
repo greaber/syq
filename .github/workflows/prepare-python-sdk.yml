@@ -6,7 +6,6 @@ on:
     types: [completed]
 
 permissions:
-  actions: write
   contents: write
   pull-requests: write
 
@@ -114,7 +113,7 @@ jobs:
             "- sets the Python SDK version to match syq $SYQ_VERSION" \
             "- embeds the exact signed v$SYQ_VERSION release manifest" \
             "- updates the managed executable cache documentation" \
-            "The native pull-request checks are approved explicitly because GitHub puts workflow runs caused by GITHUB_TOKEN into an approval-required state. Auto-merge is requested only after the substantive sdks check succeeds on this exact commit; publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
+            "The preparation workflow ran the pinned SDK release-tool and unit-test suites before opening this pull request. Publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
           pr_url=$(gh pr create \
             --base master \
             --head "$branch" \
@@ -122,7 +121,5 @@ jobs:
             --body "$body")
           echo "Created $pr_url"
           head_sha=$(git rev-parse HEAD)
-          scripts/approve-generated-pr-runs.sh \
-            "$GITHUB_REPOSITORY" "$branch" "$head_sha"
-          gh pr merge "$pr_url" --auto --merge --match-head-commit "$head_sha"
-          echo "Requested auto-merge for $pr_url at $head_sha"
+          gh pr merge "$pr_url" --merge --match-head-commit "$head_sha"
+          echo "Merged $pr_url at $head_sha"

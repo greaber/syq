@@ -108,13 +108,12 @@ outlive its premise and steer later work in the wrong direction.
   request, before asking for review, and before merging, and include its output
   in the report. It prints the branch SHA and cleanliness, the pull request's
   GitHub head and check results, and the latest post-merge `ci`,
-  `rsync-compat`, and `macos` runs on `master`. Pull requests run a reduced
-  suite, so a failure in the full suites first appears in those `master` runs,
-  and nothing else surfaces it. A red `master` run makes the script exit 1;
-  report it to the user even when the current task did not cause it, and do not
-  treat the task's own green pull-request checks as evidence that `master` is
-  healthy. `--check` also runs the Rust baseline below, and `--json` prints the
-  same facts for scripting.
+  `rsync-compat`, and `macos` runs on `master`. Pull requests do not start
+  automated test workflows and branch protection does not require test status
+  contexts. Any pull-request check results are informational. A red `master`
+  run makes the script exit 1; report it to the user even when the current task
+  did not cause it. `--check` also runs the Rust baseline below, and `--json`
+  prints the same facts for scripting.
 - Before removing a worktree or branch, require a clean worktree, no retained
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
@@ -256,11 +255,9 @@ scripts/test-real-ssh.sh
 It is intentionally not part of ordinary CI or `cargo test`; see
 `tests/real-ssh/README.md` for its isolation and coverage.
 
-Pull-request CI intentionally mirrors this policy: it runs formatting, clippy,
-and native unit tests for Rust changes, plus a directly affected SDK, rsync, or
-executable-documentation suite. The agent remains responsible for choosing and
-reporting focused integration tests before review. The cumulative `master` CI
-run executes the complete native and cross-platform suites after merge, so a
-green pull request is not evidence that every repository test ran on that head.
-State exactly what was and was not verified, especially for remote, TCP,
-platform-specific, or performance behavior.
+Pull requests do not start automated test workflows. The agent remains
+responsible for running the baseline above, choosing focused integration tests,
+and reporting exactly what was and was not verified before review. The
+cumulative `master` workflows execute the complete native and cross-platform
+suites after merge. Pay particular attention to remote, TCP, platform-specific,
+and performance behavior when choosing local checks.

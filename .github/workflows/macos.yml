@@ -1,8 +1,8 @@
 name: macOS suite
 
 # The complete native and SDK test suites, clippy, and release shell suites on
-# macOS. Pull-request CI defers this platform coverage; this cumulative run
-# happens after every merge to master and on demand.
+# macOS. Automated validation runs after merges to master and on demand, not
+# on pull requests.
 on:
   push:
     branches: [master]
