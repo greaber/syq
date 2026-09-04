@@ -1150,7 +1150,7 @@ pub struct RemoteSpec {
     pub rsh: Vec<String>,
     pub syq_path: Option<String>,
     /// Install and use the versioned helper rather than resolving `syq` on PATH.
-    pub auto_helper: bool,
+    pub bootstrap_helper: bool,
     /// One-time signed authorization for a command-restricted receiver. It is
     /// sent only on the SSH control connection; authenticated TCP workers are
     /// children of that already-authorized receiver.
@@ -1178,7 +1178,7 @@ impl RemoteSpec {
             port: None,
             rsh: vec!["local".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -1322,7 +1322,7 @@ impl RemoteSpec {
         if let Some(p) = &self.syq_path {
             return format!("{} {}", shell_words::quote(p), shell_words::join(args));
         }
-        if self.auto_helper {
+        if self.bootstrap_helper {
             return remote_helper::launcher(args);
         }
         format!("syq {}", shell_words::join(args))
@@ -1351,7 +1351,7 @@ impl RemoteSpec {
         let Err(first_error) = first else {
             return first;
         };
-        if !self.auto_helper || !helper_needs_install(&first_error) {
+        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
             return Err(first_error);
         }
         self.install_helper()?;
@@ -1375,7 +1375,7 @@ impl RemoteSpec {
         let Err(first_error) = first else {
             return first;
         };
-        if !self.auto_helper || !helper_needs_install(&first_error) {
+        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
             return Err(first_error);
         }
 
@@ -2874,7 +2874,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -3248,7 +3248,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".to_string()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -3284,7 +3284,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(multiplexer),
@@ -3350,7 +3350,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
@@ -3400,7 +3400,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),

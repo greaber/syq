@@ -111,7 +111,7 @@ pub type ContentDigest = [u8; 32];
 
 /// Stable identifier for one logical copy command. Destination partial names
 /// include this value so unrelated commands never write the same staged inode.
-pub type PartialId = [u8; 16];
+pub type CopyId = [u8; 16];
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -279,7 +279,7 @@ pub struct SmallRead {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallPut {
     pub path: PathBytes,
-    pub partial_id: PartialId,
+    pub copy_id: CopyId,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     pub hash: ContentDigest,
@@ -669,7 +669,7 @@ pub enum Request {
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {
         paths: Vec<PathBytes>,
-        partial_id: PartialId,
+        copy_id: CopyId,
         guard: Option<ContainerGuard>,
     },
     Apply {
@@ -681,7 +681,7 @@ pub enum Request {
     /// directory, so callers can preserve parent-before-child replacement.
     PlanBatch {
         partial_paths: Vec<PathBytes>,
-        partial_id: PartialId,
+        copy_id: CopyId,
         directories: Vec<PathBytes>,
         others: Vec<PathBytes>,
         guard: Option<ContainerGuard>,
@@ -690,7 +690,7 @@ pub enum Request {
     /// The planner has already statted the final path.
     ProbePartial {
         path: PathBytes,
-        partial_id: PartialId,
+        copy_id: CopyId,
         guard: Option<ContainerGuard>,
     },
     /// Inspect and, when requested, create/adjust the write target for `path`.
@@ -703,7 +703,7 @@ pub enum Request {
         path: PathBytes,
         size: u64,
         inplace: bool,
-        partial_id: PartialId,
+        copy_id: CopyId,
         mode: u32,
         attempt: u32,
         create_if_missing: bool,
@@ -713,7 +713,7 @@ pub enum Request {
     /// basis until FinishBasis or SeedBasis consumes it.
     HashAndHold {
         path: PathBytes,
-        partial_id: PartialId,
+        copy_id: CopyId,
         block: u64,
         len: u64,
         condition: TargetCondition,
@@ -724,7 +724,7 @@ pub enum Request {
     /// winner and this only touches the now-unlinked old inode.
     FinishBasis {
         path: PathBytes,
-        partial_id: PartialId,
+        copy_id: CopyId,
         meta: Meta,
         flags: u8,
         condition: TargetCondition,
@@ -733,7 +733,7 @@ pub enum Request {
     /// Seed this job's sidecar from the retained basis descriptor.
     SeedBasis {
         path: PathBytes,
-        partial_id: PartialId,
+        copy_id: CopyId,
         len: u64,
         attempt: u32,
         guard: Option<ContainerGuard>,
@@ -747,7 +747,7 @@ pub enum Request {
         dst: PathBytes,
         inplace: bool,
         allow_sequential_nfs_fallback: bool,
-        partial_id: PartialId,
+        copy_id: CopyId,
         size: u64,
         mode: u32,
     },
@@ -757,7 +757,7 @@ pub enum Request {
         /// omits it; a confined source session rejects an omission.
         source: Option<RegisteredPath>,
         which: Which,
-        partial_id: PartialId,
+        copy_id: CopyId,
         block: u64,
         len: u64,
         attempt: u32,
@@ -777,7 +777,7 @@ pub enum Request {
     WriteRange {
         path: PathBytes,
         inplace: bool,
-        partial_id: PartialId,
+        copy_id: CopyId,
         attempt: u32,
         off: u64,
         hash: ContentDigest,
@@ -788,7 +788,7 @@ pub enum Request {
     Finalize {
         path: PathBytes,
         inplace: bool,
-        partial_id: PartialId,
+        copy_id: CopyId,
         meta: Meta,
         flags: u8,
         condition: TargetCondition,
@@ -804,7 +804,7 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
-    /// existing prefix resolved), for a stable job identity.
+    /// existing prefix resolved), for a stable copy identity.
     Canonicalize {
         path: PathBytes,
         guard: Option<ContainerGuard>,

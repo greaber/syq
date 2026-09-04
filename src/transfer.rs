@@ -87,7 +87,7 @@ pub struct Opts {
     pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
-    pub partial_id: std::sync::OnceLock<PartialId>,
+    pub copy_id: std::sync::OnceLock<CopyId>,
     /// gitignore-style patterns applied to every source (see scan.rs).
     pub ignore: Vec<String>,
     /// --delete: remove destination paths the source doesn't have (see Planner::plan_deletes).
@@ -144,7 +144,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 port: loc.port,
                 rsh,
                 syq_path: args.syq_path.clone(),
-                auto_helper: args.restricted_grant.is_none()
+                bootstrap_helper: args.restricted_grant.is_none()
                     && args.syq_path.is_none()
                     && !args.no_bootstrap,
                 restricted_grant: args.restricted_grant.clone(),
@@ -280,7 +280,7 @@ fn interface_option<'a>(args: &Args, native: &'a str, rsync: &'a str) -> &'a str
 }
 
 fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
-    if spec.auto_helper {
+    if spec.bootstrap_helper {
         if *spec.helper_install.lock().unwrap() {
             "managed; installed now"
         } else {
@@ -532,7 +532,7 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
 }
 
 /// The canonical form of a path (symlinks and `..` resolved the way the kernel
-/// does), normalized by the endpoint that holds it. Used for the job identity —
+/// does), normalized by the endpoint that holds it. Used for the copy identity —
 /// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job.
 fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::path::PathBuf> {
     if !remote {
@@ -592,7 +592,7 @@ fn destination_identity_plan(
     }
 }
 
-/// Encode the content/metadata-affecting options into the job identity.
+/// Encode the content/metadata-affecting options into the copy identity.
 fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
     let source_modes: Vec<&str> = srcs
         .iter()
@@ -632,7 +632,7 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
     flags.to_string()
 }
 
-/// The endpoint half of a job identity: `user@host[:port]` (the user and an
+/// The endpoint half of a copy identity: `user@host[:port]` (the user and an
 /// explicit port matter — they may select different filesystems), or `local`.
 fn endpoint_identity(l: &Location) -> String {
     match (&l.user, &l.host) {
@@ -716,7 +716,7 @@ pub(crate) fn validate_native_source_type(
     }
 }
 
-fn copy_identity(
+fn resolve_copy_identity(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
@@ -754,7 +754,7 @@ fn copy_identity(
         None => canonical_path(dst_ctl, &dst.path, dst.is_remote())?,
     };
     let dst_root = path_identity(&dst_root);
-    Ok(crate::resume::job_identity(
+    Ok(crate::resume::copy_identity(
         &endpoint_identity(&srcs[0]),
         &src_roots,
         &endpoint_identity(dst),
@@ -908,16 +908,16 @@ pub fn run(args: Args) -> Result<i32> {
                 exit_code: 1,
                 dry_run,
                 files_transferred: progress.files_done.load(Relaxed),
-                files_unchanged: progress.files_skipped.load(Relaxed),
+                files_unchanged: progress.files_unchanged.load(Relaxed),
                 files_excluded: progress.files_excluded.load(Relaxed),
                 // Mutations that settled (and streamed their records)
                 // before the run died must not vanish from the aggregates.
-                directories_created: progress.dirs_created.load(Relaxed),
-                symlinks_created: progress.links_created.load(Relaxed),
+                directories_created: progress.directories_created.load(Relaxed),
+                symlinks_created: progress.symlinks_created.load(Relaxed),
                 specials_created: progress.specials_created.load(Relaxed),
                 errors: progress.errors.load(Relaxed),
                 bytes_transferred: progress.bytes_done.load(Relaxed),
-                bytes_unchanged: progress.bytes_skipped.load(Relaxed),
+                bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
                 elapsed_ms: progress.start.elapsed().as_millis() as u64,
                 // What the deletion pass did before the run died; zeros
                 // mean it never got that far, and status "failed" already
@@ -1199,7 +1199,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
         umask: crate::fsops::process_umask(),
-        partial_id: std::sync::OnceLock::new(),
+        copy_id: std::sync::OnceLock::new(),
         ignore: args.ignore_lines.clone(),
         delete: args.delete,
         delete_excluded: args.delete_excluded,
@@ -1563,7 +1563,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // canonical parent plus the operator-supplied leaf. Ordinary endpoints
     // compute that form here; restricted setup already supplied and signed
     // it. Canonicalizing the whole path would dereference an existing leaf
-    // symlink and give the self-copy guard and resumable-job identity the
+    // symlink and give the self-copy guard and resumable-copy identity the
     // wrong destination.
     let exact_native_destination =
         args.interface != Interface::Rsync && args.placement == Placement::As;
@@ -1922,7 +1922,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
 
-    let identity = copy_identity(
+    let identity = resolve_copy_identity(
         &args,
         srcs,
         dst,
@@ -1931,8 +1931,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Some(dst_canonical),
         &opts,
     )?;
-    opts.partial_id
-        .set(crate::resume::partial_id(&identity))
+    opts.copy_id
+        .set(crate::resume::copy_id(&identity))
         .expect("partial identity set once");
     if debug() {
         eprintln!(
@@ -2507,8 +2507,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // summary count the same set (spec: summary renders from the record).
     dry_run_changes.directories.remove(&dst_root);
     let created_counts = (
-        progress.dirs_created.load(Relaxed),
-        progress.links_created.load(Relaxed),
+        progress.directories_created.load(Relaxed),
+        progress.symlinks_created.load(Relaxed),
         progress.specials_created.load(Relaxed),
     );
     drop(st);
@@ -2597,7 +2597,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         exit_code,
         dry_run: opts.dry_run,
         files_transferred: progress.files_done.load(Relaxed),
-        files_unchanged: progress.files_skipped.load(Relaxed),
+        files_unchanged: progress.files_unchanged.load(Relaxed),
         files_excluded: progress.files_excluded.load(Relaxed),
         // Live counters only move when mutations run; a dry run reports the
         // planned work it traced instead.
@@ -2618,7 +2618,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         },
         errors,
         bytes_transferred: progress.bytes_done.load(Relaxed),
-        bytes_unchanged: progress.bytes_skipped.load(Relaxed),
+        bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
         elapsed_ms: progress.start.elapsed().as_millis() as u64,
         deletions_planned,
         deletions_completed,
@@ -2733,10 +2733,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
-                commas(progress.files_skipped.load(Relaxed)),
+                commas(progress.files_unchanged.load(Relaxed)),
                 commas(progress.files_excluded.load(Relaxed)),
                 commas(bytes_work),
-                commas(progress.bytes_skipped.load(Relaxed)),
+                commas(progress.bytes_unchanged.load(Relaxed)),
                 elapsed,
                 match &tuned {
                     Some(p) => format!(
@@ -3625,8 +3625,8 @@ fn print_dry_run_summary(
         "  logical data: {} in {} needing content work (upper bound); {} in {} with unchanged content",
         human(progress.bytes_total.load(Relaxed)),
         count_label(progress.files_total.load(Relaxed), "file", "files"),
-        human(progress.bytes_skipped.load(Relaxed)),
-        count_label(progress.files_skipped.load(Relaxed), "file", "files")
+        human(progress.bytes_unchanged.load(Relaxed)),
+        count_label(progress.files_unchanged.load(Relaxed), "file", "files")
     );
     if let Some(capacity) = capacity {
         let inode_detail = capacity.available_inodes.map_or_else(
@@ -5007,7 +5007,7 @@ impl Planner<'_> {
                         self.collision = true;
                         return Ok(());
                     }
-                    self.progress.dirs_created.fetch_add(1, Relaxed);
+                    self.progress.directories_created.fetch_add(1, Relaxed);
                     if opts.verbose > 0 {
                         self.progress
                             .println(&format!("{}/", display(&self.dst_root)));
@@ -5094,7 +5094,7 @@ impl Planner<'_> {
                         }
                     }
                     self.progress
-                        .dirs_created
+                        .directories_created
                         .fetch_add((n - failed - reopened) as u64, Relaxed);
                     if let Some(error) = capacity_error {
                         return Err(endpoint_error(error)).context("apply destination changes");
@@ -5303,8 +5303,8 @@ impl Planner<'_> {
                                 ff |= flags::GROUP;
                             }
                             if ff != 0 {
-                                self.progress.files_skipped.fetch_add(1, Relaxed);
-                                self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                                self.progress.files_unchanged.fetch_add(1, Relaxed);
+                                self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
                                 if opts.dry_run {
                                     self.dry_run_changes.metadata_files += 1;
                                     self.emit_trace(
@@ -5334,8 +5334,8 @@ impl Planner<'_> {
                                 continue;
                             }
                         }
-                        self.progress.files_skipped.fetch_add(1, Relaxed);
-                        self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                        self.progress.files_unchanged.fetch_add(1, Relaxed);
+                        self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
                     } else if opts.dry_run {
                         self.progress.files_total.fetch_add(1, Relaxed);
                         self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -5586,7 +5586,7 @@ impl Planner<'_> {
                     // phantom creations in the terminal aggregates.
                     match queued.action {
                         "create_symlink" => {
-                            self.progress.links_created.fetch_add(1, Relaxed);
+                            self.progress.symlinks_created.fetch_add(1, Relaxed);
                         }
                         _ => {
                             self.progress.specials_created.fetch_add(1, Relaxed);
@@ -5718,9 +5718,9 @@ impl Planner<'_> {
         let (sidecars, dir_stats, other_stats) = if pre_stat {
             let response = self.dst.call(Request::PlanBatch {
                 partial_paths,
-                partial_id: *self
+                copy_id: *self
                     .opts
-                    .partial_id
+                    .copy_id
                     .get()
                     .expect("partial identity initialized before planning"),
                 directories: directories.clone(),
@@ -5977,7 +5977,7 @@ impl Planner<'_> {
             dst_entry,
             target_condition,
             container_guard: self.container_guard.clone(),
-            attempts: 0,
+            attempt: 0,
             done: Arc::new(AtomicU64::new(0)),
             inplace: false,
             src_rel,
@@ -6071,7 +6071,7 @@ impl Planner<'_> {
                         // namespace preflight listed. Membership is the whole
                         // test: a path is only in that set if the receiver
                         // generated it for this job, and the compact
-                        // (near-PATH_MAX) form doesn't even embed the job id,
+                        // (near-PATH_MAX) form doesn't even embed the copy ID,
                         // so there is nothing valid to compare names against.
                         // Anything else matching the pattern is an ordinary
                         // extra: syq itself copies such names as payload now,
@@ -6382,9 +6382,9 @@ impl Planner<'_> {
         match ok(
             self.dst.call(Request::PartialPaths {
                 paths,
-                partial_id: *self
+                copy_id: *self
                     .opts
-                    .partial_id
+                    .copy_id
                     .get()
                     .expect("partial identity initialized before planning"),
                 guard: None,
@@ -6684,7 +6684,7 @@ impl Worker {
             .map(|job| SmallRead {
                 path: job.src.clone(),
                 source: self.source_reference(job),
-                attempt: job.attempts,
+                attempt: job.attempt,
                 len: job.entry.size as u32,
             })
             .collect();
@@ -6741,7 +6741,7 @@ impl Worker {
             meta.mode = self.create_mode(j);
             puts.push(SmallPut {
                 path: j.dst.clone(),
-                partial_id: self.partial_id(),
+                copy_id: self.copy_id(),
                 data,
                 hash,
                 meta,
@@ -6828,7 +6828,7 @@ impl Worker {
             if changed {
                 if let (Some(e), true, true) = (
                     now,
-                    j.attempts + 1 < MAX_ATTEMPTS,
+                    j.attempt + 1 < MAX_ATTEMPTS,
                     j.target_condition == TargetCondition::Any,
                 ) {
                     if !self.opts.quiet {
@@ -6845,7 +6845,7 @@ impl Worker {
                         path: job.entry.path.clone(),
                         ..e
                     };
-                    job.attempts += 1;
+                    job.attempt += 1;
                     job.dst_entry = Some(published);
                     drop(all);
                     self.sched.requeue(*idx);
@@ -6875,7 +6875,7 @@ impl Worker {
                     kind: "file",
                     disposition: "succeeded",
                     bytes: Some(j.entry.size),
-                    attempts: Some(u64::from(j.attempts) + 1),
+                    attempts: Some(u64::from(j.attempt) + 1),
                     retryable: None,
                     class: None,
                     os_kind: None,
@@ -6929,7 +6929,7 @@ impl Worker {
                 kind: "file",
                 disposition: "failed",
                 bytes: None,
-                attempts: Some(u64::from(job.attempts) + 1),
+                attempts: Some(u64::from(job.attempt) + 1),
                 retryable: Some(retryable),
                 class: Some("io"),
                 os_kind,
@@ -7023,9 +7023,9 @@ impl Worker {
                     path: job.dst.clone(),
                     size,
                     inplace,
-                    partial_id: self.partial_id(),
+                    copy_id: self.copy_id(),
                     mode: self.create_mode(&job),
-                    attempt: job.attempts,
+                    attempt: job.attempt,
                     create_if_missing: inplace || !final_is_file,
                     guard: job.container_guard.clone(),
                 })?,
@@ -7055,7 +7055,7 @@ impl Worker {
                     ok(
                         self.dst.call(Request::FinishBasis {
                             path: job.dst.clone(),
-                            partial_id: self.partial_id(),
+                            copy_id: self.copy_id(),
                             meta,
                             flags: publication_metadata_flags(self.opts.flags),
                             condition: job.target_condition,
@@ -7068,9 +7068,9 @@ impl Worker {
                 ok(
                     self.dst.call(Request::SeedBasis {
                         path: job.dst.clone(),
-                        partial_id: self.partial_id(),
+                        copy_id: self.copy_id(),
                         len: size,
-                        attempt: job.attempts,
+                        attempt: job.attempt,
                         guard: job.container_guard.clone(),
                     })?,
                     "seed partial from destination basis",
@@ -7093,7 +7093,7 @@ impl Worker {
         let to_send: u64 = ranges.iter().map(|(o, e)| e - o).sum();
         job.done.store(size - to_send, Relaxed);
         self.progress
-            .bytes_skipped
+            .bytes_unchanged
             .fetch_add(size - to_send, Relaxed);
         self.progress.bytes_total.fetch_sub(size - to_send, Relaxed);
         match self.sched.ranges_ready(idx, ranges) {
@@ -7164,7 +7164,7 @@ impl Worker {
             dst: job.dst.clone(),
             inplace,
             allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
-            partial_id: self.partial_id(),
+            copy_id: self.copy_id(),
             size: job.entry.size,
             mode,
         })?;
@@ -7209,10 +7209,10 @@ impl Worker {
         }
     }
 
-    fn partial_id(&self) -> PartialId {
+    fn copy_id(&self) -> CopyId {
         *self
             .opts
-            .partial_id
+            .copy_id
             .get()
             .expect("partial identity initialized before planning")
     }
@@ -7235,10 +7235,10 @@ impl Worker {
                 path: job.dst.clone(),
                 source: None,
                 which,
-                partial_id: self.partial_id(),
+                copy_id: self.copy_id(),
                 block: self.opts.block,
                 len: job.entry.size,
-                attempt: job.attempts,
+                attempt: job.attempt,
                 guard: None,
             },
             "hash destination",
@@ -7253,7 +7253,7 @@ impl Worker {
             job,
             Request::HashAndHold {
                 path: job.dst.clone(),
-                partial_id: self.partial_id(),
+                copy_id: self.copy_id(),
                 block: self.opts.block,
                 len: job.entry.size,
                 condition: job.target_condition,
@@ -7280,10 +7280,10 @@ impl Worker {
             path: job.src.clone(),
             source: self.source_reference(job),
             which: Which::Final,
-            partial_id: self.partial_id(),
+            copy_id: self.copy_id(),
             block,
             len: size,
-            attempt: job.attempts,
+            attempt: job.attempt,
             guard: None,
         })?;
         self.dst.send(destination_request)?;
@@ -7391,7 +7391,7 @@ impl Worker {
                 self.src.send(Request::ReadRange {
                     path: job.src.clone(),
                     source: self.source_reference(&job),
-                    attempt: job.attempts,
+                    attempt: job.attempt,
                     off,
                     len: n as u32,
                 })?;
@@ -7412,8 +7412,8 @@ impl Worker {
             self.dst.send(Request::WriteRange {
                 path: job.dst.clone(),
                 inplace,
-                partial_id: self.partial_id(),
-                attempt: job.attempts,
+                copy_id: self.copy_id(),
+                attempt: job.attempt,
                 off,
                 hash,
                 data,
@@ -7472,7 +7472,7 @@ impl Worker {
             self.dst.call(Request::Finalize {
                 path: job.dst.clone(),
                 inplace: job.inplace,
-                partial_id: self.partial_id(),
+                copy_id: self.copy_id(),
                 meta,
                 flags,
                 condition: job.target_condition,
@@ -7491,7 +7491,7 @@ impl Worker {
             let partial_missing = match ok(
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
-                    partial_id: self.partial_id(),
+                    copy_id: self.copy_id(),
                     guard: None,
                 })?,
                 "probe partial after finalize",
@@ -7571,7 +7571,7 @@ impl Worker {
             None => true,
         };
         if changed {
-            if job.attempts + 1 < MAX_ATTEMPTS && job.target_condition == TargetCondition::Any {
+            if job.attempt + 1 < MAX_ATTEMPTS && job.target_condition == TargetCondition::Any {
                 if let Some(e) = now {
                     if !self.opts.quiet {
                         self.progress.eprintln(&format!(
@@ -7587,7 +7587,7 @@ impl Worker {
                         path: j.entry.path.clone(),
                         ..e
                     };
-                    j.attempts += 1;
+                    j.attempt += 1;
                     j.dst_entry = Some(published);
                     j.done.store(0, Relaxed);
                     drop(jobs);
@@ -7599,7 +7599,7 @@ impl Worker {
         }
         if matched {
             self.progress.files_total.fetch_sub(1, Relaxed);
-            self.progress.files_skipped.fetch_add(1, Relaxed);
+            self.progress.files_unchanged.fetch_add(1, Relaxed);
         } else {
             self.progress.files_done.fetch_add(1, Relaxed);
             if let Some(results) = self.progress.results_writer() {
@@ -7610,7 +7610,7 @@ impl Worker {
                     kind: "file",
                     disposition: "succeeded",
                     bytes: Some(job.entry.size),
-                    attempts: Some(u64::from(job.attempts) + 1),
+                    attempts: Some(u64::from(job.attempt) + 1),
                     retryable: None,
                     class: None,
                     os_kind: None,

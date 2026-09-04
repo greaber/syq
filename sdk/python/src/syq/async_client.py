@@ -20,7 +20,7 @@ from collections.abc import (
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
-from .bootstrap import managed_executable
+from .managed import managed_executable
 from .client import (
     Argument,
     IgnoreSelector,

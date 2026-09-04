@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from .bootstrap import managed_executable
+from .managed import managed_executable
 from .errors import (
     SyqInvocationError,
     SyqOperationError,

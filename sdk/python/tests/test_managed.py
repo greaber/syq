@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import syq
-from syq import bootstrap
+from syq import managed
 
 
 FAKE_BINARY = b"""#!/bin/sh
@@ -72,13 +72,13 @@ class BootstrapTests(unittest.TestCase):
     def _patch_release(self) -> tuple[mock._patch, mock._patch]:
         return (
             mock.patch.object(
-                bootstrap, "_load_release_manifest", return_value=_release()
+                managed, "_load_release_manifest", return_value=_release()
             ),
-            mock.patch.object(bootstrap, "_host_target", return_value="linux-x86_64"),
+            mock.patch.object(managed, "_host_target", return_value="linux-x86_64"),
         )
 
     def test_package_version_and_pin_match_embedded_manifest(self) -> None:
-        manifest_path = Path(bootstrap.__file__).with_name("syq-release-manifest.json")
+        manifest_path = Path(managed.__file__).with_name("syq-release-manifest.json")
         manifest = json.loads(manifest_path.read_bytes())
         self.assertEqual(syq.__version__, manifest["version"])
         self.assertEqual(syq.PINNED_SYQ_VERSION, manifest["version"])
@@ -87,10 +87,10 @@ class BootstrapTests(unittest.TestCase):
         manifest_patch, target_patch = self._patch_release()
         download = mock.Mock(side_effect=lambda *args, **kwargs: _Response(FAKE_ARCHIVE))
         with manifest_patch, target_patch, mock.patch.object(
-            bootstrap.urllib.request, "urlopen", download
+            managed.urllib.request, "urlopen", download
         ):
-            first = bootstrap.managed_executable(cache_dir=self.cache)
-            second = bootstrap.managed_executable(cache_dir=self.cache)
+            first = managed.managed_executable(cache_dir=self.cache)
+            second = managed.managed_executable(cache_dir=self.cache)
 
         self.assertEqual(first, second)
         self.assertEqual(first.read_bytes(), FAKE_BINARY)
@@ -101,11 +101,11 @@ class BootstrapTests(unittest.TestCase):
         manifest_patch, target_patch = self._patch_release()
         download = mock.Mock(side_effect=lambda *args, **kwargs: _Response(FAKE_ARCHIVE))
         with manifest_patch, target_patch, mock.patch.object(
-            bootstrap.urllib.request, "urlopen", download
+            managed.urllib.request, "urlopen", download
         ):
-            executable = bootstrap.managed_executable(cache_dir=self.cache)
+            executable = managed.managed_executable(cache_dir=self.cache)
             executable.write_bytes(b"tampered")
-            repaired = bootstrap.managed_executable(cache_dir=self.cache)
+            repaired = managed.managed_executable(cache_dir=self.cache)
 
         self.assertEqual(repaired.read_bytes(), FAKE_BINARY)
         self.assertEqual(download.call_count, 2)
@@ -114,12 +114,12 @@ class BootstrapTests(unittest.TestCase):
         manifest_patch, target_patch = self._patch_release()
         corrupted = bytes([FAKE_ARCHIVE[0] ^ 1]) + FAKE_ARCHIVE[1:]
         with manifest_patch, target_patch, mock.patch.object(
-            bootstrap.urllib.request,
+            managed.urllib.request,
             "urlopen",
             return_value=_Response(corrupted),
         ):
             with self.assertRaisesRegex(syq.SyqInstallError, "SHA-256"):
-                bootstrap.managed_executable(cache_dir=self.cache)
+                managed.managed_executable(cache_dir=self.cache)
 
         install_dir = (
             self.cache / "syq" / "sdk" / "python" / "v9.8.7" / "linux-x86_64"
@@ -130,16 +130,16 @@ class BootstrapTests(unittest.TestCase):
         wrong_binary = FAKE_BINARY.replace(b"v9.8.7", b"source-build")
         wrong_archive = gzip.compress(wrong_binary, mtime=0)
         with mock.patch.object(
-            bootstrap, "_load_release_manifest", return_value=_release(wrong_binary)
+            managed, "_load_release_manifest", return_value=_release(wrong_binary)
         ), mock.patch.object(
-            bootstrap, "_host_target", return_value="linux-x86_64"
+            managed, "_host_target", return_value="linux-x86_64"
         ), mock.patch.object(
-            bootstrap.urllib.request,
+            managed.urllib.request,
             "urlopen",
             return_value=_Response(wrong_archive),
         ):
             with self.assertRaisesRegex(syq.SyqInstallError, "build identity"):
-                bootstrap.managed_executable(cache_dir=self.cache)
+                managed.managed_executable(cache_dir=self.cache)
 
     def test_supported_host_aliases_select_release_targets(self) -> None:
         cases = [
@@ -150,19 +150,19 @@ class BootstrapTests(unittest.TestCase):
         ]
         for system, machine, expected in cases:
             with self.subTest(system=system, machine=machine), mock.patch.object(
-                bootstrap.platform, "system", return_value=system
+                managed.platform, "system", return_value=system
             ), mock.patch.object(
-                bootstrap.platform, "machine", return_value=machine
+                managed.platform, "machine", return_value=machine
             ):
-                self.assertEqual(bootstrap._host_target(), expected)
+                self.assertEqual(managed._host_target(), expected)
 
     def test_unsupported_host_fails_before_downloading(self) -> None:
         with mock.patch.object(
-            bootstrap.platform, "system", return_value="Windows"
+            managed.platform, "system", return_value="Windows"
         ), mock.patch.object(
-            bootstrap.platform, "machine", return_value="x86_64"
+            managed.platform, "machine", return_value="x86_64"
         ), self.assertRaisesRegex(syq.SyqInstallError, "no binary"):
-            bootstrap.managed_executable(cache_dir=self.cache)
+            managed.managed_executable(cache_dir=self.cache)
 
 
 if __name__ == "__main__":
