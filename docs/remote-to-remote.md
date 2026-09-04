@@ -56,6 +56,16 @@ receiver enforces it authoritatively. This protection applies only to the
 enrolled command-restricted receiver; ordinary local and remote copies retain
 their normal destination semantics.
 
+That state directory is not a cache. Removing `~/.cache/syq` on either host
+only costs a fresh helper bootstrap on the next transfer, but removing
+`~/.local/share/syq/restricted` on hostB breaks every enrollment there and
+discards the record of which signed requests were already redeemed; revoke and
+enroll again instead. If hostB's home directory is on a network filesystem
+shared by several machines, they share the receiver, the forced key, and that
+record, so a signed request can be redeemed on only one of them. Each redemption
+is recorded by creating a link that fails if the name already exists, which
+stays atomic on NFS even where advisory locking does not.
+
 Enrollment first tries local→hostB directly. If SSH reports a transport
 failure, it retries through hostA with OpenSSH `ProxyJump`; a remote validation
 or installation error is reported against hostB without repeating it through
