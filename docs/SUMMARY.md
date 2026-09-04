@@ -13,7 +13,7 @@
 # Performance
 
 - [Speed](speed.md)
-- [Server tuning](server-tuning.md)
+- [Server setup](server-tuning.md)
 
 # Trust
 
@@ -22,4 +22,4 @@
 
 # Compatibility
 
-- [Rsync compatibility record](rsync-compat.md)
+- [Rsync compatibility](rsync-compat.md)

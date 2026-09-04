@@ -54,10 +54,11 @@ degree with speed and composability. It is mainly a replacement for `cp`, not
 `rm` or `mv`, but `cp` is the command that most needed replacing, and rsync's
 `--delete` adds mirroring, which the classical commands never had.
 
-Syq aims to do most of what rsync does while doing better on all four counts.
-Today its biggest strengths are speed and secure remote-to-remote transfers.
-Its composability story is still developing but is arguably already ahead of
-rsync's. On filesystem hardening, rsync, and especially [its security
+Syq's biggest strengths are speed and secure remote-to-remote transfers.
+Its composability comes from planning before acting: a dry run reports what
+would change, mappings let a program choose placement, and a results stream
+reports each operation's outcome. On filesystem hardening, rsync, and
+especially [its security
 design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md), has
 been a great teacher; native `cp` and `rm` now follow the same design, and the
 remaining differences are documented rather than hidden.
@@ -120,7 +121,9 @@ time it connects, one per version, so both ends always run
 matching code. The remote downloads the release directly when it has the tools,
 or the local machine uploads it. Either way the binary is checked against a
 signed release manifest, verified with a public key compiled into your local
-syq, before it runs.
+syq, before it runs. This requires an official release build; Cargo and
+checkout builds need a compatible remote `syq`, as
+[Installing](install.md#cargo) explains.
 
 **Direct remote-to-remote transfers.** Rsync cannot copy between two remote
 hosts from your laptop. You download and re-upload, at your laptop's bandwidth,
