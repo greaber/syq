@@ -34,7 +34,9 @@ table](reference.md#compatibility-options)).
    carrying AES-256-GCM records keyed through the ssh session. It advertises
    every IPv4 and IPv6 address the remote has, prefers the fastest that
    answers, and spreads connections across NICs of comparable speed. If no port is reachable it says
-   so once and falls back to ssh data connections. See [TCP data
+   so once and falls back to ssh data connections, except on a
+   command-restricted remote-to-remote transfer, whose receiver requires
+   encrypted TCP and fails instead. See [TCP data
    connections](#tcp-data-connections).
 3. **Kernel and server-side copies on one machine.** Same-machine copies use
    `copy_file_range`, which becomes a reflink where the filesystem supports it
@@ -50,8 +52,9 @@ table](reference.md#compatibility-options)).
    pipelined whole-file requests in batches instead of one round trip per
    file. Workers connect while the source is still being scanned, address
    probes run while the control connection prepares the destination, and a
-   transfer of nothing but fresh small files over ssh reuses the authenticated
-   control connection instead of paying a handshake per worker.
+   transfer of nothing but fresh small files over ssh, without `--bwlimit`,
+   reuses the authenticated control connection instead of paying a handshake
+   per worker.
 6. **Compression that costs nothing when it cannot help.** Remote transfers
    use zstd level 1 per protocol frame, sending the compressed form only when it
    is smaller, so archives, media, and encrypted data are not expanded on the
@@ -148,8 +151,9 @@ The rest of this document describes each mechanism in detail.
   connection wouldn't help — same TCP stream, same single encrypting process —
   so syq gives its large-file data connections their own ssh process
   (`-o ControlMaster=no -o ControlPath=none`) on purpose. The one exception is
-  a job made only of fresh files no larger than one block, where the workers
-  share the already-authenticated control connection instead; those are
+  a job made only of fresh files no larger than one block, without
+  `--bwlimit`, where the workers share the already-authenticated control
+  connection instead; those are
   latency-bound, not cipher-bound.
 - **WAN**: several TCP flows beat one against per-flow window and loss limits.
 - **High-latency filesystems** (NFS, FUSE, object-backed): many small files
@@ -166,7 +170,7 @@ copy runs instead of guessing. It starts at the count that settled last time on
 the same data path and transport. On a path it has not measured, it starts with
 16 over TCP data connections, 8 over ssh, or, when both ends are local, 16 on a
 process limited to one or two CPUs and 32 otherwise. A job of nothing but new small
-files starts no more workers than it has batches, and a single file copied on
+files, without `--bwlimit`, starts no more workers than it has batches, and a single file copied on
 one machine starts with one worker when the kernel or the receiver can copy it
 directly, since extra loopback connections cannot help.
 
@@ -210,7 +214,9 @@ data connections are plain TCP sockets carrying AES-256-GCM records keyed by a
 secret exchanged over the ssh session. `--tcp-plain` skips the encryption on
 trusted networks; `--no-tcp` sends data over the ssh connection instead. If
 the port can't be reached — a firewall, typically — syq says so once (silenced
-by `-q`) and falls back to ssh data connections, so the default is always safe.
+by `-q`) and falls back to ssh data connections, so the default is always
+safe. The one exception is a command-restricted remote-to-remote transfer,
+whose signed receiver requires encrypted TCP: it fails rather than fall back.
 
 The listener accepts IPv4 and IPv6 on the same port. The remote advertises its
 addresses of both families in order of preference: the address your ssh

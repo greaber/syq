@@ -178,11 +178,10 @@ codes and dispositions are authoritative. An authenticated expected manifest
 is required for source completeness and byte authenticity.
 
 `--detach` is not available with the command-restricted receiver because its
-constrained agent exists only while syq remains attached. Unless both
-endpoints are the same host, a detached launch instead requires
-coordinator-owned peer credentials (`--no-forward-agent`) or an explicit
-`--rsh` policy. Neither path prepares a restricted grant or signed receipt;
-the returned remote log is not a locally authenticated receipt.
+constrained agent exists only while syq remains attached. A detached launch
+instead requires coordinator-owned peer credentials (`--no-forward-agent`) or
+an explicit `--rsh` policy. Neither path prepares a restricted grant or signed
+receipt; the returned remote log is not a locally authenticated receipt.
 
 ## Signed policies and options that fail closed
 
@@ -217,8 +216,9 @@ to a hundred million; `--max-delete 0` signs a grant that forbids deletion
 outright. The other signed ceilings default to 100 million entries, 8 TiB of
 file data, and a 23-hour grant. Native `--max-runtime` can only shorten the
 grant; `--max-entries` and `--max-total-bytes` replace their defaults for one
-transfer and may be set above or below them. Either way, what a claimed grant
-is worth to hostA is stated on the command line.
+transfer and may be set above or below them. Either way, a claimed grant is
+worth no more to hostA than those ceilings, the defaults or the values given
+on the command line.
 
 `--dry-run` is cryptographically read-only: the signed grant marks it as
 such and the receiver rejects every mutation even if hostA sends one. A dry

@@ -275,10 +275,11 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
   a symlink maps as a symlink, and a destination path that would traverse a
   symlink inside the destination container fails that entry. Resolve links before
   emitting the manifest if you want targets instead.
-- `kind: "special"` asserts the source's type; it does not override the
-  fixed `-rlt` fidelity, which copies no special files. Such an entry is
-  a policy exclusion like `--min-size`: the run still succeeds and the
-  entry appears only in the excluded aggregate. Filter with
+- `kind: "special"` asserts the source's type; it does not by itself make
+  the copy carry special files. Under the default fidelity, which copies
+  none, such an entry is a policy exclusion like `--min-size`: the run still
+  succeeds and the entry appears only in the excluded aggregate. Pass
+  `--preserve=specials` to copy them, or filter with
   `jq -c 'select(.kind != "special")'` to drop such entries up front.
 - Mappings define no deletion region, so `--mapping` cannot be combined
   with `--prune`.

@@ -290,8 +290,8 @@ own. Deletion through the receiver requires an explicit `--max-delete`, and
 the native `--max-entries`, `--max-total-bytes`, and `--max-runtime` options
 set the signed ceilings for one transfer (`--max-runtime` can only shorten
 the 23-hour grant; the other two replace their defaults and may go above or
-below them), so what a claimed grant is worth to hostA is always stated on the
-command line. Options whose semantics the receiver cannot enforce
+below them), so what a claimed grant is worth to hostA is always bounded, by
+the defaults or by the values given on the command line. Options whose semantics the receiver cannot enforce
 independently of hostA fail closed rather than trusting hostA: `--mapping`,
 `--min-size`, unencrypted or ssh data transport, and several others (the
 [complete list](remote-to-remote.md#signed-policies-and-options-that-fail-closed)
@@ -338,11 +338,10 @@ become a valid clean receipt, though suppression remains a denial of service.
 The receipt is hostB's closure-time account of hostB: it says what landed, not
 what hostA omitted or invented, and it is neither a transaction nor a rollback.
 `--detach` is not available with this command-restricted receiver because its
-constrained agent exists only while syq remains attached. Unless both
-endpoints are the same host, a detached launch instead requires
-coordinator-owned peer credentials through `--no-forward-agent`, or an
-explicit `--rsh` policy. Neither path prepares a restricted grant or signed
-receipt.
+constrained agent exists only while syq remains attached. A detached launch
+instead requires coordinator-owned peer credentials through
+`--no-forward-agent`, or an explicit `--rsh` policy. Neither path prepares a
+restricted grant or signed receipt.
 
 ### Putting the layers together
 

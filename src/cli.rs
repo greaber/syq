@@ -857,7 +857,7 @@ struct NativeRemoteArgs {
         conflicts_with = "no_tcp"
     )]
     tcp_congestion: Option<String>,
-    /// Run at the remote coordinator and return after launch; requires --no-forward-agent or --rsh unless both endpoints are one host
+    /// Run at the remote coordinator and return after launch; requires --no-forward-agent or --rsh
     #[arg(long)]
     detach: bool,
     /// Give a remote coordinator no forwarded agent; it must own credentials for the peer

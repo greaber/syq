@@ -78,7 +78,9 @@ all — a consumer constructs its own argv, so a usage error is a
 consumer bug and gets no JSON. If the stream itself cannot be opened (the
 `--results` file already exists, or the `--results-fd` descriptor is not
 open or is read-only), syq exits `1`, also with no stream. Every run whose
-stream was opened emits a terminal record, fatal setup failures included.
+stream was opened and stayed writable emits a terminal record, fatal setup
+failures included; the one exception is the write failure above, which
+leaves the stream without one.
 
 ## Record envelope
 

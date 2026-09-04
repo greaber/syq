@@ -2,7 +2,9 @@
 
 syq does not require a specially configured server. It installs its versioned
 remote helper automatically, encrypts its TCP data connections by default,
-falls back to ssh when a TCP listener cannot be reached, and tunes its worker
+falls back to ssh when a TCP listener cannot be reached (a command-restricted
+remote-to-remote transfer instead fails, since it requires encrypted TCP), and
+tunes its worker
 count while a copy runs. Start with the defaults and change the host only when
 a representative transfer shows a specific bottleneck.
 
@@ -43,7 +45,8 @@ transfer. The default TCP records are encrypted with a key exchanged through
 ssh. The helper listens on that port over both IPv4 and IPv6, so a firewall
 rule must allow whichever family the client will use. If no advertised
 address and port is reachable, syq reports the fallback once and carries data
-over separate ssh sessions instead.
+over separate ssh sessions instead; a command-restricted remote-to-remote
+transfer requires encrypted TCP and fails instead of falling back.
 
 Allow the chosen port range only from clients or trusted networks that need it.
 For example, an administrator using ufw could adapt one of these rules:
